@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/crypto-pq/crypto-pq"
 authors = ["Wilson Tran"]
