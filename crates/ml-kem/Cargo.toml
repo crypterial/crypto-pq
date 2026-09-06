@@ -1,0 +1,26 @@
+[package]
+name = "crypto-pq-ml-kem"
+version = "0.1.0"
+description = "ML-KEM (FIPS 203) key encapsulation in pure Rust, no_std, no unsafe"
+readme = "README.md"
+homepage = "https://crypterial.com"
+keywords = ["post-quantum", "kem", "ml-kem", "fips203", "kyber"]
+categories = ["cryptography", "no-std", "no-std::no-alloc"]
+exclude = ["tests/"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rand_core = { version = "0.9", default-features = false }
+sha3 = { version = "0.10", default-features = false }
+subtle = { version = "2.6", default-features = false }
+zeroize = { version = "1.8", default-features = false }
+
+[dev-dependencies]
+flate2 = "1"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

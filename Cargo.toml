@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.81"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/crypto-pq/crypto-pq"
+authors = ["Wilson Tran"]
+
+[profile.release]
+debug = false
+overflow-checks = true
+
+[profile.test]
+opt-level = 3

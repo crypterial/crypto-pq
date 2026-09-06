@@ -1,0 +1,23 @@
+[package]
+name = "crypto-pq"
+version = "0.1.0"
+description = "Post-quantum cryptography: one crate per algorithm, re-exported here behind features"
+readme = "../../README.md"
+homepage = "https://crypterial.com"
+keywords = ["post-quantum", "cryptography", "ml-kem", "kem", "pqc"]
+categories = ["cryptography", "no-std", "no-std::no-alloc"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["ml-kem"]
+ml-kem = ["dep:crypto-pq-ml-kem"]
+
+[dependencies]
+crypto-pq-ml-kem = { version = "0.1.0", path = "../ml-kem", optional = true }
+
+[dev-dependencies]
+rand_core = { version = "0.9", default-features = false }
