@@ -15,7 +15,7 @@ authors.workspace = true
 
 [dependencies]
 rand_core = { version = "0.9", default-features = false }
-sha3 = { version = "0.10", default-features = false }
+sha3 = { version = "0.12", default-features = false }
 subtle = { version = "2.6", default-features = false }
 zeroize = { version = "1.8", default-features = false }
 
