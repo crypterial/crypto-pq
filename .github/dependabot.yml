@@ -1,0 +1,12 @@
+# Keeps the pinned action commits and the Cargo dependencies current; each bump arrives as a
+# pull request that CI checks.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
