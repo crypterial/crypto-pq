@@ -20,4 +20,4 @@ ml-kem = ["dep:crypto-pq-ml-kem"]
 crypto-pq-ml-kem = { version = "0.1.0", path = "../ml-kem", optional = true }
 
 [dev-dependencies]
-rand_core = { version = "0.9", default-features = false }
+rand_core = { version = "0.10", default-features = false }
