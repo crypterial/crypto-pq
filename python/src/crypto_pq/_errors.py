@@ -1,0 +1,36 @@
+import enum
+
+
+class ErrorCode(enum.StrEnum):
+    INVALID_LENGTH = "INVALID_LENGTH"
+
+    INVALID_ENCODING = "INVALID_ENCODING"
+
+    ALGORITHM_MISMATCH = "ALGORITHM_MISMATCH"
+
+    INVALID_PUBLIC_KEY = "INVALID_PUBLIC_KEY"
+
+    INVALID_PRIVATE_KEY = "INVALID_PRIVATE_KEY"
+
+    INVALID_CONTEXT = "INVALID_CONTEXT"
+
+    INVALID_OPTION = "INVALID_OPTION"
+
+    RNG_FAILURE = "RNG_FAILURE"
+
+    SELF_TEST_FAILED = "SELF_TEST_FAILED"
+
+    KEY_EXHAUSTED = "KEY_EXHAUSTED"
+
+    STATE_PERSIST_FAILED = "STATE_PERSIST_FAILED"
+
+    STATE_CONFLICT = "STATE_CONFLICT"
+
+    UNSUPPORTED = "UNSUPPORTED"
+
+
+class CryptoPQError(Exception):
+    def __init__(self, code: ErrorCode, message: str) -> None:
+        super().__init__(message)
+
+        self.code = code

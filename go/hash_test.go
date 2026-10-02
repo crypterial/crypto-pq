@@ -1,0 +1,489 @@
+package cryptopq_test
+
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+
+	cryptopq "github.com/crypterial/crypto-pq-go"
+)
+
+type fields map[string]string
+
+type record struct {
+	header fields
+	values fields
+}
+
+var hashes = []struct {
+	file      string
+	name      string
+	algorithm cryptopq.HashAlgorithm
+}{
+	{"SHA224", "SHA-224", cryptopq.SHA_224},
+	{"SHA256", "SHA-256", cryptopq.SHA_256},
+	{"SHA384", "SHA-384", cryptopq.SHA_384},
+	{"SHA512", "SHA-512", cryptopq.SHA_512},
+	{"SHA512_224", "SHA-512/224", cryptopq.SHA_512_224},
+	{"SHA512_256", "SHA-512/256", cryptopq.SHA_512_256},
+	{"SHA3_224", "SHA3-224", cryptopq.SHA3_224},
+	{"SHA3_256", "SHA3-256", cryptopq.SHA3_256},
+	{"SHA3_384", "SHA3-384", cryptopq.SHA3_384},
+	{"SHA3_512", "SHA3-512", cryptopq.SHA3_512},
+}
+
+var xofs = []struct {
+	file      string
+	algorithm cryptopq.XofAlgorithm
+}{
+	{"SHAKE128", cryptopq.SHAKE128},
+	{"SHAKE256", cryptopq.SHAKE256},
+}
+
+// HMAC.rsp labels each group by digest length in bytes; L=20 is SHA-1, which is out of scope.
+var hmacs = map[string]struct {
+	name      string
+	algorithm cryptopq.HmacAlgorithm
+}{
+	"28": {"HMAC-SHA-224", cryptopq.HMAC_SHA_224},
+	"32": {"HMAC-SHA-256", cryptopq.HMAC_SHA_256},
+	"48": {"HMAC-SHA-384", cryptopq.HMAC_SHA_384},
+	"64": {"HMAC-SHA-512", cryptopq.HMAC_SHA_512},
+}
+
+// Uneven sizes reach every buffering path: empty updates, partial blocks and whole blocks.
+var sizes = []int{0, 1, 3, 64, 7, 136, 128, 168, 0, 200}
+
+func records(t *testing.T, name, field string) []record {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join("..", "vectors", "cavp", name))
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+
+	header := fields{}
+
+	values := fields{}
+
+	var found []record
+
+	for _, raw := range append(lines, "") {
+		line := strings.TrimSpace(raw)
+
+		key, value, hasValue := strings.Cut(line, "=")
+
+		switch {
+		case strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]"):
+			key, value, _ = strings.Cut(line[1:len(line)-1], "=")
+
+			header = maps.Clone(header)
+
+			header[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		case hasValue && !strings.HasPrefix(line, "#"):
+			values[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		case len(values) > 0:
+			found = append(found, record{header, values})
+
+			values = fields{}
+		}
+	}
+
+	expected, parsed := 0, 0
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, field+" =") {
+			expected++
+		}
+	}
+
+	for _, r := range found {
+		if _, ok := r.values[field]; ok {
+			parsed++
+		}
+	}
+
+	if expected == 0 || parsed != expected {
+		t.Fatalf("%s: parsed %d records, expected %d", name, parsed, expected)
+	}
+
+	return found
+}
+
+func decode(t *testing.T, text string) []byte {
+	t.Helper()
+
+	data, err := hex.DecodeString(text)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return data
+}
+
+func number(t *testing.T, text string) int {
+	t.Helper()
+
+	n, err := strconv.Atoi(text)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return n
+}
+
+func message(t *testing.T, values fields) []byte {
+	t.Helper()
+
+	bits := number(t, values["Len"])
+
+	if bits%8 != 0 {
+		t.Fatal("bit-oriented message")
+	}
+
+	return decode(t, values["Msg"])[:bits/8]
+}
+
+func pieces(data []byte) [][]byte {
+	var out [][]byte
+
+	for offset, index := 0, 0; offset < len(data); index++ {
+		end := min(offset+sizes[index%len(sizes)], len(data))
+
+		out = append(out, data[offset:end])
+
+		offset = end
+	}
+
+	return out
+}
+
+func TestHashVectors(t *testing.T) {
+	for _, h := range hashes {
+		for _, kind := range []string{"ShortMsg", "LongMsg"} {
+			for _, r := range records(t, h.file+kind+".rsp", "MD") {
+				data := message(t, r.values)
+
+				expected := decode(t, r.values["MD"])
+
+				context := fmt.Sprintf("%s%s Len = %s", h.file, kind, r.values["Len"])
+
+				if got := h.algorithm.Digest(data); !bytes.Equal(got, expected) {
+					t.Fatalf("%s: got %x", context, got)
+				}
+
+				hasher := h.algorithm.Create()
+
+				for _, piece := range pieces(data) {
+					hasher.Update(piece)
+				}
+
+				if got := hasher.Digest(); !bytes.Equal(got, expected) {
+					t.Fatalf("%s streamed: got %x", context, got)
+				}
+			}
+		}
+	}
+}
+
+// SHAVS 6.4 and SHA3VS 6.2.3: each checkpoint chains 1000 digests from the previous one.
+func TestHashMonteCarlo(t *testing.T) {
+	for _, h := range hashes {
+		found := records(t, h.file+"Monte.rsp", "MD")
+
+		seed := decode(t, found[0].values["Seed"])
+
+		for _, r := range found[1:] {
+			if strings.HasPrefix(h.file, "SHA3_") {
+				for range 1000 {
+					seed = h.algorithm.Digest(seed)
+				}
+			} else {
+				md := [3][]byte{seed, seed, seed}
+
+				for range 1000 {
+					md = [3][]byte{md[1], md[2], h.algorithm.Digest(slices.Concat(md[0], md[1], md[2]))}
+				}
+
+				seed = md[2]
+			}
+
+			if !bytes.Equal(seed, decode(t, r.values["MD"])) {
+				t.Fatalf("%sMonte COUNT = %s: got %x", h.file, r.values["COUNT"], seed)
+			}
+		}
+	}
+}
+
+func TestHashDigestIsRepeatable(t *testing.T) {
+	for _, h := range hashes {
+		hasher := h.algorithm.Create()
+
+		hasher.Update([]byte("abc"))
+
+		first := hasher.Digest()
+
+		if !bytes.Equal(hasher.Digest(), first) || !bytes.Equal(first, h.algorithm.Digest([]byte("abc"))) {
+			t.Fatalf("%s: digest changed the state", h.name)
+		}
+
+		hasher.Update([]byte("def"))
+
+		if !bytes.Equal(hasher.Digest(), h.algorithm.Digest([]byte("abcdef"))) {
+			t.Fatalf("%s: update after digest", h.name)
+		}
+	}
+}
+
+func TestHashProperties(t *testing.T) {
+	for _, h := range hashes {
+		if h.algorithm.Name() != h.name || h.algorithm.String() != h.name {
+			t.Fatalf("name %q, want %q", h.algorithm.Name(), h.name)
+		}
+
+		if len(h.algorithm.Digest(nil)) != h.algorithm.DigestSize() {
+			t.Fatalf("%s: digest size", h.name)
+		}
+	}
+}
+
+func TestXofVectors(t *testing.T) {
+	for _, x := range xofs {
+		for _, kind := range []string{"ShortMsg", "LongMsg"} {
+			for _, r := range records(t, x.file+kind+".rsp", "Output") {
+				data := message(t, r.values)
+
+				expected := decode(t, r.values["Output"])
+
+				context := fmt.Sprintf("%s%s Len = %s", x.file, kind, r.values["Len"])
+
+				if number(t, r.header["Outputlen"]) != 8*len(expected) {
+					t.Fatalf("%s: output length", context)
+				}
+
+				if got := x.algorithm.Digest(data, len(expected)); !bytes.Equal(got, expected) {
+					t.Fatalf("%s: got %x", context, got)
+				}
+
+				xof := x.algorithm.Create()
+
+				for _, piece := range pieces(data) {
+					xof.Update(piece)
+				}
+
+				got := append(xof.Read(1), xof.Read(len(expected)-1)...)
+
+				if !bytes.Equal(got, expected) {
+					t.Fatalf("%s streamed: got %x", context, got)
+				}
+			}
+		}
+
+		for _, r := range records(t, x.file+"VariableOut.rsp", "Output") {
+			expected := decode(t, r.values["Output"])
+
+			if number(t, r.values["Outputlen"]) != 8*len(expected) {
+				t.Fatalf("%s VariableOut COUNT = %s: output length", x.file, r.values["COUNT"])
+			}
+
+			if got := x.algorithm.Digest(decode(t, r.values["Msg"]), len(expected)); !bytes.Equal(got, expected) {
+				t.Fatalf("%s VariableOut COUNT = %s: got %x", x.file, r.values["COUNT"], got)
+			}
+		}
+	}
+}
+
+// SHA3VS 6.3.3: the next input is the first 16 output bytes, zero-padded, and the last two
+// output bytes pick the next output length.
+func TestXofMonteCarlo(t *testing.T) {
+	for _, x := range xofs {
+		found := records(t, x.file+"Monte.rsp", "Output")
+
+		minimum := number(t, found[0].header["Minimum Output Length (bits)"]) / 8
+
+		maximum := number(t, found[0].header["Maximum Output Length (bits)"]) / 8
+
+		output := decode(t, found[0].values["Msg"])
+
+		length := maximum
+
+		for _, r := range found[1:] {
+			for range 1000 {
+				var message [16]byte
+
+				copy(message[:], output)
+
+				output = x.algorithm.Digest(message[:], length)
+
+				length = minimum + int(binary.BigEndian.Uint16(output[len(output)-2:]))%(maximum-minimum+1)
+			}
+
+			if !bytes.Equal(output, decode(t, r.values["Output"])) || 8*len(output) != number(t, r.values["Outputlen"]) {
+				t.Fatalf("%sMonte COUNT = %s: got %x", x.file, r.values["COUNT"], output)
+			}
+		}
+	}
+}
+
+func TestXofStreamingRead(t *testing.T) {
+	for _, x := range xofs {
+		xof := x.algorithm.Create()
+
+		xof.Update([]byte("abc"))
+
+		var got []byte
+
+		for _, n := range []int{0, 1, 135, 1, 167, 200, 496} {
+			got = append(got, xof.Read(n)...)
+		}
+
+		if !bytes.Equal(got, x.algorithm.Digest([]byte("abc"), 1000)) {
+			t.Fatalf("%s: streamed output differs", x.file)
+		}
+	}
+}
+
+func panics(t *testing.T, code string, f func()) {
+	t.Helper()
+
+	defer func() {
+		if message := fmt.Sprint(recover()); !strings.Contains(message, code) {
+			t.Fatalf("panic %q, want %s", message, code)
+		}
+	}()
+
+	f()
+}
+
+func TestXofErrors(t *testing.T) {
+	xof := cryptopq.SHAKE128.Create()
+
+	xof.Read(1)
+
+	panics(t, "UNSUPPORTED", func() { xof.Update([]byte("x")) })
+
+	panics(t, "INVALID_LENGTH", func() { cryptopq.SHAKE256.Digest(nil, -1) })
+
+	if len(cryptopq.SHAKE256.Digest(nil, 0)) != 0 {
+		t.Fatal("zero length")
+	}
+}
+
+func TestXofProperties(t *testing.T) {
+	if cryptopq.SHAKE128.Name() != "SHAKE128" || cryptopq.SHAKE256.String() != "SHAKE256" {
+		t.Fatal("names")
+	}
+}
+
+func TestInvalidAlgorithm(t *testing.T) {
+	panics(t, "invalid HashAlgorithm", func() { cryptopq.HashAlgorithm(0).Create() })
+
+	panics(t, "invalid XofAlgorithm", func() { cryptopq.XofAlgorithm(9).Create() })
+
+	panics(t, "invalid HmacAlgorithm", func() { cryptopq.HmacAlgorithm(0).Create(nil) })
+}
+
+func TestHmacVectors(t *testing.T) {
+	tested := 0
+
+	for _, r := range records(t, "HMAC.rsp", "Mac") {
+		if r.header["L"] == "20" {
+			continue
+		}
+
+		h, ok := hmacs[r.header["L"]]
+
+		if !ok {
+			t.Fatalf("digest length %s", r.header["L"])
+		}
+
+		key := decode(t, r.values["Key"])
+
+		data := decode(t, r.values["Msg"])
+
+		mac := decode(t, r.values["Mac"])
+
+		context := fmt.Sprintf("L = %s Count = %s", r.header["L"], r.values["Count"])
+
+		if len(key) != number(t, r.values["Klen"]) || len(mac) != number(t, r.values["Tlen"]) {
+			t.Fatalf("%s: lengths", context)
+		}
+
+		tag := h.algorithm.Digest(key, data)
+
+		if !bytes.Equal(tag[:len(mac)], mac) {
+			t.Fatalf("%s: got %x", context, tag)
+		}
+
+		hmac := h.algorithm.Create(key)
+
+		for _, piece := range pieces(data) {
+			hmac.Update(piece)
+		}
+
+		if !bytes.Equal(hmac.Digest(), tag) || !hmac.Verify(tag) || !h.algorithm.Verify(key, data, tag) {
+			t.Fatalf("%s: streamed or verify", context)
+		}
+
+		tested++
+	}
+
+	if tested != 1275 {
+		t.Fatalf("tested %d", tested)
+	}
+}
+
+func TestHmacVerifyRejects(t *testing.T) {
+	key := []byte("key")
+
+	data := []byte("data")
+
+	tag := cryptopq.HMAC_SHA_256.Digest(key, data)
+
+	if cryptopq.HMAC_SHA_256.Verify(key, data, tag[:len(tag)-1]) {
+		t.Fatal("truncated tag")
+	}
+
+	if cryptopq.HMAC_SHA_256.Verify(key, data, append(bytes.Clone(tag), 0)) {
+		t.Fatal("extended tag")
+	}
+
+	if cryptopq.HMAC_SHA_256.Verify([]byte("kez"), data, tag) {
+		t.Fatal("wrong key")
+	}
+
+	for index := range tag {
+		flipped := bytes.Clone(tag)
+
+		flipped[index] ^= 0x80
+
+		if cryptopq.HMAC_SHA_256.Verify(key, data, flipped) {
+			t.Fatalf("flipped byte %d", index)
+		}
+	}
+}
+
+func TestHmacProperties(t *testing.T) {
+	for _, h := range hmacs {
+		if h.algorithm.Name() != h.name || h.algorithm.String() != h.name {
+			t.Fatalf("name %q, want %q", h.algorithm.Name(), h.name)
+		}
+
+		if len(h.algorithm.Digest([]byte("k"), nil)) != h.algorithm.DigestSize() {
+			t.Fatalf("%s: digest size", h.name)
+		}
+	}
+}

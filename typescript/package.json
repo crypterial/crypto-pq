@@ -1,0 +1,47 @@
+{
+  "name": "crypto-pq",
+  "version": "0.2.0-dev.0",
+  "description": "Post-quantum cryptography in TypeScript, with no dependencies.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  },
+  "keywords": [
+    "post-quantum",
+    "cryptography",
+    "ml-kem",
+    "ml-dsa",
+    "sha3"
+  ],
+  "homepage": "https://crypterial.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crypterial/crypto-pq.git",
+    "directory": "typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/crypterial/crypto-pq/issues"
+  },
+  "author": "Wilson Tran",
+  "license": "Apache-2.0 OR MIT"
+}

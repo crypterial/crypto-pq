@@ -1,1 +1,8 @@
 .DS_Store
+__pycache__/
+/python/dist/
+/rust/target/
+/typescript/dist/
+/typescript/node_modules/
+/zig/.zig-cache/
+/zig/zig-out/

@@ -6,7 +6,7 @@ on:
   pull_request:
 
 # Only GitHub's own actions, pinned to commits (the repo setting "require SHA pinning" enforces
-# it); the token is read-only. Jobs for each implementation are added as the code lands.
+# it); the token is read-only. Toolchains come from their official distributions.
 permissions:
   contents: read
 
@@ -17,3 +17,103 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: cd vectors && sha256sum -c SHA256SUMS
+
+  python:
+    name: python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.x"]
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
+        env:
+          PYTHONPATH: src
+
+  rust:
+    name: rust ${{ matrix.rust }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: ["1.88", stable]
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install ${{ matrix.rust }} --profile minimal --component clippy,rustfmt
+      - run: rustup override set ${{ matrix.rust }}
+      - if: matrix.rust == 'stable'
+        run: cargo fmt --check
+      - if: matrix.rust == 'stable'
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo test --locked --release
+
+  typescript:
+    name: typescript (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ["22", "24", "26"]
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+  go:
+    name: go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ["1.25", stable]
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  zig:
+    name: zig 0.16.0
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zig
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # ziglang.org asks automated downloads to stay rare, so the tarball is cached; it is
+      # checked against the SHA-256 that ziglang.org/download/index.json publishes either way.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/zig.tar.xz
+          key: zig-x86_64-linux-0.16.0
+      - run: |
+          [ -f ~/zig.tar.xz ] || curl -fsSL --proto '=https' -o ~/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $HOME/zig.tar.xz" | sha256sum -c -
+          mkdir -p ~/zig && tar -xJf ~/zig.tar.xz -C ~/zig --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+      - run: zig fmt --check .
+      - run: zig build test --summary all
+      - run: zig build test -Doptimize=ReleaseSafe --summary all
