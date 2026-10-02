@@ -21,14 +21,24 @@ Only the files that do not depend on key generation are kept:
 The collection's `intermediate/`, `unluckysample/` and accumulated vectors were generated
 in December 2023 against FIPS 203 ipd (with the A-hat index fix) and do not include the
 domain separator byte that the final standard added to K-PKE.KeyGen (`G(d || k)`). They
-cannot match a final-standard implementation. This was confirmed on 2026-09-05: with the
-byte removed in a throwaway copy of the crate, all 15 CCTV tests passed, including the
-10 000 accumulated vectors for every parameter set, while the ACVP key-generation tests
-failed; with the byte present the reverse holds.
+cannot match a final-standard implementation. This was confirmed on 2026-09-05 with an
+implementation of the final standard: with the byte removed, all 15 CCTV tests passed,
+including the 10 000 accumulated vectors for every parameter set, while the ACVP
+key-generation tests failed; with the byte present the reverse holds.
 
 ## Accumulated randomized test
 
-`tests/accumulated.rs` follows `TestAccumulated` from Go's `crypto/mlkem`
-(src/crypto/mlkem/mlkem_test.go), an independent implementation of the final standard,
-and uses its published hashes for ML-KEM-768 after 100 and 10 000 iterations. No
-independent final-standard hashes are published for ML-KEM-512 and ML-KEM-1024.
+Go's `crypto/mlkem`, an independent implementation of the final standard, publishes
+accumulated hashes for ML-KEM-768 (`TestAccumulated` in src/crypto/mlkem/mlkem_test.go).
+Every implementation here runs the same procedure and must reproduce them:
+
+- A SHAKE-128 stream with empty input supplies, per iteration, the 64-byte key seed
+  (`d || z`), a 32-byte encapsulation seed and a ciphertext-sized random string.
+- The encapsulation key, the ciphertext, the shared secret, and the implicit-rejection secret
+  of the random ciphertext are absorbed, in that order, into a second SHAKE-128.
+- The first 32 bytes of that second SHAKE-128's output, read from a copy so the absorbing
+  continues, must equal:
+  - after 100 iterations: `1114b1b6699ed191734fa339376afa7e285c9e6acf6ff0177d346696ce564415`
+  - after 10 000 iterations: `8a518cc63da366322a8e7a818c7a0d63483cb3528d34a4cf42f35d5ad73f22fc`
+
+No independent final-standard hashes are published for ML-KEM-512 and ML-KEM-1024.

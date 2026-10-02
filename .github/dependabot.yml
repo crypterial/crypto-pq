@@ -1,16 +1,7 @@
-# Keeps the pinned action commits and the Cargo dependencies current; each bump arrives as a
-# pull request that CI checks. Major Cargo bumps change APIs (digest, rand_core), so they are
-# done by hand, not by the bot.
+# Keeps the pinned GitHub action commits current. There are no package dependencies to update.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
-  - package-ecosystem: cargo
-    directory: /
-    schedule:
-      interval: weekly
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
