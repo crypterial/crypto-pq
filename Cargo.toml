@@ -6,7 +6,7 @@ members = ["crates/*"]
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/crypto-pq/crypto-pq"
+repository = "https://github.com/crypterial/crypto-pq"
 authors = ["Wilson Tran"]
 
 [profile.release]

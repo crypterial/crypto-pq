@@ -1,6 +1,6 @@
 [package]
 name = "crypto-pq"
-version = "0.1.0"
+version = "0.1.1"
 description = "Post-quantum cryptography: one crate per algorithm, re-exported here behind features"
 readme = "../../README.md"
 homepage = "https://crypterial.com"
@@ -17,7 +17,7 @@ default = ["ml-kem"]
 ml-kem = ["dep:crypto-pq-ml-kem"]
 
 [dependencies]
-crypto-pq-ml-kem = { version = "0.1.0", path = "../ml-kem", optional = true }
+crypto-pq-ml-kem = { version = "0.1.1", path = "../ml-kem", optional = true }
 
 [dev-dependencies]
 rand_core = { version = "0.9", default-features = false }

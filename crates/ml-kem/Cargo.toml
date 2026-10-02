@@ -1,6 +1,6 @@
 [package]
 name = "crypto-pq-ml-kem"
-version = "0.1.0"
+version = "0.1.1"
 description = "ML-KEM (FIPS 203) key encapsulation in pure Rust, no_std, no unsafe"
 readme = "README.md"
 homepage = "https://crypterial.com"

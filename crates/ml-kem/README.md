@@ -1,5 +1,11 @@
 # crypto-pq-ml-kem
 
+> **Withdrawn prototype.** Versions 0.1.x were an early prototype. They were never reviewed by
+> a cryptographer, and they depend on third-party crates, which this project no longer allows.
+> Every 0.1.x release is yanked from crates.io: do not use them. crypto-pq is being redesigned
+> from scratch, with no external dependencies and only standardized algorithms. Progress:
+> [crypterial.com](https://crypterial.com). The rest of this page describes the prototype.
+
 ML-KEM (FIPS 203) in pure Rust. `no_std`, no allocator, no `unsafe`.
 
 Parameter sets: `ml_kem_512`, `ml_kem_768`, `ml_kem_1024`, all with the same API.
