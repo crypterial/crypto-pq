@@ -43,6 +43,20 @@ pub fn build(b: *std.Build) void {
             }),
         }));
     }
+
+    const bench = b.addRunArtifact(b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "crypto_pq", .module = crypto_pq }},
+        }),
+    }));
+
+    if (b.args) |args| bench.addArgs(args);
+
+    b.step("bench", "Run the benchmarks; an argument selects the cases whose names contain it").dependOn(&bench.step);
 }
 
 fn run(b: *std.Build, step: *std.Build.Step, artifact: *std.Build.Step.Compile) void {

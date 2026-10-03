@@ -106,7 +106,9 @@ pub const SignatureAlgorithm = struct {
 
         if (key.len != publicKeySize(self.kind)) return if (format == .raw) error.InvalidLength else error.InvalidEncoding;
 
-        var public_key: SignaturePublicKey = .{ .algorithm = self, .bytes = @splat(0) };
+        var public_key: SignaturePublicKey = .{ .algorithm = self, .bytes = undefined };
+
+        ct.wipe(&public_key.bytes);
 
         @memcpy(public_key.bytes[0..key.len], key);
 
@@ -354,7 +356,11 @@ fn deterministicRandomness(key: *const SignaturePrivateKey) []const u8 {
 }
 
 fn empty(algorithm: SignatureAlgorithm) SignaturePrivateKey {
-    return .{ .algorithm = algorithm, .seed = @splat(0), .has_seed = false, .secret_bytes = @splat(0), .public = @splat(0) };
+    var key: SignaturePrivateKey = .{ .algorithm = algorithm, .seed = undefined, .has_seed = false, .secret_bytes = undefined, .public = undefined };
+
+    inline for (.{ &key.seed, &key.secret_bytes, &key.public }) |buffer| ct.wipe(buffer);
+
+    return key;
 }
 
 pub fn fromSeed(algorithm: SignatureAlgorithm, seed: []const u8) SignaturePrivateKey {

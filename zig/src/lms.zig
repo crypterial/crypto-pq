@@ -5,6 +5,7 @@ const hash = @import("hash.zig");
 const merkle = @import("merkle.zig");
 const primitives = @import("primitives.zig");
 const sha2 = @import("sha2.zig");
+const vec = @import("vector.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -307,6 +308,23 @@ fn otsSign(t: OtsType, i_value: *const [16]u8, q: u32, seed: []const u8, message
 
     digits(t, q_hash[0..n], &a);
 
+    if (!t.shake) {
+        const values = out[4 + n ..][0 .. t.p() * n];
+
+        const zeros: [max_p]u32 = @splat(0);
+
+        switch (n) {
+            inline 24, 32 => |size| {
+                Lanes(max_lanes).derive(size / 4, i_value, q, seed, t.p(), values);
+
+                Lanes(max_lanes).chains(size / 4, i_value, q, zeros[0..t.p()], a[0..t.p()], values);
+            },
+            else => unreachable,
+        }
+
+        return;
+    }
+
     for (a[0..t.p()], 0..) |digit, j| {
         const y = out[4 + n * (j + 1) ..][0..n];
 
@@ -335,6 +353,25 @@ fn otsCandidate(t: OtsType, i_value: *const [16]u8, q: u32, signature: []const u
     var stream = h.start();
 
     for ([_][]const u8{ i_value, &u32Bytes(q), &d_pblc }) |part| stream.update(part);
+
+    if (!t.shake) {
+        var values: [max_p * max_n]u8 = undefined;
+
+        @memcpy(values[0 .. t.p() * n], signature[4 + n ..][0 .. t.p() * n]);
+
+        const ends: [max_p]u32 = @splat((@as(u32, 1) << t.w) - 1);
+
+        switch (n) {
+            inline 24, 32 => |size| Lanes(max_lanes).chains(size / 4, i_value, q, a[0..t.p()], ends[0..t.p()], values[0 .. t.p() * n]),
+            else => unreachable,
+        }
+
+        stream.update(values[0 .. t.p() * n]);
+
+        stream.finish(out[0..n]);
+
+        return;
+    }
 
     for (a[0..t.p()], 0..) |digit, j| {
         var z: [max_n]u8 = undefined;
@@ -453,6 +490,271 @@ pub fn hssVerify(public_key: []const u8, message: []const u8, signature: []const
     return lmsVerify(key, message, signature[offset..]);
 }
 
+// Independent SHA-256 computations run side by side in the lanes of vectors.
+const max_lanes = 8;
+
+// SHA-256 of L hashes at once: lane l of every vector belongs to the l-th. Values are kept as
+// big-endian 32-bit words. Every hash starts with I || u32: a chain step or seed derivation then
+// puts its value at byte offset 23, the public key and leaf hashes put theirs at offset 22, so
+// the value words are split across two block words.
+fn Lanes(comptime L: usize) type {
+    return struct {
+        const V = @Vector(L, u32);
+
+        fn splat(value: u32) V {
+            return @splat(value);
+        }
+
+        fn shl(x: V, comptime r: u5) V {
+            return x << @as(@Vector(L, u5), @splat(r));
+        }
+
+        fn shr(x: V, comptime r: u5) V {
+            return x >> @as(@Vector(L, u5), @splat(r));
+        }
+
+        fn words(bytes: []const u8, out: []V) void {
+            for (out, 0..) |*word, i| word.* = splat(std.mem.readInt(u32, bytes[4 * i ..][0..4], .big));
+        }
+
+        fn initial() [8]V {
+            var state: [8]V = undefined;
+
+            for (&state, sha2.iv_256) |*word, value| word.* = @splat(value);
+
+            return state;
+        }
+
+        // H(I || u32(q) || u16(j) || u8(k) || x) on m-word values: a chain step, or a seed
+        // derivation with k = 0xff.
+        fn step(comptime m: usize, i_words: *const [4]V, q: V, j: V, k: V, x: *const [m]V, out: *[m]V) void {
+            var block: [16]V = undefined;
+
+            defer ct.wipe(std.mem.asBytes(&block));
+
+            block[0..4].* = i_words.*;
+
+            block[4] = q;
+
+            block[5] = shl(j, 16) | shl(k, 8) | shr(x[0], 24);
+
+            inline for (1..m) |i| {
+                block[5 + i] = shl(x[i - 1], 8) | shr(x[i], 24);
+            }
+
+            block[5 + m] = shl(x[m - 1], 8) | splat(0x80);
+
+            inline for (6 + m..15) |i| {
+                block[i] = splat(0);
+            }
+
+            block[15] = splat((23 + 4 * m) * 8);
+
+            var state = initial();
+
+            defer ct.wipe(std.mem.asBytes(&state));
+
+            sha2.rounds256(V, &state, &block);
+
+            out.* = state[0..m].*;
+        }
+
+        // H(I || u32(r) || D_LEAF || K).
+        fn leafHash(comptime m: usize, i_words: *const [4]V, r: V, key: *const [m]V, out: *[m]V) void {
+            var block: [16]V = undefined;
+
+            block[0..4].* = i_words.*;
+
+            block[4] = r;
+
+            block[5] = splat(@as(u32, std.mem.readInt(u16, &d_leaf, .big)) << 16) | shr(key[0], 16);
+
+            inline for (1..m) |i| {
+                block[5 + i] = shl(key[i - 1], 16) | shr(key[i], 16);
+            }
+
+            block[5 + m] = shl(key[m - 1], 16) | splat(0x8000);
+
+            inline for (6 + m..15) |i| {
+                block[i] = splat(0);
+            }
+
+            block[15] = splat((22 + 4 * m) * 8);
+
+            var state = initial();
+
+            sha2.rounds256(V, &state, &block);
+
+            out.* = state[0..m].*;
+        }
+
+        // K = H(I || u32(q) || D_PBLC || y_0 || ... || y_(p-1)), fed one chain end at a time.
+        const KeyStream = struct {
+            state: [8]V,
+            block: [16]V,
+            count: usize,
+            carry: V,
+            bytes: usize,
+
+            fn init(i_words: *const [4]V, q: V) KeyStream {
+                var self: KeyStream = .{ .state = initial(), .block = undefined, .count = 5, .carry = splat(@as(u32, std.mem.readInt(u16, &d_pblc, .big)) << 16), .bytes = 22 };
+
+                self.block[0..4].* = i_words.*;
+
+                self.block[4] = q;
+
+                return self;
+            }
+
+            fn push(self: *KeyStream, word: V) void {
+                self.block[self.count] = word;
+
+                self.count += 1;
+
+                if (self.count == 16) {
+                    sha2.rounds256(V, &self.state, &self.block);
+
+                    self.count = 0;
+                }
+            }
+
+            fn absorb(self: *KeyStream, value: []const V) void {
+                for (value) |word| {
+                    self.push(self.carry | shr(word, 16));
+
+                    self.carry = shl(word, 16);
+                }
+
+                self.bytes += 4 * value.len;
+            }
+
+            // The bit length fills the last two words of a block.
+            fn finish(self: *KeyStream, out: []V) void {
+                self.push(self.carry | splat(0x8000));
+
+                if (self.count > 16 - 2) {
+                    @memset(self.block[self.count..], splat(0));
+
+                    sha2.rounds256(V, &self.state, &self.block);
+
+                    self.count = 0;
+                }
+
+                @memset(self.block[self.count..15], splat(0));
+
+                self.block[15] = splat(@intCast(self.bytes * 8));
+
+                sha2.rounds256(V, &self.state, &self.block);
+
+                @memcpy(out, self.state[0..out.len]);
+            }
+        };
+
+        fn scatter(value: []const V, out: []u8) void {
+            for (value, 0..) |word, w| {
+                const values: [L]u32 = word;
+
+                for (0..out.len / (4 * value.len)) |l| std.mem.writeInt(u32, out[4 * (l * value.len + w) ..][0..4], values[l], .big);
+            }
+        }
+
+        // The leaves of key pairs first .. first + out.len / n - 1, one per lane.
+        fn leaves(comptime m: usize, context: *const TreeContext, first: u32, out: []u8) void {
+            const ots = context.level.ots;
+
+            var i_words: [4]V = undefined;
+
+            words(&context.i_value, &i_words);
+
+            const q = std.simd.iota(u32, L) + splat(first);
+
+            var seed: [m]V = undefined;
+
+            var y: [m]V = undefined;
+
+            defer {
+                ct.wipe(std.mem.asBytes(&seed));
+
+                ct.wipe(std.mem.asBytes(&y));
+            }
+
+            words(context.seed[0 .. 4 * m], &seed);
+
+            var stream: KeyStream = .init(&i_words, q);
+
+            for (0..ots.p()) |j| {
+                step(m, &i_words, q, splat(@intCast(j)), splat(0xff), &seed, &y);
+
+                for (0..(@as(usize, 1) << ots.w) - 1) |k| step(m, &i_words, q, splat(@intCast(j)), splat(@intCast(k)), &y, &y);
+
+                stream.absorb(&y);
+            }
+
+            var key: [m]V = undefined;
+
+            stream.finish(&key);
+
+            var leaf: [m]V = undefined;
+
+            leafHash(m, &i_words, q + splat(@as(u32, 1) << @intCast(context.level.lms.h)), &key, &leaf);
+
+            scatter(&leaf, out);
+        }
+
+        // Runs chain j of key pair q from step starts[j] to ends[j] on the values in place.
+        fn chains(comptime m: usize, i_value: *const [16]u8, q: u32, starts: []const u32, ends: []const u32, values: []u8) void {
+            var i_words: [4]V = undefined;
+
+            words(i_value, &i_words);
+
+            var lanes: vec.ChainLanes(L, m) = .init(starts, ends, values);
+
+            var value: [m]V = undefined;
+
+            defer {
+                lanes.wipe();
+
+                ct.wipe(std.mem.asBytes(&value));
+            }
+
+            while (lanes.running > 0) {
+                value = lanes.current();
+
+                step(m, &i_words, splat(q), lanes.chain, lanes.step, &value, &value);
+
+                lanes.advance(&value);
+            }
+        }
+
+        // The starting values of all p chains: x_j = H(I || u32(q) || u16(j) || 0xff || SEED).
+        fn derive(comptime m: usize, i_value: *const [16]u8, q: u32, seed: []const u8, p: usize, out: []u8) void {
+            var i_words: [4]V = undefined;
+
+            words(i_value, &i_words);
+
+            var seed_words: [m]V = undefined;
+
+            var x: [m]V = undefined;
+
+            defer {
+                ct.wipe(std.mem.asBytes(&seed_words));
+
+                ct.wipe(std.mem.asBytes(&x));
+            }
+
+            words(seed[0 .. 4 * m], &seed_words);
+
+            var j: usize = 0;
+
+            while (j < p) : (j += L) {
+                step(m, &i_words, splat(q), std.simd.iota(u32, L) + splat(@intCast(j)), splat(0xff), &seed_words, &x);
+
+                scatter(&x, out[j * 4 * m ..][0 .. @as(usize, @min(L, p - j)) * 4 * m]);
+            }
+        }
+    };
+}
+
 const TreeContext = struct {
     level: Level,
     i_value: [16]u8,
@@ -470,6 +772,23 @@ const TreeContext = struct {
         otsPublicKey(self.level.ots, &self.i_value, @intCast(index), self.seed[0..lms.m], &k);
 
         self.hasher().digest(&.{ &self.i_value, &u32Bytes(@intCast((@as(u64, 1) << lms.h) + index)), &d_leaf, k[0..lms.m] }, out);
+    }
+
+    pub const lanes = max_lanes;
+
+    pub fn leaves(self: *const TreeContext, first: u64, out: []u8) void {
+        const n = self.level.lms.m;
+
+        if (self.level.lms.shake) {
+            for (0..out.len / n) |i| self.leaf(first + i, out[i * n ..][0..n]);
+
+            return;
+        }
+
+        switch (n) {
+            inline 24, 32 => |size| Lanes(max_lanes).leaves(size / 4, self, @intCast(first), out),
+            else => unreachable,
+        }
     }
 
     pub fn combine(self: *const TreeContext, z: u32, j: u64, left: []const u8, right: []const u8, out: []u8) void {

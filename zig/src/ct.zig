@@ -33,7 +33,29 @@ pub fn select(mask: u8, when_set: []const u8, otherwise: []const u8, out: []u8) 
 }
 
 // Volatile writes survive dead-store elimination, so secrets are gone even when the memory is
-// never read again.
+// never read again. They are 16 bytes wide: a memset of more than a few hundred bytes becomes a
+// call to the runtime's memset, which writes one byte at a time, so this also zeroes large
+// buffers that hold nothing secret.
 pub fn wipe(bytes: []u8) void {
-    @memset(@as([]volatile u8, bytes), 0);
+    var rest = bytes;
+
+    while (rest.len >= 16) : (rest = rest[16..]) {
+        const chunk: *align(1) volatile @Vector(2, u64) = @ptrCast(rest.ptr);
+
+        chunk.* = @splat(0);
+    }
+
+    if (rest.len >= 8) {
+        const word: *align(1) volatile u64 = @ptrCast(rest.ptr);
+
+        word.* = 0;
+
+        rest = rest[8..];
+    }
+
+    for (rest) |*byte| {
+        const target: *volatile u8 = byte;
+
+        target.* = 0;
+    }
 }

@@ -63,137 +63,116 @@ pub const iv_512_256 = [8]u64{
 pub fn compress256(state: *[8]u32, block: *const [64]u8) void {
     var w: [16]u32 = undefined;
 
-    for (0..16) |t| {
-        w[t] = std.mem.readInt(u32, block[4 * t ..][0..4], .big);
+    for (&w, 0..) |*word, t| {
+        word.* = std.mem.readInt(u32, block[4 * t ..][0..4], .big);
     }
 
-    var a = state[0];
-
-    var b = state[1];
-
-    var c = state[2];
-
-    var d = state[3];
-
-    var e = state[4];
-
-    var f = state[5];
-
-    var g = state[6];
-
-    var h = state[7];
-
-    // The schedule keeps its last 16 words: word t lives at t % 16, so t - 15, t - 7 and t - 2
-    // are at (t + 1) % 16, (t + 9) % 16 and (t + 14) % 16, and t - 16 is the slot it replaces.
-    for (k256, 0..) |k, t| {
-        if (t >= 16) {
-            const x = w[(t + 1) % 16];
-
-            const y = w[(t + 14) % 16];
-
-            const s0 = std.math.rotr(u32, x, 7) ^ std.math.rotr(u32, x, 18) ^ (x >> 3);
-
-            const s1 = std.math.rotr(u32, y, 17) ^ std.math.rotr(u32, y, 19) ^ (y >> 10);
-
-            w[t % 16] = w[t % 16] +% s0 +% w[(t + 9) % 16] +% s1;
-        }
-
-        const s1 = std.math.rotr(u32, e, 6) ^ std.math.rotr(u32, e, 11) ^ std.math.rotr(u32, e, 25);
-
-        const t1 = h +% s1 +% ((e & f) ^ (~e & g)) +% k +% w[t % 16];
-
-        const s0 = std.math.rotr(u32, a, 2) ^ std.math.rotr(u32, a, 13) ^ std.math.rotr(u32, a, 22);
-
-        const t2 = s0 +% ((a & b) ^ (a & c) ^ (b & c));
-
-        h = g;
-
-        g = f;
-
-        f = e;
-
-        e = d +% t1;
-
-        d = c;
-
-        c = b;
-
-        b = a;
-
-        a = t1 +% t2;
-    }
-
-    for (state, [8]u32{ a, b, c, d, e, f, g, h }) |*word, value| {
-        word.* +%= value;
-    }
+    rounds256(u32, state, &w);
 }
 
 pub fn compress512(state: *[8]u64, block: *const [128]u8) void {
     var w: [16]u64 = undefined;
 
-    for (0..16) |t| {
-        w[t] = std.mem.readInt(u64, block[8 * t ..][0..8], .big);
+    for (&w, 0..) |*word, t| {
+        word.* = std.mem.readInt(u64, block[8 * t ..][0..8], .big);
     }
 
-    var a = state[0];
+    rounds512(u64, state, &w);
+}
 
-    var b = state[1];
+fn broadcast(comptime W: type, value: anytype) W {
+    return if (@typeInfo(W) == .vector) @splat(value) else value;
+}
 
-    var c = state[2];
+fn shr(comptime W: type, x: W, comptime r: comptime_int) W {
+    if (@typeInfo(W) != .vector) return x >> r;
 
-    var d = state[3];
+    const vector = @typeInfo(W).vector;
 
-    var e = state[4];
+    return x >> @as(@Vector(vector.len, std.math.Log2Int(vector.child)), @splat(r));
+}
 
-    var f = state[5];
+// The rounds run on words of type u32, or u64 for SHA-512, or on vectors of them that carry
+// independent computations in their lanes. Fully unrolled, the eight working variables rotate by
+// renaming instead of moving: at round t, variable i lives in slot (i - t) mod 8. The schedule
+// keeps its last 16 words: word t lives at t % 16, so t - 15, t - 7 and t - 2 are at (t + 1) % 16,
+// (t + 9) % 16 and (t + 14) % 16, and t - 16 is the slot it replaces.
+pub fn rounds256(comptime W: type, state: *[8]W, words: *const [16]W) void {
+    var w = words.*;
 
-    var g = state[6];
+    var v = state.*;
 
-    var h = state[7];
-
-    // The schedule keeps its last 16 words: word t lives at t % 16, so t - 15, t - 7 and t - 2
-    // are at (t + 1) % 16, (t + 9) % 16 and (t + 14) % 16, and t - 16 is the slot it replaces.
-    for (k512, 0..) |k, t| {
+    inline for (k256, 0..) |k, t| {
         if (t >= 16) {
             const x = w[(t + 1) % 16];
 
             const y = w[(t + 14) % 16];
 
-            const s0 = std.math.rotr(u64, x, 1) ^ std.math.rotr(u64, x, 8) ^ (x >> 7);
+            const s0 = std.math.rotr(W, x, 7) ^ std.math.rotr(W, x, 18) ^ shr(W, x, 3);
 
-            const s1 = std.math.rotr(u64, y, 19) ^ std.math.rotr(u64, y, 61) ^ (y >> 6);
+            const s1 = std.math.rotr(W, y, 17) ^ std.math.rotr(W, y, 19) ^ shr(W, y, 10);
 
             w[t % 16] = w[t % 16] +% s0 +% w[(t + 9) % 16] +% s1;
         }
 
-        const s1 = std.math.rotr(u64, e, 14) ^ std.math.rotr(u64, e, 18) ^ std.math.rotr(u64, e, 41);
-
-        const t1 = h +% s1 +% ((e & f) ^ (~e & g)) +% k +% w[t % 16];
-
-        const s0 = std.math.rotr(u64, a, 28) ^ std.math.rotr(u64, a, 34) ^ std.math.rotr(u64, a, 39);
-
-        const t2 = s0 +% ((a & b) ^ (a & c) ^ (b & c));
-
-        h = g;
-
-        g = f;
-
-        f = e;
-
-        e = d +% t1;
-
-        d = c;
-
-        c = b;
-
-        b = a;
-
-        a = t1 +% t2;
+        round(W, &v, t, broadcast(W, k) +% w[t % 16], .{ 6, 11, 25, 2, 13, 22 });
     }
 
-    for (state, [8]u64{ a, b, c, d, e, f, g, h }) |*word, value| {
+    inline for (state, v) |*word, value| {
         word.* +%= value;
     }
+}
+
+pub fn rounds512(comptime W: type, state: *[8]W, words: *const [16]W) void {
+    @setEvalBranchQuota(4000);
+
+    var w = words.*;
+
+    var v = state.*;
+
+    inline for (k512, 0..) |k, t| {
+        if (t >= 16) {
+            const x = w[(t + 1) % 16];
+
+            const y = w[(t + 14) % 16];
+
+            const s0 = std.math.rotr(W, x, 1) ^ std.math.rotr(W, x, 8) ^ shr(W, x, 7);
+
+            const s1 = std.math.rotr(W, y, 19) ^ std.math.rotr(W, y, 61) ^ shr(W, y, 6);
+
+            w[t % 16] = w[t % 16] +% s0 +% w[(t + 9) % 16] +% s1;
+        }
+
+        round(W, &v, t, broadcast(W, k) +% w[t % 16], .{ 14, 18, 41, 28, 34, 39 });
+    }
+
+    inline for (state, v) |*word, value| {
+        word.* +%= value;
+    }
+}
+
+inline fn round(comptime W: type, v: *[8]W, comptime t: usize, kw: W, comptime r: [6]comptime_int) void {
+    const a = v[(8 - t % 8) % 8];
+
+    const b = v[(9 - t % 8) % 8];
+
+    const c = v[(10 - t % 8) % 8];
+
+    const e = v[(12 - t % 8) % 8];
+
+    const f = v[(13 - t % 8) % 8];
+
+    const g = v[(14 - t % 8) % 8];
+
+    const s1 = std.math.rotr(W, e, r[0]) ^ std.math.rotr(W, e, r[1]) ^ std.math.rotr(W, e, r[2]);
+
+    const t1 = v[(15 - t % 8) % 8] +% s1 +% (((f ^ g) & e) ^ g) +% kw;
+
+    const s0 = std.math.rotr(W, a, r[3]) ^ std.math.rotr(W, a, r[4]) ^ std.math.rotr(W, a, r[5]);
+
+    v[(11 - t % 8) % 8] +%= t1;
+
+    v[(15 - t % 8) % 8] = t1 +% s0 +% (((a ^ b) & c) ^ (a & b));
 }
 
 fn Sha2(comptime Word: type, comptime block_size: usize, comptime compress: fn (*[8]Word, *const [block_size]u8) void) type {

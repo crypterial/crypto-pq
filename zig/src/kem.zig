@@ -70,7 +70,9 @@ pub const KemAlgorithm = struct {
 
         if (!checkPublicKey(self.kind, key)) return error.InvalidPublicKey;
 
-        var public_key: KemPublicKey = .{ .algorithm = self, .bytes = @splat(0) };
+        var public_key: KemPublicKey = .{ .algorithm = self, .bytes = undefined };
+
+        ct.wipe(&public_key.bytes);
 
         @memcpy(public_key.bytes[0..key.len], key);
 
@@ -257,7 +259,11 @@ fn checkPublicKey(kind: KemAlgorithm.Kind, key: []const u8) bool {
 }
 
 fn empty(algorithm: KemAlgorithm) KemPrivateKey {
-    return .{ .algorithm = algorithm, .seed = @splat(0), .has_seed = false, .dk = @splat(0), .scalar = @splat(0), .public = @splat(0) };
+    var key: KemPrivateKey = .{ .algorithm = algorithm, .seed = undefined, .has_seed = false, .dk = undefined, .scalar = undefined, .public = undefined };
+
+    inline for (.{ &key.seed, &key.dk, &key.scalar, &key.public }) |buffer| ct.wipe(buffer);
+
+    return key;
 }
 
 // `seed` has the length of the algorithm's seed: d || z for ML-KEM, 32 bytes for X-Wing.
@@ -303,7 +309,9 @@ fn fromExpanded(algorithm: KemAlgorithm, dk: []const u8) Error!KemPrivateKey {
 
 // `randomness` has the algorithm's length: m for ML-KEM, the 64-byte eseed for X-Wing.
 pub fn encapsulateWith(public_key: *const KemPublicKey, randomness: []const u8) Encapsulation {
-    var encapsulation: Encapsulation = .{ .shared_secret = undefined, .ciphertext_buffer = @splat(0), .ciphertext_size = 0 };
+    var encapsulation: Encapsulation = .{ .shared_secret = undefined, .ciphertext_buffer = undefined, .ciphertext_size = 0 };
+
+    ct.wipe(&encapsulation.ciphertext_buffer);
 
     switch (public_key.algorithm.kind) {
         inline .ml_kem_512, .ml_kem_768, .ml_kem_1024 => |kind| {

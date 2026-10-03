@@ -5,6 +5,7 @@ const hash = @import("hash.zig");
 const merkle = @import("merkle.zig");
 const primitives = @import("primitives.zig");
 const sha2 = @import("sha2.zig");
+const vec = @import("vector.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -311,10 +312,17 @@ const Hashes = struct {
         setWord(adrs, 5, 0);
 
         while (count > 1) {
-            for (0..count / 2) |i| {
-                setWord(adrs, 6, @intCast(i));
+            if (!self.p.shake and count / 2 >= 3) {
+                switch (n) {
+                    inline 24, 32 => |size| Lanes(max_lanes, size / 4).ltreeLevel(self, adrs, count, values),
+                    else => unreachable,
+                }
+            } else {
+                for (0..count / 2) |i| {
+                    setWord(adrs, 6, @intCast(i));
 
-                self.randHash(values[2 * i * n ..][0..n], values[(2 * i + 1) * n ..][0..n], adrs, values[i * n ..][0..n]);
+                    self.randHash(values[2 * i * n ..][0..n], values[(2 * i + 1) * n ..][0..n], adrs, values[i * n ..][0..n]);
+                }
             }
 
             if (count % 2 == 1) @memcpy(values[count / 2 * n ..][0..n], values[(count - 1) * n ..][0..n]);
@@ -354,6 +362,342 @@ const Hashes = struct {
     }
 };
 
+// Independent SHA-256 computations run side by side in the lanes of vectors.
+const max_lanes = 8;
+
+// SHA-256 of L hashes at once, lane l of every vector belonging to the l-th, for SHA2 parameter
+// sets with m-word values. Every input is a sequence of whole 32-bit words: the padded prefix,
+// the key, the address words and the values.
+fn Lanes(comptime L: usize, comptime m: usize) type {
+    return struct {
+        const V = @Vector(L, u32);
+
+        const Value = [m]V;
+
+        // With n = 32 the 32-byte prefix and the key fill a block, so the PRF keys are hashed once.
+        const wide = m == 8;
+
+        fn splat(value: u32) V {
+            return @splat(value);
+        }
+
+        fn words(bytes: []const u8, out: []V) void {
+            for (out, 0..) |*word, i| word.* = splat(std.mem.readInt(u32, bytes[4 * i ..][0..4], .big));
+        }
+
+        fn broadcast(state: *const [8]u32) [8]V {
+            var out: [8]V = undefined;
+
+            for (&out, state) |*word, value| word.* = @splat(value);
+
+            return out;
+        }
+
+        // SHA-256 of `count` message words that follow `prefix_blocks` blocks already absorbed into
+        // `start`; the padding word and the two length words round it up to whole blocks.
+        fn digest(comptime count: usize, comptime prefix_blocks: usize, start: *const [8]V, message: *const [count]V, out: *Value) void {
+            const blocks = (count + 18) / 16;
+
+            var buffer: [16 * blocks]V = undefined;
+
+            defer ct.wipe(std.mem.asBytes(&buffer));
+
+            buffer[0..count].* = message.*;
+
+            buffer[count] = splat(0x80000000);
+
+            inline for (count + 1..16 * blocks - 1) |i| {
+                buffer[i] = splat(0);
+            }
+
+            buffer[16 * blocks - 1] = splat((64 * prefix_blocks + 4 * count) * 8);
+
+            var state = start.*;
+
+            defer ct.wipe(std.mem.asBytes(&state));
+
+            inline for (0..blocks) |b| {
+                sha2.rounds256(V, &state, buffer[16 * b ..][0..16]);
+            }
+
+            out.* = state[0..m].*;
+        }
+
+        // The seeds of one key as words, and with n = 32 the states after their first block.
+        const Keys = struct {
+            pub_seed: Value,
+            sk_seed: Value,
+            prf_state: [8]V,
+            keygen_state: [8]V,
+
+            fn init(hashes: *const Hashes) Keys {
+                var self: Keys = .{ .pub_seed = undefined, .sk_seed = undefined, .prf_state = broadcast(&sha2.iv_256), .keygen_state = broadcast(&sha2.iv_256) };
+
+                words(&hashes.pub_seed, &self.pub_seed);
+
+                words(&hashes.sk_seed, &self.sk_seed);
+
+                if (wide) {
+                    self.prf_state = broadcast(&hashes.prf_state.?);
+
+                    self.keygen_state = broadcast(&hashes.keygen_state.?);
+                }
+
+                return self;
+            }
+
+            fn wipe(self: *Keys) void {
+                ct.wipe(std.mem.asBytes(&self.sk_seed));
+
+                ct.wipe(std.mem.asBytes(&self.keygen_state));
+            }
+        };
+
+        fn prf(keys: *const Keys, adrs: *const [8]V, out: *Value) void {
+            if (wide) return digest(8, 1, &keys.prf_state, adrs, out);
+
+            const message = [1]V{splat(prf_prefix)} ++ keys.pub_seed ++ adrs.*;
+
+            digest(message.len, 0, &keys.prf_state, &message, out);
+        }
+
+        fn prfKeygen(keys: *const Keys, adrs: *const [8]V, out: *Value) void {
+            if (wide) {
+                const message = keys.pub_seed ++ adrs.*;
+
+                return digest(message.len, 1, &keys.keygen_state, &message, out);
+            }
+
+            var message = [1]V{splat(prf_keygen_prefix)} ++ keys.sk_seed ++ keys.pub_seed ++ adrs.*;
+
+            defer ct.wipe(std.mem.asBytes(&message));
+
+            digest(message.len, 0, &keys.keygen_state, &message, out);
+        }
+
+        fn prefix(comptime value: u32) [if (wide) 8 else 1]V {
+            var out: [if (wide) 8 else 1]V = @splat(splat(0));
+
+            out[out.len - 1] = splat(value);
+
+            return out;
+        }
+
+        // F(KEY, M ^ BM) for a chain step.
+        fn step(keys: *const Keys, adrs: *[8]V, value: *Value) void {
+            var key: Value = undefined;
+
+            var mask: Value = undefined;
+
+            adrs[7] = splat(0);
+
+            prf(keys, adrs, &key);
+
+            adrs[7] = splat(1);
+
+            prf(keys, adrs, &mask);
+
+            for (&mask, value) |*word, x| word.* ^= x;
+
+            var message = prefix(f_prefix) ++ key ++ mask;
+
+            defer ct.wipe(std.mem.asBytes(&message));
+
+            ct.wipe(std.mem.asBytes(&mask));
+
+            digest(message.len, 0, &broadcast(&sha2.iv_256), &message, value);
+        }
+
+        fn randHash(keys: *const Keys, adrs: *[8]V, left: *const Value, right: *const Value, out: *Value) void {
+            var key: Value = undefined;
+
+            var masks: [2]Value = undefined;
+
+            adrs[7] = splat(0);
+
+            prf(keys, adrs, &key);
+
+            adrs[7] = splat(1);
+
+            prf(keys, adrs, &masks[0]);
+
+            adrs[7] = splat(2);
+
+            prf(keys, adrs, &masks[1]);
+
+            for (&masks[0], left) |*word, x| word.* ^= x;
+
+            for (&masks[1], right) |*word, x| word.* ^= x;
+
+            const message = prefix(h_prefix) ++ key ++ masks[0] ++ masks[1];
+
+            digest(message.len, 0, &broadcast(&sha2.iv_256), &message, out);
+        }
+
+        fn laneAddress(layer: u32, tree: u64, kind: u32, index: V) [8]V {
+            return .{ splat(layer), splat(@truncate(tree >> 32)), splat(@truncate(tree)), splat(kind), index, splat(0), splat(0), splat(0) };
+        }
+
+        fn gather(bytes: []const u8, lanes: usize, stride: usize, out: *Value) void {
+            var values: [m][L]u32 = @splat(@splat(0));
+
+            for (0..lanes) |l| {
+                for (0..m) |w| values[w][l] = std.mem.readInt(u32, bytes[l * stride + 4 * w ..][0..4], .big);
+            }
+
+            for (out, values) |*word, lane_values| word.* = lane_values;
+        }
+
+        fn scatter(value: *const Value, lanes: usize, stride: usize, out: []u8) void {
+            for (value, 0..) |word, w| {
+                const values: [L]u32 = word;
+
+                for (0..lanes) |l| std.mem.writeInt(u32, out[l * stride + 4 * w ..][0..4], values[l], .big);
+            }
+        }
+
+        // The leaves first .. first + out.len / n - 1 of a tree, one per lane: every WOTS chain
+        // in full, then the L-tree.
+        fn leaves(hashes: *const Hashes, layer: u32, tree: u64, first: u32, out: []u8) void {
+            var keys: Keys = .init(hashes);
+
+            defer keys.wipe();
+
+            const index = std.simd.iota(u32, L) + splat(first);
+
+            var values: [max_length]Value = undefined;
+
+            defer ct.wipe(std.mem.asBytes(&values));
+
+            const length = hashes.p.length();
+
+            var adrs = laneAddress(layer, tree, ots_address, index);
+
+            for (values[0..length], 0..) |*value, i| {
+                adrs[5] = splat(@intCast(i));
+
+                adrs[6] = splat(0);
+
+                adrs[7] = splat(0);
+
+                prfKeygen(&keys, &adrs, value);
+
+                for (0..15) |j| {
+                    adrs[6] = splat(@intCast(j));
+
+                    step(&keys, &adrs, value);
+                }
+            }
+
+            adrs = laneAddress(layer, tree, ltree_address, index);
+
+            var count = length;
+
+            while (count > 1) : (adrs[5] += splat(1)) {
+                for (0..count / 2) |i| {
+                    adrs[6] = splat(@intCast(i));
+
+                    randHash(&keys, &adrs, &values[2 * i], &values[2 * i + 1], &values[i]);
+                }
+
+                if (count % 2 == 1) values[count / 2] = values[count - 1];
+
+                count = (count + 1) / 2;
+            }
+
+            scatter(&values[0], out.len / (4 * m), 4 * m, out);
+        }
+
+        // Runs WOTS chain i of key pair `index` from step starts[i] to ends[i] on the values in
+        // place.
+        fn chains(hashes: *const Hashes, layer: u32, tree: u64, index: u32, starts: []const u32, ends: []const u32, values: []u8) void {
+            var keys: Keys = .init(hashes);
+
+            defer keys.wipe();
+
+            var lanes: vec.ChainLanes(L, m) = .init(starts, ends, values);
+
+            var value: Value = undefined;
+
+            defer {
+                lanes.wipe();
+
+                ct.wipe(std.mem.asBytes(&value));
+            }
+
+            var adrs = laneAddress(layer, tree, ots_address, splat(index));
+
+            while (lanes.running > 0) {
+                value = lanes.current();
+
+                adrs[5] = lanes.chain;
+
+                adrs[6] = lanes.step;
+
+                step(&keys, &adrs, &value);
+
+                lanes.advance(&value);
+            }
+        }
+
+        // The secret starting values of the WOTS chains of key pair `index`, one chain per lane.
+        fn secrets(hashes: *const Hashes, layer: u32, tree: u64, index: u32, out: []u8) void {
+            var keys: Keys = .init(hashes);
+
+            defer keys.wipe();
+
+            var value: Value = undefined;
+
+            defer ct.wipe(std.mem.asBytes(&value));
+
+            const length = out.len / (4 * m);
+
+            var adrs = laneAddress(layer, tree, ots_address, splat(index));
+
+            var i: usize = 0;
+
+            while (i < length) : (i += L) {
+                adrs[5] = std.simd.iota(u32, L) + splat(@intCast(i));
+
+                prfKeygen(&keys, &adrs, &value);
+
+                scatter(&value, @min(L, length - i), 4 * m, out[i * 4 * m ..]);
+            }
+        }
+
+        // One level of an L-tree: the pairs of `count` nodes in place, one pair per lane.
+        fn ltreeLevel(hashes: *const Hashes, adrs: *const Address, count: usize, values: []u8) void {
+            var keys: Keys = .init(hashes);
+
+            defer keys.wipe();
+
+            var lane_adrs: [8]V = undefined;
+
+            for (&lane_adrs, 0..) |*word, w| word.* = splat(getWord(adrs, w));
+
+            var i: usize = 0;
+
+            while (i < count / 2) : (i += L) {
+                const lanes = @min(L, count / 2 - i);
+
+                var left: Value = undefined;
+
+                var right: Value = undefined;
+
+                gather(values[2 * i * 4 * m ..], lanes, 8 * m, &left);
+
+                gather(values[(2 * i + 1) * 4 * m ..], lanes, 8 * m, &right);
+
+                lane_adrs[6] = std.simd.iota(u32, L) + splat(@intCast(i));
+
+                randHash(&keys, &lane_adrs, &left, &right, &left);
+
+                scatter(&left, lanes, 4 * m, values[i * 4 * m ..]);
+            }
+        }
+    };
+}
+
 fn wotsDigits(p: Parameters, message: []const u8, out: *[max_length]u32) void {
     var checksum: u32 = 0;
 
@@ -379,6 +723,23 @@ const TreeContext = struct {
 
     pub fn leaf(self: *const TreeContext, index: u64, out: []u8) void {
         self.hashes.leaf(self.layer, self.tree, @intCast(index), out);
+    }
+
+    pub const lanes = max_lanes;
+
+    pub fn leaves(self: *const TreeContext, first: u64, out: []u8) void {
+        const n = self.hashes.p.n;
+
+        if (self.hashes.p.shake) {
+            for (0..out.len / n) |i| self.leaf(first + i, out[i * n ..][0..n]);
+
+            return;
+        }
+
+        switch (n) {
+            inline 24, 32 => |size| Lanes(max_lanes, size / 4).leaves(self.hashes, self.layer, self.tree, @intCast(first), out),
+            else => unreachable,
+        }
     }
 
     pub fn combine(self: *const TreeContext, z: u32, j: u64, left: []const u8, right: []const u8, out: []u8) void {
@@ -468,10 +829,19 @@ pub fn verify(p: Parameters, public_key: []const u8, message: []const u8, signat
 
         @memcpy(values[0 .. p.length() * n], signature[offset..][0 .. p.length() * n]);
 
-        for (digits[0..p.length()], 0..) |digit, i| {
-            setWord(&ots, 5, @intCast(i));
+        if (p.shake) {
+            for (digits[0..p.length()], 0..) |digit, i| {
+                setWord(&ots, 5, @intCast(i));
 
-            hashes.chain(values[i * n ..][0..n], digit, 15 - digit, &ots);
+                hashes.chain(values[i * n ..][0..n], digit, 15 - digit, &ots);
+            }
+        } else {
+            const ends: [max_length]u32 = @splat(15);
+
+            switch (n) {
+                inline 24, 32 => |size| Lanes(max_lanes, size / 4).chains(&hashes, @intCast(layer), index, leaf_index, digits[0..p.length()], ends[0..p.length()], values[0 .. p.length() * n]),
+                else => unreachable,
+            }
         }
 
         offset += p.length() * n;
@@ -608,12 +978,29 @@ pub const Xmss = struct {
 
             wotsDigits(p, &node, &digits);
 
-            for (digits[0..p.length()], 0..) |digit, i| {
-                const value = out[offset + i * n ..][0..n];
+            if (p.shake) {
+                for (digits[0..p.length()], 0..) |digit, i| {
+                    const value = out[offset + i * n ..][0..n];
 
-                self.hashes.secret(&ots, i, value);
+                    self.hashes.secret(&ots, i, value);
 
-                self.hashes.chain(value, 0, digit, &ots);
+                    self.hashes.chain(value, 0, digit, &ots);
+                }
+            } else {
+                const values = out[offset..][0 .. p.length() * n];
+
+                const zeros: [max_length]u32 = @splat(0);
+
+                switch (n) {
+                    inline 24, 32 => |size| {
+                        const lanes = Lanes(max_lanes, size / 4);
+
+                        lanes.secrets(&self.hashes, @intCast(layer), rest, leaf_index, values);
+
+                        lanes.chains(&self.hashes, @intCast(layer), rest, leaf_index, zeros[0..p.length()], digits[0..p.length()], values);
+                    },
+                    else => unreachable,
+                }
             }
 
             offset += p.length() * n;

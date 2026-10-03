@@ -2,7 +2,9 @@ const std = @import("std");
 
 const ct = @import("ct.zig");
 const hash = @import("hash.zig");
+const keccak = @import("keccak.zig");
 const primitives = @import("primitives.zig");
+const vec = @import("vector.zig");
 
 pub const Parameters = struct {
     k: u8,
@@ -79,319 +81,542 @@ const zetas: [256]i32 = blk: {
 // 2^64 / 256 mod q completes the inverse NTT and leaves the factor 2^32.
 const inverse_ntt_factor = 41978;
 
-// Returns a value congruent to a * 2^-32 modulo q, in (-q, q) for |a| < 2^31 * q.
-fn montgomeryReduce(a: i64) i32 {
-    const t: i32 = @as(i32, @truncate(a)) *% 58728449;
+// Coefficients are processed eight at a time; every lane computes exactly what the scalar
+// formulas compute, so the results do not depend on the vector width.
+const V = @Vector(8, i32);
 
-    return @intCast((a - @as(i64, t) * q) >> 32);
+// q^-1 modulo 2^32.
+const q_inverse = 58728449;
+
+fn splat(value: i32) V {
+    return @splat(value);
+}
+
+fn shiftRight(a: V, comptime r: u5) V {
+    return a >> @splat(r);
 }
 
 // A representative of a modulo q with |r| <= 6283009, for |a| < 2^31 - 2^22.
-fn reduce32(a: i32) i32 {
-    const t = (a + (1 << 22)) >> 23;
-
-    return a - t * q;
+fn reduce32(a: V) V {
+    return a - shiftRight(a + splat(1 << 22), 23) * splat(q);
 }
 
-fn addQIfNegative(a: i32) i32 {
-    return a + ((a >> 31) & q);
+fn addQIfNegative(a: V) V {
+    return a + (shiftRight(a, 31) & splat(q));
 }
 
 // The standard representative in [0, q).
-fn freeze(a: i32) i32 {
+fn freeze(a: V) V {
     return addQIfNegative(reduce32(a));
 }
 
 // The representative in [-(q - 1) / 2, (q - 1) / 2] of a standard representative.
-fn centered(a: i32) i32 {
-    return a - (q & (((q - 1) / 2 - a) >> 31));
+fn centered(a: V) V {
+    return a - (splat(q) & shiftRight(splat((q - 1) / 2) - a, 31));
 }
 
-fn absolute(a: i32) i32 {
-    const mask = a >> 31;
+fn absolute(a: V) V {
+    const mask = shiftRight(a, 31);
 
     return (a ^ mask) - mask;
 }
 
+fn load(f: *const Poly, i: usize) V {
+    return f[i..][0..8].*;
+}
+
+fn store(f: *Poly, i: usize, value: V) void {
+    f[i..][0..8].* = value;
+}
+
+fn mulHigh(a: V, b: V) V {
+    const Wide = @Vector(8, i64);
+
+    return @truncate(@as(Wide, a) * @as(Wide, b) >> @splat(32));
+}
+
+// a * b * 2^-32 modulo q, given b_qinv = b * q^-1 mod 2^32: the low halves of a * b and t * q
+// agree, so the difference of the high halves is the exact quotient.
+fn montgomery(a: V, b: V, b_qinv: V) V {
+    return mulHigh(a, b) - mulHigh(a *% b_qinv, splat(q));
+}
+
+fn montgomeryProduct(a: V, b: V) V {
+    return montgomery(a, b, b *% splat(q_inverse));
+}
+
+fn timesQInverse(comptime table: anytype) @TypeOf(table) {
+    var out = table;
+
+    for (&out) |*value| value.* *%= if (@TypeOf(value.*) == V) splat(q_inverse) else q_inverse;
+
+    return out;
+}
+
+const zetas_qinv = timesQInverse(zetas);
+
+// The last three forward layers, and the first three inverse layers, run inside 16-coefficient
+// chunks held in two vectors; their zetas are laid out per chunk in the lane order used there.
+// Layer `step` pairs coefficients `step` apart, so a block holds 2 * step coefficients.
+fn chunkZetas(comptime inverse: bool, comptime step: usize) [16]V {
+    var out: [16]V = undefined;
+
+    for (&out, 0..) |*chunk, c| {
+        var lanes: [8]i32 = undefined;
+
+        for (&lanes, 0..) |*lane, i| {
+            const block = c * (8 / step) + i / step;
+
+            lane.* = if (inverse) -zetas[256 / step - 1 - block] else zetas[128 / step + block];
+        }
+
+        chunk.* = lanes;
+    }
+
+    return out;
+}
+
+const Chunk = struct {
+    zeta: [16]V,
+    zeta_qinv: [16]V,
+
+    fn init(comptime inverse: bool, comptime step: usize) Chunk {
+        @setEvalBranchQuota(100000);
+
+        const zeta = chunkZetas(inverse, step);
+
+        return .{ .zeta = zeta, .zeta_qinv = timesQInverse(zeta) };
+    }
+};
+
+const forward_chunks = [3]Chunk{ .init(false, 4), .init(false, 2), .init(false, 1) };
+
+const inverse_chunks = [3]Chunk{ .init(true, 1), .init(true, 2), .init(true, 4) };
+
 fn ntt(f: *Poly) void {
     var k: usize = 0;
 
-    var length: usize = 128;
-
-    while (length > 0) : (length >>= 1) {
+    inline for ([_]usize{ 128, 64, 32, 16, 8 }) |length| {
         var start: usize = 0;
 
         while (start < 256) : (start += 2 * length) {
             k += 1;
 
-            const zeta: i64 = zetas[k];
+            const zeta = splat(zetas[k]);
 
-            for (start..start + length) |j| {
-                const t = montgomeryReduce(zeta * f[j + length]);
+            const zeta_qinv = splat(zetas_qinv[k]);
 
-                f[j + length] = f[j] - t;
+            var j = start;
 
-                f[j] = f[j] + t;
+            while (j < start + length) : (j += 8) {
+                const a = load(f, j);
+
+                const t = montgomery(load(f, j + length), zeta, zeta_qinv);
+
+                store(f, j + length, a - t);
+
+                store(f, j, a + t);
             }
         }
+    }
+
+    for (0..16) |c| {
+        var a = load(f, 16 * c);
+
+        var b = load(f, 16 * c + 8);
+
+        inline for (forward_chunks, [_]usize{ 4, 2, 1 }) |chunk, step| {
+            const x, const y = vec.split(step, a, b);
+
+            const t = montgomery(y, chunk.zeta[c], chunk.zeta_qinv[c]);
+
+            a, b = vec.join(step, x + t, x - t);
+        }
+
+        store(f, 16 * c, a);
+
+        store(f, 16 * c + 8, b);
     }
 }
 
 // Inputs must be below q in absolute value; the output carries the factor 2^32 that cancels the
 // 2^-32 of the preceding Montgomery products.
 fn inverseNtt(f: *Poly) void {
-    var k: usize = 256;
+    for (0..16) |c| {
+        var a = load(f, 16 * c);
 
-    var length: usize = 1;
+        var b = load(f, 16 * c + 8);
 
-    while (length < 256) : (length <<= 1) {
+        inline for (inverse_chunks, [_]usize{ 1, 2, 4 }) |chunk, step| {
+            const x, const y = vec.split(step, a, b);
+
+            a, b = vec.join(step, x + y, montgomery(x - y, chunk.zeta[c], chunk.zeta_qinv[c]));
+        }
+
+        store(f, 16 * c, a);
+
+        store(f, 16 * c + 8, b);
+    }
+
+    var k: usize = 32;
+
+    inline for ([_]usize{ 8, 16, 32, 64 }) |length| {
         var start: usize = 0;
 
         while (start < 256) : (start += 2 * length) {
             k -= 1;
 
-            const zeta: i64 = -zetas[k];
+            const zeta = splat(-zetas[k]);
 
-            for (start..start + length) |j| {
-                const t = f[j];
+            const zeta_qinv = splat(-zetas[k] *% q_inverse);
 
-                f[j] = t + f[j + length];
+            var j = start;
 
-                f[j + length] = montgomeryReduce(zeta * (t - f[j + length]));
+            while (j < start + length) : (j += 8) {
+                const a = load(f, j);
+
+                const b = load(f, j + length);
+
+                store(f, j, a + b);
+
+                store(f, j + length, montgomery(a - b, zeta, zeta_qinv));
             }
         }
     }
 
-    for (f) |*c| {
-        c.* = montgomeryReduce(@as(i64, inverse_ntt_factor) * c.*);
+    // The last layer and the final factor share one pass: the differences take the product of
+    // -zeta_1 and the factor as one Montgomery constant. The results are congruent to those of two
+    // separate products, and every caller reduces them to standard representatives.
+    const factor = splat(inverse_ntt_factor);
+
+    const factor_qinv = splat(@as(i32, inverse_ntt_factor) *% q_inverse);
+
+    const last = splat(last_factor);
+
+    const last_qinv = splat(last_factor *% q_inverse);
+
+    for (0..16) |i| {
+        const a = load(f, 8 * i);
+
+        const b = load(f, 8 * i + 128);
+
+        store(f, 8 * i, montgomery(a + b, factor, factor_qinv));
+
+        store(f, 8 * i + 128, montgomery(a - b, last, last_qinv));
     }
 }
 
+// -zeta_1 * inverse_ntt_factor * 2^-32 modulo q.
+const last_factor: i32 = blk: {
+    const product: i64 = @as(i64, -zetas[1]) * inverse_ntt_factor;
+
+    const t: i32 = @as(i32, @truncate(product)) *% q_inverse;
+
+    break :blk @intCast((product - @as(i64, t) * q) >> 32);
+};
+
 fn pointwise(a: *const Poly, b: *const Poly, out: *Poly) void {
-    for (out, a, b) |*c, x, y| {
-        c.* = montgomeryReduce(@as(i64, x) * y);
-    }
+    for (0..32) |i| store(out, 8 * i, montgomeryProduct(load(a, 8 * i), load(b, 8 * i)));
 }
 
 // The NTT-domain inner product of a matrix row with a vector, reduced below q.
 fn dot(comptime n: usize, row: *const [n]Poly, vector: *const [n]Poly, out: *Poly) void {
-    out.* = @splat(0);
+    for (0..32) |i| {
+        var sum = splat(0);
 
-    for (row, vector) |*f, *g| {
-        for (out, f, g) |*c, x, y| {
-            c.* += montgomeryReduce(@as(i64, x) * y);
+        for (row, vector) |*f, *g| {
+            sum += montgomeryProduct(load(f, 8 * i), load(g, 8 * i));
         }
-    }
 
-    for (out) |*c| {
-        c.* = reduce32(c.*);
+        store(out, 8 * i, reduce32(sum));
     }
 }
 
-fn freezeAll(f: *Poly) void {
-    for (f) |*c| {
-        c.* = freeze(c.*);
-    }
-}
+fn power2Round(r: V) struct { V, V } {
+    const r1 = shiftRight(r + splat((1 << (d - 1)) - 1), d);
 
-fn power2Round(r: i32) struct { i32, i32 } {
-    const r1 = (r + (1 << (d - 1)) - 1) >> d;
-
-    return .{ r1, r - (r1 << d) };
+    return .{ r1, r - r1 * splat(1 << d) };
 }
 
 // FIPS 204, Algorithm 36, for a standard representative: r1 = (r - r0) / (2 * gamma2) with
 // r0 = r mod± 2 * gamma2, except that r - r0 = q - 1 gives r1 = 0 and r0 - 1. Computed with
 // multiplications and masks.
-fn decompose(comptime gamma2: i32, r: i32) struct { i32, i32 } {
-    var r1 = (r + 127) >> 7;
+fn decompose(comptime gamma2: i32, r: V) struct { V, V } {
+    var r1 = shiftRight(r + splat(127), 7);
 
     if (gamma2 == (q - 1) / 32) {
-        r1 = ((r1 * 1025 + (1 << 21)) >> 22) & 15;
+        r1 = shiftRight(r1 * splat(1025) + splat(1 << 21), 22) & splat(15);
     } else {
-        r1 = (r1 * 11275 + (1 << 23)) >> 24;
+        r1 = shiftRight(r1 * splat(11275) + splat(1 << 23), 24);
 
-        r1 ^= ((43 - r1) >> 31) & r1;
+        r1 ^= shiftRight(splat(43) - r1, 31) & r1;
     }
 
-    var r0 = r - r1 * 2 * gamma2;
+    var r0 = r - r1 * splat(2 * gamma2);
 
-    r0 -= (((q - 1) / 2 - r0) >> 31) & q;
+    r0 -= shiftRight(splat((q - 1) / 2) - r0, 31) & splat(q);
 
     return .{ r1, r0 };
 }
 
-fn useHint(comptime gamma2: i32, hint: bool, r: i32) i32 {
+// FIPS 204, Algorithm 40, on public values: r1 moves by one step modulo m where the hint is set.
+fn useHint(comptime gamma2: i32, hint: @Vector(8, bool), r: V) V {
     const m = (q - 1) / (2 * gamma2);
 
     const r1, const r0 = decompose(gamma2, r);
 
-    if (!hint) return r1;
+    const up = @select(i32, r1 == splat(m - 1), splat(0), r1 + splat(1));
 
-    return if (r0 > 0) @mod(r1 + 1, m) else @mod(r1 - 1, m);
+    const down = @select(i32, r1 == splat(0), splat(m - 1), r1 - splat(1));
+
+    return @select(i32, hint, @select(i32, r0 > splat(0), up, down), r1);
 }
 
 fn pack(comptime bits: u5, values: *const [256]u32, out: *[32 * @as(usize, bits)]u8) void {
-    var buffer: u64 = 0;
+    const G = vec.Group(bits);
 
-    var filled: u6 = 0;
+    for (0..256 / G.count) |g| {
+        var word: G.Word = 0;
 
-    var index: usize = 0;
-
-    for (values) |value| {
-        buffer |= @as(u64, value) << filled;
-
-        filled += bits;
-
-        while (filled >= 8) : (filled -= 8) {
-            out[index] = @truncate(buffer);
-
-            index += 1;
-
-            buffer >>= 8;
+        inline for (0..G.count) |i| {
+            word |= @as(G.Word, values[G.count * g + i]) << (G.width * i);
         }
+
+        G.write(word, out[G.size * g ..][0..G.size]);
     }
 }
 
 fn unpack(comptime bits: u5, bytes: *const [32 * @as(usize, bits)]u8, out: *[256]u32) void {
-    var buffer: u64 = 0;
+    const G = vec.Group(bits);
 
-    var filled: u6 = 0;
+    for (0..256 / G.count) |g| {
+        const word = G.read(bytes[G.size * g ..][0..G.size]);
 
-    var index: usize = 0;
-
-    for (out) |*value| {
-        while (filled < bits) : (filled += 8) {
-            buffer |= @as(u64, bytes[index]) << filled;
-
-            index += 1;
+        inline for (0..G.count) |i| {
+            out[G.count * g + i] = @truncate(word >> (G.width * i) & G.mask);
         }
-
-        value.* = @truncate(buffer & ((1 << bits) - 1));
-
-        buffer >>= bits;
-
-        filled -= bits;
     }
 }
 
 // Coefficients in [-a, b] are stored as b - x.
 fn bitPack(comptime bits: u5, comptime b: i32, f: *const Poly, out: *[32 * @as(usize, bits)]u8) void {
-    var values: [256]u32 = undefined;
+    const G = vec.Group(bits);
 
-    defer ct.wipe(std.mem.asBytes(&values));
+    for (0..256 / G.count) |g| {
+        var word: G.Word = 0;
 
-    for (&values, f) |*value, c| {
-        value.* = @intCast(b - c);
+        inline for (0..G.count) |i| {
+            word |= @as(G.Word, @as(u32, @intCast(b - f[G.count * g + i]))) << (G.width * i);
+        }
+
+        G.write(word, out[G.size * g ..][0..G.size]);
     }
-
-    pack(bits, &values, out);
 }
 
 fn bitUnpack(comptime bits: u5, comptime b: i32, bytes: *const [32 * @as(usize, bits)]u8, f: *Poly) void {
-    var values: [256]u32 = undefined;
+    const G = vec.Group(bits);
 
-    defer ct.wipe(std.mem.asBytes(&values));
+    for (0..256 / G.count) |g| {
+        const word = G.read(bytes[G.size * g ..][0..G.size]);
 
-    unpack(bits, bytes, &values);
-
-    for (f, values) |*c, value| {
-        c.* = b - @as(i32, @intCast(value));
+        inline for (0..G.count) |i| {
+            f[G.count * g + i] = b - @as(i32, @intCast(word >> (G.width * i) & G.mask));
+        }
     }
 }
 
-fn rejectionNttPoly(rho: *const [32]u8, s: u8, r: u8, out: *Poly) void {
-    var xof = hash.shake128.create();
+// Candidates from a block of the matrix XOF; the matrix is public and rejections are rare.
+fn parseUniform(out: *Poly, start: usize, block: *const [168]u8) usize {
+    var count = start;
 
-    xof.update(rho);
+    var offset: usize = 0;
 
-    xof.update(&.{ s, r });
+    while (offset < block.len and count < 256) : (offset += 3) {
+        const z = block[offset] | (@as(i32, block[offset + 1]) << 8) | (@as(i32, block[offset + 2] & 0x7f) << 16);
 
-    var count: usize = 0;
+        if (z < q) {
+            out[count] = z;
 
-    var block: [168]u8 = undefined;
-
-    while (count < 256) {
-        xof.read(&block);
-
-        var offset: usize = 0;
-
-        while (offset < block.len and count < 256) : (offset += 3) {
-            const z = block[offset] | (@as(i32, block[offset + 1]) << 8) | (@as(i32, block[offset + 2] & 0x7f) << 16);
-
-            if (z < q) {
-                out[count] = z;
-
-                count += 1;
-            }
+            count += 1;
         }
     }
+
+    return count;
 }
 
 // FIPS 204, Algorithm 31, on the secret seed: every candidate is written and the count advances
 // by a mask, so the accepted values never steer a branch; only the loop end depends on them.
-fn rejectionBoundedPoly(comptime eta: u8, rho: *const [64]u8, r: u16, out: *Poly) void {
-    var xof = hash.shake256.create();
+fn parseBounded(comptime eta: u8, buffer: *[257]i32, start: usize, block: *const [136]u8) usize {
+    var count = start;
 
-    defer ct.wipe(std.mem.asBytes(&xof));
+    for (block) |byte| {
+        for ([2]i32{ byte & 0x0f, byte >> 4 }) |half| {
+            const accepted: usize = @intFromBool(if (eta == 2) half < 15 else half < 9);
 
-    xof.update(rho);
+            // half mod 5 is half - 5 * floor(205 * half / 1024) for half < 15.
+            buffer[count] = if (eta == 2) 2 - (half - 5 * ((205 * half) >> 10)) else 4 - half;
 
-    var nonce: [2]u8 = undefined;
-
-    std.mem.writeInt(u16, &nonce, r, .little);
-
-    xof.update(&nonce);
-
-    var buffer: [257]i32 = undefined;
-
-    defer ct.wipe(std.mem.asBytes(&buffer));
-
-    var count: usize = 0;
-
-    var block: [136]u8 = undefined;
-
-    defer ct.wipe(&block);
-
-    while (count < 256) {
-        xof.read(&block);
-
-        for (block) |byte| {
-            for ([2]i32{ byte & 0x0f, byte >> 4 }) |half| {
-                const accepted: usize = @intFromBool(if (eta == 2) half < 15 else half < 9);
-
-                // half mod 5 is half - 5 * floor(205 * half / 1024) for half < 15.
-                buffer[count] = if (eta == 2) 2 - (half - 5 * ((205 * half) >> 10)) else 4 - half;
-
-                count += accepted & @intFromBool(count < 256);
-            }
+            count += accepted & @intFromBool(count < 256);
         }
     }
 
-    out.* = buffer[0..256].*;
+    return count;
 }
 
-fn expandRow(comptime p: Parameters, rho: *const [32]u8, r: usize, row: *[p.l]Poly) void {
-    for (row, 0..) |*f, s| {
-        rejectionNttPoly(rho, @intCast(s), @intCast(r), f);
+// The k * l matrix A, entry (r, s) from SHAKE128(rho || s || r), four entries at a time.
+fn expandMatrix(comptime p: Parameters, rho: *const [32]u8, a: *[p.k][p.l]Poly) void {
+    const count = @as(usize, p.k) * p.l;
+
+    var first: usize = 0;
+
+    while (first + 4 <= count) : (first += 4) {
+        var inputs: [4][34]u8 = undefined;
+
+        for (&inputs, first..) |*input, e| input.* = rho.* ++ [2]u8{ @intCast(e % p.l), @intCast(e / p.l) };
+
+        var sponge: keccak.Sponge4 = .init(168, 0x1f, .{ &inputs[0], &inputs[1], &inputs[2], &inputs[3] });
+
+        var counts: [4]usize = @splat(0);
+
+        while (@reduce(.Min, @as(@Vector(4, usize), counts)) < 256) {
+            var blocks: [4][168]u8 = undefined;
+
+            sponge.squeeze(.{ &blocks[0], &blocks[1], &blocks[2], &blocks[3] });
+
+            for (&counts, &blocks, first..) |*filled, *block, e| filled.* = parseUniform(&a[e / p.l][e % p.l], filled.*, block);
+        }
+    }
+
+    for (first..count) |e| {
+        var xof = hash.shake128.create();
+
+        xof.update(rho);
+
+        xof.update(&.{ @intCast(e % p.l), @intCast(e / p.l) });
+
+        var filled: usize = 0;
+
+        var block: [168]u8 = undefined;
+
+        while (filled < 256) {
+            xof.read(&block);
+
+            filled = parseUniform(&a[e / p.l][e % p.l], filled, &block);
+        }
     }
 }
 
+// The secret vectors: outs[i] from SHAKE256(rho || nonce + i), four at a time.
+fn expandSecret(comptime eta: u8, rho: *const [64]u8, nonce: u16, outs: []const *Poly) void {
+    var buffers: [4][257]i32 = undefined;
+
+    var blocks: [4][136]u8 = undefined;
+
+    defer {
+        ct.wipe(std.mem.asBytes(&buffers));
+
+        ct.wipe(std.mem.asBytes(&blocks));
+    }
+
+    var first: usize = 0;
+
+    while (first + 4 <= outs.len) : (first += 4) {
+        var inputs: [4][66]u8 = undefined;
+
+        defer ct.wipe(std.mem.asBytes(&inputs));
+
+        for (&inputs, first..) |*input, i| {
+            input[0..64].* = rho.*;
+
+            std.mem.writeInt(u16, input[64..66], nonce + @as(u16, @intCast(i)), .little);
+        }
+
+        var sponge: keccak.Sponge4 = .init(136, 0x1f, .{ &inputs[0], &inputs[1], &inputs[2], &inputs[3] });
+
+        defer sponge.wipe();
+
+        var counts: [4]usize = @splat(0);
+
+        while (@reduce(.Min, @as(@Vector(4, usize), counts)) < 256) {
+            sponge.squeeze(.{ &blocks[0], &blocks[1], &blocks[2], &blocks[3] });
+
+            for (&buffers, &counts, &blocks) |*buffer, *filled, *block| filled.* = parseBounded(eta, buffer, filled.*, block);
+        }
+
+        for (&buffers, outs[first..][0..4]) |*buffer, out| out.* = buffer[0..256].*;
+    }
+
+    for (outs[first..], first..) |out, i| {
+        var xof = hash.shake256.create();
+
+        defer ct.wipe(std.mem.asBytes(&xof));
+
+        xof.update(rho);
+
+        var input: [2]u8 = undefined;
+
+        std.mem.writeInt(u16, &input, nonce + @as(u16, @intCast(i)), .little);
+
+        xof.update(&input);
+
+        var filled: usize = 0;
+
+        while (filled < 256) {
+            xof.read(&blocks[0]);
+
+            filled = parseBounded(eta, &buffers[0], filled, &blocks[0]);
+        }
+
+        out.* = buffers[0][0..256].*;
+    }
+}
+
+// The mask y from SHAKE256(rho' || kappa + r), four polynomials at a time.
 fn expandMask(comptime p: Parameters, rho: *const [64]u8, kappa: u16, y: *[p.l]Poly) void {
     const bits = p.gamma1Bits();
 
-    for (y, 0..) |*f, r| {
-        var bytes: [32 * @as(usize, bits)]u8 = undefined;
+    const size = 32 * @as(usize, bits);
 
-        defer ct.wipe(&bytes);
+    var bytes: [4][size]u8 = undefined;
 
+    defer ct.wipe(std.mem.asBytes(&bytes));
+
+    var first: usize = 0;
+
+    while (first + 4 <= p.l) : (first += 4) {
+        var inputs: [4][66]u8 = undefined;
+
+        defer ct.wipe(std.mem.asBytes(&inputs));
+
+        for (&inputs, first..) |*input, r| {
+            input[0..64].* = rho.*;
+
+            std.mem.writeInt(u16, input[64..66], kappa + @as(u16, @intCast(r)), .little);
+        }
+
+        var sponge: keccak.Sponge4 = .init(136, 0x1f, .{ &inputs[0], &inputs[1], &inputs[2], &inputs[3] });
+
+        defer sponge.wipe();
+
+        var offset: usize = 0;
+
+        while (offset < size) : (offset += 136) {
+            const take = @min(136, size - offset);
+
+            sponge.squeeze(.{ bytes[0][offset..][0..take], bytes[1][offset..][0..take], bytes[2][offset..][0..take], bytes[3][offset..][0..take] });
+        }
+
+        for (&bytes, y[first..][0..4]) |*lane, *f| bitUnpack(bits, p.gamma1, lane, f);
+    }
+
+    for (y[first..], first..) |*f, r| {
         var nonce: [2]u8 = undefined;
 
         std.mem.writeInt(u16, &nonce, kappa + @as(u16, @intCast(r)), .little);
 
-        primitives.shake256(&.{ rho, &nonce }, &bytes);
+        primitives.shake256(&.{ rho, &nonce }, &bytes[0]);
 
-        bitUnpack(bits, p.gamma1, &bytes, f);
+        bitUnpack(bits, p.gamma1, &bytes[0], f);
     }
 }
 
@@ -406,7 +631,7 @@ fn sampleInBall(comptime p: Parameters, seed: []const u8, c: *Poly) void {
 
     var signs = std.mem.readInt(u64, &sign_bytes, .little);
 
-    c.* = @splat(0);
+    ct.wipe(std.mem.asBytes(c));
 
     for (256 - @as(usize, p.tau)..256) |i| {
         var j: [1]u8 = undefined;
@@ -467,18 +692,16 @@ fn publicT(comptime p: Parameters, rho: *const [32]u8, s1: *const [p.l]Poly, s2:
 
     for (&s1_hat) |*f| ntt(f);
 
-    for (t, 0..) |*f, i| {
-        var row: [p.l]Poly = undefined;
+    var a: [p.k][p.l]Poly = undefined;
 
-        expandRow(p, rho, i, &row);
+    expandMatrix(p, rho, &a);
 
-        dot(p.l, &row, &s1_hat, f);
+    for (t, &a, 0..) |*f, *row, i| {
+        dot(p.l, row, &s1_hat, f);
 
         inverseNtt(f);
 
-        for (f, s2[i]) |*c, e| {
-            c.* = freeze(c.* + e);
-        }
+        for (0..32) |j| store(f, 8 * j, freeze(load(f, 8 * j) + load(&s2[i], 8 * j)));
     }
 }
 
@@ -574,21 +797,25 @@ pub fn keyGen(comptime p: Parameters, seed: *const [32]u8, pk: *[p.publicKeySize
 
     parts.key = expanded[96..128].*;
 
-    for (&parts.s1, 0..) |*f, r| {
-        rejectionBoundedPoly(p.eta, expanded[32..96], @intCast(r), f);
-    }
+    var outs: [@as(usize, p.l) + p.k]*Poly = undefined;
 
-    for (&parts.s2, 0..) |*f, r| {
-        rejectionBoundedPoly(p.eta, expanded[32..96], @intCast(p.l + r), f);
-    }
+    for (outs[0..p.l], &parts.s1) |*out, *f| out.* = f;
+
+    for (outs[p.l..], &parts.s2) |*out, *f| out.* = f;
+
+    expandSecret(p.eta, expanded[32..96], 0, &outs);
 
     publicT(p, &parts.rho, &parts.s1, &parts.s2, &t);
 
     var t1: [p.k]Poly = undefined;
 
     for (&t, &t1, &parts.t0) |*f, *high, *low| {
-        for (f, high, low) |c, *r1, *r0| {
-            r1.*, r0.* = power2Round(c);
+        for (0..32) |i| {
+            const r1, const r0 = power2Round(load(f, 8 * i));
+
+            store(high, 8 * i, r1);
+
+            store(low, 8 * i, r0);
         }
     }
 
@@ -615,13 +842,11 @@ pub fn checkPrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8
 
     decodePrivateKey(p, sk, &parts);
 
-    var invalid: i32 = 0;
+    var invalid = splat(0);
 
     for ([_][]const Poly{ &parts.s1, &parts.s2 }) |vector| {
-        for (vector) |f| {
-            for (f) |c| {
-                invalid |= p.eta - absolute(c);
-            }
+        for (vector) |*f| {
+            for (0..32) |i| invalid |= splat(p.eta) - absolute(load(f, 8 * i));
         }
     }
 
@@ -629,13 +854,13 @@ pub fn checkPrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8
 
     var t1: [p.k]Poly = undefined;
 
-    for (&t, &t1, &parts.t0) |*f, *high, low| {
-        for (f, high, low) |c, *r1, expected| {
-            const r0 = power2Round(c)[1];
+    for (&t, &t1, &parts.t0) |*f, *high, *low| {
+        for (0..32) |i| {
+            const r1, const r0 = power2Round(load(f, 8 * i));
 
-            r1.* = power2Round(c)[0];
+            store(high, 8 * i, r1);
 
-            invalid |= -absolute(r0 - expected);
+            invalid |= -absolute(r0 - load(low, 8 * i));
         }
     }
 
@@ -645,7 +870,9 @@ pub fn checkPrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8
 
     primitives.shake256(&.{pk}, &tr);
 
-    const barrier: *volatile i32 = &invalid;
+    var negative = @reduce(.Or, invalid);
+
+    const barrier: *volatile i32 = &negative;
 
     return barrier.* >= 0 and ct.equal(&tr, &parts.tr);
 }
@@ -691,9 +918,7 @@ pub fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, message: 
 
     var a: [k][l]Poly = undefined;
 
-    for (&a, 0..) |*row, r| {
-        expandRow(p, &parts.rho, r, row);
-    }
+    expandMatrix(p, &parts.rho, &a);
 
     var mu_hasher = hash.shake256.create();
 
@@ -733,10 +958,12 @@ pub fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, message: 
 
             inverseNtt(f);
 
-            freezeAll(f);
+            for (0..32) |i| {
+                const c = freeze(load(f, 8 * i));
 
-            for (f, high) |c, *r1| {
-                r1.* = decompose(p.gamma2, c)[0];
+                store(f, 8 * i, c);
+
+                store(high, 8 * i, decompose(p.gamma2, c)[0]);
             }
         }
 
@@ -750,17 +977,19 @@ pub fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, message: 
 
         ntt(&c_hat);
 
-        var invalid: i32 = 0;
+        var invalid = splat(0);
 
         for (&cs1, &parts.s1, &y) |*f, *s, *mask| {
             pointwise(&c_hat, s, f);
 
             inverseNtt(f);
 
-            for (f, mask) |*c, m| {
-                c.* = centered(freeze(c.* + m));
+            for (0..32) |i| {
+                const c = centered(freeze(load(f, 8 * i) + load(mask, 8 * i)));
 
-                invalid |= (p.gamma1 - p.beta() - 1) - absolute(c.*);
+                store(f, 8 * i, c);
+
+                invalid |= splat(p.gamma1 - p.beta() - 1) - absolute(c);
             }
         }
 
@@ -769,14 +998,16 @@ pub fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, message: 
 
             inverseNtt(f);
 
-            for (f, wf, uf) |c, wc, *uc| {
-                uc.* = freeze(wc - c);
+            for (0..32) |i| {
+                const uc = freeze(load(wf, 8 * i) - load(f, 8 * i));
 
-                invalid |= (p.gamma2 - p.beta() - 1) - absolute(decompose(p.gamma2, uc.*)[1]);
+                store(uf, 8 * i, uc);
+
+                invalid |= splat(p.gamma2 - p.beta() - 1) - absolute(decompose(p.gamma2, uc)[1]);
             }
         }
 
-        var hints: u32 = 0;
+        var counts = splat(0);
 
         var h: [k][256]bool = undefined;
 
@@ -785,25 +1016,31 @@ pub fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, message: 
 
             inverseNtt(f);
 
-            for (f, uf, hf) |*c, uc, *hc| {
-                c.* = centered(freeze(c.*));
+            for (0..32) |i| {
+                const c = centered(freeze(load(f, 8 * i)));
 
-                invalid |= (p.gamma2 - 1) - absolute(c.*);
+                store(f, 8 * i, c);
+
+                invalid |= splat(p.gamma2 - 1) - absolute(c);
 
                 // MakeHint(-ct0, w - cs2 + ct0): whether adding ct0 moves the high bits.
-                const moved = decompose(p.gamma2, freeze(uc + c.*))[0] ^ decompose(p.gamma2, uc)[0];
+                const uc = load(uf, 8 * i);
 
-                const bit: u32 = @intCast(((moved | -moved) >> 31) & 1);
+                const moved = decompose(p.gamma2, freeze(uc + c))[0] ^ decompose(p.gamma2, uc)[0];
 
-                hc.* = bit != 0;
+                const bit = shiftRight(moved | -moved, 31) & splat(1);
 
-                hints += bit;
+                hf[8 * i ..][0..8].* = bit != splat(0);
+
+                counts += bit;
             }
         }
 
-        const barrier: *volatile i32 = &invalid;
+        var negative = @reduce(.Or, invalid);
 
-        if (barrier.* < 0 or hints > p.omega) continue;
+        const barrier: *volatile i32 = &negative;
+
+        if (barrier.* < 0 or @reduce(.Add, counts) > p.omega) continue;
 
         encodeSignature(p, &cs1, &h, signature);
 
@@ -889,8 +1126,8 @@ pub fn verify(comptime p: Parameters, pk: *const [p.publicKeySize()]u8, message:
 
         offset += 32 * @as(usize, bits);
 
-        for (f) |c| {
-            if (absolute(c) >= p.gamma1 - p.beta()) return false;
+        for (0..32) |i| {
+            if (@reduce(.Or, absolute(load(f, 8 * i)) >= splat(p.gamma1 - p.beta()))) return false;
         }
     }
 
@@ -922,14 +1159,14 @@ pub fn verify(comptime p: Parameters, pk: *const [p.publicKeySize()]u8, message:
 
     for (&z) |*f| ntt(f);
 
+    var a: [k][l]Poly = undefined;
+
+    expandMatrix(p, rho, &a);
+
     var w1: [k]Poly = undefined;
 
-    for (&w1, 0..) |*f, i| {
-        var row: [l]Poly = undefined;
-
-        expandRow(p, rho, i, &row);
-
-        dot(l, &row, &z, f);
+    for (&w1, &a, 0..) |*f, *row, i| {
+        dot(l, row, &z, f);
 
         var t1: [256]u32 = undefined;
 
@@ -945,15 +1182,11 @@ pub fn verify(comptime p: Parameters, pk: *const [p.publicKeySize()]u8, message:
 
         pointwise(&c_hat, &ct1, &ct1);
 
-        for (f, ct1) |*c, x| {
-            c.* = reduce32(c.* - x);
-        }
+        for (0..32) |j| store(f, 8 * j, reduce32(load(f, 8 * j) - load(&ct1, 8 * j)));
 
         inverseNtt(f);
 
-        for (f, h[i]) |*c, hint| {
-            c.* = useHint(p.gamma2, hint, freeze(c.*));
-        }
+        for (0..32) |j| store(f, 8 * j, useHint(p.gamma2, h[i][8 * j ..][0..8].*, freeze(load(f, 8 * j))));
     }
 
     var expected: [p.lambda / 4]u8 = undefined;

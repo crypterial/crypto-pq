@@ -105,20 +105,45 @@ fn sub(a: Fe, b: Fe) Fe {
     return carry(h);
 }
 
+fn wide(a: u64, b: u64) u128 {
+    return @as(u128, a) * b;
+}
+
+// The multiples 19 * b_i and 2 * a_i fit in 64 bits for limbs below 2^54, so every product is a
+// single 64 x 64 -> 128-bit multiplication.
 fn mul(a: Fe, b: Fe) Fe {
-    const m = [5]u128{ a[0], a[1], a[2], a[3], a[4] };
+    const b19 = [5]u64{ 0, 19 * b[1], 19 * b[2], 19 * b[3], 19 * b[4] };
 
-    const n = [5]u128{ b[0], b[1], b[2], b[3], b[4] };
+    return reduceWide(.{
+        wide(a[0], b[0]) + wide(a[1], b19[4]) + wide(a[2], b19[3]) + wide(a[3], b19[2]) + wide(a[4], b19[1]),
+        wide(a[0], b[1]) + wide(a[1], b[0]) + wide(a[2], b19[4]) + wide(a[3], b19[3]) + wide(a[4], b19[2]),
+        wide(a[0], b[2]) + wide(a[1], b[1]) + wide(a[2], b[0]) + wide(a[3], b19[4]) + wide(a[4], b19[3]),
+        wide(a[0], b[3]) + wide(a[1], b[2]) + wide(a[2], b[1]) + wide(a[3], b[0]) + wide(a[4], b19[4]),
+        wide(a[0], b[4]) + wide(a[1], b[3]) + wide(a[2], b[2]) + wide(a[3], b[1]) + wide(a[4], b[0]),
+    });
+}
 
-    const n19 = [5]u128{ 0, 19 * n[1], 19 * n[2], 19 * n[3], 19 * n[4] };
+// The products a_i * a_j and a_j * a_i of a square are equal, so each pair is computed once and
+// doubled: 15 multiplications instead of 25.
+fn square(a: Fe) Fe {
+    const doubled = [4]u64{ 2 * a[0], 2 * a[1], 2 * a[2], 2 * a[3] };
 
-    var t = [5]u128{
-        m[0] * n[0] + m[1] * n19[4] + m[2] * n19[3] + m[3] * n19[2] + m[4] * n19[1],
-        m[0] * n[1] + m[1] * n[0] + m[2] * n19[4] + m[3] * n19[3] + m[4] * n19[2],
-        m[0] * n[2] + m[1] * n[1] + m[2] * n[0] + m[3] * n19[4] + m[4] * n19[3],
-        m[0] * n[3] + m[1] * n[2] + m[2] * n[1] + m[3] * n[0] + m[4] * n19[4],
-        m[0] * n[4] + m[1] * n[3] + m[2] * n[2] + m[3] * n[1] + m[4] * n[0],
-    };
+    const a3_19 = 19 * a[3];
+
+    const a4_19 = 19 * a[4];
+
+    return reduceWide(.{
+        wide(a[0], a[0]) + wide(doubled[1], a4_19) + wide(doubled[2], a3_19),
+        wide(doubled[0], a[1]) + wide(doubled[2], a4_19) + wide(a[3], a3_19),
+        wide(doubled[0], a[2]) + wide(a[1], a[1]) + wide(doubled[3], a4_19),
+        wide(doubled[0], a[3]) + wide(doubled[1], a[2]) + wide(a[4], a4_19),
+        wide(doubled[0], a[4]) + wide(doubled[1], a[3]) + wide(a[2], a[2]),
+    });
+}
+
+// Carries the column sums of a product back into 51-bit limbs.
+fn reduceWide(columns: [5]u128) Fe {
+    var t = columns;
 
     for (0..4) |i| {
         t[i + 1] += t[i] >> 51;
@@ -139,10 +164,6 @@ fn mul(a: Fe, b: Fe) Fe {
     h[0] &= mask51;
 
     return h;
-}
-
-fn square(a: Fe) Fe {
-    return mul(a, a);
 }
 
 fn squareTimes(a: Fe, count: usize) Fe {

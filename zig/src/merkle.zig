@@ -14,9 +14,10 @@ const max_low = 10;
 // cache and rebuilds only the 2^low-leaf subtree under the signed leaf, so memory stays below
 // 2^16 nodes for every height while trees of height 15 or less never recompute a leaf.
 //
-// `Context` provides leaf(index, out) and combine(z, j, left, right, out), where z is the height
-// of the children and j the index of the parent; `out` may alias `left`. The node memory is
-// allocated once, so that a tree can be rebuilt for another context without allocating.
+// `Context` provides leaf(index, out), or leaves(first, out) with a `lanes` count, and
+// combine(z, j, left, right, out), where z is the height of the children and j the index of the
+// parent; `out` may alias `left`. The node memory is allocated once, so that a tree can be rebuilt
+// for another context without allocating.
 pub fn MerkleTree(comptime Context: type) type {
     return struct {
         const Self = @This();
@@ -52,12 +53,16 @@ pub fn MerkleTree(comptime Context: type) type {
 
             self.context = context;
 
-            for (0..@as(usize, 1) << (self.height - self.low)) |chunk| {
-                var buffer: [(1 << max_low) * max_node_size]u8 = undefined;
+            if (self.low == 0) {
+                self.leaves(0, self.nodes[0 .. (@as(usize, 1) << self.height) * n]);
+            } else {
+                for (0..@as(usize, 1) << (self.height - self.low)) |chunk| {
+                    var buffer: [(1 << max_low) * max_node_size]u8 = undefined;
 
-                self.subtree(chunk, &buffer, null);
+                    self.subtree(chunk, &buffer, null);
 
-                @memcpy(self.node(self.low, chunk), buffer[0..n]);
+                    @memcpy(self.node(self.low, chunk), buffer[0..n]);
+                }
             }
 
             for (self.low..self.height) |z| {
@@ -67,6 +72,26 @@ pub fn MerkleTree(comptime Context: type) type {
             }
 
             @memcpy(self.root[0..n], self.node(self.height, 0));
+        }
+
+        // Leaves first .. first + out.len / n - 1, computed `Context.lanes` at a time by contexts
+        // that provide leaves(first, out).
+        fn leaves(self: *const Self, first: u64, out: []u8) void {
+            const n = self.n;
+
+            const count = out.len / n;
+
+            if (!@hasDecl(Context, "leaves")) {
+                for (0..count) |i| self.context.leaf(first + i, out[i * n ..][0..n]);
+
+                return;
+            }
+
+            var i: usize = 0;
+
+            while (i < count) : (i += Context.lanes) {
+                self.context.leaves(first + i, out[i * n ..][0 .. @min(Context.lanes, count - i) * n]);
+            }
         }
 
         // Level z holds 2^(height - z) nodes; the levels are stored from `low` upwards.
@@ -87,9 +112,7 @@ pub fn MerkleTree(comptime Context: type) type {
 
             const base = chunk << self.low;
 
-            for (0..@as(usize, 1) << self.low) |i| {
-                self.context.leaf(base + i, buffer[i * n ..][0..n]);
-            }
+            self.leaves(base, buffer[0 .. (@as(usize, 1) << self.low) * n]);
 
             for (0..self.low) |z| {
                 const count = @as(usize, 1) << @intCast(self.low - z);

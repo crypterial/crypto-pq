@@ -47,15 +47,17 @@ fn gather(buffer: []u8, parts: []const []const u8) usize {
 // SHA-2 computation from a chaining state that already absorbed `absorbed` bytes (whole blocks)
 // by padding the remaining parts in place, without the buffering of the streaming engines.
 pub fn sha256Finish(state: *const [8]u32, absorbed: usize, parts: []const []const u8, out: []u8) void {
-    var block: [192]u8 = @splat(0);
-
-    defer ct.wipe(&block);
+    var block: [192]u8 = undefined;
 
     const length = gather(&block, parts);
 
-    block[length] = 0x80;
-
     const end = (length + 9 + 63) / 64 * 64;
+
+    defer ct.wipe(block[0..end]);
+
+    @memset(block[length..end], 0);
+
+    block[length] = 0x80;
 
     std.mem.writeInt(u64, block[end - 8 ..][0..8], (absorbed + length) * 8, .big);
 
@@ -75,15 +77,17 @@ pub fn sha256Finish(state: *const [8]u32, absorbed: usize, parts: []const []cons
 }
 
 pub fn sha512Finish(state: *const [8]u64, absorbed: usize, parts: []const []const u8, out: []u8) void {
-    var block: [256]u8 = @splat(0);
-
-    defer ct.wipe(&block);
+    var block: [256]u8 = undefined;
 
     const length = gather(&block, parts);
 
-    block[length] = 0x80;
-
     const end = (length + 17 + 127) / 128 * 128;
+
+    defer ct.wipe(block[0..end]);
+
+    @memset(block[length..end], 0);
+
+    block[length] = 0x80;
 
     std.mem.writeInt(u64, block[end - 8 ..][0..8], (absorbed + length) * 8, .big);
 
@@ -104,27 +108,23 @@ pub fn sha512Finish(state: *const [8]u64, absorbed: usize, parts: []const []cons
 
 // SHAKE256 of at most 135 bytes: a single permutation of one padded block.
 pub fn shake256Short(parts: []const []const u8, out: []u8) void {
-    var block: [136]u8 = @splat(0);
-
-    defer ct.wipe(&block);
-
-    const length = gather(&block, parts);
-
-    block[length] ^= 0x1f;
-
-    block[135] ^= 0x80;
-
     var state: [25]u64 = @splat(0);
 
     defer ct.wipe(std.mem.asBytes(&state));
 
-    for (state[0..17], 0..) |*lane, i| {
-        lane.* = std.mem.readInt(u64, block[8 * i ..][0..8], .little);
+    var length: usize = 0;
+
+    for (parts) |part| {
+        keccak.xorBytes(&state, length, part);
+
+        length += part.len;
     }
+
+    keccak.xorBytes(&state, length, &.{0x1f});
+
+    keccak.xorBytes(&state, 135, &.{0x80});
 
     keccak.permute(&state);
 
-    for (out, 0..) |*byte, i| {
-        byte.* = @truncate(state[i / 8] >> @intCast(8 * (i % 8)));
-    }
+    keccak.copyBytes(&state, 0, out);
 }

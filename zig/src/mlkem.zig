@@ -2,7 +2,9 @@ const std = @import("std");
 
 const ct = @import("ct.zig");
 const hash = @import("hash.zig");
+const keccak = @import("keccak.zig");
 const primitives = @import("primitives.zig");
+const vec = @import("vector.zig");
 
 pub const Parameters = struct {
     k: u8,
@@ -57,116 +59,231 @@ const montgomery_square = 1353;
 
 const inverse_ntt_factor = 1441;
 
-// Returns a value congruent to a * 2^-16 modulo q, in (-q, q) for |a| < 2^15 * q.
-fn montgomeryReduce(a: i32) i16 {
-    const t: i16 = @as(i16, @truncate(a)) *% -3327;
+// The arithmetic runs on eight coefficients per vector. Every lane computes exactly what the
+// scalar formulas of FIPS 203 with Montgomery and Barrett reduction compute, so the results do not
+// depend on the vector width.
+const V = @Vector(8, i16);
 
-    return @intCast((a - @as(i32, t) * q) >> 16);
+const Wide = @Vector(8, i32);
+
+const U = @Vector(8, u32);
+
+// q^-1 modulo 2^16.
+const q_inverse = -3327;
+
+fn splat(value: i16) V {
+    return @splat(value);
 }
 
-fn fqmul(a: i16, b: i16) i16 {
-    return montgomeryReduce(@as(i32, a) * b);
+fn load(f: *const Poly, i: usize) V {
+    return f[i..][0..8].*;
 }
 
-// Returns the representative of a modulo q in [-(q - 1) / 2, (q - 1) / 2].
-fn barrettReduce(a: i16) i16 {
-    const v: i32 = ((1 << 26) + q / 2) / q;
+fn store(f: *Poly, i: usize, value: V) void {
+    f[i..][0..8].* = value;
+}
 
-    const t = (v * a + (1 << 25)) >> 26;
+fn mulHigh(a: V, b: V) V {
+    return @truncate(@as(Wide, a) * @as(Wide, b) >> @splat(16));
+}
 
-    return @intCast(a - t * q);
+// a * b * 2^-16 modulo q, in (-q, q), given b_qinv = b * q^-1 mod 2^16: the low halves of a * b
+// and t * q agree, so the difference of the high halves is the exact quotient.
+fn montgomery(a: V, b: V, b_qinv: V) V {
+    return mulHigh(a, b) - mulHigh(a *% b_qinv, splat(q));
+}
+
+fn montgomeryProduct(a: V, b: V) V {
+    return montgomery(a, b, b *% splat(q_inverse));
+}
+
+fn constantProduct(a: V, comptime b: i16) V {
+    return montgomery(a, splat(b), splat(b *% q_inverse));
+}
+
+// The representative modulo q in [-(q - 1) / 2, (q - 1) / 2].
+fn barrett(a: V) V {
+    const v = ((1 << 26) + q / 2) / q;
+
+    const t = (@as(Wide, a) * @as(Wide, @splat(v)) + @as(Wide, @splat(1 << 25))) >> @splat(26);
+
+    return @truncate(@as(Wide, a) - t * @as(Wide, @splat(q)));
 }
 
 // Maps (-q, q) to [0, q) with a mask instead of a branch.
-fn canonical(a: i16) u16 {
-    return @intCast(a + ((a >> 15) & q));
+fn canonical(a: V) U {
+    return @intCast(a + (a >> @splat(15) & splat(q)));
 }
 
 fn reduce(f: *Poly) void {
-    for (f) |*c| {
-        c.* = barrettReduce(c.*);
-    }
+    for (0..32) |i| store(f, 8 * i, barrett(load(f, 8 * i)));
 }
 
 fn add(f: *Poly, g: *const Poly) void {
-    for (f, g) |*a, b| {
-        a.* += b;
-    }
+    for (0..32) |i| store(f, 8 * i, load(f, 8 * i) + load(g, 8 * i));
 }
+
+// The last two forward layers and the first two inverse layers run inside 16-coefficient chunks
+// held in two vectors; their zetas are laid out per chunk in the lane order used there. Layer
+// `step` pairs coefficients `step` apart.
+const Chunk = struct {
+    zeta: [16]V,
+    zeta_qinv: [16]V,
+
+    fn init(comptime inverse: bool, comptime step: usize) Chunk {
+        @setEvalBranchQuota(100000);
+
+        var self: Chunk = undefined;
+
+        for (&self.zeta, &self.zeta_qinv, 0..) |*zeta, *zeta_qinv, c| {
+            var lanes: [8]i16 = undefined;
+
+            for (&lanes, 0..) |*lane, i| {
+                const block = c * (8 / step) + i / step;
+
+                lane.* = zetas[if (inverse) 256 / step - 1 - block else 128 / step + block];
+            }
+
+            zeta.* = lanes;
+
+            zeta_qinv.* = zeta.* *% splat(q_inverse);
+        }
+
+        return self;
+    }
+};
+
+const forward_chunks = [2]Chunk{ .init(false, 4), .init(false, 2) };
+
+const inverse_chunks = [2]Chunk{ .init(true, 2), .init(true, 4) };
+
+// The zetas of the base multiplications of each chunk, alternating zeta and -zeta per pair.
+const base_zetas: Chunk = blk: {
+    var self: Chunk = undefined;
+
+    for (&self.zeta, &self.zeta_qinv, 0..) |*zeta, *zeta_qinv, c| {
+        var lanes: [8]i16 = undefined;
+
+        for (&lanes, 0..) |*lane, i| lane.* = if (i % 2 == 0) zetas[64 + 4 * c + i / 2] else -zetas[64 + 4 * c + i / 2];
+
+        zeta.* = lanes;
+
+        zeta_qinv.* = zeta.* *% splat(q_inverse);
+    }
+
+    break :blk self;
+};
 
 fn ntt(f: *Poly) void {
     var k: usize = 1;
 
-    var length: usize = 128;
-
-    while (length >= 2) : (length >>= 1) {
+    inline for ([_]usize{ 128, 64, 32, 16, 8 }) |length| {
         var start: usize = 0;
 
         while (start < 256) : (start += 2 * length) {
-            const zeta = zetas[k];
+            const zeta = splat(zetas[k]);
+
+            const zeta_qinv = splat(zetas[k] *% q_inverse);
 
             k += 1;
 
-            for (start..start + length) |j| {
-                const t = fqmul(zeta, f[j + length]);
+            var j = start;
 
-                f[j + length] = f[j] - t;
+            while (j < start + length) : (j += 8) {
+                const a = load(f, j);
 
-                f[j] = f[j] + t;
+                const t = montgomery(load(f, j + length), zeta, zeta_qinv);
+
+                store(f, j + length, a - t);
+
+                store(f, j, a + t);
             }
         }
     }
 
-    reduce(f);
+    for (0..16) |c| {
+        var a = load(f, 16 * c);
+
+        var b = load(f, 16 * c + 8);
+
+        inline for (forward_chunks, [_]usize{ 4, 2 }) |chunk, step| {
+            const x, const y = vec.split(step, a, b);
+
+            const t = montgomery(y, chunk.zeta[c], chunk.zeta_qinv[c]);
+
+            a, b = vec.join(step, x + t, x - t);
+        }
+
+        store(f, 16 * c, barrett(a));
+
+        store(f, 16 * c + 8, barrett(b));
+    }
 }
 
 // The output carries the factor 2^16 that cancels the 2^-16 of the preceding products.
 fn inverseNtt(f: *Poly) void {
-    var k: usize = 127;
+    for (0..16) |c| {
+        var a = load(f, 16 * c);
 
-    var length: usize = 2;
+        var b = load(f, 16 * c + 8);
 
-    while (length <= 128) : (length <<= 1) {
+        inline for (inverse_chunks, [_]usize{ 2, 4 }) |chunk, step| {
+            const x, const y = vec.split(step, a, b);
+
+            a, b = vec.join(step, barrett(x + y), montgomery(y - x, chunk.zeta[c], chunk.zeta_qinv[c]));
+        }
+
+        store(f, 16 * c, a);
+
+        store(f, 16 * c + 8, b);
+    }
+
+    var k: usize = 31;
+
+    inline for ([_]usize{ 8, 16, 32, 64, 128 }) |length| {
         var start: usize = 0;
 
         while (start < 256) : (start += 2 * length) {
-            const zeta = zetas[k];
+            const zeta = splat(zetas[k]);
+
+            const zeta_qinv = splat(zetas[k] *% q_inverse);
 
             k -= 1;
 
-            for (start..start + length) |j| {
-                const t = f[j];
+            var j = start;
 
-                f[j] = barrettReduce(t + f[j + length]);
+            while (j < start + length) : (j += 8) {
+                const a = load(f, j);
 
-                f[j + length] = fqmul(zeta, f[j + length] - t);
+                const b = load(f, j + length);
+
+                store(f, j, barrett(a + b));
+
+                store(f, j + length, montgomery(b - a, zeta, zeta_qinv));
             }
         }
     }
 
-    for (f) |*c| {
-        c.* = fqmul(c.*, inverse_ntt_factor);
-    }
+    for (0..32) |i| store(f, 8 * i, constantProduct(load(f, 8 * i), inverse_ntt_factor));
 }
 
-// The product of two degree-one residues modulo X^2 - zeta, times 2^-16.
-fn basemul(r: *[2]i16, a: *const [2]i16, b: *const [2]i16, zeta: i16) void {
-    r[0] = fqmul(fqmul(a[1], b[1]), zeta) + fqmul(a[0], b[0]);
-
-    r[1] = fqmul(a[0], b[1]) + fqmul(a[1], b[0]);
-}
-
+// The products of degree-one residues modulo X^2 - zeta, times 2^-16, added to r: for a pair
+// (a0, a1) and (b0, b1), a1 * b1 * zeta + a0 * b0 and a0 * b1 + a1 * b0.
 fn multiplyAdd(r: *Poly, a: *const Poly, b: *const Poly) void {
-    for (0..64) |i| {
-        var product: [4]i16 = undefined;
+    for (0..16) |c| {
+        const a0, const a1 = vec.split(1, load(a, 16 * c), load(a, 16 * c + 8));
 
-        basemul(product[0..2], a[4 * i ..][0..2], b[4 * i ..][0..2], zetas[64 + i]);
+        const b0, const b1 = vec.split(1, load(b, 16 * c), load(b, 16 * c + 8));
 
-        basemul(product[2..4], a[4 * i + 2 ..][0..2], b[4 * i + 2 ..][0..2], -zetas[64 + i]);
+        const first = montgomery(montgomeryProduct(a1, b1), base_zetas.zeta[c], base_zetas.zeta_qinv[c]) + montgomeryProduct(a0, b0);
 
-        for (r[4 * i ..][0..4], product) |*c, p| {
-            c.* += p;
-        }
+        const second = montgomeryProduct(a0, b1) + montgomeryProduct(a1, b0);
+
+        const low, const high = vec.join(1, first, second);
+
+        store(r, 16 * c, load(r, 16 * c) + low);
+
+        store(r, 16 * c + 8, load(r, 16 * c + 8) + high);
     }
 }
 
@@ -181,12 +298,39 @@ fn dot(comptime k: usize, a: *const [k]Poly, b: *const [k]Poly, r: *Poly) void {
     reduce(r);
 }
 
+// The matrix is public, so the loop may end on its values, but a fifth of the candidates are
+// rejected at random: every candidate is written and the count advances by the comparison, which
+// avoids a mispredicted branch per rejection. The buffer has room for the writes past the end.
+fn parseUniform(buffer: *[258]i16, start: usize, block: *const [168]u8) usize {
+    var count = start;
+
+    var offset: usize = 0;
+
+    while (offset < block.len and count < 256) : (offset += 3) {
+        const d1 = block[offset] | (@as(u16, block[offset + 1] & 0x0f) << 8);
+
+        const d2 = (block[offset + 1] >> 4) | (@as(u16, block[offset + 2]) << 4);
+
+        buffer[count] = @intCast(d1);
+
+        count += @intFromBool(d1 < q);
+
+        buffer[count] = @intCast(d2);
+
+        count += @intFromBool(d2 < q) & @intFromBool(count < 256);
+    }
+
+    return count;
+}
+
 fn sampleNtt(rho: *const [32]u8, x: u8, y: u8, out: *Poly) void {
     var xof = hash.shake128.create();
 
     xof.update(rho);
 
     xof.update(&.{ x, y });
+
+    var buffer: [258]i16 = undefined;
 
     var count: usize = 0;
 
@@ -195,37 +339,61 @@ fn sampleNtt(rho: *const [32]u8, x: u8, y: u8, out: *Poly) void {
     while (count < 256) {
         xof.read(&block);
 
-        var offset: usize = 0;
+        count = parseUniform(&buffer, count, &block);
+    }
 
-        while (offset < block.len and count < 256) : (offset += 3) {
-            const d1 = block[offset] | (@as(u16, block[offset + 1] & 0x0f) << 8);
+    out.* = buffer[0..256].*;
+}
 
-            const d2 = (block[offset + 1] >> 4) | (@as(u16, block[offset + 2]) << 4);
+// The k * k matrix, entry (i, j) from XOF(rho, j, i), or from XOF(rho, i, j) for its transpose,
+// four entries at a time.
+fn sampleMatrix(comptime k: usize, rho: *const [32]u8, transposed: bool, out: *[k][k]Poly) void {
+    var first: usize = 0;
 
-            if (d1 < q) {
-                out[count] = @intCast(d1);
+    while (first + 4 <= k * k) : (first += 4) {
+        var inputs: [4][34]u8 = undefined;
 
-                count += 1;
-            }
+        var messages: [4][]const u8 = undefined;
 
-            if (d2 < q and count < 256) {
-                out[count] = @intCast(d2);
+        for (&inputs, &messages, first..) |*input, *message, e| {
+            const i: u8 = @intCast(e / k);
 
-                count += 1;
-            }
+            const j: u8 = @intCast(e % k);
+
+            input.* = rho.* ++ (if (transposed) [2]u8{ i, j } else [2]u8{ j, i });
+
+            message.* = input;
         }
+
+        var sponge: keccak.Sponge4 = .init(168, 0x1f, messages);
+
+        var buffers: [4][258]i16 = undefined;
+
+        var counts: [4]usize = @splat(0);
+
+        while (@reduce(.Min, @as(@Vector(4, usize), counts)) < 256) {
+            var blocks: [4][168]u8 = undefined;
+
+            sponge.squeeze(.{ &blocks[0], &blocks[1], &blocks[2], &blocks[3] });
+
+            for (&buffers, &counts, &blocks) |*buffer, *count, *block| count.* = parseUniform(buffer, count.*, block);
+        }
+
+        for (&buffers, first..) |*buffer, e| out[e / k][e % k] = buffer[0..256].*;
+    }
+
+    for (first..k * k) |e| {
+        const i: u8 = @intCast(e / k);
+
+        const j: u8 = @intCast(e % k);
+
+        if (transposed) sampleNtt(rho, i, j, &out[e / k][e % k]) else sampleNtt(rho, j, i, &out[e / k][e % k]);
     }
 }
 
 // The centered binomial distribution: each coefficient is the difference of the bit counts of
 // two adjacent eta-bit groups.
-fn sampleNoise(comptime eta: u8, seed: *const [32]u8, nonce: u8, out: *Poly) void {
-    var bytes: [64 * eta]u8 = undefined;
-
-    defer ct.wipe(&bytes);
-
-    primitives.shake256(&.{ seed, &.{nonce} }, &bytes);
-
+fn binomial(comptime eta: u8, bytes: *const [64 * eta]u8, out: *Poly) void {
     if (eta == 2) {
         for (0..32) |i| {
             const t = std.mem.readInt(u32, bytes[4 * i ..][0..4], .little);
@@ -257,17 +425,58 @@ fn sampleNoise(comptime eta: u8, seed: *const [32]u8, nonce: u8, out: *Poly) voi
     }
 }
 
+// Noise polynomials outs[i] = CBD(PRF(seed, nonce + i)), four at a time.
+fn sampleNoise(comptime eta: u8, seed: *const [32]u8, nonce: u8, outs: []const *Poly) void {
+    var bytes: [4][64 * eta]u8 = undefined;
+
+    defer ct.wipe(std.mem.asBytes(&bytes));
+
+    var first: usize = 0;
+
+    while (first + 4 <= outs.len) : (first += 4) {
+        var inputs: [4][33]u8 = undefined;
+
+        for (&inputs, first..) |*input, i| input.* = seed.* ++ [1]u8{nonce + @as(u8, @intCast(i))};
+
+        var sponge: keccak.Sponge4 = .init(136, 0x1f, .{ &inputs[0], &inputs[1], &inputs[2], &inputs[3] });
+
+        defer sponge.wipe();
+
+        defer ct.wipe(std.mem.asBytes(&inputs));
+
+        var offset: usize = 0;
+
+        while (offset < 64 * eta) : (offset += 136) {
+            const size = @min(136, 64 * eta - offset);
+
+            sponge.squeeze(.{ bytes[0][offset..][0..size], bytes[1][offset..][0..size], bytes[2][offset..][0..size], bytes[3][offset..][0..size] });
+        }
+
+        for (&bytes, outs[first..][0..4]) |*lane, out| binomial(eta, lane, out);
+    }
+
+    for (outs[first..], first..) |out, i| {
+        primitives.shake256(&.{ seed, &.{nonce + @as(u8, @intCast(i))} }, &bytes[0]);
+
+        binomial(eta, &bytes[0], out);
+    }
+}
+
 fn encode12(f: *const Poly, out: *[384]u8) void {
-    for (0..128) |i| {
-        const a = canonical(f[2 * i]);
+    for (0..32) |i| {
+        const values: [8]u32 = canonical(load(f, 8 * i));
 
-        const b = canonical(f[2 * i + 1]);
+        for (0..4) |j| {
+            const a = values[2 * j];
 
-        out[3 * i] = @truncate(a);
+            const b = values[2 * j + 1];
 
-        out[3 * i + 1] = @truncate((a >> 8) | (b << 4));
+            out[12 * i + 3 * j] = @truncate(a);
 
-        out[3 * i + 2] = @truncate(b >> 4);
+            out[12 * i + 3 * j + 1] = @truncate((a >> 8) | (b << 4));
+
+            out[12 * i + 3 * j + 2] = @truncate(b >> 4);
+        }
     }
 }
 
@@ -288,65 +497,59 @@ fn decode12(bytes: *const [384]u8, out: *Poly) void {
 
 // round(2^d * x / q) mod 2^d for x in [0, q): the floor division by q of t < 2^24 is exactly
 // (t * 20642679) >> 36, so no division instruction touches the secret value.
-fn compress(x: u16, comptime d: u5) u16 {
-    const t = (@as(u64, x) << d) + q / 2;
+fn compress(x: U, comptime d: u5) U {
+    const Long = @Vector(8, u64);
 
-    return @truncate(((t * 20642679) >> 36) & ((1 << d) - 1));
+    const t = (x << @splat(d)) + @as(U, @splat(q / 2));
+
+    return @as(U, @truncate(@as(Long, t) * @as(Long, @splat(20642679)) >> @splat(36))) & @as(U, @splat((1 << d) - 1));
 }
 
-fn decompress(y: u16, comptime d: u5) i16 {
-    return @intCast((@as(u32, y) * q + (1 << (d - 1))) >> d);
+fn decompress(y: U, comptime d: u5) V {
+    return @intCast((y * @as(U, @splat(q)) + @as(U, @splat(1 << (d - 1)))) >> @splat(d));
 }
 
 fn encodeCompressed(comptime d: u5, f: *const Poly, out: *[32 * @as(usize, d)]u8) void {
-    var buffer: u32 = 0;
+    const G = vec.Group(d);
 
-    var bits: u5 = 0;
+    var values: [256]u32 = undefined;
 
-    var index: usize = 0;
+    for (0..32) |i| values[8 * i ..][0..8].* = compress(canonical(load(f, 8 * i)), d);
 
-    for (f) |c| {
-        buffer |= @as(u32, compress(canonical(c), d)) << bits;
+    for (0..256 / G.count) |g| {
+        var word: G.Word = 0;
 
-        bits += d;
-
-        while (bits >= 8) : (bits -= 8) {
-            out[index] = @truncate(buffer);
-
-            index += 1;
-
-            buffer >>= 8;
+        inline for (0..G.count) |i| {
+            word |= @as(G.Word, values[G.count * g + i]) << (G.width * i);
         }
+
+        G.write(word, out[G.size * g ..][0..G.size]);
     }
 }
 
 fn decodeDecompressed(comptime d: u5, bytes: *const [32 * @as(usize, d)]u8, out: *Poly) void {
-    var buffer: u32 = 0;
+    const G = vec.Group(d);
 
-    var bits: u5 = 0;
+    var values: [256]u32 = undefined;
 
-    var index: usize = 0;
+    for (0..256 / G.count) |g| {
+        const word = G.read(bytes[G.size * g ..][0..G.size]);
 
-    for (out) |*c| {
-        while (bits < d) : (bits += 8) {
-            buffer |= @as(u32, bytes[index]) << bits;
-
-            index += 1;
+        inline for (0..G.count) |i| {
+            values[G.count * g + i] = @truncate(word >> (G.width * i) & G.mask);
         }
-
-        c.* = decompress(@truncate(buffer & ((1 << d) - 1)), d);
-
-        buffer >>= d;
-
-        bits -= d;
     }
+
+    for (0..32) |i| store(out, 8 * i, decompress(values[8 * i ..][0..8].*, d));
 }
 
 fn fromMessage(m: *const [32]u8, out: *Poly) void {
-    for (out, 0..) |*c, i| {
-        const bit: i16 = (m[i / 8] >> @intCast(i % 8)) & 1;
+    const positions: @Vector(8, u3) = std.simd.iota(u3, 8);
 
-        c.* = -bit & ((q + 1) / 2);
+    for (m, 0..) |byte, i| {
+        const bits: V = @intCast(@as(@Vector(8, u8), @splat(byte)) >> positions & @as(@Vector(8, u8), @splat(1)));
+
+        store(out, 8 * i, -bits & splat((q + 1) / 2));
     }
 }
 
@@ -379,28 +582,40 @@ fn encrypt(comptime p: Parameters, ek: *const [p.encapsulationKeySize()]u8, m: *
         decode12(ek[384 * i ..][0..384], f);
     }
 
-    for (&y, 0..) |*f, i| {
-        sampleNoise(p.eta1, r, @intCast(i), f);
+    if (p.eta1 == p.eta2) {
+        var outs: [2 * k + 1]*Poly = undefined;
 
-        ntt(f);
+        for (outs[0..k], &y) |*out, *f| out.* = f;
+
+        for (outs[k..][0..k], &e1) |*out, *f| out.* = f;
+
+        outs[2 * k] = &e2;
+
+        sampleNoise(p.eta1, r, 0, &outs);
+    } else {
+        var outs: [k + 1]*Poly = undefined;
+
+        for (outs[0..k], &y) |*out, *f| out.* = f;
+
+        sampleNoise(p.eta1, r, 0, outs[0..k]);
+
+        for (outs[0..k], &e1) |*out, *f| out.* = f;
+
+        outs[k] = &e2;
+
+        sampleNoise(p.eta2, r, k, &outs);
     }
 
-    for (&e1, 0..) |*f, i| {
-        sampleNoise(p.eta2, r, @intCast(k + i), f);
-    }
+    for (&y) |*f| ntt(f);
 
-    sampleNoise(p.eta2, r, 2 * k, &e2);
+    var matrix: [k][k]Poly = undefined;
 
-    for (0..k) |i| {
-        var column: [k]Poly = undefined;
+    sampleMatrix(k, rho, true, &matrix);
 
-        for (&column, 0..) |*f, j| {
-            sampleNtt(rho, @intCast(i), @intCast(j), f);
-        }
-
+    for (&matrix, 0..) |*column, i| {
         var u: Poly = undefined;
 
-        dot(k, &column, &y, &u);
+        dot(k, column, &y, &u);
 
         inverseNtt(&u);
 
@@ -463,16 +678,12 @@ fn decrypt(comptime p: Parameters, dk_pke: *const [384 * @as(usize, p.k)]u8, c: 
 
     inverseNtt(&w);
 
-    for (&w, v) |*a, b| {
-        a.* = b - a.*;
-    }
+    const positions: @Vector(8, u5) = std.simd.iota(u5, 8);
 
-    reduce(&w);
+    for (m, 0..) |*byte, i| {
+        const bits = compress(canonical(barrett(load(&v, 8 * i) - load(&w, 8 * i))), 1);
 
-    @memset(m, 0);
-
-    for (w, 0..) |a, i| {
-        m[i / 8] |= @as(u8, @truncate(compress(canonical(a), 1))) << @intCast(i % 8);
+        byte.* = @truncate(@reduce(.Or, bits << positions));
     }
 }
 
@@ -499,36 +710,26 @@ pub fn keyGen(comptime p: Parameters, d: *const [32]u8, z: *const [32]u8, ek: *[
 
     const sigma = g[32..64];
 
-    for (&s, 0..) |*f, i| {
-        sampleNoise(p.eta1, sigma, @intCast(i), f);
+    var outs: [2 * k]*Poly = undefined;
 
-        ntt(f);
-    }
+    for (outs[0..k], &s) |*out, *f| out.* = f;
 
-    for (&e, 0..) |*f, i| {
-        sampleNoise(p.eta1, sigma, @intCast(k + i), f);
+    for (outs[k..], &e) |*out, *f| out.* = f;
 
-        ntt(f);
-    }
+    sampleNoise(p.eta1, sigma, 0, &outs);
 
-    for (0..k) |i| {
-        var row: [k]Poly = undefined;
+    for (outs) |f| ntt(f);
 
-        for (&row, 0..) |*f, j| {
-            sampleNtt(rho, @intCast(j), @intCast(i), f);
-        }
+    var matrix: [k][k]Poly = undefined;
 
+    sampleMatrix(k, rho, false, &matrix);
+
+    for (&matrix, 0..) |*row, i| {
         var t: Poly = undefined;
 
-        dot(k, &row, &s, &t);
+        dot(k, row, &s, &t);
 
-        for (&t) |*c| {
-            c.* = fqmul(c.*, montgomery_square);
-        }
-
-        add(&t, &e[i]);
-
-        reduce(&t);
+        for (0..32) |j| store(&t, 8 * j, barrett(constantProduct(load(&t, 8 * j), montgomery_square) + load(&e[i], 8 * j)));
 
         encode12(&t, ek[384 * i ..][0..384]);
     }
