@@ -15,6 +15,14 @@ func newSha3(size int) engine {
 	return &sha3Engine{sponge: keccak{rate: 200 - 2*size, suffix: 0x06}, size: size}
 }
 
+func sha3Digest(size int, data []byte) []byte {
+	e := sha3Engine{sponge: keccak{rate: 200 - 2*size, suffix: 0x06}, size: size}
+
+	e.update(data)
+
+	return e.digest()
+}
+
 func (e *sha3Engine) update(data []byte) {
 	e.sponge.update(data)
 }
@@ -50,24 +58,26 @@ const (
 	SHA3_512
 )
 
+// sum is the one-shot digest, on an engine that stays on the stack rather than behind a Hasher.
 type hashSpec struct {
 	name       string
 	digestSize int
 	blockSize  int
 	create     func() engine
+	sum        func([]byte) []byte
 }
 
 var hashSpecs = [...]hashSpec{
-	SHA_224:     {"SHA-224", 28, 64, func() engine { return newSha256(&iv224, 28) }},
-	SHA_256:     {"SHA-256", 32, 64, func() engine { return newSha256(&iv256, 32) }},
-	SHA_384:     {"SHA-384", 48, 128, func() engine { return newSha512(&iv384, 48) }},
-	SHA_512:     {"SHA-512", 64, 128, func() engine { return newSha512(&iv512, 64) }},
-	SHA_512_224: {"SHA-512/224", 28, 128, func() engine { return newSha512(&iv512224, 28) }},
-	SHA_512_256: {"SHA-512/256", 32, 128, func() engine { return newSha512(&iv512256, 32) }},
-	SHA3_224:    {"SHA3-224", 28, 144, func() engine { return newSha3(28) }},
-	SHA3_256:    {"SHA3-256", 32, 136, func() engine { return newSha3(32) }},
-	SHA3_384:    {"SHA3-384", 48, 104, func() engine { return newSha3(48) }},
-	SHA3_512:    {"SHA3-512", 64, 72, func() engine { return newSha3(64) }},
+	SHA_224:     {"SHA-224", 28, 64, func() engine { return newSha256(&iv224, 28) }, func(data []byte) []byte { return sha256Digest(&iv224, 28, data) }},
+	SHA_256:     {"SHA-256", 32, 64, func() engine { return newSha256(&iv256, 32) }, func(data []byte) []byte { return sha256Digest(&iv256, 32, data) }},
+	SHA_384:     {"SHA-384", 48, 128, func() engine { return newSha512(&iv384, 48) }, func(data []byte) []byte { return sha512Digest(&iv384, 48, data) }},
+	SHA_512:     {"SHA-512", 64, 128, func() engine { return newSha512(&iv512, 64) }, func(data []byte) []byte { return sha512Digest(&iv512, 64, data) }},
+	SHA_512_224: {"SHA-512/224", 28, 128, func() engine { return newSha512(&iv512224, 28) }, func(data []byte) []byte { return sha512Digest(&iv512224, 28, data) }},
+	SHA_512_256: {"SHA-512/256", 32, 128, func() engine { return newSha512(&iv512256, 32) }, func(data []byte) []byte { return sha512Digest(&iv512256, 32, data) }},
+	SHA3_224:    {"SHA3-224", 28, 144, func() engine { return newSha3(28) }, func(data []byte) []byte { return sha3Digest(28, data) }},
+	SHA3_256:    {"SHA3-256", 32, 136, func() engine { return newSha3(32) }, func(data []byte) []byte { return sha3Digest(32, data) }},
+	SHA3_384:    {"SHA3-384", 48, 104, func() engine { return newSha3(48) }, func(data []byte) []byte { return sha3Digest(48, data) }},
+	SHA3_512:    {"SHA3-512", 64, 72, func() engine { return newSha3(64) }, func(data []byte) []byte { return sha3Digest(64, data) }},
 }
 
 func (a HashAlgorithm) spec() *hashSpec {
@@ -87,11 +97,7 @@ func (a HashAlgorithm) DigestSize() int {
 }
 
 func (a HashAlgorithm) Digest(data []byte) []byte {
-	hasher := a.Create()
-
-	hasher.Update(data)
-
-	return hasher.Digest()
+	return a.spec().sum(data)
 }
 
 func (a HashAlgorithm) Create() *Hasher {
@@ -144,11 +150,11 @@ func (a XofAlgorithm) Name() string {
 }
 
 func (a XofAlgorithm) Digest(data []byte, length int) []byte {
-	xof := a.Create()
+	sponge := keccak{rate: a.spec().rate, suffix: 0x1f}
 
-	xof.Update(data)
+	sponge.update(data)
 
-	return xof.Read(length)
+	return squeeze(&sponge, length)
 }
 
 func (a XofAlgorithm) Create() *Xof {
@@ -168,13 +174,17 @@ func (x *Xof) Update(data []byte) {
 }
 
 func (x *Xof) Read(length int) []byte {
+	return squeeze(&x.sponge, length)
+}
+
+func squeeze(sponge *keccak, length int) []byte {
 	if length < 0 {
 		panic("cryptopq: INVALID_LENGTH: length must not be negative")
 	}
 
 	out := make([]byte, length)
 
-	x.sponge.read(out)
+	sponge.read(out)
 
 	return out
 }

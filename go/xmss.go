@@ -223,7 +223,66 @@ func (x *xmssHasher) prfKeygen(out []byte, adrs *xmssAddress) {
 	x.digest(out, xmssPRFKeygen, x.skSeed, message[:x.p.n+32])
 }
 
+// PRF(PUB_SEED, ADRS) with the midstate: the address and the padding form the second block.
+func (x *xmssHasher) prfWords(adrs *xmssAddress) [8]uint32 {
+	var w [16]uint32
+
+	copy(w[:8], adrs[:])
+
+	w[8], w[15] = 0x80000000, 96*8
+
+	return sha256Block(x.prfState, w)
+}
+
+// With the midstates, a chain stays in words: F(KEY, M) = SHA-256(toByte(0, 32) || KEY || M) is a
+// block of 32 zero bytes and KEY, then a block of M and the padding.
+func (x *xmssHasher) chainWords(value []byte, start, steps int, adrs *xmssAddress) {
+	var current, mask [8]uint32
+
+	for i := range current {
+		current[i] = binary.BigEndian.Uint32(value[4*i:])
+	}
+
+	var keyBlock, messageBlock [16]uint32
+
+	messageBlock[8], messageBlock[15] = 0x80000000, 96*8
+
+	for k := start; k < start+steps; k++ {
+		adrs[6], adrs[7] = uint32(k), 0
+
+		key := x.prfWords(adrs)
+
+		adrs[7] = 1
+
+		mask = x.prfWords(adrs)
+
+		copy(keyBlock[8:], key[:])
+
+		for i := range current {
+			messageBlock[i] = current[i] ^ mask[i]
+		}
+
+		current = sha256Block(sha256Block(iv256, keyBlock), messageBlock)
+	}
+
+	for i, word := range current {
+		binary.BigEndian.PutUint32(value[4*i:], word)
+	}
+
+	clear(current[:])
+
+	clear(mask[:])
+
+	clear(messageBlock[:])
+}
+
 func (x *xmssHasher) chain(value []byte, start, steps int, adrs *xmssAddress) {
+	if x.midstates {
+		x.chainWords(value, start, steps, adrs)
+
+		return
+	}
+
 	n := x.p.n
 
 	var current, key, mask [32]byte
@@ -320,6 +379,12 @@ func (x *xmssHasher) wotsPublicFromSignature(values, signature, message []byte, 
 
 // RAND_HASH (RFC 8391, Algorithm 7). out may alias either input.
 func (x *xmssHasher) randHash(out, left, right []byte, adrs *xmssAddress) {
+	if x.midstates {
+		x.randHashWords(out, left, right, adrs)
+
+		return
+	}
+
 	n := x.p.n
 
 	var key [32]byte
@@ -345,6 +410,42 @@ func (x *xmssHasher) randHash(out, left, right []byte, adrs *xmssAddress) {
 	}
 
 	x.digest(out, xmssH, key[:n], masks[:2*n])
+}
+
+// H(KEY, M) = SHA-256(toByte(1, 32) || KEY || M) for the midstate case, as in chainWords: a block
+// of the prefix and KEY, a block of the two masked nodes, and a block of padding.
+func (x *xmssHasher) randHashWords(out, left, right []byte, adrs *xmssAddress) {
+	adrs[7] = 0
+
+	key := x.prfWords(adrs)
+
+	adrs[7] = 1
+
+	leftMask := x.prfWords(adrs)
+
+	adrs[7] = 2
+
+	rightMask := x.prfWords(adrs)
+
+	var w [16]uint32
+
+	w[7] = xmssH
+
+	copy(w[8:], key[:])
+
+	state := sha256Block(iv256, w)
+
+	for i := range 8 {
+		w[i], w[8+i] = binary.BigEndian.Uint32(left[4*i:])^leftMask[i], binary.BigEndian.Uint32(right[4*i:])^rightMask[i]
+	}
+
+	state = sha256Block(state, w)
+
+	state = sha256Block(state, [16]uint32{0x80000000, 15: 128 * 8})
+
+	for i, word := range state {
+		binary.BigEndian.PutUint32(out[4*i:], word)
+	}
 }
 
 // The L-tree (RFC 8391, Algorithm 8) compresses the WOTS+ public key in place.

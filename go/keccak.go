@@ -14,183 +14,67 @@ var roundConstants = [24]uint64{
 	0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
 }
 
-// Keccak-f[1600], unrolled. Lane x + 5y is a{x + 5y}; rho and pi move it to b{y + 5((2x + 3y) mod 5)}.
-func permute(a *[25]uint64) {
-	a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24 := a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24]
+// Keccak-f[1600], two rounds per iteration, from the a lanes into the e lanes and back. Lane x + 5y
+// is a{x + 5y}; rho and pi move it to y + 5((2x + 3y) mod 5), so each output plane of chi comes from
+// five input lanes, which are combined just before the plane is written. The lanes are locals, and
+// the compiler decides which to spill: with them in arrays instead, which needs fewer instructions,
+// the speed came to depend on where the arrays sat in memory, by up to a fifth on arm64.
+func permute(s *[25]uint64) {
+	a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24 := s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24]
 
-	for _, constant := range roundConstants {
-		c0 := a0 ^ a5 ^ a10 ^ a15 ^ a20
+	var e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17, e18, e19, e20, e21, e22, e23, e24 uint64
 
-		c1 := a1 ^ a6 ^ a11 ^ a16 ^ a21
+	for i := 0; i < 24; i += 2 {
+		c0, c1, c2, c3, c4 := a0^a5^a10^a15^a20, a1^a6^a11^a16^a21, a2^a7^a12^a17^a22, a3^a8^a13^a18^a23, a4^a9^a14^a19^a24
 
-		c2 := a2 ^ a7 ^ a12 ^ a17 ^ a22
+		d0, d1, d2, d3, d4 := c4^bits.RotateLeft64(c1, 1), c0^bits.RotateLeft64(c2, 1), c1^bits.RotateLeft64(c3, 1), c2^bits.RotateLeft64(c4, 1), c3^bits.RotateLeft64(c0, 1)
 
-		c3 := a3 ^ a8 ^ a13 ^ a18 ^ a23
+		b0, b1, b2, b3, b4 := a0^d0, bits.RotateLeft64(a6^d1, 44), bits.RotateLeft64(a12^d2, 43), bits.RotateLeft64(a18^d3, 21), bits.RotateLeft64(a24^d4, 14)
 
-		c4 := a4 ^ a9 ^ a14 ^ a19 ^ a24
+		e0, e1, e2, e3, e4 = b0^(b2&^b1)^roundConstants[i], b1^(b3&^b2), b2^(b4&^b3), b3^(b0&^b4), b4^(b1&^b0)
 
-		d0 := c4 ^ bits.RotateLeft64(c1, 1)
+		b0, b1, b2, b3, b4 = bits.RotateLeft64(a3^d3, 28), bits.RotateLeft64(a9^d4, 20), bits.RotateLeft64(a10^d0, 3), bits.RotateLeft64(a16^d1, 45), bits.RotateLeft64(a22^d2, 61)
 
-		d1 := c0 ^ bits.RotateLeft64(c2, 1)
+		e5, e6, e7, e8, e9 = b0^(b2&^b1), b1^(b3&^b2), b2^(b4&^b3), b3^(b0&^b4), b4^(b1&^b0)
 
-		d2 := c1 ^ bits.RotateLeft64(c3, 1)
+		b0, b1, b2, b3, b4 = bits.RotateLeft64(a1^d1, 1), bits.RotateLeft64(a7^d2, 6), bits.RotateLeft64(a13^d3, 25), bits.RotateLeft64(a19^d4, 8), bits.RotateLeft64(a20^d0, 18)
 
-		d3 := c2 ^ bits.RotateLeft64(c4, 1)
+		e10, e11, e12, e13, e14 = b0^(b2&^b1), b1^(b3&^b2), b2^(b4&^b3), b3^(b0&^b4), b4^(b1&^b0)
 
-		d4 := c3 ^ bits.RotateLeft64(c0, 1)
+		b0, b1, b2, b3, b4 = bits.RotateLeft64(a4^d4, 27), bits.RotateLeft64(a5^d0, 36), bits.RotateLeft64(a11^d1, 10), bits.RotateLeft64(a17^d2, 15), bits.RotateLeft64(a23^d3, 56)
 
-		a0 ^= d0
+		e15, e16, e17, e18, e19 = b0^(b2&^b1), b1^(b3&^b2), b2^(b4&^b3), b3^(b0&^b4), b4^(b1&^b0)
 
-		a1 ^= d1
+		b0, b1, b2, b3, b4 = bits.RotateLeft64(a2^d2, 62), bits.RotateLeft64(a8^d3, 55), bits.RotateLeft64(a14^d4, 39), bits.RotateLeft64(a15^d0, 41), bits.RotateLeft64(a21^d1, 2)
 
-		a2 ^= d2
+		e20, e21, e22, e23, e24 = b0^(b2&^b1), b1^(b3&^b2), b2^(b4&^b3), b3^(b0&^b4), b4^(b1&^b0)
 
-		a3 ^= d3
+		c0, c1, c2, c3, c4 = e0^e5^e10^e15^e20, e1^e6^e11^e16^e21, e2^e7^e12^e17^e22, e3^e8^e13^e18^e23, e4^e9^e14^e19^e24
 
-		a4 ^= d4
+		d0, d1, d2, d3, d4 = c4^bits.RotateLeft64(c1, 1), c0^bits.RotateLeft64(c2, 1), c1^bits.RotateLeft64(c3, 1), c2^bits.RotateLeft64(c4, 1), c3^bits.RotateLeft64(c0, 1)
 
-		a5 ^= d0
+		b0, b1, b2, b3, b4 = e0^d0, bits.RotateLeft64(e6^d1, 44), bits.RotateLeft64(e12^d2, 43), bits.RotateLeft64(e18^d3, 21), bits.RotateLeft64(e24^d4, 14)
 
-		a6 ^= d1
+		a0, a1, a2, a3, a4 = b0^(b2&^b1)^roundConstants[i+1], b1^(b3&^b2), b2^(b4&^b3), b3^(b0&^b4), b4^(b1&^b0)
 
-		a7 ^= d2
+		b0, b1, b2, b3, b4 = bits.RotateLeft64(e3^d3, 28), bits.RotateLeft64(e9^d4, 20), bits.RotateLeft64(e10^d0, 3), bits.RotateLeft64(e16^d1, 45), bits.RotateLeft64(e22^d2, 61)
 
-		a8 ^= d3
+		a5, a6, a7, a8, a9 = b0^(b2&^b1), b1^(b3&^b2), b2^(b4&^b3), b3^(b0&^b4), b4^(b1&^b0)
 
-		a9 ^= d4
+		b0, b1, b2, b3, b4 = bits.RotateLeft64(e1^d1, 1), bits.RotateLeft64(e7^d2, 6), bits.RotateLeft64(e13^d3, 25), bits.RotateLeft64(e19^d4, 8), bits.RotateLeft64(e20^d0, 18)
 
-		a10 ^= d0
+		a10, a11, a12, a13, a14 = b0^(b2&^b1), b1^(b3&^b2), b2^(b4&^b3), b3^(b0&^b4), b4^(b1&^b0)
 
-		a11 ^= d1
+		b0, b1, b2, b3, b4 = bits.RotateLeft64(e4^d4, 27), bits.RotateLeft64(e5^d0, 36), bits.RotateLeft64(e11^d1, 10), bits.RotateLeft64(e17^d2, 15), bits.RotateLeft64(e23^d3, 56)
 
-		a12 ^= d2
+		a15, a16, a17, a18, a19 = b0^(b2&^b1), b1^(b3&^b2), b2^(b4&^b3), b3^(b0&^b4), b4^(b1&^b0)
 
-		a13 ^= d3
+		b0, b1, b2, b3, b4 = bits.RotateLeft64(e2^d2, 62), bits.RotateLeft64(e8^d3, 55), bits.RotateLeft64(e14^d4, 39), bits.RotateLeft64(e15^d0, 41), bits.RotateLeft64(e21^d1, 2)
 
-		a14 ^= d4
-
-		a15 ^= d0
-
-		a16 ^= d1
-
-		a17 ^= d2
-
-		a18 ^= d3
-
-		a19 ^= d4
-
-		a20 ^= d0
-
-		a21 ^= d1
-
-		a22 ^= d2
-
-		a23 ^= d3
-
-		a24 ^= d4
-
-		b0 := a0
-
-		b1 := bits.RotateLeft64(a6, 44)
-
-		b2 := bits.RotateLeft64(a12, 43)
-
-		b3 := bits.RotateLeft64(a18, 21)
-
-		b4 := bits.RotateLeft64(a24, 14)
-
-		b5 := bits.RotateLeft64(a3, 28)
-
-		b6 := bits.RotateLeft64(a9, 20)
-
-		b7 := bits.RotateLeft64(a10, 3)
-
-		b8 := bits.RotateLeft64(a16, 45)
-
-		b9 := bits.RotateLeft64(a22, 61)
-
-		b10 := bits.RotateLeft64(a1, 1)
-
-		b11 := bits.RotateLeft64(a7, 6)
-
-		b12 := bits.RotateLeft64(a13, 25)
-
-		b13 := bits.RotateLeft64(a19, 8)
-
-		b14 := bits.RotateLeft64(a20, 18)
-
-		b15 := bits.RotateLeft64(a4, 27)
-
-		b16 := bits.RotateLeft64(a5, 36)
-
-		b17 := bits.RotateLeft64(a11, 10)
-
-		b18 := bits.RotateLeft64(a17, 15)
-
-		b19 := bits.RotateLeft64(a23, 56)
-
-		b20 := bits.RotateLeft64(a2, 62)
-
-		b21 := bits.RotateLeft64(a8, 55)
-
-		b22 := bits.RotateLeft64(a14, 39)
-
-		b23 := bits.RotateLeft64(a15, 41)
-
-		b24 := bits.RotateLeft64(a21, 2)
-
-		a0 = b0 ^ (^b1 & b2) ^ constant
-
-		a1 = b1 ^ (^b2 & b3)
-
-		a2 = b2 ^ (^b3 & b4)
-
-		a3 = b3 ^ (^b4 & b0)
-
-		a4 = b4 ^ (^b0 & b1)
-
-		a5 = b5 ^ (^b6 & b7)
-
-		a6 = b6 ^ (^b7 & b8)
-
-		a7 = b7 ^ (^b8 & b9)
-
-		a8 = b8 ^ (^b9 & b5)
-
-		a9 = b9 ^ (^b5 & b6)
-
-		a10 = b10 ^ (^b11 & b12)
-
-		a11 = b11 ^ (^b12 & b13)
-
-		a12 = b12 ^ (^b13 & b14)
-
-		a13 = b13 ^ (^b14 & b10)
-
-		a14 = b14 ^ (^b10 & b11)
-
-		a15 = b15 ^ (^b16 & b17)
-
-		a16 = b16 ^ (^b17 & b18)
-
-		a17 = b17 ^ (^b18 & b19)
-
-		a18 = b18 ^ (^b19 & b15)
-
-		a19 = b19 ^ (^b15 & b16)
-
-		a20 = b20 ^ (^b21 & b22)
-
-		a21 = b21 ^ (^b22 & b23)
-
-		a22 = b22 ^ (^b23 & b24)
-
-		a23 = b23 ^ (^b24 & b20)
-
-		a24 = b24 ^ (^b20 & b21)
+		a20, a21, a22, a23, a24 = b0^(b2&^b1), b1^(b3&^b2), b2^(b4&^b3), b3^(b0&^b4), b4^(b1&^b0)
 	}
 
-	a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24] = a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24
+	s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24] = a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24
 }
 
 type keccak struct {
@@ -207,29 +91,23 @@ func (k *keccak) update(data []byte) {
 	}
 
 	for len(data) > 0 {
-		if k.position == 0 && len(data) >= k.rate {
-			for i := range k.rate / 8 {
-				k.state[i] ^= binary.LittleEndian.Uint64(data[8*i:])
+		if k.position%8 == 0 && len(data) >= 8 {
+			lanes, first := min(len(data), k.rate-k.position)/8, k.position/8
+
+			for i, lane := range k.state[first : first+lanes] {
+				k.state[first+i] = lane ^ binary.LittleEndian.Uint64(data[8*i:])
 			}
 
-			permute(&k.state)
+			k.position += 8 * lanes
 
-			data = data[k.rate:]
+			data = data[8*lanes:]
+		} else {
+			k.state[k.position/8] ^= uint64(data[0]) << (8 * (k.position % 8))
 
-			continue
+			k.position++
+
+			data = data[1:]
 		}
-
-		n := min(k.rate-k.position, len(data))
-
-		for i, b := range data[:n] {
-			index := k.position + i
-
-			k.state[index/8] ^= uint64(b) << (8 * (index % 8))
-		}
-
-		k.position += n
-
-		data = data[n:]
 
 		if k.position == k.rate {
 			permute(&k.state)
@@ -254,16 +132,30 @@ func (k *keccak) read(out []byte) {
 		k.squeezing = true
 	}
 
-	for i := range out {
+	for len(out) > 0 {
 		if k.position == k.rate {
 			permute(&k.state)
 
 			k.position = 0
 		}
 
-		out[i] = byte(k.state[k.position/8] >> (8 * (k.position % 8)))
+		if k.position%8 == 0 && len(out) >= 8 {
+			lanes, first := min(len(out), k.rate-k.position)/8, k.position/8
 
-		k.position++
+			for i, lane := range k.state[first : first+lanes] {
+				binary.LittleEndian.PutUint64(out[8*i:], lane)
+			}
+
+			k.position += 8 * lanes
+
+			out = out[8*lanes:]
+		} else {
+			out[0] = byte(k.state[k.position/8] >> (8 * (k.position % 8)))
+
+			k.position++
+
+			out = out[1:]
+		}
 	}
 }
 

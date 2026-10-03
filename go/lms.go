@@ -159,8 +159,43 @@ func lmsPrefix(out []byte, i []byte, q uint32, value uint16) {
 	binary.BigEndian.PutUint16(out[20:], value)
 }
 
+// SHA-256 of I || u32(q) || u16(index) || u8(j) || x, truncated to n = len(x) bytes. The 23 + n
+// bytes always fit in one block, which is assembled here directly as words, so chains and seed
+// derivations avoid the byte-oriented padding of sha256Finish.
+func lmsSha256Short(i []byte, q uint32, index uint16, j byte, x, out []byte) {
+	n := len(x)
+
+	var w [16]uint32
+
+	w[0], w[1], w[2], w[3] = binary.BigEndian.Uint32(i), binary.BigEndian.Uint32(i[4:]), binary.BigEndian.Uint32(i[8:]), binary.BigEndian.Uint32(i[12:])
+
+	w[4], w[5] = q, uint32(index)<<16|uint32(j)<<8|uint32(x[0])
+
+	for k := 1; k < n/4; k++ {
+		w[5+k] = binary.BigEndian.Uint32(x[4*k-3:])
+	}
+
+	w[5+n/4] = uint32(x[n-3])<<24 | uint32(x[n-2])<<16 | uint32(x[n-1])<<8 | 0x80
+
+	w[15] = uint32(23+n) * 8
+
+	s := sha256Block(iv256, w)
+
+	for k := range n / 4 {
+		binary.BigEndian.PutUint32(out[4*k:], s[k])
+	}
+
+	clear(w[:])
+}
+
 // H(I || u32(q) || u16(index) || 0xFF || SEED).
 func lmsDerive(shake bool, n int, i []byte, q uint32, index uint16, seed, out []byte) {
+	if !shake {
+		lmsSha256Short(i, q, index, 0xff, seed[:n], out)
+
+		return
+	}
+
 	var data [55]byte
 
 	lmsPrefix(data[:], i, q, index)
@@ -176,6 +211,14 @@ func lmsDerive(shake bool, n int, i []byte, q uint32, index uint16, seed, out []
 
 // Iterates x = H(I || u32(q) || u16(j) || u8(k) || x) for k from start to end - 1.
 func lmotsChain(t *lmotsType, i []byte, q uint32, j uint16, start, end int, x []byte) {
+	if !t.shake {
+		for k := start; k < end; k++ {
+			lmsSha256Short(i, q, j, byte(k), x[:t.n], x)
+		}
+
+		return
+	}
+
 	var data [55]byte
 
 	lmsPrefix(data[:], i, q, j)

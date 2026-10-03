@@ -1,7 +1,10 @@
 package cryptopq
 
-// ML-KEM (FIPS 203). Coefficients stay in [0, q) and every reduction is a multiply-shift or a
-// masked subtraction, so no branch or memory index depends on secret data.
+import "encoding/binary"
+
+// ML-KEM (FIPS 203). Coefficients are canonical, in [0, q), except inside the NTTs, which reduce
+// lazily. Every reduction is a multiply-shift or a masked subtraction, so no branch or memory index
+// depends on secret data.
 
 const kemQ = 3329
 
@@ -55,18 +58,22 @@ func powMod(base, exponent, modulus uint64) uint64 {
 	return result
 }
 
-var kemZetas, kemGammas = kemTables()
+// The twiddle factors zeta = 17^BitRev7(i) with their Shoup companions floor(zeta * 2^16 / q), and
+// the base-case factors gamma = 17^(2 BitRev7(i) + 1).
+var kemZetas, kemShoup, kemGammas = kemTables()
 
-func kemTables() (zetas, gammas [128]uint16) {
+func kemTables() (zetas, shoup, gammas [128]uint16) {
 	for i := range 128 {
 		r := uint64(bitReverse(i, 7))
 
 		zetas[i] = uint16(powMod(17, r, kemQ))
 
+		shoup[i] = uint16((uint32(zetas[i]) << 16) / kemQ)
+
 		gammas[i] = uint16(powMod(17, 2*r+1, kemQ))
 	}
 
-	return zetas, gammas
+	return zetas, shoup, gammas
 }
 
 // a < 2q: subtracts q when a >= q. A negative a - q wraps to at least 2^16 - q, setting bit 15.
@@ -74,6 +81,13 @@ func kemReduceOnce(a uint16) uint16 {
 	a -= kemQ
 
 	return a + kemQ&-(a>>15)
+}
+
+// a < 4q: subtracts 2q when a >= 2q, as kemReduceOnce does q.
+func kemReduceTwice(a uint16) uint16 {
+	a -= 2 * kemQ
+
+	return a + 2*kemQ&-(a>>15)
 }
 
 // Barrett reduction of a < 2^32: the estimate a * floor(2^32 / q) / 2^32 is the quotient or one
@@ -84,6 +98,18 @@ func kemReduce(a uint32) uint16 {
 	return kemReduceOnce(uint16(a - quotient*kemQ))
 }
 
+// The same for a < 2^16 with 32-bit arithmetic: a * floor(2^26 / q) / 2^26 is the quotient or one
+// less.
+func kemReduce16(a uint16) uint16 {
+	return kemReduceOnce(a - uint16((uint32(a)*((1<<26)/kemQ))>>26)*kemQ)
+}
+
+// a * zeta mod q, or that plus q, for any 16-bit a, where shoup = floor(zeta * 2^16 / q): the
+// quotient estimate a * shoup / 2^16 is exact or one too small (Shoup's modular multiplication).
+func kemMulShoup(a uint16, zeta, shoup uint32) uint16 {
+	return uint16(uint32(a)*zeta - (uint32(a)*shoup>>16)*kemQ)
+}
+
 func kemAdd(a, b uint16) uint16 {
 	return kemReduceOnce(a + b)
 }
@@ -92,69 +118,135 @@ func kemSub(a, b uint16) uint16 {
 	return kemReduceOnce(a - b + kemQ)
 }
 
+// NTT (FIPS 203, Algorithm 9) of canonical coefficients. A butterfly adds less than 2q to its
+// outputs, so after seven layers they stay below 15q < 2^16 and one reduction at the end suffices.
+// The layers go in pairs over groups of four coefficients held in locals, which halves the memory
+// traffic; the last layer also reduces.
 func kemNTT(f *kemPoly) {
-	i := 1
+	for length := 128; length >= 8; length /= 4 {
+		half := length / 2
 
-	for length := 128; length >= 2; length /= 2 {
-		for start := 0; start < 256; start += 2 * length {
-			zeta := uint32(kemZetas[i])
+		for k := range 128 / length {
+			block := f[2*length*k : 2*length*(k+1)]
 
-			i++
+			q0, q1, q2, q3 := block[:half], block[half:length], block[length:length+half], block[length+half:]
 
-			for j := start; j < start+length; j++ {
-				t := kemReduce(zeta * uint32(f[j+length]))
+			_, _, _ = q1[len(q0)-1], q2[len(q0)-1], q3[len(q0)-1]
 
-				f[j+length] = kemSub(f[j], t)
+			zeta, shoup := uint32(kemZetas[128/length+k]), uint32(kemShoup[128/length+k])
 
-				f[j] = kemAdd(f[j], t)
+			zetaLow, shoupLow := uint32(kemZetas[256/length+2*k]), uint32(kemShoup[256/length+2*k])
+
+			zetaHigh, shoupHigh := uint32(kemZetas[256/length+2*k+1]), uint32(kemShoup[256/length+2*k+1])
+
+			for j, a0 := range q0 {
+				a1, a2, a3 := q1[j], q2[j], q3[j]
+
+				t0, t1 := kemMulShoup(a2, zeta, shoup), kemMulShoup(a3, zeta, shoup)
+
+				a0, a1, a2, a3 = a0+t0, a1+t1, a0-t0+2*kemQ, a1-t1+2*kemQ
+
+				t0, t1 = kemMulShoup(a1, zetaLow, shoupLow), kemMulShoup(a3, zetaHigh, shoupHigh)
+
+				q0[j], q1[j], q2[j], q3[j] = a0+t0, a0-t0+2*kemQ, a2+t1, a2-t1+2*kemQ
 			}
 		}
 	}
+
+	for k := range 64 {
+		g := (*[4]uint16)(f[4*k : 4*k+4])
+
+		zeta, shoup := uint32(kemZetas[64+k]), uint32(kemShoup[64+k])
+
+		t0, t1 := kemMulShoup(g[2], zeta, shoup), kemMulShoup(g[3], zeta, shoup)
+
+		g[0], g[1], g[2], g[3] = kemReduce16(g[0]+t0), kemReduce16(g[1]+t1), kemReduce16(g[0]-t0+2*kemQ), kemReduce16(g[1]-t1+2*kemQ)
+	}
 }
 
+// The last layer of the inverse NTT multiplies by zeta_1 and then by 1/128; the factors are folded.
+var kemLastZeta = kemReduce(uint32(kemZetas[1]) * 3303)
+
+// Inverse NTT (FIPS 203, Algorithm 10) of canonical coefficients, which every butterfly keeps below
+// 2q. As in kemNTT the layers after the first go in pairs; the last pair also applies the factor
+// 1/128 and reduces.
 func kemInverseNTT(f *kemPoly) {
-	i := 127
+	for k := range 64 {
+		g := (*[4]uint16)(f[4*k : 4*k+4])
 
-	for length := 2; length <= 128; length *= 2 {
-		for start := 0; start < 256; start += 2 * length {
-			zeta := uint32(kemZetas[i])
+		zeta, shoup := uint32(kemZetas[127-k]), uint32(kemShoup[127-k])
 
-			i--
+		g[0], g[1], g[2], g[3] = g[0]+g[2], g[1]+g[3], kemMulShoup(g[2]-g[0]+2*kemQ, zeta, shoup), kemMulShoup(g[3]-g[1]+2*kemQ, zeta, shoup)
+	}
 
-			for j := start; j < start+length; j++ {
-				t := f[j]
+	for length := 8; length <= 32; length *= 4 {
+		half := length / 2
 
-				f[j] = kemAdd(t, f[j+length])
+		for k := range 128 / length {
+			block := f[2*length*k : 2*length*(k+1)]
 
-				f[j+length] = kemReduce(zeta * uint32(kemSub(f[j+length], t)))
+			q0, q1, q2, q3 := block[:half], block[half:length], block[length:length+half], block[length+half:]
+
+			_, _, _ = q1[len(q0)-1], q2[len(q0)-1], q3[len(q0)-1]
+
+			zetaLow, shoupLow := uint32(kemZetas[512/length-1-2*k]), uint32(kemShoup[512/length-1-2*k])
+
+			zetaHigh, shoupHigh := uint32(kemZetas[512/length-2-2*k]), uint32(kemShoup[512/length-2-2*k])
+
+			zeta, shoup := uint32(kemZetas[256/length-1-k]), uint32(kemShoup[256/length-1-k])
+
+			for j, a0 := range q0 {
+				a1, a2, a3 := q1[j], q2[j], q3[j]
+
+				a0, a1 = kemReduceTwice(a0+a1), kemMulShoup(a1-a0+2*kemQ, zetaLow, shoupLow)
+
+				a2, a3 = kemReduceTwice(a2+a3), kemMulShoup(a3-a2+2*kemQ, zetaHigh, shoupHigh)
+
+				q0[j], q1[j], q2[j], q3[j] = kemReduceTwice(a0+a2), kemReduceTwice(a1+a3), kemMulShoup(a2-a0+2*kemQ, zeta, shoup), kemMulShoup(a3-a1+2*kemQ, zeta, shoup)
 			}
 		}
 	}
 
-	for j := range f {
-		f[j] = kemReduce(uint32(f[j]) * 3303)
+	q0, q1, q2, q3 := f[:64], f[64:128], f[128:192], f[192:]
+
+	zeta, shoup := uint32(kemLastZeta), (uint32(kemLastZeta)<<16)/kemQ
+
+	for j, a0 := range q0 {
+		a1, a2, a3 := q1[j], q2[j], q3[j]
+
+		a0, a1 = kemReduceTwice(a0+a1), kemMulShoup(a1-a0+2*kemQ, uint32(kemZetas[3]), uint32(kemShoup[3]))
+
+		a2, a3 = kemReduceTwice(a2+a3), kemMulShoup(a3-a2+2*kemQ, uint32(kemZetas[2]), uint32(kemShoup[2]))
+
+		q0[j], q1[j] = kemReduceOnce(kemMulShoup(a0+a2, 3303, (3303<<16)/kemQ)), kemReduceOnce(kemMulShoup(a1+a3, 3303, (3303<<16)/kemQ))
+
+		q2[j], q3[j] = kemReduceOnce(kemMulShoup(a2-a0+2*kemQ, zeta, shoup)), kemReduceOnce(kemMulShoup(a3-a1+2*kemQ, zeta, shoup))
 	}
 }
 
-// acc += f * g in the NTT domain (FIPS 203, Algorithms 11 and 12).
-func kemMultiplyAdd(acc, f, g *kemPoly) {
+// acc += f * g in the NTT domain (FIPS 203, Algorithms 11 and 12) for canonical f and g, without the
+// final reduction: a product adds less than 2q^2 to a coefficient, so a canonical start plus k <= 4
+// products stays far below 2^32.
+func kemMultiplyAdd(acc *[256]uint32, f, g *kemPoly) {
 	for i := range 128 {
 		a0, a1 := uint32(f[2*i]), uint32(f[2*i+1])
 
 		b0, b1 := uint32(g[2*i]), uint32(g[2*i+1])
 
-		c0 := kemReduce(a0*b0 + uint32(kemReduce(a1*b1))*uint32(kemGammas[i]))
+		acc[2*i] += a0*b0 + uint32(kemReduce(a1*b1))*uint32(kemGammas[i])
 
-		c1 := kemReduce(a0*b1 + a1*b0)
-
-		acc[2*i] = kemAdd(acc[2*i], c0)
-
-		acc[2*i+1] = kemAdd(acc[2*i+1], c1)
+		acc[2*i+1] += a0*b1 + a1*b0
 	}
 }
 
-// Packs len(values) d-bit values into out, least significant bits first (FIPS 203 ByteEncode,
-// FIPS 204 SimpleBitPack).
+func kemReduceAll(f *kemPoly, acc *[256]uint32) {
+	for x, c := range acc {
+		f[x] = kemReduce(c)
+	}
+}
+
+// Packs the 256 d-bit values of a polynomial into 32d bytes, least significant bits first (FIPS 203
+// ByteEncode, FIPS 204 SimpleBitPack), 32 bits at a time; unpackBits reads them the same way.
 func packBits[T uint16 | uint32](out []byte, values []T, d int) {
 	var accumulator uint64
 
@@ -165,14 +257,14 @@ func packBits[T uint16 | uint32](out []byte, values []T, d int) {
 
 		bits += d
 
-		for bits >= 8 {
-			out[o] = byte(accumulator)
+		if bits >= 32 {
+			binary.LittleEndian.PutUint32(out[o:], uint32(accumulator))
 
-			o++
+			o += 4
 
-			accumulator >>= 8
+			accumulator >>= 32
 
-			bits -= 8
+			bits -= 32
 		}
 	}
 }
@@ -180,33 +272,46 @@ func packBits[T uint16 | uint32](out []byte, values []T, d int) {
 func unpackBits[T uint16 | uint32](values []T, in []byte, d int) {
 	var accumulator uint64
 
-	bits, i := 0, 0
+	bits, o := 0, 0
 
 	mask := uint64(1)<<d - 1
 
-	for _, b := range in {
-		accumulator |= uint64(b) << bits
+	for i := range values {
+		if bits < d {
+			accumulator |= uint64(binary.LittleEndian.Uint32(in[o:])) << bits
 
-		bits += 8
+			o += 4
 
-		for bits >= d && i < len(values) {
-			values[i] = T(accumulator & mask)
-
-			i++
-
-			accumulator >>= d
-
-			bits -= d
+			bits += 32
 		}
+
+		values[i] = T(accumulator & mask)
+
+		accumulator >>= d
+
+		bits -= d
+	}
+}
+
+// ByteEncode_12 of canonical coefficients, two in three bytes.
+func kemEncode12(out []byte, f *kemPoly) {
+	out = out[:384]
+
+	for i := range 128 {
+		a, b := f[2*i], f[2*i+1]
+
+		out[3*i], out[3*i+1], out[3*i+2] = byte(a), byte(a>>8)|byte(b<<4), byte(b>>4)
 	}
 }
 
 // ByteDecode_12 reduces modulo q; every 12-bit value is below 2q.
 func kemDecode12(f *kemPoly, in []byte) {
-	unpackBits(f[:], in[:384], 12)
+	in = in[:384]
 
-	for i := range f {
-		f[i] = kemReduceOnce(f[i])
+	for i := range 128 {
+		x, y, z := uint16(in[3*i]), uint16(in[3*i+1]), uint16(in[3*i+2])
+
+		f[2*i], f[2*i+1] = kemReduceOnce(x|(y&0x0f)<<8), kemReduceOnce(y>>4|z<<4)
 	}
 }
 
@@ -222,34 +327,31 @@ func kemDecompress(y uint16, d int) uint16 {
 	return uint16((uint32(y)*kemQ + 1<<(d-1)) >> d)
 }
 
-// SamplePolyCBD (FIPS 203, Algorithm 8) with the bits counted arithmetically.
+// SamplePolyCBD (FIPS 203, Algorithm 8). Masks add up each pair (eta = 2) or triple (eta = 3) of
+// neighbouring bits in place; a coefficient is the difference of two such sums.
 func kemSampleCBD(f *kemPoly, data []byte, eta int) {
-	var accumulator uint32
+	if eta == 2 {
+		for i := range 32 {
+			t := binary.LittleEndian.Uint32(data[4*i:])
 
-	bits, o := 0, 0
+			t = t&0x55555555 + t>>1&0x55555555
 
-	for i := range f {
-		for bits < 2*eta {
-			accumulator |= uint32(data[o]) << bits
-
-			o++
-
-			bits += 8
+			for j := range 8 {
+				f[8*i+j] = kemReduceOnce(uint16(t>>(4*j)&3 + kemQ - t>>(4*j+2)&3))
+			}
 		}
 
-		var x, y uint16
+		return
+	}
 
-		for j := range eta {
-			x += uint16(accumulator>>j) & 1
+	for i := range 64 {
+		t := uint32(data[3*i]) | uint32(data[3*i+1])<<8 | uint32(data[3*i+2])<<16
 
-			y += uint16(accumulator>>(eta+j)) & 1
+		t = t&0x249249 + t>>1&0x249249 + t>>2&0x249249
+
+		for j := range 4 {
+			f[4*i+j] = kemReduceOnce(uint16(t>>(6*j)&7 + kemQ - t>>(6*j+3)&7))
 		}
-
-		accumulator >>= 2 * eta
-
-		bits -= 2 * eta
-
-		f[i] = kemSub(x, y)
 	}
 }
 
@@ -264,7 +366,9 @@ func kemNoise(f *kemPoly, seed []byte, nonce byte, eta int) {
 	clear(data[:])
 }
 
-// SampleNTT (FIPS 203, Algorithm 7): rejection sampling over public data.
+// SampleNTT (FIPS 203, Algorithm 7): rejection sampling over public data. Each candidate is stored
+// and then kept or overwritten by advancing the count or not, which avoids a hard-to-predict branch;
+// the slot after the last one absorbs a candidate beyond the 256th.
 func kemSampleNTT(f *kemPoly, rho []byte, j, i byte) {
 	sponge := keccak{rate: 168, suffix: 0x1f}
 
@@ -274,45 +378,33 @@ func kemSampleNTT(f *kemPoly, rho []byte, j, i byte) {
 
 	var block [168]byte
 
+	var accepted [257]uint16
+
 	count := 0
 
 	for count < 256 {
 		sponge.read(block[:])
 
-		for offset := 0; offset < len(block) && count < 256; offset += 3 {
-			d1 := uint16(block[offset]) | uint16(block[offset+1]&0x0f)<<8
+		for rest := block[:]; len(rest) >= 3 && count < 256; rest = rest[3:] {
+			d1 := uint32(rest[0]) | uint32(rest[1]&0x0f)<<8
 
-			d2 := uint16(block[offset+1]>>4) | uint16(block[offset+2])<<4
+			d2 := uint32(rest[1]>>4) | uint32(rest[2])<<4
 
-			if d1 < kemQ {
-				f[count] = d1
+			accepted[count] = uint16(d1)
 
-				count++
-			}
+			count += int((d1 - kemQ) >> 31)
 
-			if d2 < kemQ && count < 256 {
-				f[count] = d2
+			accepted[count] = uint16(d2)
 
-				count++
-			}
-		}
-	}
-}
-
-// Entry i * k + j is A[i][j] = SampleNTT(rho || j || i).
-func kemMatrix(rho []byte, k int) []kemPoly {
-	a := make([]kemPoly, k*k)
-
-	for i := range k {
-		for j := range k {
-			kemSampleNTT(&a[i*k+j], rho, byte(j), byte(i))
+			count += int((d2 - kemQ) >> 31)
 		}
 	}
 
-	return a
+	copy(f[:], accepted[:256])
 }
 
-// K-PKE.KeyGen (FIPS 203, Algorithm 13).
+// K-PKE.KeyGen (FIPS 203, Algorithm 13). Each entry A[i][j] = SampleNTT(rho || j || i) is folded into
+// t as soon as it is sampled, so the matrix is never stored.
 func kpkeKeyGen(p *mlkemParams, d, ek, dkPKE []byte) {
 	k := p.k
 
@@ -322,11 +414,7 @@ func kpkeKeyGen(p *mlkemParams, d, ek, dkPKE []byte) {
 
 	rho, sigma := g[:32], g[32:]
 
-	a := kemMatrix(rho, k)
-
-	s := make([]kemPoly, k)
-
-	e := make([]kemPoly, k)
+	var s, e [4]kemPoly
 
 	for n := range k {
 		kemNoise(&s[n], sigma, byte(n), p.eta1)
@@ -340,46 +428,50 @@ func kpkeKeyGen(p *mlkemParams, d, ek, dkPKE []byte) {
 		kemNTT(&e[n])
 	}
 
-	for i := range k {
-		t := e[i]
+	var a kemPoly
 
-		for j := range k {
-			kemMultiplyAdd(&t, &a[i*k+j], &s[j])
+	var acc [256]uint32
+
+	for i := range k {
+		for x, c := range e[i] {
+			acc[x] = uint32(c)
 		}
 
-		packBits(ek[384*i:], t[:], 12)
+		for j := range k {
+			kemSampleNTT(&a, rho, byte(j), byte(i))
+
+			kemMultiplyAdd(&acc, &a, &s[j])
+		}
+
+		kemReduceAll(&a, &acc)
+
+		kemEncode12(ek[384*i:], &a)
 	}
 
 	copy(ek[384*k:], rho)
 
 	for i := range k {
-		packBits(dkPKE[384*i:], s[i][:], 12)
+		kemEncode12(dkPKE[384*i:], &s[i])
 	}
 
 	clear(g[:])
 
-	clear(s)
+	clear(s[:])
 
-	clear(e)
+	clear(e[:])
 }
 
-// K-PKE.Encrypt (FIPS 203, Algorithm 14).
+// K-PKE.Encrypt (FIPS 203, Algorithm 14), with the transposed matrix sampled entry by entry.
 func kpkeEncrypt(p *mlkemParams, ek, m, r, c []byte) {
 	k, du, dv := p.k, p.du, p.dv
 
-	t := make([]kemPoly, k)
+	rho := ek[384*k : 384*k+32]
 
-	for i := range k {
-		kemDecode12(&t[i], ek[384*i:])
-	}
+	var y [4]kemPoly
 
-	a := kemMatrix(ek[384*k:], k)
+	var a, e, u kemPoly
 
-	y := make([]kemPoly, k)
-
-	e1 := make([]kemPoly, k)
-
-	var e2, mu, u, v kemPoly
+	var acc [256]uint32
 
 	for n := range k {
 		kemNoise(&y[n], r, byte(n), p.eta1)
@@ -387,60 +479,70 @@ func kpkeEncrypt(p *mlkemParams, ek, m, r, c []byte) {
 		kemNTT(&y[n])
 	}
 
-	for n := range k {
-		kemNoise(&e1[n], r, byte(k+n), p.eta2)
-	}
-
-	kemNoise(&e2, r, byte(2*k), p.eta2)
-
 	for i := range k {
-		clear(u[:])
+		clear(acc[:])
 
 		for j := range k {
-			kemMultiplyAdd(&u, &a[j*k+i], &y[j])
+			kemSampleNTT(&a, rho, byte(i), byte(j))
+
+			kemMultiplyAdd(&acc, &a, &y[j])
 		}
+
+		kemReduceAll(&u, &acc)
 
 		kemInverseNTT(&u)
 
+		kemNoise(&e, r, byte(k+i), p.eta2)
+
 		for x := range u {
-			u[x] = kemCompress(kemAdd(u[x], e1[i][x]), du)
+			u[x] = kemCompress(kemAdd(u[x], e[x]), du)
 		}
 
 		packBits(c[32*du*i:], u[:], du)
 	}
 
-	unpackBits(mu[:], m, 1)
+	clear(acc[:])
 
 	for j := range k {
-		kemMultiplyAdd(&v, &t[j], &y[j])
+		kemDecode12(&a, ek[384*j:])
+
+		kemMultiplyAdd(&acc, &a, &y[j])
 	}
 
-	kemInverseNTT(&v)
+	kemReduceAll(&u, &acc)
 
-	for x := range v {
-		v[x] = kemCompress(kemAdd(kemAdd(v[x], e2[x]), kemDecompress(mu[x], 1)), dv)
+	kemInverseNTT(&u)
+
+	kemNoise(&e, r, byte(2*k), p.eta2)
+
+	var mu kemPoly
+
+	unpackBits(mu[:], m, 1)
+
+	for x := range u {
+		u[x] = kemCompress(kemAdd(kemAdd(u[x], e[x]), kemDecompress(mu[x], 1)), dv)
 	}
 
-	packBits(c[32*du*k:], v[:], dv)
+	packBits(c[32*du*k:], u[:], dv)
 
-	clear(y)
+	clear(y[:])
 
-	clear(e1)
-
-	clear(e2[:])
+	clear(e[:])
 
 	clear(mu[:])
 
 	clear(u[:])
 
-	clear(v[:])
+	clear(acc[:])
 }
 
 // K-PKE.Decrypt (FIPS 203, Algorithm 15).
 func kpkeDecrypt(p *mlkemParams, dkPKE, c, m []byte) {
 	k, du, dv := p.k, p.du, p.dv
 
-	var u, s, product, w kemPoly
+	var u, s, w kemPoly
+
+	var acc [256]uint32
 
 	for i := range k {
 		unpackBits(u[:], c[32*du*i:32*du*(i+1)], du)
@@ -453,24 +555,28 @@ func kpkeDecrypt(p *mlkemParams, dkPKE, c, m []byte) {
 
 		kemDecode12(&s, dkPKE[384*i:])
 
-		kemMultiplyAdd(&product, &s, &u)
+		kemMultiplyAdd(&acc, &s, &u)
 	}
 
-	kemInverseNTT(&product)
+	kemReduceAll(&u, &acc)
+
+	kemInverseNTT(&u)
 
 	unpackBits(w[:], c[32*du*k:], dv)
 
 	for x := range w {
-		w[x] = kemCompress(kemSub(kemDecompress(w[x], dv), product[x]), 1)
+		w[x] = kemCompress(kemSub(kemDecompress(w[x], dv), u[x]), 1)
 	}
 
 	packBits(m, w[:], 1)
 
 	clear(s[:])
 
-	clear(product[:])
+	clear(u[:])
 
 	clear(w[:])
+
+	clear(acc[:])
 }
 
 func mlkemKeyGen(p *mlkemParams, d, z []byte) (ek, dk []byte) {
@@ -526,19 +632,19 @@ func mlkemDecapsulate(p *mlkemParams, dk, c []byte) []byte {
 
 	var rejected [32]byte
 
+	var reencrypted [1568]byte
+
 	kpkeDecrypt(p, dkPKE, c, m[:])
 
 	sha3Sum512(g[:], m[:], h)
 
 	shake256Sum(rejected[:], z, c)
 
-	reencrypted := make([]byte, len(c))
-
-	kpkeEncrypt(p, ek, m[:], g[32:], reencrypted)
+	kpkeEncrypt(p, ek, m[:], g[32:], reencrypted[:len(c)])
 
 	sharedSecret := make([]byte, 32)
 
-	selectBytes(equalBit(c, reencrypted), g[:32], rejected[:], sharedSecret)
+	selectBytes(equalBit(c, reencrypted[:len(c)]), g[:32], rejected[:], sharedSecret)
 
 	clear(m[:])
 
@@ -546,7 +652,7 @@ func mlkemDecapsulate(p *mlkemParams, dk, c []byte) []byte {
 
 	clear(rejected[:])
 
-	clear(reencrypted)
+	clear(reencrypted[:])
 
 	return sharedSecret
 }

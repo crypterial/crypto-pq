@@ -30,13 +30,16 @@ var iv512256 = [8]uint64{
 }
 
 // One SHA-256 round. The caller rotates the roles of the working variables instead of moving
-// them: the new e and the new a replace the variables that held d and h.
-func sha256Round(a, b, c, d, e, f, g, h, w, k uint32) (uint32, uint32) {
-	t1 := h + (bits.RotateLeft32(e, -6) ^ bits.RotateLeft32(e, -11) ^ bits.RotateLeft32(e, -25)) + (g ^ (e & (f ^ g))) + k + w
+// them: the new e and the new a replace the variables that held d and h. Ch(e, f, g) is the sum of
+// its two disjoint halves, and Maj(a, b, c) is ((a ^ b) & (b ^ c)) ^ b, where b ^ c is the a ^ b of
+// the previous round: the caller passes it as bc and keeps the returned a ^ b for the next round.
+// Both forms take fewer instructions than the textbook ones.
+func sha256Round(a, b, bc, d, e, f, g, h, w, k uint32) (uint32, uint32, uint32) {
+	t1 := h + k + w + e&f + g&^e + (bits.RotateLeft32(e, -6) ^ bits.RotateLeft32(e, -11) ^ bits.RotateLeft32(e, -25))
 
-	t2 := (bits.RotateLeft32(a, -2) ^ bits.RotateLeft32(a, -13) ^ bits.RotateLeft32(a, -22)) + ((a & b) | (c & (a | b)))
+	ab := a ^ b
 
-	return d + t1, t1 + t2
+	return d + t1, t1 + (bits.RotateLeft32(a, -2) ^ bits.RotateLeft32(a, -13) ^ bits.RotateLeft32(a, -22)) + (ab&bc ^ b), ab
 }
 
 // The schedule word W[t] from W[t-2], W[t-7], W[t-15] and W[t-16].
@@ -53,229 +56,231 @@ func sha256Block(state [8]uint32, w [16]uint32) [8]uint32 {
 
 	w8, w9, w10, w11, w12, w13, w14, w15 := w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]
 
-	d, h = sha256Round(a, b, c, d, e, f, g, h, w0, 0x428a2f98)
+	bc := b ^ c
 
-	c, g = sha256Round(h, a, b, c, d, e, f, g, w1, 0x71374491)
+	d, h, bc = sha256Round(a, b, bc, d, e, f, g, h, w0, 0x428a2f98)
 
-	b, f = sha256Round(g, h, a, b, c, d, e, f, w2, 0xb5c0fbcf)
+	c, g, bc = sha256Round(h, a, bc, c, d, e, f, g, w1, 0x71374491)
 
-	a, e = sha256Round(f, g, h, a, b, c, d, e, w3, 0xe9b5dba5)
+	b, f, bc = sha256Round(g, h, bc, b, c, d, e, f, w2, 0xb5c0fbcf)
 
-	h, d = sha256Round(e, f, g, h, a, b, c, d, w4, 0x3956c25b)
+	a, e, bc = sha256Round(f, g, bc, a, b, c, d, e, w3, 0xe9b5dba5)
 
-	g, c = sha256Round(d, e, f, g, h, a, b, c, w5, 0x59f111f1)
+	h, d, bc = sha256Round(e, f, bc, h, a, b, c, d, w4, 0x3956c25b)
 
-	f, b = sha256Round(c, d, e, f, g, h, a, b, w6, 0x923f82a4)
+	g, c, bc = sha256Round(d, e, bc, g, h, a, b, c, w5, 0x59f111f1)
 
-	e, a = sha256Round(b, c, d, e, f, g, h, a, w7, 0xab1c5ed5)
+	f, b, bc = sha256Round(c, d, bc, f, g, h, a, b, w6, 0x923f82a4)
 
-	d, h = sha256Round(a, b, c, d, e, f, g, h, w8, 0xd807aa98)
+	e, a, bc = sha256Round(b, c, bc, e, f, g, h, a, w7, 0xab1c5ed5)
 
-	c, g = sha256Round(h, a, b, c, d, e, f, g, w9, 0x12835b01)
+	d, h, bc = sha256Round(a, b, bc, d, e, f, g, h, w8, 0xd807aa98)
 
-	b, f = sha256Round(g, h, a, b, c, d, e, f, w10, 0x243185be)
+	c, g, bc = sha256Round(h, a, bc, c, d, e, f, g, w9, 0x12835b01)
 
-	a, e = sha256Round(f, g, h, a, b, c, d, e, w11, 0x550c7dc3)
+	b, f, bc = sha256Round(g, h, bc, b, c, d, e, f, w10, 0x243185be)
 
-	h, d = sha256Round(e, f, g, h, a, b, c, d, w12, 0x72be5d74)
+	a, e, bc = sha256Round(f, g, bc, a, b, c, d, e, w11, 0x550c7dc3)
 
-	g, c = sha256Round(d, e, f, g, h, a, b, c, w13, 0x80deb1fe)
+	h, d, bc = sha256Round(e, f, bc, h, a, b, c, d, w12, 0x72be5d74)
 
-	f, b = sha256Round(c, d, e, f, g, h, a, b, w14, 0x9bdc06a7)
+	g, c, bc = sha256Round(d, e, bc, g, h, a, b, c, w13, 0x80deb1fe)
 
-	e, a = sha256Round(b, c, d, e, f, g, h, a, w15, 0xc19bf174)
+	f, b, bc = sha256Round(c, d, bc, f, g, h, a, b, w14, 0x9bdc06a7)
 
-	w0 = sha256Schedule(w14, w9, w1, w0)
-
-	d, h = sha256Round(a, b, c, d, e, f, g, h, w0, 0xe49b69c1)
-
-	w1 = sha256Schedule(w15, w10, w2, w1)
-
-	c, g = sha256Round(h, a, b, c, d, e, f, g, w1, 0xefbe4786)
-
-	w2 = sha256Schedule(w0, w11, w3, w2)
-
-	b, f = sha256Round(g, h, a, b, c, d, e, f, w2, 0x0fc19dc6)
-
-	w3 = sha256Schedule(w1, w12, w4, w3)
-
-	a, e = sha256Round(f, g, h, a, b, c, d, e, w3, 0x240ca1cc)
-
-	w4 = sha256Schedule(w2, w13, w5, w4)
-
-	h, d = sha256Round(e, f, g, h, a, b, c, d, w4, 0x2de92c6f)
-
-	w5 = sha256Schedule(w3, w14, w6, w5)
-
-	g, c = sha256Round(d, e, f, g, h, a, b, c, w5, 0x4a7484aa)
-
-	w6 = sha256Schedule(w4, w15, w7, w6)
-
-	f, b = sha256Round(c, d, e, f, g, h, a, b, w6, 0x5cb0a9dc)
-
-	w7 = sha256Schedule(w5, w0, w8, w7)
-
-	e, a = sha256Round(b, c, d, e, f, g, h, a, w7, 0x76f988da)
-
-	w8 = sha256Schedule(w6, w1, w9, w8)
-
-	d, h = sha256Round(a, b, c, d, e, f, g, h, w8, 0x983e5152)
-
-	w9 = sha256Schedule(w7, w2, w10, w9)
-
-	c, g = sha256Round(h, a, b, c, d, e, f, g, w9, 0xa831c66d)
-
-	w10 = sha256Schedule(w8, w3, w11, w10)
-
-	b, f = sha256Round(g, h, a, b, c, d, e, f, w10, 0xb00327c8)
-
-	w11 = sha256Schedule(w9, w4, w12, w11)
-
-	a, e = sha256Round(f, g, h, a, b, c, d, e, w11, 0xbf597fc7)
-
-	w12 = sha256Schedule(w10, w5, w13, w12)
-
-	h, d = sha256Round(e, f, g, h, a, b, c, d, w12, 0xc6e00bf3)
-
-	w13 = sha256Schedule(w11, w6, w14, w13)
-
-	g, c = sha256Round(d, e, f, g, h, a, b, c, w13, 0xd5a79147)
-
-	w14 = sha256Schedule(w12, w7, w15, w14)
-
-	f, b = sha256Round(c, d, e, f, g, h, a, b, w14, 0x06ca6351)
-
-	w15 = sha256Schedule(w13, w8, w0, w15)
-
-	e, a = sha256Round(b, c, d, e, f, g, h, a, w15, 0x14292967)
+	e, a, bc = sha256Round(b, c, bc, e, f, g, h, a, w15, 0xc19bf174)
 
 	w0 = sha256Schedule(w14, w9, w1, w0)
 
-	d, h = sha256Round(a, b, c, d, e, f, g, h, w0, 0x27b70a85)
+	d, h, bc = sha256Round(a, b, bc, d, e, f, g, h, w0, 0xe49b69c1)
 
 	w1 = sha256Schedule(w15, w10, w2, w1)
 
-	c, g = sha256Round(h, a, b, c, d, e, f, g, w1, 0x2e1b2138)
+	c, g, bc = sha256Round(h, a, bc, c, d, e, f, g, w1, 0xefbe4786)
 
 	w2 = sha256Schedule(w0, w11, w3, w2)
 
-	b, f = sha256Round(g, h, a, b, c, d, e, f, w2, 0x4d2c6dfc)
+	b, f, bc = sha256Round(g, h, bc, b, c, d, e, f, w2, 0x0fc19dc6)
 
 	w3 = sha256Schedule(w1, w12, w4, w3)
 
-	a, e = sha256Round(f, g, h, a, b, c, d, e, w3, 0x53380d13)
+	a, e, bc = sha256Round(f, g, bc, a, b, c, d, e, w3, 0x240ca1cc)
 
 	w4 = sha256Schedule(w2, w13, w5, w4)
 
-	h, d = sha256Round(e, f, g, h, a, b, c, d, w4, 0x650a7354)
+	h, d, bc = sha256Round(e, f, bc, h, a, b, c, d, w4, 0x2de92c6f)
 
 	w5 = sha256Schedule(w3, w14, w6, w5)
 
-	g, c = sha256Round(d, e, f, g, h, a, b, c, w5, 0x766a0abb)
+	g, c, bc = sha256Round(d, e, bc, g, h, a, b, c, w5, 0x4a7484aa)
 
 	w6 = sha256Schedule(w4, w15, w7, w6)
 
-	f, b = sha256Round(c, d, e, f, g, h, a, b, w6, 0x81c2c92e)
+	f, b, bc = sha256Round(c, d, bc, f, g, h, a, b, w6, 0x5cb0a9dc)
 
 	w7 = sha256Schedule(w5, w0, w8, w7)
 
-	e, a = sha256Round(b, c, d, e, f, g, h, a, w7, 0x92722c85)
+	e, a, bc = sha256Round(b, c, bc, e, f, g, h, a, w7, 0x76f988da)
 
 	w8 = sha256Schedule(w6, w1, w9, w8)
 
-	d, h = sha256Round(a, b, c, d, e, f, g, h, w8, 0xa2bfe8a1)
+	d, h, bc = sha256Round(a, b, bc, d, e, f, g, h, w8, 0x983e5152)
 
 	w9 = sha256Schedule(w7, w2, w10, w9)
 
-	c, g = sha256Round(h, a, b, c, d, e, f, g, w9, 0xa81a664b)
+	c, g, bc = sha256Round(h, a, bc, c, d, e, f, g, w9, 0xa831c66d)
 
 	w10 = sha256Schedule(w8, w3, w11, w10)
 
-	b, f = sha256Round(g, h, a, b, c, d, e, f, w10, 0xc24b8b70)
+	b, f, bc = sha256Round(g, h, bc, b, c, d, e, f, w10, 0xb00327c8)
 
 	w11 = sha256Schedule(w9, w4, w12, w11)
 
-	a, e = sha256Round(f, g, h, a, b, c, d, e, w11, 0xc76c51a3)
+	a, e, bc = sha256Round(f, g, bc, a, b, c, d, e, w11, 0xbf597fc7)
 
 	w12 = sha256Schedule(w10, w5, w13, w12)
 
-	h, d = sha256Round(e, f, g, h, a, b, c, d, w12, 0xd192e819)
+	h, d, bc = sha256Round(e, f, bc, h, a, b, c, d, w12, 0xc6e00bf3)
 
 	w13 = sha256Schedule(w11, w6, w14, w13)
 
-	g, c = sha256Round(d, e, f, g, h, a, b, c, w13, 0xd6990624)
+	g, c, bc = sha256Round(d, e, bc, g, h, a, b, c, w13, 0xd5a79147)
 
 	w14 = sha256Schedule(w12, w7, w15, w14)
 
-	f, b = sha256Round(c, d, e, f, g, h, a, b, w14, 0xf40e3585)
+	f, b, bc = sha256Round(c, d, bc, f, g, h, a, b, w14, 0x06ca6351)
 
 	w15 = sha256Schedule(w13, w8, w0, w15)
 
-	e, a = sha256Round(b, c, d, e, f, g, h, a, w15, 0x106aa070)
+	e, a, bc = sha256Round(b, c, bc, e, f, g, h, a, w15, 0x14292967)
 
 	w0 = sha256Schedule(w14, w9, w1, w0)
 
-	d, h = sha256Round(a, b, c, d, e, f, g, h, w0, 0x19a4c116)
+	d, h, bc = sha256Round(a, b, bc, d, e, f, g, h, w0, 0x27b70a85)
 
 	w1 = sha256Schedule(w15, w10, w2, w1)
 
-	c, g = sha256Round(h, a, b, c, d, e, f, g, w1, 0x1e376c08)
+	c, g, bc = sha256Round(h, a, bc, c, d, e, f, g, w1, 0x2e1b2138)
 
 	w2 = sha256Schedule(w0, w11, w3, w2)
 
-	b, f = sha256Round(g, h, a, b, c, d, e, f, w2, 0x2748774c)
+	b, f, bc = sha256Round(g, h, bc, b, c, d, e, f, w2, 0x4d2c6dfc)
 
 	w3 = sha256Schedule(w1, w12, w4, w3)
 
-	a, e = sha256Round(f, g, h, a, b, c, d, e, w3, 0x34b0bcb5)
+	a, e, bc = sha256Round(f, g, bc, a, b, c, d, e, w3, 0x53380d13)
 
 	w4 = sha256Schedule(w2, w13, w5, w4)
 
-	h, d = sha256Round(e, f, g, h, a, b, c, d, w4, 0x391c0cb3)
+	h, d, bc = sha256Round(e, f, bc, h, a, b, c, d, w4, 0x650a7354)
 
 	w5 = sha256Schedule(w3, w14, w6, w5)
 
-	g, c = sha256Round(d, e, f, g, h, a, b, c, w5, 0x4ed8aa4a)
+	g, c, bc = sha256Round(d, e, bc, g, h, a, b, c, w5, 0x766a0abb)
 
 	w6 = sha256Schedule(w4, w15, w7, w6)
 
-	f, b = sha256Round(c, d, e, f, g, h, a, b, w6, 0x5b9cca4f)
+	f, b, bc = sha256Round(c, d, bc, f, g, h, a, b, w6, 0x81c2c92e)
 
 	w7 = sha256Schedule(w5, w0, w8, w7)
 
-	e, a = sha256Round(b, c, d, e, f, g, h, a, w7, 0x682e6ff3)
+	e, a, bc = sha256Round(b, c, bc, e, f, g, h, a, w7, 0x92722c85)
 
 	w8 = sha256Schedule(w6, w1, w9, w8)
 
-	d, h = sha256Round(a, b, c, d, e, f, g, h, w8, 0x748f82ee)
+	d, h, bc = sha256Round(a, b, bc, d, e, f, g, h, w8, 0xa2bfe8a1)
 
 	w9 = sha256Schedule(w7, w2, w10, w9)
 
-	c, g = sha256Round(h, a, b, c, d, e, f, g, w9, 0x78a5636f)
+	c, g, bc = sha256Round(h, a, bc, c, d, e, f, g, w9, 0xa81a664b)
 
 	w10 = sha256Schedule(w8, w3, w11, w10)
 
-	b, f = sha256Round(g, h, a, b, c, d, e, f, w10, 0x84c87814)
+	b, f, bc = sha256Round(g, h, bc, b, c, d, e, f, w10, 0xc24b8b70)
 
 	w11 = sha256Schedule(w9, w4, w12, w11)
 
-	a, e = sha256Round(f, g, h, a, b, c, d, e, w11, 0x8cc70208)
+	a, e, bc = sha256Round(f, g, bc, a, b, c, d, e, w11, 0xc76c51a3)
 
 	w12 = sha256Schedule(w10, w5, w13, w12)
 
-	h, d = sha256Round(e, f, g, h, a, b, c, d, w12, 0x90befffa)
+	h, d, bc = sha256Round(e, f, bc, h, a, b, c, d, w12, 0xd192e819)
 
 	w13 = sha256Schedule(w11, w6, w14, w13)
 
-	g, c = sha256Round(d, e, f, g, h, a, b, c, w13, 0xa4506ceb)
+	g, c, bc = sha256Round(d, e, bc, g, h, a, b, c, w13, 0xd6990624)
 
 	w14 = sha256Schedule(w12, w7, w15, w14)
 
-	f, b = sha256Round(c, d, e, f, g, h, a, b, w14, 0xbef9a3f7)
+	f, b, bc = sha256Round(c, d, bc, f, g, h, a, b, w14, 0xf40e3585)
 
 	w15 = sha256Schedule(w13, w8, w0, w15)
 
-	e, a = sha256Round(b, c, d, e, f, g, h, a, w15, 0xc67178f2)
+	e, a, bc = sha256Round(b, c, bc, e, f, g, h, a, w15, 0x106aa070)
+
+	w0 = sha256Schedule(w14, w9, w1, w0)
+
+	d, h, bc = sha256Round(a, b, bc, d, e, f, g, h, w0, 0x19a4c116)
+
+	w1 = sha256Schedule(w15, w10, w2, w1)
+
+	c, g, bc = sha256Round(h, a, bc, c, d, e, f, g, w1, 0x1e376c08)
+
+	w2 = sha256Schedule(w0, w11, w3, w2)
+
+	b, f, bc = sha256Round(g, h, bc, b, c, d, e, f, w2, 0x2748774c)
+
+	w3 = sha256Schedule(w1, w12, w4, w3)
+
+	a, e, bc = sha256Round(f, g, bc, a, b, c, d, e, w3, 0x34b0bcb5)
+
+	w4 = sha256Schedule(w2, w13, w5, w4)
+
+	h, d, bc = sha256Round(e, f, bc, h, a, b, c, d, w4, 0x391c0cb3)
+
+	w5 = sha256Schedule(w3, w14, w6, w5)
+
+	g, c, bc = sha256Round(d, e, bc, g, h, a, b, c, w5, 0x4ed8aa4a)
+
+	w6 = sha256Schedule(w4, w15, w7, w6)
+
+	f, b, bc = sha256Round(c, d, bc, f, g, h, a, b, w6, 0x5b9cca4f)
+
+	w7 = sha256Schedule(w5, w0, w8, w7)
+
+	e, a, bc = sha256Round(b, c, bc, e, f, g, h, a, w7, 0x682e6ff3)
+
+	w8 = sha256Schedule(w6, w1, w9, w8)
+
+	d, h, bc = sha256Round(a, b, bc, d, e, f, g, h, w8, 0x748f82ee)
+
+	w9 = sha256Schedule(w7, w2, w10, w9)
+
+	c, g, bc = sha256Round(h, a, bc, c, d, e, f, g, w9, 0x78a5636f)
+
+	w10 = sha256Schedule(w8, w3, w11, w10)
+
+	b, f, bc = sha256Round(g, h, bc, b, c, d, e, f, w10, 0x84c87814)
+
+	w11 = sha256Schedule(w9, w4, w12, w11)
+
+	a, e, bc = sha256Round(f, g, bc, a, b, c, d, e, w11, 0x8cc70208)
+
+	w12 = sha256Schedule(w10, w5, w13, w12)
+
+	h, d, bc = sha256Round(e, f, bc, h, a, b, c, d, w12, 0x90befffa)
+
+	w13 = sha256Schedule(w11, w6, w14, w13)
+
+	g, c, bc = sha256Round(d, e, bc, g, h, a, b, c, w13, 0xa4506ceb)
+
+	w14 = sha256Schedule(w12, w7, w15, w14)
+
+	f, b, bc = sha256Round(c, d, bc, f, g, h, a, b, w14, 0xbef9a3f7)
+
+	w15 = sha256Schedule(w13, w8, w0, w15)
+
+	e, a, bc = sha256Round(b, c, bc, e, f, g, h, a, w15, 0xc67178f2)
 
 	return [8]uint32{state[0] + a, state[1] + b, state[2] + c, state[3] + d, state[4] + e, state[5] + f, state[6] + g, state[7] + h}
 }
@@ -304,12 +309,12 @@ func compress256(state *[8]uint32, p []byte) {
 }
 
 // The SHA-512 counterpart of sha256Round.
-func sha512Round(a, b, c, d, e, f, g, h, w, k uint64) (uint64, uint64) {
-	t1 := h + (bits.RotateLeft64(e, -14) ^ bits.RotateLeft64(e, -18) ^ bits.RotateLeft64(e, -41)) + (g ^ (e & (f ^ g))) + k + w
+func sha512Round(a, b, bc, d, e, f, g, h, w, k uint64) (uint64, uint64, uint64) {
+	t1 := h + k + w + e&f + g&^e + (bits.RotateLeft64(e, -14) ^ bits.RotateLeft64(e, -18) ^ bits.RotateLeft64(e, -41))
 
-	t2 := (bits.RotateLeft64(a, -28) ^ bits.RotateLeft64(a, -34) ^ bits.RotateLeft64(a, -39)) + ((a & b) | (c & (a | b)))
+	ab := a ^ b
 
-	return d + t1, t1 + t2
+	return d + t1, t1 + (bits.RotateLeft64(a, -28) ^ bits.RotateLeft64(a, -34) ^ bits.RotateLeft64(a, -39)) + (ab&bc ^ b), ab
 }
 
 func sha512Schedule(w2, w7, w15, w16 uint64) uint64 {
@@ -324,293 +329,295 @@ func sha512Block(state [8]uint64, w [16]uint64) [8]uint64 {
 
 	w8, w9, w10, w11, w12, w13, w14, w15 := w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]
 
-	d, h = sha512Round(a, b, c, d, e, f, g, h, w0, 0x428a2f98d728ae22)
+	bc := b ^ c
 
-	c, g = sha512Round(h, a, b, c, d, e, f, g, w1, 0x7137449123ef65cd)
+	d, h, bc = sha512Round(a, b, bc, d, e, f, g, h, w0, 0x428a2f98d728ae22)
 
-	b, f = sha512Round(g, h, a, b, c, d, e, f, w2, 0xb5c0fbcfec4d3b2f)
+	c, g, bc = sha512Round(h, a, bc, c, d, e, f, g, w1, 0x7137449123ef65cd)
 
-	a, e = sha512Round(f, g, h, a, b, c, d, e, w3, 0xe9b5dba58189dbbc)
+	b, f, bc = sha512Round(g, h, bc, b, c, d, e, f, w2, 0xb5c0fbcfec4d3b2f)
 
-	h, d = sha512Round(e, f, g, h, a, b, c, d, w4, 0x3956c25bf348b538)
+	a, e, bc = sha512Round(f, g, bc, a, b, c, d, e, w3, 0xe9b5dba58189dbbc)
 
-	g, c = sha512Round(d, e, f, g, h, a, b, c, w5, 0x59f111f1b605d019)
+	h, d, bc = sha512Round(e, f, bc, h, a, b, c, d, w4, 0x3956c25bf348b538)
 
-	f, b = sha512Round(c, d, e, f, g, h, a, b, w6, 0x923f82a4af194f9b)
+	g, c, bc = sha512Round(d, e, bc, g, h, a, b, c, w5, 0x59f111f1b605d019)
 
-	e, a = sha512Round(b, c, d, e, f, g, h, a, w7, 0xab1c5ed5da6d8118)
+	f, b, bc = sha512Round(c, d, bc, f, g, h, a, b, w6, 0x923f82a4af194f9b)
 
-	d, h = sha512Round(a, b, c, d, e, f, g, h, w8, 0xd807aa98a3030242)
+	e, a, bc = sha512Round(b, c, bc, e, f, g, h, a, w7, 0xab1c5ed5da6d8118)
 
-	c, g = sha512Round(h, a, b, c, d, e, f, g, w9, 0x12835b0145706fbe)
+	d, h, bc = sha512Round(a, b, bc, d, e, f, g, h, w8, 0xd807aa98a3030242)
 
-	b, f = sha512Round(g, h, a, b, c, d, e, f, w10, 0x243185be4ee4b28c)
+	c, g, bc = sha512Round(h, a, bc, c, d, e, f, g, w9, 0x12835b0145706fbe)
 
-	a, e = sha512Round(f, g, h, a, b, c, d, e, w11, 0x550c7dc3d5ffb4e2)
+	b, f, bc = sha512Round(g, h, bc, b, c, d, e, f, w10, 0x243185be4ee4b28c)
 
-	h, d = sha512Round(e, f, g, h, a, b, c, d, w12, 0x72be5d74f27b896f)
+	a, e, bc = sha512Round(f, g, bc, a, b, c, d, e, w11, 0x550c7dc3d5ffb4e2)
 
-	g, c = sha512Round(d, e, f, g, h, a, b, c, w13, 0x80deb1fe3b1696b1)
+	h, d, bc = sha512Round(e, f, bc, h, a, b, c, d, w12, 0x72be5d74f27b896f)
 
-	f, b = sha512Round(c, d, e, f, g, h, a, b, w14, 0x9bdc06a725c71235)
+	g, c, bc = sha512Round(d, e, bc, g, h, a, b, c, w13, 0x80deb1fe3b1696b1)
 
-	e, a = sha512Round(b, c, d, e, f, g, h, a, w15, 0xc19bf174cf692694)
+	f, b, bc = sha512Round(c, d, bc, f, g, h, a, b, w14, 0x9bdc06a725c71235)
 
-	w0 = sha512Schedule(w14, w9, w1, w0)
-
-	d, h = sha512Round(a, b, c, d, e, f, g, h, w0, 0xe49b69c19ef14ad2)
-
-	w1 = sha512Schedule(w15, w10, w2, w1)
-
-	c, g = sha512Round(h, a, b, c, d, e, f, g, w1, 0xefbe4786384f25e3)
-
-	w2 = sha512Schedule(w0, w11, w3, w2)
-
-	b, f = sha512Round(g, h, a, b, c, d, e, f, w2, 0x0fc19dc68b8cd5b5)
-
-	w3 = sha512Schedule(w1, w12, w4, w3)
-
-	a, e = sha512Round(f, g, h, a, b, c, d, e, w3, 0x240ca1cc77ac9c65)
-
-	w4 = sha512Schedule(w2, w13, w5, w4)
-
-	h, d = sha512Round(e, f, g, h, a, b, c, d, w4, 0x2de92c6f592b0275)
-
-	w5 = sha512Schedule(w3, w14, w6, w5)
-
-	g, c = sha512Round(d, e, f, g, h, a, b, c, w5, 0x4a7484aa6ea6e483)
-
-	w6 = sha512Schedule(w4, w15, w7, w6)
-
-	f, b = sha512Round(c, d, e, f, g, h, a, b, w6, 0x5cb0a9dcbd41fbd4)
-
-	w7 = sha512Schedule(w5, w0, w8, w7)
-
-	e, a = sha512Round(b, c, d, e, f, g, h, a, w7, 0x76f988da831153b5)
-
-	w8 = sha512Schedule(w6, w1, w9, w8)
-
-	d, h = sha512Round(a, b, c, d, e, f, g, h, w8, 0x983e5152ee66dfab)
-
-	w9 = sha512Schedule(w7, w2, w10, w9)
-
-	c, g = sha512Round(h, a, b, c, d, e, f, g, w9, 0xa831c66d2db43210)
-
-	w10 = sha512Schedule(w8, w3, w11, w10)
-
-	b, f = sha512Round(g, h, a, b, c, d, e, f, w10, 0xb00327c898fb213f)
-
-	w11 = sha512Schedule(w9, w4, w12, w11)
-
-	a, e = sha512Round(f, g, h, a, b, c, d, e, w11, 0xbf597fc7beef0ee4)
-
-	w12 = sha512Schedule(w10, w5, w13, w12)
-
-	h, d = sha512Round(e, f, g, h, a, b, c, d, w12, 0xc6e00bf33da88fc2)
-
-	w13 = sha512Schedule(w11, w6, w14, w13)
-
-	g, c = sha512Round(d, e, f, g, h, a, b, c, w13, 0xd5a79147930aa725)
-
-	w14 = sha512Schedule(w12, w7, w15, w14)
-
-	f, b = sha512Round(c, d, e, f, g, h, a, b, w14, 0x06ca6351e003826f)
-
-	w15 = sha512Schedule(w13, w8, w0, w15)
-
-	e, a = sha512Round(b, c, d, e, f, g, h, a, w15, 0x142929670a0e6e70)
+	e, a, bc = sha512Round(b, c, bc, e, f, g, h, a, w15, 0xc19bf174cf692694)
 
 	w0 = sha512Schedule(w14, w9, w1, w0)
 
-	d, h = sha512Round(a, b, c, d, e, f, g, h, w0, 0x27b70a8546d22ffc)
+	d, h, bc = sha512Round(a, b, bc, d, e, f, g, h, w0, 0xe49b69c19ef14ad2)
 
 	w1 = sha512Schedule(w15, w10, w2, w1)
 
-	c, g = sha512Round(h, a, b, c, d, e, f, g, w1, 0x2e1b21385c26c926)
+	c, g, bc = sha512Round(h, a, bc, c, d, e, f, g, w1, 0xefbe4786384f25e3)
 
 	w2 = sha512Schedule(w0, w11, w3, w2)
 
-	b, f = sha512Round(g, h, a, b, c, d, e, f, w2, 0x4d2c6dfc5ac42aed)
+	b, f, bc = sha512Round(g, h, bc, b, c, d, e, f, w2, 0x0fc19dc68b8cd5b5)
 
 	w3 = sha512Schedule(w1, w12, w4, w3)
 
-	a, e = sha512Round(f, g, h, a, b, c, d, e, w3, 0x53380d139d95b3df)
+	a, e, bc = sha512Round(f, g, bc, a, b, c, d, e, w3, 0x240ca1cc77ac9c65)
 
 	w4 = sha512Schedule(w2, w13, w5, w4)
 
-	h, d = sha512Round(e, f, g, h, a, b, c, d, w4, 0x650a73548baf63de)
+	h, d, bc = sha512Round(e, f, bc, h, a, b, c, d, w4, 0x2de92c6f592b0275)
 
 	w5 = sha512Schedule(w3, w14, w6, w5)
 
-	g, c = sha512Round(d, e, f, g, h, a, b, c, w5, 0x766a0abb3c77b2a8)
+	g, c, bc = sha512Round(d, e, bc, g, h, a, b, c, w5, 0x4a7484aa6ea6e483)
 
 	w6 = sha512Schedule(w4, w15, w7, w6)
 
-	f, b = sha512Round(c, d, e, f, g, h, a, b, w6, 0x81c2c92e47edaee6)
+	f, b, bc = sha512Round(c, d, bc, f, g, h, a, b, w6, 0x5cb0a9dcbd41fbd4)
 
 	w7 = sha512Schedule(w5, w0, w8, w7)
 
-	e, a = sha512Round(b, c, d, e, f, g, h, a, w7, 0x92722c851482353b)
+	e, a, bc = sha512Round(b, c, bc, e, f, g, h, a, w7, 0x76f988da831153b5)
 
 	w8 = sha512Schedule(w6, w1, w9, w8)
 
-	d, h = sha512Round(a, b, c, d, e, f, g, h, w8, 0xa2bfe8a14cf10364)
+	d, h, bc = sha512Round(a, b, bc, d, e, f, g, h, w8, 0x983e5152ee66dfab)
 
 	w9 = sha512Schedule(w7, w2, w10, w9)
 
-	c, g = sha512Round(h, a, b, c, d, e, f, g, w9, 0xa81a664bbc423001)
+	c, g, bc = sha512Round(h, a, bc, c, d, e, f, g, w9, 0xa831c66d2db43210)
 
 	w10 = sha512Schedule(w8, w3, w11, w10)
 
-	b, f = sha512Round(g, h, a, b, c, d, e, f, w10, 0xc24b8b70d0f89791)
+	b, f, bc = sha512Round(g, h, bc, b, c, d, e, f, w10, 0xb00327c898fb213f)
 
 	w11 = sha512Schedule(w9, w4, w12, w11)
 
-	a, e = sha512Round(f, g, h, a, b, c, d, e, w11, 0xc76c51a30654be30)
+	a, e, bc = sha512Round(f, g, bc, a, b, c, d, e, w11, 0xbf597fc7beef0ee4)
 
 	w12 = sha512Schedule(w10, w5, w13, w12)
 
-	h, d = sha512Round(e, f, g, h, a, b, c, d, w12, 0xd192e819d6ef5218)
+	h, d, bc = sha512Round(e, f, bc, h, a, b, c, d, w12, 0xc6e00bf33da88fc2)
 
 	w13 = sha512Schedule(w11, w6, w14, w13)
 
-	g, c = sha512Round(d, e, f, g, h, a, b, c, w13, 0xd69906245565a910)
+	g, c, bc = sha512Round(d, e, bc, g, h, a, b, c, w13, 0xd5a79147930aa725)
 
 	w14 = sha512Schedule(w12, w7, w15, w14)
 
-	f, b = sha512Round(c, d, e, f, g, h, a, b, w14, 0xf40e35855771202a)
+	f, b, bc = sha512Round(c, d, bc, f, g, h, a, b, w14, 0x06ca6351e003826f)
 
 	w15 = sha512Schedule(w13, w8, w0, w15)
 
-	e, a = sha512Round(b, c, d, e, f, g, h, a, w15, 0x106aa07032bbd1b8)
+	e, a, bc = sha512Round(b, c, bc, e, f, g, h, a, w15, 0x142929670a0e6e70)
 
 	w0 = sha512Schedule(w14, w9, w1, w0)
 
-	d, h = sha512Round(a, b, c, d, e, f, g, h, w0, 0x19a4c116b8d2d0c8)
+	d, h, bc = sha512Round(a, b, bc, d, e, f, g, h, w0, 0x27b70a8546d22ffc)
 
 	w1 = sha512Schedule(w15, w10, w2, w1)
 
-	c, g = sha512Round(h, a, b, c, d, e, f, g, w1, 0x1e376c085141ab53)
+	c, g, bc = sha512Round(h, a, bc, c, d, e, f, g, w1, 0x2e1b21385c26c926)
 
 	w2 = sha512Schedule(w0, w11, w3, w2)
 
-	b, f = sha512Round(g, h, a, b, c, d, e, f, w2, 0x2748774cdf8eeb99)
+	b, f, bc = sha512Round(g, h, bc, b, c, d, e, f, w2, 0x4d2c6dfc5ac42aed)
 
 	w3 = sha512Schedule(w1, w12, w4, w3)
 
-	a, e = sha512Round(f, g, h, a, b, c, d, e, w3, 0x34b0bcb5e19b48a8)
+	a, e, bc = sha512Round(f, g, bc, a, b, c, d, e, w3, 0x53380d139d95b3df)
 
 	w4 = sha512Schedule(w2, w13, w5, w4)
 
-	h, d = sha512Round(e, f, g, h, a, b, c, d, w4, 0x391c0cb3c5c95a63)
+	h, d, bc = sha512Round(e, f, bc, h, a, b, c, d, w4, 0x650a73548baf63de)
 
 	w5 = sha512Schedule(w3, w14, w6, w5)
 
-	g, c = sha512Round(d, e, f, g, h, a, b, c, w5, 0x4ed8aa4ae3418acb)
+	g, c, bc = sha512Round(d, e, bc, g, h, a, b, c, w5, 0x766a0abb3c77b2a8)
 
 	w6 = sha512Schedule(w4, w15, w7, w6)
 
-	f, b = sha512Round(c, d, e, f, g, h, a, b, w6, 0x5b9cca4f7763e373)
+	f, b, bc = sha512Round(c, d, bc, f, g, h, a, b, w6, 0x81c2c92e47edaee6)
 
 	w7 = sha512Schedule(w5, w0, w8, w7)
 
-	e, a = sha512Round(b, c, d, e, f, g, h, a, w7, 0x682e6ff3d6b2b8a3)
+	e, a, bc = sha512Round(b, c, bc, e, f, g, h, a, w7, 0x92722c851482353b)
 
 	w8 = sha512Schedule(w6, w1, w9, w8)
 
-	d, h = sha512Round(a, b, c, d, e, f, g, h, w8, 0x748f82ee5defb2fc)
+	d, h, bc = sha512Round(a, b, bc, d, e, f, g, h, w8, 0xa2bfe8a14cf10364)
 
 	w9 = sha512Schedule(w7, w2, w10, w9)
 
-	c, g = sha512Round(h, a, b, c, d, e, f, g, w9, 0x78a5636f43172f60)
+	c, g, bc = sha512Round(h, a, bc, c, d, e, f, g, w9, 0xa81a664bbc423001)
 
 	w10 = sha512Schedule(w8, w3, w11, w10)
 
-	b, f = sha512Round(g, h, a, b, c, d, e, f, w10, 0x84c87814a1f0ab72)
+	b, f, bc = sha512Round(g, h, bc, b, c, d, e, f, w10, 0xc24b8b70d0f89791)
 
 	w11 = sha512Schedule(w9, w4, w12, w11)
 
-	a, e = sha512Round(f, g, h, a, b, c, d, e, w11, 0x8cc702081a6439ec)
+	a, e, bc = sha512Round(f, g, bc, a, b, c, d, e, w11, 0xc76c51a30654be30)
 
 	w12 = sha512Schedule(w10, w5, w13, w12)
 
-	h, d = sha512Round(e, f, g, h, a, b, c, d, w12, 0x90befffa23631e28)
+	h, d, bc = sha512Round(e, f, bc, h, a, b, c, d, w12, 0xd192e819d6ef5218)
 
 	w13 = sha512Schedule(w11, w6, w14, w13)
 
-	g, c = sha512Round(d, e, f, g, h, a, b, c, w13, 0xa4506cebde82bde9)
+	g, c, bc = sha512Round(d, e, bc, g, h, a, b, c, w13, 0xd69906245565a910)
 
 	w14 = sha512Schedule(w12, w7, w15, w14)
 
-	f, b = sha512Round(c, d, e, f, g, h, a, b, w14, 0xbef9a3f7b2c67915)
+	f, b, bc = sha512Round(c, d, bc, f, g, h, a, b, w14, 0xf40e35855771202a)
 
 	w15 = sha512Schedule(w13, w8, w0, w15)
 
-	e, a = sha512Round(b, c, d, e, f, g, h, a, w15, 0xc67178f2e372532b)
+	e, a, bc = sha512Round(b, c, bc, e, f, g, h, a, w15, 0x106aa07032bbd1b8)
 
 	w0 = sha512Schedule(w14, w9, w1, w0)
 
-	d, h = sha512Round(a, b, c, d, e, f, g, h, w0, 0xca273eceea26619c)
+	d, h, bc = sha512Round(a, b, bc, d, e, f, g, h, w0, 0x19a4c116b8d2d0c8)
 
 	w1 = sha512Schedule(w15, w10, w2, w1)
 
-	c, g = sha512Round(h, a, b, c, d, e, f, g, w1, 0xd186b8c721c0c207)
+	c, g, bc = sha512Round(h, a, bc, c, d, e, f, g, w1, 0x1e376c085141ab53)
 
 	w2 = sha512Schedule(w0, w11, w3, w2)
 
-	b, f = sha512Round(g, h, a, b, c, d, e, f, w2, 0xeada7dd6cde0eb1e)
+	b, f, bc = sha512Round(g, h, bc, b, c, d, e, f, w2, 0x2748774cdf8eeb99)
 
 	w3 = sha512Schedule(w1, w12, w4, w3)
 
-	a, e = sha512Round(f, g, h, a, b, c, d, e, w3, 0xf57d4f7fee6ed178)
+	a, e, bc = sha512Round(f, g, bc, a, b, c, d, e, w3, 0x34b0bcb5e19b48a8)
 
 	w4 = sha512Schedule(w2, w13, w5, w4)
 
-	h, d = sha512Round(e, f, g, h, a, b, c, d, w4, 0x06f067aa72176fba)
+	h, d, bc = sha512Round(e, f, bc, h, a, b, c, d, w4, 0x391c0cb3c5c95a63)
 
 	w5 = sha512Schedule(w3, w14, w6, w5)
 
-	g, c = sha512Round(d, e, f, g, h, a, b, c, w5, 0x0a637dc5a2c898a6)
+	g, c, bc = sha512Round(d, e, bc, g, h, a, b, c, w5, 0x4ed8aa4ae3418acb)
 
 	w6 = sha512Schedule(w4, w15, w7, w6)
 
-	f, b = sha512Round(c, d, e, f, g, h, a, b, w6, 0x113f9804bef90dae)
+	f, b, bc = sha512Round(c, d, bc, f, g, h, a, b, w6, 0x5b9cca4f7763e373)
 
 	w7 = sha512Schedule(w5, w0, w8, w7)
 
-	e, a = sha512Round(b, c, d, e, f, g, h, a, w7, 0x1b710b35131c471b)
+	e, a, bc = sha512Round(b, c, bc, e, f, g, h, a, w7, 0x682e6ff3d6b2b8a3)
 
 	w8 = sha512Schedule(w6, w1, w9, w8)
 
-	d, h = sha512Round(a, b, c, d, e, f, g, h, w8, 0x28db77f523047d84)
+	d, h, bc = sha512Round(a, b, bc, d, e, f, g, h, w8, 0x748f82ee5defb2fc)
 
 	w9 = sha512Schedule(w7, w2, w10, w9)
 
-	c, g = sha512Round(h, a, b, c, d, e, f, g, w9, 0x32caab7b40c72493)
+	c, g, bc = sha512Round(h, a, bc, c, d, e, f, g, w9, 0x78a5636f43172f60)
 
 	w10 = sha512Schedule(w8, w3, w11, w10)
 
-	b, f = sha512Round(g, h, a, b, c, d, e, f, w10, 0x3c9ebe0a15c9bebc)
+	b, f, bc = sha512Round(g, h, bc, b, c, d, e, f, w10, 0x84c87814a1f0ab72)
 
 	w11 = sha512Schedule(w9, w4, w12, w11)
 
-	a, e = sha512Round(f, g, h, a, b, c, d, e, w11, 0x431d67c49c100d4c)
+	a, e, bc = sha512Round(f, g, bc, a, b, c, d, e, w11, 0x8cc702081a6439ec)
 
 	w12 = sha512Schedule(w10, w5, w13, w12)
 
-	h, d = sha512Round(e, f, g, h, a, b, c, d, w12, 0x4cc5d4becb3e42b6)
+	h, d, bc = sha512Round(e, f, bc, h, a, b, c, d, w12, 0x90befffa23631e28)
 
 	w13 = sha512Schedule(w11, w6, w14, w13)
 
-	g, c = sha512Round(d, e, f, g, h, a, b, c, w13, 0x597f299cfc657e2a)
+	g, c, bc = sha512Round(d, e, bc, g, h, a, b, c, w13, 0xa4506cebde82bde9)
 
 	w14 = sha512Schedule(w12, w7, w15, w14)
 
-	f, b = sha512Round(c, d, e, f, g, h, a, b, w14, 0x5fcb6fab3ad6faec)
+	f, b, bc = sha512Round(c, d, bc, f, g, h, a, b, w14, 0xbef9a3f7b2c67915)
 
 	w15 = sha512Schedule(w13, w8, w0, w15)
 
-	e, a = sha512Round(b, c, d, e, f, g, h, a, w15, 0x6c44198c4a475817)
+	e, a, bc = sha512Round(b, c, bc, e, f, g, h, a, w15, 0xc67178f2e372532b)
+
+	w0 = sha512Schedule(w14, w9, w1, w0)
+
+	d, h, bc = sha512Round(a, b, bc, d, e, f, g, h, w0, 0xca273eceea26619c)
+
+	w1 = sha512Schedule(w15, w10, w2, w1)
+
+	c, g, bc = sha512Round(h, a, bc, c, d, e, f, g, w1, 0xd186b8c721c0c207)
+
+	w2 = sha512Schedule(w0, w11, w3, w2)
+
+	b, f, bc = sha512Round(g, h, bc, b, c, d, e, f, w2, 0xeada7dd6cde0eb1e)
+
+	w3 = sha512Schedule(w1, w12, w4, w3)
+
+	a, e, bc = sha512Round(f, g, bc, a, b, c, d, e, w3, 0xf57d4f7fee6ed178)
+
+	w4 = sha512Schedule(w2, w13, w5, w4)
+
+	h, d, bc = sha512Round(e, f, bc, h, a, b, c, d, w4, 0x06f067aa72176fba)
+
+	w5 = sha512Schedule(w3, w14, w6, w5)
+
+	g, c, bc = sha512Round(d, e, bc, g, h, a, b, c, w5, 0x0a637dc5a2c898a6)
+
+	w6 = sha512Schedule(w4, w15, w7, w6)
+
+	f, b, bc = sha512Round(c, d, bc, f, g, h, a, b, w6, 0x113f9804bef90dae)
+
+	w7 = sha512Schedule(w5, w0, w8, w7)
+
+	e, a, bc = sha512Round(b, c, bc, e, f, g, h, a, w7, 0x1b710b35131c471b)
+
+	w8 = sha512Schedule(w6, w1, w9, w8)
+
+	d, h, bc = sha512Round(a, b, bc, d, e, f, g, h, w8, 0x28db77f523047d84)
+
+	w9 = sha512Schedule(w7, w2, w10, w9)
+
+	c, g, bc = sha512Round(h, a, bc, c, d, e, f, g, w9, 0x32caab7b40c72493)
+
+	w10 = sha512Schedule(w8, w3, w11, w10)
+
+	b, f, bc = sha512Round(g, h, bc, b, c, d, e, f, w10, 0x3c9ebe0a15c9bebc)
+
+	w11 = sha512Schedule(w9, w4, w12, w11)
+
+	a, e, bc = sha512Round(f, g, bc, a, b, c, d, e, w11, 0x431d67c49c100d4c)
+
+	w12 = sha512Schedule(w10, w5, w13, w12)
+
+	h, d, bc = sha512Round(e, f, bc, h, a, b, c, d, w12, 0x4cc5d4becb3e42b6)
+
+	w13 = sha512Schedule(w11, w6, w14, w13)
+
+	g, c, bc = sha512Round(d, e, bc, g, h, a, b, c, w13, 0x597f299cfc657e2a)
+
+	w14 = sha512Schedule(w12, w7, w15, w14)
+
+	f, b, bc = sha512Round(c, d, bc, f, g, h, a, b, w14, 0x5fcb6fab3ad6faec)
+
+	w15 = sha512Schedule(w13, w8, w0, w15)
+
+	e, a, bc = sha512Round(b, c, bc, e, f, g, h, a, w15, 0x6c44198c4a475817)
 
 	return [8]uint64{state[0] + a, state[1] + b, state[2] + c, state[3] + d, state[4] + e, state[5] + f, state[6] + g, state[7] + h}
 }
@@ -648,6 +655,14 @@ type sha256Engine struct {
 
 func newSha256(iv *[8]uint32, size int) *sha256Engine {
 	return &sha256Engine{state: *iv, size: size}
+}
+
+func sha256Digest(iv *[8]uint32, size int, data []byte) []byte {
+	e := sha256Engine{state: *iv, size: size}
+
+	e.update(data)
+
+	return e.digest()
 }
 
 func (e *sha256Engine) update(data []byte) {
@@ -723,6 +738,14 @@ type sha512Engine struct {
 
 func newSha512(iv *[8]uint64, size int) *sha512Engine {
 	return &sha512Engine{state: *iv, size: size}
+}
+
+func sha512Digest(iv *[8]uint64, size int, data []byte) []byte {
+	e := sha512Engine{state: *iv, size: size}
+
+	e.update(data)
+
+	return e.digest()
 }
 
 func (e *sha512Engine) update(data []byte) {

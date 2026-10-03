@@ -1,6 +1,9 @@
 package cryptopq
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"math/bits"
+)
 
 // SLH-DSA (FIPS 205). Every tree and chain index is public, so the code branches on them freely.
 
@@ -95,13 +98,15 @@ func (a *slhAddress) retyped(kind int) slhAddress {
 }
 
 // F, H, T and PRF bound to one public seed (FIPS 205, section 11). For SHA2 the block holding
-// PK.seed and its zero padding is compressed once and that state reused for every call.
+// PK.seed and its zero padding is compressed once and that state reused for every call; for SHAKE
+// PK.seed is kept as Keccak lanes.
 type slhContext struct {
 	p      *slhParams
 	pkSeed []byte
 	skSeed []byte
 	small  [8]uint32
 	large  [8]uint64
+	lanes  [4]uint64
 	values []byte
 	input  []byte
 }
@@ -111,94 +116,170 @@ func newSlhContext(p *slhParams, pkSeed, skSeed []byte) *slhContext {
 
 	c := &slhContext{p: p, pkSeed: pkSeed, skSeed: skSeed, values: make([]byte, size), input: make([]byte, 32+p.n+size)}
 
-	if !p.shake {
-		var block [128]byte
+	if p.shake {
+		for i := range p.n / 8 {
+			c.lanes[i] = binary.LittleEndian.Uint64(pkSeed[8*i:])
+		}
 
-		copy(block[:], pkSeed)
-
-		c.small = iv256
-
-		compress256(&c.small, block[:64])
-
-		c.large = iv512
-
-		compress512(&c.large, block[:])
+		return c
 	}
+
+	var block [128]byte
+
+	copy(block[:], pkSeed)
+
+	c.small = iv256
+
+	compress256(&c.small, block[:64])
+
+	c.large = iv512
+
+	compress512(&c.large, block[:])
 
 	return c
 }
 
-// Hashes ADRS and the message into out[:n], with SHA-512 for H and T when n > 16. SHAKE hashes
-// PK.seed || ADRS || M; SHA2 hashes the 22-byte ADRSc || M after the precomputed PK.seed block
-// (FIPS 205, section 11.2). The input is built in a stack buffer from a copy of the address.
-func (c *slhContext) hash(out []byte, adrs *slhAddress, message []byte, wide bool) {
-	n := c.p.n
+// F, H and PRF hash ADRS with a message of n or 2n bytes, which always fits in a single block, so
+// these functions assemble that block directly: for SHAKE, PK.seed || ADRS || M fills whole lanes;
+// for SHA2, ADRSc || M (FIPS 205, section 11.2) follows the precomputed PK.seed block, and the
+// 22-byte ADRSc puts M two bytes into a word.
+func (c *slhContext) shakeShort(out []byte, adrs *slhAddress, message []byte) {
+	var s [25]uint64
 
-	words := *adrs
+	k := c.p.n / 8
 
-	var block [136]byte
-
-	if c.p.shake {
-		copy(block[:], c.pkSeed)
-
-		for i, word := range words {
-			block[n+4*i], block[n+4*i+1], block[n+4*i+2], block[n+4*i+3] = byte(word>>24), byte(word>>16), byte(word>>8), byte(word)
-		}
-
-		if length := n + 32 + len(message); length < len(block) {
-			copy(block[n+32:], message)
-
-			shake256Short(block[:length], out[:n])
-		} else {
-			shake256Sum(out[:n], block[:n+32], message)
-		}
-
-		return
+	for i, lane := range c.lanes[:k] {
+		s[i] = lane
 	}
-
-	block[0], block[9] = byte(words[0]), byte(words[4])
 
 	for i := range 4 {
-		shift := 24 - 8*i
-
-		block[1+i], block[5+i] = byte(words[2]>>shift), byte(words[3]>>shift)
-
-		block[10+i], block[14+i], block[18+i] = byte(words[5]>>shift), byte(words[6]>>shift), byte(words[7]>>shift)
+		s[k+i] = uint64(bits.ReverseBytes32(adrs[2*i])) | uint64(bits.ReverseBytes32(adrs[2*i+1]))<<32
 	}
 
-	var data []byte
+	k += 4
 
-	if len(message) <= len(block)-22 {
-		data = block[:22+len(message)]
-	} else {
-		copy(c.input, block[:22])
-
-		data = c.input[:22+len(message)]
+	for i := range len(message) / 8 {
+		s[k+i] = binary.LittleEndian.Uint64(message[8*i:])
 	}
 
-	copy(data[22:], message)
+	s[k+len(message)/8] = 0x1f
 
-	c.finish(out, data, wide)
+	s[16] ^= 0x80 << 56
+
+	permute(&s)
+
+	for i := range c.p.n / 8 {
+		binary.LittleEndian.PutUint64(out[8*i:], s[i])
+	}
 }
 
-func (c *slhContext) finish(out, data []byte, wide bool) {
-	if wide && c.p.n > 16 {
-		sha512Finish(c.large, 128, data, out[:c.p.n])
-	} else {
-		sha256Finish(c.small, 64, data, out[:c.p.n])
+func (c *slhContext) sha256Short(out []byte, adrs *slhAddress, message []byte) {
+	a, m := adrs, len(message)
+
+	var w [16]uint32
+
+	w[0], w[1], w[2] = a[0]<<24|a[2]>>8, a[2]<<24|a[3]>>8, a[3]<<24|a[4]<<16|a[5]>>16
+
+	w[3], w[4], w[5] = a[5]<<16|a[6]>>16, a[6]<<16|a[7]>>16, a[7]<<16|uint32(message[0])<<8|uint32(message[1])
+
+	for i := 1; i < m/4; i++ {
+		w[5+i] = binary.BigEndian.Uint32(message[4*i-2:])
+	}
+
+	w[5+m/4] = uint32(message[m-2])<<24 | uint32(message[m-1])<<16 | 0x8000
+
+	w[15] = uint32(64+22+m) * 8
+
+	s := sha256Block(c.small, w)
+
+	for i := range c.p.n / 4 {
+		binary.BigEndian.PutUint32(out[4*i:], s[i])
+	}
+}
+
+// H with n = 24 or 32 uses SHA-512 after the 128-byte PK.seed block.
+func (c *slhContext) sha512Short(out []byte, adrs *slhAddress, message []byte) {
+	a, m := adrs, len(message)
+
+	var w [16]uint64
+
+	w[0] = uint64(a[0])<<56 | uint64(a[2])<<24 | uint64(a[3]>>8)
+
+	w[1] = uint64(a[3])<<56 | uint64(a[4])<<48 | uint64(a[5])<<16 | uint64(a[6]>>16)
+
+	w[2] = uint64(a[6])<<48 | uint64(a[7])<<16 | uint64(message[0])<<8 | uint64(message[1])
+
+	last := (22 + m) / 8
+
+	for j := 3; j < last; j++ {
+		w[j] = binary.BigEndian.Uint64(message[8*j-22:])
+	}
+
+	w[last] = uint64(binary.BigEndian.Uint32(message[m-6:]))<<32 | uint64(binary.BigEndian.Uint16(message[m-2:]))<<16 | 0x8000
+
+	w[15] = uint64(128+22+m) * 8
+
+	s := sha512Block(c.large, w)
+
+	for i := range c.p.n / 8 {
+		binary.BigEndian.PutUint64(out[8*i:], s[i])
 	}
 }
 
 func (c *slhContext) f(out []byte, adrs *slhAddress, message []byte) {
-	c.hash(out, adrs, message, false)
+	if c.p.shake {
+		c.shakeShort(out, adrs, message)
+	} else {
+		c.sha256Short(out, adrs, message)
+	}
 }
 
 func (c *slhContext) h(out []byte, adrs *slhAddress, message []byte) {
-	c.hash(out, adrs, message, true)
+	switch {
+	case c.p.shake:
+		c.shakeShort(out, adrs, message)
+	case c.p.n == 16:
+		c.sha256Short(out, adrs, message)
+	default:
+		c.sha512Short(out, adrs, message)
+	}
 }
 
 func (c *slhContext) prf(out []byte, adrs *slhAddress) {
-	c.hash(out, adrs, c.skSeed, false)
+	c.f(out, adrs, c.skSeed)
+}
+
+// T_l over a message of many blocks, with SHA-512 for SHA2 when n > 16.
+func (c *slhContext) t(out []byte, adrs *slhAddress, message []byte) {
+	n := c.p.n
+
+	var address [32]byte
+
+	for i, word := range adrs {
+		binary.BigEndian.PutUint32(address[4*i:], word)
+	}
+
+	if c.p.shake {
+		shake256Sum(out[:n], c.pkSeed, address[:], message)
+
+		return
+	}
+
+	data := c.input[:22+len(message)]
+
+	data[0], data[9] = address[3], address[19]
+
+	copy(data[1:9], address[8:16])
+
+	copy(data[10:22], address[20:])
+
+	copy(data[22:], message)
+
+	if n > 16 {
+		sha512Finish(c.large, 128, data, out[:n])
+	} else {
+		sha256Finish(c.small, 64, data, out[:n])
+	}
 }
 
 func (c *slhContext) chain(x []byte, start, steps int, adrs *slhAddress) {
@@ -250,7 +331,7 @@ func (c *slhContext) wotsDigits(digits []uint32, message []byte) {
 func (c *slhContext) wotsPublic(out []byte, adrs *slhAddress, values []byte) {
 	public := adrs.retyped(slhWotsPublicKey)
 
-	c.hash(out, &public, values, true)
+	c.t(out, &public, values)
 }
 
 func (c *slhContext) wotsPublicKey(out []byte, adrs *slhAddress) {
@@ -556,7 +637,7 @@ func (c *slhContext) forsPublicKeyFromSignature(out, signature, digest []byte, a
 
 	public := adrs.retyped(slhForsRoots)
 
-	c.hash(out, &public, roots, true)
+	c.t(out, &public, roots)
 }
 
 func slhRoot(p *slhParams, skSeed, pkSeed []byte) []byte {
