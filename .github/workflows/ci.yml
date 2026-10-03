@@ -78,6 +78,7 @@ jobs:
           package-manager-cache: false
       - run: npm ci --ignore-scripts
       - run: npm run check
+      - run: node tools/generate.ts --check
       - run: npm test
       - run: npm run build
 

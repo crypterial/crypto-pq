@@ -228,11 +228,11 @@ export class HmacAlgorithm {
   }
 }
 
-function sha256(iv: readonly number[], digestSize: number): Spec {
+function sha256(iv: Int32Array, digestSize: number): Spec {
   return { digestSize, blockSize: 64, create: () => new Sha256(iv, digestSize) };
 }
 
-function sha512(iv: readonly number[], digestSize: number): Spec {
+function sha512(iv: Int32Array, digestSize: number): Spec {
   return { digestSize, blockSize: 128, create: () => new Sha512(iv, digestSize) };
 }
 

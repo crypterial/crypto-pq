@@ -15,7 +15,7 @@ export abstract class Blocks {
     if (this.buffered > 0) {
       offset = Math.min(block - this.buffered, data.length);
 
-      this.buffer.set(data.subarray(0, offset), this.buffered);
+      copy(data, 0, this.buffer, this.buffered, offset);
 
       this.buffered += offset;
 
@@ -32,10 +32,21 @@ export abstract class Blocks {
       this.process(data, offset);
     }
 
-    this.buffer.set(data.subarray(offset), 0);
+    copy(data, offset, this.buffer, 0, data.length - offset);
 
     this.buffered = data.length - offset;
   }
 
   protected abstract process(data: Uint8Array, offset: number): void;
+}
+
+// Short copies, the usual case here, are cheaper as a loop than as a subarray view and set().
+function copy(from: Uint8Array, fromOffset: number, to: Uint8Array, toOffset: number, count: number): void {
+  if (count > 64) {
+    to.set(from.subarray(fromOffset, fromOffset + count), toOffset);
+  } else {
+    for (let i = 0; i < count; i++) {
+      to[toOffset + i] = from[fromOffset + i];
+    }
+  }
 }

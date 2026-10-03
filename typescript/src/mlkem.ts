@@ -1,5 +1,6 @@
 import { equal, wipe } from "./bytes.ts";
-import { sha3, shake128, shake256 } from "./primitives.ts";
+import { Keccak } from "./keccak.ts";
+import { sha3, shake256 } from "./primitives.ts";
 
 const Q = 3329;
 
@@ -142,32 +143,61 @@ function inverseNtt(r: Int16Array): void {
   }
 }
 
-// Returns sum(a[i] * b[i] * R^-1) in the NTT domain, reduced to [-(q - 1) / 2, (q - 1) / 2].
+// Returns sum(a[i] * b[i] * R^-1) in the NTT domain, reduced to [-(q - 1) / 2, (q - 1) / 2]. Each
+// group of four coefficients is summed over the vector in registers; the sums stay below 8q < 2^15.
 function multiplyAccumulate(a: Int16Array[], b: Int16Array[]): Int16Array {
   const r = new Int16Array(256);
 
-  for (let i = 0; i < a.length; i++) {
-    const f = a[i];
+  for (let j = 0; j < 64; j++) {
+    const zeta = ZETAS[64 + j];
 
-    const g = b[i];
+    const at = 4 * j;
 
-    for (let j = 0; j < 64; j++) {
-      const zeta = ZETAS[64 + j];
+    let r0 = 0;
 
-      for (let half = 0; half < 2; half++) {
-        const at = 4 * j + 2 * half;
+    let r1 = 0;
 
-        const gamma = half === 0 ? zeta : -zeta;
+    let r2 = 0;
 
-        r[at] += fqmul(fqmul(f[at + 1], g[at + 1]), gamma) + fqmul(f[at], g[at]);
+    let r3 = 0;
 
-        r[at + 1] += fqmul(f[at], g[at + 1]) + fqmul(f[at + 1], g[at]);
-      }
+    for (let i = 0; i < a.length; i++) {
+      const f = a[i];
+
+      const g = b[i];
+
+      const f0 = f[at];
+
+      const f1 = f[at + 1];
+
+      const f2 = f[at + 2];
+
+      const f3 = f[at + 3];
+
+      const g0 = g[at];
+
+      const g1 = g[at + 1];
+
+      const g2 = g[at + 2];
+
+      const g3 = g[at + 3];
+
+      r0 += fqmul(fqmul(f1, g1), zeta) + fqmul(f0, g0);
+
+      r1 += fqmul(f0, g1) + fqmul(f1, g0);
+
+      r2 += fqmul(fqmul(f3, g3), -zeta) + fqmul(f2, g2);
+
+      r3 += fqmul(f2, g3) + fqmul(f3, g2);
     }
-  }
 
-  for (let j = 0; j < 256; j++) {
-    r[j] = barrettReduce(r[j]);
+    r[at] = barrettReduce(r0);
+
+    r[at + 1] = barrettReduce(r1);
+
+    r[at + 2] = barrettReduce(r2);
+
+    r[at + 3] = barrettReduce(r3);
   }
 
   return r;
@@ -274,15 +304,25 @@ function decompressPolynomial(data: Uint8Array, offset: number, d: number): Int1
   return f;
 }
 
+// The XOF streams of the samplers, reused from one polynomial to the next; reset() also clears what
+// the previous seed left in them.
+const XOF128 = new Keccak(168, 0x1f);
+
+const XOF256 = new Keccak(136, 0x1f);
+
+const NOISE = new Uint8Array(192);
+
 function sampleNtt(seed: Uint8Array): Int16Array {
-  const stream = shake128(seed);
+  XOF128.reset();
+
+  XOF128.update(seed);
 
   const a = new Int16Array(256);
 
   let count = 0;
 
   while (count < 256) {
-    const block = stream.read(168);
+    const block = XOF128.readBlock();
 
     for (let offset = 0; offset < 168 && count < 256; offset += 3) {
       const d1 = block[offset] | ((block[offset + 1] & 0x0f) << 8);
@@ -333,11 +373,21 @@ function sampleCbd(data: Uint8Array, eta: number): Int16Array {
 }
 
 function noise(seed: Uint8Array, nonce: number, eta: number): Int16Array {
-  const data = shake256(64 * eta, seed, Uint8Array.of(nonce));
+  const data = NOISE.subarray(0, 64 * eta);
+
+  XOF256.reset();
+
+  XOF256.update(seed);
+
+  XOF256.update(Uint8Array.of(nonce));
+
+  XOF256.readInto(data);
 
   const f = sampleCbd(data, eta);
 
   data.fill(0);
+
+  XOF256.reset();
 
   return f;
 }

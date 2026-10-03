@@ -1,5 +1,6 @@
 import { equal, wipe } from "./bytes.ts";
-import { shake128, shake256, shake256Stream } from "./primitives.ts";
+import { Keccak } from "./keccak.ts";
+import { shake256 } from "./primitives.ts";
 
 const Q = 8380417;
 
@@ -87,9 +88,9 @@ export const ML_DSA_65 = parameters(6, 5, 4, 49, 192, 1 << 19, GAMMA2_32, 55);
 
 export const ML_DSA_87 = parameters(8, 7, 2, 60, 256, 1 << 19, GAMMA2_32, 75);
 
-// 1753^BitRev8(k) mod q.
+// 1753^BitRev8(k) mod q, as doubles, and q minus each for the inverse transform.
 const ZETAS = (() => {
-  const table = new Int32Array(256);
+  const table = new Float64Array(256);
 
   for (let k = 0; k < 256; k++) {
     let exponent = 0;
@@ -110,8 +111,16 @@ const ZETAS = (() => {
   return table;
 })();
 
-// Returns a mod q in [0, q) for an integer |a| < 2^53. The floating-point quotient is never above
-// floor(a / q) and at most one below it, so a single masked subtraction completes the reduction.
+const INVERSE_ZETAS = ZETAS.map((zeta) => Q - zeta);
+
+// A representative of a mod q in [0, 2q), for an integer |a| < 2^53. The floating-point quotient is
+// never above floor(a / q) and at most one below it: 1/q rounds down, and the product's rounding
+// error stays below the distance 1/q from a / q to the next integer.
+function reduceLazy(a: number): number {
+  return a - Math.floor(a * Q_INVERSE) * Q;
+}
+
+// Returns a mod q in [0, q) for an integer |a| < 2^53: reduceLazy and one masked subtraction.
 function reduce(a: number): number {
   const r = a - Math.floor(a * Q_INVERSE) * Q - Q;
 
@@ -159,7 +168,12 @@ function exceeds(values: Int32Array, bound: number, isCentered: boolean): number
   return flag & 1;
 }
 
-function ntt(w: Int32Array): void {
+// The NTT domain is held in doubles: products of coefficients and the sums of a few of them are exact
+// integers, and the reductions skip the conversions to 32-bit integers.
+
+// The NTT in place, with lazy reductions: each layer adds at most 2q to the bound of the coefficients,
+// so the products stay below 2^51; the last pass brings every coefficient into [0, 2q).
+function ntt(w: Float64Array): void {
   let m = 0;
 
   for (let length = 128; length >= 1; length >>= 1) {
@@ -167,65 +181,76 @@ function ntt(w: Int32Array): void {
       const zeta = ZETAS[++m];
 
       for (let j = start; j < start + length; j++) {
-        const t = reduce(zeta * w[j + length]);
+        const t = reduceLazy(zeta * w[j + length]);
 
         const a = w[j];
 
-        w[j + length] = subtractMod(a, t);
+        w[j + length] = a - t + 2 * Q;
 
-        w[j] = addMod(a, t);
-      }
-    }
-  }
-}
-
-function inverseNtt(w: Int32Array): void {
-  let m = 256;
-
-  for (let length = 1; length < 256; length <<= 1) {
-    for (let start = 0; start < 256; start += 2 * length) {
-      const zeta = Q - ZETAS[--m];
-
-      for (let j = start; j < start + length; j++) {
-        const t = w[j];
-
-        w[j] = addMod(t, w[j + length]);
-
-        w[j + length] = reduce(zeta * (t - w[j + length]));
+        w[j] = a + t;
       }
     }
   }
 
   for (let j = 0; j < 256; j++) {
-    w[j] = reduce(w[j] * N_INVERSE);
+    w[j] = reduceLazy(w[j]);
   }
 }
 
-// NTT of a polynomial with small centered coefficients, into a new array.
-function nttOf(values: Int32Array): Int32Array {
-  const w = new Int32Array(256);
+// The inverse NTT of w, whose coefficients lie in [0, 2q) and are overwritten, into out with
+// coefficients in [0, q). The sums double at every layer, so they are reduced once halfway, after
+// which they stay below 32q and the products below 2^51.
+function inverseNtt(w: Float64Array, out: Int32Array): void {
+  let m = 256;
 
-  for (let i = 0; i < 256; i++) {
-    w[i] = canonical(values[i]);
+  for (let length = 1; length < 256; length <<= 1) {
+    for (let start = 0; start < 256; start += 2 * length) {
+      const zeta = INVERSE_ZETAS[--m];
+
+      for (let j = start; j < start + length; j++) {
+        const t = w[j];
+
+        const u = w[j + length];
+
+        w[j] = t + u;
+
+        w[j + length] = reduceLazy(zeta * (t - u));
+      }
+    }
+
+    if (length === 8) {
+      for (let j = 0; j < 256; j++) {
+        w[j] = reduceLazy(w[j]);
+      }
+    }
   }
+
+  for (let j = 0; j < 256; j++) {
+    out[j] = reduce(w[j] * N_INVERSE);
+  }
+}
+
+// NTT of a polynomial with coefficients below 2^20 in magnitude, into a new array.
+function nttOf(values: Int32Array): Float64Array {
+  const w = new Float64Array(values);
 
   ntt(w);
 
   return w;
 }
 
-function pointwise(f: Int32Array, g: Int32Array): Int32Array {
-  const h = new Int32Array(256);
+function pointwise(f: Float64Array, g: Float64Array): Float64Array {
+  const h = new Float64Array(256);
 
   for (let i = 0; i < 256; i++) {
-    h[i] = reduce(f[i] * g[i]);
+    h[i] = reduceLazy(f[i] * g[i]);
   }
 
   return h;
 }
 
-// sum(row[i] * vector[i]) in the NTT domain; each product is below 2^46, so the sums are exact.
-function dot(row: Int32Array[], vector: Int32Array[]): Int32Array {
+// sum(row[i] * vector[i]) in the NTT domain; each product is below 2^48, so the sums are exact.
+function dot(row: Float64Array[], vector: Float64Array[]): Float64Array {
   const total = new Float64Array(256);
 
   for (let i = 0; i < row.length; i++) {
@@ -238,25 +263,32 @@ function dot(row: Int32Array[], vector: Int32Array[]): Int32Array {
     }
   }
 
-  const out = new Int32Array(256);
-
   for (let j = 0; j < 256; j++) {
-    out[j] = reduce(total[j]);
+    total[j] = reduceLazy(total[j]);
   }
 
-  total.fill(0);
+  return total;
+}
+
+// The inverse NTT of w, which it overwrites, into a new array.
+function inverseOf(w: Float64Array): Int32Array {
+  const out = new Int32Array(256);
+
+  inverseNtt(w, out);
 
   return out;
 }
 
 // t = NTT^-1(A * NTT(s1)) + s2, with canonical coefficients.
-function publicT(a: Int32Array[][], s1: Int32Array[], s2: Int32Array[]): Int32Array[] {
+function publicT(a: Float64Array[][], s1: Int32Array[], s2: Int32Array[]): Int32Array[] {
   const s1Hat = s1.map(nttOf);
 
   const t = a.map((row, i) => {
-    const w = dot(row, s1Hat);
+    const product = dot(row, s1Hat);
 
-    inverseNtt(w);
+    const w = inverseOf(product);
+
+    product.fill(0);
 
     for (let j = 0; j < 256; j++) {
       w[j] = addMod(w[j], canonical(s2[i][j]));
@@ -430,15 +462,25 @@ function hintBitUnpack(data: Uint8Array, p: Parameters): Uint8Array[] | null {
   return h;
 }
 
-function rejNttPoly(seed: Uint8Array): Int32Array {
-  const stream = shake128(seed);
+// The XOF streams of the samplers, reused from one polynomial to the next; reset() also clears what
+// the previous seed left in them.
+const XOF128 = new Keccak(168, 0x1f);
 
-  const a = new Int32Array(256);
+const XOF256 = new Keccak(136, 0x1f);
+
+const MASK = new Uint8Array(640);
+
+function rejNttPoly(seed: Uint8Array): Float64Array {
+  XOF128.reset();
+
+  XOF128.update(seed);
+
+  const a = new Float64Array(256);
 
   let count = 0;
 
   while (count < 256) {
-    const block = stream.read(168);
+    const block = XOF128.readBlock();
 
     for (let offset = 0; offset < 168 && count < 256; offset += 3) {
       const z = block[offset] | (block[offset + 1] << 8) | ((block[offset + 2] & 0x7f) << 16);
@@ -454,15 +496,19 @@ function rejNttPoly(seed: Uint8Array): Int32Array {
 
 // The sampled coefficients are secret: the reduction modulo 5 is a multiply-shift, as in the
 // reference code; only the acceptance of each nibble branches.
-function rejBoundedPoly(seed: Uint8Array, eta: number): Int32Array {
-  const stream = shake256Stream(seed);
+function rejBoundedPoly(rho: Uint8Array, nonce: number, eta: number): Int32Array {
+  XOF256.reset();
+
+  XOF256.update(rho);
+
+  XOF256.update(Uint8Array.of(nonce & 0xff, nonce >> 8));
 
   const a = new Int32Array(256);
 
   let count = 0;
 
   while (count < 256) {
-    const block = stream.read(136);
+    const block = XOF256.readBlock();
 
     for (let i = 0; i < 136 && count < 256; i++) {
       for (let shift = 0; shift < 8 && count < 256; shift += 4) {
@@ -475,23 +521,23 @@ function rejBoundedPoly(seed: Uint8Array, eta: number): Int32Array {
         }
       }
     }
-
-    block.fill(0);
   }
+
+  XOF256.reset();
 
   return a;
 }
 
 // matrix[r][s] = RejNTTPoly(rho || s || r).
-function expandA(rho: Uint8Array, p: Parameters): Int32Array[][] {
+function expandA(rho: Uint8Array, p: Parameters): Float64Array[][] {
   const seed = new Uint8Array(34);
 
   seed.set(rho);
 
-  const rows: Int32Array[][] = [];
+  const rows: Float64Array[][] = [];
 
   for (let r = 0; r < p.k; r++) {
-    const row: Int32Array[] = [];
+    const row: Float64Array[] = [];
 
     for (let s = 0; s < p.l; s++) {
       seed[32] = s;
@@ -511,46 +557,98 @@ function expandS(rho: Uint8Array, p: Parameters): [Int32Array[], Int32Array[]] {
   const s: Int32Array[] = [];
 
   for (let r = 0; r < p.l + p.k; r++) {
-    s.push(rejBoundedPoly(Uint8Array.of(...rho, r & 0xff, r >> 8), p.eta));
+    s.push(rejBoundedPoly(rho, r, p.eta));
   }
 
   return [s.slice(0, p.l), s.slice(p.l)];
 }
 
+// y = gamma1 - BitUnpack(H(rho' || counter)), with the 18-bit (gamma1 = 2^17) or 20-bit (2^19)
+// fields read four or two at a time.
 function expandMask(rho: Uint8Array, kappa: number, p: Parameters): Int32Array[] {
   const y: Int32Array[] = [];
+
+  const data = MASK.subarray(0, 32 * p.gamma1Bits);
+
+  const gamma1 = p.gamma1;
 
   for (let r = 0; r < p.l; r++) {
     const counter = kappa + r;
 
-    const data = shake256(32 * p.gamma1Bits, rho, Uint8Array.of(counter & 0xff, (counter >> 8) & 0xff));
+    XOF256.reset();
 
-    y.push(bitUnpack(data, 0, p.gamma1, p.gamma1Bits));
+    XOF256.update(rho);
 
-    data.fill(0);
+    XOF256.update(Uint8Array.of(counter & 0xff, (counter >> 8) & 0xff));
+
+    XOF256.readInto(data);
+
+    const poly = new Int32Array(256);
+
+    if (p.gamma1Bits === 18) {
+      for (let i = 0, at = 0; i < 256; i += 4, at += 9) {
+        poly[i] = gamma1 - (data[at] | (data[at + 1] << 8) | ((data[at + 2] & 3) << 16));
+
+        poly[i + 1] = gamma1 - ((data[at + 2] >> 2) | (data[at + 3] << 6) | ((data[at + 4] & 0x0f) << 14));
+
+        poly[i + 2] = gamma1 - ((data[at + 4] >> 4) | (data[at + 5] << 4) | ((data[at + 6] & 0x3f) << 12));
+
+        poly[i + 3] = gamma1 - ((data[at + 6] >> 6) | (data[at + 7] << 2) | (data[at + 8] << 10));
+      }
+    } else {
+      for (let i = 0, at = 0; i < 256; i += 2, at += 5) {
+        poly[i] = gamma1 - (data[at] | (data[at + 1] << 8) | ((data[at + 2] & 0x0f) << 16));
+
+        poly[i + 1] = gamma1 - ((data[at + 2] >> 4) | (data[at + 3] << 4) | (data[at + 4] << 12));
+      }
+    }
+
+    y.push(poly);
   }
+
+  data.fill(0);
+
+  XOF256.reset();
 
   return y;
 }
 
+// The signs are the first 64 bits of the stream, little-endian; each position j then comes from one
+// byte, retried until it is at most i.
 function sampleInBall(seed: Uint8Array, tau: number): Int32Array {
-  const stream = shake256Stream(seed);
+  XOF256.reset();
 
-  const signs = stream.read(8);
+  XOF256.update(seed);
+
+  let block = XOF256.readBlock();
+
+  const low = block[0] | (block[1] << 8) | (block[2] << 16) | (block[3] << 24);
+
+  const high = block[4] | (block[5] << 8) | (block[6] << 16) | (block[7] << 24);
 
   const c = new Int32Array(256);
 
+  let offset = 8;
+
   for (let i = 256 - tau, bit = 0; i < 256; i++, bit++) {
-    let j = stream.read(1)[0];
+    let j = i + 1;
 
     while (j > i) {
-      j = stream.read(1)[0];
+      if (offset === 136) {
+        block = XOF256.readBlock();
+
+        offset = 0;
+      }
+
+      j = block[offset++];
     }
 
     c[i] = c[j];
 
-    c[j] = 1 - 2 * ((signs[bit >> 3] >> (bit & 7)) & 1);
+    c[j] = 1 - 2 * (((bit < 32 ? low : high) >>> (bit & 31)) & 1);
   }
+
+  XOF256.reset();
 
   return c;
 }
@@ -650,6 +748,19 @@ function w1Encode(w1: Int32Array[], p: Parameters): Uint8Array {
   return out;
 }
 
+// The high (Power2Round t1) or low (t0) parts of the coefficients of each polynomial in t.
+function power2Round(t: Int32Array[], high: boolean): Int32Array[] {
+  return t.map((poly) => {
+    const out = new Int32Array(256);
+
+    for (let j = 0; j < 256; j++) {
+      out[j] = high ? power2RoundHigh(poly[j]) : power2RoundLow(poly[j]);
+    }
+
+    return out;
+  });
+}
+
 export function keygenInternal(xi: Uint8Array, p: Parameters): [Uint8Array, Uint8Array] {
   const expanded = shake256(128, xi, Uint8Array.of(p.k, p.l));
 
@@ -659,9 +770,9 @@ export function keygenInternal(xi: Uint8Array, p: Parameters): [Uint8Array, Uint
 
   const t = publicT(expandA(rho, p), s1, s2);
 
-  const t0 = t.map((poly) => poly.map(power2RoundLow));
+  const t0 = power2Round(t, false);
 
-  const pk = pkEncode(rho, t.map((poly) => poly.map(power2RoundHigh)));
+  const pk = pkEncode(rho, power2Round(t, true));
 
   const sk = skEncode(rho, expanded.subarray(96), shake256(64, pk), s1, s2, t0, p);
 
@@ -694,7 +805,7 @@ export function checkPrivateKey(sk: Uint8Array, p: Parameters): Uint8Array | nul
       }
     }
 
-    const pk = pkEncode(rho, t.map((poly) => poly.map(power2RoundHigh)));
+    const pk = pkEncode(rho, power2Round(t, true));
 
     wipe(...t);
 
@@ -702,6 +813,28 @@ export function checkPrivateKey(sk: Uint8Array, p: Parameters): Uint8Array | nul
   } finally {
     wipe(...s1, ...s2, ...t0);
   }
+}
+
+// NTT^-1(cHat * sHat), wiping the product left in the NTT domain.
+function multiply(cHat: Float64Array, sHat: Float64Array): Int32Array {
+  const product = pointwise(cHat, sHat);
+
+  const out = inverseOf(product);
+
+  product.fill(0);
+
+  return out;
+}
+
+// 1 when some |LowBits(coefficient)| is at least bound, accumulated without branches.
+function lowExceeds(values: Int32Array, gamma2: number, bound: number): number {
+  let flag = 0;
+
+  for (let i = 0; i < 256; i++) {
+    flag |= (bound - 1 - absolute(lowBits(values[i], gamma2))) >> 31;
+  }
+
+  return flag & 1;
 }
 
 export function signInternal(sk: Uint8Array, message: Uint8Array, rnd: Uint8Array, p: Parameters): Uint8Array {
@@ -719,7 +852,11 @@ export function signInternal(sk: Uint8Array, message: Uint8Array, rnd: Uint8Arra
 
   const rhoPrime = shake256(64, key, rnd, mu);
 
-  const secrets: Int32Array[] = [...s1, ...s2, ...t0, ...s1Hat, ...s2Hat, ...t0Hat];
+  const w1 = Array.from({ length: p.k }, () => new Int32Array(256));
+
+  const centeredZ = new Int32Array(256);
+
+  const secrets: (Int32Array | Float64Array)[] = [...s1, ...s2, ...t0, ...s1Hat, ...s2Hat, ...t0Hat, centeredZ];
 
   try {
     for (let kappa = 0; ; kappa += p.l) {
@@ -728,23 +865,27 @@ export function signInternal(sk: Uint8Array, message: Uint8Array, rnd: Uint8Arra
       const yHat = y.map(nttOf);
 
       const w = a.map((row) => {
-        const r = dot(row, yHat);
+        const product = dot(row, yHat);
 
-        inverseNtt(r);
+        const out = inverseOf(product);
 
-        return r;
+        product.fill(0);
+
+        return out;
       });
 
-      const w1 = w.map((poly) => poly.map((x) => highBits(x, p.gamma2)));
+      for (let i = 0; i < p.k; i++) {
+        for (let j = 0; j < 256; j++) {
+          w1[i][j] = highBits(w[i][j], p.gamma2);
+        }
+      }
 
       const cTilde = shake256(p.lambda / 4, mu, w1Encode(w1, p));
 
       const cHat = nttOf(sampleInBall(cTilde, p.tau));
 
       const z = s1Hat.map((s, r) => {
-        const cs1 = pointwise(cHat, s);
-
-        inverseNtt(cs1);
+        const cs1 = multiply(cHat, s);
 
         for (let j = 0; j < 256; j++) {
           cs1[j] = addMod(canonical(y[r][j]), cs1[j]);
@@ -754,9 +895,7 @@ export function signInternal(sk: Uint8Array, message: Uint8Array, rnd: Uint8Arra
       });
 
       const wcs2 = s2Hat.map((s, i) => {
-        const cs2 = pointwise(cHat, s);
-
-        inverseNtt(cs2);
+        const cs2 = multiply(cHat, s);
 
         for (let j = 0; j < 256; j++) {
           cs2[j] = subtractMod(w[i][j], cs2[j]);
@@ -774,7 +913,7 @@ export function signInternal(sk: Uint8Array, message: Uint8Array, rnd: Uint8Arra
       }
 
       for (const poly of wcs2) {
-        reject |= exceeds(poly.map((x) => lowBits(x, p.gamma2)), p.gamma2 - p.beta, true);
+        reject |= lowExceeds(poly, p.gamma2, p.gamma2 - p.beta);
       }
 
       if (reject !== 0) {
@@ -786,9 +925,7 @@ export function signInternal(sk: Uint8Array, message: Uint8Array, rnd: Uint8Arra
       let ones = 0;
 
       for (let i = 0; i < p.k; i++) {
-        const ct0 = pointwise(cHat, t0Hat[i]);
-
-        inverseNtt(ct0);
+        const ct0 = multiply(cHat, t0Hat[i]);
 
         reject |= exceeds(ct0, p.gamma2, false);
 
@@ -818,7 +955,11 @@ export function signInternal(sk: Uint8Array, message: Uint8Array, rnd: Uint8Arra
       let offset = p.lambda / 4;
 
       for (const poly of z) {
-        bitPack(poly.map(centered), p.gamma1, p.gamma1Bits, signature, offset);
+        for (let j = 0; j < 256; j++) {
+          centeredZ[j] = centered(poly[j]);
+        }
+
+        bitPack(centeredZ, p.gamma1, p.gamma1Bits, signature, offset);
 
         offset += 32 * p.gamma1Bits;
       }
@@ -866,23 +1007,27 @@ export function verifyInternal(pk: Uint8Array, message: Uint8Array, signature: U
   const w1 = a.map((row, i) => {
     const t1 = unpack(pk, 32 + 320 * i, 10);
 
+    const t1Hat = new Float64Array(256);
+
     for (let j = 0; j < 256; j++) {
-      t1[j] <<= D;
+      t1Hat[j] = t1[j] << D;
     }
 
-    ntt(t1);
-
-    const product = pointwise(cHat, t1);
+    ntt(t1Hat);
 
     const w = dot(row, zHat);
 
     for (let j = 0; j < 256; j++) {
-      w[j] = subtractMod(w[j], product[j]);
+      w[j] = reduceLazy(w[j] - reduceLazy(cHat[j] * t1Hat[j]) + 2 * Q);
     }
 
-    inverseNtt(w);
+    const r = inverseOf(w);
 
-    return w.map((x, j) => useHint(h[i][j], x, p.gamma2));
+    for (let j = 0; j < 256; j++) {
+      r[j] = useHint(h[i][j], r[j], p.gamma2);
+    }
+
+    return r;
   });
 
   return equal(shake256(p.lambda / 4, mu, w1Encode(w1, p)), cTilde);

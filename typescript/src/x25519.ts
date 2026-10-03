@@ -1,4 +1,5 @@
 import { wipe } from "./bytes.ts";
+import { multiply, square } from "./x25519-field.ts";
 
 // GF(2^255 - 19) with sixteen 16-bit limbs held in doubles. Limb products and their sums stay
 // below 2^53, so every operation is exact, and no branch or index depends on a value.
@@ -7,10 +8,6 @@ type Field = Float64Array;
 const LIMB = 65536;
 
 const LIMB_INVERSE = 2 ** -16;
-
-const PRODUCT = new Float64Array(31);
-
-const A24 = Float64Array.of(0xdb41, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
 export const BASE = Uint8Array.of(9, ...new Uint8Array(31));
 
@@ -49,30 +46,15 @@ function subtract(o: Field, a: Field, b: Field): void {
   }
 }
 
-function multiply(o: Field, a: Field, b: Field): void {
-  const t = PRODUCT;
-
-  t.fill(0);
-
+// a * 121665, the constant (A - 2) / 4 of the Montgomery ladder.
+function multiplyA24(o: Field, a: Field): void {
   for (let i = 0; i < 16; i++) {
-    for (let j = 0; j < 16; j++) {
-      t[i + j] += a[i] * b[j];
-    }
+    o[i] = 121665 * a[i];
   }
-
-  for (let i = 0; i < 15; i++) {
-    o[i] = t[i] + 38 * t[i + 16];
-  }
-
-  o[15] = t[15];
 
   carry(o);
 
   carry(o);
-}
-
-function square(o: Field, a: Field): void {
-  multiply(o, a, a);
 }
 
 // Swaps p and q when bit is 1, with a mask instead of a branch.
@@ -88,21 +70,69 @@ function swap(p: Field, q: Field, bit: number): void {
   }
 }
 
-// a^(p - 2) = a^-1 by a fixed square-and-multiply chain; p - 2 has every bit set except 2 and 4.
-function invert(o: Field, a: Field): void {
-  const c = a.slice();
+function squares(o: Field, a: Field, count: number): void {
+  square(o, a);
 
-  for (let i = 253; i >= 0; i--) {
-    square(c, c);
-
-    if (i !== 2 && i !== 4) {
-      multiply(c, c, a);
-    }
+  for (let i = 1; i < count; i++) {
+    square(o, o);
   }
+}
 
-  o.set(c);
+// a^(p - 2) = a^-1 by the fixed addition chain of 254 squarings and 11 multiplications in ref10.
+function invert(o: Field, a: Field): void {
+  const t0 = field();
 
-  c.fill(0);
+  const t1 = field();
+
+  const t2 = field();
+
+  const t3 = field();
+
+  square(t0, a);
+
+  squares(t1, t0, 2);
+
+  multiply(t1, a, t1);
+
+  multiply(t0, t0, t1);
+
+  square(t2, t0);
+
+  multiply(t1, t1, t2);
+
+  squares(t2, t1, 5);
+
+  multiply(t1, t2, t1);
+
+  squares(t2, t1, 10);
+
+  multiply(t2, t2, t1);
+
+  squares(t3, t2, 20);
+
+  multiply(t2, t3, t2);
+
+  squares(t2, t2, 10);
+
+  multiply(t1, t2, t1);
+
+  squares(t2, t1, 50);
+
+  multiply(t2, t2, t1);
+
+  squares(t3, t2, 100);
+
+  multiply(t2, t3, t2);
+
+  squares(t2, t2, 50);
+
+  multiply(t1, t2, t1);
+
+  squares(t1, t1, 5);
+
+  multiply(o, t1, t0);
+
+  wipe(t0, t1, t2, t3);
 }
 
 function unpack(data: Uint8Array): Field {
@@ -241,7 +271,7 @@ export function x25519(scalar: Uint8Array, u: Uint8Array): Uint8Array {
 
     multiply(x2, aa, bb);
 
-    multiply(a, e, A24);
+    multiplyA24(a, e);
 
     add(a, a, aa);
 
@@ -258,7 +288,7 @@ export function x25519(scalar: Uint8Array, u: Uint8Array): Uint8Array {
 
   const out = pack(x2);
 
-  wipe(k, x1, x2, z2, x3, z3, a, aa, b, bb, e, c, d, da, cb, PRODUCT);
+  wipe(k, x1, x2, z2, x3, z3, a, aa, b, bb, e, c, d, da, cb);
 
   return out;
 }
