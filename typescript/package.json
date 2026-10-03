@@ -7,6 +7,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./hazmat": {
+      "types": "./dist/hazmat.d.ts",
+      "default": "./dist/hazmat.js"
     }
   },
   "files": [

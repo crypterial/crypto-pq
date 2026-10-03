@@ -1,3 +1,5 @@
+export type { KeyFormat } from "./encoding.ts";
+
 export { CryptoPQError } from "./errors.ts";
 
 export type { ErrorCode } from "./errors.ts";
@@ -26,3 +28,43 @@ export {
   Xof,
   XofAlgorithm,
 } from "./hash.ts";
+
+export { ML_KEM_512, ML_KEM_768, ML_KEM_1024, X_WING, KemAlgorithm, KemPrivateKey, KemPublicKey } from "./kem.ts";
+
+export type { Encapsulation, KemKeyPair } from "./kem.ts";
+
+export type { KeyGenOptions } from "./keys.ts";
+
+export {
+  ML_DSA_44,
+  ML_DSA_65,
+  ML_DSA_87,
+  SLH_DSA_SHA2_128F,
+  SLH_DSA_SHA2_128S,
+  SLH_DSA_SHA2_192F,
+  SLH_DSA_SHA2_192S,
+  SLH_DSA_SHA2_256F,
+  SLH_DSA_SHA2_256S,
+  SLH_DSA_SHAKE_128F,
+  SLH_DSA_SHAKE_128S,
+  SLH_DSA_SHAKE_192F,
+  SLH_DSA_SHAKE_192S,
+  SLH_DSA_SHAKE_256F,
+  SLH_DSA_SHAKE_256S,
+  SignatureAlgorithm,
+  SignaturePrivateKey,
+  SignaturePublicKey,
+} from "./signature.ts";
+
+export type { SignOptions, SignatureKeyPair, VerifyOptions } from "./signature.ts";
+
+export {
+  HSS_LMS,
+  XMSS,
+  XMSS_MT,
+  StatefulPrivateKey,
+  StatefulPublicKey,
+  StatefulSignatureAlgorithm,
+} from "./stateful.ts";
+
+export type { StateStore, StatefulKeyGenOptions, StatefulKeyPair, StatefulParameters } from "./stateful.ts";

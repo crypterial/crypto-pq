@@ -1,12 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import * as pq from "../src/index.ts";
-
-type Fields = Record<string, string>;
-
-const CAVP = new URL("../../vectors/cavp/", import.meta.url);
+import { type Fields, hex, records, toHex } from "./vectors.ts";
 
 const HASHES: [string, string, pq.HashAlgorithm][] = [
   ["SHA224", "SHA-224", pq.SHA_224],
@@ -37,58 +33,6 @@ const HMACS: [string, string, pq.HmacAlgorithm][] = [
 // Uneven sizes reach every buffering path: empty updates, partial blocks and whole blocks.
 const PIECES = [0, 1, 3, 64, 7, 136, 128, 168, 0, 200];
 
-function records(name: string, field: string): [Fields, Fields][] {
-  const lines = readFileSync(new URL(name, CAVP), "utf8").split(/\r?\n/);
-
-  let header: Fields = {};
-
-  let record: Fields = {};
-
-  const found: [Fields, Fields][] = [];
-
-  for (const raw of [...lines, ""]) {
-    const line = raw.trim();
-
-    if (line.startsWith("[") && line.endsWith("]")) {
-      const [key, value = ""] = line.slice(1, -1).split("=");
-
-      header = { ...header, [key.trim()]: value.trim() };
-    } else if (line.includes("=") && !line.startsWith("#")) {
-      const index = line.indexOf("=");
-
-      record[line.slice(0, index).trim()] = line.slice(index + 1).trim();
-    } else if (Object.keys(record).length > 0) {
-      found.push([header, record]);
-
-      record = {};
-    }
-  }
-
-  const expected = lines.filter((line) => line.startsWith(`${field} =`)).length;
-
-  const parsed = found.filter(([, record]) => field in record).length;
-
-  assert.ok(expected > 0 && parsed === expected, `${name}: parsed ${parsed}, expected ${expected}`);
-
-  return found;
-}
-
-function hex(text: string): Uint8Array {
-  assert.match(text, /^(?:[0-9a-f]{2})*$/i);
-
-  const out = new Uint8Array(text.length / 2);
-
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(text.slice(2 * i, 2 * i + 2), 16);
-  }
-
-  return out;
-}
-
-function toHex(data: Uint8Array): string {
-  return Array.from(data, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
 function message(record: Fields): Uint8Array {
   const bits = Number(record.Len);
 
@@ -114,7 +58,7 @@ function pieces(data: Uint8Array): Uint8Array[] {
 test("hash vectors", () => {
   for (const [prefix, , algorithm] of HASHES) {
     for (const kind of ["ShortMsg", "LongMsg"]) {
-      for (const [, record] of records(`${prefix}${kind}.rsp`, "MD")) {
+      for (const [, record] of records(`cavp/${prefix}${kind}.rsp`, "MD")) {
         const data = message(record);
 
         const expected = record.MD.toLowerCase();
@@ -136,7 +80,7 @@ test("hash vectors", () => {
 // SHAVS 6.4 and SHA3VS 6.2.3: each checkpoint chains 1000 digests from the previous one.
 test("hash monte carlo", () => {
   for (const [prefix, , algorithm] of HASHES) {
-    const [[, first], ...checkpoints] = records(`${prefix}Monte.rsp`, "MD");
+    const [[, first], ...checkpoints] = records(`cavp/${prefix}Monte.rsp`, "MD");
 
     let seed = hex(first.Seed);
 
@@ -207,7 +151,7 @@ test("hash input types", () => {
 test("xof vectors", () => {
   for (const [prefix, algorithm] of XOFS) {
     for (const kind of ["ShortMsg", "LongMsg"]) {
-      for (const [header, record] of records(`${prefix}${kind}.rsp`, "Output")) {
+      for (const [header, record] of records(`cavp/${prefix}${kind}.rsp`, "Output")) {
         const data = message(record);
 
         const expected = record.Output.toLowerCase();
@@ -228,7 +172,7 @@ test("xof vectors", () => {
       }
     }
 
-    for (const [, record] of records(`${prefix}VariableOut.rsp`, "Output")) {
+    for (const [, record] of records(`cavp/${prefix}VariableOut.rsp`, "Output")) {
       const expected = record.Output.toLowerCase();
 
       assert.equal(Number(record.Outputlen), 4 * expected.length);
@@ -246,7 +190,7 @@ test("xof vectors", () => {
 // output bytes pick the next output length.
 test("xof monte carlo", () => {
   for (const [prefix, algorithm] of XOFS) {
-    const [[header, first], ...checkpoints] = records(`${prefix}Monte.rsp`, "Output");
+    const [[header, first], ...checkpoints] = records(`cavp/${prefix}Monte.rsp`, "Output");
 
     const minimum = Number(header["Minimum Output Length (bits)"]) / 8;
 
@@ -317,7 +261,7 @@ test("xof properties", () => {
 test("hmac vectors", () => {
   let tested = 0;
 
-  for (const [header, record] of records("HMAC.rsp", "Mac")) {
+  for (const [header, record] of records("cavp/HMAC.rsp", "Mac")) {
     if (header.L === "20") {
       continue;
     }

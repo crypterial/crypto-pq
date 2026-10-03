@@ -68,7 +68,7 @@ const WH = new Uint32Array(80);
 
 const WL = new Uint32Array(80);
 
-function compress256(state: Uint32Array, data: Uint8Array, offset: number): void {
+export function compress256(state: Uint32Array, data: Uint8Array, offset: number): void {
   for (let t = 0; t < 16; t++) {
     W[t] = readUint32(data, offset + 4 * t);
   }
@@ -153,7 +153,7 @@ function add64(state: Uint32Array, index: number, high: number, low: number): vo
 }
 
 // Low halves are kept unsigned so that a sum divided by 2^32 gives its carry.
-function compress512(state: Uint32Array, data: Uint8Array, offset: number): void {
+export function compress512(state: Uint32Array, data: Uint8Array, offset: number): void {
   for (let t = 0; t < 16; t++) {
     WH[t] = readUint32(data, offset + 8 * t);
 
