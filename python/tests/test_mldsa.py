@@ -235,6 +235,12 @@ class SignatureApiTest(unittest.TestCase):
                     else:
                         self.assertCode(ErrorCode.INVALID_OPTION, private_key.sign, b"m", pre_hash=function)
 
+                        signature = hazmat.sign(private_key, b"m", bytes(32), pre_hash=function)
+
+                        self.assertTrue(hazmat.verify(private_key.public_key, signature, b"m", pre_hash=function))
+
+                        self.assertFalse(private_key.public_key.verify(signature, b"m", pre_hash=function))
+
     def test_formats(self):
         for name, algorithm in ALGORITHMS.items():
             with self.subTest(algorithm=name):

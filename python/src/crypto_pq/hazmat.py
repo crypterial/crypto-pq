@@ -5,10 +5,19 @@ functions skip the pre-hash strength policy of the public API."""
 from ._kem import KemAlgorithm, KemKeyPair, KemPublicKey
 from ._keys import require_bytes, require_length
 from ._signature import SignatureAlgorithm, SignaturePrivateKey, SignaturePublicKey
+from ._stateful import StatefulSignatureAlgorithm
 
 
-def generate_key_pair(algorithm, seed):
+# Stateful seeds are I || SEED of the top LMS tree, or SK_SEED || SK_PRF || PUB_SEED for XMSS.
+def generate_key_pair(algorithm, seed, *, parameters=None, state_store=None, index=0):
     seed = require_bytes(seed, "seed")
+
+    if isinstance(algorithm, StatefulSignatureAlgorithm):
+        parameters = algorithm._backend.parameters(parameters)
+
+        require_length(seed, algorithm._backend.seed_size(parameters), "seed")
+
+        return algorithm._create(parameters, seed, index, state_store)
 
     if isinstance(algorithm, KemAlgorithm):
         require_length(seed, algorithm._backend.seed_size, "seed")

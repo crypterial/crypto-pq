@@ -148,19 +148,20 @@ class _SlhDsa:
         return _slhdsa.verify_internal(message, signature, public, self.params)
 
 
-def pre_hash_entry(backend, pre_hash, policy):
+def pre_hash_entry(pre_hash):
     if pre_hash is None:
         return None
 
     try:
-        entry = PRE_HASHES[pre_hash]
+        return PRE_HASHES[pre_hash]
     except (KeyError, TypeError):
         raise CryptoPQError(ErrorCode.INVALID_OPTION, "pre_hash must be one of the crypto_pq hash functions") from None
 
-    if policy and entry.strength < backend.strength:
-        raise CryptoPQError(ErrorCode.INVALID_OPTION, f"{pre_hash.name} is weaker than the signature algorithm")
 
-    return entry
+# A pre-hash must give at least the collision strength of the signature (FIPS 204, 5.4, and
+# FIPS 205, 10.2): signing with a weaker one is refused and verification fails closed.
+def too_weak(backend, entry, policy):
+    return policy and entry is not None and entry.strength < backend.strength
 
 
 # FIPS 204 and FIPS 205: M' = 0 || |ctx| || ctx || M, or 1 || |ctx| || ctx || OID || PH(M).
@@ -195,9 +196,9 @@ class SignaturePublicKey:
 
         backend = self._algorithm._backend
 
-        entry = pre_hash_entry(backend, pre_hash, policy)
+        entry = pre_hash_entry(pre_hash)
 
-        if len(context) > 255 or len(signature) != backend.signature_size:
+        if too_weak(backend, entry, policy) or len(context) > 255 or len(signature) != backend.signature_size:
             return False
 
         return backend.verify(self._key, message_representative(message, context, entry), signature)
@@ -254,7 +255,10 @@ class SignaturePrivateKey:
 
         backend = self._algorithm._backend
 
-        entry = pre_hash_entry(backend, pre_hash, policy)
+        entry = pre_hash_entry(pre_hash)
+
+        if too_weak(backend, entry, policy):
+            raise CryptoPQError(ErrorCode.INVALID_OPTION, f"{pre_hash.name} is weaker than the signature algorithm")
 
         if len(context) > 255:
             raise CryptoPQError(ErrorCode.INVALID_CONTEXT, "the context must be at most 255 bytes")
