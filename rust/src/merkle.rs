@@ -37,7 +37,9 @@ impl MerkleTree {
 
         for z in low..height {
             let parents = nodes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .enumerate()
                 .map(|(j, pair)| hasher.combine(z, j as u32, &pair[0], &pair[1]))
                 .collect();
@@ -62,7 +64,9 @@ impl MerkleTree {
             let offset = base >> (z + 1);
 
             let parents = level
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .enumerate()
                 .map(|(j, pair)| hasher.combine(z, offset + j as u32, &pair[0], &pair[1]))
                 .collect();
@@ -130,7 +134,9 @@ mod tests {
 
         for z in 0..height {
             let parents = level
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .enumerate()
                 .map(|(j, pair)| Tagged.combine(z, j as u32, &pair[0], &pair[1]))
                 .collect();

@@ -382,7 +382,7 @@ fn rej_ntt_poly(rho: &[u8], s: usize, r: usize) -> Poly {
     while count < 256 {
         stream.read(&mut block);
 
-        for chunk in block.chunks_exact(3) {
+        for chunk in block.as_chunks::<3>().0 {
             let z = i32::from(chunk[0])
                 | (i32::from(chunk[1]) << 8)
                 | (i32::from(chunk[2] & 0x7F) << 16);
@@ -543,7 +543,7 @@ fn encode_public_key(rho: &[u8], t: &Polys, p: &Parameters) -> Vec<u8> {
 
     pk[..32].copy_from_slice(rho);
 
-    for (chunk, poly) in pk[32..].chunks_exact_mut(320).zip(t.iter()) {
+    for (chunk, poly) in pk[32..].as_chunks_mut::<320>().0.iter_mut().zip(t.iter()) {
         pack(chunk, 10, poly.iter().map(|&x| power2round(x).0));
     }
 
@@ -567,7 +567,12 @@ fn encode_private_key(parts: [&[u8]; 3], s: &Polys, t: &Polys, p: &Parameters) -
         pack(chunk, p.eta_bits(), poly.iter().map(|&x| p.eta - x));
     }
 
-    for (chunk, poly) in t0_bytes.chunks_exact_mut(32 * D as usize).zip(t.iter()) {
+    for (chunk, poly) in t0_bytes
+        .as_chunks_mut::<{ 32 * D as usize }>()
+        .0
+        .iter_mut()
+        .zip(t.iter())
+    {
         pack(
             chunk,
             D,
@@ -599,7 +604,10 @@ fn decode_private_key<'a>(sk: &'a [u8], p: &Parameters) -> PrivateKey<'a> {
 
     let mut t0 = Polys::new(p.k);
 
-    for (poly, chunk) in t0.iter_mut().zip(t0_bytes.chunks_exact(32 * D as usize)) {
+    for (poly, chunk) in t0
+        .iter_mut()
+        .zip(t0_bytes.as_chunks::<{ 32 * D as usize }>().0.iter())
+    {
         *poly = unpack(chunk, D).map(|x| (1 << (D - 1)) - x);
     }
 
@@ -944,7 +952,11 @@ pub(crate) fn verify_internal(pk: &[u8], message: &[&[u8]], sig: &[u8], p: &Para
 
     let mut w = Polys::new(p.k);
 
-    for ((i, w_i), chunk) in w.iter_mut().enumerate().zip(pk[32..].chunks_exact(320)) {
+    for ((i, w_i), chunk) in w
+        .iter_mut()
+        .enumerate()
+        .zip(pk[32..].as_chunks::<320>().0.iter())
+    {
         let mut t1 = unpack(chunk, 10).map(|x| x << D);
 
         ntt(&mut t1);

@@ -321,7 +321,7 @@ fn base64_decode(text: &[u8]) -> Result<SecretBytes, Error> {
 
     let mut invalid = 0u32;
 
-    for (index, chunk) in text.chunks_exact(4).enumerate() {
+    for (index, chunk) in text.as_chunks::<4>().0.iter().enumerate() {
         let used = if index + 1 == chunks { 4 - padding } else { 4 };
 
         let mut value = 0u32;

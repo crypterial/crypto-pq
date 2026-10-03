@@ -358,7 +358,9 @@ impl StatefulSignatureAlgorithm {
                     .ok_or(Error::InvalidPrivateKey)?;
 
                 let levels = codes
-                    .chunks_exact(8)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let lms = lms::lms_by_code(read_u32(&chunk[..4]))?;
 

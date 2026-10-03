@@ -281,7 +281,7 @@ fn sample_ntt(rho: &[u8], first: usize, second: usize) -> Poly {
     while count < 256 {
         stream.read(&mut block);
 
-        for chunk in block.chunks_exact(3) {
+        for chunk in block.as_chunks::<3>().0 {
             let d1 = u16::from(chunk[0]) | (u16::from(chunk[1] & 0x0F) << 8);
 
             let d2 = u16::from(chunk[1] >> 4) | (u16::from(chunk[2]) << 4);
@@ -540,7 +540,7 @@ pub(crate) fn decaps_internal(dk: &[u8], c: &[u8], p: &Parameters) -> [u8; 32] {
 // FIPS 203, 7.2: every coefficient of the encoded vector must already be reduced modulo q.
 pub(crate) fn check_encapsulation_key(ek: &[u8], p: &Parameters) -> bool {
     ek.len() == p.encapsulation_key_size()
-        && ek[..384 * p.k].chunks_exact(3).all(|chunk| {
+        && ek[..384 * p.k].as_chunks::<3>().0.iter().all(|chunk| {
             let d1 = u32::from(chunk[0]) | (u32::from(chunk[1] & 0x0F) << 8);
 
             let d2 = u32::from(chunk[1] >> 4) | (u32::from(chunk[2]) << 4);
