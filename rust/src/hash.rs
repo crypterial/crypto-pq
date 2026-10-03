@@ -48,11 +48,14 @@ impl Engine {
     }
 }
 
+// oid_arc is the last arc of the NIST identifier 2.16.840.1.101.3.4.2.x, which pre-hashed
+// signatures embed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HashAlgorithm {
     name: &'static str,
     digest_size: usize,
     kind: Kind,
+    oid_arc: u8,
 }
 
 impl HashAlgorithm {
@@ -62,6 +65,10 @@ impl HashAlgorithm {
 
     pub const fn digest_size(&self) -> usize {
         self.digest_size
+    }
+
+    pub(crate) const fn oid_arc(&self) -> u8 {
+        self.oid_arc
     }
 
     pub fn digest(&self, data: &[u8]) -> Vec<u8> {
@@ -113,11 +120,16 @@ impl Hasher {
 pub struct XofAlgorithm {
     name: &'static str,
     rate: usize,
+    oid_arc: u8,
 }
 
 impl XofAlgorithm {
     pub const fn name(&self) -> &'static str {
         self.name
+    }
+
+    pub(crate) const fn oid_arc(&self) -> u8 {
+        self.oid_arc
     }
 
     pub fn digest(&self, data: &[u8], length: usize) -> Vec<u8> {
@@ -244,70 +256,82 @@ pub const SHA_224: HashAlgorithm = HashAlgorithm {
     name: "SHA-224",
     digest_size: 28,
     kind: Kind::Sha256(&IV_224),
+    oid_arc: 4,
 };
 
 pub const SHA_256: HashAlgorithm = HashAlgorithm {
     name: "SHA-256",
     digest_size: 32,
     kind: Kind::Sha256(&IV_256),
+    oid_arc: 1,
 };
 
 pub const SHA_384: HashAlgorithm = HashAlgorithm {
     name: "SHA-384",
     digest_size: 48,
     kind: Kind::Sha512(&IV_384),
+    oid_arc: 2,
 };
 
 pub const SHA_512: HashAlgorithm = HashAlgorithm {
     name: "SHA-512",
     digest_size: 64,
     kind: Kind::Sha512(&IV_512),
+    oid_arc: 3,
 };
 
 pub const SHA_512_224: HashAlgorithm = HashAlgorithm {
     name: "SHA-512/224",
     digest_size: 28,
     kind: Kind::Sha512(&IV_512_224),
+    oid_arc: 5,
 };
 
 pub const SHA_512_256: HashAlgorithm = HashAlgorithm {
     name: "SHA-512/256",
     digest_size: 32,
     kind: Kind::Sha512(&IV_512_256),
+    oid_arc: 6,
 };
 
 pub const SHA3_224: HashAlgorithm = HashAlgorithm {
     name: "SHA3-224",
     digest_size: 28,
     kind: Kind::Sha3,
+    oid_arc: 7,
 };
 
 pub const SHA3_256: HashAlgorithm = HashAlgorithm {
     name: "SHA3-256",
     digest_size: 32,
     kind: Kind::Sha3,
+    oid_arc: 8,
 };
 
 pub const SHA3_384: HashAlgorithm = HashAlgorithm {
     name: "SHA3-384",
     digest_size: 48,
     kind: Kind::Sha3,
+    oid_arc: 9,
 };
 
 pub const SHA3_512: HashAlgorithm = HashAlgorithm {
     name: "SHA3-512",
     digest_size: 64,
     kind: Kind::Sha3,
+    oid_arc: 10,
 };
 
 pub const SHAKE128: XofAlgorithm = XofAlgorithm {
     name: "SHAKE128",
     rate: 168,
+    oid_arc: 11,
 };
 
 pub const SHAKE256: XofAlgorithm = XofAlgorithm {
     name: "SHAKE256",
     rate: 136,
+    oid_arc: 12,
 };
 
 pub const HMAC_SHA_224: HmacAlgorithm = HmacAlgorithm {

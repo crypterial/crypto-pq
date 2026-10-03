@@ -10,3 +10,8 @@ repository = "https://github.com/crypterial/crypto-pq"
 keywords = ["post-quantum", "cryptography", "ml-kem", "ml-dsa", "sha3"]
 categories = ["cryptography", "no-std"]
 include = ["/src", "/LICENSE-APACHE", "/LICENSE-MIT"]
+
+# The SLH-DSA, XMSS and LMS vector suites take minutes unoptimized; test builds keep their debug
+# assertions and overflow checks but are optimized.
+[profile.test]
+opt-level = 3
