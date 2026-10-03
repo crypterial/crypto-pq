@@ -23,6 +23,16 @@ def option(message):
     return CryptoPQError(ErrorCode.INVALID_OPTION, message)
 
 
+def require_store(store):
+    if store is None:
+        raise option("a state store is required")
+
+    if not callable(getattr(store, "read", None)) or not callable(getattr(store, "update", None)):
+        raise TypeError("state_store must provide read() and update(previous, next)")
+
+    return store
+
+
 # State blob: version, kind, the parameters, the secret seeds and the next index, closed by the
 # first 16 bytes of its SHA-256 so that a damaged state is refused rather than reused.
 def seal(body):
@@ -296,6 +306,8 @@ class StatefulSignatureAlgorithm:
         return self._create(parameters, random_bytes(self._backend.seed_size(parameters)), 0, state_store)
 
     def _create(self, parameters, seed, index, store):
+        require_store(store)
+
         signer = self._backend.signer(parameters, seed)
 
         if not 0 <= index <= signer.capacity:
@@ -316,6 +328,8 @@ class StatefulSignatureAlgorithm:
         return StatefulKeyPair(private_key.public_key, private_key)
 
     def load_private_key(self, state_store):
+        require_store(state_store)
+
         try:
             state = state_store.read()
         except Exception as error:

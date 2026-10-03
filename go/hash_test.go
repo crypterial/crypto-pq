@@ -3,25 +3,13 @@ package cryptopq_test
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
-	"maps"
-	"os"
-	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 
 	cryptopq "github.com/crypterial/crypto-pq-go"
 )
-
-type fields map[string]string
-
-type record struct {
-	header fields
-	values fields
-}
 
 var hashes = []struct {
 	file      string
@@ -62,89 +50,6 @@ var hmacs = map[string]struct {
 // Uneven sizes reach every buffering path: empty updates, partial blocks and whole blocks.
 var sizes = []int{0, 1, 3, 64, 7, 136, 128, 168, 0, 200}
 
-func records(t *testing.T, name, field string) []record {
-	t.Helper()
-
-	data, err := os.ReadFile(filepath.Join("..", "vectors", "cavp", name))
-
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
-
-	header := fields{}
-
-	values := fields{}
-
-	var found []record
-
-	for _, raw := range append(lines, "") {
-		line := strings.TrimSpace(raw)
-
-		key, value, hasValue := strings.Cut(line, "=")
-
-		switch {
-		case strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]"):
-			key, value, _ = strings.Cut(line[1:len(line)-1], "=")
-
-			header = maps.Clone(header)
-
-			header[strings.TrimSpace(key)] = strings.TrimSpace(value)
-		case hasValue && !strings.HasPrefix(line, "#"):
-			values[strings.TrimSpace(key)] = strings.TrimSpace(value)
-		case len(values) > 0:
-			found = append(found, record{header, values})
-
-			values = fields{}
-		}
-	}
-
-	expected, parsed := 0, 0
-
-	for _, line := range lines {
-		if strings.HasPrefix(line, field+" =") {
-			expected++
-		}
-	}
-
-	for _, r := range found {
-		if _, ok := r.values[field]; ok {
-			parsed++
-		}
-	}
-
-	if expected == 0 || parsed != expected {
-		t.Fatalf("%s: parsed %d records, expected %d", name, parsed, expected)
-	}
-
-	return found
-}
-
-func decode(t *testing.T, text string) []byte {
-	t.Helper()
-
-	data, err := hex.DecodeString(text)
-
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return data
-}
-
-func number(t *testing.T, text string) int {
-	t.Helper()
-
-	n, err := strconv.Atoi(text)
-
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return n
-}
-
 func message(t *testing.T, values fields) []byte {
 	t.Helper()
 
@@ -174,7 +79,7 @@ func pieces(data []byte) [][]byte {
 func TestHashVectors(t *testing.T) {
 	for _, h := range hashes {
 		for _, kind := range []string{"ShortMsg", "LongMsg"} {
-			for _, r := range records(t, h.file+kind+".rsp", "MD") {
+			for _, r := range records(t, "cavp/"+h.file+kind+".rsp", "MD") {
 				data := message(t, r.values)
 
 				expected := decode(t, r.values["MD"])
@@ -202,7 +107,7 @@ func TestHashVectors(t *testing.T) {
 // SHAVS 6.4 and SHA3VS 6.2.3: each checkpoint chains 1000 digests from the previous one.
 func TestHashMonteCarlo(t *testing.T) {
 	for _, h := range hashes {
-		found := records(t, h.file+"Monte.rsp", "MD")
+		found := records(t, "cavp/"+h.file+"Monte.rsp", "MD")
 
 		seed := decode(t, found[0].values["Seed"])
 
@@ -263,7 +168,7 @@ func TestHashProperties(t *testing.T) {
 func TestXofVectors(t *testing.T) {
 	for _, x := range xofs {
 		for _, kind := range []string{"ShortMsg", "LongMsg"} {
-			for _, r := range records(t, x.file+kind+".rsp", "Output") {
+			for _, r := range records(t, "cavp/"+x.file+kind+".rsp", "Output") {
 				data := message(t, r.values)
 
 				expected := decode(t, r.values["Output"])
@@ -292,7 +197,7 @@ func TestXofVectors(t *testing.T) {
 			}
 		}
 
-		for _, r := range records(t, x.file+"VariableOut.rsp", "Output") {
+		for _, r := range records(t, "cavp/"+x.file+"VariableOut.rsp", "Output") {
 			expected := decode(t, r.values["Output"])
 
 			if number(t, r.values["Outputlen"]) != 8*len(expected) {
@@ -310,7 +215,7 @@ func TestXofVectors(t *testing.T) {
 // output bytes pick the next output length.
 func TestXofMonteCarlo(t *testing.T) {
 	for _, x := range xofs {
-		found := records(t, x.file+"Monte.rsp", "Output")
+		found := records(t, "cavp/"+x.file+"Monte.rsp", "Output")
 
 		minimum := number(t, found[0].header["Minimum Output Length (bits)"]) / 8
 
@@ -399,7 +304,7 @@ func TestInvalidAlgorithm(t *testing.T) {
 func TestHmacVectors(t *testing.T) {
 	tested := 0
 
-	for _, r := range records(t, "HMAC.rsp", "Mac") {
+	for _, r := range records(t, "cavp/HMAC.rsp", "Mac") {
 		if r.header["L"] == "20" {
 			continue
 		}

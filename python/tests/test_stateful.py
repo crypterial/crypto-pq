@@ -217,6 +217,13 @@ class HssTest(unittest.TestCase):
 
         self.assertCode(ErrorCode.INVALID_OPTION, hazmat.generate_key_pair, HSS_LMS, bytes(40), parameters=SMALL, state_store=MemoryStore(), index=33)
 
+        self.assertCode(ErrorCode.INVALID_OPTION, HSS_LMS.generate_key_pair, parameters=SMALL, state_store=None)
+
+        self.assertCode(ErrorCode.INVALID_OPTION, HSS_LMS.load_private_key, None)
+
+        with self.assertRaises(TypeError):
+            HSS_LMS.load_private_key(object())
+
         exhausted = hazmat.generate_key_pair(HSS_LMS, bytes(40), parameters=SMALL, state_store=MemoryStore(), index=32)
 
         self.assertEqual(exhausted.private_key.remaining_signatures(), 0)

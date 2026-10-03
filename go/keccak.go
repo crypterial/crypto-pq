@@ -266,3 +266,58 @@ func (k *keccak) read(out []byte) {
 		k.position++
 	}
 }
+
+// One-shot Keccak hash or XOF of the concatenated parts into out; the state is cleared after.
+func keccakSum(rate int, suffix byte, out []byte, parts ...[]byte) {
+	sponge := keccak{rate: rate, suffix: suffix}
+
+	for _, part := range parts {
+		sponge.update(part)
+	}
+
+	sponge.read(out)
+
+	clear(sponge.state[:])
+}
+
+func sha3Sum256(out []byte, parts ...[]byte) {
+	keccakSum(136, 0x06, out[:32], parts...)
+}
+
+func sha3Sum512(out []byte, parts ...[]byte) {
+	keccakSum(72, 0x06, out[:64], parts...)
+}
+
+func shake256Sum(out []byte, parts ...[]byte) {
+	keccakSum(136, 0x1f, out, parts...)
+}
+
+// SHAKE256 of fewer than 136 input bytes into at most 136 output bytes: a single permutation,
+// without the byte-wise buffering of keccak.update. The block is indexed on the stack directly,
+// so that the race detector checks one range per call rather than every byte.
+func shake256Short(data, out []byte) {
+	var block [136]byte
+
+	copy(block[:], data)
+
+	block[len(data)] ^= 0x1f
+
+	block[135] ^= 0x80
+
+	var state [25]uint64
+
+	for i := range 17 {
+		state[i] = uint64(block[8*i]) | uint64(block[8*i+1])<<8 | uint64(block[8*i+2])<<16 | uint64(block[8*i+3])<<24 |
+			uint64(block[8*i+4])<<32 | uint64(block[8*i+5])<<40 | uint64(block[8*i+6])<<48 | uint64(block[8*i+7])<<56
+	}
+
+	permute(&state)
+
+	for i := range (len(out) + 7) / 8 {
+		for j := range 8 {
+			block[8*i+j] = byte(state[i] >> (8 * j))
+		}
+	}
+
+	copy(out, block[:])
+}

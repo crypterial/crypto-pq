@@ -5,40 +5,6 @@ import (
 	"math/bits"
 )
 
-var k256 = [64]uint32{
-	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-}
-
-var k512 = [80]uint64{
-	0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
-	0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
-	0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
-	0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694,
-	0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
-	0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
-	0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4,
-	0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70,
-	0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
-	0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
-	0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30,
-	0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
-	0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8,
-	0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3,
-	0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
-	0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b,
-	0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178,
-	0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
-	0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
-	0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
-}
-
 var iv224 = [8]uint32{0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4}
 
 var iv256 = [8]uint32{0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19}
@@ -63,78 +29,613 @@ var iv512256 = [8]uint64{
 	0x96283ee2a88effe3, 0xbe5e1e2553863992, 0x2b0199fc2c85b8aa, 0x0eb72ddc81c52ca2,
 }
 
-// Every whole 64-byte block of p is compressed into state.
-func compress256(state *[8]uint32, p []byte) {
-	var w [64]uint32
+// One SHA-256 round. The caller rotates the roles of the working variables instead of moving
+// them: the new e and the new a replace the variables that held d and h.
+func sha256Round(a, b, c, d, e, f, g, h, w, k uint32) (uint32, uint32) {
+	t1 := h + (bits.RotateLeft32(e, -6) ^ bits.RotateLeft32(e, -11) ^ bits.RotateLeft32(e, -25)) + (g ^ (e & (f ^ g))) + k + w
 
-	h0, h1, h2, h3, h4, h5, h6, h7 := state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7]
+	t2 := (bits.RotateLeft32(a, -2) ^ bits.RotateLeft32(a, -13) ^ bits.RotateLeft32(a, -22)) + ((a & b) | (c & (a | b)))
 
-	for ; len(p) >= 64; p = p[64:] {
-		a, b, c, d, e, f, g, h := h0, h1, h2, h3, h4, h5, h6, h7
-
-		for t := range 64 {
-			if t < 16 {
-				w[t] = binary.BigEndian.Uint32(p[4*t:])
-			} else {
-				s0 := bits.RotateLeft32(w[t-15], -7) ^ bits.RotateLeft32(w[t-15], -18) ^ (w[t-15] >> 3)
-
-				s1 := bits.RotateLeft32(w[t-2], -17) ^ bits.RotateLeft32(w[t-2], -19) ^ (w[t-2] >> 10)
-
-				w[t] = w[t-16] + s0 + w[t-7] + s1
-			}
-
-			s1 := bits.RotateLeft32(e, -6) ^ bits.RotateLeft32(e, -11) ^ bits.RotateLeft32(e, -25)
-
-			t1 := h + s1 + ((e & f) ^ (^e & g)) + k256[t] + w[t]
-
-			s0 := bits.RotateLeft32(a, -2) ^ bits.RotateLeft32(a, -13) ^ bits.RotateLeft32(a, -22)
-
-			t2 := s0 + ((a & b) ^ (a & c) ^ (b & c))
-
-			h, g, f, e, d, c, b, a = g, f, e, d+t1, c, b, a, t1+t2
-		}
-
-		h0, h1, h2, h3, h4, h5, h6, h7 = h0+a, h1+b, h2+c, h3+d, h4+e, h5+f, h6+g, h7+h
-	}
-
-	state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7] = h0, h1, h2, h3, h4, h5, h6, h7
+	return d + t1, t1 + t2
 }
 
-// Every whole 128-byte block of p is compressed into state.
-func compress512(state *[8]uint64, p []byte) {
-	var w [80]uint64
+// The schedule word W[t] from W[t-2], W[t-7], W[t-15] and W[t-16].
+func sha256Schedule(w2, w7, w15, w16 uint32) uint32 {
+	return (bits.RotateLeft32(w2, -17) ^ bits.RotateLeft32(w2, -19) ^ w2>>10) + w7 + (bits.RotateLeft32(w15, -7) ^ bits.RotateLeft32(w15, -18) ^ w15>>3) + w16
+}
 
-	h0, h1, h2, h3, h4, h5, h6, h7 := state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7]
+// One block of big-endian words, unrolled: the round constants are immediates and the message
+// schedule lives in sixteen locals, so the rounds touch no memory.
+func sha256Block(state [8]uint32, w [16]uint32) [8]uint32 {
+	a, b, c, d, e, f, g, h := state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7]
 
-	for ; len(p) >= 128; p = p[128:] {
-		a, b, c, d, e, f, g, h := h0, h1, h2, h3, h4, h5, h6, h7
+	w0, w1, w2, w3, w4, w5, w6, w7 := w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]
 
-		for t := range 80 {
-			if t < 16 {
-				w[t] = binary.BigEndian.Uint64(p[8*t:])
-			} else {
-				s0 := bits.RotateLeft64(w[t-15], -1) ^ bits.RotateLeft64(w[t-15], -8) ^ (w[t-15] >> 7)
+	w8, w9, w10, w11, w12, w13, w14, w15 := w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]
 
-				s1 := bits.RotateLeft64(w[t-2], -19) ^ bits.RotateLeft64(w[t-2], -61) ^ (w[t-2] >> 6)
+	d, h = sha256Round(a, b, c, d, e, f, g, h, w0, 0x428a2f98)
 
-				w[t] = w[t-16] + s0 + w[t-7] + s1
-			}
+	c, g = sha256Round(h, a, b, c, d, e, f, g, w1, 0x71374491)
 
-			s1 := bits.RotateLeft64(e, -14) ^ bits.RotateLeft64(e, -18) ^ bits.RotateLeft64(e, -41)
+	b, f = sha256Round(g, h, a, b, c, d, e, f, w2, 0xb5c0fbcf)
 
-			t1 := h + s1 + ((e & f) ^ (^e & g)) + k512[t] + w[t]
+	a, e = sha256Round(f, g, h, a, b, c, d, e, w3, 0xe9b5dba5)
 
-			s0 := bits.RotateLeft64(a, -28) ^ bits.RotateLeft64(a, -34) ^ bits.RotateLeft64(a, -39)
+	h, d = sha256Round(e, f, g, h, a, b, c, d, w4, 0x3956c25b)
 
-			t2 := s0 + ((a & b) ^ (a & c) ^ (b & c))
+	g, c = sha256Round(d, e, f, g, h, a, b, c, w5, 0x59f111f1)
 
-			h, g, f, e, d, c, b, a = g, f, e, d+t1, c, b, a, t1+t2
+	f, b = sha256Round(c, d, e, f, g, h, a, b, w6, 0x923f82a4)
+
+	e, a = sha256Round(b, c, d, e, f, g, h, a, w7, 0xab1c5ed5)
+
+	d, h = sha256Round(a, b, c, d, e, f, g, h, w8, 0xd807aa98)
+
+	c, g = sha256Round(h, a, b, c, d, e, f, g, w9, 0x12835b01)
+
+	b, f = sha256Round(g, h, a, b, c, d, e, f, w10, 0x243185be)
+
+	a, e = sha256Round(f, g, h, a, b, c, d, e, w11, 0x550c7dc3)
+
+	h, d = sha256Round(e, f, g, h, a, b, c, d, w12, 0x72be5d74)
+
+	g, c = sha256Round(d, e, f, g, h, a, b, c, w13, 0x80deb1fe)
+
+	f, b = sha256Round(c, d, e, f, g, h, a, b, w14, 0x9bdc06a7)
+
+	e, a = sha256Round(b, c, d, e, f, g, h, a, w15, 0xc19bf174)
+
+	w0 = sha256Schedule(w14, w9, w1, w0)
+
+	d, h = sha256Round(a, b, c, d, e, f, g, h, w0, 0xe49b69c1)
+
+	w1 = sha256Schedule(w15, w10, w2, w1)
+
+	c, g = sha256Round(h, a, b, c, d, e, f, g, w1, 0xefbe4786)
+
+	w2 = sha256Schedule(w0, w11, w3, w2)
+
+	b, f = sha256Round(g, h, a, b, c, d, e, f, w2, 0x0fc19dc6)
+
+	w3 = sha256Schedule(w1, w12, w4, w3)
+
+	a, e = sha256Round(f, g, h, a, b, c, d, e, w3, 0x240ca1cc)
+
+	w4 = sha256Schedule(w2, w13, w5, w4)
+
+	h, d = sha256Round(e, f, g, h, a, b, c, d, w4, 0x2de92c6f)
+
+	w5 = sha256Schedule(w3, w14, w6, w5)
+
+	g, c = sha256Round(d, e, f, g, h, a, b, c, w5, 0x4a7484aa)
+
+	w6 = sha256Schedule(w4, w15, w7, w6)
+
+	f, b = sha256Round(c, d, e, f, g, h, a, b, w6, 0x5cb0a9dc)
+
+	w7 = sha256Schedule(w5, w0, w8, w7)
+
+	e, a = sha256Round(b, c, d, e, f, g, h, a, w7, 0x76f988da)
+
+	w8 = sha256Schedule(w6, w1, w9, w8)
+
+	d, h = sha256Round(a, b, c, d, e, f, g, h, w8, 0x983e5152)
+
+	w9 = sha256Schedule(w7, w2, w10, w9)
+
+	c, g = sha256Round(h, a, b, c, d, e, f, g, w9, 0xa831c66d)
+
+	w10 = sha256Schedule(w8, w3, w11, w10)
+
+	b, f = sha256Round(g, h, a, b, c, d, e, f, w10, 0xb00327c8)
+
+	w11 = sha256Schedule(w9, w4, w12, w11)
+
+	a, e = sha256Round(f, g, h, a, b, c, d, e, w11, 0xbf597fc7)
+
+	w12 = sha256Schedule(w10, w5, w13, w12)
+
+	h, d = sha256Round(e, f, g, h, a, b, c, d, w12, 0xc6e00bf3)
+
+	w13 = sha256Schedule(w11, w6, w14, w13)
+
+	g, c = sha256Round(d, e, f, g, h, a, b, c, w13, 0xd5a79147)
+
+	w14 = sha256Schedule(w12, w7, w15, w14)
+
+	f, b = sha256Round(c, d, e, f, g, h, a, b, w14, 0x06ca6351)
+
+	w15 = sha256Schedule(w13, w8, w0, w15)
+
+	e, a = sha256Round(b, c, d, e, f, g, h, a, w15, 0x14292967)
+
+	w0 = sha256Schedule(w14, w9, w1, w0)
+
+	d, h = sha256Round(a, b, c, d, e, f, g, h, w0, 0x27b70a85)
+
+	w1 = sha256Schedule(w15, w10, w2, w1)
+
+	c, g = sha256Round(h, a, b, c, d, e, f, g, w1, 0x2e1b2138)
+
+	w2 = sha256Schedule(w0, w11, w3, w2)
+
+	b, f = sha256Round(g, h, a, b, c, d, e, f, w2, 0x4d2c6dfc)
+
+	w3 = sha256Schedule(w1, w12, w4, w3)
+
+	a, e = sha256Round(f, g, h, a, b, c, d, e, w3, 0x53380d13)
+
+	w4 = sha256Schedule(w2, w13, w5, w4)
+
+	h, d = sha256Round(e, f, g, h, a, b, c, d, w4, 0x650a7354)
+
+	w5 = sha256Schedule(w3, w14, w6, w5)
+
+	g, c = sha256Round(d, e, f, g, h, a, b, c, w5, 0x766a0abb)
+
+	w6 = sha256Schedule(w4, w15, w7, w6)
+
+	f, b = sha256Round(c, d, e, f, g, h, a, b, w6, 0x81c2c92e)
+
+	w7 = sha256Schedule(w5, w0, w8, w7)
+
+	e, a = sha256Round(b, c, d, e, f, g, h, a, w7, 0x92722c85)
+
+	w8 = sha256Schedule(w6, w1, w9, w8)
+
+	d, h = sha256Round(a, b, c, d, e, f, g, h, w8, 0xa2bfe8a1)
+
+	w9 = sha256Schedule(w7, w2, w10, w9)
+
+	c, g = sha256Round(h, a, b, c, d, e, f, g, w9, 0xa81a664b)
+
+	w10 = sha256Schedule(w8, w3, w11, w10)
+
+	b, f = sha256Round(g, h, a, b, c, d, e, f, w10, 0xc24b8b70)
+
+	w11 = sha256Schedule(w9, w4, w12, w11)
+
+	a, e = sha256Round(f, g, h, a, b, c, d, e, w11, 0xc76c51a3)
+
+	w12 = sha256Schedule(w10, w5, w13, w12)
+
+	h, d = sha256Round(e, f, g, h, a, b, c, d, w12, 0xd192e819)
+
+	w13 = sha256Schedule(w11, w6, w14, w13)
+
+	g, c = sha256Round(d, e, f, g, h, a, b, c, w13, 0xd6990624)
+
+	w14 = sha256Schedule(w12, w7, w15, w14)
+
+	f, b = sha256Round(c, d, e, f, g, h, a, b, w14, 0xf40e3585)
+
+	w15 = sha256Schedule(w13, w8, w0, w15)
+
+	e, a = sha256Round(b, c, d, e, f, g, h, a, w15, 0x106aa070)
+
+	w0 = sha256Schedule(w14, w9, w1, w0)
+
+	d, h = sha256Round(a, b, c, d, e, f, g, h, w0, 0x19a4c116)
+
+	w1 = sha256Schedule(w15, w10, w2, w1)
+
+	c, g = sha256Round(h, a, b, c, d, e, f, g, w1, 0x1e376c08)
+
+	w2 = sha256Schedule(w0, w11, w3, w2)
+
+	b, f = sha256Round(g, h, a, b, c, d, e, f, w2, 0x2748774c)
+
+	w3 = sha256Schedule(w1, w12, w4, w3)
+
+	a, e = sha256Round(f, g, h, a, b, c, d, e, w3, 0x34b0bcb5)
+
+	w4 = sha256Schedule(w2, w13, w5, w4)
+
+	h, d = sha256Round(e, f, g, h, a, b, c, d, w4, 0x391c0cb3)
+
+	w5 = sha256Schedule(w3, w14, w6, w5)
+
+	g, c = sha256Round(d, e, f, g, h, a, b, c, w5, 0x4ed8aa4a)
+
+	w6 = sha256Schedule(w4, w15, w7, w6)
+
+	f, b = sha256Round(c, d, e, f, g, h, a, b, w6, 0x5b9cca4f)
+
+	w7 = sha256Schedule(w5, w0, w8, w7)
+
+	e, a = sha256Round(b, c, d, e, f, g, h, a, w7, 0x682e6ff3)
+
+	w8 = sha256Schedule(w6, w1, w9, w8)
+
+	d, h = sha256Round(a, b, c, d, e, f, g, h, w8, 0x748f82ee)
+
+	w9 = sha256Schedule(w7, w2, w10, w9)
+
+	c, g = sha256Round(h, a, b, c, d, e, f, g, w9, 0x78a5636f)
+
+	w10 = sha256Schedule(w8, w3, w11, w10)
+
+	b, f = sha256Round(g, h, a, b, c, d, e, f, w10, 0x84c87814)
+
+	w11 = sha256Schedule(w9, w4, w12, w11)
+
+	a, e = sha256Round(f, g, h, a, b, c, d, e, w11, 0x8cc70208)
+
+	w12 = sha256Schedule(w10, w5, w13, w12)
+
+	h, d = sha256Round(e, f, g, h, a, b, c, d, w12, 0x90befffa)
+
+	w13 = sha256Schedule(w11, w6, w14, w13)
+
+	g, c = sha256Round(d, e, f, g, h, a, b, c, w13, 0xa4506ceb)
+
+	w14 = sha256Schedule(w12, w7, w15, w14)
+
+	f, b = sha256Round(c, d, e, f, g, h, a, b, w14, 0xbef9a3f7)
+
+	w15 = sha256Schedule(w13, w8, w0, w15)
+
+	e, a = sha256Round(b, c, d, e, f, g, h, a, w15, 0xc67178f2)
+
+	return [8]uint32{state[0] + a, state[1] + b, state[2] + c, state[3] + d, state[4] + e, state[5] + f, state[6] + g, state[7] + h}
+}
+
+// Every whole 64-byte block of p is compressed into state. Each block is copied to the stack
+// and indexed there directly, so that the race detector checks one range per block rather
+// than every byte.
+func compress256(state *[8]uint32, p []byte) {
+	s := *state
+
+	var block [64]byte
+
+	var w [16]uint32
+
+	for ; len(p) >= 64; p = p[64:] {
+		copy(block[:], p)
+
+		for i := range w {
+			w[i] = uint32(block[4*i])<<24 | uint32(block[4*i+1])<<16 | uint32(block[4*i+2])<<8 | uint32(block[4*i+3])
 		}
 
-		h0, h1, h2, h3, h4, h5, h6, h7 = h0+a, h1+b, h2+c, h3+d, h4+e, h5+f, h6+g, h7+h
+		s = sha256Block(s, w)
 	}
 
-	state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7] = h0, h1, h2, h3, h4, h5, h6, h7
+	*state = s
+}
+
+// The SHA-512 counterpart of sha256Round.
+func sha512Round(a, b, c, d, e, f, g, h, w, k uint64) (uint64, uint64) {
+	t1 := h + (bits.RotateLeft64(e, -14) ^ bits.RotateLeft64(e, -18) ^ bits.RotateLeft64(e, -41)) + (g ^ (e & (f ^ g))) + k + w
+
+	t2 := (bits.RotateLeft64(a, -28) ^ bits.RotateLeft64(a, -34) ^ bits.RotateLeft64(a, -39)) + ((a & b) | (c & (a | b)))
+
+	return d + t1, t1 + t2
+}
+
+func sha512Schedule(w2, w7, w15, w16 uint64) uint64 {
+	return (bits.RotateLeft64(w2, -19) ^ bits.RotateLeft64(w2, -61) ^ w2>>6) + w7 + (bits.RotateLeft64(w15, -1) ^ bits.RotateLeft64(w15, -8) ^ w15>>7) + w16
+}
+
+// The 80 rounds of SHA-512 on one block, unrolled like sha256Block.
+func sha512Block(state [8]uint64, w [16]uint64) [8]uint64 {
+	a, b, c, d, e, f, g, h := state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7]
+
+	w0, w1, w2, w3, w4, w5, w6, w7 := w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]
+
+	w8, w9, w10, w11, w12, w13, w14, w15 := w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]
+
+	d, h = sha512Round(a, b, c, d, e, f, g, h, w0, 0x428a2f98d728ae22)
+
+	c, g = sha512Round(h, a, b, c, d, e, f, g, w1, 0x7137449123ef65cd)
+
+	b, f = sha512Round(g, h, a, b, c, d, e, f, w2, 0xb5c0fbcfec4d3b2f)
+
+	a, e = sha512Round(f, g, h, a, b, c, d, e, w3, 0xe9b5dba58189dbbc)
+
+	h, d = sha512Round(e, f, g, h, a, b, c, d, w4, 0x3956c25bf348b538)
+
+	g, c = sha512Round(d, e, f, g, h, a, b, c, w5, 0x59f111f1b605d019)
+
+	f, b = sha512Round(c, d, e, f, g, h, a, b, w6, 0x923f82a4af194f9b)
+
+	e, a = sha512Round(b, c, d, e, f, g, h, a, w7, 0xab1c5ed5da6d8118)
+
+	d, h = sha512Round(a, b, c, d, e, f, g, h, w8, 0xd807aa98a3030242)
+
+	c, g = sha512Round(h, a, b, c, d, e, f, g, w9, 0x12835b0145706fbe)
+
+	b, f = sha512Round(g, h, a, b, c, d, e, f, w10, 0x243185be4ee4b28c)
+
+	a, e = sha512Round(f, g, h, a, b, c, d, e, w11, 0x550c7dc3d5ffb4e2)
+
+	h, d = sha512Round(e, f, g, h, a, b, c, d, w12, 0x72be5d74f27b896f)
+
+	g, c = sha512Round(d, e, f, g, h, a, b, c, w13, 0x80deb1fe3b1696b1)
+
+	f, b = sha512Round(c, d, e, f, g, h, a, b, w14, 0x9bdc06a725c71235)
+
+	e, a = sha512Round(b, c, d, e, f, g, h, a, w15, 0xc19bf174cf692694)
+
+	w0 = sha512Schedule(w14, w9, w1, w0)
+
+	d, h = sha512Round(a, b, c, d, e, f, g, h, w0, 0xe49b69c19ef14ad2)
+
+	w1 = sha512Schedule(w15, w10, w2, w1)
+
+	c, g = sha512Round(h, a, b, c, d, e, f, g, w1, 0xefbe4786384f25e3)
+
+	w2 = sha512Schedule(w0, w11, w3, w2)
+
+	b, f = sha512Round(g, h, a, b, c, d, e, f, w2, 0x0fc19dc68b8cd5b5)
+
+	w3 = sha512Schedule(w1, w12, w4, w3)
+
+	a, e = sha512Round(f, g, h, a, b, c, d, e, w3, 0x240ca1cc77ac9c65)
+
+	w4 = sha512Schedule(w2, w13, w5, w4)
+
+	h, d = sha512Round(e, f, g, h, a, b, c, d, w4, 0x2de92c6f592b0275)
+
+	w5 = sha512Schedule(w3, w14, w6, w5)
+
+	g, c = sha512Round(d, e, f, g, h, a, b, c, w5, 0x4a7484aa6ea6e483)
+
+	w6 = sha512Schedule(w4, w15, w7, w6)
+
+	f, b = sha512Round(c, d, e, f, g, h, a, b, w6, 0x5cb0a9dcbd41fbd4)
+
+	w7 = sha512Schedule(w5, w0, w8, w7)
+
+	e, a = sha512Round(b, c, d, e, f, g, h, a, w7, 0x76f988da831153b5)
+
+	w8 = sha512Schedule(w6, w1, w9, w8)
+
+	d, h = sha512Round(a, b, c, d, e, f, g, h, w8, 0x983e5152ee66dfab)
+
+	w9 = sha512Schedule(w7, w2, w10, w9)
+
+	c, g = sha512Round(h, a, b, c, d, e, f, g, w9, 0xa831c66d2db43210)
+
+	w10 = sha512Schedule(w8, w3, w11, w10)
+
+	b, f = sha512Round(g, h, a, b, c, d, e, f, w10, 0xb00327c898fb213f)
+
+	w11 = sha512Schedule(w9, w4, w12, w11)
+
+	a, e = sha512Round(f, g, h, a, b, c, d, e, w11, 0xbf597fc7beef0ee4)
+
+	w12 = sha512Schedule(w10, w5, w13, w12)
+
+	h, d = sha512Round(e, f, g, h, a, b, c, d, w12, 0xc6e00bf33da88fc2)
+
+	w13 = sha512Schedule(w11, w6, w14, w13)
+
+	g, c = sha512Round(d, e, f, g, h, a, b, c, w13, 0xd5a79147930aa725)
+
+	w14 = sha512Schedule(w12, w7, w15, w14)
+
+	f, b = sha512Round(c, d, e, f, g, h, a, b, w14, 0x06ca6351e003826f)
+
+	w15 = sha512Schedule(w13, w8, w0, w15)
+
+	e, a = sha512Round(b, c, d, e, f, g, h, a, w15, 0x142929670a0e6e70)
+
+	w0 = sha512Schedule(w14, w9, w1, w0)
+
+	d, h = sha512Round(a, b, c, d, e, f, g, h, w0, 0x27b70a8546d22ffc)
+
+	w1 = sha512Schedule(w15, w10, w2, w1)
+
+	c, g = sha512Round(h, a, b, c, d, e, f, g, w1, 0x2e1b21385c26c926)
+
+	w2 = sha512Schedule(w0, w11, w3, w2)
+
+	b, f = sha512Round(g, h, a, b, c, d, e, f, w2, 0x4d2c6dfc5ac42aed)
+
+	w3 = sha512Schedule(w1, w12, w4, w3)
+
+	a, e = sha512Round(f, g, h, a, b, c, d, e, w3, 0x53380d139d95b3df)
+
+	w4 = sha512Schedule(w2, w13, w5, w4)
+
+	h, d = sha512Round(e, f, g, h, a, b, c, d, w4, 0x650a73548baf63de)
+
+	w5 = sha512Schedule(w3, w14, w6, w5)
+
+	g, c = sha512Round(d, e, f, g, h, a, b, c, w5, 0x766a0abb3c77b2a8)
+
+	w6 = sha512Schedule(w4, w15, w7, w6)
+
+	f, b = sha512Round(c, d, e, f, g, h, a, b, w6, 0x81c2c92e47edaee6)
+
+	w7 = sha512Schedule(w5, w0, w8, w7)
+
+	e, a = sha512Round(b, c, d, e, f, g, h, a, w7, 0x92722c851482353b)
+
+	w8 = sha512Schedule(w6, w1, w9, w8)
+
+	d, h = sha512Round(a, b, c, d, e, f, g, h, w8, 0xa2bfe8a14cf10364)
+
+	w9 = sha512Schedule(w7, w2, w10, w9)
+
+	c, g = sha512Round(h, a, b, c, d, e, f, g, w9, 0xa81a664bbc423001)
+
+	w10 = sha512Schedule(w8, w3, w11, w10)
+
+	b, f = sha512Round(g, h, a, b, c, d, e, f, w10, 0xc24b8b70d0f89791)
+
+	w11 = sha512Schedule(w9, w4, w12, w11)
+
+	a, e = sha512Round(f, g, h, a, b, c, d, e, w11, 0xc76c51a30654be30)
+
+	w12 = sha512Schedule(w10, w5, w13, w12)
+
+	h, d = sha512Round(e, f, g, h, a, b, c, d, w12, 0xd192e819d6ef5218)
+
+	w13 = sha512Schedule(w11, w6, w14, w13)
+
+	g, c = sha512Round(d, e, f, g, h, a, b, c, w13, 0xd69906245565a910)
+
+	w14 = sha512Schedule(w12, w7, w15, w14)
+
+	f, b = sha512Round(c, d, e, f, g, h, a, b, w14, 0xf40e35855771202a)
+
+	w15 = sha512Schedule(w13, w8, w0, w15)
+
+	e, a = sha512Round(b, c, d, e, f, g, h, a, w15, 0x106aa07032bbd1b8)
+
+	w0 = sha512Schedule(w14, w9, w1, w0)
+
+	d, h = sha512Round(a, b, c, d, e, f, g, h, w0, 0x19a4c116b8d2d0c8)
+
+	w1 = sha512Schedule(w15, w10, w2, w1)
+
+	c, g = sha512Round(h, a, b, c, d, e, f, g, w1, 0x1e376c085141ab53)
+
+	w2 = sha512Schedule(w0, w11, w3, w2)
+
+	b, f = sha512Round(g, h, a, b, c, d, e, f, w2, 0x2748774cdf8eeb99)
+
+	w3 = sha512Schedule(w1, w12, w4, w3)
+
+	a, e = sha512Round(f, g, h, a, b, c, d, e, w3, 0x34b0bcb5e19b48a8)
+
+	w4 = sha512Schedule(w2, w13, w5, w4)
+
+	h, d = sha512Round(e, f, g, h, a, b, c, d, w4, 0x391c0cb3c5c95a63)
+
+	w5 = sha512Schedule(w3, w14, w6, w5)
+
+	g, c = sha512Round(d, e, f, g, h, a, b, c, w5, 0x4ed8aa4ae3418acb)
+
+	w6 = sha512Schedule(w4, w15, w7, w6)
+
+	f, b = sha512Round(c, d, e, f, g, h, a, b, w6, 0x5b9cca4f7763e373)
+
+	w7 = sha512Schedule(w5, w0, w8, w7)
+
+	e, a = sha512Round(b, c, d, e, f, g, h, a, w7, 0x682e6ff3d6b2b8a3)
+
+	w8 = sha512Schedule(w6, w1, w9, w8)
+
+	d, h = sha512Round(a, b, c, d, e, f, g, h, w8, 0x748f82ee5defb2fc)
+
+	w9 = sha512Schedule(w7, w2, w10, w9)
+
+	c, g = sha512Round(h, a, b, c, d, e, f, g, w9, 0x78a5636f43172f60)
+
+	w10 = sha512Schedule(w8, w3, w11, w10)
+
+	b, f = sha512Round(g, h, a, b, c, d, e, f, w10, 0x84c87814a1f0ab72)
+
+	w11 = sha512Schedule(w9, w4, w12, w11)
+
+	a, e = sha512Round(f, g, h, a, b, c, d, e, w11, 0x8cc702081a6439ec)
+
+	w12 = sha512Schedule(w10, w5, w13, w12)
+
+	h, d = sha512Round(e, f, g, h, a, b, c, d, w12, 0x90befffa23631e28)
+
+	w13 = sha512Schedule(w11, w6, w14, w13)
+
+	g, c = sha512Round(d, e, f, g, h, a, b, c, w13, 0xa4506cebde82bde9)
+
+	w14 = sha512Schedule(w12, w7, w15, w14)
+
+	f, b = sha512Round(c, d, e, f, g, h, a, b, w14, 0xbef9a3f7b2c67915)
+
+	w15 = sha512Schedule(w13, w8, w0, w15)
+
+	e, a = sha512Round(b, c, d, e, f, g, h, a, w15, 0xc67178f2e372532b)
+
+	w0 = sha512Schedule(w14, w9, w1, w0)
+
+	d, h = sha512Round(a, b, c, d, e, f, g, h, w0, 0xca273eceea26619c)
+
+	w1 = sha512Schedule(w15, w10, w2, w1)
+
+	c, g = sha512Round(h, a, b, c, d, e, f, g, w1, 0xd186b8c721c0c207)
+
+	w2 = sha512Schedule(w0, w11, w3, w2)
+
+	b, f = sha512Round(g, h, a, b, c, d, e, f, w2, 0xeada7dd6cde0eb1e)
+
+	w3 = sha512Schedule(w1, w12, w4, w3)
+
+	a, e = sha512Round(f, g, h, a, b, c, d, e, w3, 0xf57d4f7fee6ed178)
+
+	w4 = sha512Schedule(w2, w13, w5, w4)
+
+	h, d = sha512Round(e, f, g, h, a, b, c, d, w4, 0x06f067aa72176fba)
+
+	w5 = sha512Schedule(w3, w14, w6, w5)
+
+	g, c = sha512Round(d, e, f, g, h, a, b, c, w5, 0x0a637dc5a2c898a6)
+
+	w6 = sha512Schedule(w4, w15, w7, w6)
+
+	f, b = sha512Round(c, d, e, f, g, h, a, b, w6, 0x113f9804bef90dae)
+
+	w7 = sha512Schedule(w5, w0, w8, w7)
+
+	e, a = sha512Round(b, c, d, e, f, g, h, a, w7, 0x1b710b35131c471b)
+
+	w8 = sha512Schedule(w6, w1, w9, w8)
+
+	d, h = sha512Round(a, b, c, d, e, f, g, h, w8, 0x28db77f523047d84)
+
+	w9 = sha512Schedule(w7, w2, w10, w9)
+
+	c, g = sha512Round(h, a, b, c, d, e, f, g, w9, 0x32caab7b40c72493)
+
+	w10 = sha512Schedule(w8, w3, w11, w10)
+
+	b, f = sha512Round(g, h, a, b, c, d, e, f, w10, 0x3c9ebe0a15c9bebc)
+
+	w11 = sha512Schedule(w9, w4, w12, w11)
+
+	a, e = sha512Round(f, g, h, a, b, c, d, e, w11, 0x431d67c49c100d4c)
+
+	w12 = sha512Schedule(w10, w5, w13, w12)
+
+	h, d = sha512Round(e, f, g, h, a, b, c, d, w12, 0x4cc5d4becb3e42b6)
+
+	w13 = sha512Schedule(w11, w6, w14, w13)
+
+	g, c = sha512Round(d, e, f, g, h, a, b, c, w13, 0x597f299cfc657e2a)
+
+	w14 = sha512Schedule(w12, w7, w15, w14)
+
+	f, b = sha512Round(c, d, e, f, g, h, a, b, w14, 0x5fcb6fab3ad6faec)
+
+	w15 = sha512Schedule(w13, w8, w0, w15)
+
+	e, a = sha512Round(b, c, d, e, f, g, h, a, w15, 0x6c44198c4a475817)
+
+	return [8]uint64{state[0] + a, state[1] + b, state[2] + c, state[3] + d, state[4] + e, state[5] + f, state[6] + g, state[7] + h}
+}
+
+// Every whole 128-byte block of p is compressed into state, read from a stack copy as in
+// compress256.
+func compress512(state *[8]uint64, p []byte) {
+	s := *state
+
+	var block [128]byte
+
+	var w [16]uint64
+
+	for ; len(p) >= 128; p = p[128:] {
+		copy(block[:], p)
+
+		for i := range w {
+			w[i] = uint64(block[8*i])<<56 | uint64(block[8*i+1])<<48 | uint64(block[8*i+2])<<40 | uint64(block[8*i+3])<<32 |
+				uint64(block[8*i+4])<<24 | uint64(block[8*i+5])<<16 | uint64(block[8*i+6])<<8 | uint64(block[8*i+7])
+		}
+
+		s = sha512Block(s, w)
+	}
+
+	*state = s
 }
 
 type sha256Engine struct {
@@ -287,4 +788,78 @@ func (e *sha512Engine) clone() engine {
 	copied := *e
 
 	return &copied
+}
+
+// Completes a SHA-256 hash whose first absorbed bytes, a multiple of 64, are already compressed
+// into state, and writes the first len(out) bytes of the digest. Nothing is allocated, and the
+// stack buffers are indexed directly for the race detector's sake, as in compress256.
+func sha256Finish(state [8]uint32, absorbed int, data, out []byte) {
+	whole := len(data) &^ 63
+
+	compress256(&state, data[:whole])
+
+	var tail [128]byte
+
+	used := copy(tail[:], data[whole:])
+
+	tail[used] = 0x80
+
+	end := 64
+
+	if used+1+8 > 64 {
+		end = 128
+	}
+
+	length := uint64(absorbed+len(data)) * 8
+
+	for i := range 8 {
+		tail[end-1-i] = byte(length >> (8 * i))
+	}
+
+	compress256(&state, tail[:end])
+
+	var digest [32]byte
+
+	for i, word := range state {
+		digest[4*i], digest[4*i+1], digest[4*i+2], digest[4*i+3] = byte(word>>24), byte(word>>16), byte(word>>8), byte(word)
+	}
+
+	copy(out, digest[:])
+}
+
+// The SHA-512 counterpart of sha256Finish, with 128-byte blocks; absorbed stays below 2^61.
+func sha512Finish(state [8]uint64, absorbed int, data, out []byte) {
+	whole := len(data) &^ 127
+
+	compress512(&state, data[:whole])
+
+	var tail [256]byte
+
+	used := copy(tail[:], data[whole:])
+
+	tail[used] = 0x80
+
+	end := 128
+
+	if used+1+16 > 128 {
+		end = 256
+	}
+
+	length := uint64(absorbed+len(data)) * 8
+
+	for i := range 8 {
+		tail[end-1-i] = byte(length >> (8 * i))
+	}
+
+	compress512(&state, tail[:end])
+
+	var digest [64]byte
+
+	for i, word := range state {
+		for j := range 8 {
+			digest[8*i+j] = byte(word >> (56 - 8*j))
+		}
+	}
+
+	copy(out, digest[:])
 }
