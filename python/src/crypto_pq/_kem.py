@@ -18,6 +18,7 @@ from ._keys import (
     mismatch,
     require_bool,
     require_bytes,
+    require_key_length,
     require_length,
 )
 from ._rng import random_bytes
@@ -228,7 +229,7 @@ class KemAlgorithm:
     def import_public_key(self, data: _Bytes | str, format: KeyFormat | str) -> KemPublicKey:
         key = import_public(format, data, self._backend.oid)
 
-        require_length(key, self._backend.public_key_size, "public key")
+        require_key_length(key, self._backend.public_key_size, format, "public key")
 
         if not self._backend.check_public_key(key):
             raise CryptoPQError(ErrorCode.INVALID_PUBLIC_KEY, "the public key fails the encoding checks")

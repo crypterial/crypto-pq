@@ -43,6 +43,17 @@ def require_length(data, length, name):
     return data
 
 
+# A raw key of the wrong size is a length error; inside DER or PEM it is an encoding error.
+def require_key_length(data, length, format, name):
+    if len(data) != length:
+        if key_format(format) is KeyFormat.RAW:
+            raise CryptoPQError(ErrorCode.INVALID_LENGTH, f"{name} must be {length} bytes")
+
+        raise invalid(f"the encoded {name} has the wrong length")
+
+    return data
+
+
 def der_input(format, data, label):
     if format is KeyFormat.PEM:
         if isinstance(data, str):

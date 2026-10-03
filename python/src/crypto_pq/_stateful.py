@@ -94,7 +94,10 @@ class _Hss:
     def decode(self, state):
         body = unseal(state, self.kind)
 
-        count = body[0]
+        count = body[0] if body else 0
+
+        if len(body) < 1 + 8 * count:
+            raise mismatch("the stored key has the wrong length")
 
         names = [(int.from_bytes(body[1 + 8 * i : 5 + 8 * i], "big"), int.from_bytes(body[5 + 8 * i : 9 + 8 * i], "big")) for i in range(count)]
 
@@ -294,6 +297,9 @@ class StatefulSignatureAlgorithm:
 
     def _create(self, parameters, seed, index, store):
         signer = self._backend.signer(parameters, seed)
+
+        if not 0 <= index <= signer.capacity:
+            raise option("the index must lie between 0 and the key's capacity")
 
         state = self._backend.encode(parameters, seed, index)
 

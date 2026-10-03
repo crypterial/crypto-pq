@@ -27,6 +27,7 @@ from ._keys import (
     mismatch,
     require_bool,
     require_bytes,
+    require_key_length,
     require_length,
 )
 from ._rng import random_bytes
@@ -332,7 +333,7 @@ class SignatureAlgorithm:
     def import_public_key(self, data, format):
         key = import_public(format, data, self._backend.oid)
 
-        require_length(key, self._backend.public_key_size, "public key")
+        require_key_length(key, self._backend.public_key_size, format, "public key")
 
         return SignaturePublicKey(self, key)
 
@@ -342,7 +343,7 @@ class SignatureAlgorithm:
         octets, raw, public_key = import_private(format, data, backend.oid)
 
         if backend.expanded_size is None:
-            key = self._import_slh_dsa(raw if raw is not None else octets)
+            key = self._import_slh_dsa(raw if raw is not None else octets, format)
         elif raw is not None:
             key = self._import_ml_dsa_raw(raw)
         else:
@@ -353,8 +354,8 @@ class SignatureAlgorithm:
 
         return key
 
-    def _import_slh_dsa(self, sk):
-        require_length(sk, self._backend.params.private_key_size, "private key")
+    def _import_slh_dsa(self, sk, format):
+        require_key_length(sk, self._backend.params.private_key_size, format, "private key")
 
         public, private = self._backend.from_private(sk)
 

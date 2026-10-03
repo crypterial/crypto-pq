@@ -214,6 +214,12 @@ class KemApiTest(unittest.TestCase):
 
                 self.assertCode(ErrorCode.INVALID_LENGTH, algorithm.import_private_key, b"\x00" * 63, "raw")
 
+                short = der(0x30, der(0x30, OIDS[algorithm.name]) + der(0x03, b"\x00" + pair.public_key.export_key("raw")[:-1]))
+
+                self.assertCode(ErrorCode.INVALID_ENCODING, algorithm.import_public_key, short, "der")
+
+                self.assertCode(ErrorCode.INVALID_LENGTH, algorithm.import_public_key, pair.public_key.export_key("raw")[:-1], "raw")
+
         pair = crypto_pq.ML_KEM_768.generate_key_pair()
 
         self.assertCode(ErrorCode.ALGORITHM_MISMATCH, crypto_pq.ML_KEM_512.import_public_key, pair.public_key.export_key("der"), "der")

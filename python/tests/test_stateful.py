@@ -211,6 +211,18 @@ class HssTest(unittest.TestCase):
 
         self.assertCode(ErrorCode.INVALID_PRIVATE_KEY, HSS_LMS.load_private_key, MemoryStore())
 
+        truncated = b"\x01\x01" + crypto_pq.SHA_256.digest(b"\x01\x01")[:16]
+
+        self.assertCode(ErrorCode.INVALID_PRIVATE_KEY, HSS_LMS.load_private_key, MemoryStore(truncated))
+
+        self.assertCode(ErrorCode.INVALID_OPTION, hazmat.generate_key_pair, HSS_LMS, bytes(40), parameters=SMALL, state_store=MemoryStore(), index=33)
+
+        exhausted = hazmat.generate_key_pair(HSS_LMS, bytes(40), parameters=SMALL, state_store=MemoryStore(), index=32)
+
+        self.assertEqual(exhausted.private_key.remaining_signatures(), 0)
+
+        self.assertCode(ErrorCode.KEY_EXHAUSTED, exhausted.private_key.sign, b"m")
+
         self.assertCode(ErrorCode.ALGORITHM_MISMATCH, XMSS.load_private_key, MemoryStore(broken.state))
 
     def test_parameters(self):
