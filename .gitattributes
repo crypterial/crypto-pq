@@ -1,0 +1,4 @@
+# LF everywhere, also on Windows checkouts, where the formatters would reject CRLF. The vectors
+# keep their exact bytes (the CAVP files use CRLF), as SHA256SUMS pins them.
+* text=auto eol=lf
+vectors/** -text

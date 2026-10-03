@@ -15,6 +15,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# The same bash steps on every platform; Windows runs them in Git Bash.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   vectors:
     name: test vectors are unmodified
@@ -23,12 +28,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: cd vectors && sha256sum -c SHA256SUMS
 
+  # Every language runs its full suite on x86-64 and arm64 Linux, macOS and Windows; the extra
+  # toolchain versions run on x86-64 Linux only.
   python:
-    name: python ${{ matrix.python }}
-    runs-on: ubuntu-latest
+    name: python ${{ matrix.python }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python: ["3.11", "3.x"]
+        include:
+          - { os: ubuntu-24.04-arm, python: "3.x" }
+          - { os: macos-latest, python: "3.x" }
+          - { os: windows-latest, python: "3.x" }
     defaults:
       run:
         working-directory: python
@@ -42,11 +55,17 @@ jobs:
           PYTHONPATH: src
 
   rust:
-    name: rust ${{ matrix.rust }}
-    runs-on: ubuntu-latest
+    name: rust ${{ matrix.rust }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         rust: ["1.88", stable]
+        include:
+          - { os: ubuntu-24.04-arm, rust: stable }
+          - { os: macos-latest, rust: stable }
+          - { os: windows-latest, rust: stable }
     defaults:
       run:
         working-directory: rust
@@ -54,19 +73,25 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install ${{ matrix.rust }} --profile minimal --component clippy,rustfmt
       - run: rustup override set ${{ matrix.rust }}
-      - if: matrix.rust == 'stable'
+      - if: matrix.rust == 'stable' && matrix.os == 'ubuntu-latest'
         run: cargo fmt --check
-      - if: matrix.rust == 'stable'
+      - if: matrix.rust == 'stable' && matrix.os == 'ubuntu-latest'
         run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
       - run: cargo test --locked --release
 
   typescript:
-    name: typescript (node ${{ matrix.node }})
-    runs-on: ubuntu-latest
+    name: typescript node ${{ matrix.node }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         node: ["22", "24", "26"]
+        include:
+          - { os: ubuntu-24.04-arm, node: "24" }
+          - { os: macos-latest, node: "24" }
+          - { os: windows-latest, node: "24" }
     defaults:
       run:
         working-directory: typescript
@@ -83,11 +108,17 @@ jobs:
       - run: npm run build
 
   go:
-    name: go ${{ matrix.go }}
-    runs-on: ubuntu-latest
+    name: go ${{ matrix.go }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         go: ["1.25", stable]
+        include:
+          - { os: ubuntu-24.04-arm, go: stable }
+          - { os: macos-latest, go: stable }
+          - { os: windows-latest, go: stable }
     defaults:
       run:
         working-directory: go
@@ -97,30 +128,183 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           cache: false
-      - run: test -z "$(gofmt -l .)"
+      - if: matrix.os == 'ubuntu-latest'
+        run: test -z "$(gofmt -l .)"
       - run: go vet ./...
-      - run: go test -race ./...
+      # The race detector needs cgo, which the Windows runner has no C compiler set up for.
+      - if: runner.os != 'Windows'
+        run: go test -race ./...
+      - if: runner.os == 'Windows'
+        run: go test ./...
 
   zig:
-    name: zig 0.16.0
-    runs-on: ubuntu-latest
+    name: zig 0.16.0 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive: zig-x86_64-linux-0.16.0.tar.xz
+            sha256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+          - os: ubuntu-24.04-arm
+            archive: zig-aarch64-linux-0.16.0.tar.xz
+            sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+          - os: macos-latest
+            archive: zig-aarch64-macos-0.16.0.tar.xz
+            sha256: b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489
+          - os: windows-latest
+            archive: zig-x86_64-windows-0.16.0.zip
+            sha256: 68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e
     defaults:
       run:
         working-directory: zig
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # ziglang.org asks automated downloads to stay rare, so the tarball is cached; it is
+      # ziglang.org asks automated downloads to stay rare, so the archive is cached; it is
       # checked against the SHA-256 that ziglang.org/download/index.json publishes either way.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/zig.tar.xz
-          key: zig-x86_64-linux-0.16.0
+          path: ~/${{ matrix.archive }}
+          key: ${{ matrix.archive }}
       - run: |
-          [ -f ~/zig.tar.xz ] || curl -fsSL --proto '=https' -o ~/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
-          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $HOME/zig.tar.xz" | sha256sum -c -
-          mkdir -p ~/zig && tar -xJf ~/zig.tar.xz -C ~/zig --strip-components=1
-          echo "$HOME/zig" >> "$GITHUB_PATH"
-      - run: zig fmt --check .
-      - run: zig build test --summary all
+          archive="$HOME/${{ matrix.archive }}"
+          [ -f "$archive" ] || curl -fsSL --proto '=https' -o "$archive" "https://ziglang.org/download/0.16.0/${{ matrix.archive }}"
+          actual=$({ sha256sum "$archive" 2>/dev/null || shasum -a 256 "$archive"; } | cut -d' ' -f1)
+          [ "$actual" = "${{ matrix.sha256 }}" ]
+          mkdir -p ~/zig
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z x -bd -y -o"$(cygpath -w ~/unpacked)" "$(cygpath -w "$archive")" > /dev/null
+            mv ~/unpacked/*/* ~/zig/
+            cygpath -w ~/zig >> "$GITHUB_PATH"
+          else
+            tar -xJf "$archive" -C ~/zig --strip-components=1
+            echo ~/zig >> "$GITHUB_PATH"
+          fi
+      - if: matrix.os == 'ubuntu-latest'
+        run: zig fmt --check .
+      # Debug builds take a quarter of an hour, so they run once; the other platforms run the
+      # optimized modes, which keep or drop the safety checks.
+      - if: matrix.os == 'ubuntu-latest'
+        run: zig build test --summary all
       - run: zig build test -Doptimize=ReleaseSafe --summary all
       - run: zig build test -Doptimize=ReleaseFast --summary all
+
+  # 32-bit and big-endian targets, the big-endian one (s390x) under qemu: the code has no
+  # word-size or byte-order assumptions, and these runs keep it that way. JavaScript and Python
+  # expose neither, so their jobs above cover them.
+  go-cross:
+    name: go ${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: ["386", s390x]
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+      - if: matrix.goarch == 's390x'
+        run: sudo apt-get update -q && sudo apt-get install -yq qemu-user
+      - if: matrix.goarch == '386'
+        run: GOARCH=386 go test ./...
+      - if: matrix.goarch == 's390x'
+        run: GOARCH=s390x go test -exec qemu-s390x ./...
+
+  rust-cross:
+    name: rust ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: i686-unknown-linux-gnu
+            packages: gcc-multilib
+          - target: s390x-unknown-linux-gnu
+            packages: gcc-s390x-linux-gnu libc6-dev-s390x-cross qemu-user
+    defaults:
+      run:
+        working-directory: rust
+    env:
+      CARGO_TARGET_S390X_UNKNOWN_LINUX_GNU_LINKER: s390x-linux-gnu-gcc
+      CARGO_TARGET_S390X_UNKNOWN_LINUX_GNU_RUNNER: qemu-s390x -L /usr/s390x-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update -q && sudo apt-get install -yq ${{ matrix.packages }}
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo test --locked --release --target ${{ matrix.target }}
+
+  zig-cross:
+    name: zig ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86-linux, s390x-linux]
+    defaults:
+      run:
+        working-directory: zig
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/zig-x86_64-linux-0.16.0.tar.xz
+          key: zig-x86_64-linux-0.16.0.tar.xz
+      - run: |
+          archive=~/zig-x86_64-linux-0.16.0.tar.xz
+          [ -f "$archive" ] || curl -fsSL --proto '=https' -o "$archive" https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $archive" | sha256sum -c -
+          mkdir -p ~/zig && tar -xJf "$archive" -C ~/zig --strip-components=1
+          echo ~/zig >> "$GITHUB_PATH"
+      - if: matrix.target == 's390x-linux'
+        run: sudo apt-get update -q && sudo apt-get install -yq qemu-user
+      - run: zig build test -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -fqemu --summary all
+
+  # The packages that would be published build from their declared contents alone.
+  package:
+    name: packages build cleanly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: rust crate
+        working-directory: rust
+        run: |
+          cargo package --locked
+          cargo package --locked --list
+      - name: npm package
+        working-directory: typescript
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+          npm pack --dry-run --json > pack.json
+          node -e '
+            const files = JSON.parse(require("fs").readFileSync("pack.json", "utf8"))[0].files.map((f) => f.path);
+            const stray = files.filter((p) => !/^(dist\/|LICENSE-|package\.json$)/.test(p));
+            console.log(files.join("\n"));
+            if (stray.length) throw new Error("unexpected files: " + stray.join(", "));
+          '
+      - name: python wheel
+        working-directory: python
+        run: |
+          python -m pip wheel . --no-deps -w "$RUNNER_TEMP/wheel"
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install "$RUNNER_TEMP"/wheel/*.whl
+          cd "$RUNNER_TEMP" && venv/bin/python -c '
+          import crypto_pq
+          pair = crypto_pq.ML_KEM_768.generate_key_pair()
+          sealed = pair.public_key.encapsulate()
+          assert pair.private_key.decapsulate(sealed.ciphertext) == sealed.shared_secret
+          print(crypto_pq.__name__, "wheel OK")
+          '
