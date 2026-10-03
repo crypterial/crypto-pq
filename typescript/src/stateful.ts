@@ -245,9 +245,13 @@ function xmssBackend(multi: boolean): StatefulBackend<xmss.Parameters> {
 }
 
 function checkStore(store: unknown): StateStore {
-  const candidate = store as Partial<StateStore> | null;
+  if (store === undefined || store === null) {
+    throw new CryptoPQError("INVALID_OPTION", "a stateStore is required");
+  }
 
-  if (typeof candidate?.read !== "function" || typeof candidate.update !== "function") {
+  const candidate = store as Partial<StateStore>;
+
+  if (typeof candidate.read !== "function" || typeof candidate.update !== "function") {
     throw new TypeError("stateStore must have read and update methods");
   }
 

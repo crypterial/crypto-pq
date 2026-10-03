@@ -377,6 +377,10 @@ test("stateful signing is serialized", async () => {
   assert.equal(key.remainingSignatures(), 27n);
 
   await assert.rejects(pq.HSS_LMS.loadPrivateKey({} as pq.StateStore), TypeError);
+
+  await rejectsCode("INVALID_OPTION", () => pq.HSS_LMS.loadPrivateKey(undefined as unknown as pq.StateStore));
+
+  await rejectsCode("INVALID_OPTION", () => pq.HSS_LMS.generateKeyPair({ parameters: SMALL, stateStore: null as unknown as pq.StateStore }));
 });
 
 test("stateful hazmat options", async () => {
