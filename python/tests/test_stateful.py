@@ -51,9 +51,6 @@ class HssTest(unittest.TestCase):
 
     def test_acvp_key_generation(self):
         for header, record in records("acvp/LMS-keyGen.txt", "publicKey"):
-            if not SLOW and header["lmsMode"].endswith("H10"):
-                continue
-
             with self.subTest(tcId=record["tcId"]):
                 pair = hazmat.generate_key_pair(
                     HSS_LMS,
@@ -99,7 +96,8 @@ class HssTest(unittest.TestCase):
 
                 index = self.index(levels, signature)
 
-                if not SLOW and sum(lms.h for lms, _ in levels) > 5:
+                # RFC 9858, A.4, has a tree of height 20: about a million leaves.
+                if not SLOW and sum(lms.h for lms, _ in levels) > 15:
                     continue
 
                 pair = hazmat.generate_key_pair(
@@ -286,7 +284,9 @@ class XmssTest(unittest.TestCase):
 
                 self.assertFalse(public_key.verify(bytes(tampered), message))
 
-                if not SLOW and (name != "XMSSMT-SHA2_20/4_256" or index > 1):
+                # By default only the sets with 4 layers of height 5 build keys and sign: one tree
+                # of height 10 takes about ten seconds in pure Python.
+                if not SLOW and name.split("_")[1] != "20/4":
                     continue
 
                 pair = hazmat.generate_key_pair(algorithm, unhex(record["seed"]), parameters=name, state_store=MemoryStore(), index=index)

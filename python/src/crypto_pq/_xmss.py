@@ -1,13 +1,20 @@
+import struct
+from itertools import starmap
 from typing import NamedTuple
 
+from . import _lanes
 from ._merkle import MerkleTree
 from ._primitives import sha256, shake256
+from ._sha2 import IV_256, Sha256
 
 W = 16
 
 OTS, LTREE, HASH_TREE = 0, 1, 2
 
 F, H, H_MSG, PRF, PRF_KEYGEN = range(5)
+
+# Lanes per batch (see _slhdsa).
+CHUNK = 8192
 
 
 class Parameters(NamedTuple):
@@ -83,45 +90,23 @@ def hash_function(p, prefix, key, message):
     return shake256(data, p.n) if p.shake else sha256(data)[: p.n]
 
 
-def address(layer, tree, kind):
-    adrs = bytearray(32)
-
-    adrs[0:4] = layer.to_bytes(4, "big")
-
-    adrs[4:12] = tree.to_bytes(8, "big")
-
-    adrs[12:16] = kind.to_bytes(4, "big")
-
-    return adrs
+# An address: layer, tree, type, then the words 4 to 7 (OTS, L-tree or padding; chain or tree
+# height; hash or tree index; key and mask).
+_ADDRESS = struct.Struct(">IQIIIII")
 
 
-def set_word(adrs, word, value):
-    adrs[4 * word : 4 * word + 4] = value.to_bytes(4, "big")
+def address(layer, tree, kind, word4=0, word5=0, word6=0, word7=0):
+    return _ADDRESS.pack(layer, tree, kind, word4, word5, word6, word7)
 
 
 def xor(a, b):
     return bytes(x ^ y for x, y in zip(a, b))
 
 
-def prf(p, key, adrs):
-    return hash_function(p, PRF, key, bytes(adrs))
+def rand_hash(p, left, right, pub_seed, layer, tree, kind, word4, word5, word6):
+    key, mask0, mask1 = (hash_function(p, PRF, pub_seed, address(layer, tree, kind, word4, word5, word6, i)) for i in range(3))
 
-
-def chain(p, x, start, steps, pub_seed, adrs):
-    for k in range(start, start + steps):
-        set_word(adrs, 6, k)
-
-        set_word(adrs, 7, 0)
-
-        key = prf(p, pub_seed, adrs)
-
-        set_word(adrs, 7, 1)
-
-        mask = prf(p, pub_seed, adrs)
-
-        x = hash_function(p, F, key, xor(x, mask))
-
-    return x
+    return hash_function(p, H, key, xor(left, mask0) + xor(right, mask1))
 
 
 def wots_digits(p, message):
@@ -135,142 +120,248 @@ def wots_digits(p, message):
     return digits + [(checksum >> shift) & 0x0F for shift in (12, 8, 4)]
 
 
-# SP 800-208: secret chain values come from PRF_keygen(SK_SEED, PUB_SEED || ADRS) with the hash
-# and key-and-mask words cleared.
-def wots_secret(p, sk_seed, pub_seed, adrs, i):
-    set_word(adrs, 5, i)
-
-    set_word(adrs, 6, 0)
-
-    set_word(adrs, 7, 0)
-
-    return hash_function(p, PRF_KEYGEN, sk_seed, pub_seed + bytes(adrs))
+def _swap32(value):
+    return int.from_bytes(value.to_bytes(4, "big"), "little")
 
 
-def wots_public(p, sk_seed, pub_seed, adrs):
-    secrets = [wots_secret(p, sk_seed, pub_seed, adrs, i) for i in range(p.length)]
+class Lanes:
+    """The hashes of one XMSS key on many inputs at once (see _lanes).
 
-    out = []
+    Every hash is H(toByte(prefix, padding) || KEY || M). With SHA-256 and n = 32 the first block
+    is the prefix and the key, so the keyed PRFs start from the state after that block; with n =
+    24 the 4-byte prefix keeps every value word-aligned. SHAKE256 values are Keccak lanes; with n =
+    24 the key and message start 4 bytes into a lane. A value is n/4 SHA-256 words in 64-bit
+    fields, or n/8 Keccak lanes.
+    """
 
-    for i, secret in enumerate(secrets):
-        set_word(adrs, 5, i)
+    def __init__(self, p, pub_seed, sk_seed, count):
+        self.p = p
 
-        out.append(chain(p, secret, 0, W - 1, pub_seed, adrs))
+        self.count = count
 
-    return out
+        self.pub_seed = self.constant(pub_seed)
+
+        self.sk_seed = self.constant(sk_seed) if sk_seed is not None else None
+
+        self.keyed = {}
+
+        if not p.shake and p.padding == 32:
+            for prefix, key in ((PRF, pub_seed), (PRF_KEYGEN, sk_seed)):
+                if key is not None:
+                    engine = Sha256(IV_256, 32)
+
+                    engine.update(prefix.to_bytes(32, "big") + key)
+
+                    self.keyed[prefix] = list(engine._state)
+
+    def constant(self, data):
+        if self.p.shake:
+            words = struct.unpack(f"<{len(data) // 8}Q", data)
+        else:
+            words = struct.unpack(f">{len(data) // 4}I", data)
+
+        return [_lanes.replicate(word, self.count, 64) for word in words]
+
+    def from_bytes(self, values):
+        return _lanes.lanes64(values) if self.p.shake else _lanes.words(values, 4, 64)
+
+    def to_bytes(self, value):
+        return _lanes.chunks64(value, self.count) if self.p.shake else _lanes.chunks(value, self.count, 4, 64)
+
+    # The address words of every lane from fields that are one value for all lanes, or lists.
+    def address(self, layer, tree, kind, word4=0, word5=0, word6=0, word7=0):
+        fields = (layer, tree, kind, word4, word5, word6, word7)
+
+        layout = "<4Q" if self.p.shake else ">8I"
+
+        if not any(isinstance(field, list) for field in fields):
+            return [_lanes.replicate(word, self.count, 64) for word in struct.unpack(layout, _ADDRESS.pack(*fields))]
+
+        columns = [field if isinstance(field, list) else [field] * self.count for field in fields]
+
+        data = b"".join(starmap(_ADDRESS.pack, zip(*columns)))
+
+        return [_lanes.pack(column, 64) for column in zip(*struct.iter_unpack(layout, data))]
+
+    # The address with words 6 and 7 set for every lane, for an address made with both zero.
+    def last_words(self, adrs, word6, word7):
+        if self.p.shake:
+            return adrs[:3] + [_lanes.replicate(_swap32(word6) | (_swap32(word7) << 32), self.count, 64)]
+
+        return adrs[:6] + [_lanes.replicate(word6, self.count, 64), _lanes.replicate(word7, self.count, 64)]
+
+    def hash(self, prefix, key, message):
+        p, count = self.p, self.count
+
+        if p.shake:
+            if p.padding == 32:
+                lanes = [0, 0, 0, _lanes.replicate(prefix << 56, count, 64)] + key + message + [_lanes.replicate(0x1F, count, 64)]
+            else:
+                lanes = _lanes.shifted_le(_lanes.replicate(_swap32(prefix), count, 64), key + message, 4, count)
+
+            return _lanes.shake256(lanes, count, p.n // 8)
+
+        end = [_lanes.replicate(0x80000000, count, 64)]
+
+        if prefix in self.keyed:
+            return _lanes.sha256(self.keyed[prefix], message + end, count, 8 * (64 + 4 * len(message)))[: p.n // 4]
+
+        head = [0] * (p.padding // 4 - 1) + [_lanes.replicate(prefix, count, 64)]
+
+        words = head + key + message + end
+
+        return _lanes.sha256(IV_256, words, count, 32 * (len(words) - 1))[: p.n // 4]
+
+    def prf(self, adrs):
+        return self.hash(PRF, self.pub_seed, adrs)
+
+    def prf_keygen(self, adrs):
+        return self.hash(PRF_KEYGEN, self.sk_seed, self.pub_seed + adrs)
+
+    # One step of the chains of the given address (made with hash and key-and-mask words zero):
+    # the key and the bitmask come from PRF(PUB_SEED, ADRS) with key-and-mask 0 and 1.
+    def chain_step(self, adrs):
+        def step(value, k):
+            key = self.prf(self.last_words(adrs, k, 0))
+
+            mask = self.prf(self.last_words(adrs, k, 1))
+
+            return self.hash(F, key, [x ^ y for x, y in zip(value, mask)])
+
+        return step
+
+    # RAND_HASH of RFC 8391 for an address made with key-and-mask word zero.
+    def rand_hash(self, adrs, left, right):
+        key, mask0, mask1 = (self.prf(adrs[:-1] + [adrs[-1] | self._mask_word(i)]) for i in range(3))
+
+        return self.hash(H, key, [x ^ y for x, y in zip(left, mask0)] + [x ^ y for x, y in zip(right, mask1)])
+
+    def _mask_word(self, value):
+        return _lanes.replicate(_swap32(value) << 32 if self.p.shake else value, self.count, 64)
 
 
-def wots_sign(p, message, sk_seed, pub_seed, adrs):
-    secrets = [wots_secret(p, sk_seed, pub_seed, adrs, i) for i in range(p.length)]
+# The L-trees of several leaves at once: values[i] holds WOTS public key value i of every leaf.
+# Each level hashes the pairs of every leaf in one batch, pair i of leaf c in lane i * count + c.
+def ltrees(p, pub_seed, layer, tree, leaves, values):
+    count = len(leaves)
 
-    out = []
-
-    for i, (secret, digit) in enumerate(zip(secrets, wots_digits(p, message))):
-        set_word(adrs, 5, i)
-
-        out.append(chain(p, secret, 0, digit, pub_seed, adrs))
-
-    return b"".join(out)
-
-
-def wots_public_from_signature(p, signature, message, pub_seed, adrs):
-    n = p.n
-
-    out = []
-
-    for i, digit in enumerate(wots_digits(p, message)):
-        set_word(adrs, 5, i)
-
-        out.append(chain(p, signature[i * n : (i + 1) * n], digit, W - 1 - digit, pub_seed, adrs))
-
-    return out
-
-
-def rand_hash(p, left, right, pub_seed, adrs):
-    set_word(adrs, 7, 0)
-
-    key = prf(p, pub_seed, adrs)
-
-    set_word(adrs, 7, 1)
-
-    mask0 = prf(p, pub_seed, adrs)
-
-    set_word(adrs, 7, 2)
-
-    mask1 = prf(p, pub_seed, adrs)
-
-    return hash_function(p, H, key, xor(left, mask0) + xor(right, mask1))
-
-
-def ltree(p, values, pub_seed, adrs):
-    values = list(values)
-
-    set_word(adrs, 5, 0)
+    height = 0
 
     while len(values) > 1:
-        paired = []
+        pairs = len(values) // 2
 
-        for i in range(len(values) // 2):
-            set_word(adrs, 6, i)
+        lanes = Lanes(p, pub_seed, None, pairs * count)
 
-            paired.append(rand_hash(p, values[2 * i], values[2 * i + 1], pub_seed, adrs))
+        words = range(len(values[0]))
 
-        if len(values) % 2:
-            paired.append(values[-1])
+        left = [_lanes.concatenate([values[2 * i][j] for i in range(pairs)], [count] * pairs, 64) for j in words]
 
-        values = paired
+        right = [_lanes.concatenate([values[2 * i + 1][j] for i in range(pairs)], [count] * pairs, 64) for j in words]
 
-        set_word(adrs, 5, int.from_bytes(adrs[20:24], "big") + 1)
+        adrs = lanes.address(layer, tree, LTREE, leaves * pairs, height, [i for i in range(pairs) for _ in range(count)])
+
+        out = lanes.rand_hash(adrs, left, right)
+
+        values = [[_lanes.select(word, i * count, count, 64) for word in out] for i in range(pairs)] + values[2 * pairs :]
+
+        height += 1
 
     return values[0]
 
 
-def leaf(p, sk_seed, pub_seed, layer, tree, index):
-    ots = address(layer, tree, OTS)
+# The leaves first .. first + count - 1 of one XMSS tree: lane i * size + c of a batch is chain i
+# of leaf c, so that the values of one chain form a slice for the L-trees.
+def leaves(p, sk_seed, pub_seed, layer, tree, first, count):
+    per_batch = max(1, CHUNK // p.length)
 
-    set_word(ots, 4, index)
+    out = []
 
-    values = wots_public(p, sk_seed, pub_seed, ots)
+    for start in range(first, first + count, per_batch):
+        size = min(per_batch, first + count - start)
 
-    lt = address(layer, tree, LTREE)
+        lanes = Lanes(p, pub_seed, sk_seed, size * p.length)
 
-    set_word(lt, 4, index)
+        indices = list(range(start, start + size))
 
-    return ltree(p, values, pub_seed, lt)
+        chains = [i for i in range(p.length) for _ in range(size)]
+
+        adrs = lanes.address(layer, tree, OTS, indices * p.length, chains)
+
+        step = lanes.chain_step(adrs)
+
+        value = lanes.prf_keygen(adrs)
+
+        for k in range(W - 1):
+            value = step(value, k)
+
+        values = [[_lanes.select(word, i * size, size, 64) for word in value] for i in range(p.length)]
+
+        out += Lanes(p, pub_seed, None, size).to_bytes(ltrees(p, pub_seed, layer, tree, indices, values))
+
+    return out
+
+
+def combine(p, pub_seed, layer, tree, z, first, lefts, rights):
+    out = []
+
+    for start in range(0, len(lefts), CHUNK):
+        size = min(CHUNK, len(lefts) - start)
+
+        lanes = Lanes(p, pub_seed, None, size)
+
+        adrs = lanes.address(layer, tree, HASH_TREE, 0, z, list(range(first + start, first + start + size)))
+
+        out += lanes.to_bytes(lanes.rand_hash(adrs, lanes.from_bytes(lefts[start : start + size]), lanes.from_bytes(rights[start : start + size])))
+
+    return out
 
 
 def subtree(p, sk_seed, pub_seed, layer, tree):
-    def make_leaf(index):
-        return leaf(p, sk_seed, pub_seed, layer, tree, index)
+    def tree_leaves(first, count):
+        return leaves(p, sk_seed, pub_seed, layer, tree, first, count)
 
-    def combine(z, j, left, right):
-        adrs = address(layer, tree, HASH_TREE)
+    def tree_combine(z, first, lefts, rights):
+        return combine(p, pub_seed, layer, tree, z, first, lefts, rights)
 
-        set_word(adrs, 5, z)
+    return MerkleTree(p.tree_height, tree_leaves, tree_combine)
 
-        set_word(adrs, 6, j)
 
-        return rand_hash(p, left, right, pub_seed, adrs)
+def wots_sign(p, message, sk_seed, pub_seed, layer, tree, leaf):
+    lanes = Lanes(p, pub_seed, sk_seed, p.length)
 
-    return MerkleTree(p.tree_height, make_leaf, combine)
+    adrs = lanes.address(layer, tree, OTS, leaf, list(range(p.length)))
+
+    value = _lanes.run_to(lanes.chain_step(adrs), lanes.prf_keygen(adrs), wots_digits(p, message))
+
+    return b"".join(lanes.to_bytes(value))
+
+
+def leaf_from_signature(p, signature, message, pub_seed, layer, tree, leaf):
+    n = p.n
+
+    lanes = Lanes(p, pub_seed, None, p.length)
+
+    adrs = lanes.address(layer, tree, OTS, leaf, list(range(p.length)))
+
+    value = lanes.from_bytes([signature[i * n : (i + 1) * n] for i in range(p.length)])
+
+    value = _lanes.run_from(lanes.chain_step(adrs), value, wots_digits(p, message), W - 1)
+
+    values = [[_lanes.select(word, i, 1, 64) for word in value] for i in range(p.length)]
+
+    return Lanes(p, pub_seed, None, 1).to_bytes(ltrees(p, pub_seed, layer, tree, [leaf], values))[0]
 
 
 def compute_root(p, node, index, auth, pub_seed, layer, tree):
-    adrs = address(layer, tree, HASH_TREE)
-
     n = p.n
 
     for k in range(p.tree_height):
-        set_word(adrs, 5, k)
-
-        set_word(adrs, 6, index >> (k + 1))
-
         sibling = auth[k * n : (k + 1) * n]
 
         if (index >> k) & 1:
-            node = rand_hash(p, sibling, node, pub_seed, adrs)
+            node = rand_hash(p, sibling, node, pub_seed, layer, tree, HASH_TREE, 0, k, index >> (k + 1))
         else:
-            node = rand_hash(p, node, sibling, pub_seed, adrs)
+            node = rand_hash(p, node, sibling, pub_seed, layer, tree, HASH_TREE, 0, k, index >> (k + 1))
 
     return node
 
@@ -306,19 +397,11 @@ def verify(p, public_key, message, signature):
 
         index >>= p.tree_height
 
-        ots = address(layer, index, OTS)
-
-        set_word(ots, 4, leaf_index)
-
-        values = wots_public_from_signature(p, signature[offset : offset + p.length * n], node, pub_seed, ots)
+        leaf = leaf_from_signature(p, signature[offset : offset + p.length * n], node, pub_seed, layer, index, leaf_index)
 
         offset += p.length * n
 
-        lt = address(layer, index, LTREE)
-
-        set_word(lt, 4, leaf_index)
-
-        node = compute_root(p, ltree(p, values, pub_seed, lt), leaf_index, signature[offset : offset + p.tree_height * n], pub_seed, layer, index)
+        node = compute_root(p, leaf, leaf_index, signature[offset : offset + p.tree_height * n], pub_seed, layer, index)
 
         offset += p.tree_height * n
 
@@ -373,11 +456,7 @@ class Xmss:
 
             index >>= p.tree_height
 
-            ots = address(layer, index, OTS)
-
-            set_word(ots, 4, leaf_index)
-
-            out.append(wots_sign(p, node, self.sk_seed, self.pub_seed, ots))
+            out.append(wots_sign(p, node, self.sk_seed, self.pub_seed, layer, index, leaf_index))
 
             tree = self._tree(layer, index)
 

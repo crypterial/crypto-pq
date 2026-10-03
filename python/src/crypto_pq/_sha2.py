@@ -6,7 +6,7 @@ _M32 = 0xFFFFFFFF
 
 _M64 = 0xFFFFFFFFFFFFFFFF
 
-_K256 = (
+K256 = (
     0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
     0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174,
     0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC, 0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA,
@@ -17,7 +17,7 @@ _K256 = (
     0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2,
 )
 
-_K512 = (
+K512 = (
     0x428A2F98D728AE22, 0x7137449123EF65CD, 0xB5C0FBCFEC4D3B2F, 0xE9B5DBA58189DBBC,
     0x3956C25BF348B538, 0x59F111F1B605D019, 0x923F82A4AF194F9B, 0xAB1C5ED5DA6D8118,
     0xD807AA98A3030242, 0x12835B0145706FBE, 0x243185BE4EE4B28C, 0x550C7DC3D5FFB4E2,
@@ -65,39 +65,42 @@ IV_512_256 = (
 )
 
 
-# Rotations leave bits above the word size; every sum is masked once, which removes them.
+_SCHEDULE256 = struct.Struct(">16I")
+
+_SCHEDULE512 = struct.Struct(">16Q")
+
+# Multiplying a word by 2^w + 1 puts a copy of it above itself, so that a right rotation is one
+# shift. The bits left above the word only reach sums, and carries never move down, so the mask
+# of each kept sum removes them.
+_COPY32 = (1 << 32) + 1
+
+_COPY64 = (1 << 64) + 1
+
+
 def _compress256(state, data, offset):
-    w = list(struct.unpack_from(">16I", data, offset))
+    w = list(_SCHEDULE256.unpack_from(data, offset))
 
     for t in range(16, 64):
         x = w[t - 15]
 
         y = w[t - 2]
 
-        w.append(
-            (
-                w[t - 16]
-                + w[t - 7]
-                + (((x >> 7) | (x << 25)) ^ ((x >> 18) | (x << 14)) ^ (x >> 3))
-                + (((y >> 17) | (y << 15)) ^ ((y >> 19) | (y << 13)) ^ (y >> 10))
-            )
-            & _M32
-        )
+        xx = x * _COPY32
+
+        yy = y * _COPY32
+
+        w.append((w[t - 16] + w[t - 7] + ((xx >> 7) ^ (xx >> 18) ^ (x >> 3)) + ((yy >> 17) ^ (yy >> 19) ^ (y >> 10))) & _M32)
 
     a, b, c, d, e, f, g, h = state
 
-    for k, x in zip(_K256, w):
-        t1 = (
-            h
-            + (((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7)))
-            + ((e & f) ^ (~e & g))
-            + k
-            + x
-        )
+    for k, x in zip(K256, w):
+        ee = e * _COPY32
 
-        t2 = (((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10))) + (
-            (a & b) ^ (a & c) ^ (b & c)
-        )
+        aa = a * _COPY32
+
+        t1 = h + ((ee >> 6) ^ (ee >> 11) ^ (ee >> 25)) + (g ^ (e & (f ^ g))) + k + x
+
+        t2 = ((aa >> 2) ^ (aa >> 13) ^ (aa >> 22)) + ((a & b) | (c & (a | b)))
 
         h, g, f, e, d, c, b, a = g, f, e, (d + t1) & _M32, c, b, a, (t1 + t2) & _M32
 
@@ -105,37 +108,29 @@ def _compress256(state, data, offset):
 
 
 def _compress512(state, data, offset):
-    w = list(struct.unpack_from(">16Q", data, offset))
+    w = list(_SCHEDULE512.unpack_from(data, offset))
 
     for t in range(16, 80):
         x = w[t - 15]
 
         y = w[t - 2]
 
-        w.append(
-            (
-                w[t - 16]
-                + w[t - 7]
-                + (((x >> 1) | (x << 63)) ^ ((x >> 8) | (x << 56)) ^ (x >> 7))
-                + (((y >> 19) | (y << 45)) ^ ((y >> 61) | (y << 3)) ^ (y >> 6))
-            )
-            & _M64
-        )
+        xx = x * _COPY64
+
+        yy = y * _COPY64
+
+        w.append((w[t - 16] + w[t - 7] + ((xx >> 1) ^ (xx >> 8) ^ (x >> 7)) + ((yy >> 19) ^ (yy >> 61) ^ (y >> 6))) & _M64)
 
     a, b, c, d, e, f, g, h = state
 
-    for k, x in zip(_K512, w):
-        t1 = (
-            h
-            + (((e >> 14) | (e << 50)) ^ ((e >> 18) | (e << 46)) ^ ((e >> 41) | (e << 23)))
-            + ((e & f) ^ (~e & g))
-            + k
-            + x
-        )
+    for k, x in zip(K512, w):
+        ee = e * _COPY64
 
-        t2 = (((a >> 28) | (a << 36)) ^ ((a >> 34) | (a << 30)) ^ ((a >> 39) | (a << 25))) + (
-            (a & b) ^ (a & c) ^ (b & c)
-        )
+        aa = a * _COPY64
+
+        t1 = h + ((ee >> 14) ^ (ee >> 18) ^ (ee >> 41)) + (g ^ (e & (f ^ g))) + k + x
+
+        t2 = ((aa >> 28) ^ (aa >> 34) ^ (aa >> 39)) + ((a & b) | (c & (a | b)))
 
         h, g, f, e, d, c, b, a = g, f, e, (d + t1) & _M64, c, b, a, (t1 + t2) & _M64
 

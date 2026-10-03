@@ -1,6 +1,8 @@
+import struct
 from typing import NamedTuple
 
-from ._primitives import shake128, shake256, shake256_stream
+from . import _lanes
+from ._primitives import shake256, shake256_stream
 
 Q = 8380417
 
@@ -57,6 +59,8 @@ ML_DSA_65 = Parameters("ML-DSA-65", 6, 5, 4, 49, 192, 1 << 19, (Q - 1) // 32, 55
 ML_DSA_87 = Parameters("ML-DSA-87", 8, 7, 2, 60, 256, 1 << 19, (Q - 1) // 32, 75)
 
 
+# The butterflies reduce only the product: the sums stay within 9q, which Python integers hold
+# exactly, and the last line reduces every coefficient once.
 def ntt(w):
     w = [x % Q for x in w]
 
@@ -73,13 +77,15 @@ def ntt(w):
             for j in range(start, start + length):
                 t = zeta * w[j + length] % Q
 
-                w[j + length] = (w[j] - t) % Q
+                x = w[j]
 
-                w[j] = (w[j] + t) % Q
+                w[j + length] = x - t
+
+                w[j] = x + t
 
         length //= 2
 
-    return w
+    return [x % Q for x in w]
 
 
 def inverse_ntt(w):
@@ -98,26 +104,24 @@ def inverse_ntt(w):
             for j in range(start, start + length):
                 t = w[j]
 
-                w[j] = (t + w[j + length]) % Q
+                u = w[j + length]
 
-                w[j + length] = zeta * (t - w[j + length]) % Q
+                w[j] = (t + u) % Q
+
+                w[j + length] = zeta * (t - u) % Q
 
         length *= 2
 
     return [x * 8347681 % Q for x in w]
 
 
-def pointwise(f, g):
-    return [a * b % Q for a, b in zip(f, g)]
-
-
 def dot(row, vector):
-    total = [0] * 256
+    total = [a * b for a, b in zip(row[0], vector[0])]
 
-    for f, g in zip(row, vector):
-        total = [(t + a * b) % Q for t, a, b in zip(total, f, g)]
+    for f, g in zip(row[1:], vector[1:]):
+        total = [t + a * b for t, a, b in zip(total, f, g)]
 
-    return total
+    return [t % Q for t in total]
 
 
 def centered(x):
@@ -127,58 +131,55 @@ def centered(x):
 
 
 def infinity_norm(vector):
-    return max(abs(centered(x)) for poly in vector for x in poly)
+    values = [x % Q for poly in vector for x in poly]
+
+    return max(Q - x if x > (Q - 1) // 2 else x for x in values)
 
 
-def power2round(r):
-    r %= Q
+# FIPS 204, Algorithms 35 to 37, on whole polynomials of coefficients in [0, q), without branches:
+# the formulas of the reference implementation, equal to the specification for every input.
+def power2round(poly):
+    low = [(r & 0x1FFF) - (((4096 - (r & 0x1FFF)) >> 31) & 8192) for r in poly]
 
-    r0 = r & ((1 << D) - 1)
-
-    if r0 > 1 << (D - 1):
-        r0 -= 1 << D
-
-    return (r - r0) >> D, r0
+    return [(r - r0) >> D for r, r0 in zip(poly, low)], low
 
 
-def decompose(r, gamma2):
-    r %= Q
+def high_bits(poly, gamma2):
+    if gamma2 == (Q - 1) // 32:
+        return [((((r + 127) >> 7) * 1025 + (1 << 21)) >> 22) & 15 for r in poly]
 
-    r0 = r % (2 * gamma2)
+    high = [(((r + 127) >> 7) * 11275 + (1 << 23)) >> 24 for r in poly]
 
-    if r0 > gamma2:
-        r0 -= 2 * gamma2
-
-    if r - r0 == Q - 1:
-        return 0, r0 - 1
-
-    return (r - r0) // (2 * gamma2), r0
+    return [r1 ^ (((43 - r1) >> 31) & r1) for r1 in high]
 
 
-def high_bits(r, gamma2):
-    return decompose(r, gamma2)[0]
+def low_bits(poly, gamma2):
+    two = 2 * gamma2
+
+    low = [r - r1 * two for r, r1 in zip(poly, high_bits(poly, gamma2))]
+
+    return [r0 - ((((Q - 1) // 2 - r0) >> 31) & Q) for r0 in low]
 
 
-def low_bits(r, gamma2):
-    return decompose(r, gamma2)[1]
+# FIPS 204, Algorithm 39, for every coefficient: whether adding c changes the high bits of r.
+def make_hint(c, r, gamma2):
+    moved = high_bits([(x + y) % Q for x, y in zip(r, c)], gamma2)
+
+    return [int(a != b) for a, b in zip(moved, high_bits(r, gamma2))]
 
 
-def make_hint(z, r, gamma2):
-    return int(high_bits(r, gamma2) != high_bits(r + z, gamma2))
-
-
-def use_hint(h, r, gamma2):
+def use_hint(h, poly, gamma2):
     m = (Q - 1) // (2 * gamma2)
 
-    r1, r0 = decompose(r, gamma2)
+    out = []
 
-    if h and r0 > 0:
-        return (r1 + 1) % m
+    for bit, r1, r0 in zip(h, high_bits(poly, gamma2), low_bits(poly, gamma2)):
+        if bit:
+            r1 = (r1 + 1) % m if r0 > 0 else (r1 - 1) % m
 
-    if h:
-        return (r1 - 1) % m
+        out.append(r1)
 
-    return r1
+    return out
 
 
 def pack(values, bits):
@@ -329,70 +330,101 @@ def w1_encode(w1, p):
     return b"".join(pack(poly, bits) for poly in w1)
 
 
-def rej_ntt_poly(seed):
-    stream = shake128(seed)
+# FIPS 204, Algorithm 30, on a SHAKE128 output: the accepted 23-bit candidates of its 3-byte
+# groups, each spread into a 32-bit field.
+def rej_ntt_poly(data):
+    groups = len(data) // 3
 
-    a = []
+    spread = bytearray(4 * groups)
 
-    while len(a) < 256:
-        block = stream.read(168)
+    spread[0::4] = data[0::3]
 
-        for offset in range(0, 168, 3):
-            z = block[offset] | (block[offset + 1] << 8) | ((block[offset + 2] & 0x7F) << 16)
+    spread[1::4] = data[1::3]
 
-            if z < Q and len(a) < 256:
-                a.append(z)
+    spread[2::4] = data[2::3]
 
-    return a
+    x = int.from_bytes(spread, "little") & (_lanes.ones(groups, 32) * 0x7FFFFF)
+
+    return [z for z in struct.unpack(f"<{groups}I", x.to_bytes(4 * groups, "little")) if z < Q][:256]
 
 
-def rej_bounded_poly(seed, eta):
-    stream = shake256_stream(seed)
+# FIPS 204, Algorithm 31, on a SHAKE256 output: the low and the high half of every byte, in turn.
+def rej_bounded_poly(data, eta):
+    x = int.from_bytes(data, "little")
 
-    a = []
+    low = _lanes.ones(len(data), 8) * 0x0F
 
-    while len(a) < 256:
-        for byte in stream.read(136):
-            for half in (byte & 0x0F, byte >> 4):
-                if len(a) == 256:
-                    break
+    halves = bytearray(2 * len(data))
 
-                if eta == 2 and half < 15:
-                    a.append(2 - half % 5)
-                elif eta == 4 and half < 9:
-                    a.append(4 - half)
+    halves[0::2] = (x & low).to_bytes(len(data), "little")
 
-    return a
+    halves[1::2] = ((x >> 4) & low).to_bytes(len(data), "little")
+
+    if eta == 2:
+        return [2 - half % 5 for half in halves if half < 15][:256]
+
+    return [4 - half for half in halves if half < 9][:256]
+
+
+# The samplers of a key run their streams in lanes: a first number of blocks that nearly always
+# suffices, then another block for every stream whenever one of them falls short.
+def _sample(seeds, rate, blocks, parse):
+    stream = _lanes.Squeeze(seeds, rate)
+
+    data = stream.blocks(blocks)
+
+    polys = [parse(d) for d in data]
+
+    while any(len(poly) < 256 for poly in polys):
+        data = [d + more for d, more in zip(data, stream.blocks(1))]
+
+        polys = [parse(d) for d in data]
+
+    return polys
 
 
 def expand_a(rho, p):
-    return [[rej_ntt_poly(rho + bytes([s, r])) for s in range(p.l)] for r in range(p.k)]
+    polys = _sample([rho + bytes([s, r]) for r in range(p.k) for s in range(p.l)], 168, 5, rej_ntt_poly)
+
+    return [polys[r * p.l : (r + 1) * p.l] for r in range(p.k)]
 
 
 def expand_s(rho, p):
-    s = [rej_bounded_poly(rho + r.to_bytes(2, "little"), p.eta) for r in range(p.l + p.k)]
+    s = _sample([rho + r.to_bytes(2, "little") for r in range(p.l + p.k)], 136, 2, lambda data: rej_bounded_poly(data, p.eta))
 
     return s[: p.l], s[p.l :]
 
 
 def expand_mask(rho, kappa, p):
-    bits = gamma1_bits(p)
+    size = 32 * gamma1_bits(p)
 
-    return [bit_unpack(shake256(rho + (kappa + r).to_bytes(2, "little"), 32 * bits), p.gamma1 - 1, p.gamma1) for r in range(p.l)]
+    data = _lanes.Squeeze([rho + (kappa + r).to_bytes(2, "little") for r in range(p.l)], 136).blocks(-(-size // 136))
+
+    return [bit_unpack(d[:size], p.gamma1 - 1, p.gamma1) for d in data]
 
 
 def sample_in_ball(seed, tau):
     stream = shake256_stream(seed)
 
-    signs = int.from_bytes(stream.read(8), "little")
+    data = stream.read(136)
+
+    signs = int.from_bytes(data[:8], "little")
+
+    position = 8
 
     c = [0] * 256
 
     for i in range(256 - tau, 256):
-        j = stream.read(1)[0]
+        while True:
+            if position == len(data):
+                data += stream.read(136)
 
-        while j > i:
-            j = stream.read(1)[0]
+            j = data[position]
+
+            position += 1
+
+            if j <= i:
+                break
 
         c[i] = c[j]
 
@@ -401,6 +433,50 @@ def sample_in_ball(seed, tau):
         signs >>= 1
 
     return c
+
+
+_BIAS = {bits: (1 << (bits - 1)) * _lanes.ones(512, bits) for bits in (16, 32)}
+
+_OPERAND_BIAS = {bits: _BIAS[bits] & ((1 << (256 * bits)) - 1) for bits in (16, 32)}
+
+
+# f + 2^(bits - 1) per digit at 2^bits: every digit is positive, so the integer's length does not
+# depend on the coefficients.
+def _biased(f, bits):
+    data = struct.pack(f"<{len(f)}{'H' if bits == 16 else 'I'}", *[x + (1 << (bits - 1)) for x in f])
+
+    return int.from_bytes(data, "little")
+
+
+def _evaluate(f, bits):
+    return _biased(f, bits) - _OPERAND_BIAS[bits]
+
+
+class Challenge:
+    """The challenge c of a signature, whose products with polynomials of small coefficients come
+    from one integer multiplication (Kronecker substitution) instead of NTTs.
+
+    c and f are evaluated at 2^bits, where every coefficient of the integer product c * f has
+    magnitude below 2^(bits - 1); a bias of 2^(bits - 1) per digit keeps the digits of the
+    product apart, and X^256 = -1 folds the upper 256 of them back. The result is the product in
+    Z_q[X] / (X^256 + 1) that the NTT gives, reduced to [0, q).
+    """
+
+    __slots__ = ("values", "corrections")
+
+    def __init__(self, c):
+        self.values = {bits: _evaluate(c, bits) for bits in (16, 32)}
+
+        self.corrections = {bits: self.values[bits] * _OPERAND_BIAS[bits] - _BIAS[bits] for bits in (16, 32)}
+
+    # f, often secret, is multiplied with its bias, which keeps the size of the multiplication
+    # independent of its coefficients; the public correction then removes c times that bias.
+    def times(self, f, bits):
+        product = self.values[bits] * _biased(f, bits) - self.corrections[bits]
+
+        digits = struct.unpack(f"<512{'H' if bits == 16 else 'I'}", product.to_bytes(64 * bits, "little"))
+
+        return [(x - y) % Q for x, y in zip(digits[:256], digits[256:])]
 
 
 def public_t(a, s1, s2, p):
@@ -418,9 +494,7 @@ def keygen_internal(xi, p):
 
     t = public_t(expand_a(rho, p), s1, s2, p)
 
-    t1 = [[power2round(x)[0] for x in poly] for poly in t]
-
-    t0 = [[power2round(x)[1] for x in poly] for poly in t]
+    t1, t0 = zip(*[power2round(poly) for poly in t])
 
     pk = pk_encode(rho, t1)
 
@@ -435,24 +509,18 @@ def check_private_key(sk, p):
     if any(abs(x) > p.eta for poly in s1 + s2 for x in poly):
         return None
 
-    t = public_t(expand_a(rho, p), s1, s2, p)
+    t1, t0_check = zip(*[power2round(poly) for poly in public_t(expand_a(rho, p), s1, s2, p)])
 
-    if [[power2round(x)[1] for x in poly] for poly in t] != t0:
+    if list(t0_check) != t0:
         return None
 
-    pk = pk_encode(rho, [[power2round(x)[0] for x in poly] for poly in t])
+    pk = pk_encode(rho, t1)
 
     return pk if shake256(pk, 64) == tr else None
 
 
 def sign_internal(sk, message, rnd, p):
     rho, key, tr, s1, s2, t0 = sk_decode(sk, p)
-
-    s1_hat = [ntt(s) for s in s1]
-
-    s2_hat = [ntt(s) for s in s2]
-
-    t0_hat = [ntt(t) for t in t0]
 
     a = expand_a(rho, p)
 
@@ -471,26 +539,22 @@ def sign_internal(sk, message, rnd, p):
 
         w = [inverse_ntt(dot(a[i], y_hat)) for i in range(p.k)]
 
-        w1 = [[high_bits(x, p.gamma2) for x in poly] for poly in w]
+        c_tilde = shake256(mu + w1_encode([high_bits(poly, p.gamma2) for poly in w], p), p.lam // 4)
 
-        c_tilde = shake256(mu + w1_encode(w1, p), p.lam // 4)
+        c = Challenge(sample_in_ball(c_tilde, p.tau))
 
-        c_hat = ntt(sample_in_ball(c_tilde, p.tau))
+        z = [[(x + e) % Q for x, e in zip(y[i], c.times(s1[i], 16))] for i in range(p.l)]
 
-        cs1 = [inverse_ntt(pointwise(c_hat, s)) for s in s1_hat]
+        difference = [[(x - e) % Q for x, e in zip(w[i], c.times(s2[i], 16))] for i in range(p.k)]
 
-        cs2 = [inverse_ntt(pointwise(c_hat, s)) for s in s2_hat]
-
-        z = [[(a1 + b1) % Q for a1, b1 in zip(y[r], cs1[r])] for r in range(p.l)]
-
-        r0 = [[low_bits(x - e, p.gamma2) for x, e in zip(w[i], cs2[i])] for i in range(p.k)]
+        r0 = [low_bits(poly, p.gamma2) for poly in difference]
 
         if infinity_norm(z) >= p.gamma1 - p.beta or max(abs(x) for poly in r0 for x in poly) >= p.gamma2 - p.beta:
             continue
 
-        ct0 = [inverse_ntt(pointwise(c_hat, t)) for t in t0_hat]
+        ct0 = [c.times(t, 32) for t in t0]
 
-        h = [[make_hint(-c, x - e + c, p.gamma2) for c, x, e in zip(ct0[i], w[i], cs2[i])] for i in range(p.k)]
+        h = [make_hint(ct0[i], difference[i], p.gamma2) for i in range(p.k)]
 
         if infinity_norm(ct0) >= p.gamma2 or sum(map(sum, h)) > p.omega:
             continue
@@ -518,14 +582,14 @@ def verify_internal(pk, message, sig, p):
 
     mu = shake256(shake256(pk, 64) + message, 64)
 
-    c_hat = ntt(sample_in_ball(c_tilde, p.tau))
+    c = Challenge(sample_in_ball(c_tilde, p.tau))
 
     z_hat = [ntt(v) for v in z]
 
-    t1_hat = [ntt([x << D for x in t]) for t in t1]
+    az = [inverse_ntt(dot(a[i], z_hat)) for i in range(p.k)]
 
-    w = [inverse_ntt([(x - y) % Q for x, y in zip(dot(a[i], z_hat), pointwise(c_hat, t1_hat[i]))]) for i in range(p.k)]
+    w = [[(x - (y << D)) % Q for x, y in zip(az[i], c.times(t1[i], 32))] for i in range(p.k)]
 
-    w1 = [[use_hint(b, x, p.gamma2) for b, x in zip(h[i], w[i])] for i in range(p.k)]
+    w1 = [use_hint(h[i], w[i], p.gamma2) for i in range(p.k)]
 
     return shake256(mu + w1_encode(w1, p), p.lam // 4) == c_tilde

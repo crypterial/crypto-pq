@@ -1,7 +1,9 @@
+import struct
 from typing import NamedTuple
 
+from . import _lanes
 from ._bytes import equal
-from ._primitives import sha3_256, sha3_512, shake128, shake256
+from ._primitives import sha3_256, sha3_512, shake256
 
 Q = 3329
 
@@ -48,6 +50,8 @@ ML_KEM_768 = Parameters("ML-KEM-768", 3, 2, 2, 10, 4)
 ML_KEM_1024 = Parameters("ML-KEM-1024", 4, 2, 2, 11, 5)
 
 
+# In both transforms the butterflies reduce only the products: the sums stay below 2^7 q in
+# magnitude, which Python integers hold exactly, and the last line reduces every coefficient once.
 def ntt(f):
     f = list(f)
 
@@ -64,13 +68,15 @@ def ntt(f):
             for j in range(start, start + length):
                 t = zeta * f[j + length] % Q
 
-                f[j + length] = (f[j] - t) % Q
+                x = f[j]
 
-                f[j] = (f[j] + t) % Q
+                f[j + length] = x - t
+
+                f[j] = x + t
 
         length //= 2
 
-    return f
+    return [x % Q for x in f]
 
 
 def inverse_ntt(f):
@@ -89,26 +95,15 @@ def inverse_ntt(f):
             for j in range(start, start + length):
                 t = f[j]
 
-                f[j] = (t + f[j + length]) % Q
+                u = f[j + length]
 
-                f[j + length] = zeta * (f[j + length] - t) % Q
+                f[j] = t + u
+
+                f[j + length] = zeta * (u - t) % Q
 
         length *= 2
 
     return [x * 3303 % Q for x in f]
-
-
-def multiply_ntts(f, g):
-    h = [0] * 256
-
-    for i in range(128):
-        a0, a1, b0, b1 = f[2 * i], f[2 * i + 1], g[2 * i], g[2 * i + 1]
-
-        h[2 * i] = (a0 * b0 + a1 * b1 * GAMMAS[i]) % Q
-
-        h[2 * i + 1] = (a0 * b1 + a1 * b0) % Q
-
-    return h
 
 
 def add(f, g):
@@ -119,13 +114,27 @@ def subtract(f, g):
     return [(a - b) % Q for a, b in zip(f, g)]
 
 
+# The sum of the products of the 128 degree-1 pieces (FIPS 203, Algorithms 11 and 12), with the
+# even and the odd coefficients of every piece in separate lists and one reduction at the end.
 def dot(row, vector):
-    total = [0] * 256
+    even = [0] * 128
+
+    odd = [0] * 128
 
     for f, g in zip(row, vector):
-        total = add(total, multiply_ntts(f, g))
+        a0, a1, b0, b1 = f[0::2], f[1::2], g[0::2], g[1::2]
 
-    return total
+        even = [e + x0 * y0 + x1 * y1 * gamma for e, x0, x1, y0, y1, gamma in zip(even, a0, a1, b0, b1, GAMMAS)]
+
+        odd = [o + x0 * y1 + x1 * y0 for o, x0, x1, y0, y1 in zip(odd, a0, a1, b0, b1)]
+
+    h = [0] * 256
+
+    h[0::2] = [e % Q for e in even]
+
+    h[1::2] = [o % Q for o in odd]
+
+    return h
 
 
 def byte_encode(f, d):
@@ -156,51 +165,86 @@ def decompress(y, d):
     return (y * Q + (1 << (d - 1))) >> d
 
 
-def sample_ntt(seed):
-    stream = shake128(seed)
+# FIPS 203, Algorithm 7: two 12-bit candidates from every 3 bytes, in stream order. Each group
+# of 3 bytes is spread into a 32-bit field, d1 stays in its low half and d2 moves to the high one.
+def candidates(data):
+    groups = len(data) // 3
 
-    a = []
+    spread = bytearray(4 * groups)
 
-    while len(a) < 256:
-        block = stream.read(168)
+    spread[0::4] = data[0::3]
 
-        for offset in range(0, 168, 3):
-            d1 = block[offset] | ((block[offset + 1] & 0x0F) << 8)
+    spread[1::4] = data[1::3]
 
-            d2 = (block[offset + 1] >> 4) | (block[offset + 2] << 4)
+    spread[2::4] = data[2::3]
 
-            if d1 < Q and len(a) < 256:
-                a.append(d1)
+    one = _lanes.ones(groups, 32)
 
-            if d2 < Q and len(a) < 256:
-                a.append(d2)
+    x = int.from_bytes(spread, "little")
 
-    return a
+    x = (x & (one * 0xFFF)) | ((x << 4) & (one * 0x0FFF0000))
+
+    return struct.unpack(f"<{2 * groups}H", x.to_bytes(4 * groups, "little"))
 
 
+def sample_ntt(data):
+    return [c for c in candidates(data) if c < Q][:256]
+
+
+# SampleNTT for the whole matrix: the k * k SHAKE128 streams run in lanes, three blocks at first,
+# which nearly always give 256 coefficients, and another block whenever one stream needs it.
+def matrix(rho, k):
+    stream = _lanes.Squeeze([rho + bytes([j, i]) for i in range(k) for j in range(k)], 168)
+
+    data = stream.blocks(3)
+
+    polys = [sample_ntt(d) for d in data]
+
+    while any(len(a) < 256 for a in polys):
+        data = [d + more for d, more in zip(data, stream.blocks(1))]
+
+        polys = [sample_ntt(d) for d in data]
+
+    return [polys[i * k : (i + 1) * k] for i in range(k)]
+
+
+def _cbd_masks(eta):
+    width = 2 * eta
+
+    groups = sum(1 << (eta * i) for i in range(512))
+
+    low = sum(((1 << eta) - 1) << (width * i) for i in range(256))
+
+    return groups, low, eta * (low // ((1 << eta) - 1))
+
+
+_CBD = {eta: _cbd_masks(eta) for eta in (2, 3)}
+
+
+# FIPS 203, Algorithm 8, on every coefficient at once: after the bits of each eta-bit group are
+# added in place, a field of 2 * eta bits holds x and y side by side, and x + eta - y never
+# borrows from the next field.
 def sample_cbd(data, eta):
+    groups, low, bias = _CBD[eta]
+
     bits = int.from_bytes(data, "little")
 
-    mask = (1 << eta) - 1
+    sums = sum((bits >> i) & groups for i in range(eta))
 
-    f = []
+    values = (sums & low) + bias - ((sums >> eta) & low)
 
-    for i in range(256):
-        x = ((bits >> (2 * i * eta)) & mask).bit_count()
+    width = 2 * eta
 
-        y = ((bits >> (2 * i * eta + eta)) & mask).bit_count()
+    mask = (1 << width) - 1
 
-        f.append((x - y) % Q)
-
-    return f
+    return [(((values >> (width * i)) & mask) - eta) % Q for i in range(256)]
 
 
-def prf(eta, seed, nonce):
-    return shake256(seed + bytes([nonce]), 64 * eta)
+# The PRF outputs for nonces 0, 1, ... with the given eta each, as one batch of SHAKE256 streams.
+def prfs(seed, etas):
+    data = _lanes.Squeeze([seed + bytes([n]) for n in range(len(etas))], 136).blocks(-(-64 * max(etas) // 136))
 
-
-def matrix(rho, k):
-    return [[sample_ntt(rho + bytes([j, i])) for j in range(k)] for i in range(k)]
+    return [d[: 64 * eta] for d, eta in zip(data, etas)]
 
 
 def pke_keygen(d, params):
@@ -212,9 +256,9 @@ def pke_keygen(d, params):
 
     a = matrix(rho, k)
 
-    s = [ntt(sample_cbd(prf(params.eta1, sigma, n), params.eta1)) for n in range(k)]
+    noise = [ntt(sample_cbd(data, params.eta1)) for data in prfs(sigma, [params.eta1] * (2 * k))]
 
-    e = [ntt(sample_cbd(prf(params.eta1, sigma, k + n), params.eta1)) for n in range(k)]
+    s, e = noise[:k], noise[k:]
 
     t = [add(dot(a[i], s), e[i]) for i in range(k)]
 
@@ -232,11 +276,13 @@ def pke_encrypt(ek, m, r, params):
 
     a = matrix(ek[384 * k :], k)
 
-    y = [ntt(sample_cbd(prf(params.eta1, r, n), params.eta1)) for n in range(k)]
+    noise = prfs(r, [params.eta1] * k + [params.eta2] * (k + 1))
 
-    e1 = [sample_cbd(prf(params.eta2, r, k + n), params.eta2) for n in range(k)]
+    y = [ntt(sample_cbd(data, params.eta1)) for data in noise[:k]]
 
-    e2 = sample_cbd(prf(params.eta2, r, 2 * k), params.eta2)
+    e1 = [sample_cbd(data, params.eta2) for data in noise[k : 2 * k]]
+
+    e2 = sample_cbd(noise[2 * k], params.eta2)
 
     columns = [[a[j][i] for j in range(k)] for i in range(k)]
 

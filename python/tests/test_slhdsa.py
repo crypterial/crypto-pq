@@ -21,8 +21,9 @@ ALGORITHMS = {algorithm.name: algorithm for algorithm in (
     crypto_pq.SLH_DSA_SHAKE_256F,
 )}
 
-# Pure Python needs minutes per "s" signature, so by default only the "f" sets sign, one "s"
-# set builds keys, and every set verifies. CRYPTO_PQ_SLOW=1 runs everything.
+# An "s" key takes about a second and an "s" signature 5 to 15 seconds in pure Python, so by
+# default every "f" vector runs, each "s" set builds one key and signs one message, and every
+# set verifies. CRYPTO_PQ_SLOW=1 runs everything.
 SLOW = bool(os.environ.get("CRYPTO_PQ_SLOW"))
 
 
@@ -37,7 +38,7 @@ class SlhDsaTest(unittest.TestCase):
         for header, record in records("acvp/SLH-DSA-keyGen.txt", "sk"):
             name = header["parameterSet"]
 
-            if not SLOW and (name.endswith("s") and name != "SLH-DSA-SHAKE-128s" or name in seen):
+            if not SLOW and name.endswith("s") and name in seen:
                 continue
 
             seen.add(name)
@@ -72,7 +73,7 @@ class SlhDsaTest(unittest.TestCase):
         for header, record in records("acvp/SLH-DSA-sigGen.txt", "signature"):
             name = header["parameterSet"]
 
-            if not SLOW and (name.endswith("s") or name in seen):
+            if not SLOW and name.endswith("s") and name in seen:
                 continue
 
             seen.add(name)
@@ -144,9 +145,6 @@ class SlhDsaTest(unittest.TestCase):
             "HmSlASuBCex3fKpOHwJMz8+Ul9mRgFCSgPQlavKwevgCibSU\n"
             "-----END PRIVATE KEY-----\n"
         )
-
-        if not SLOW:
-            self.skipTest("SLH-DSA-SHA2-128s key validation is slow in pure Python")
 
         private_key = crypto_pq.SLH_DSA_SHA2_128S.import_private_key(pem, "pem")
 

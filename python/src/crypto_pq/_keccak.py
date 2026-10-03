@@ -5,7 +5,7 @@ from ._errors import CryptoPQError, ErrorCode
 
 _M64 = 0xFFFFFFFFFFFFFFFF
 
-_ROUND_CONSTANTS = (
+ROUND_CONSTANTS = (
     0x0000000000000001, 0x0000000000008082, 0x800000000000808A, 0x8000000080008000,
     0x000000000000808B, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
     0x000000000000008A, 0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
@@ -20,10 +20,25 @@ _LANES = {rate: struct.Struct(f"<{rate // 8}Q") for rate in (72, 104, 136, 144, 
 
 
 # Keccak-f[1600], unrolled. Lane x + 5y is a{x + 5y}; rho and pi move it to b{y + 5((2x + 3y) mod 5)}.
+# Lanes 1, 2, 8, 12, 17 and 20 are kept complemented during the rounds (the lane complementing of
+# the Keccak implementation overview, section 2.2): chi then needs one NOT per row instead of
+# five, and theta, rho and pi carry the complements along unchanged.
 def permute(state):
     (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24) = state
 
-    for constant in _ROUND_CONSTANTS:
+    a1 ^= _M64
+
+    a2 ^= _M64
+
+    a8 ^= _M64
+
+    a12 ^= _M64
+
+    a17 ^= _M64
+
+    a20 ^= _M64
+
+    for constant in ROUND_CONSTANTS:
         c0 = a0 ^ a5 ^ a10 ^ a15 ^ a20
 
         c1 = a1 ^ a6 ^ a11 ^ a16 ^ a21
@@ -144,57 +159,63 @@ def permute(state):
 
         b24 = ((a21 << 2) | (a21 >> 62)) & _M64
 
-        a0 = b0 ^ (~b1 & b2) ^ constant
+        a0 = b0 ^ (b1 | b2) ^ constant
 
-        a1 = b1 ^ (~b2 & b3)
+        a1 = b1 ^ ((b2 ^ _M64) | b3)
 
-        a2 = b2 ^ (~b3 & b4)
+        a2 = b2 ^ (b3 & b4)
 
-        a3 = b3 ^ (~b4 & b0)
+        a3 = b3 ^ (b4 | b0)
 
-        a4 = b4 ^ (~b0 & b1)
+        a4 = b4 ^ (b0 & b1)
 
-        a5 = b5 ^ (~b6 & b7)
+        a5 = b5 ^ (b6 | b7)
 
-        a6 = b6 ^ (~b7 & b8)
+        a6 = b6 ^ (b7 & b8)
 
-        a7 = b7 ^ (~b8 & b9)
+        a7 = b7 ^ (b8 | (b9 ^ _M64))
 
-        a8 = b8 ^ (~b9 & b5)
+        a8 = b8 ^ (b9 | b5)
 
-        a9 = b9 ^ (~b5 & b6)
+        a9 = b9 ^ (b5 & b6)
 
-        a10 = b10 ^ (~b11 & b12)
+        x = b13 ^ _M64
 
-        a11 = b11 ^ (~b12 & b13)
+        a10 = b10 ^ (b11 | b12)
 
-        a12 = b12 ^ (~b13 & b14)
+        a11 = b11 ^ (b12 & b13)
 
-        a13 = b13 ^ (~b14 & b10)
+        a12 = b12 ^ (x & b14)
 
-        a14 = b14 ^ (~b10 & b11)
+        a13 = x ^ (b14 | b10)
 
-        a15 = b15 ^ (~b16 & b17)
+        a14 = b14 ^ (b10 & b11)
 
-        a16 = b16 ^ (~b17 & b18)
+        x = b18 ^ _M64
 
-        a17 = b17 ^ (~b18 & b19)
+        a15 = b15 ^ (b16 & b17)
 
-        a18 = b18 ^ (~b19 & b15)
+        a16 = b16 ^ (b17 | b18)
 
-        a19 = b19 ^ (~b15 & b16)
+        a17 = b17 ^ (x | b19)
 
-        a20 = b20 ^ (~b21 & b22)
+        a18 = x ^ (b19 & b15)
 
-        a21 = b21 ^ (~b22 & b23)
+        a19 = b19 ^ (b15 | b16)
 
-        a22 = b22 ^ (~b23 & b24)
+        x = b21 ^ _M64
 
-        a23 = b23 ^ (~b24 & b20)
+        a20 = b20 ^ (x & b22)
 
-        a24 = b24 ^ (~b20 & b21)
+        a21 = x ^ (b22 | b23)
 
-    state[:] = (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24)
+        a22 = b22 ^ (b23 & b24)
+
+        a23 = b23 ^ (b24 | b20)
+
+        a24 = b24 ^ (b20 & b21)
+
+    state[:] = (a0, a1 ^ _M64, a2 ^ _M64, a3, a4, a5, a6, a7, a8 ^ _M64, a9, a10, a11, a12 ^ _M64, a13, a14, a15, a16, a17 ^ _M64, a18, a19, a20 ^ _M64, a21, a22, a23, a24)
 
 
 class Keccak(Blocks):
