@@ -1,4 +1,8 @@
+from __future__ import annotations
+
 from typing import NamedTuple
+
+from ._encoding import KeyFormat
 
 from . import _mlkem, _xwing
 from ._bytes import equal
@@ -17,6 +21,8 @@ from ._keys import (
     require_length,
 )
 from ._rng import random_bytes
+
+_Bytes = bytes | bytearray | memoryview
 
 
 class _MlKem:
@@ -94,42 +100,42 @@ class Encapsulation(NamedTuple):
 class KemPublicKey:
     __slots__ = ("_algorithm", "_key")
 
-    def __init__(self, algorithm, key):
+    def __init__(self, algorithm: KemAlgorithm, key: bytes) -> None:
         self._algorithm = algorithm
 
         self._key = key
 
     @property
-    def algorithm(self):
+    def algorithm(self) -> KemAlgorithm:
         return self._algorithm
 
-    def encapsulate(self):
+    def encapsulate(self) -> Encapsulation:
         backend = self._algorithm._backend
 
         return self._encapsulate(random_bytes(backend.randomness_size))
 
-    def _encapsulate(self, randomness):
+    def _encapsulate(self, randomness: bytes) -> Encapsulation:
         shared_secret, ciphertext = self._algorithm._backend.encapsulate(self._key, randomness)
 
         return Encapsulation(shared_secret, ciphertext)
 
-    def export_key(self, format):
+    def export_key(self, format: KeyFormat | str) -> bytes:
         return export_public(format, self._algorithm._backend.oid, self._key)
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         return isinstance(other, KemPublicKey) and self._algorithm is other._algorithm and self._key == other._key
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash(self._key)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<KemPublicKey {self._algorithm.name}>"
 
 
 class KemPrivateKey:
     __slots__ = ("_algorithm", "_seed", "_private", "_public")
 
-    def __init__(self, algorithm, seed, private, public):
+    def __init__(self, algorithm: KemAlgorithm, seed: bytes | None, private: object, public: bytes) -> None:
         self._algorithm = algorithm
 
         self._seed = seed
@@ -139,14 +145,14 @@ class KemPrivateKey:
         self._public = public
 
     @property
-    def algorithm(self):
+    def algorithm(self) -> KemAlgorithm:
         return self._algorithm
 
     @property
-    def public_key(self):
+    def public_key(self) -> KemPublicKey:
         return KemPublicKey(self._algorithm, self._public)
 
-    def decapsulate(self, ciphertext):
+    def decapsulate(self, ciphertext: _Bytes) -> bytes:
         ciphertext = require_bytes(ciphertext, "ciphertext")
 
         backend = self._algorithm._backend
@@ -155,7 +161,7 @@ class KemPrivateKey:
 
         return backend.decapsulate(self._private, ciphertext)
 
-    def export_key(self, format):
+    def export_key(self, format: KeyFormat | str) -> bytes:
         backend = self._algorithm._backend
 
         if self._seed is not None:
@@ -165,7 +171,7 @@ class KemPrivateKey:
 
         return export_private(format, backend.oid, encode_seed_choice(None, expanded), expanded)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<KemPrivateKey {self._algorithm.name}>"
 
 
@@ -178,28 +184,28 @@ class KemKeyPair(NamedTuple):
 class KemAlgorithm:
     __slots__ = ("_name", "_backend")
 
-    def __init__(self, name, backend):
+    def __init__(self, name: str, backend: object) -> None:
         self._name = name
 
         self._backend = backend
 
     @property
-    def name(self):
+    def name(self) -> str:
         return self._name
 
     @property
-    def public_key_size(self):
+    def public_key_size(self) -> int:
         return self._backend.public_key_size
 
     @property
-    def ciphertext_size(self):
+    def ciphertext_size(self) -> int:
         return self._backend.ciphertext_size
 
     @property
-    def shared_secret_size(self):
+    def shared_secret_size(self) -> int:
         return 32
 
-    def generate_key_pair(self, *, self_test=True):
+    def generate_key_pair(self, *, self_test: bool = True) -> KemKeyPair:
         require_bool(self_test, "self_test")
 
         private_key = self._from_seed(random_bytes(self._backend.seed_size))
@@ -214,12 +220,12 @@ class KemAlgorithm:
 
         return KemKeyPair(public_key, private_key)
 
-    def _from_seed(self, seed):
+    def _from_seed(self, seed: bytes) -> KemPrivateKey:
         public, private = self._backend.from_seed(seed)
 
         return KemPrivateKey(self, seed, private, public)
 
-    def import_public_key(self, data, format):
+    def import_public_key(self, data: _Bytes | str, format: KeyFormat | str) -> KemPublicKey:
         key = import_public(format, data, self._backend.oid)
 
         require_length(key, self._backend.public_key_size, "public key")
@@ -229,7 +235,7 @@ class KemAlgorithm:
 
         return KemPublicKey(self, key)
 
-    def import_private_key(self, data, format):
+    def import_private_key(self, data: _Bytes | str, format: KeyFormat | str) -> KemPrivateKey:
         backend = self._backend
 
         octets, raw, public_key = import_private(format, data, backend.oid)
@@ -262,7 +268,7 @@ class KemAlgorithm:
 
         return key
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<KemAlgorithm {self._name}>"
 
 

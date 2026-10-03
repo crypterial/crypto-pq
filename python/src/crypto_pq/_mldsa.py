@@ -445,10 +445,6 @@ def check_private_key(sk, p):
     return pk if shake256(pk, 64) == tr else None
 
 
-def public_key_of(sk, p):
-    return check_private_key(sk, p)
-
-
 def sign_internal(sk, message, rnd, p):
     rho, key, tr, s1, s2, t0 = sk_decode(sk, p)
 
