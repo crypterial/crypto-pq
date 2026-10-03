@@ -1,115 +1,10 @@
 const std = @import("std");
 const pq = @import("crypto_pq");
+const vectors = @import("vectors");
 
 const testing = std.testing;
 
-const Fields = struct {
-    keys: [8][]const u8 = undefined,
-    values: [8][]const u8 = undefined,
-    len: usize = 0,
-
-    fn put(self: *Fields, key: []const u8, value: []const u8) void {
-        for (self.keys[0..self.len], 0..) |existing, i| {
-            if (std.mem.eql(u8, existing, key)) {
-                self.values[i] = value;
-
-                return;
-            }
-        }
-
-        self.keys[self.len] = key;
-
-        self.values[self.len] = value;
-
-        self.len += 1;
-    }
-
-    fn find(self: Fields, key: []const u8) ?[]const u8 {
-        for (self.keys[0..self.len], self.values[0..self.len]) |k, v| {
-            if (std.mem.eql(u8, k, key)) return v;
-        }
-
-        return null;
-    }
-
-    fn get(self: Fields, key: []const u8) []const u8 {
-        return self.find(key) orelse @panic("missing field");
-    }
-};
-
-const Record = struct {
-    header: Fields,
-    values: Fields,
-};
-
-const Vectors = struct {
-    text: []u8,
-    records: []Record,
-
-    fn load(name: []const u8, field: []const u8) !Vectors {
-        var path: [128]u8 = undefined;
-
-        const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, try std.fmt.bufPrint(&path, "../vectors/cavp/{s}", .{name}), testing.allocator, .unlimited);
-
-        errdefer testing.allocator.free(text);
-
-        var records: std.ArrayList(Record) = .empty;
-
-        errdefer records.deinit(testing.allocator);
-
-        var header: Fields = .{};
-
-        var values: Fields = .{};
-
-        var expected: usize = 0;
-
-        var lines = std.mem.splitScalar(u8, text, '\n');
-
-        while (true) {
-            const raw = lines.next();
-
-            const line = std.mem.trim(u8, raw orelse "", " \t\r");
-
-            if (std.mem.startsWith(u8, line, field) and std.mem.startsWith(u8, line[field.len..], " =")) expected += 1;
-
-            if (line.len >= 2 and line[0] == '[' and line[line.len - 1] == ']') {
-                const key, const value = std.mem.cutScalar(u8, line[1 .. line.len - 1], '=') orelse .{ line[1 .. line.len - 1], "" };
-
-                header.put(std.mem.trim(u8, key, " "), std.mem.trim(u8, value, " "));
-            } else if (line.len > 0 and line[0] != '#' and std.mem.findScalar(u8, line, '=') != null) {
-                const key, const value = std.mem.cutScalar(u8, line, '=').?;
-
-                values.put(std.mem.trim(u8, key, " "), std.mem.trim(u8, value, " "));
-            } else if (values.len > 0) {
-                try records.append(testing.allocator, .{ .header = header, .values = values });
-
-                values = .{};
-            }
-
-            if (raw == null) break;
-        }
-
-        var parsed: usize = 0;
-
-        for (records.items) |r| {
-            if (r.values.find(field) != null) parsed += 1;
-        }
-
-        if (expected == 0 or parsed != expected) {
-            std.debug.print("{s}: parsed {d} records, expected {d}\n", .{ name, parsed, expected });
-
-            return error.TestUnexpectedResult;
-        }
-
-        return .{ .text = text, .records = try records.toOwnedSlice(testing.allocator) };
-    }
-
-    fn deinit(self: Vectors) void {
-        testing.allocator.free(self.records);
-
-        testing.allocator.free(self.text);
-    }
-};
+const Fields = vectors.Fields;
 
 const hashes = [_]struct { file: []const u8, name: []const u8, algorithm: pq.HashAlgorithm }{
     .{ .file = "SHA224", .name = "SHA-224", .algorithm = pq.sha_224 },
@@ -159,17 +54,11 @@ const Pieces = struct {
 };
 
 fn decode(hex: []const u8) ![]u8 {
-    const out = try testing.allocator.alloc(u8, hex.len / 2);
-
-    errdefer testing.allocator.free(out);
-
-    _ = try std.fmt.hexToBytes(out, hex);
-
-    return out;
+    return vectors.decode(testing.allocator, hex);
 }
 
 fn number(text: []const u8) !usize {
-    return std.fmt.parseInt(usize, text, 10);
+    return vectors.number(usize, text);
 }
 
 fn message(values: Fields) ![]u8 {
@@ -185,11 +74,11 @@ test "hash vectors" {
         for ([_][]const u8{ "ShortMsg", "LongMsg" }) |kind| {
             var name: [64]u8 = undefined;
 
-            const vectors = try Vectors.load(try std.fmt.bufPrint(&name, "{s}{s}.rsp", .{ h.file, kind }), "MD");
+            const v = try vectors.Vectors.load(try std.fmt.bufPrint(&name, "cavp/{s}{s}.rsp", .{ h.file, kind }), "MD");
 
-            defer vectors.deinit();
+            defer v.deinit();
 
-            for (vectors.records) |r| {
+            for (v.records) |r| {
                 const data = try message(r.values);
 
                 defer testing.allocator.free(data);
@@ -227,17 +116,17 @@ test "hash monte carlo" {
     for (hashes) |h| {
         var name: [64]u8 = undefined;
 
-        const vectors = try Vectors.load(try std.fmt.bufPrint(&name, "{s}Monte.rsp", .{h.file}), "MD");
+        const v = try vectors.Vectors.load(try std.fmt.bufPrint(&name, "cavp/{s}Monte.rsp", .{h.file}), "MD");
 
-        defer vectors.deinit();
+        defer v.deinit();
 
         const size = h.algorithm.digest_size;
 
         var md: [3][64]u8 = undefined;
 
-        _ = try std.fmt.hexToBytes(md[2][0..size], vectors.records[0].values.get("Seed"));
+        _ = try std.fmt.hexToBytes(md[2][0..size], v.records[0].values.get("Seed"));
 
-        for (vectors.records[1..]) |r| {
+        for (v.records[1..]) |r| {
             if (std.mem.startsWith(u8, h.file, "SHA3_")) {
                 for (0..1000) |_| {
                     var next: [64]u8 = undefined;
@@ -320,11 +209,11 @@ test "xof vectors" {
         for ([_][]const u8{ "ShortMsg", "LongMsg" }) |kind| {
             var name: [64]u8 = undefined;
 
-            const vectors = try Vectors.load(try std.fmt.bufPrint(&name, "{s}{s}.rsp", .{ x.file, kind }), "Output");
+            const v = try vectors.Vectors.load(try std.fmt.bufPrint(&name, "cavp/{s}{s}.rsp", .{ x.file, kind }), "Output");
 
-            defer vectors.deinit();
+            defer v.deinit();
 
-            for (vectors.records) |r| {
+            for (v.records) |r| {
                 const data = try message(r.values);
 
                 defer testing.allocator.free(data);
@@ -361,11 +250,11 @@ test "xof vectors" {
 
         var name: [64]u8 = undefined;
 
-        const vectors = try Vectors.load(try std.fmt.bufPrint(&name, "{s}VariableOut.rsp", .{x.file}), "Output");
+        const v = try vectors.Vectors.load(try std.fmt.bufPrint(&name, "cavp/{s}VariableOut.rsp", .{x.file}), "Output");
 
-        defer vectors.deinit();
+        defer v.deinit();
 
-        for (vectors.records) |r| {
+        for (v.records) |r| {
             const data = try decode(r.values.get("Msg"));
 
             defer testing.allocator.free(data);
@@ -391,11 +280,11 @@ test "xof monte carlo" {
     for (xofs) |x| {
         var name: [64]u8 = undefined;
 
-        const vectors = try Vectors.load(try std.fmt.bufPrint(&name, "{s}Monte.rsp", .{x.file}), "Output");
+        const v = try vectors.Vectors.load(try std.fmt.bufPrint(&name, "cavp/{s}Monte.rsp", .{x.file}), "Output");
 
-        defer vectors.deinit();
+        defer v.deinit();
 
-        const header = vectors.records[0].header;
+        const header = v.records[0].header;
 
         const minimum = try number(header.get("Minimum Output Length (bits)")) / 8;
 
@@ -405,11 +294,11 @@ test "xof monte carlo" {
 
         var length: usize = 16;
 
-        _ = try std.fmt.hexToBytes(output[0..length], vectors.records[0].values.get("Msg"));
+        _ = try std.fmt.hexToBytes(output[0..length], v.records[0].values.get("Msg"));
 
         var next = maximum;
 
-        for (vectors.records[1..]) |r| {
+        for (v.records[1..]) |r| {
             for (0..1000) |_| {
                 var input: [16]u8 = @splat(0);
 
@@ -466,13 +355,13 @@ test "xof properties" {
 }
 
 test "hmac vectors" {
-    const vectors = try Vectors.load("HMAC.rsp", "Mac");
+    const v = try vectors.Vectors.load("cavp/HMAC.rsp", "Mac");
 
-    defer vectors.deinit();
+    defer v.deinit();
 
     var tested: usize = 0;
 
-    for (vectors.records) |r| {
+    for (v.records) |r| {
         const length = r.header.get("L");
 
         if (std.mem.eql(u8, length, "20")) continue;

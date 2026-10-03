@@ -60,7 +60,7 @@ pub const iv_512_256 = [8]u64{
     0x96283ee2a88effe3, 0xbe5e1e2553863992, 0x2b0199fc2c85b8aa, 0x0eb72ddc81c52ca2,
 };
 
-fn compress256(state: *[8]u32, block: *const [64]u8) void {
+pub fn compress256(state: *[8]u32, block: *const [64]u8) void {
     var w: [16]u32 = undefined;
 
     for (0..16) |t| {
@@ -128,7 +128,7 @@ fn compress256(state: *[8]u32, block: *const [64]u8) void {
     }
 }
 
-fn compress512(state: *[8]u64, block: *const [128]u8) void {
+pub fn compress512(state: *[8]u64, block: *const [128]u8) void {
     var w: [16]u64 = undefined;
 
     for (0..16) |t| {

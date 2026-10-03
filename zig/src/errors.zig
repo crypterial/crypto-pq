@@ -1,0 +1,15 @@
+pub const Error = error{
+    InvalidLength,
+    InvalidEncoding,
+    AlgorithmMismatch,
+    InvalidPublicKey,
+    InvalidPrivateKey,
+    InvalidContext,
+    InvalidOption,
+    RngFailure,
+    SelfTestFailed,
+    KeyExhausted,
+    StatePersistFailed,
+    StateConflict,
+    Unsupported,
+};
