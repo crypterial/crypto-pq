@@ -2,11 +2,9 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-from ._encoding import KeyFormat
-
 from . import _mlkem, _xwing
 from ._bytes import equal
-from ._encoding import object_identifier
+from ._encoding import KeyFormat, object_identifier
 from ._errors import CryptoPQError, ErrorCode
 from ._keys import (
     decode_seed_choice,
@@ -185,7 +183,7 @@ class KemKeyPair(NamedTuple):
 class KemAlgorithm:
     __slots__ = ("_name", "_backend")
 
-    def __init__(self, name: str, backend: object) -> None:
+    def __init__(self, name: str, backend) -> None:
         self._name = name
 
         self._backend = backend

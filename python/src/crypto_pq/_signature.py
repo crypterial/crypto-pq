@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 from typing import NamedTuple
 
 from . import _mldsa, _slhdsa
-from ._encoding import OBJECT_IDENTIFIER, element, object_identifier
+from ._encoding import OBJECT_IDENTIFIER, KeyFormat, element, object_identifier
 from ._errors import CryptoPQError, ErrorCode
 from ._hash import (
     SHA3_224,
@@ -16,6 +18,8 @@ from ._hash import (
     SHA_512_256,
     SHAKE128,
     SHAKE256,
+    HashAlgorithm,
+    XofAlgorithm,
 )
 from ._keys import (
     decode_seed_choice,
@@ -31,6 +35,10 @@ from ._keys import (
     require_length,
 )
 from ._rng import random_bytes
+
+_Bytes = bytes | bytearray | memoryview
+
+_PreHash = HashAlgorithm | XofAlgorithm | None
 
 SELF_TEST_MESSAGE = b"crypto-pq pairwise consistency test"
 
@@ -176,16 +184,16 @@ def message_representative(message, context, entry):
 class SignaturePublicKey:
     __slots__ = ("_algorithm", "_key")
 
-    def __init__(self, algorithm, key):
+    def __init__(self, algorithm: SignatureAlgorithm, key: bytes) -> None:
         self._algorithm = algorithm
 
         self._key = key
 
     @property
-    def algorithm(self):
+    def algorithm(self) -> SignatureAlgorithm:
         return self._algorithm
 
-    def verify(self, signature, message, *, context=b"", pre_hash=None):
+    def verify(self, signature: _Bytes, message: _Bytes, *, context: _Bytes = b"", pre_hash: _PreHash = None) -> bool:
         return self._verify(signature, message, context, pre_hash, True)
 
     def _verify(self, signature, message, context, pre_hash, policy):
@@ -204,23 +212,23 @@ class SignaturePublicKey:
 
         return backend.verify(self._key, message_representative(message, context, entry), signature)
 
-    def export_key(self, format):
+    def export_key(self, format: KeyFormat | str) -> bytes:
         return export_public(format, self._algorithm._backend.oid, self._key)
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         return isinstance(other, SignaturePublicKey) and self._algorithm is other._algorithm and self._key == other._key
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash(self._key)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<SignaturePublicKey {self._algorithm.name}>"
 
 
 class SignaturePrivateKey:
     __slots__ = ("_algorithm", "_seed", "_private", "_public")
 
-    def __init__(self, algorithm, seed, private, public):
+    def __init__(self, algorithm: SignatureAlgorithm, seed: bytes | None, private: bytes, public: bytes) -> None:
         self._algorithm = algorithm
 
         self._seed = seed
@@ -230,14 +238,14 @@ class SignaturePrivateKey:
         self._public = public
 
     @property
-    def algorithm(self):
+    def algorithm(self) -> SignatureAlgorithm:
         return self._algorithm
 
     @property
-    def public_key(self):
+    def public_key(self) -> SignaturePublicKey:
         return SignaturePublicKey(self._algorithm, self._public)
 
-    def sign(self, message, *, context=b"", deterministic=False, pre_hash=None):
+    def sign(self, message: _Bytes, *, context: _Bytes = b"", deterministic: bool = False, pre_hash: _PreHash = None) -> bytes:
         require_bool(deterministic, "deterministic")
 
         backend = self._algorithm._backend
@@ -266,7 +274,7 @@ class SignaturePrivateKey:
 
         return backend.sign(self._private, message_representative(message, context, entry), randomness)
 
-    def export_key(self, format):
+    def export_key(self, format: KeyFormat | str) -> bytes:
         backend = self._algorithm._backend
 
         if backend.expanded_size is None:
@@ -277,7 +285,7 @@ class SignaturePrivateKey:
 
         return export_private(format, backend.oid, encode_seed_choice(None, self._private), self._private)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<SignaturePrivateKey {self._algorithm.name}>"
 
 
@@ -290,24 +298,24 @@ class SignatureKeyPair(NamedTuple):
 class SignatureAlgorithm:
     __slots__ = ("_name", "_backend")
 
-    def __init__(self, name, backend):
+    def __init__(self, name: str, backend) -> None:
         self._name = name
 
         self._backend = backend
 
     @property
-    def name(self):
+    def name(self) -> str:
         return self._name
 
     @property
-    def public_key_size(self):
+    def public_key_size(self) -> int:
         return self._backend.public_key_size
 
     @property
-    def signature_size(self):
+    def signature_size(self) -> int:
         return self._backend.signature_size
 
-    def generate_key_pair(self, *, self_test=True):
+    def generate_key_pair(self, *, self_test: bool = True) -> SignatureKeyPair:
         require_bool(self_test, "self_test")
 
         pair = self._from_seed(random_bytes(self._backend.seed_size))
@@ -321,7 +329,7 @@ class SignatureAlgorithm:
         return pair
 
     # ML-DSA keeps the seed as its private key; SLH-DSA keeps the expanded 4n-byte key.
-    def _from_seed(self, seed):
+    def _from_seed(self, seed: bytes) -> SignatureKeyPair:
         public, private = self._backend.from_seed(seed)
 
         kept = seed if self._backend.expanded_size is not None else None
@@ -330,14 +338,14 @@ class SignatureAlgorithm:
 
         return SignatureKeyPair(private_key.public_key, private_key)
 
-    def import_public_key(self, data, format):
+    def import_public_key(self, data: _Bytes | str, format: KeyFormat | str) -> SignaturePublicKey:
         key = import_public(format, data, self._backend.oid)
 
         require_key_length(key, self._backend.public_key_size, format, "public key")
 
         return SignaturePublicKey(self, key)
 
-    def import_private_key(self, data, format):
+    def import_private_key(self, data: _Bytes | str, format: KeyFormat | str) -> SignaturePrivateKey:
         backend = self._backend
 
         octets, raw, public_key = import_private(format, data, backend.oid)
@@ -390,7 +398,7 @@ class SignatureAlgorithm:
 
         return key
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<SignatureAlgorithm {self._name}>"
 
 

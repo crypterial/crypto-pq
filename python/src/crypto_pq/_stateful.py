@@ -1,12 +1,17 @@
+from __future__ import annotations
+
 import threading
+from collections.abc import Sequence
 from typing import NamedTuple, Protocol
 
 from . import _lms, _xmss
-from ._encoding import object_identifier
+from ._encoding import KeyFormat, object_identifier
 from ._errors import CryptoPQError, ErrorCode
 from ._keys import export_public, import_public, mismatch, require_bytes
 from ._primitives import sha256
 from ._rng import random_bytes
+
+_Bytes = bytes | bytearray | memoryview
 
 VERSION = 1
 
@@ -190,32 +195,32 @@ class _Xmss:
 class StatefulPublicKey:
     __slots__ = ("_algorithm", "_key")
 
-    def __init__(self, algorithm, key):
+    def __init__(self, algorithm: StatefulSignatureAlgorithm, key: bytes) -> None:
         self._algorithm = algorithm
 
         self._key = key
 
     @property
-    def algorithm(self):
+    def algorithm(self) -> StatefulSignatureAlgorithm:
         return self._algorithm
 
-    def verify(self, signature, message):
+    def verify(self, signature: _Bytes, message: _Bytes) -> bool:
         signature = require_bytes(signature, "signature")
 
         message = require_bytes(message, "message")
 
         return self._algorithm._backend.verify(self._key, message, signature)
 
-    def export_key(self, format):
+    def export_key(self, format: KeyFormat | str) -> bytes:
         return export_public(format, self._algorithm._backend.oid, self._key)
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         return isinstance(other, StatefulPublicKey) and self._algorithm is other._algorithm and self._key == other._key
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash(self._key)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<StatefulPublicKey {self._algorithm.name}>"
 
 
@@ -240,20 +245,20 @@ class StatefulPrivateKey:
         self._lock = threading.Lock()
 
     @property
-    def algorithm(self):
+    def algorithm(self) -> StatefulSignatureAlgorithm:
         return self._algorithm
 
     @property
-    def public_key(self):
+    def public_key(self) -> StatefulPublicKey:
         return StatefulPublicKey(self._algorithm, self._signer.public_key)
 
-    def remaining_signatures(self):
+    def remaining_signatures(self) -> int:
         with self._lock:
             return self._signer.capacity - self._index
 
     # The next index is written to the store before the signature exists, so a crash or a failed
     # write can waste an index but never use one twice.
-    def sign(self, message):
+    def sign(self, message: _Bytes) -> bytes:
         message = require_bytes(message, "message")
 
         with self._lock:
@@ -278,7 +283,7 @@ class StatefulPrivateKey:
 
             return self._signer.sign(index, message)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<StatefulPrivateKey {self._algorithm.name}>"
 
 
@@ -291,16 +296,16 @@ class StatefulKeyPair(NamedTuple):
 class StatefulSignatureAlgorithm:
     __slots__ = ("_name", "_backend")
 
-    def __init__(self, name, backend):
+    def __init__(self, name: str, backend) -> None:
         self._name = name
 
         self._backend = backend
 
     @property
-    def name(self):
+    def name(self) -> str:
         return self._name
 
-    def generate_key_pair(self, *, parameters, state_store):
+    def generate_key_pair(self, *, parameters: str | Sequence[tuple[str, str]], state_store: StateStore) -> StatefulKeyPair:
         parameters = self._backend.parameters(parameters)
 
         return self._create(parameters, random_bytes(self._backend.seed_size(parameters)), 0, state_store)
@@ -327,13 +332,16 @@ class StatefulSignatureAlgorithm:
 
         return StatefulKeyPair(private_key.public_key, private_key)
 
-    def load_private_key(self, state_store):
+    def load_private_key(self, state_store: StateStore) -> StatefulPrivateKey:
         require_store(state_store)
 
         try:
             state = state_store.read()
         except Exception as error:
             raise CryptoPQError(ErrorCode.STATE_PERSIST_FAILED, "the state store failed to read the key state") from error
+
+        if state is None:
+            raise mismatch("the state store holds no key")
 
         parameters, seed, index = self._backend.decode(state)
 
@@ -344,7 +352,7 @@ class StatefulSignatureAlgorithm:
 
         return StatefulPrivateKey(self, parameters, seed, signer, state_store, bytes(state), index)
 
-    def import_public_key(self, data, format):
+    def import_public_key(self, data: _Bytes | str, format: KeyFormat | str) -> StatefulPublicKey:
         key = import_public(format, data, self._backend.oid)
 
         if not self._backend.check_public_key(key):
@@ -352,7 +360,7 @@ class StatefulSignatureAlgorithm:
 
         return StatefulPublicKey(self, key)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<StatefulSignatureAlgorithm {self._name}>"
 
 

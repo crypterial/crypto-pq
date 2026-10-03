@@ -77,14 +77,14 @@ LMS_TYPES = {}
 
 for _index, (_shake, _n, _ots, _lms) in enumerate(FAMILIES):
     for _j, _w in enumerate((1, 2, 4, 8)):
-        _type = OtsType(1 + 4 * _index + _j, f"LMOTS_{_ots}_W{_w}", _shake, _n, _w)
+        _ots_type = OtsType(1 + 4 * _index + _j, f"LMOTS_{_ots}_W{_w}", _shake, _n, _w)
 
-        OTS_TYPES[_type.code] = _type
+        OTS_TYPES[_ots_type.code] = _ots_type
 
     for _j, _h in enumerate((5, 10, 15, 20, 25)):
-        _type = LmsType(5 + 5 * _index + _j, f"LMS_{_lms}_H{_h}", _shake, _n, _h)
+        _lms_type = LmsType(5 + 5 * _index + _j, f"LMS_{_lms}_H{_h}", _shake, _n, _h)
 
-        LMS_TYPES[_type.code] = _type
+        LMS_TYPES[_lms_type.code] = _lms_type
 
 OTS_BY_NAME = {t.name: t for t in OTS_TYPES.values()}
 
