@@ -11,6 +11,10 @@ keywords = ["post-quantum", "cryptography", "ml-kem", "ml-dsa", "sha3"]
 categories = ["cryptography", "no-std"]
 include = ["/src", "/LICENSE-APACHE", "/LICENSE-MIT"]
 
+[[bench]]
+name = "bench"
+harness = false
+
 # The SLH-DSA, XMSS and LMS vector suites take minutes unoptimized; test builds keep their debug
 # assertions and overflow checks but are optimized.
 [profile.test]

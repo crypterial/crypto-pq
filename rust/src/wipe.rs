@@ -4,10 +4,25 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{Ordering, compiler_fence};
 
 // Volatile writes survive dead-store elimination, so secrets are gone even when the memory is
-// never read again.
+// never read again. Groups of sixteen, then eight values are written at once, which turns them
+// into a few wide stores instead of one narrow store per value.
 #[allow(unsafe_code)]
 pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
-    for value in values.iter_mut() {
+    let (wide, rest) = values.as_chunks_mut::<16>();
+
+    for group in wide {
+        // SAFETY: `group` comes from a mutable slice, so it is valid, aligned and exclusive.
+        unsafe { core::ptr::write_volatile(group, [T::default(); 16]) };
+    }
+
+    let (groups, rest) = rest.as_chunks_mut::<8>();
+
+    for group in groups {
+        // SAFETY: as above.
+        unsafe { core::ptr::write_volatile(group, [T::default(); 8]) };
+    }
+
+    for value in rest {
         // SAFETY: `value` comes from a mutable slice, so it is valid, aligned and exclusive.
         unsafe { core::ptr::write_volatile(value, T::default()) };
     }

@@ -9,6 +9,9 @@ const Q: u32 = 3329;
 
 type Poly = [u16; 256];
 
+// The NTT runs on 32-bit lanes; its sums are reduced lazily.
+type Wide = [i32; 256];
+
 const fn power(base: u32, exponent: u32) -> u32 {
     let mut result = 1;
 
@@ -27,13 +30,38 @@ const fn bit_reverse7(value: usize) -> u32 {
     (value as u32).reverse_bits() >> 25
 }
 
-const ZETAS: [u16; 128] = {
+// q^-1 mod 2^32, by Newton's iteration from 1, for Montgomery reduction.
+const QINV: i32 = {
+    let mut inverse = 1u32;
+
+    let mut i = 0;
+
+    while i < 5 {
+        inverse = inverse.wrapping_mul(2u32.wrapping_sub(Q.wrapping_mul(inverse)));
+
+        i += 1;
+    }
+
+    inverse as i32
+};
+
+const R_MOD_Q: u16 = ((1u64 << 32) % Q as u64) as u16;
+
+// x * 2^32 mod q in (-q / 2, q / 2], so that one Montgomery reduction of a product with it gives
+// the plain product modulo q.
+const fn montgomery_form(x: u32) -> i32 {
+    let value = mul(x as u16, R_MOD_Q) as i32;
+
+    value - (Q as i32 & (((Q as i32 - 1) / 2 - value) >> 31))
+}
+
+const ZETAS: [i32; 128] = {
     let mut table = [0; 128];
 
     let mut i = 0;
 
     while i < 128 {
-        table[i] = power(17, bit_reverse7(i)) as u16;
+        table[i] = montgomery_form(power(17, bit_reverse7(i)));
 
         i += 1;
     }
@@ -41,19 +69,22 @@ const ZETAS: [u16; 128] = {
     table
 };
 
-const GAMMAS: [u16; 128] = {
+const GAMMAS: [i32; 128] = {
     let mut table = [0; 128];
 
     let mut i = 0;
 
     while i < 128 {
-        table[i] = power(17, 2 * bit_reverse7(i) + 1) as u16;
+        table[i] = montgomery_form(power(17, 2 * bit_reverse7(i) + 1));
 
         i += 1;
     }
 
     table
 };
+
+// 3303 = 128^-1 mod q.
+const INVERSE_SCALE: i32 = montgomery_form(3303);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Parameters {
@@ -130,6 +161,29 @@ const fn mul(a: u16, b: u16) -> u16 {
     reduce(a as u32 * b as u32)
 }
 
+const fn high(a: i32, b: i32) -> i32 {
+    ((a as i64 * b as i64) >> 32) as i32
+}
+
+// a * b * 2^-32 mod q in (-q, q), for |a * b| < 2^31 q, given b_qinv = b * q^-1 mod 2^32. The
+// low halves of a * b and of its multiple of q cancel, so only high halves are computed, which
+// the compiler can vectorize.
+const fn montgomery(a: i32, b: i32, b_qinv: i32) -> i32 {
+    high(a, b) - high(a.wrapping_mul(b_qinv), Q as i32)
+}
+
+// (-q, q) to [0, q) with a mask instead of a branch.
+const fn freeze(y: i32) -> u16 {
+    (y + (Q as i32 & (y >> 31))) as u16
+}
+
+// |w| < 2^31 to the canonical coefficients w mod q.
+fn canonical(w: &Wide) -> Poly {
+    let (r, r_qinv) = (i32::from(R_MOD_Q), i32::from(R_MOD_Q).wrapping_mul(QINV));
+
+    w.map(|x| freeze(montgomery(x, r, r_qinv)))
+}
+
 fn add_assign(f: &mut Poly, g: &Poly) {
     for (x, y) in f.iter_mut().zip(g) {
         *x = add(*x, *y);
@@ -137,119 +191,153 @@ fn add_assign(f: &mut Poly, g: &Poly) {
 }
 
 fn ntt(f: &mut Poly) {
+    let mut w = f.map(i32::from);
+
     let mut i = 1;
 
     let mut length = 128;
 
+    // The butterflies reduce only their products, so the sums stay below 8q.
     while length >= 2 {
         for start in (0..256).step_by(2 * length) {
-            let zeta = ZETAS[i];
+            let (zeta, zeta_qinv) = (ZETAS[i], ZETAS[i].wrapping_mul(QINV));
 
             i += 1;
 
-            for j in start..start + length {
-                let t = mul(zeta, f[j + length]);
+            let (low, high) = w[start..start + 2 * length].split_at_mut(length);
 
-                f[j + length] = sub(f[j], t);
+            for (a, b) in low.iter_mut().zip(high) {
+                let t = montgomery(*b, zeta, zeta_qinv);
 
-                f[j] = add(f[j], t);
+                *b = *a - t;
+
+                *a += t;
             }
         }
 
         length /= 2;
     }
+
+    *f = canonical(&w);
+
+    wipe(&mut w);
 }
 
-fn inverse_ntt(f: &mut Poly) {
+// The inverse NTT of the accumulated products, as canonical coefficients.
+fn inverse_ntt(acc: &Wide) -> Poly {
+    let (r, r_qinv) = (i32::from(R_MOD_Q), i32::from(R_MOD_Q).wrapping_mul(QINV));
+
+    // Below q in absolute value first, so that the sums stay below 128q.
+    let mut w = acc.map(|x| montgomery(x, r, r_qinv));
+
     let mut i = 127;
 
     let mut length = 2;
 
     while length <= 128 {
         for start in (0..256).step_by(2 * length) {
-            let zeta = ZETAS[i];
+            let (zeta, zeta_qinv) = (ZETAS[i], ZETAS[i].wrapping_mul(QINV));
 
             i -= 1;
 
-            for j in start..start + length {
-                let t = f[j];
+            let (low, high) = w[start..start + 2 * length].split_at_mut(length);
 
-                f[j] = add(t, f[j + length]);
+            for (a, b) in low.iter_mut().zip(high) {
+                let t = *a;
 
-                f[j + length] = mul(zeta, sub(f[j + length], t));
+                *a = t + *b;
+
+                *b = montgomery(*b - t, zeta, zeta_qinv);
             }
         }
 
         length *= 2;
     }
 
-    // 3303 = 128^-1 mod q.
-    for x in f.iter_mut() {
-        *x = mul(*x, 3303);
-    }
+    let scale_qinv = INVERSE_SCALE.wrapping_mul(QINV);
+
+    let f = w.map(|x| freeze(montgomery(x, INVERSE_SCALE, scale_qinv)));
+
+    wipe(&mut w);
+
+    f
 }
 
-// acc += f * g in the NTT domain (FIPS 203, Algorithms 11 and 12).
-fn multiply_add(acc: &mut Poly, f: &Poly, g: &Poly) {
-    for (i, gamma) in GAMMAS.iter().enumerate() {
-        let (a0, a1, b0, b1) = (f[2 * i], f[2 * i + 1], g[2 * i], g[2 * i + 1]);
+// acc += f * g in the NTT domain (FIPS 203, Algorithms 11 and 12) for canonical f and g. The
+// products are not reduced: k of them stay far below 2^31.
+fn multiply_accumulate(acc: &mut Wide, f: &Poly, g: &Poly) {
+    let pairs = acc.as_chunks_mut::<2>().0.iter_mut();
 
-        let c0 = add(mul(a0, b0), mul(mul(a1, b1), *gamma));
+    let factors = f.as_chunks::<2>().0.iter().zip(g.as_chunks::<2>().0);
 
-        let c1 = add(mul(a0, b1), mul(a1, b0));
+    for ((acc, (a, b)), &gamma) in pairs.zip(factors).zip(&GAMMAS) {
+        let ([a0, a1], [b0, b1]) = (a.map(i32::from), b.map(i32::from));
 
-        acc[2 * i] = add(acc[2 * i], c0);
+        acc[0] += a0 * b0 + montgomery(a1, b1, b1.wrapping_mul(QINV)) * gamma;
 
-        acc[2 * i + 1] = add(acc[2 * i + 1], c1);
+        acc[1] += a0 * b1 + a1 * b0;
     }
 }
 
 fn byte_encode(f: &Poly, d: u32, out: &mut [u8]) {
-    let mut buffer = 0u64;
-
-    let mut bits = 0;
-
-    let mut position = 0;
-
-    for &coefficient in f {
-        buffer |= u64::from(coefficient) << bits;
-
-        bits += d;
-
-        while bits >= 8 {
-            out[position] = buffer as u8;
-
-            buffer >>= 8;
-
-            bits -= 8;
-
-            position += 1;
-        }
+    match d {
+        1 => encode_bits::<1>(f, out),
+        4 => encode_bits::<4>(f, out),
+        5 => encode_bits::<5>(f, out),
+        10 => encode_bits::<10>(f, out),
+        11 => encode_bits::<11>(f, out),
+        12 => encode_bits::<12>(f, out),
+        _ => unreachable!("no ML-KEM encoding uses {d} bits"),
     }
 }
 
 fn byte_decode(data: &[u8], d: u32) -> Poly {
+    match d {
+        1 => decode_bits::<1>(data),
+        4 => decode_bits::<4>(data),
+        5 => decode_bits::<5>(data),
+        10 => decode_bits::<10>(data),
+        11 => decode_bits::<11>(data),
+        12 => decode_bits::<12>(data),
+        _ => unreachable!("no ML-KEM encoding uses {d} bits"),
+    }
+}
+
+// Eight coefficients of D bits fill D bytes, so with D constant every shift is a constant.
+fn encode_bits<const D: usize>(f: &Poly, out: &mut [u8]) {
+    for (bytes, group) in out
+        .as_chunks_mut::<D>()
+        .0
+        .iter_mut()
+        .zip(f.as_chunks::<8>().0)
+    {
+        let word = group
+            .iter()
+            .enumerate()
+            .fold(0u128, |word, (i, &x)| word | (u128::from(x) << (D * i)));
+
+        for (j, byte) in bytes.iter_mut().enumerate() {
+            *byte = (word >> (8 * j)) as u8;
+        }
+    }
+}
+
+fn decode_bits<const D: usize>(data: &[u8]) -> Poly {
     let mut f = [0; 256];
 
-    let mut buffer = 0u64;
+    for (group, bytes) in f
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .zip(data.as_chunks::<D>().0)
+    {
+        let word = bytes
+            .iter()
+            .rev()
+            .fold(0u128, |word, &byte| (word << 8) | u128::from(byte));
 
-    let mut bits = 0;
-
-    let mut index = 0;
-
-    for &byte in data {
-        buffer |= u64::from(byte) << bits;
-
-        bits += 8;
-
-        while bits >= d {
-            f[index] = (buffer & ((1 << d) - 1)) as u16;
-
-            buffer >>= d;
-
-            bits -= d;
-
-            index += 1;
+        for (i, x) in group.iter_mut().enumerate() {
+            *x = (word >> (D * i)) as u16 & ((1 << D) - 1);
         }
     }
 
@@ -269,6 +357,8 @@ const fn decompress(y: u16, d: u32) -> u16 {
     ((y as u32 * Q + (1 << (d - 1))) >> d) as u16
 }
 
+// Every candidate is written and only an accepted one advances the count, so that no branch
+// depends on a candidate, which a random matrix makes unpredictable.
 fn sample_ntt(rho: &[u8], first: usize, second: usize) -> Poly {
     let mut stream = shake128(&[rho, &[first as u8, second as u8]]);
 
@@ -278,7 +368,7 @@ fn sample_ntt(rho: &[u8], first: usize, second: usize) -> Poly {
 
     let mut block = [0u8; 168];
 
-    while count < 256 {
+    'blocks: while count < 256 {
         stream.read(&mut block);
 
         for chunk in block.as_chunks::<3>().0 {
@@ -287,10 +377,12 @@ fn sample_ntt(rho: &[u8], first: usize, second: usize) -> Poly {
             let d2 = u16::from(chunk[1] >> 4) | (u16::from(chunk[2]) << 4);
 
             for candidate in [d1, d2] {
-                if u32::from(candidate) < Q && count < 256 {
-                    a[count] = candidate;
+                a[count] = candidate;
 
-                    count += 1;
+                count += usize::from(u32::from(candidate) < Q);
+
+                if count == 256 {
+                    break 'blocks;
                 }
             }
         }
@@ -299,7 +391,8 @@ fn sample_ntt(rho: &[u8], first: usize, second: usize) -> Poly {
     a
 }
 
-// FIPS 203, Algorithm 8, applied to PRF_eta(seed, nonce) = SHAKE256(seed || nonce).
+// FIPS 203, Algorithm 8, applied to PRF_eta(seed, nonce) = SHAKE256(seed || nonce). The bits of
+// each half are summed with masks over a whole word, never one secret bit at a time.
 fn sample_noise(eta: usize, seed: &[u8], nonce: usize) -> Poly {
     let mut buffer = [0u8; 192];
 
@@ -307,17 +400,35 @@ fn sample_noise(eta: usize, seed: &[u8], nonce: usize) -> Poly {
 
     shake256_into(&[seed, &[nonce as u8]], data);
 
-    let bit = |index: usize| u16::from((data[index / 8] >> (index % 8)) & 1);
+    let mut f = [0; 256];
 
-    let f = core::array::from_fn(|i| {
-        let start = 2 * i * eta;
+    if eta == 2 {
+        for (bytes, group) in data.as_chunks::<4>().0.iter().zip(f.as_chunks_mut::<8>().0) {
+            let t = u32::from_le_bytes(*bytes);
 
-        let x = (start..start + eta).map(bit).sum();
+            let sums = (t & 0x5555_5555) + ((t >> 1) & 0x5555_5555);
 
-        let y = (start + eta..start + 2 * eta).map(bit).sum();
+            for (i, x) in group.iter_mut().enumerate() {
+                *x = sub(
+                    ((sums >> (4 * i)) & 3) as u16,
+                    ((sums >> (4 * i + 2)) & 3) as u16,
+                );
+            }
+        }
+    } else {
+        for (bytes, group) in data.as_chunks::<3>().0.iter().zip(f.as_chunks_mut::<4>().0) {
+            let t = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]);
 
-        sub(x, y)
-    });
+            let sums = (t & 0x24_9249) + ((t >> 1) & 0x24_9249) + ((t >> 2) & 0x24_9249);
+
+            for (i, x) in group.iter_mut().enumerate() {
+                *x = sub(
+                    ((sums >> (6 * i)) & 7) as u16,
+                    ((sums >> (6 * i + 3)) & 7) as u16,
+                );
+            }
+        }
+    }
 
     wipe(&mut buffer);
 
@@ -346,11 +457,17 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) {
     }
 
     for i in 0..k {
-        let mut t = e[i];
+        let mut acc = [0; 256];
 
         for (j, s_j) in s[..k].iter().enumerate() {
-            multiply_add(&mut t, &sample_ntt(rho, j, i), s_j);
+            multiply_accumulate(&mut acc, &sample_ntt(rho, j, i), s_j);
         }
+
+        let mut t = canonical(&acc);
+
+        wipe(&mut acc);
+
+        add_assign(&mut t, &e[i]);
 
         byte_encode(&t, 12, &mut ek[384 * i..384 * (i + 1)]);
 
@@ -384,26 +501,28 @@ fn pke_encrypt(ek: &[u8], m: &[u8], r: &[u8], p: &Parameters, c: &mut [u8]) {
     let mut u = [0; 256];
 
     for (i, chunk) in c1.chunks_exact_mut(32 * p.du as usize).enumerate() {
-        u = [0; 256];
+        let mut acc = [0; 256];
 
         for (j, y_j) in y[..k].iter().enumerate() {
-            multiply_add(&mut u, &sample_ntt(rho, i, j), y_j);
+            multiply_accumulate(&mut acc, &sample_ntt(rho, i, j), y_j);
         }
 
-        inverse_ntt(&mut u);
+        u = inverse_ntt(&acc);
+
+        wipe(&mut acc);
 
         add_assign(&mut u, &sample_noise(p.eta2, r, k + i));
 
         byte_encode(&u.map(|x| compress(x, p.du)), p.du, chunk);
     }
 
-    let mut v = [0; 256];
+    let mut acc = [0; 256];
 
     for (i, y_i) in y[..k].iter().enumerate() {
-        multiply_add(&mut v, &decode12(&ek[384 * i..384 * (i + 1)]), y_i);
+        multiply_accumulate(&mut acc, &decode12(&ek[384 * i..384 * (i + 1)]), y_i);
     }
 
-    inverse_ntt(&mut v);
+    let mut v = inverse_ntt(&acc);
 
     let mut noise = sample_noise(p.eta2, r, 2 * k);
 
@@ -416,6 +535,8 @@ fn pke_encrypt(ek: &[u8], m: &[u8], r: &[u8], p: &Parameters, c: &mut [u8]) {
     byte_encode(&v.map(|x| compress(x, p.dv)), p.dv, c2);
 
     wipe(y.as_flattened_mut());
+
+    wipe(&mut acc);
 
     wipe(&mut u);
 
@@ -431,7 +552,7 @@ fn pke_decrypt(dk: &[u8], c: &[u8], p: &Parameters) -> [u8; 32] {
 
     let (c1, c2) = c.split_at(32 * p.du as usize * k);
 
-    let mut w = [0; 256];
+    let mut acc = [0; 256];
 
     for (i, chunk) in c1.chunks_exact(32 * p.du as usize).enumerate() {
         let mut u = byte_decode(chunk, p.du).map(|x| decompress(x, p.du));
@@ -440,12 +561,12 @@ fn pke_decrypt(dk: &[u8], c: &[u8], p: &Parameters) -> [u8; 32] {
 
         let mut s = decode12(&dk[384 * i..384 * (i + 1)]);
 
-        multiply_add(&mut w, &s, &u);
+        multiply_accumulate(&mut acc, &s, &u);
 
         wipe(&mut s);
     }
 
-    inverse_ntt(&mut w);
+    let mut w = inverse_ntt(&acc);
 
     let v = byte_decode(c2, p.dv).map(|x| decompress(x, p.dv));
 
@@ -456,6 +577,8 @@ fn pke_decrypt(dk: &[u8], c: &[u8], p: &Parameters) -> [u8; 32] {
     let mut m = [0; 32];
 
     byte_encode(&w, 1, &mut m);
+
+    wipe(&mut acc);
 
     wipe(&mut w);
 

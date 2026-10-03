@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use crate::hash::{HMAC_SHA_256, HMAC_SHA_512};
 use crate::primitives::{sha256, sha512, shake256};
 use crate::sha2::{IV_256, IV_512, Sha256, Sha512};
-use crate::wipe::SecretBytes;
+use crate::wipe::{SecretBytes, wipe};
 
 const WOTS_HASH: u32 = 0;
 
@@ -26,6 +26,12 @@ const W: u32 = 16;
 const MAX_LEN: usize = 67;
 
 const MAX_K: usize = 35;
+
+// The largest tree height: h' of a hypertree layer or a of a FORS tree.
+const MAX_HEIGHT: usize = 14;
+
+// Hashes computed side by side (see Sha256::finish_lanes).
+const LANES: usize = 16;
 
 type Adrs = [u8; 32];
 
@@ -246,6 +252,21 @@ impl<'a> Hashes<'a> {
         out
     }
 
+    // ADRSc followed by the parts, as the message after the PK.seed block; returns its length.
+    fn message(out: &mut [u8], adrs: &Adrs, parts: &[&[u8]]) -> usize {
+        out[..22].copy_from_slice(&Self::compressed(adrs));
+
+        let mut length = 22;
+
+        for part in parts {
+            out[length..length + part.len()].copy_from_slice(part);
+
+            length += part.len();
+        }
+
+        length
+    }
+
     fn truncate(&self, digest: &[u8]) -> Node {
         let mut out = [0; 32];
 
@@ -278,26 +299,165 @@ impl<'a> Hashes<'a> {
         self.truncate(&engine.digest())
     }
 
-    fn f(&self, adrs: &Adrs, parts: &[&[u8]]) -> Node {
-        match &self.sha2 {
-            None => self.shake(adrs, parts),
-            Some(states) => self.with_sha256(&states.small, adrs, parts),
+    // F of up to LANES independent inputs, side by side with SHA-2. A lane without input gives
+    // nothing useful; with SHAKE it costs nothing.
+    fn f_lanes(&self, adrs: &[Adrs; LANES], inputs: [Option<&[u8]>; LANES]) -> [Node; LANES] {
+        let Some(states) = &self.sha2 else {
+            return core::array::from_fn(|lane| {
+                inputs[lane].map_or([0; 32], |input| self.shake(&adrs[lane], &[input]))
+            });
+        };
+
+        let n = self.n;
+
+        let mut blocks = [[0; LANES]; 16];
+
+        for (lane, (adrs, input)) in adrs.iter().zip(inputs).enumerate() {
+            let adrs_c = Self::compressed(adrs);
+
+            for (t, bytes) in adrs_c.as_chunks::<4>().0.iter().enumerate() {
+                blocks[t][lane] = u32::from_be_bytes(*bytes);
+            }
+
+            // ADRSc ends two bytes into word 5, so every input word straddles two block words.
+            let mut carry = (u32::from(adrs_c[20]) << 24) | (u32::from(adrs_c[21]) << 16);
+
+            for (t, bytes) in input
+                .unwrap_or(&[0; 32][..n])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+            {
+                let word = u32::from_be_bytes(*bytes);
+
+                blocks[5 + t][lane] = carry | (word >> 16);
+
+                carry = word << 16;
+            }
+
+            blocks[5 + n / 4][lane] = carry | 0x8000;
+
+            blocks[15][lane] = ((64 + 22 + n) * 8) as u32;
         }
+
+        let mut digests = states.small.finish_words(&mut blocks);
+
+        let nodes = core::array::from_fn(|lane| {
+            let mut node = [0; 32];
+
+            for (bytes, state) in node[..n].as_chunks_mut::<4>().0.iter_mut().zip(&digests) {
+                *bytes = state[lane].to_be_bytes();
+            }
+
+            node
+        });
+
+        wipe(blocks.as_flattened_mut());
+
+        wipe(digests.as_flattened_mut());
+
+        nodes
     }
 
-    // H and T.
-    fn h(&self, adrs: &Adrs, parts: &[&[u8]]) -> Node {
+    fn prf_lanes(&self, adrs: &[Adrs; LANES]) -> [Node; LANES] {
+        self.f_lanes(adrs, [Some(self.sk_seed); LANES])
+    }
+
+    // H of two n-byte nodes: one block of SHA-256 or SHA-512 after the seed.
+    fn h(&self, adrs: &Adrs, left: &[u8], right: &[u8]) -> Node {
         match &self.sha2 {
-            None => self.shake(adrs, parts),
+            None => self.shake(adrs, &[left, right]),
             Some(Sha2States {
                 large: Some(large), ..
-            }) => self.with_sha512(large, adrs, parts),
-            Some(Sha2States { small, large: None }) => self.with_sha256(small, adrs, parts),
+            }) => {
+                let mut message = [0; 128];
+
+                let length = Self::message(&mut message, adrs, &[left, right]);
+
+                self.truncate(&large.finish_message(&mut message, length))
+            }
+            Some(Sha2States { small, large: None }) => {
+                let mut message = [[0; 64]];
+
+                let length = Self::message(&mut message[0], adrs, &[left, right]);
+
+                let [digest] = small.finish_lanes(&mut message, length);
+
+                self.truncate(&digest)
+            }
         }
     }
 
-    fn prf(&self, adrs: &Adrs) -> Node {
-        self.f(adrs, &[self.sk_seed])
+    // T_l over the concatenated nodes.
+    fn t(&self, adrs: &Adrs, data: &[u8]) -> Node {
+        match &self.sha2 {
+            None => self.shake(adrs, &[data]),
+            Some(Sha2States {
+                large: Some(large), ..
+            }) => self.with_sha512(large, adrs, &[data]),
+            Some(Sha2States { small, large: None }) => self.with_sha256(small, adrs, &[data]),
+        }
+    }
+}
+
+// Treehash: the leaves arrive from left to right and each completed pair is replaced at once by
+// its parent, so at most one node per height waits on the stack. The siblings on the path of
+// the target leaf are recorded as they appear, n bytes per height.
+struct TreeHash<'s> {
+    n: usize,
+    stack: [(u32, Node); MAX_HEIGHT + 1],
+    size: usize,
+    target: Option<(u32, &'s mut [u8])>,
+}
+
+impl<'s> TreeHash<'s> {
+    fn new(n: usize, target: Option<(u32, &'s mut [u8])>) -> Self {
+        Self {
+            n,
+            stack: [(0, [0; 32]); MAX_HEIGHT + 1],
+            size: 0,
+            target,
+        }
+    }
+
+    // combine(height, index, left, right) is the node at that height and index over its children.
+    fn push(
+        &mut self,
+        mut index: u32,
+        mut node: Node,
+        combine: impl Fn(u32, u32, &Node, &Node) -> Node,
+    ) {
+        let mut height = 0;
+
+        loop {
+            if let Some((leaf, auth)) = &mut self.target
+                && index == (*leaf >> height) ^ 1
+            {
+                auth[height as usize * self.n..][..self.n].copy_from_slice(&node[..self.n]);
+            }
+
+            match self.size.checked_sub(1) {
+                Some(top) if self.stack[top].0 == height => {
+                    self.size = top;
+
+                    index >>= 1;
+
+                    height += 1;
+
+                    node = combine(height, index, &self.stack[top].1, &node);
+                }
+                _ => break,
+            }
+        }
+
+        self.stack[self.size] = (height, node);
+
+        self.size += 1;
+    }
+
+    fn root(&self) -> Node {
+        self.stack[0].1
     }
 }
 
@@ -307,16 +467,6 @@ struct Context<'a> {
 }
 
 impl Context<'_> {
-    fn chain(&self, mut x: Node, start: u32, steps: u32, adrs: &mut Adrs) -> Node {
-        for j in start..start + steps {
-            set_hash(adrs, j);
-
-            x = self.hashes.f(adrs, &[&x[..self.p.n]]);
-        }
-
-        x
-    }
-
     // base_2b(message, 4, 2n) followed by the three digits of the shifted checksum.
     fn wots_digits(&self, message: &[u8]) -> [u32; MAX_LEN] {
         let n = self.p.n;
@@ -342,118 +492,233 @@ impl Context<'_> {
         digits
     }
 
-    fn wots_secret(&self, adrs: &Adrs, i: usize) -> Node {
-        let mut sk_adrs = *adrs;
+    // The WOTS+ public keys of the leaves first, first + 1, ... filling `leaves`, from the XMSS
+    // tree at adrs. Every (leaf, chain) pair is a job, and LANES jobs run side by side; keys
+    // receives the chain ends. A signer, (leaf offset, digits, signature), receives the chain
+    // values at its digits.
+    fn wots_leaves(
+        &self,
+        adrs: &Adrs,
+        first: u32,
+        leaves: &mut [Node],
+        keys: &mut [u8],
+        mut signer: Option<(usize, &[u32; MAX_LEN], &mut [u8])>,
+    ) {
+        let (n, len, count) = (self.p.n, self.p.len(), leaves.len());
 
-        set_type(&mut sk_adrs, WOTS_PRF);
+        for start in (0..count * len).step_by(LANES) {
+            let jobs: [Option<(usize, usize)>; LANES] = core::array::from_fn(|lane| {
+                let job = start + lane;
 
-        set_key_pair(&mut sk_adrs, key_pair(adrs));
+                (job < count * len).then_some((job % count, job / count))
+            });
 
-        set_chain(&mut sk_adrs, i as u32);
+            let address = |kind: u32| {
+                jobs.map(|job| {
+                    let mut lane_adrs = *adrs;
 
-        self.hashes.prf(&sk_adrs)
+                    set_type(&mut lane_adrs, kind);
+
+                    if let Some((leaf, chain)) = job {
+                        set_key_pair(&mut lane_adrs, first + leaf as u32);
+
+                        set_chain(&mut lane_adrs, chain as u32);
+                    }
+
+                    lane_adrs
+                })
+            };
+
+            let mut x = self.hashes.f_lanes(
+                &address(WOTS_PRF),
+                jobs.map(|job| job.map(|_| self.hashes.sk_seed)),
+            );
+
+            let mut chain_adrs = address(WOTS_HASH);
+
+            for j in 0..W {
+                if let Some((signer_leaf, digits, signature)) = &mut signer {
+                    for (job, value) in jobs.iter().zip(&x) {
+                        if let Some((leaf, chain)) = *job
+                            && leaf == *signer_leaf
+                            && digits[chain] == j
+                        {
+                            signature[chain * n..(chain + 1) * n].copy_from_slice(&value[..n]);
+                        }
+                    }
+                }
+
+                if j == W - 1 {
+                    break;
+                }
+
+                for lane_adrs in &mut chain_adrs {
+                    set_hash(lane_adrs, j);
+                }
+
+                let inputs = core::array::from_fn(|lane| jobs[lane].map(|_| &x[lane][..n]));
+
+                x = self.hashes.f_lanes(&chain_adrs, inputs);
+            }
+
+            for (job, value) in jobs.iter().zip(&x) {
+                if let Some((leaf, chain)) = *job {
+                    keys[(leaf * len + chain) * n..][..n].copy_from_slice(&value[..n]);
+                }
+            }
+        }
+
+        for (leaf, node) in leaves.iter_mut().enumerate() {
+            let mut pk_adrs = *adrs;
+
+            set_type(&mut pk_adrs, WOTS_PK);
+
+            set_key_pair(&mut pk_adrs, first + leaf as u32);
+
+            *node = self
+                .hashes
+                .t(&pk_adrs, &keys[leaf * len * n..(leaf + 1) * len * n]);
+        }
     }
 
-    fn wots_public(&self, adrs: &Adrs, values: &[u8]) -> Node {
+    // The root of the XMSS tree at adrs (layer and tree set). A signer, (leaf, message,
+    // signature), receives the WOTS+ signature of the message by that leaf and its
+    // authentication path.
+    fn xmss_tree(&self, adrs: &Adrs, signer: Option<(u32, &[u8], &mut [u8])>) -> Node {
+        let (n, len) = (self.p.n, self.p.len());
+
+        let group = (1 << self.p.hp).min(LANES);
+
+        let mut leaves = [[0; 32]; LANES];
+
+        let mut keys = vec![0; group * len * n];
+
+        let (target, mut wots) = match signer {
+            Some((leaf, message, signature)) => {
+                let (wots, auth) = signature.split_at_mut(len * n);
+
+                (
+                    Some((leaf, auth)),
+                    Some((leaf, self.wots_digits(message), wots)),
+                )
+            }
+            None => (None, None),
+        };
+
+        let mut tree = TreeHash::new(n, target);
+
+        for first in (0..1 << self.p.hp).step_by(group) {
+            let signer = wots
+                .as_mut()
+                .filter(|(leaf, ..)| (first..first + group as u32).contains(leaf))
+                .map(|(leaf, digits, wots)| ((*leaf - first) as usize, &*digits, &mut **wots));
+
+            self.wots_leaves(adrs, first, &mut leaves[..group], &mut keys, signer);
+
+            for (offset, leaf) in leaves[..group].iter().enumerate() {
+                tree.push(
+                    first + offset as u32,
+                    *leaf,
+                    |height, index, left, right| {
+                        let mut node_adrs = *adrs;
+
+                        set_type(&mut node_adrs, TREE);
+
+                        set_chain(&mut node_adrs, height);
+
+                        set_hash(&mut node_adrs, index);
+
+                        self.hashes.h(&node_adrs, &left[..n], &right[..n])
+                    },
+                );
+            }
+        }
+
+        tree.root()
+    }
+
+    // Advances chain i of the WOTS+ key at adrs from step starts[i] to the end, for every chain.
+    // The chains have different lengths, so each lane takes the next chain as its own ends, the
+    // longest first so that the last ones to finish are short. The lengths come from public
+    // digests.
+    fn chains(&self, adrs: &Adrs, starts: &[u32], values: &mut [Node]) {
+        let n = self.p.n;
+
+        let mut order: [usize; MAX_LEN] = core::array::from_fn(|i| i);
+
+        let order = &mut order[..starts.len()];
+
+        order.sort_unstable_by_key(|&i| starts[i]);
+
+        let mut pending = order.iter().copied().filter(|&i| starts[i] < W - 1);
+
+        let mut lanes: [Option<(usize, u32)>; LANES] = [None; LANES];
+
+        loop {
+            for lane in lanes.iter_mut().filter(|lane| lane.is_none()) {
+                *lane = pending.next().map(|i| (i, starts[i]));
+            }
+
+            if lanes.iter().all(Option::is_none) {
+                return;
+            }
+
+            let lane_adrs = lanes.map(|lane| {
+                let mut chain_adrs = *adrs;
+
+                if let Some((i, j)) = lane {
+                    set_chain(&mut chain_adrs, i as u32);
+
+                    set_hash(&mut chain_adrs, j);
+                }
+
+                chain_adrs
+            });
+
+            let inputs = lanes.map(|lane| lane.map(|(i, _)| &values[i][..n]));
+
+            let outputs = self.hashes.f_lanes(&lane_adrs, inputs);
+
+            for (lane, output) in lanes.iter_mut().zip(outputs) {
+                if let Some((i, j)) = lane {
+                    values[*i] = output;
+
+                    *j += 1;
+
+                    if *j == W - 1 {
+                        *lane = None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn wots_pk_from_sig(&self, signature: &[u8], message: &[u8], adrs: &Adrs) -> Node {
+        let (n, len) = (self.p.n, self.p.len());
+
+        let digits = self.wots_digits(message);
+
+        let mut values = [[0; 32]; MAX_LEN];
+
+        for (value, piece) in values.iter_mut().zip(signature.chunks_exact(n)) {
+            value[..n].copy_from_slice(piece);
+        }
+
+        self.chains(adrs, &digits[..len], &mut values[..len]);
+
+        let mut key = [0; MAX_LEN * 32];
+
+        for (piece, value) in key.chunks_exact_mut(n).zip(&values[..len]) {
+            piece.copy_from_slice(&value[..n]);
+        }
+
         let mut pk_adrs = *adrs;
 
         set_type(&mut pk_adrs, WOTS_PK);
 
         set_key_pair(&mut pk_adrs, key_pair(adrs));
 
-        self.hashes.h(&pk_adrs, &[values])
-    }
-
-    fn wots_pk_gen(&self, adrs: &mut Adrs) -> Node {
-        let n = self.p.n;
-
-        let mut values = [0u8; MAX_LEN * 32];
-
-        for (i, value) in values.chunks_exact_mut(n).take(self.p.len()).enumerate() {
-            let secret = self.wots_secret(adrs, i);
-
-            set_chain(adrs, i as u32);
-
-            value.copy_from_slice(&self.chain(secret, 0, W - 1, adrs)[..n]);
-        }
-
-        self.wots_public(adrs, &values[..self.p.len() * n])
-    }
-
-    fn wots_sign(&self, message: &[u8], adrs: &mut Adrs, out: &mut [u8]) {
-        let n = self.p.n;
-
-        let digits = self.wots_digits(message);
-
-        for (i, (value, &digit)) in out.chunks_exact_mut(n).zip(&digits).enumerate() {
-            let secret = self.wots_secret(adrs, i);
-
-            set_chain(adrs, i as u32);
-
-            value.copy_from_slice(&self.chain(secret, 0, digit, adrs)[..n]);
-        }
-    }
-
-    fn wots_pk_from_sig(&self, signature: &[u8], message: &[u8], adrs: &mut Adrs) -> Node {
-        let n = self.p.n;
-
-        let digits = self.wots_digits(message);
-
-        let mut values = [0u8; MAX_LEN * 32];
-
-        let pieces = values.chunks_exact_mut(n).zip(signature.chunks_exact(n));
-
-        for (i, ((value, piece), &digit)) in pieces.zip(&digits).enumerate() {
-            set_chain(adrs, i as u32);
-
-            let mut x = [0; 32];
-
-            x[..n].copy_from_slice(piece);
-
-            value.copy_from_slice(&self.chain(x, digit, W - 1 - digit, adrs)[..n]);
-        }
-
-        self.wots_public(adrs, &values[..self.p.len() * n])
-    }
-
-    fn xmss_node(&self, i: u32, z: u32, adrs: &mut Adrs) -> Node {
-        if z == 0 {
-            set_type(adrs, WOTS_HASH);
-
-            set_key_pair(adrs, i);
-
-            return self.wots_pk_gen(adrs);
-        }
-
-        let left = self.xmss_node(2 * i, z - 1, adrs);
-
-        let right = self.xmss_node(2 * i + 1, z - 1, adrs);
-
-        set_type(adrs, TREE);
-
-        set_chain(adrs, z);
-
-        set_hash(adrs, i);
-
-        let n = self.p.n;
-
-        self.hashes.h(adrs, &[&left[..n], &right[..n]])
-    }
-
-    fn xmss_sign(&self, message: &[u8], index: u32, adrs: &mut Adrs, out: &mut [u8]) {
-        let n = self.p.n;
-
-        let (wots, auth) = out.split_at_mut(self.p.len() * n);
-
-        for (j, node) in auth.chunks_exact_mut(n).enumerate() {
-            node.copy_from_slice(&self.xmss_node((index >> j) ^ 1, j as u32, adrs)[..n]);
-        }
-
-        set_type(adrs, WOTS_HASH);
-
-        set_key_pair(adrs, index);
-
-        self.wots_sign(message, adrs, wots);
+        self.hashes.t(&pk_adrs, &key[..len * n])
     }
 
     // Climbs from the leaf to the root along the authentication path (FIPS 205, Algorithm 11,
@@ -467,11 +732,11 @@ impl Context<'_> {
             if (index >> k) & 1 == 0 {
                 set_hash(adrs, tree_index(adrs) / 2);
 
-                node = self.hashes.h(adrs, &[&node[..n], sibling]);
+                node = self.hashes.h(adrs, &node[..n], sibling);
             } else {
                 set_hash(adrs, (tree_index(adrs) - 1) / 2);
 
-                node = self.hashes.h(adrs, &[sibling, &node[..n]]);
+                node = self.hashes.h(adrs, sibling, &node[..n]);
             }
         }
 
@@ -504,35 +769,26 @@ impl Context<'_> {
         (1 << self.p.hp) - 1
     }
 
-    fn ht_sign(&self, message: &[u8], mut tree: u64, leaf: u32, out: &mut [u8]) {
+    // Each layer signs the root of the layer below, the bottom one the FORS public key.
+    fn ht_sign(&self, message: &[u8], mut tree: u64, mut leaf: u32, out: &mut [u8]) {
         let n = self.p.n;
 
-        let mut adrs = [0; 32];
+        let mut root = [0; 32];
 
-        set_tree(&mut adrs, tree);
+        root[..n].copy_from_slice(message);
 
-        let mut parts = out.chunks_exact_mut(self.p.xmss_size());
+        for (layer, part) in out.chunks_exact_mut(self.p.xmss_size()).enumerate() {
+            let mut adrs = [0; 32];
 
-        let first = parts.next().expect("one XMSS signature per layer");
-
-        self.xmss_sign(message, leaf, &mut adrs, first);
-
-        let mut root = self.xmss_pk_from_sig(leaf, first, message, &mut adrs);
-
-        for (j, part) in parts.enumerate().map(|(j, part)| (j + 1, part)) {
-            let leaf = (tree & self.leaf_mask()) as u32;
-
-            tree >>= self.p.hp;
-
-            set_layer(&mut adrs, j);
+            set_layer(&mut adrs, layer);
 
             set_tree(&mut adrs, tree);
 
-            self.xmss_sign(&root[..n], leaf, &mut adrs, part);
+            root = self.xmss_tree(&adrs, Some((leaf, &root[..n], part)));
 
-            if j < self.p.d - 1 {
-                root = self.xmss_pk_from_sig(leaf, part, &root[..n], &mut adrs);
-            }
+            leaf = (tree & self.leaf_mask()) as u32;
+
+            tree >>= self.p.hp;
         }
     }
 
@@ -564,42 +820,6 @@ impl Context<'_> {
         node
     }
 
-    fn fors_secret(&self, adrs: &Adrs, index: u32) -> Node {
-        let mut sk_adrs = *adrs;
-
-        set_type(&mut sk_adrs, FORS_PRF);
-
-        set_key_pair(&mut sk_adrs, key_pair(adrs));
-
-        set_hash(&mut sk_adrs, index);
-
-        self.hashes.prf(&sk_adrs)
-    }
-
-    fn fors_node(&self, i: u32, z: u32, adrs: &mut Adrs) -> Node {
-        let n = self.p.n;
-
-        if z == 0 {
-            let secret = self.fors_secret(adrs, i);
-
-            set_chain(adrs, 0);
-
-            set_hash(adrs, i);
-
-            return self.hashes.f(adrs, &[&secret[..n]]);
-        }
-
-        let left = self.fors_node(2 * i, z - 1, adrs);
-
-        let right = self.fors_node(2 * i + 1, z - 1, adrs);
-
-        set_chain(adrs, z);
-
-        set_hash(adrs, i);
-
-        self.hashes.h(adrs, &[&left[..n], &right[..n]])
-    }
-
     // base_2b(digest, a, k): the indices of the revealed FORS leaves.
     fn fors_indices(&self, digest: &[u8]) -> [u32; MAX_K] {
         let a = self.p.a;
@@ -629,50 +849,140 @@ impl Context<'_> {
         indices
     }
 
-    fn fors_sign(&self, digest: &[u8], adrs: &mut Adrs, out: &mut [u8]) {
-        let (n, a) = (self.p.n, self.p.a);
-
-        let indices = self.fors_indices(digest);
-
-        for (i, (chunk, &index)) in out.chunks_exact_mut((a + 1) * n).zip(&indices).enumerate() {
-            let base = (i << a) as u32;
-
-            chunk[..n].copy_from_slice(&self.fors_secret(adrs, base + index)[..n]);
-
-            for (j, node) in chunk[n..].chunks_exact_mut(n).enumerate() {
-                let sibling = ((i << (a - j)) as u32) + ((index >> j) ^ 1);
-
-                node.copy_from_slice(&self.fors_node(sibling, j as u32, adrs)[..n]);
-            }
-        }
-    }
-
-    fn fors_pk_from_sig(&self, signature: &[u8], digest: &[u8], adrs: &mut Adrs) -> Node {
-        let (n, a) = (self.p.n, self.p.a);
-
-        let indices = self.fors_indices(digest);
-
-        let mut roots = [0u8; MAX_K * 32];
-
-        let trees = signature.chunks_exact((a + 1) * n).zip(&indices);
-
-        for (i, ((chunk, &index), root)) in trees.zip(roots.chunks_exact_mut(n)).enumerate() {
-            set_chain(adrs, 0);
-
-            set_hash(adrs, ((i << a) as u32) + index);
-
-            let leaf = self.hashes.f(adrs, &[&chunk[..n]]);
-
-            root.copy_from_slice(&self.climb(leaf, index, &chunk[n..], adrs)[..n]);
-        }
-
+    fn fors_public_key(&self, adrs: &Adrs, roots: &[u8]) -> Node {
         let mut pk_adrs = *adrs;
 
         set_type(&mut pk_adrs, FORS_ROOTS);
 
         set_key_pair(&mut pk_adrs, key_pair(adrs));
 
-        self.hashes.h(&pk_adrs, &[&roots[..self.p.k * n]])
+        self.hashes.t(&pk_adrs, roots)
+    }
+
+    // Signs the digest with the FORS key at adrs (FORS_TREE type, key pair set) and returns the
+    // FORS public key: each tree is built from its leaves, LANES at a time, revealing the secret
+    // value of the selected leaf and its authentication path.
+    fn fors_sign(&self, digest: &[u8], adrs: &Adrs, out: &mut [u8]) -> Node {
+        let (n, a) = (self.p.n, self.p.a);
+
+        let indices = self.fors_indices(digest);
+
+        let mut roots = [0u8; MAX_K * 32];
+
+        let trees = out
+            .chunks_exact_mut((a + 1) * n)
+            .zip(roots.chunks_exact_mut(n));
+
+        for (i, (chunk, root)) in trees.enumerate() {
+            let (secret, auth) = chunk.split_at_mut(n);
+
+            let selected = indices[i];
+
+            let base = (i << a) as u32;
+
+            let mut tree = TreeHash::new(n, Some((selected, auth)));
+
+            for first in (0..1 << a).step_by(LANES) {
+                let secret_adrs = core::array::from_fn(|lane| {
+                    let mut secret_adrs = *adrs;
+
+                    set_type(&mut secret_adrs, FORS_PRF);
+
+                    set_key_pair(&mut secret_adrs, key_pair(adrs));
+
+                    set_hash(&mut secret_adrs, base + first + lane as u32);
+
+                    secret_adrs
+                });
+
+                let secrets = self.hashes.prf_lanes(&secret_adrs);
+
+                if (first..first + LANES as u32).contains(&selected) {
+                    secret.copy_from_slice(&secrets[(selected - first) as usize][..n]);
+                }
+
+                let leaf_adrs = core::array::from_fn(|lane| {
+                    let mut leaf_adrs = *adrs;
+
+                    set_chain(&mut leaf_adrs, 0);
+
+                    set_hash(&mut leaf_adrs, base + first + lane as u32);
+
+                    leaf_adrs
+                });
+
+                let leaves = self.hashes.f_lanes(
+                    &leaf_adrs,
+                    core::array::from_fn(|lane| Some(&secrets[lane][..n])),
+                );
+
+                for (lane, leaf) in leaves.into_iter().enumerate() {
+                    tree.push(first + lane as u32, leaf, |height, index, left, right| {
+                        let mut node_adrs = *adrs;
+
+                        set_chain(&mut node_adrs, height);
+
+                        set_hash(
+                            &mut node_adrs,
+                            ((i << (a - height as usize)) as u32) + index,
+                        );
+
+                        self.hashes.h(&node_adrs, &left[..n], &right[..n])
+                    });
+                }
+            }
+
+            root.copy_from_slice(&tree.root()[..n]);
+        }
+
+        self.fors_public_key(adrs, &roots[..self.p.k * n])
+    }
+
+    fn fors_pk_from_sig(&self, signature: &[u8], digest: &[u8], adrs: &mut Adrs) -> Node {
+        let (n, a, k) = (self.p.n, self.p.a, self.p.k);
+
+        let indices = self.fors_indices(digest);
+
+        let chunks: Vec<&[u8]> = signature.chunks_exact((a + 1) * n).collect();
+
+        let mut leaves = [[0; 32]; MAX_K];
+
+        for first in (0..k).step_by(LANES) {
+            let lane_adrs = core::array::from_fn(|lane| {
+                let mut leaf_adrs = *adrs;
+
+                if let Some(&index) = indices[..k].get(first + lane) {
+                    set_chain(&mut leaf_adrs, 0);
+
+                    set_hash(&mut leaf_adrs, (((first + lane) << a) as u32) + index);
+                }
+
+                leaf_adrs
+            });
+
+            let inputs =
+                core::array::from_fn(|lane| chunks.get(first + lane).map(|chunk| &chunk[..n]));
+
+            let outputs = self.hashes.f_lanes(&lane_adrs, inputs);
+
+            for (leaf, output) in leaves[first..k].iter_mut().zip(outputs) {
+                *leaf = output;
+            }
+        }
+
+        let mut roots = [0u8; MAX_K * 32];
+
+        let trees = chunks.iter().zip(&indices).zip(roots.chunks_exact_mut(n));
+
+        for (i, ((chunk, &index), root)) in trees.enumerate() {
+            set_chain(adrs, 0);
+
+            set_hash(adrs, ((i << a) as u32) + index);
+
+            root.copy_from_slice(&self.climb(leaves[i], index, &chunk[n..], adrs)[..n]);
+        }
+
+        self.fors_public_key(adrs, &roots[..k * n])
     }
 }
 
@@ -777,7 +1087,7 @@ pub(crate) fn root(p: &Parameters, sk_seed: &[u8], pk_seed: &[u8]) -> Node {
 
     set_layer(&mut adrs, p.d - 1);
 
-    context.xmss_node(0, p.hp as u32, &mut adrs)
+    context.xmss_tree(&adrs, None)
 }
 
 pub(crate) fn keygen_internal(
@@ -836,9 +1146,7 @@ pub(crate) fn sign_internal(
 
     set_key_pair(&mut adrs, leaf);
 
-    context.fors_sign(md, &mut adrs, fors);
-
-    let pk_fors = context.fors_pk_from_sig(fors, md, &mut adrs);
+    let pk_fors = context.fors_sign(md, &adrs, fors);
 
     context.ht_sign(&pk_fors[..n], tree, leaf, ht);
 

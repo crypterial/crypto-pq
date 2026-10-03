@@ -2,6 +2,7 @@ use alloc::vec::Vec;
 
 use crate::merkle::{MerkleTree, Node, TreeHasher};
 use crate::primitives::TruncatedHash;
+use crate::sha2::{IV_256, Sha256};
 use crate::wipe::{SecretBytes, wipe};
 
 const D_PBLC: [u8; 2] = [0x80, 0x80];
@@ -23,6 +24,9 @@ const CHILD_I: u16 = 0xFFFF;
 
 // The largest number of chains, p for n = 32 and w = 1.
 const MAX_P: usize = 265;
+
+// Hashes computed side by side (see Sha256::finish_lanes).
+const LANES: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct OtsType {
@@ -201,72 +205,294 @@ fn digits(t: &OtsType, q_hash: &[u8]) -> [u8; MAX_P] {
     out
 }
 
-fn chain(t: &OtsType, i: &[u8], q: u32, j: usize, range: (u32, u32), mut x: Node) -> Node {
-    for k in range.0..range.1 {
-        x = digest(
-            t.shake,
-            t.n,
-            &[
-                i,
-                &q.to_be_bytes(),
-                &(j as u16).to_be_bytes(),
-                &[k as u8],
-                &x[..t.n],
-            ],
-        );
-    }
+// The truncated hashes of L messages of length bytes, which fit one SHA-256 block, side by side;
+// with SHAKE the inactive lanes are skipped. The messages are wiped.
+fn digest_lanes<const L: usize>(
+    shake: bool,
+    n: usize,
+    messages: &mut [[u8; 64]; L],
+    length: usize,
+    active: [bool; L],
+) -> [Node; L] {
+    let digests = if shake {
+        let digests = core::array::from_fn(|lane| {
+            let message: &[u8] = &messages[lane][..length];
 
-    x
+            if active[lane] {
+                digest(true, n, &[message])
+            } else {
+                [0; 32]
+            }
+        });
+
+        wipe(messages.as_flattened_mut());
+
+        digests
+    } else {
+        Sha256::new(&IV_256).finish_lanes(messages, length)
+    };
+
+    digests.map(|digest| {
+        let mut out = [0; 32];
+
+        out[..n].copy_from_slice(&digest[..n]);
+
+        out
+    })
 }
 
-fn ots_public_key(t: &OtsType, lms: &LmsType, i: &[u8], q: u32, seed: &[u8]) -> Node {
-    let mut engine = TruncatedHash::new(t.shake);
+// I || u32(q) || u16(j) || u8(k) || x: a chain step, or with k = 0xFF and x = SEED a derived value.
+fn chain_message(out: &mut [u8; 64], i: &[u8], q: u32, j: usize, k: u8, x: &[u8]) -> usize {
+    out[..16].copy_from_slice(i);
 
-    for part in [i, &q.to_be_bytes(), &D_PBLC] {
-        engine.update(part);
+    out[16..20].copy_from_slice(&q.to_be_bytes());
+
+    out[20..22].copy_from_slice(&(j as u16).to_be_bytes());
+
+    out[22] = k;
+
+    out[23..23 + x.len()].copy_from_slice(x);
+
+    23 + x.len()
+}
+
+// H(I || u32(q) || u16(j) || u8(k) || x) for L lanes: a chain step, or with k = 0xFF and x = SEED
+// a derived value. With SHA-256 the block is built as words; x starts three bytes into word 5,
+// so each of its words straddles two block words.
+#[allow(clippy::too_many_arguments)]
+fn chain_lanes<const L: usize>(
+    shake: bool,
+    n: usize,
+    i: &[u8],
+    q: [u32; L],
+    j: [usize; L],
+    k: [u8; L],
+    x: [&[u8]; L],
+    active: [bool; L],
+) -> [Node; L] {
+    if shake {
+        let mut messages = [[0; 64]; L];
+
+        for (lane, message) in messages.iter_mut().enumerate() {
+            chain_message(message, i, q[lane], j[lane], k[lane], &x[lane][..n]);
+        }
+
+        return digest_lanes(true, n, &mut messages, 23 + n, active);
     }
 
-    let top = (1 << t.w) - 1;
+    let mut blocks = [[0; L]; 16];
+
+    for (t, bytes) in i.as_chunks::<4>().0.iter().enumerate() {
+        blocks[t] = [u32::from_be_bytes(*bytes); L];
+    }
+
+    for lane in 0..L {
+        blocks[4][lane] = q[lane];
+
+        let mut carry = ((j[lane] as u32) << 16) | (u32::from(k[lane]) << 8);
+
+        for (t, bytes) in x[lane][..n].as_chunks::<4>().0.iter().enumerate() {
+            let word = u32::from_be_bytes(*bytes);
+
+            blocks[5 + t][lane] = carry | (word >> 24);
+
+            carry = word << 8;
+        }
+
+        blocks[5 + n / 4][lane] = carry | 0x80;
+
+        blocks[15][lane] = ((23 + n) * 8) as u32;
+    }
+
+    let mut states = Sha256::new(&IV_256).finish_words(&mut blocks);
+
+    let nodes = core::array::from_fn(|lane| {
+        let mut node = [0; 32];
+
+        for (bytes, state) in node[..n].as_chunks_mut::<4>().0.iter_mut().zip(&states) {
+            *bytes = state[lane].to_be_bytes();
+        }
+
+        node
+    });
+
+    wipe(blocks.as_flattened_mut());
+
+    wipe(states.as_flattened_mut());
+
+    nodes
+}
+
+// The secret first values x_j = derive(q, j) of L chains.
+fn chain_starts<const L: usize>(
+    lms: &LmsType,
+    i: &[u8],
+    q: [u32; L],
+    j: [usize; L],
+    seed: &[u8],
+) -> [Node; L] {
+    chain_lanes(lms.shake, lms.m, i, q, j, [0xFF; L], [seed; L], [true; L])
+}
+
+// The LM-OTS public keys K of the L keys from q = first on, chain by chain for all of them.
+fn ots_public_keys<const L: usize>(
+    t: &OtsType,
+    lms: &LmsType,
+    i: &[u8],
+    first: u32,
+    seed: &[u8],
+) -> [Node; L] {
+    let n = t.n;
+
+    let q: [u32; L] = core::array::from_fn(|lane| first + lane as u32);
+
+    let mut engines = q.map(|q| {
+        let mut engine = TruncatedHash::new(t.shake);
+
+        for part in [i, &q.to_be_bytes(), &D_PBLC] {
+            engine.update(part);
+        }
+
+        engine
+    });
 
     for j in 0..t.p() {
-        let x = derive(lms, i, q, j as u16, seed);
+        let mut x = chain_starts(lms, i, q, [j; L], seed);
 
-        engine.update(&chain(t, i, q, j, (0, top), x)[..t.n]);
+        for k in 0..(1u32 << t.w) - 1 {
+            let inputs = core::array::from_fn(|lane| &x[lane][..n]);
+
+            x = chain_lanes(t.shake, n, i, q, [j; L], [k as u8; L], inputs, [true; L]);
+        }
+
+        for (engine, value) in engines.iter_mut().zip(&x) {
+            engine.update(&value[..n]);
+        }
     }
 
-    engine.finish(t.n)
+    engines.map(|engine| engine.finish(n))
+}
+
+// Advances chain j of the LM-OTS key q from step starts[j] to ends[j], for every chain. The
+// chains have different lengths, so each lane takes the next chain as its own ends, the longest
+// first so that the last ones to finish are short. The lengths come from public digests.
+fn chains(t: &OtsType, i: &[u8], q: u32, starts: &[u32], ends: &[u32], values: &mut [Node]) {
+    let n = t.n;
+
+    let mut order: [usize; MAX_P] = core::array::from_fn(|j| j);
+
+    let order = &mut order[..values.len()];
+
+    order.sort_unstable_by_key(|&j| core::cmp::Reverse(ends[j] - starts[j]));
+
+    let mut pending = order.iter().copied().filter(|&j| starts[j] < ends[j]);
+
+    let mut lanes: [Option<(usize, u32)>; LANES] = [None; LANES];
+
+    loop {
+        for lane in lanes.iter_mut().filter(|lane| lane.is_none()) {
+            *lane = pending.next().map(|j| (j, starts[j]));
+        }
+
+        if lanes.iter().all(Option::is_none) {
+            return;
+        }
+
+        let (j, k) = (
+            lanes.map(|lane| lane.unwrap_or_default().0),
+            lanes.map(|lane| lane.unwrap_or_default().1 as u8),
+        );
+
+        let inputs = core::array::from_fn(|lane| &values[j[lane]][..n]);
+
+        let active = lanes.map(|lane| lane.is_some());
+
+        let outputs = chain_lanes(t.shake, n, i, [q; LANES], j, k, inputs, active);
+
+        for (lane, output) in lanes.iter_mut().zip(outputs) {
+            if let Some((j, k)) = lane {
+                values[*j] = output;
+
+                *k += 1;
+
+                if *k == ends[*j] {
+                    *lane = None;
+                }
+            }
+        }
+    }
+}
+
+// The secret chain starts x_j of the key q, LANES at a time.
+fn secret_values(t: &OtsType, lms: &LmsType, i: &[u8], q: u32, seed: &[u8]) -> [Node; MAX_P] {
+    let mut values = [[0; 32]; MAX_P];
+
+    for (first, group) in (0..t.p()).step_by(LANES).zip(values.chunks_mut(LANES)) {
+        let j = core::array::from_fn(|lane| first + lane);
+
+        let starts = chain_starts::<LANES>(lms, i, [q; LANES], j, seed);
+
+        for (value, start) in group.iter_mut().zip(starts) {
+            *value = start;
+        }
+    }
+
+    values
 }
 
 fn ots_sign(t: &OtsType, lms: &LmsType, i: &[u8], q: u32, seed: &[u8], message: &[u8]) -> Vec<u8> {
+    let (n, p) = (t.n, t.p());
+
     let c = derive(lms, i, q, RANDOMIZER, seed);
 
     let q_hash = digest(
         t.shake,
-        t.n,
-        &[i, &q.to_be_bytes(), &D_MESG, &c[..t.n], message],
+        n,
+        &[i, &q.to_be_bytes(), &D_MESG, &c[..n], message],
     );
 
     let mut out = Vec::with_capacity(t.signature_size());
 
     out.extend_from_slice(&t.code.to_be_bytes());
 
-    out.extend_from_slice(&c[..t.n]);
+    out.extend_from_slice(&c[..n]);
 
-    for (j, &a) in digits(t, &q_hash).iter().take(t.p()).enumerate() {
-        let x = derive(lms, i, q, j as u16, seed);
+    let digits = digits(t, &q_hash).map(u32::from);
 
-        out.extend_from_slice(&chain(t, i, q, j, (0, u32::from(a)), x)[..t.n]);
+    let mut values = secret_values(t, lms, i, q, seed);
+
+    chains(t, i, q, &[0; MAX_P][..p], &digits[..p], &mut values[..p]);
+
+    for value in &values[..p] {
+        out.extend_from_slice(&value[..n]);
     }
 
     out
 }
 
 fn ots_candidate(t: &OtsType, i: &[u8], q: u32, signature: &[u8], message: &[u8]) -> Node {
-    let n = t.n;
+    let (n, p) = (t.n, t.p());
 
     let c = &signature[4..4 + n];
 
     let q_hash = digest(t.shake, n, &[i, &q.to_be_bytes(), &D_MESG, c, message]);
+
+    let mut values = [[0; 32]; MAX_P];
+
+    for (value, y) in values.iter_mut().zip(signature[4 + n..].chunks_exact(n)) {
+        value[..n].copy_from_slice(y);
+    }
+
+    let digits = digits(t, &q_hash).map(u32::from);
+
+    chains(
+        t,
+        i,
+        q,
+        &digits[..p],
+        &[(1 << t.w) - 1; MAX_P][..p],
+        &mut values[..p],
+    );
 
     let mut engine = TruncatedHash::new(t.shake);
 
@@ -274,16 +500,8 @@ fn ots_candidate(t: &OtsType, i: &[u8], q: u32, signature: &[u8], message: &[u8]
         engine.update(part);
     }
 
-    let top = (1 << t.w) - 1;
-
-    let chains = signature[4 + n..].chunks_exact(n);
-
-    for (j, (&a, y)) in digits(t, &q_hash).iter().zip(chains).enumerate() {
-        let mut x = [0; 32];
-
-        x[..n].copy_from_slice(y);
-
-        engine.update(&chain(t, i, q, j, (u32::from(a), top), x)[..n]);
+    for value in &values[..p] {
+        engine.update(&value[..n]);
     }
 
     engine.finish(n)
@@ -422,17 +640,41 @@ struct TreeKey<'a> {
     seed: &'a [u8],
 }
 
+impl TreeKey<'_> {
+    fn leaf_lanes<const L: usize>(&self, first: u32) -> [Node; L] {
+        let keys = ots_public_keys::<L>(self.ots, self.lms, self.i, first, self.seed);
+
+        let mut messages = [[0; 64]; L];
+
+        let n = self.ots.n;
+
+        for (lane, (message, key)) in messages.iter_mut().zip(&keys).enumerate() {
+            let node = (1u32 << self.lms.h) + first + lane as u32;
+
+            message[..16].copy_from_slice(self.i);
+
+            message[16..20].copy_from_slice(&node.to_be_bytes());
+
+            message[20..22].copy_from_slice(&D_LEAF);
+
+            message[22..22 + n].copy_from_slice(&key[..n]);
+        }
+
+        digest_lanes(self.lms.shake, self.lms.m, &mut messages, 22 + n, [true; L])
+    }
+}
+
 impl TreeHasher for TreeKey<'_> {
-    fn leaf(&self, q: u32) -> Node {
-        let k = ots_public_key(self.ots, self.lms, self.i, q, self.seed);
-
-        let node = (1u32 << self.lms.h) + q;
-
-        digest(
-            self.lms.shake,
-            self.lms.m,
-            &[self.i, &node.to_be_bytes(), &D_LEAF, &k[..self.ots.n]],
-        )
+    fn leaves(&self, first: u32, out: &mut [Node]) {
+        for (start, group) in (first..).step_by(LANES).zip(out.chunks_mut(LANES)) {
+            if let Ok(group) = <&mut [Node; LANES]>::try_from(&mut *group) {
+                *group = self.leaf_lanes(start);
+            } else {
+                for (q, node) in (start..).zip(group) {
+                    [*node] = self.leaf_lanes(q);
+                }
+            }
+        }
     }
 
     fn combine(&self, height: u32, index: u32, left: &Node, right: &Node) -> Node {

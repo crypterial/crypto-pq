@@ -216,6 +216,25 @@ impl<const N: usize> Drop for Blocks<N> {
     }
 }
 
+// One round, with the working variables passed in their rotated roles so that unrolled rounds
+// never move values between them: only d and h receive new values.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn round256(a: u32, b: u32, c: u32, d: &mut u32, e: u32, f: u32, g: u32, h: &mut u32, kw: u32) {
+    let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+
+    let t1 = h
+        .wrapping_add(kw)
+        .wrapping_add((e & f) | (!e & g))
+        .wrapping_add(s1);
+
+    let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+
+    *d = d.wrapping_add(t1);
+
+    *h = s0.wrapping_add((a & b) | (c & (a | b))).wrapping_add(t1);
+}
+
 fn compress256(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 16];
 
@@ -227,54 +246,172 @@ fn compress256(state: &mut [u32; 8], block: &[u8; 64]) {
 
     // The schedule keeps its last 16 words: word t lives at t % 16, so t - 15, t - 7 and t - 2
     // are at (t + 1) % 16, (t + 9) % 16 and (t + 14) % 16, and t - 16 is the slot it replaces.
-    for (t, k) in K256.iter().enumerate() {
-        if t >= 16 {
-            let x = w[(t + 1) % 16];
+    for start in (0..64).step_by(8) {
+        let mut kw = [0; 8];
 
-            let y = w[(t + 14) % 16];
+        for (j, kw) in kw.iter_mut().enumerate() {
+            let t = start + j;
 
-            let s0 = x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3);
+            if t >= 16 {
+                let (x, y) = (w[(t + 1) % 16], w[(t + 14) % 16]);
 
-            let s1 = y.rotate_right(17) ^ y.rotate_right(19) ^ (y >> 10);
+                let s0 = x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3);
 
-            w[t % 16] = w[t % 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[(t + 9) % 16])
-                .wrapping_add(s1);
+                let s1 = y.rotate_right(17) ^ y.rotate_right(19) ^ (y >> 10);
+
+                w[t % 16] = w[t % 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[(t + 9) % 16])
+                    .wrapping_add(s1);
+            }
+
+            *kw = w[t % 16].wrapping_add(K256[t]);
         }
 
-        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        round256(a, b, c, &mut d, e, f, g, &mut h, kw[0]);
 
-        let t1 = h
-            .wrapping_add(s1)
-            .wrapping_add((e & f) ^ (!e & g))
-            .wrapping_add(*k)
-            .wrapping_add(w[t % 16]);
+        round256(h, a, b, &mut c, d, e, f, &mut g, kw[1]);
 
-        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        round256(g, h, a, &mut b, c, d, e, &mut f, kw[2]);
 
-        let t2 = s0.wrapping_add((a & b) ^ (a & c) ^ (b & c));
+        round256(f, g, h, &mut a, b, c, d, &mut e, kw[3]);
 
-        h = g;
+        round256(e, f, g, &mut h, a, b, c, &mut d, kw[4]);
 
-        g = f;
+        round256(d, e, f, &mut g, h, a, b, &mut c, kw[5]);
 
-        f = e;
+        round256(c, d, e, &mut f, g, h, a, &mut b, kw[6]);
 
-        e = d.wrapping_add(t1);
-
-        d = c;
-
-        c = b;
-
-        b = a;
-
-        a = t1.wrapping_add(t2);
+        round256(b, c, d, &mut e, f, g, h, &mut a, kw[7]);
     }
 
     for (word, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
         *word = word.wrapping_add(value);
     }
+}
+
+// LANES independent compressions side by side, each variable holding one word of every lane, so
+// that the compiler interleaves or vectorizes them: a single SHA-256 is bound by the latency of
+// its rounds, not by the arithmetic units.
+type Lanes<const LANES: usize> = [u32; LANES];
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn round256_lanes<const LANES: usize>(
+    a: &Lanes<LANES>,
+    b: &Lanes<LANES>,
+    c: &Lanes<LANES>,
+    d: &mut Lanes<LANES>,
+    e: &Lanes<LANES>,
+    f: &Lanes<LANES>,
+    g: &Lanes<LANES>,
+    h: &mut Lanes<LANES>,
+    k: u32,
+    w: &Lanes<LANES>,
+) {
+    let s1: Lanes<LANES> = core::array::from_fn(|i| {
+        e[i].rotate_right(6) ^ e[i].rotate_right(11) ^ e[i].rotate_right(25)
+    });
+
+    let s0: Lanes<LANES> = core::array::from_fn(|i| {
+        a[i].rotate_right(2) ^ a[i].rotate_right(13) ^ a[i].rotate_right(22)
+    });
+
+    for i in 0..LANES {
+        let t1 = h[i]
+            .wrapping_add(k)
+            .wrapping_add(w[i])
+            .wrapping_add((e[i] & f[i]) | (!e[i] & g[i]))
+            .wrapping_add(s1[i]);
+
+        d[i] = d[i].wrapping_add(t1);
+
+        h[i] = s0[i]
+            .wrapping_add((a[i] & b[i]) | (c[i] & (a[i] | b[i])))
+            .wrapping_add(t1);
+    }
+}
+
+// The states and the blocks are word-major: states[i][lane] is word i of the state of that lane.
+// The schedule overwrites the blocks.
+fn compress256_lanes<const LANES: usize>(
+    states: &mut [Lanes<LANES>; 8],
+    w: &mut [Lanes<LANES>; 16],
+) {
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *states;
+
+    for (round, k) in K256.as_chunks::<16>().0.iter().enumerate() {
+        if round > 0 {
+            for t in 0..16 {
+                let (x, y, z) = (w[(t + 1) % 16], w[(t + 14) % 16], w[(t + 9) % 16]);
+
+                for (lane, word) in w[t].iter_mut().enumerate() {
+                    let s0 = x[lane].rotate_right(7) ^ x[lane].rotate_right(18) ^ (x[lane] >> 3);
+
+                    let s1 = y[lane].rotate_right(17) ^ y[lane].rotate_right(19) ^ (y[lane] >> 10);
+
+                    *word = word.wrapping_add(s0).wrapping_add(z[lane]).wrapping_add(s1);
+                }
+            }
+        }
+
+        round256_lanes(&a, &b, &c, &mut d, &e, &f, &g, &mut h, k[0], &w[0]);
+
+        round256_lanes(&h, &a, &b, &mut c, &d, &e, &f, &mut g, k[1], &w[1]);
+
+        round256_lanes(&g, &h, &a, &mut b, &c, &d, &e, &mut f, k[2], &w[2]);
+
+        round256_lanes(&f, &g, &h, &mut a, &b, &c, &d, &mut e, k[3], &w[3]);
+
+        round256_lanes(&e, &f, &g, &mut h, &a, &b, &c, &mut d, k[4], &w[4]);
+
+        round256_lanes(&d, &e, &f, &mut g, &h, &a, &b, &mut c, k[5], &w[5]);
+
+        round256_lanes(&c, &d, &e, &mut f, &g, &h, &a, &mut b, k[6], &w[6]);
+
+        round256_lanes(&b, &c, &d, &mut e, &f, &g, &h, &mut a, k[7], &w[7]);
+
+        round256_lanes(&a, &b, &c, &mut d, &e, &f, &g, &mut h, k[8], &w[8]);
+
+        round256_lanes(&h, &a, &b, &mut c, &d, &e, &f, &mut g, k[9], &w[9]);
+
+        round256_lanes(&g, &h, &a, &mut b, &c, &d, &e, &mut f, k[10], &w[10]);
+
+        round256_lanes(&f, &g, &h, &mut a, &b, &c, &d, &mut e, k[11], &w[11]);
+
+        round256_lanes(&e, &f, &g, &mut h, &a, &b, &c, &mut d, k[12], &w[12]);
+
+        round256_lanes(&d, &e, &f, &mut g, &h, &a, &b, &mut c, k[13], &w[13]);
+
+        round256_lanes(&c, &d, &e, &mut f, &g, &h, &a, &mut b, k[14], &w[14]);
+
+        round256_lanes(&b, &c, &d, &mut e, &f, &g, &h, &mut a, k[15], &w[15]);
+    }
+
+    let words = [a, b, c, d, e, f, g, h];
+
+    for (state, value) in states.iter_mut().zip(&words) {
+        for (word, value) in state.iter_mut().zip(value) {
+            *word = word.wrapping_add(*value);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn round512(a: u64, b: u64, c: u64, d: &mut u64, e: u64, f: u64, g: u64, h: &mut u64, kw: u64) {
+    let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+
+    let t1 = h
+        .wrapping_add(kw)
+        .wrapping_add((e & f) | (!e & g))
+        .wrapping_add(s1);
+
+    let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+
+    *d = d.wrapping_add(t1);
+
+    *h = s0.wrapping_add((a & b) | (c & (a | b))).wrapping_add(t1);
 }
 
 fn compress512(state: &mut [u64; 8], block: &[u8; 128]) {
@@ -286,51 +423,44 @@ fn compress512(state: &mut [u64; 8], block: &[u8; 128]) {
 
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
 
-    // The schedule keeps its last 16 words: word t lives at t % 16, so t - 15, t - 7 and t - 2
-    // are at (t + 1) % 16, (t + 9) % 16 and (t + 14) % 16, and t - 16 is the slot it replaces.
-    for (t, k) in K512.iter().enumerate() {
-        if t >= 16 {
-            let x = w[(t + 1) % 16];
+    // The same rolling schedule as SHA-256.
+    for start in (0..80).step_by(8) {
+        let mut kw = [0; 8];
 
-            let y = w[(t + 14) % 16];
+        for (j, kw) in kw.iter_mut().enumerate() {
+            let t = start + j;
 
-            let s0 = x.rotate_right(1) ^ x.rotate_right(8) ^ (x >> 7);
+            if t >= 16 {
+                let (x, y) = (w[(t + 1) % 16], w[(t + 14) % 16]);
 
-            let s1 = y.rotate_right(19) ^ y.rotate_right(61) ^ (y >> 6);
+                let s0 = x.rotate_right(1) ^ x.rotate_right(8) ^ (x >> 7);
 
-            w[t % 16] = w[t % 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[(t + 9) % 16])
-                .wrapping_add(s1);
+                let s1 = y.rotate_right(19) ^ y.rotate_right(61) ^ (y >> 6);
+
+                w[t % 16] = w[t % 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[(t + 9) % 16])
+                    .wrapping_add(s1);
+            }
+
+            *kw = w[t % 16].wrapping_add(K512[t]);
         }
 
-        let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+        round512(a, b, c, &mut d, e, f, g, &mut h, kw[0]);
 
-        let t1 = h
-            .wrapping_add(s1)
-            .wrapping_add((e & f) ^ (!e & g))
-            .wrapping_add(*k)
-            .wrapping_add(w[t % 16]);
+        round512(h, a, b, &mut c, d, e, f, &mut g, kw[1]);
 
-        let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+        round512(g, h, a, &mut b, c, d, e, &mut f, kw[2]);
 
-        let t2 = s0.wrapping_add((a & b) ^ (a & c) ^ (b & c));
+        round512(f, g, h, &mut a, b, c, d, &mut e, kw[3]);
 
-        h = g;
+        round512(e, f, g, &mut h, a, b, c, &mut d, kw[4]);
 
-        g = f;
+        round512(d, e, f, &mut g, h, a, b, &mut c, kw[5]);
 
-        f = e;
+        round512(c, d, e, &mut f, g, h, a, &mut b, kw[6]);
 
-        e = d.wrapping_add(t1);
-
-        d = c;
-
-        c = b;
-
-        b = a;
-
-        a = t1.wrapping_add(t2);
+        round512(b, c, d, &mut e, f, g, h, &mut a, kw[7]);
     }
 
     for (word, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
@@ -380,6 +510,83 @@ impl Sha256 {
 
         out
     }
+
+    // finish_lanes for messages whose padded last block the caller has already built as words,
+    // word-major (blocks[t][lane]); returns the final states, word-major too. The blocks are
+    // overwritten.
+    pub(crate) fn finish_words<const LANES: usize>(
+        &self,
+        blocks: &mut [[u32; LANES]; 16],
+    ) -> [[u32; LANES]; 8] {
+        assert_eq!(
+            self.blocks.len, 0,
+            "the shared input must fill whole blocks"
+        );
+
+        let mut states = self.state.map(|word| [word; LANES]);
+
+        compress256_lanes(&mut states, blocks);
+
+        states
+    }
+
+    // The digests of LANES messages of `length` bytes, each appended to the input so far, which
+    // must fill whole blocks. Hashes that share a prefix, such as a public seed, pay for it once
+    // and run side by side. The message buffers receive the padding and are wiped.
+    pub(crate) fn finish_lanes<const LANES: usize, const SIZE: usize>(
+        &self,
+        messages: &mut [[u8; SIZE]; LANES],
+        length: usize,
+    ) -> [[u8; 32]; LANES] {
+        assert_eq!(
+            self.blocks.len, 0,
+            "the shared input must fill whole blocks"
+        );
+
+        let end = (length + 9).next_multiple_of(64);
+
+        let bits = self.length.wrapping_add(length as u64).wrapping_mul(8);
+
+        for message in messages.iter_mut() {
+            message[length..end].fill(0);
+
+            message[length] = 0x80;
+
+            message[end - 8..end].copy_from_slice(&bits.to_be_bytes());
+        }
+
+        let mut states = self.state.map(|word| [word; LANES]);
+
+        let mut words = [[0; LANES]; 16];
+
+        for offset in (0..end).step_by(64) {
+            for (lane, message) in messages.iter().enumerate() {
+                let block = message[offset..offset + 64].as_chunks::<4>().0;
+
+                for (words, bytes) in words.iter_mut().zip(block) {
+                    words[lane] = u32::from_be_bytes(*bytes);
+                }
+            }
+
+            compress256_lanes(&mut states, &mut words);
+        }
+
+        let mut digests = [[0; 32]; LANES];
+
+        for (lane, digest) in digests.iter_mut().enumerate() {
+            for (bytes, state) in digest.as_chunks_mut::<4>().0.iter_mut().zip(&states) {
+                *bytes = state[lane].to_be_bytes();
+            }
+        }
+
+        wipe(messages.as_flattened_mut());
+
+        wipe(states.as_flattened_mut());
+
+        wipe(words.as_flattened_mut());
+
+        digests
+    }
 }
 
 #[derive(Clone)]
@@ -419,6 +626,46 @@ impl Sha512 {
         for (bytes, word) in out.as_chunks_mut::<8>().0.iter_mut().zip(state) {
             *bytes = word.to_be_bytes();
         }
+
+        wipe(&mut state);
+
+        out
+    }
+
+    // Sha256::finish_lanes for one message.
+    pub(crate) fn finish_message<const SIZE: usize>(
+        &self,
+        message: &mut [u8; SIZE],
+        length: usize,
+    ) -> [u8; 64] {
+        assert_eq!(
+            self.blocks.len, 0,
+            "the shared input must fill whole blocks"
+        );
+
+        let end = (length + 17).next_multiple_of(128);
+
+        let bits = self.length.wrapping_add(length as u128).wrapping_mul(8);
+
+        message[length..end].fill(0);
+
+        message[length] = 0x80;
+
+        message[end - 16..end].copy_from_slice(&bits.to_be_bytes());
+
+        let mut state = self.state;
+
+        for block in message[..end].as_chunks::<128>().0 {
+            compress512(&mut state, block);
+        }
+
+        let mut out = [0; 64];
+
+        for (bytes, word) in out.as_chunks_mut::<8>().0.iter_mut().zip(state) {
+            *bytes = word.to_be_bytes();
+        }
+
+        wipe(message);
 
         wipe(&mut state);
 

@@ -2,8 +2,9 @@ use core::hint::black_box;
 
 use crate::wipe::wipe;
 
-// Field elements modulo p = 2^255 - 19 in five 51-bit limbs. Every operation returns limbs
-// below 2^52, which keeps the 128-bit products of mul and the subtraction below in range.
+// Field elements modulo p = 2^255 - 19 in five 51-bit limbs. mul, square and mul_small carry
+// their results to limbs just above 2^51; add and sub do not carry, and their limbs stay below
+// 2^54, which mul and square accept: their 128-bit sums of products stay below 2^115.
 type Fe = [u64; 5];
 
 const MASK: u64 = (1 << 51) - 1;
@@ -69,11 +70,12 @@ fn carry(mut wide: [u128; 5]) -> Fe {
 }
 
 fn add(a: &Fe, b: &Fe) -> Fe {
-    carry(core::array::from_fn(|i| u128::from(a[i] + b[i])))
+    core::array::from_fn(|i| a[i] + b[i])
 }
 
+// b must be carried, so that adding 2p first keeps every limb from going below zero.
 fn sub(a: &Fe, b: &Fe) -> Fe {
-    carry(core::array::from_fn(|i| u128::from(a[i] + TWO_P[i] - b[i])))
+    core::array::from_fn(|i| a[i] + TWO_P[i] - b[i])
 }
 
 fn mul_small(a: &Fe, k: u64) -> Fe {
@@ -98,8 +100,21 @@ fn mul(a: &Fe, b: &Fe) -> Fe {
     ])
 }
 
+// mul(a, a) with the symmetric products counted once and doubled.
 fn square(a: &Fe) -> Fe {
-    mul(a, a)
+    let m = |x: u64, y: u64| u128::from(x) * u128::from(y);
+
+    let [a0, a1, a2, a3, a4] = *a;
+
+    let (a3_19, a4_19) = (19 * a3, 19 * a4);
+
+    carry([
+        m(a0, a0) + m(2 * a1, a4_19) + m(2 * a2, a3_19),
+        m(2 * a0, a1) + m(2 * a2, a4_19) + m(a3, a3_19),
+        m(2 * a0, a2) + m(a1, a1) + m(2 * a3, a4_19),
+        m(2 * a0, a3) + m(2 * a1, a2) + m(a4, a4_19),
+        m(2 * a0, a4) + m(2 * a1, a3) + m(a2, a2),
+    ])
 }
 
 fn square_times(a: &Fe, count: usize) -> Fe {

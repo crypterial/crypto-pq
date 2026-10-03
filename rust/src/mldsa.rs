@@ -162,15 +162,29 @@ impl Drop for Polys {
     }
 }
 
-const fn montgomery(a: i64) -> i32 {
-    let t = (a as i32).wrapping_mul(QINV);
+const fn high(a: i32, b: i32) -> i32 {
+    ((a as i64 * b as i64) >> 32) as i32
+}
 
-    ((a - t as i64 * Q as i64) >> 32) as i32
+// a * b * 2^-32 mod q in (-q, q), for |a * b| < 2^31 q, given b_qinv = b * q^-1 mod 2^32. The
+// low halves of a * b and of its multiple of q cancel, so only high halves are computed, which
+// the compiler can vectorize.
+const fn montgomery(a: i32, b: i32, b_qinv: i32) -> i32 {
+    high(a, b) - high(a.wrapping_mul(b_qinv), Q)
+}
+
+const fn montgomery_mul(a: i32, b: i32) -> i32 {
+    montgomery(a, b, b.wrapping_mul(QINV))
 }
 
 // (-q, q) to [0, q) with a mask instead of a branch.
 const fn freeze(a: i32) -> i32 {
     a + (Q & (a >> 31))
+}
+
+// |a| < 2^31 - 2^22 to a representative of absolute value below q, without a division.
+const fn reduce(a: i32) -> i32 {
+    a - ((a + (1 << 22)) >> 23) * Q
 }
 
 const fn add(a: i32, b: i32) -> i32 {
@@ -182,14 +196,12 @@ const fn sub(a: i32, b: i32) -> i32 {
 }
 
 const fn mul(a: i32, b: i32) -> i32 {
-    freeze(montgomery(
-        montgomery(a as i64 * b as i64) as i64 * R2 as i64,
-    ))
+    freeze(montgomery_mul(montgomery_mul(a, b), R2))
 }
 
-const fn mul_zeta(zeta: i32, a: i32) -> i32 {
-    freeze(montgomery(zeta as i64 * a as i64))
-}
+// 2^64 / 256 mod q: one Montgomery reduction against it removes the 2^-32 that the pointwise
+// products carry and divides by the 256 of the transform.
+const INVERSE_SCALE: i32 = mul(R2, 8347681);
 
 // A coefficient in (-q, q) to [0, q).
 const fn canonical(a: i32) -> i32 {
@@ -201,6 +213,8 @@ const fn centered(a: i32) -> i32 {
     a - (Q & (((Q - 1) / 2 - a) >> 31))
 }
 
+// Inputs of absolute value below q; the butterflies reduce only their products, so the outputs
+// stay below 9q in absolute value.
 fn ntt(w: &mut Poly) {
     let mut m = 0;
 
@@ -210,14 +224,18 @@ fn ntt(w: &mut Poly) {
         for start in (0..256).step_by(2 * length) {
             m += 1;
 
-            let zeta = ZETAS[m];
+            let zeta = centered(ZETAS[m]);
 
-            for j in start..start + length {
-                let t = mul_zeta(zeta, w[j + length]);
+            let zeta_qinv = zeta.wrapping_mul(QINV);
 
-                w[j + length] = sub(w[j], t);
+            let (low, high) = w[start..start + 2 * length].split_at_mut(length);
 
-                w[j] = add(w[j], t);
+            for (a, b) in low.iter_mut().zip(high) {
+                let t = montgomery(*b, zeta, zeta_qinv);
+
+                *b = *a - t;
+
+                *a += t;
             }
         }
 
@@ -225,7 +243,14 @@ fn ntt(w: &mut Poly) {
     }
 }
 
+// Inverts ntt on sums of pointwise products (see INVERSE_SCALE) and returns coefficients in
+// [0, q). The input is first brought below q in absolute value, so the sums of the butterflies
+// stay below 256q.
 fn inverse_ntt(w: &mut Poly) {
+    for x in w.iter_mut() {
+        *x = reduce(*x);
+    }
+
     let mut m = 256;
 
     let mut length = 1;
@@ -234,34 +259,40 @@ fn inverse_ntt(w: &mut Poly) {
         for start in (0..256).step_by(2 * length) {
             m -= 1;
 
-            let zeta = Q - ZETAS[m];
+            let zeta = -centered(ZETAS[m]);
 
-            for j in start..start + length {
-                let t = w[j];
+            let zeta_qinv = zeta.wrapping_mul(QINV);
 
-                w[j] = add(t, w[j + length]);
+            let (low, high) = w[start..start + 2 * length].split_at_mut(length);
 
-                w[j + length] = mul_zeta(zeta, sub(t, w[j + length]));
+            for (a, b) in low.iter_mut().zip(high) {
+                let t = *a;
+
+                *a = t + *b;
+
+                *b = montgomery(t - *b, zeta, zeta_qinv);
             }
         }
 
         length *= 2;
     }
 
-    // 8347681 = 256^-1 mod q.
+    let scale_qinv = INVERSE_SCALE.wrapping_mul(QINV);
+
     for x in w.iter_mut() {
-        *x = mul(*x, 8347681);
+        *x = freeze(montgomery(*x, INVERSE_SCALE, scale_qinv));
     }
 }
 
+// acc += f * g * 2^-32 coefficient-wise, for outputs of ntt; inverse_ntt reduces the sums.
 fn multiply_add(acc: &mut Poly, f: &Poly, g: &Poly) {
     for ((x, a), b) in acc.iter_mut().zip(f).zip(g) {
-        *x = add(*x, mul(*a, *b));
+        *x += montgomery_mul(*a, *b);
     }
 }
 
 fn pointwise(f: &Poly, g: &Poly) -> Poly {
-    core::array::from_fn(|i| mul(f[i], g[i]))
+    core::array::from_fn(|i| montgomery_mul(f[i], g[i]))
 }
 
 // Branch-free FIPS 204 Algorithm 36 for r in [0, q): (r1, r0) with r0 centered.
@@ -319,51 +350,78 @@ fn reaches(values: impl IntoIterator<Item = i32>, bound: i32) -> i32 {
 }
 
 fn pack(out: &mut [u8], bits: u32, values: impl IntoIterator<Item = i32>) {
-    let mut buffer = 0u64;
+    let mut poly = [0; 256];
 
-    let mut filled = 0;
+    for (x, value) in poly.iter_mut().zip(values) {
+        *x = value;
+    }
 
-    let mut position = 0;
+    match bits {
+        3 => pack_bits::<3>(out, &poly),
+        4 => pack_bits::<4>(out, &poly),
+        6 => pack_bits::<6>(out, &poly),
+        10 => pack_bits::<10>(out, &poly),
+        13 => pack_bits::<13>(out, &poly),
+        18 => pack_bits::<18>(out, &poly),
+        20 => pack_bits::<20>(out, &poly),
+        _ => unreachable!("no ML-DSA encoding uses {bits} bits"),
+    }
 
-    for value in values {
-        buffer |= u64::from(value as u32) << filled;
+    wipe(&mut poly);
+}
 
-        filled += bits;
+fn unpack(data: &[u8], bits: u32) -> Poly {
+    match bits {
+        3 => unpack_bits::<3>(data),
+        4 => unpack_bits::<4>(data),
+        6 => unpack_bits::<6>(data),
+        10 => unpack_bits::<10>(data),
+        13 => unpack_bits::<13>(data),
+        18 => unpack_bits::<18>(data),
+        20 => unpack_bits::<20>(data),
+        _ => unreachable!("no ML-DSA encoding uses {bits} bits"),
+    }
+}
 
-        while filled >= 8 {
-            out[position] = buffer as u8;
+// Values move in groups that fill whole bytes and fit 128 bits, eight of them or four above 16
+// bits, so that every shift is a constant.
+const fn group_size(bits: usize) -> usize {
+    if bits <= 16 { 8 } else { 4 }
+}
 
-            buffer >>= 8;
+fn pack_bits<const BITS: usize>(out: &mut [u8], values: &Poly) {
+    let size = group_size(BITS);
 
-            filled -= 8;
+    for (bytes, group) in out
+        .chunks_exact_mut(BITS * size / 8)
+        .zip(values.chunks_exact(size))
+    {
+        let word = group.iter().enumerate().fold(0u128, |word, (i, &value)| {
+            word | (u128::from(value as u32) << (BITS * i))
+        });
 
-            position += 1;
+        for (j, byte) in bytes.iter_mut().enumerate() {
+            *byte = (word >> (8 * j)) as u8;
         }
     }
 }
 
-fn unpack(data: &[u8], bits: u32) -> Poly {
+fn unpack_bits<const BITS: usize>(data: &[u8]) -> Poly {
+    let size = group_size(BITS);
+
     let mut values = [0; 256];
 
-    let mut buffer = 0u64;
+    for (group, bytes) in values
+        .chunks_exact_mut(size)
+        .zip(data.chunks_exact(BITS * size / 8))
+    {
+        let word = bytes
+            .iter()
+            .rev()
+            .fold(0u128, |word, &byte| (word << 8) | u128::from(byte));
 
-    let mut filled = 0;
-
-    let mut index = 0;
-
-    for &byte in data {
-        buffer |= u64::from(byte) << filled;
-
-        filled += 8;
-
-        while filled >= bits {
-            values[index] = (buffer & ((1 << bits) - 1)) as i32;
-
-            buffer >>= bits;
-
-            filled -= bits;
-
-            index += 1;
+        for (i, value) in group.iter_mut().enumerate() {
+            *value = (word >> (BITS * i)) as i32 & ((1 << BITS) - 1);
         }
     }
 
@@ -398,8 +456,9 @@ fn rej_ntt_poly(rho: &[u8], s: usize, r: usize) -> Poly {
     a
 }
 
-// The rejection decisions branch, as FIPS 204 allows; the accepted values are computed without
-// a division (205 * x >> 10 = x / 5 for x < 15).
+// The rejection decisions are variable time, as FIPS 204 allows, but no branch depends on a
+// candidate: each one is written and only an accepted one advances the count. The accepted values
+// are computed without a division (205 * x >> 10 = x / 5 for x < 15).
 fn rej_bounded_poly(seed: &[u8], r: usize, eta: i32) -> Poly {
     let mut stream = shake256(&[seed, &(r as u16).to_le_bytes()]);
 
@@ -409,20 +468,24 @@ fn rej_bounded_poly(seed: &[u8], r: usize, eta: i32) -> Poly {
 
     let mut block = [0u8; 136];
 
-    while count < 256 {
+    'blocks: while count < 256 {
         stream.read(&mut block);
 
         for half in block.iter().flat_map(|&byte| [byte & 0x0F, byte >> 4]) {
             let half = i32::from(half);
 
-            if count < 256 && eta == 2 && half < 15 {
-                a[count] = 2 - (half - 5 * ((205 * half) >> 10));
+            let (value, accepted) = if eta == 2 {
+                (2 - (half - 5 * ((205 * half) >> 10)), half < 15)
+            } else {
+                (4 - half, half < 9)
+            };
 
-                count += 1;
-            } else if count < 256 && eta == 4 && half < 9 {
-                a[count] = 4 - half;
+            a[count] = value;
 
-                count += 1;
+            count += usize::from(accepted);
+
+            if count == 256 {
+                break 'blocks;
             }
         }
     }
@@ -961,7 +1024,7 @@ pub(crate) fn verify_internal(pk: &[u8], message: &[&[u8]], sig: &[u8], p: &Para
 
         ntt(&mut t1);
 
-        *w_i = pointwise(&c_hat, &t1).map(|x| sub(0, x));
+        *w_i = pointwise(&c_hat, &t1).map(|x| -x);
 
         for (j, z_j) in z.iter().enumerate() {
             multiply_add(w_i, &a[i * p.l + j], z_j);
