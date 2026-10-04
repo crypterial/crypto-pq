@@ -1,6 +1,7 @@
 package cryptopq_test
 
 import (
+	"bytes"
 	"os"
 	"strconv"
 	"testing"
@@ -10,6 +11,12 @@ import (
 
 func x25519(scalar, u []byte) []byte {
 	out := cryptopq.X25519(scalar, u)
+
+	return out[:]
+}
+
+func x25519Base(scalar []byte) []byte {
+	out := cryptopq.X25519Base(scalar)
 
 	return out[:]
 }
@@ -52,6 +59,10 @@ func TestX25519Rfc7748(t *testing.T) {
 
 			same(t, x25519(bob, base), bobPublic, "bob")
 
+			same(t, x25519Base(alice), alicePublic, "alice, fixed base")
+
+			same(t, x25519Base(bob), bobPublic, "bob, fixed base")
+
 			same(t, x25519(alice, bobPublic), shared, "alice shared")
 
 			same(t, x25519(bob, alicePublic), shared, "bob shared")
@@ -69,5 +80,44 @@ func TestX25519Wycheproof(t *testing.T) {
 		got := x25519(decode(t, r.values["private"]), decode(t, r.values["public"]))
 
 		same(t, got, decode(t, r.values["shared"]), "tcId "+r.values["tcId"])
+	}
+}
+
+// The fixed-base multiplication must give the ladder's result from u = 9 for every scalar: here
+// repeated bytes and single bits, which give runs of extreme and zero digits, the Wycheproof private
+// keys and pseudorandom scalars.
+func TestX25519Base(t *testing.T) {
+	t.Parallel()
+
+	base := make([]byte, 32)
+
+	base[0] = 9
+
+	var scalars [][]byte
+
+	for _, fill := range []byte{0x00, 0xff, 0x88, 0x77, 0x80, 0x08, 0xf0, 0x0f, 0x7f, 0xf7} {
+		scalars = append(scalars, bytes.Repeat([]byte{fill}, 32))
+	}
+
+	for bit := range 256 {
+		scalar := make([]byte, 32)
+
+		scalar[bit/8] = 1 << (bit % 8)
+
+		scalars = append(scalars, scalar)
+	}
+
+	for _, r := range records(t, "wycheproof/x25519.txt", "tcId") {
+		scalars = append(scalars, decode(t, r.values["private"]))
+	}
+
+	stream := cryptopq.SHAKE256.Digest([]byte("crypto-pq fixed-base X25519"), 32*2000)
+
+	for i := 0; i < len(stream); i += 32 {
+		scalars = append(scalars, stream[i:i+32])
+	}
+
+	for i, scalar := range scalars {
+		same(t, x25519Base(scalar), x25519(scalar, base), "scalar "+strconv.Itoa(i))
 	}
 }

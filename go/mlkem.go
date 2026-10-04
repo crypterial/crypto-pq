@@ -1,6 +1,9 @@
 package cryptopq
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"sync"
+)
 
 // ML-KEM (FIPS 203). Coefficients are canonical, in [0, q), except inside the NTTs, which reduce
 // lazily. Every reduction is a multiply-shift or a masked subtraction, so no branch or memory index
@@ -224,16 +227,30 @@ func kemInverseNTT(f *kemPoly) {
 	}
 }
 
-// acc += f * g in the NTT domain (FIPS 203, Algorithms 11 and 12) for canonical f and g, without the
-// final reduction: a product adds less than 2q^2 to a coefficient, so a canonical start plus k <= 4
+// A polynomial in the NTT domain prepared as the fixed factor of kemMultiplyAdd: odd[i] holds
+// f[2i + 1] gamma_i mod q, which the base case would otherwise reduce at every use. Key material
+// that is multiplied again and again is kept in this form.
+type kemFactor struct {
+	f   kemPoly
+	odd [128]uint16
+}
+
+func (f *kemFactor) prepare() {
+	for i := range f.odd {
+		f.odd[i] = kemReduce(uint32(f.f[2*i+1]) * uint32(kemGammas[i]))
+	}
+}
+
+// acc += f * g in the NTT domain (FIPS 203, Algorithms 11 and 12) for canonical f and g, without any
+// reduction: a product adds less than 2q^2 to a coefficient, so a canonical start plus k <= 4
 // products stays far below 2^32.
-func kemMultiplyAdd(acc *[256]uint32, f, g *kemPoly) {
-	for i := range 128 {
-		a0, a1 := uint32(f[2*i]), uint32(f[2*i+1])
+func kemMultiplyAdd(acc *[256]uint32, f *kemFactor, g *kemPoly) {
+	for i := range f.odd {
+		a0, a1, odd := uint32(f.f[2*i]), uint32(f.f[2*i+1]), uint32(f.odd[i])
 
 		b0, b1 := uint32(g[2*i]), uint32(g[2*i+1])
 
-		acc[2*i] += a0*b0 + uint32(kemReduce(a1*b1))*uint32(kemGammas[i])
+		acc[2*i] += a0*b0 + odd*b1
 
 		acc[2*i+1] += a0*b1 + a1*b0
 	}
@@ -414,12 +431,16 @@ func kpkeKeyGen(p *mlkemParams, d, ek, dkPKE []byte) {
 
 	rho, sigma := g[:32], g[32:]
 
-	var s, e [4]kemPoly
+	var s [4]kemFactor
+
+	var e [4]kemPoly
 
 	for n := range k {
-		kemNoise(&s[n], sigma, byte(n), p.eta1)
+		kemNoise(&s[n].f, sigma, byte(n), p.eta1)
 
-		kemNTT(&s[n])
+		kemNTT(&s[n].f)
+
+		s[n].prepare()
 	}
 
 	for n := range k {
@@ -440,7 +461,7 @@ func kpkeKeyGen(p *mlkemParams, d, ek, dkPKE []byte) {
 		for j := range k {
 			kemSampleNTT(&a, rho, byte(j), byte(i))
 
-			kemMultiplyAdd(&acc, &a, &s[j])
+			kemMultiplyAdd(&acc, &s[j], &a)
 		}
 
 		kemReduceAll(&a, &acc)
@@ -451,7 +472,7 @@ func kpkeKeyGen(p *mlkemParams, d, ek, dkPKE []byte) {
 	copy(ek[384*k:], rho)
 
 	for i := range k {
-		kemEncode12(dkPKE[384*i:], &s[i])
+		kemEncode12(dkPKE[384*i:], &s[i].f)
 	}
 
 	clear(g[:])
@@ -461,15 +482,81 @@ func kpkeKeyGen(p *mlkemParams, d, ek, dkPKE []byte) {
 	clear(e[:])
 }
 
-// K-PKE.Encrypt (FIPS 203, Algorithm 14), with the transposed matrix sampled entry by entry.
-func kpkeEncrypt(p *mlkemParams, ek, m, r, c []byte) {
-	k, du, dv := p.k, p.du, p.dv
+// What encapsulation derives from an encapsulation key, kept by the key: H(ek), set when the key is
+// made, and the prepared factors of Â in the NTT domain, entry i*k + j holding A[i][j] =
+// SampleNTT(rho || j || i), and of the decoded vector t̂, computed on first use. A private key shares
+// it with the public keys it returns.
+type mlkemPublic struct {
+	h    [32]byte
+	once sync.Once
+	a    []kemFactor
+	t    []kemFactor
+}
 
-	rho := ek[384*k : 384*k+32]
+func newMlkemPublic(h []byte) *mlkemPublic {
+	c := &mlkemPublic{}
+
+	copy(c.h[:], h)
+
+	return c
+}
+
+// Computes Â and t̂ of ek, which passes mlkemCheckEncapsulationKey, unless already done.
+func (c *mlkemPublic) expand(p *mlkemParams, ek []byte) *mlkemPublic {
+	c.once.Do(func() {
+		k := p.k
+
+		factors := make([]kemFactor, k*k+k)
+
+		c.a, c.t = factors[:k*k], factors[k*k:]
+
+		for i := range k {
+			for j := range k {
+				kemSampleNTT(&c.a[i*k+j].f, ek[384*k:], byte(j), byte(i))
+
+				c.a[i*k+j].prepare()
+			}
+
+			kemDecode12(&c.t[i].f, ek[384*i:])
+
+			c.t[i].prepare()
+		}
+	})
+
+	return c
+}
+
+// ŝ of a private key as prepared factors: decoded from the decapsulation key on first use and wiped
+// with the key.
+type mlkemSecret struct {
+	once sync.Once
+	s    []kemFactor
+}
+
+func (c *mlkemSecret) get(p *mlkemParams, dk []byte) []kemFactor {
+	c.once.Do(func() {
+		s := make([]kemFactor, p.k)
+
+		for i := range s {
+			kemDecode12(&s[i].f, dk[384*i:])
+
+			s[i].prepare()
+		}
+
+		c.s = s
+	})
+
+	return c.s
+}
+
+// K-PKE.Encrypt (FIPS 203, Algorithm 14) with the expanded encapsulation key, whose matrix it reads
+// transposed.
+func kpkeEncrypt(p *mlkemParams, key *mlkemPublic, m, r, c []byte) {
+	k, du, dv := p.k, p.du, p.dv
 
 	var y [4]kemPoly
 
-	var a, e, u kemPoly
+	var e, u kemPoly
 
 	var acc [256]uint32
 
@@ -483,9 +570,7 @@ func kpkeEncrypt(p *mlkemParams, ek, m, r, c []byte) {
 		clear(acc[:])
 
 		for j := range k {
-			kemSampleNTT(&a, rho, byte(i), byte(j))
-
-			kemMultiplyAdd(&acc, &a, &y[j])
+			kemMultiplyAdd(&acc, &key.a[j*k+i], &y[j])
 		}
 
 		kemReduceAll(&u, &acc)
@@ -504,9 +589,7 @@ func kpkeEncrypt(p *mlkemParams, ek, m, r, c []byte) {
 	clear(acc[:])
 
 	for j := range k {
-		kemDecode12(&a, ek[384*j:])
-
-		kemMultiplyAdd(&acc, &a, &y[j])
+		kemMultiplyAdd(&acc, &key.t[j], &y[j])
 	}
 
 	kemReduceAll(&u, &acc)
@@ -536,11 +619,11 @@ func kpkeEncrypt(p *mlkemParams, ek, m, r, c []byte) {
 	clear(acc[:])
 }
 
-// K-PKE.Decrypt (FIPS 203, Algorithm 15).
-func kpkeDecrypt(p *mlkemParams, dkPKE, c, m []byte) {
+// K-PKE.Decrypt (FIPS 203, Algorithm 15) with the decoded ŝ.
+func kpkeDecrypt(p *mlkemParams, sHat []kemFactor, c, m []byte) {
 	k, du, dv := p.k, p.du, p.dv
 
-	var u, s, w kemPoly
+	var u, w kemPoly
 
 	var acc [256]uint32
 
@@ -553,9 +636,7 @@ func kpkeDecrypt(p *mlkemParams, dkPKE, c, m []byte) {
 
 		kemNTT(&u)
 
-		kemDecode12(&s, dkPKE[384*i:])
-
-		kemMultiplyAdd(&acc, &s, &u)
+		kemMultiplyAdd(&acc, &sHat[i], &u)
 	}
 
 	kemReduceAll(&u, &acc)
@@ -569,8 +650,6 @@ func kpkeDecrypt(p *mlkemParams, dkPKE, c, m []byte) {
 	}
 
 	packBits(m, w[:], 1)
-
-	clear(s[:])
 
 	clear(u[:])
 
@@ -597,18 +676,15 @@ func mlkemKeyGen(p *mlkemParams, d, z []byte) (ek, dk []byte) {
 	return ek, dk
 }
 
-func mlkemEncapsulate(p *mlkemParams, ek, m []byte) (sharedSecret, ciphertext []byte) {
-	var h [32]byte
-
+// key holds what the encapsulation key ek derives.
+func mlkemEncapsulate(p *mlkemParams, ek []byte, key *mlkemPublic, m []byte) (sharedSecret, ciphertext []byte) {
 	var g [64]byte
 
-	sha3Sum256(h[:], ek)
-
-	sha3Sum512(g[:], m, h[:])
+	sha3Sum512(g[:], m, key.h[:])
 
 	ciphertext = make([]byte, p.ciphertextSize())
 
-	kpkeEncrypt(p, ek, m, g[32:], ciphertext)
+	kpkeEncrypt(p, key.expand(p, ek), m, g[32:], ciphertext)
 
 	sharedSecret = make([]byte, 32)
 
@@ -620,11 +696,11 @@ func mlkemEncapsulate(p *mlkemParams, ek, m []byte) (sharedSecret, ciphertext []
 }
 
 // Implicit rejection: a ciphertext that does not re-encrypt to itself yields J(z || c), chosen
-// with a mask rather than a branch.
-func mlkemDecapsulate(p *mlkemParams, dk, c []byte) []byte {
+// with a mask rather than a branch. secret and key hold what dk derives.
+func mlkemDecapsulate(p *mlkemParams, dk []byte, secret *mlkemSecret, key *mlkemPublic, c []byte) []byte {
 	k := p.k
 
-	dkPKE, ek, h, z := dk[:384*k], dk[384*k:768*k+32], dk[768*k+32:768*k+64], dk[768*k+64:]
+	ek, h, z := dk[384*k:768*k+32], dk[768*k+32:768*k+64], dk[768*k+64:]
 
 	var m [32]byte
 
@@ -634,13 +710,13 @@ func mlkemDecapsulate(p *mlkemParams, dk, c []byte) []byte {
 
 	var reencrypted [1568]byte
 
-	kpkeDecrypt(p, dkPKE, c, m[:])
+	kpkeDecrypt(p, secret.get(p, dk), c, m[:])
 
 	sha3Sum512(g[:], m[:], h)
 
 	shake256Sum(rejected[:], z, c)
 
-	kpkeEncrypt(p, ek, m[:], g[32:], reencrypted[:len(c)])
+	kpkeEncrypt(p, key.expand(p, ek), m[:], g[32:], reencrypted[:len(c)])
 
 	sharedSecret := make([]byte, 32)
 

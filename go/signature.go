@@ -247,7 +247,7 @@ func (a SignatureAlgorithm) fromSeed(seed []byte) *SignaturePrivateKey {
 	if spec.mldsa != nil {
 		public, private := mldsaKeyGen(spec.mldsa, seed)
 
-		return &SignaturePrivateKey{algorithm: a, seed: seed, private: private, public: public}
+		return &SignaturePrivateKey{algorithm: a, seed: seed, private: private, public: public, cache: newDsaPublic(private[64:128]), secrets: &dsaSecrets{}}
 	}
 
 	n := spec.slh.n
@@ -268,7 +268,7 @@ func (a SignatureAlgorithm) fromExpanded(sk []byte) (*SignaturePrivateKey, error
 		return nil, mismatch("the private key fails the consistency checks")
 	}
 
-	return &SignaturePrivateKey{algorithm: a, private: sk, public: public}, nil
+	return &SignaturePrivateKey{algorithm: a, private: sk, public: public, cache: newDsaPublic(sk[64:128]), secrets: &dsaSecrets{}}, nil
 }
 
 func (a SignatureAlgorithm) fromSlhPrivateKey(sk []byte) (*SignaturePrivateKey, error) {
@@ -294,7 +294,17 @@ func (a SignatureAlgorithm) ImportPublicKey(data []byte, format KeyFormat) (*Sig
 		return nil, err
 	}
 
-	return &SignaturePublicKey{algorithm: a, key: key}, nil
+	public := &SignaturePublicKey{algorithm: a, key: key}
+
+	if spec.mldsa != nil {
+		var tr [64]byte
+
+		shake256Sum(tr[:], key)
+
+		public.cache = newDsaPublic(tr[:])
+	}
+
+	return public, nil
 }
 
 func (a SignatureAlgorithm) ImportPrivateKey(data []byte, format KeyFormat) (*SignaturePrivateKey, error) {
@@ -374,9 +384,11 @@ func (a SignatureAlgorithm) fromSeedChoice(octets []byte) (*SignaturePrivateKey,
 	return key, nil
 }
 
+// cache holds what ML-DSA derives from the key; SLH-DSA keys have none.
 type SignaturePublicKey struct {
 	algorithm SignatureAlgorithm
 	key       []byte
+	cache     *dsaPublic
 }
 
 func (k *SignaturePublicKey) Algorithm() SignatureAlgorithm {
@@ -407,7 +419,7 @@ func (k *SignaturePublicKey) verify(signature, message, context []byte, preHash 
 	representative := messageRepresentative(message, context, entry)
 
 	if spec.mldsa != nil {
-		return mldsaVerify(spec.mldsa, k.key, representative, signature)
+		return mldsaVerify(spec.mldsa, k.key, k.cache, representative, signature)
 	}
 
 	return slhVerify(spec.slh, representative, signature, k.key)
@@ -429,15 +441,23 @@ func (k *SignaturePublicKey) String() string {
 	return "<SignaturePublicKey " + k.algorithm.Name() + ">"
 }
 
+// An ML-DSA key shares cache with its public keys and decodes secrets on first use; SLH-DSA keys
+// have neither.
 type SignaturePrivateKey struct {
 	algorithm SignatureAlgorithm
 	seed      []byte
 	private   []byte
 	public    []byte
+	cache     *dsaPublic
+	secrets   *dsaSecrets
 }
 
 func (k *SignaturePrivateKey) protect() *SignaturePrivateKey {
 	wipeWhenUnreachable(k, k.seed, k.private)
+
+	if k.secrets != nil {
+		runtime.AddCleanup(k, func(secrets *dsaSecrets) { clear(secrets.polys) }, k.secrets)
+	}
 
 	return k
 }
@@ -446,6 +466,10 @@ func (k *SignaturePrivateKey) wipe() {
 	clear(k.seed)
 
 	clear(k.private)
+
+	if k.secrets != nil {
+		clear(k.secrets.polys)
+	}
 }
 
 func (k *SignaturePrivateKey) Algorithm() SignatureAlgorithm {
@@ -453,7 +477,7 @@ func (k *SignaturePrivateKey) Algorithm() SignatureAlgorithm {
 }
 
 func (k *SignaturePrivateKey) PublicKey() *SignaturePublicKey {
-	return &SignaturePublicKey{algorithm: k.algorithm, key: k.public}
+	return &SignaturePublicKey{algorithm: k.algorithm, key: k.public, cache: k.cache}
 }
 
 // deterministic: ML-DSA signs with rnd = 32 zero bytes and SLH-DSA with opt_rand = PK.seed.
@@ -509,8 +533,10 @@ func (k *SignaturePrivateKey) sign(message, randomness, context []byte, preHash 
 
 	representative := messageRepresentative(message, context, entry)
 
-	if spec.mldsa != nil {
-		return mldsaSign(spec.mldsa, k.private, representative, randomness), nil
+	if p := spec.mldsa; p != nil {
+		a, secrets := k.cache.matrix(p, k.public[:32]), k.secrets.get(p, k.private)
+
+		return mldsaSign(p, k.private, a, secrets, representative, randomness), nil
 	}
 
 	return slhSign(spec.slh, representative, k.private, randomness), nil

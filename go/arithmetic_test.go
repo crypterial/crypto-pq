@@ -1,6 +1,10 @@
 package cryptopq
 
-import "testing"
+import (
+	"math/big"
+	"slices"
+	"testing"
+)
 
 // The multiply-shift reductions are checked against plain division, exhaustively where the input
 // range allows it and on the edges and a dense sample elsewhere.
@@ -249,6 +253,85 @@ func TestNTTBounds(t *testing.T) {
 			if v != w {
 				t.Fatalf("ML-DSA input %d, inverse %v: transforms differ", n, inverse)
 			}
+		}
+	}
+}
+
+// Every entry of the fixed-base X25519 table against (j + 1) 256^i B in affine coordinates with
+// math/big, from B = (x, 4/5) with x the even square root of (y^2 - 1) / (d y^2 + 1), where d is
+// -121665 / 121666 (RFC 8032, 5.1).
+func TestEdwardsTable(t *testing.T) {
+	p := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 255), big.NewInt(19))
+
+	product := func(factors ...*big.Int) *big.Int {
+		out := big.NewInt(1)
+
+		for _, factor := range factors {
+			out.Mod(out.Mul(out, factor), p)
+		}
+
+		return out
+	}
+
+	inverse := func(v *big.Int) *big.Int {
+		return new(big.Int).ModInverse(new(big.Int).Mod(v, p), p)
+	}
+
+	one := big.NewInt(1)
+
+	d := product(big.NewInt(-121665), inverse(big.NewInt(121666)))
+
+	sum := func(a, b [2]*big.Int) [2]*big.Int {
+		c := product(d, a[0], a[1], b[0], b[1])
+
+		x := product(new(big.Int).Add(product(a[0], b[1]), product(a[1], b[0])), inverse(new(big.Int).Add(one, c)))
+
+		y := product(new(big.Int).Add(product(a[1], b[1]), product(a[0], b[0])), inverse(new(big.Int).Sub(one, c)))
+
+		return [2]*big.Int{x, y}
+	}
+
+	y := product(big.NewInt(4), inverse(big.NewInt(5)))
+
+	square := product(new(big.Int).Sub(product(y, y), one), inverse(new(big.Int).Add(product(d, y, y), one)))
+
+	x := new(big.Int).ModSqrt(square, p)
+
+	if x.Bit(0) == 1 {
+		x.Sub(p, x)
+	}
+
+	field := func(v fieldElement) *big.Int {
+		encoded := v.bytes()
+
+		slices.Reverse(encoded[:])
+
+		return new(big.Int).SetBytes(encoded[:])
+	}
+
+	row := [2]*big.Int{x, y}
+
+	for i, entries := range edwardsTable() {
+		multiple := row
+
+		for j, entry := range entries {
+			want := []*big.Int{
+				new(big.Int).Mod(new(big.Int).Add(multiple[1], multiple[0]), p),
+				new(big.Int).Mod(new(big.Int).Sub(multiple[1], multiple[0]), p),
+				product(big.NewInt(2), d, multiple[0], multiple[1]),
+			}
+
+			for n, got := range []fieldElement{entry.yPlusX, entry.yMinusX, entry.xy2d} {
+				if field(got).Cmp(want[n]) != 0 {
+					t.Fatalf("entry [%d][%d] differs from %d * 256^%d B", i, j, j+1, i)
+				}
+			}
+
+			multiple = sum(multiple, row)
+		}
+
+		for range 8 {
+			row = sum(row, row)
 		}
 	}
 }

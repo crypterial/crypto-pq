@@ -124,13 +124,17 @@ func (a KemAlgorithm) GenerateKeyPair(options *KeyGenOptions) (*KemKeyPair, erro
 func (a KemAlgorithm) fromSeed(seed []byte) *KemPrivateKey {
 	key := &KemPrivateKey{algorithm: a, seed: seed}
 
-	if params := a.spec().params; params != nil {
+	params := a.spec().params
+
+	if params != nil {
 		key.public, key.dk = mlkemKeyGen(params, seed[:32], seed[32:])
 	} else {
+		params = &mlkem768
+
 		key.public, key.dk, key.scalar, key.point = xwingExpand(seed)
 	}
 
-	return key
+	return key.withCaches(params)
 }
 
 func (a KemAlgorithm) fromExpanded(dk []byte) (*KemPrivateKey, error) {
@@ -142,7 +146,7 @@ func (a KemAlgorithm) fromExpanded(dk []byte) (*KemPrivateKey, error) {
 
 	public := bytes.Clone(dk[384*params.k : 768*params.k+32])
 
-	return &KemPrivateKey{algorithm: a, dk: dk, public: public}, nil
+	return (&KemPrivateKey{algorithm: a, dk: dk, public: public}).withCaches(params), nil
 }
 
 func (s *kemSpec) validPublicKey(key []byte) bool {
@@ -151,6 +155,19 @@ func (s *kemSpec) validPublicKey(key []byte) bool {
 	}
 
 	return xwingCheckPublicKey(key)
+}
+
+// The cache of a public key, with H(ek) of its ML-KEM part for X-Wing.
+func (s *kemSpec) cache(key []byte) *mlkemPublic {
+	if s.params == nil {
+		key = key[:xwingMlkemSize]
+	}
+
+	var h [32]byte
+
+	sha3Sum256(h[:], key)
+
+	return newMlkemPublic(h[:])
 }
 
 func (a KemAlgorithm) ImportPublicKey(data []byte, format KeyFormat) (*KemPublicKey, error) {
@@ -166,7 +183,7 @@ func (a KemAlgorithm) ImportPublicKey(data []byte, format KeyFormat) (*KemPublic
 		return nil, newError(INVALID_PUBLIC_KEY, "the public key fails the encoding checks")
 	}
 
-	return &KemPublicKey{algorithm: a, key: key}, nil
+	return &KemPublicKey{algorithm: a, key: key, cache: spec.cache(key)}, nil
 }
 
 func (a KemAlgorithm) ImportPrivateKey(data []byte, format KeyFormat) (*KemPrivateKey, error) {
@@ -235,6 +252,7 @@ func (a KemAlgorithm) fromSeedChoice(octets []byte) (*KemPrivateKey, error) {
 type KemPublicKey struct {
 	algorithm KemAlgorithm
 	key       []byte
+	cache     *mlkemPublic
 }
 
 func (k *KemPublicKey) Algorithm() KemAlgorithm {
@@ -257,9 +275,9 @@ func (k *KemPublicKey) encapsulate(randomness []byte) *Encapsulation {
 	var sharedSecret, ciphertext []byte
 
 	if params := k.algorithm.spec().params; params != nil {
-		sharedSecret, ciphertext = mlkemEncapsulate(params, k.key, randomness)
+		sharedSecret, ciphertext = mlkemEncapsulate(params, k.key, k.cache, randomness)
 	} else {
-		sharedSecret, ciphertext = xwingEncapsulate(k.key, randomness)
+		sharedSecret, ciphertext = xwingEncapsulate(k.key, k.cache, randomness)
 	}
 
 	return &Encapsulation{SharedSecret: sharedSecret, Ciphertext: ciphertext}
@@ -281,6 +299,8 @@ func (k *KemPublicKey) String() string {
 	return "<KemPublicKey " + k.algorithm.Name() + ">"
 }
 
+// cache and secret hold what the key derives from dk, the ML-KEM-768 key for X-Wing; cache is shared
+// with the public keys it returns.
 type KemPrivateKey struct {
 	algorithm KemAlgorithm
 	seed      []byte
@@ -288,10 +308,21 @@ type KemPrivateKey struct {
 	scalar    []byte
 	point     []byte
 	public    []byte
+	cache     *mlkemPublic
+	secret    *mlkemSecret
+}
+
+// The decapsulation key holds H(ek).
+func (k *KemPrivateKey) withCaches(params *mlkemParams) *KemPrivateKey {
+	k.cache, k.secret = newMlkemPublic(k.dk[768*params.k+32:768*params.k+64]), &mlkemSecret{}
+
+	return k
 }
 
 func (k *KemPrivateKey) protect() *KemPrivateKey {
 	wipeWhenUnreachable(k, k.seed, k.dk, k.scalar)
+
+	runtime.AddCleanup(k, func(secret *mlkemSecret) { clear(secret.s) }, k.secret)
 
 	return k
 }
@@ -302,6 +333,8 @@ func (k *KemPrivateKey) wipe() {
 	clear(k.dk)
 
 	clear(k.scalar)
+
+	clear(k.secret.s)
 }
 
 func (k *KemPrivateKey) Algorithm() KemAlgorithm {
@@ -309,7 +342,7 @@ func (k *KemPrivateKey) Algorithm() KemAlgorithm {
 }
 
 func (k *KemPrivateKey) PublicKey() *KemPublicKey {
-	return &KemPublicKey{algorithm: k.algorithm, key: k.public}
+	return &KemPublicKey{algorithm: k.algorithm, key: k.public, cache: k.cache}
 }
 
 func (k *KemPrivateKey) Decapsulate(ciphertext []byte) ([]byte, error) {
@@ -322,10 +355,10 @@ func (k *KemPrivateKey) Decapsulate(ciphertext []byte) ([]byte, error) {
 	}
 
 	if spec.params != nil {
-		return mlkemDecapsulate(spec.params, k.dk, ciphertext), nil
+		return mlkemDecapsulate(spec.params, k.dk, k.secret, k.cache, ciphertext), nil
 	}
 
-	return xwingDecapsulate(k.dk, k.scalar, k.point, ciphertext), nil
+	return xwingDecapsulate(k.dk, k.secret, k.cache, k.scalar, k.point, ciphertext), nil
 }
 
 func (k *KemPrivateKey) ExportKey(format KeyFormat) ([]byte, error) {

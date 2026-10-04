@@ -5,6 +5,7 @@ package cryptopq
 const (
 	xwingPublicKeySize  = 1216
 	xwingCiphertextSize = 1120
+	xwingMlkemSize      = 1184
 	xwingLabel          = `\.//^\`
 )
 
@@ -22,7 +23,7 @@ func xwingExpand(seed []byte) (public, dk, scalar, point []byte) {
 
 	clear(expanded[:])
 
-	base := x25519(scalar, x25519Base[:])
+	base := x25519Base(scalar)
 
 	point = base[:]
 
@@ -38,15 +39,16 @@ func xwingCombine(ssM, ssX, ctX, pkX []byte) []byte {
 }
 
 func xwingCheckPublicKey(pk []byte) bool {
-	return len(pk) == xwingPublicKeySize && mlkemCheckEncapsulationKey(&mlkem768, pk[:1184])
+	return len(pk) == xwingPublicKeySize && mlkemCheckEncapsulationKey(&mlkem768, pk[:xwingMlkemSize])
 }
 
-func xwingEncapsulate(pk, eseed []byte) (sharedSecret, ciphertext []byte) {
-	pkM, pkX := pk[:1184], pk[1184:]
+// key holds what the ML-KEM part of pk derives.
+func xwingEncapsulate(pk []byte, key *mlkemPublic, eseed []byte) (sharedSecret, ciphertext []byte) {
+	pkM, pkX := pk[:xwingMlkemSize], pk[xwingMlkemSize:]
 
-	ssM, ctM := mlkemEncapsulate(&mlkem768, pkM, eseed[:32])
+	ssM, ctM := mlkemEncapsulate(&mlkem768, pkM, key, eseed[:32])
 
-	ctX := x25519(eseed[32:], x25519Base[:])
+	ctX := x25519Base(eseed[32:])
 
 	ssX := x25519(eseed[32:], pkX)
 
@@ -59,10 +61,10 @@ func xwingEncapsulate(pk, eseed []byte) (sharedSecret, ciphertext []byte) {
 	return sharedSecret, append(ctM, ctX[:]...)
 }
 
-func xwingDecapsulate(dk, scalar, point, ciphertext []byte) []byte {
+func xwingDecapsulate(dk []byte, secret *mlkemSecret, key *mlkemPublic, scalar, point, ciphertext []byte) []byte {
 	ctM, ctX := ciphertext[:1088], ciphertext[1088:]
 
-	ssM := mlkemDecapsulate(&mlkem768, dk, ctM)
+	ssM := mlkemDecapsulate(&mlkem768, dk, secret, key, ctM)
 
 	ssX := x25519(scalar, ctX)
 

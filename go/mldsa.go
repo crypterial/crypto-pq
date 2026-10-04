@@ -3,6 +3,7 @@ package cryptopq
 import (
 	"encoding/binary"
 	"math/bits"
+	"sync"
 )
 
 // ML-DSA (FIPS 204). Coefficients stay in [0, q); products are reduced with a Barrett estimate
@@ -370,8 +371,7 @@ func dsaSampleBounded(f *dsaPoly, seed []byte, eta int) {
 	clear(sponge.state[:])
 }
 
-// Entry r * l + s is A[r][s] = RejNTTPoly(rho || s || r). Only signing, which reuses the matrix
-// in every attempt, stores it; elsewhere each row is folded into the result as it is sampled.
+// Entry r * l + s is A[r][s] = RejNTTPoly(rho || s || r).
 func dsaExpandA(a []dsaPoly, rho []byte, p *mldsaParams) {
 	for r := range p.k {
 		for s := range p.l {
@@ -531,6 +531,77 @@ func dsaPublicT(t []dsaPoly, rho []byte, s1Hat, s2 []dsaPoly, p *mldsaParams) {
 	}
 
 	clear(acc[:])
+}
+
+// What verification and signing derive from a public key, kept by the key: tr = H(pk, 64), set when
+// the key is made, and computed on first use Â in the NTT domain and t̂1 = NTT(t1 2^d), which only
+// verification reads. A private key shares it with the public keys it returns.
+type dsaPublic struct {
+	tr     [64]byte
+	once   sync.Once
+	a      []dsaPoly
+	t1Once sync.Once
+	t1     []dsaPoly
+}
+
+func newDsaPublic(tr []byte) *dsaPublic {
+	c := &dsaPublic{}
+
+	copy(c.tr[:], tr)
+
+	return c
+}
+
+func (c *dsaPublic) matrix(p *mldsaParams, rho []byte) []dsaPoly {
+	c.once.Do(func() {
+		c.a = make([]dsaPoly, p.k*p.l)
+
+		dsaExpandA(c.a, rho, p)
+	})
+
+	return c.a
+}
+
+func (c *dsaPublic) t1Hat(p *mldsaParams, pk []byte) []dsaPoly {
+	c.t1Once.Do(func() {
+		t1 := make([]dsaPoly, p.k)
+
+		for i := range t1 {
+			unpackBits(t1[i][:], pk[32+320*i:32+320*(i+1)], 10)
+
+			for x := range t1[i] {
+				t1[i][x] <<= dsaD
+			}
+
+			dsaNTT(&t1[i])
+		}
+
+		c.t1 = t1
+	})
+
+	return c.t1
+}
+
+// ŝ1, ŝ2 and t̂0 of a private key, in one slice: decoded on first use and wiped with the key.
+type dsaSecrets struct {
+	once  sync.Once
+	polys []dsaPoly
+}
+
+func (c *dsaSecrets) get(p *mldsaParams, sk []byte) []dsaPoly {
+	c.once.Do(func() {
+		polys := make([]dsaPoly, p.l+2*p.k)
+
+		dsaDecodePrivateKey(polys[:p.l+p.k], polys[p.l+p.k:], sk, p)
+
+		for i := range polys {
+			dsaNTT(&polys[i])
+		}
+
+		c.polys = polys
+	})
+
+	return c.polys
 }
 
 func dsaEncodePublicKey(rho []byte, t []dsaPoly, p *mldsaParams) []byte {
@@ -711,26 +782,11 @@ func mldsaCheckPrivateKey(p *mldsaParams, sk []byte) []byte {
 	return pk
 }
 
-func mldsaSign(p *mldsaParams, sk, message, rnd []byte) []byte {
+// a is Â and secrets holds ŝ1, ŝ2 and t̂0, which the key keeps.
+func mldsaSign(p *mldsaParams, sk []byte, a, secrets []dsaPoly, message, rnd []byte) []byte {
 	k, l := p.k, p.l
 
-	s, t0 := make([]dsaPoly, l+k, dsaMaxL+dsaMaxK), make([]dsaPoly, k, dsaMaxK)
-
-	dsaDecodePrivateKey(s, t0, sk, p)
-
-	for i := range s {
-		dsaNTT(&s[i])
-	}
-
-	for i := range t0 {
-		dsaNTT(&t0[i])
-	}
-
-	s1Hat, s2Hat := s[:l], s[l:]
-
-	a := make([]dsaPoly, k*l, dsaMaxK*dsaMaxL)
-
-	dsaExpandA(a, sk[:32], p)
+	s1Hat, s2Hat, t0 := secrets[:l], secrets[l:l+k], secrets[l+k:]
 
 	var mu, rhoPrime [64]byte
 
@@ -849,10 +905,6 @@ func mldsaSign(p *mldsaParams, sk, message, rnd []byte) []byte {
 
 		dsaPackHints(signature[offset:], hints, p)
 
-		clear(s)
-
-		clear(t0)
-
 		clear(y)
 
 		clear(yHat)
@@ -916,7 +968,8 @@ func dsaUnpackHints(hints [][256]byte, data []byte, p *mldsaParams) bool {
 	return true
 }
 
-func mldsaVerify(p *mldsaParams, pk, message, signature []byte) bool {
+// public holds tr, Â and t̂1, which the key keeps.
+func mldsaVerify(p *mldsaParams, pk []byte, public *dsaPublic, message, signature []byte) bool {
 	k, l := p.k, p.l
 
 	if len(pk) != p.publicKeySize() || len(signature) != p.signatureSize() {
@@ -947,13 +1000,11 @@ func mldsaVerify(p *mldsaParams, pk, message, signature []byte) bool {
 		return false
 	}
 
-	var tr, mu [64]byte
+	var mu [64]byte
 
-	shake256Sum(tr[:], pk)
+	shake256Sum(mu[:], public.tr[:], message)
 
-	shake256Sum(mu[:], tr[:], message)
-
-	var a, c, t1, product, w dsaPoly
+	var c, product, w dsaPoly
 
 	dsaSampleInBall(&c, cTilde, p.tau)
 
@@ -967,31 +1018,17 @@ func mldsaVerify(p *mldsaParams, pk, message, signature []byte) bool {
 
 	var high [256]uint32
 
-	var acc [256]uint64
-
 	m := int32((dsaQ - 1) / (2 * p.gamma2))
 
+	a, t1 := public.matrix(p, pk[:32]), public.t1Hat(p, pk)
+
 	for i := range k {
-		clear(acc[:])
+		dsaDot(&w, a[i*l:(i+1)*l], z)
 
-		for j := range z {
-			dsaSampleUniform(&a, pk[:32], byte(j), byte(i))
+		dsaPointwise(&product, &c, &t1[i])
 
-			dsaMultiplyAdd(&acc, &a, &z[j])
-		}
-
-		unpackBits(t1[:], pk[32+320*i:32+320*(i+1)], 10)
-
-		for x := range t1 {
-			t1[x] <<= dsaD
-		}
-
-		dsaNTT(&t1)
-
-		dsaPointwise(&product, &c, &t1)
-
-		for x, sum := range acc {
-			w[x] = dsaSub(dsaReduce(sum), product[x])
+		for x := range w {
+			w[x] = dsaSub(w[x], product[x])
 		}
 
 		dsaInverseNTT(&w)

@@ -2,7 +2,7 @@ package cryptopq
 
 // Test-only access to internals that are not part of the public API.
 
-var X25519 = x25519
+var X25519, X25519Base = x25519, x25519Base
 
 // The name, tree height and node size of an LMS type code.
 func LmsType(code uint32) (string, int, int) {

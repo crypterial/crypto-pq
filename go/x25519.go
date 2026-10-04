@@ -3,6 +3,7 @@ package cryptopq
 import (
 	"encoding/binary"
 	"math/bits"
+	"sync"
 )
 
 // X25519 (RFC 7748) over GF(2^255 - 19) with five 51-bit limbs, a masked conditional swap and
@@ -11,8 +12,6 @@ import (
 const mask51 = 1<<51 - 1
 
 type fieldElement [5]uint64
-
-var x25519Base = [32]byte{9}
 
 func feLoad(b []byte) fieldElement {
 	w0 := binary.LittleEndian.Uint64(b[0:])
@@ -399,4 +398,255 @@ func x25519(scalar, u []byte) [32]byte {
 	clear(k[:])
 
 	return result.bytes()
+}
+
+// Fixed-base X25519 for public keys, as in ref10 and libsodium: [k]B on the Edwards form of the curve
+// (RFC 7748, 4.1), whose u-coordinate (1 + y) / (1 - y) = (Z + Y) / (Z - Y) is what the ladder gives
+// for the same scalar. [k]B sums one multiple of 16^i B per signed radix-16 digit of k, taken from a
+// table of the multiples 1 to 8 of 256^i B: the odd digits first, then a multiplication by 16, then
+// the even digits. A digit only steers masked moves over all eight entries of its table row, so no
+// branch or memory index depends on the scalar.
+
+// A point (X : Y : Z : T) on -x^2 + y^2 = 1 + d x^2 y^2, with x = X / Z, y = Y / Z and xy = T / Z.
+type edwardsPoint struct {
+	x, y, z, t fieldElement
+}
+
+// An affine point as y + x, y - x and 2dxy, the form that mixed addition reads.
+type edwardsAffine struct {
+	yPlusX, yMinusX, xy2d fieldElement
+}
+
+// The x-coordinate of the base point B = (x, 4/5), the even one of the two roots (RFC 8032, 5.1),
+// little-endian.
+var edwardsBaseX = [32]byte{
+	0x1a, 0xd5, 0x25, 0x8f, 0x60, 0x2d, 0x56, 0xc9, 0xb2, 0xa7, 0x25, 0x95, 0x60, 0xc7, 0x2c, 0x69,
+	0x5c, 0xdc, 0xd6, 0xfd, 0x31, 0xe2, 0xa4, 0xc0, 0xfe, 0x53, 0x6e, 0xcd, 0xd3, 0x36, 0x69, 0x21,
+}
+
+// v = p + q for an affine q (add-2008-hwcd-3 with k = 2d and Z2 = 1); v may be p. 2Z1 is carried, so
+// that every product input is a sum of at most two carried values.
+func (v *edwardsPoint) addAffine(p *edwardsPoint, q *edwardsAffine) {
+	yPlusX, yMinusX := feAdd(&p.y, &p.x), feSub(&p.y, &p.x)
+
+	a, b, c := feMul(&yMinusX, &q.yMinusX), feMul(&yPlusX, &q.yPlusX), feMul(&p.t, &q.xy2d)
+
+	d := feAdd(&p.z, &p.z)
+
+	d.carry()
+
+	e, f, g, h := feSub(&b, &a), feSub(&d, &c), feAdd(&d, &c), feAdd(&b, &a)
+
+	v.x, v.y, v.z, v.t = feMul(&e, &f), feMul(&g, &h), feMul(&f, &g), feMul(&e, &h)
+}
+
+// v = 2p (dbl-2008-hwcd with a = -1) with every coordinate negated, which is the same point; v may
+// be p.
+func (v *edwardsPoint) double(p *edwardsPoint) {
+	a, b, zz := feSquare(&p.x), feSquare(&p.y), feSquare(&p.z)
+
+	s := feAdd(&p.x, &p.y)
+
+	e := feSquare(&s)
+
+	minusH := feAdd(&a, &b)
+
+	minusH.carry()
+
+	c := feAdd(&zz, &zz)
+
+	g := feSub(&b, &a)
+
+	e = feSub(&e, &minusH)
+
+	minusF := feSub(&c, &g)
+
+	v.x, v.y, v.z, v.t = feMul(&e, &minusF), feMul(&g, &minusH), feMul(&minusF, &g), feMul(&e, &minusH)
+}
+
+// Sets out[i] to points[i] in affine form with one inversion for all of them: the running products
+// of the Z coordinates are inverted once and then unwound (Montgomery's trick).
+func edwardsToAffine(points []edwardsPoint, d2 *fieldElement, out []edwardsAffine) {
+	products := make([]fieldElement, len(points))
+
+	product := fieldElement{1}
+
+	for i := range points {
+		products[i] = product
+
+		product = feMul(&product, &points[i].z)
+	}
+
+	inverse := feInvert(&product)
+
+	for i := len(points) - 1; i >= 0; i-- {
+		zInverse := feMul(&inverse, &products[i])
+
+		inverse = feMul(&inverse, &points[i].z)
+
+		x, y := feMul(&points[i].x, &zInverse), feMul(&points[i].y, &zInverse)
+
+		xy := feMul(&x, &y)
+
+		out[i] = edwardsAffine{yPlusX: feAdd(&y, &x), yMinusX: feSub(&y, &x), xy2d: feMul(&xy, d2)}
+
+		out[i].yPlusX.carry()
+	}
+}
+
+// The table of x25519Base, entry [i][j] being (j + 1) 256^i B, computed from B on first use. d is
+// -121665 / 121666 (RFC 7748, 4.1).
+var edwardsTable = sync.OnceValue(func() *[32][8]edwardsAffine {
+	inverse := feInvert(&fieldElement{121666})
+
+	d := feSub(&fieldElement{}, &fieldElement{121665})
+
+	d = feMul(&d, &inverse)
+
+	d2 := feAdd(&d, &d)
+
+	d2.carry()
+
+	inverse = feInvert(&fieldElement{5})
+
+	base := edwardsPoint{x: feLoad(edwardsBaseX[:]), y: feMul(&fieldElement{4}, &inverse), z: fieldElement{1}}
+
+	base.t = feMul(&base.x, &base.y)
+
+	var rows [32]edwardsPoint
+
+	rows[0] = base
+
+	for i := 1; i < len(rows); i++ {
+		rows[i] = rows[i-1]
+
+		for range 8 {
+			rows[i].double(&rows[i])
+		}
+	}
+
+	var firsts [32]edwardsAffine
+
+	edwardsToAffine(rows[:], &d2, firsts[:])
+
+	multiples := make([]edwardsPoint, 7*len(rows))
+
+	for i := range rows {
+		multiples[7*i].addAffine(&rows[i], &firsts[i])
+
+		for j := 1; j < 7; j++ {
+			multiples[7*i+j].addAffine(&multiples[7*i+j-1], &firsts[i])
+		}
+	}
+
+	rest := make([]edwardsAffine, len(multiples))
+
+	edwardsToAffine(multiples, &d2, rest)
+
+	table := new([32][8]edwardsAffine)
+
+	for i := range table {
+		table[i][0] = firsts[i]
+
+		copy(table[i][1:], rest[7*i:7*i+7])
+	}
+
+	return table
+})
+
+// Sets v to the multiple digit of the row's base point, for |digit| <= 8. Masked moves read all eight
+// entries; a negative digit then swaps y + x with y - x and negates 2dxy, which negates the point.
+func (v *edwardsAffine) selectFrom(row *[8]edwardsAffine, digit int8) {
+	sign := int64(digit) >> 63
+
+	magnitude := uint64((int64(digit) ^ sign) - sign)
+
+	*v = edwardsAffine{yPlusX: fieldElement{1}, yMinusX: fieldElement{1}}
+
+	for j := range row {
+		mask := -(((magnitude ^ uint64(j+1)) - 1) >> 63)
+
+		for n := range v.xy2d {
+			v.yPlusX[n] ^= mask & (v.yPlusX[n] ^ row[j].yPlusX[n])
+
+			v.yMinusX[n] ^= mask & (v.yMinusX[n] ^ row[j].yMinusX[n])
+
+			v.xy2d[n] ^= mask & (v.xy2d[n] ^ row[j].xy2d[n])
+		}
+	}
+
+	negative := uint64(sign) & 1
+
+	feSwap(&v.yPlusX, &v.yMinusX, negative)
+
+	negated := feSub(&fieldElement{}, &v.xy2d)
+
+	feSwap(&v.xy2d, &negated, negative)
+}
+
+// X25519(scalar, 9): the u-coordinate of [k]B for the clamped scalar k.
+func x25519Base(scalar []byte) [32]byte {
+	var k [32]byte
+
+	copy(k[:], scalar)
+
+	k[0] &= 248
+
+	k[31] &= 127
+
+	k[31] |= 64
+
+	// k = sum of digits[i] 16^i with every digit in [-8, 8]: each nibble above 7 becomes the nibble
+	// minus 16 and carries one into the next. The top digit stays at most 8 since bit 255 is clear.
+	var digits [64]int8
+
+	for i, b := range k {
+		digits[2*i], digits[2*i+1] = int8(b&15), int8(b>>4)
+	}
+
+	var carry int8
+
+	for i := range 63 {
+		digits[i] += carry
+
+		carry = (digits[i] + 8) >> 4
+
+		digits[i] -= carry << 4
+	}
+
+	digits[63] += carry
+
+	table := edwardsTable()
+
+	h := edwardsPoint{y: fieldElement{1}, z: fieldElement{1}}
+
+	var entry edwardsAffine
+
+	for i := 1; i < 64; i += 2 {
+		entry.selectFrom(&table[i/2], digits[i])
+
+		h.addAffine(&h, &entry)
+	}
+
+	for range 4 {
+		h.double(&h)
+	}
+
+	for i := 0; i < 64; i += 2 {
+		entry.selectFrom(&table[i/2], digits[i])
+
+		h.addAffine(&h, &entry)
+	}
+
+	numerator, denominator := feAdd(&h.z, &h.y), feSub(&h.z, &h.y)
+
+	inverse := feInvert(&denominator)
+
+	u := feMul(&numerator, &inverse)
+
+	clear(k[:])
+
+	clear(digits[:])
+
+	return u.bytes()
 }

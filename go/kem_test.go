@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	cryptopq "github.com/crypterial/crypto-pq-go"
@@ -315,6 +316,87 @@ func TestKemRoundTrip(t *testing.T) {
 		if !pair.PrivateKey.PublicKey().Equal(pair.PublicKey) || pair.PublicKey.Equal(unchecked.PublicKey) {
 			t.Fatalf("%s: Equal", algorithm)
 		}
+	}
+}
+
+// Keys compute what they derive on first use, so goroutines that first use one key, its private and
+// public halves and the public keys it returns, all at once, must race safely and agree with a key
+// that computes everything alone.
+func TestConcurrentFirstUse(t *testing.T) {
+	t.Parallel()
+
+	for _, c := range kemCases {
+		algorithm, seed, randomness := c.algorithm, sequence(c.seedSize), sequence(c.randomnessSize)
+
+		reference, err := cryptopq.Hazmat.GenerateKemKeyPair(algorithm, seed)
+
+		check(t, err)
+
+		want, err := cryptopq.Hazmat.Encapsulate(reference.PublicKey, randomness)
+
+		check(t, err)
+
+		pair, err := cryptopq.Hazmat.GenerateKemKeyPair(algorithm, seed)
+
+		check(t, err)
+
+		imported, err := algorithm.ImportPublicKey(export(t, reference.PublicKey, cryptopq.RAW), cryptopq.RAW)
+
+		check(t, err)
+
+		var group sync.WaitGroup
+
+		for i := range 12 {
+			group.Go(func() {
+				publicKey := [...]*cryptopq.KemPublicKey{pair.PublicKey, pair.PrivateKey.PublicKey(), imported}[i%3]
+
+				got, err := cryptopq.Hazmat.Encapsulate(publicKey, randomness)
+
+				if err != nil || !bytes.Equal(got.Ciphertext, want.Ciphertext) || !bytes.Equal(got.SharedSecret, want.SharedSecret) {
+					t.Errorf("%s: a concurrent encapsulation differs", algorithm)
+				}
+
+				if secret, err := pair.PrivateKey.Decapsulate(want.Ciphertext); err != nil || !bytes.Equal(secret, want.SharedSecret) {
+					t.Errorf("%s: a concurrent decapsulation differs", algorithm)
+				}
+			})
+		}
+
+		group.Wait()
+	}
+
+	message := []byte("crypto-pq concurrent first use")
+
+	for _, algorithm := range []cryptopq.SignatureAlgorithm{cryptopq.ML_DSA_44, cryptopq.ML_DSA_65, cryptopq.ML_DSA_87} {
+		reference := generateSignatureKey(t, algorithm)
+
+		want, err := reference.PrivateKey.Sign(message, &cryptopq.SignOptions{Deterministic: true})
+
+		check(t, err)
+
+		pair := generateSignatureKey(t, algorithm)
+
+		imported, err := algorithm.ImportPublicKey(export(t, reference.PublicKey, cryptopq.RAW), cryptopq.RAW)
+
+		check(t, err)
+
+		var group sync.WaitGroup
+
+		for i := range 12 {
+			group.Go(func() {
+				if got, err := pair.PrivateKey.Sign(message, &cryptopq.SignOptions{Deterministic: true}); err != nil || !bytes.Equal(got, want) {
+					t.Errorf("%s: a concurrent signature differs", algorithm)
+				}
+
+				publicKey := [...]*cryptopq.SignaturePublicKey{pair.PublicKey, pair.PrivateKey.PublicKey(), imported}[i%3]
+
+				if !publicKey.Verify(want, message, nil) {
+					t.Errorf("%s: a concurrent verification failed", algorithm)
+				}
+			})
+		}
+
+		group.Wait()
 	}
 }
 
