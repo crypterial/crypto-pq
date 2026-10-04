@@ -6,6 +6,8 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod cpu;
+
 mod ct;
 
 mod encoding;

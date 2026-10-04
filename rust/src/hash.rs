@@ -1,6 +1,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::cpu::Dit;
 use crate::ct;
 use crate::keccak::Keccak;
 use crate::sha2::{IV_224, IV_256, IV_384, IV_512, IV_512_224, IV_512_256, Sha256, Sha512};
@@ -181,6 +182,8 @@ impl HmacAlgorithm {
     }
 
     pub fn digest(&self, key: &[u8], data: &[u8]) -> Vec<u8> {
+        let _dit = Dit::new();
+
         let mut hmac = self.create(key);
 
         hmac.update(data);
@@ -189,6 +192,8 @@ impl HmacAlgorithm {
     }
 
     pub fn create(&self, key: &[u8]) -> Hmac {
+        let _dit = Dit::new();
+
         let block = self.hash.block_size();
 
         let mut pad = [0u8; 128];
@@ -221,6 +226,8 @@ impl HmacAlgorithm {
     }
 
     pub fn verify(&self, key: &[u8], data: &[u8], tag: &[u8]) -> bool {
+        let _dit = Dit::new();
+
         let mut hmac = self.create(key);
 
         hmac.update(data);
@@ -234,12 +241,17 @@ pub struct Hmac {
     outer: Hasher,
 }
 
+// HMAC runs under DIT because its key is secret; plain hashes do not know whether their input is.
 impl Hmac {
     pub fn update(&mut self, data: &[u8]) {
+        let _dit = Dit::new();
+
         self.inner.update(data);
     }
 
     pub fn digest(&self) -> Vec<u8> {
+        let _dit = Dit::new();
+
         let mut outer = self.outer.engine.clone();
 
         outer.update(&self.inner.digest());
@@ -248,6 +260,8 @@ impl Hmac {
     }
 
     pub fn verify(&self, tag: &[u8]) -> bool {
+        let _dit = Dit::new();
+
         ct::equal(&self.digest(), tag)
     }
 }

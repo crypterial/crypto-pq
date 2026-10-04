@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 
+use crate::cpu::Dit;
 use crate::ct::{self, declassify};
 use crate::error::Error;
 use crate::hash::{HashAlgorithm, SHAKE128, XofAlgorithm};
@@ -238,6 +239,8 @@ impl SignatureAlgorithm {
     // The self-test is the first use of the new keys, so it computes their cached forms from the
     // encoded keys and checks those too.
     pub fn generate_key_pair(&self, options: &KeyGenOptions) -> Result<SignatureKeyPair, Error> {
+        let _dit = Dit::new();
+
         let private_key = self.key_from_seed(&random_bytes(self.seed_size())?);
 
         let public_key = private_key.public_key();
@@ -281,6 +284,8 @@ impl SignatureAlgorithm {
         data: &[u8],
         format: KeyFormat,
     ) -> Result<SignaturePrivateKey, Error> {
+        let _dit = Dit::new();
+
         let input = import_private(format, data, Some(&self.oid))?;
 
         let (key, public_key) = match (input, self.scheme) {
@@ -378,6 +383,8 @@ impl SignatureAlgorithm {
 
     // ML-DSA keeps the seed as its private key; SLH-DSA keeps the 4n-byte key.
     pub(crate) fn key_from_seed(&self, seed: &[u8]) -> SignaturePrivateKey {
+        let _dit = Dit::new();
+
         match self.scheme {
             Scheme::MlDsa(p) => {
                 let (public, private) = mldsa::keygen_internal(seed, &p);
@@ -601,6 +608,8 @@ impl SignaturePrivateKey {
     }
 
     pub fn sign(&self, message: &[u8], options: &SignOptions) -> Result<Vec<u8>, Error> {
+        let _dit = Dit::new();
+
         self.check_options(options, true)?;
 
         let randomness = match (options.deterministic, self.algorithm.scheme) {
@@ -630,6 +639,8 @@ impl SignaturePrivateKey {
         randomness: &[u8],
         options: &SignOptions,
     ) -> Vec<u8> {
+        let _dit = Dit::new();
+
         let representative = Representative::new(message, options.context, options.pre_hash);
 
         let parts = representative.parts();
@@ -650,6 +661,8 @@ impl SignaturePrivateKey {
     }
 
     pub fn export_key(&self, format: KeyFormat) -> Result<Vec<u8>, Error> {
+        let _dit = Dit::new();
+
         let oid = Some(&self.algorithm.oid[..]);
 
         match (&self.seed, self.algorithm.scheme) {

@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 
 use crate::ct::declassify;
 use crate::hash::{HMAC_SHA_256, HMAC_SHA_512};
+use crate::keccak::Sponges;
 use crate::primitives::{sha256, sha512, shake256};
 use crate::sha2::{IV_256, IV_512, Sha256, Sha512};
 use crate::wipe::{SecretBytes, wipe};
@@ -300,13 +301,51 @@ impl<'a> Hashes<'a> {
         self.truncate(&engine.digest())
     }
 
-    // F of up to LANES independent inputs, side by side with SHA-2. A lane without input gives
-    // nothing useful; with SHAKE it costs nothing.
+    // F with SHAKE256 for the lanes that have an input, four sponges side by side: PK.seed,
+    // ADRS and the input fill less than one block.
+    fn shake_lanes(&self, adrs: &[Adrs; LANES], inputs: [Option<&[u8]>; LANES]) -> [Node; LANES] {
+        let n = self.n;
+
+        let mut nodes = [[0; 32]; LANES];
+
+        let mut active = [0; LANES];
+
+        let mut count = 0;
+
+        for (lane, input) in inputs.iter().enumerate() {
+            if input.is_some() {
+                active[count] = lane;
+
+                count += 1;
+            }
+        }
+
+        for group in active[..count].chunks(4) {
+            let parts: [[&[u8]; 3]; 4] = core::array::from_fn(|i| {
+                let lane = group.get(i).copied().unwrap_or_default();
+
+                [self.pk_seed, &adrs[lane], inputs[lane].unwrap_or_default()]
+            });
+
+            let messages = parts.each_ref().map(|parts| &parts[..]);
+
+            let mut sponges = Sponges::new(136, 0x1F, &messages[..group.len()]);
+
+            sponges.squeeze([true; 4]);
+
+            for (i, &lane) in group.iter().enumerate() {
+                sponges.read(i, &mut nodes[lane][..n]);
+            }
+        }
+
+        nodes
+    }
+
+    // F of up to LANES independent inputs, side by side. A lane without input gives nothing
+    // useful; with SHAKE it costs nothing.
     fn f_lanes(&self, adrs: &[Adrs; LANES], inputs: [Option<&[u8]>; LANES]) -> [Node; LANES] {
         let Some(states) = &self.sha2 else {
-            return core::array::from_fn(|lane| {
-                inputs[lane].map_or([0; 32], |input| self.shake(&adrs[lane], &[input]))
-            });
+            return self.shake_lanes(adrs, inputs);
         };
 
         let n = self.n;

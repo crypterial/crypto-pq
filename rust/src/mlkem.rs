@@ -1,11 +1,15 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::cpu::{self, Field, Field16, Prepare};
 use crate::ct::{self, declassify};
-use crate::primitives::{sha3_256, sha3_512, shake128, shake256_into};
+use crate::keccak::Sponges;
+use crate::primitives::{sha3_256, sha3_512, shake256_into};
 use crate::wipe::{SecretBytes, wipe};
 
 const Q: u32 = 3329;
+
+const SHAKE: u8 = 0x1F;
 
 type Poly = [u16; 256];
 
@@ -190,14 +194,82 @@ fn add_assign(f: &mut Poly, g: &Poly) {
     }
 }
 
+// The twiddle factors as the CPU kernels take them; the forward transform ends with the
+// canonical form, as ntt does.
+static FIELD: Field = Field::new(
+    Q as i32,
+    QINV,
+    7,
+    {
+        let mut zetas = [0; 256];
+
+        let mut i = 0;
+
+        while i < 128 {
+            zetas[i] = ZETAS[i];
+
+            i += 1;
+        }
+
+        zetas
+    },
+    Prepare::Montgomery(R_MOD_Q as i32),
+    Some(R_MOD_Q as i32),
+    INVERSE_SCALE,
+);
+
+// The same factors for the 16-bit kernels, in Montgomery form for 2^16 instead of 2^32.
+static FIELD16: Field16 = Field16::new(
+    Q as i16,
+    {
+        let mut zetas = [0; 128];
+
+        let mut i = 0;
+
+        while i < 128 {
+            let zeta = (power(17, bit_reverse7(i)) as u64 * 65536 % Q as u64) as i16;
+
+            zetas[i] = if zeta > (Q as i16 - 1) / 2 {
+                zeta - Q as i16
+            } else {
+                zeta
+            };
+
+            i += 1;
+        }
+
+        zetas
+    },
+    (65536 % Q) as i16,
+    (3303 * 65536 % Q) as i16,
+    R_MOD_Q as i32,
+    QINV,
+);
+
 fn ntt(f: &mut Poly) {
+    if cpu::ntt16(f, &FIELD16) {
+        return;
+    }
+
     let mut w = f.map(i32::from);
 
+    if cpu::ntt(&mut w, &FIELD) {
+        *f = w.map(|x| x as u16);
+    } else {
+        ntt_layers(&mut w);
+
+        *f = canonical(&w);
+    }
+
+    wipe(&mut w);
+}
+
+// The butterflies reduce only their products, so the sums stay below 8q.
+fn ntt_layers(w: &mut Wide) {
     let mut i = 1;
 
     let mut length = 128;
 
-    // The butterflies reduce only their products, so the sums stay below 8q.
     while length >= 2 {
         for start in (0..256).step_by(2 * length) {
             let (zeta, zeta_qinv) = (ZETAS[i], ZETAS[i].wrapping_mul(QINV));
@@ -217,18 +289,36 @@ fn ntt(f: &mut Poly) {
 
         length /= 2;
     }
-
-    *f = canonical(&w);
-
-    wipe(&mut w);
 }
 
 // The inverse NTT of the accumulated products, as canonical coefficients.
 fn inverse_ntt(acc: &Wide) -> Poly {
+    let mut f = [0; 256];
+
+    if cpu::inverse_ntt16(acc, &mut f, &FIELD16) {
+        return f;
+    }
+
+    let mut w = *acc;
+
+    let f = if cpu::inverse_ntt(&mut w, &FIELD) {
+        w.map(|x| x as u16)
+    } else {
+        inverse_ntt_portable(&mut w)
+    };
+
+    wipe(&mut w);
+
+    f
+}
+
+fn inverse_ntt_portable(w: &mut Wide) -> Poly {
     let (r, r_qinv) = (i32::from(R_MOD_Q), i32::from(R_MOD_Q).wrapping_mul(QINV));
 
     // Below q in absolute value first, so that the sums stay below 128q.
-    let mut w = acc.map(|x| montgomery(x, r, r_qinv));
+    for x in w.iter_mut() {
+        *x = montgomery(*x, r, r_qinv);
+    }
 
     let mut i = 127;
 
@@ -256,16 +346,18 @@ fn inverse_ntt(acc: &Wide) -> Poly {
 
     let scale_qinv = INVERSE_SCALE.wrapping_mul(QINV);
 
-    let f = w.map(|x| freeze(montgomery(x, INVERSE_SCALE, scale_qinv)));
-
-    wipe(&mut w);
-
-    f
+    w.map(|x| freeze(montgomery(x, INVERSE_SCALE, scale_qinv)))
 }
 
 // acc += f * g in the NTT domain (FIPS 203, Algorithms 11 and 12) for canonical f and g. The
 // products are not reduced: k of them stay far below 2^31.
 fn multiply_accumulate(acc: &mut Wide, f: &Poly, g: &Poly) {
+    if !cpu::base_multiply_add(acc, f, g, &GAMMAS, &FIELD) {
+        multiply_accumulate_portable(acc, f, g);
+    }
+}
+
+fn multiply_accumulate_portable(acc: &mut Wide, f: &Poly, g: &Poly) {
     let pairs = acc.as_chunks_mut::<2>().0.iter_mut();
 
     let factors = f.as_chunks::<2>().0.iter().zip(g.as_chunks::<2>().0);
@@ -357,49 +449,100 @@ const fn decompress(y: u16, d: u32) -> u16 {
     ((y as u32 * Q + (1 << (d - 1))) >> d) as u16
 }
 
-// Every candidate is written and only an accepted one advances the count, so that no branch
-// depends on a candidate, which a random matrix makes unpredictable.
-fn sample_ntt(rho: &[u8], first: usize, second: usize) -> Poly {
-    let mut stream = shake128(&[rho, &[first as u8, second as u8]]);
+// One block of an XOF stream into the coefficients accepted so far. Every candidate is written
+// and only an accepted one advances the count, so that no branch depends on a candidate, which a
+// random matrix makes unpredictable.
+fn sample_uniform(block: &[u8; 168], a: &mut Poly, count: &mut usize) {
+    for chunk in block.as_chunks::<3>().0 {
+        let d1 = u16::from(chunk[0]) | (u16::from(chunk[1] & 0x0F) << 8);
 
-    let mut a = [0; 256];
+        let d2 = u16::from(chunk[1] >> 4) | (u16::from(chunk[2]) << 4);
 
-    let mut count = 0;
+        for candidate in [d1, d2] {
+            if *count == 256 {
+                return;
+            }
+
+            a[*count] = candidate;
+
+            *count += usize::from(u32::from(candidate) < Q);
+        }
+    }
+}
+
+// Entries first, first + 1, ... of Â (FIPS 203, Algorithm 7, from XOF(rho, j, i) for row i and
+// column j), whose XOF streams are squeezed in lockstep.
+fn sample_ntt(rho: &[u8], k: usize, first: usize, out: &mut [Poly]) {
+    let indices: [[u8; 2]; 4] =
+        core::array::from_fn(|e| [((first + e) % k) as u8, ((first + e) / k) as u8]);
+
+    let parts = indices.each_ref().map(|index| [rho, &index[..]]);
+
+    let messages = parts.each_ref().map(|parts| &parts[..]);
+
+    let mut sponges = Sponges::new(168, SHAKE, &messages[..out.len()]);
+
+    let mut counts = [0; 4];
 
     let mut block = [0u8; 168];
 
-    'blocks: while count < 256 {
-        stream.read(&mut block);
+    while counts[..out.len()].iter().any(|&count| count < 256) {
+        sponges.squeeze(counts.map(|count| count < 256));
 
-        for chunk in block.as_chunks::<3>().0 {
-            let d1 = u16::from(chunk[0]) | (u16::from(chunk[1] & 0x0F) << 8);
+        for (i, (a, count)) in out.iter_mut().zip(&mut counts).enumerate() {
+            if *count < 256 {
+                sponges.read(i, &mut block);
 
-            let d2 = u16::from(chunk[1] >> 4) | (u16::from(chunk[2]) << 4);
-
-            for candidate in [d1, d2] {
-                a[count] = candidate;
-
-                count += usize::from(u32::from(candidate) < Q);
-
-                if count == 256 {
-                    break 'blocks;
-                }
+                sample_uniform(&block, a, count);
             }
         }
     }
-
-    a
 }
 
-// FIPS 203, Algorithm 8, applied to PRF_eta(seed, nonce) = SHAKE256(seed || nonce). The bits of
-// each half are summed with masks over a whole word, never one secret bit at a time.
-fn sample_noise(eta: usize, seed: &[u8], nonce: usize) -> Poly {
-    let mut buffer = [0u8; 192];
+// FIPS 203, Algorithm 8, applied to PRF_eta(seed, nonce) = SHAKE256(seed || nonce) for the
+// nonces first, first + 1, ..., whose sponges run side by side four at a time.
+fn sample_noise(eta: usize, seed: &[u8], first: usize, out: &mut [Poly]) {
+    for (start, group) in (first..).step_by(4).zip(out.chunks_mut(4)) {
+        let nonces: [[u8; 1]; 4] = core::array::from_fn(|i| [(start + i) as u8]);
 
-    let data = &mut buffer[..64 * eta];
+        let parts = nonces.each_ref().map(|nonce| [seed, &nonce[..]]);
 
-    shake256_into(&[seed, &[nonce as u8]], data);
+        let messages = parts.each_ref().map(|parts| &parts[..]);
 
+        let mut sponges = Sponges::new(136, SHAKE, &messages[..group.len()]);
+
+        let mut buffers = [[0u8; 192]; 4];
+
+        for offset in (0..64 * eta).step_by(136) {
+            sponges.squeeze([true; 4]);
+
+            let end = (offset + 136).min(64 * eta);
+
+            for (i, buffer) in buffers[..group.len()].iter_mut().enumerate() {
+                sponges.read(i, &mut buffer[offset..end]);
+            }
+        }
+
+        for (f, buffer) in group.iter_mut().zip(&buffers) {
+            *f = binomial(eta, &buffer[..64 * eta]);
+        }
+
+        wipe(buffers.as_flattened_mut());
+    }
+}
+
+fn binomial(eta: usize, data: &[u8]) -> Poly {
+    let mut f = [0; 256];
+
+    if !cpu::binomial(eta, data, Q as u16, &mut f) {
+        f = binomial_portable(eta, data);
+    }
+
+    f
+}
+
+// The bits of each half are summed with masks over a whole word, never one secret bit at a time.
+fn binomial_portable(eta: usize, data: &[u8]) -> Poly {
     let mut f = [0; 256];
 
     if eta == 2 {
@@ -430,14 +573,18 @@ fn sample_noise(eta: usize, seed: &[u8], nonce: usize) -> Poly {
         }
     }
 
-    wipe(&mut buffer);
-
     f
 }
 
-// Â, with row i and column j at i * k + j.
+// Â, with row i and column j at i * k + j, four entries at a time.
 fn sample_matrix(rho: &[u8], k: usize) -> Vec<Poly> {
-    (0..k * k).map(|n| sample_ntt(rho, n % k, n / k)).collect()
+    let mut matrix = vec![[0; 256]; k * k];
+
+    for (first, group) in (0..).step_by(4).zip(matrix.chunks_mut(4)) {
+        sample_ntt(rho, k, first, group);
+    }
+
+    matrix
 }
 
 fn decode_vector(bytes: &[u8]) -> Vec<Poly> {
@@ -498,25 +645,24 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) {
     // rho is part of the public key.
     declassify(rho);
 
-    let mut s = [[0; 256]; 4];
+    // s from the nonces 0 to k - 1 and e from k to 2k - 1.
+    let mut noise = [[0; 256]; 8];
 
-    let mut e = [[0; 256]; 4];
+    sample_noise(p.eta1, sigma, 0, &mut noise[..2 * k]);
 
-    for (n, (s_n, e_n)) in s[..k].iter_mut().zip(&mut e).enumerate() {
-        *s_n = sample_noise(p.eta1, sigma, n);
-
-        ntt(s_n);
-
-        *e_n = sample_noise(p.eta1, sigma, k + n);
-
-        ntt(e_n);
+    for f in &mut noise[..2 * k] {
+        ntt(f);
     }
+
+    let (s, e) = noise.split_at(k);
+
+    let matrix = sample_matrix(rho, k);
 
     for i in 0..k {
         let mut acc = [0; 256];
 
-        for (j, s_j) in s[..k].iter().enumerate() {
-            multiply_accumulate(&mut acc, &sample_ntt(rho, j, i), s_j);
+        for (a_ij, s_j) in matrix[i * k..(i + 1) * k].iter().zip(s) {
+            multiply_accumulate(&mut acc, a_ij, s_j);
         }
 
         let mut t = canonical(&acc);
@@ -534,9 +680,7 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) {
 
     ek[384 * k..].copy_from_slice(rho);
 
-    wipe(s.as_flattened_mut());
-
-    wipe(e.as_flattened_mut());
+    wipe(noise[..2 * k].as_flattened_mut());
 
     wipe(&mut g);
 }
@@ -546,11 +690,16 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
 
     let mut y = [[0; 256]; 4];
 
-    for (n, y_n) in y[..k].iter_mut().enumerate() {
-        *y_n = sample_noise(p.eta1, r, n);
+    sample_noise(p.eta1, r, 0, &mut y[..k]);
 
+    for y_n in &mut y[..k] {
         ntt(y_n);
     }
+
+    // e1 from the nonces k to 2k - 1 and e2 from 2k.
+    let mut noise = [[0; 256]; 5];
+
+    sample_noise(p.eta2, r, k, &mut noise[..k + 1]);
 
     let (c1, c2) = c.split_at_mut(32 * p.du as usize * k);
 
@@ -567,7 +716,7 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
 
         wipe(&mut acc);
 
-        add_assign(&mut u, &sample_noise(p.eta2, r, k + i));
+        add_assign(&mut u, &noise[i]);
 
         byte_encode(&u.map(|x| compress(x, p.du)), p.du, chunk);
     }
@@ -580,9 +729,7 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
 
     let mut v = inverse_ntt(&acc);
 
-    let mut noise = sample_noise(p.eta2, r, 2 * k);
-
-    add_assign(&mut v, &noise);
+    add_assign(&mut v, &noise[k]);
 
     let mut mu = byte_decode(m, 1).map(|bit| decompress(bit, 1));
 
@@ -598,7 +745,7 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
 
     wipe(&mut v);
 
-    wipe(&mut noise);
+    wipe(noise[..k + 1].as_flattened_mut());
 
     wipe(&mut mu);
 }
@@ -755,6 +902,125 @@ pub(crate) fn public_key_of<'a>(dk: &'a [u8], p: &Parameters) -> &'a [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cpu::testing::Inputs;
+
+    // Values in [low, high): the bounds themselves, alternated, for the first cases, random ones
+    // after that.
+    fn values<T: Copy>(
+        inputs: &mut Inputs,
+        case: usize,
+        low: i64,
+        high: i64,
+        cast: impl Fn(i64) -> T,
+    ) -> [T; 256] {
+        let edge = [low, high - 1];
+
+        core::array::from_fn(|i| {
+            cast(match case {
+                0 | 1 => edge[case],
+                2 => edge[i % 2],
+                _ => low + (inputs.next() % (high - low) as u64) as i64,
+            })
+        })
+    }
+
+    // The transform and product kernels against the portable code: canonical coefficients into
+    // the forward transform and the products, any 32-bit sums into the inverse, and sums below
+    // 2^28 under the products.
+    #[test]
+    fn transform_kernels_match_portable() {
+        let mut inputs = Inputs::new(3329);
+
+        let mut accelerated = 0;
+
+        let q = i64::from(Q);
+
+        for n in 0..20_000 {
+            let f = values(&mut inputs, n, 0, q, |x| x as u16);
+
+            let mut expected = f.map(i32::from);
+
+            ntt_layers(&mut expected);
+
+            let mut actual = f.map(i32::from);
+
+            if cpu::ntt(&mut actual, &FIELD) {
+                assert_eq!(
+                    actual.map(|x| x as u16),
+                    canonical(&expected),
+                    "ntt, case {n}"
+                );
+
+                accelerated += 1;
+            }
+
+            let mut actual = f;
+
+            if cpu::ntt16(&mut actual, &FIELD16) {
+                assert_eq!(actual, canonical(&expected), "16-bit ntt, case {n}");
+            }
+
+            let acc = values(&mut inputs, n, i64::from(i32::MIN), 1 << 31, |x| x as i32);
+
+            let expected = inverse_ntt_portable(&mut acc.clone());
+
+            let mut actual = acc;
+
+            if cpu::inverse_ntt(&mut actual, &FIELD) {
+                assert_eq!(actual.map(|x| x as u16), expected, "inverse, case {n}");
+            }
+
+            let mut actual = [0; 256];
+
+            if cpu::inverse_ntt16(&acc, &mut actual, &FIELD16) {
+                assert_eq!(actual, expected, "16-bit inverse, case {n}");
+            }
+
+            let g = values(&mut inputs, n + 1, 0, q, |x| x as u16);
+
+            let acc = values(&mut inputs, n, -(1 << 28), 1 << 28, |x| x as i32);
+
+            let (mut expected, mut actual) = (acc, acc);
+
+            multiply_accumulate_portable(&mut expected, &f, &g);
+
+            if cpu::base_multiply_add(&mut actual, &f, &g, &GAMMAS, &FIELD) {
+                assert_eq!(actual, expected, "base multiplication, case {n}");
+            }
+        }
+
+        std::eprintln!("ML-KEM: {accelerated} of 20000 cases through the CPU kernels");
+    }
+
+    // The noise kernel against the portable code, both values of eta, on random bytes and on
+    // bytes of all zeros, all ones and alternating bits.
+    #[test]
+    fn binomial_kernel_matches_portable() {
+        let mut inputs = Inputs::new(2);
+
+        let mut accelerated = 0;
+
+        for n in 0..20_000 {
+            let data: [u8; 192] = match [0x00, 0xFF, 0x55, 0xAA].get(n) {
+                Some(&byte) => [byte; 192],
+                None => inputs.bytes(),
+            };
+
+            for eta in [2, 3] {
+                let mut actual = [0; 256];
+
+                if cpu::binomial(eta, &data[..64 * eta], Q as u16, &mut actual) {
+                    let expected = binomial_portable(eta, &data[..64 * eta]);
+
+                    assert_eq!(actual, expected, "eta {eta}, case {n}");
+
+                    accelerated += 1;
+                }
+            }
+        }
+
+        std::eprintln!("ML-KEM noise: {accelerated} of 40000 cases through a CPU kernel");
+    }
 
     #[test]
     fn division_is_exact() {

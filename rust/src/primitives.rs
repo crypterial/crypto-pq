@@ -29,10 +29,6 @@ pub(crate) fn sha3_512(parts: &[&[u8]]) -> [u8; 64] {
     out
 }
 
-pub(crate) fn shake128(parts: &[&[u8]]) -> Keccak {
-    absorb(Keccak::new(168, SHAKE), parts)
-}
-
 pub(crate) fn shake256(parts: &[&[u8]]) -> Keccak {
     absorb(Keccak::new(136, SHAKE), parts)
 }

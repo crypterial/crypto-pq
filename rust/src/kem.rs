@@ -2,6 +2,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 
+use crate::cpu::Dit;
 use crate::ct;
 use crate::error::Error;
 use crate::keys::{
@@ -82,6 +83,8 @@ impl KemAlgorithm {
     // The self-test is the first use of the new keys, so it computes their cached forms from the
     // encoded keys and checks those too.
     pub fn generate_key_pair(&self, options: &KeyGenOptions) -> Result<KemKeyPair, Error> {
+        let _dit = Dit::new();
+
         let private_key = self.key_from_seed(&random_bytes(self.seed_size())?);
 
         let public_key = private_key.public_key();
@@ -135,6 +138,8 @@ impl KemAlgorithm {
         data: &[u8],
         format: KeyFormat,
     ) -> Result<KemPrivateKey, Error> {
+        let _dit = Dit::new();
+
         let (key, public_key) = match import_private(format, data, self.oid())? {
             PrivateInput::Raw(raw) => return self.import_raw(&raw),
             PrivateInput::Pkcs8 { key, public_key } => (self.import_choice(&key)?, public_key),
@@ -194,6 +199,8 @@ impl KemAlgorithm {
     }
 
     pub(crate) fn key_from_seed(&self, seed: &[u8]) -> KemPrivateKey {
+        let _dit = Dit::new();
+
         match self.scheme {
             Scheme::MlKem(p, _) => {
                 let (public, dk) = mlkem::keygen_internal(&seed[..32], &seed[32..], &p);
@@ -323,6 +330,8 @@ impl KemPublicKey {
     }
 
     pub(crate) fn encapsulate_with(&self, randomness: &[u8]) -> Encapsulation {
+        let _dit = Dit::new();
+
         let scheme = self.algorithm.scheme;
 
         let key = self.public.expanded(scheme);
@@ -414,6 +423,8 @@ impl KemPrivateKey {
     }
 
     pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+        let _dit = Dit::new();
+
         if ciphertext.len() != self.algorithm.ciphertext_size() {
             return Err(Error::InvalidLength);
         }
@@ -441,6 +452,8 @@ impl KemPrivateKey {
     }
 
     pub fn export_key(&self, format: KeyFormat) -> Result<Vec<u8>, Error> {
+        let _dit = Dit::new();
+
         let oid = self.algorithm.oid();
 
         match &self.secret {

@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::cpu::Dit;
 use crate::ct;
 use crate::error::Error;
 use crate::keys::{KeyFormat, export_public, import_public};
@@ -225,6 +226,8 @@ impl StatefulSignatureAlgorithm {
         mut store: S,
         options: &StatefulLoadOptions,
     ) -> Result<StatefulPrivateKey<S>, Error> {
+        let _dit = Dit::new();
+
         let reserve = check_reserve(options.reserve)?;
 
         let state = store
@@ -302,6 +305,8 @@ impl StatefulSignatureAlgorithm {
         reserve: u64,
         mut store: S,
     ) -> Result<StatefulKeyPair<S>, Error> {
+        let _dit = Dit::new();
+
         let signer = Signer::new(&parameters, &seed);
 
         let state = self.encode(&parameters, &seed, index);
@@ -540,6 +545,8 @@ impl<S: StateStore> StatefulPrivateKey<S> {
     // Indices are claimed in the store before any signature uses them, `reserve` at a time, so a
     // crash or a failed write can waste indices but never use one twice.
     pub fn sign(&mut self, message: &[u8]) -> Result<Vec<u8>, Error> {
+        let _dit = Dit::new();
+
         let index = self.index;
 
         let capacity = self.parameters.capacity();

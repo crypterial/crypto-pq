@@ -20,6 +20,7 @@ harness = false
 [profile.test]
 opt-level = 3
 
-# RUSTFLAGS="--cfg crypto_pq_ct" builds the constant-time check of tests/ct.rs.
+# RUSTFLAGS="--cfg crypto_pq_ct" builds the constant-time check of tests/ct.rs, and
+# RUSTFLAGS="--cfg crypto_pq_portable" leaves out every CPU-specific instruction.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(crypto_pq_ct)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(crypto_pq_ct)', 'cfg(crypto_pq_portable)'] }

@@ -1,6 +1,7 @@
+use crate::cpu;
 use crate::wipe::wipe;
 
-const K256: [u32; 64] = [
+pub(crate) const K256: [u32; 64] = [
     0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
     0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174,
     0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC, 0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA,
@@ -11,7 +12,7 @@ const K256: [u32; 64] = [
     0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2,
 ];
 
-const K512: [u64; 80] = [
+pub(crate) const K512: [u64; 80] = [
     0x428A2F98D728AE22,
     0x7137449123EF65CD,
     0xB5C0FBCFEC4D3B2F,
@@ -160,7 +161,9 @@ impl<const N: usize> Blocks<N> {
         }
     }
 
-    fn update(&mut self, mut data: &[u8], mut process: impl FnMut(&[u8; N])) {
+    // The whole blocks go to process in one call, so that a CPU kernel keeps the state in its
+    // registers from one block to the next.
+    fn update(&mut self, mut data: &[u8], mut process: impl FnMut(&[[u8; N]])) {
         if self.len > 0 {
             let take = (N - self.len).min(data.len());
 
@@ -174,15 +177,15 @@ impl<const N: usize> Blocks<N> {
                 return;
             }
 
-            process(&self.bytes);
+            process(core::slice::from_ref(&self.bytes));
 
             self.len = 0;
         }
 
         let (blocks, rest) = data.as_chunks::<N>();
 
-        for block in blocks {
-            process(block);
+        if !blocks.is_empty() {
+            process(blocks);
         }
 
         self.bytes[..rest.len()].copy_from_slice(rest);
@@ -191,7 +194,7 @@ impl<const N: usize> Blocks<N> {
     }
 
     // FIPS 180-4, 5.1: the 0x80 marker, zeros, then the message length in bits, big-endian.
-    fn finish(&self, bits: &[u8], mut process: impl FnMut(&[u8; N])) {
+    fn finish(&self, bits: &[u8], process: impl FnOnce(&[[u8; N]])) {
         let mut tail = [[0; N]; 2];
 
         tail[0][..self.len].copy_from_slice(&self.bytes[..self.len]);
@@ -202,9 +205,7 @@ impl<const N: usize> Blocks<N> {
 
         tail[used - 1][N - bits.len()..].copy_from_slice(bits);
 
-        for block in &tail[..used] {
-            process(block);
-        }
+        process(&tail[..used]);
 
         wipe(tail.as_flattened_mut());
     }
@@ -235,7 +236,17 @@ fn round256(a: u32, b: u32, c: u32, d: &mut u32, e: u32, f: u32, g: u32, h: &mut
     *h = s0.wrapping_add((a & b) | (c & (a | b))).wrapping_add(t1);
 }
 
-fn compress256(state: &mut [u32; 8], block: &[u8; 64]) {
+fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+    if cpu::compress256(state, blocks) {
+        return;
+    }
+
+    for block in blocks {
+        compress256_block(state, block);
+    }
+}
+
+fn compress256_block(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 16];
 
     for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
@@ -333,8 +344,19 @@ fn round256_lanes<const LANES: usize>(
 }
 
 // The states and the blocks are word-major: states[i][lane] is word i of the state of that lane.
-// The schedule overwrites the blocks.
+// The schedule may overwrite the blocks.
 fn compress256_lanes<const LANES: usize>(
+    states: &mut [Lanes<LANES>; 8],
+    w: &mut [Lanes<LANES>; 16],
+) {
+    if !cpu::compress256_lanes(states, w) {
+        compress256_lanes_portable(states, w);
+    }
+}
+
+// Always inlined, so that a caller built for wider vectors (x86-64 AVX2) vectorizes it for them.
+#[inline(always)]
+pub(crate) fn compress256_lanes_portable<const LANES: usize>(
     states: &mut [Lanes<LANES>; 8],
     w: &mut [Lanes<LANES>; 16],
 ) {
@@ -414,7 +436,17 @@ fn round512(a: u64, b: u64, c: u64, d: &mut u64, e: u64, f: u64, g: u64, h: &mut
     *h = s0.wrapping_add((a & b) | (c & (a | b))).wrapping_add(t1);
 }
 
-fn compress512(state: &mut [u64; 8], block: &[u8; 128]) {
+fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]]) {
+    if cpu::compress512(state, blocks) {
+        return;
+    }
+
+    for block in blocks {
+        compress512_block(state, block);
+    }
+}
+
+fn compress512_block(state: &mut [u64; 8], block: &[u8; 128]) {
     let mut w = [0u64; 16];
 
     for (word, bytes) in w.iter_mut().zip(block.as_chunks::<8>().0) {
@@ -489,7 +521,8 @@ impl Sha256 {
 
         let state = &mut self.state;
 
-        self.blocks.update(data, |block| compress256(state, block));
+        self.blocks
+            .update(data, |blocks| compress256(state, blocks));
     }
 
     pub(crate) fn digest(&self) -> [u8; 32] {
@@ -498,7 +531,7 @@ impl Sha256 {
         let bits = self.length.wrapping_mul(8).to_be_bytes();
 
         self.blocks
-            .finish(&bits, |block| compress256(&mut state, block));
+            .finish(&bits, |blocks| compress256(&mut state, blocks));
 
         let mut out = [0; 32];
 
@@ -610,7 +643,8 @@ impl Sha512 {
 
         let state = &mut self.state;
 
-        self.blocks.update(data, |block| compress512(state, block));
+        self.blocks
+            .update(data, |blocks| compress512(state, blocks));
     }
 
     pub(crate) fn digest(&self) -> [u8; 64] {
@@ -619,7 +653,7 @@ impl Sha512 {
         let bits = self.length.wrapping_mul(8).to_be_bytes();
 
         self.blocks
-            .finish(&bits, |block| compress512(&mut state, block));
+            .finish(&bits, |blocks| compress512(&mut state, blocks));
 
         let mut out = [0; 64];
 
@@ -655,9 +689,7 @@ impl Sha512 {
 
         let mut state = self.state;
 
-        for block in message[..end].as_chunks::<128>().0 {
-            compress512(&mut state, block);
-        }
+        compress512(&mut state, message[..end].as_chunks::<128>().0);
 
         let mut out = [0; 64];
 
@@ -682,5 +714,147 @@ impl Drop for Sha256 {
 impl Drop for Sha512 {
     fn drop(&mut self) {
         wipe(&mut self.state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpu::testing::{EDGES, Inputs};
+
+    const CASES: usize = 20_000;
+
+    // Each case is a state and up to three blocks: every combination of edge patterns first,
+    // then random ones. Where neither the build nor the CPU has a kernel, the cpu functions
+    // return false and only the portable code runs.
+    fn case<const W: usize, T: Copy, const B: usize>(
+        inputs: &mut Inputs,
+        case: usize,
+        word: impl Fn(u64) -> T,
+    ) -> ([T; W], [[u8; B]; 3]) {
+        match case.checked_sub(EDGES.len() * EDGES.len()) {
+            None => {
+                let (state, block) = (EDGES[case / EDGES.len()], EDGES[case % EDGES.len()]);
+
+                ([word(state); W], [[block as u8; B]; 3])
+            }
+            Some(_) => (
+                inputs.words::<W>().map(word),
+                [inputs.bytes(), inputs.bytes(), inputs.bytes()],
+            ),
+        }
+    }
+
+    #[test]
+    fn sha256_kernel_matches_portable() {
+        let mut inputs = Inputs::new(256);
+
+        let mut accelerated = 0;
+
+        for n in 0..CASES {
+            let (state, blocks) = case::<8, u32, 64>(&mut inputs, n, |x| x as u32);
+
+            let blocks = &blocks[..1 + n % 3];
+
+            let mut expected = state;
+
+            for block in blocks {
+                compress256_block(&mut expected, block);
+            }
+
+            let mut actual = state;
+
+            if cpu::compress256(&mut actual, blocks) {
+                assert_eq!(actual, expected, "case {n}");
+
+                accelerated += 1;
+            }
+        }
+
+        std::eprintln!("SHA-256: {accelerated} of {CASES} cases through a CPU kernel");
+    }
+
+    fn lanes_match<const LANES: usize>(inputs: &mut Inputs, cases: usize) -> usize {
+        let mut accelerated = 0;
+
+        for n in 0..cases {
+            let edge = n < EDGES.len() * EDGES.len();
+
+            let mut states = [[0u32; LANES]; 8];
+
+            let mut w = [[0u32; LANES]; 16];
+
+            for word in states.as_flattened_mut() {
+                *word = if edge {
+                    EDGES[n / EDGES.len()] as u32
+                } else {
+                    inputs.next() as u32
+                };
+            }
+
+            for word in w.as_flattened_mut() {
+                *word = if edge {
+                    EDGES[n % EDGES.len()] as u32
+                } else {
+                    inputs.next() as u32
+                };
+            }
+
+            let mut expected = states;
+
+            compress256_lanes_portable(&mut expected, &mut w.clone());
+
+            let mut actual = states;
+
+            if cpu::compress256_lanes(&mut actual, &mut w) {
+                assert_eq!(actual, expected, "{LANES} lanes, case {n}");
+
+                accelerated += 1;
+            }
+        }
+
+        accelerated
+    }
+
+    #[test]
+    fn sha256_lane_kernel_matches_portable() {
+        let mut inputs = Inputs::new(16);
+
+        let accelerated = lanes_match::<1>(&mut inputs, 4_000)
+            + lanes_match::<2>(&mut inputs, 4_000)
+            + lanes_match::<3>(&mut inputs, 4_000)
+            + lanes_match::<4>(&mut inputs, 4_000)
+            + lanes_match::<16>(&mut inputs, 4_000);
+
+        std::eprintln!("SHA-256 lanes: {accelerated} of 20000 cases through a CPU kernel");
+    }
+
+    #[test]
+    fn sha512_kernel_matches_portable() {
+        let mut inputs = Inputs::new(512);
+
+        let mut accelerated = 0;
+
+        for n in 0..CASES {
+            let (state, blocks) = case::<8, u64, 128>(&mut inputs, n, |x| x);
+
+            let blocks = &blocks[..1 + n % 3];
+
+            let mut expected = state;
+
+            for block in blocks {
+                compress512_block(&mut expected, block);
+            }
+
+            let mut actual = state;
+
+            if cpu::compress512(&mut actual, blocks) {
+                assert_eq!(actual, expected, "case {n}");
+
+                accelerated += 1;
+            }
+        }
+
+        std::eprintln!("SHA-512: {accelerated} of {CASES} cases through a CPU kernel");
     }
 }
