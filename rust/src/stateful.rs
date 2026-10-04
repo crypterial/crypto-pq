@@ -42,6 +42,39 @@ pub enum StatefulParameters<'a> {
     Name(&'a str),
 }
 
+// reserve: how many indices one write to the store claims, at least 1. A key that stops before
+// using them loses the rest, because loading starts after them. It is not part of the stored
+// state, so a generated key and a loaded one each take it as an option.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StatefulKeyGenOptions {
+    pub reserve: u64,
+}
+
+impl Default for StatefulKeyGenOptions {
+    fn default() -> Self {
+        Self { reserve: 1 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StatefulLoadOptions {
+    pub reserve: u64,
+}
+
+impl Default for StatefulLoadOptions {
+    fn default() -> Self {
+        Self { reserve: 1 }
+    }
+}
+
+pub(crate) fn check_reserve(reserve: u64) -> Result<u64, Error> {
+    if reserve == 0 {
+        return Err(Error::InvalidOption);
+    }
+
+    Ok(reserve)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Kind {
     Hss,
@@ -174,18 +207,26 @@ impl StatefulSignatureAlgorithm {
         &self,
         parameters: StatefulParameters,
         store: S,
+        options: &StatefulKeyGenOptions,
     ) -> Result<StatefulKeyPair<S>, Error> {
+        let reserve = check_reserve(options.reserve)?;
+
         let parameters = self.parameters(parameters)?;
 
         let seed = random_bytes(parameters.seed_size())?;
 
-        self.create(parameters, seed, 0, store)
+        self.create(parameters, seed, 0, reserve, store)
     }
 
+    // The stored index is the first one not handed out, so signing resumes there even when the
+    // last key reserved more than it used.
     pub fn load_private_key<S: StateStore>(
         &self,
         mut store: S,
+        options: &StatefulLoadOptions,
     ) -> Result<StatefulPrivateKey<S>, Error> {
+        let reserve = check_reserve(options.reserve)?;
+
         let state = store
             .read()
             .map_err(|_| Error::StatePersistFailed)?
@@ -209,6 +250,8 @@ impl StatefulSignatureAlgorithm {
             store,
             state,
             index,
+            reserved: index,
+            reserve,
         })
     }
 
@@ -250,11 +293,13 @@ impl StatefulSignatureAlgorithm {
         }
     }
 
+    // The new key stores index itself; its first signature reserves the indices after it.
     pub(crate) fn create<S: StateStore>(
         &self,
         parameters: Parameters,
         seed: SecretBytes,
         index: u64,
+        reserve: u64,
         mut store: S,
     ) -> Result<StatefulKeyPair<S>, Error> {
         let signer = Signer::new(&parameters, &seed);
@@ -275,6 +320,8 @@ impl StatefulSignatureAlgorithm {
             store,
             state,
             index,
+            reserved: index,
+            reserve,
         };
 
         Ok(StatefulKeyPair {
@@ -453,7 +500,13 @@ impl fmt::Debug for StatefulPublicKey {
     }
 }
 
-// The seeds and the state are SecretBytes, which wipe themselves when the key is dropped.
+// The seeds and the state are SecretBytes, which wipe themselves when the key is dropped, and so
+// does each state the key replaces. `index` is the next index to sign with and `reserved` the one
+// in the stored state, never below it: the indices in between are claimed and unused.
+//
+// sign takes &mut self, so two calls on one key cannot overlap, and the key owns its store, so the
+// store's update cannot reach the key that is signing: a store that holds the key through a
+// RefCell finds it borrowed, and safe code has no other way back in.
 pub struct StatefulPrivateKey<S> {
     algorithm: StatefulSignatureAlgorithm,
     parameters: Parameters,
@@ -462,6 +515,8 @@ pub struct StatefulPrivateKey<S> {
     store: S,
     state: SecretBytes,
     index: u64,
+    reserved: u64,
+    reserve: u64,
 }
 
 impl<S> StatefulPrivateKey<S> {
@@ -482,26 +537,34 @@ impl<S> StatefulPrivateKey<S> {
 }
 
 impl<S: StateStore> StatefulPrivateKey<S> {
-    // The next index is written to the store before the signature exists, so a crash or a
-    // failed write can waste an index but never use one twice.
+    // Indices are claimed in the store before any signature uses them, `reserve` at a time, so a
+    // crash or a failed write can waste indices but never use one twice.
     pub fn sign(&mut self, message: &[u8]) -> Result<Vec<u8>, Error> {
         let index = self.index;
 
-        if index >= self.parameters.capacity() {
+        let capacity = self.parameters.capacity();
+
+        if index >= capacity {
             return Err(Error::KeyExhausted);
         }
 
-        let next = self
-            .algorithm
-            .encode(&self.parameters, &self.seed, index + 1);
+        if index == self.reserved {
+            let reserved = index.saturating_add(self.reserve).min(capacity);
 
-        match self.store.update(Some(&self.state), &next) {
-            Err(_) => return Err(Error::StatePersistFailed),
-            Ok(false) => return Err(Error::StateConflict),
-            Ok(true) => {}
+            let next = self
+                .algorithm
+                .encode(&self.parameters, &self.seed, reserved);
+
+            match self.store.update(Some(&self.state), &next) {
+                Err(_) => return Err(Error::StatePersistFailed),
+                Ok(false) => return Err(Error::StateConflict),
+                Ok(true) => {}
+            }
+
+            self.state = next;
+
+            self.reserved = reserved;
         }
-
-        self.state = next;
 
         self.index = index + 1;
 

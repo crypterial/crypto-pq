@@ -1,10 +1,11 @@
 mod vectors;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crypto_pq::{
-    Error, HSS_LMS, KeyFormat, SHA_256, StateStore, StatefulParameters, XMSS, XMSS_MT, hazmat,
+    Error, HSS_LMS, KeyFormat, SHA_256, StateStore, StatefulKeyGenOptions, StatefulLoadOptions,
+    StatefulParameters, StatefulPrivateKey, XMSS, XMSS_MT, hazmat,
 };
 use vectors::{der, parallel, records, unhex};
 
@@ -69,12 +70,14 @@ fn slow() -> bool {
 #[derive(Default)]
 struct MemoryStore {
     state: Option<Vec<u8>>,
+    writes: usize,
 }
 
 impl MemoryStore {
     fn holding(state: &[u8]) -> Self {
         Self {
             state: Some(state.to_vec()),
+            writes: 0,
         }
     }
 }
@@ -91,6 +94,8 @@ impl StateStore for MemoryStore {
 
         self.state = Some(next.to_vec());
 
+        self.writes += 1;
+
         Ok(true)
     }
 }
@@ -98,6 +103,25 @@ impl StateStore for MemoryStore {
 // One store seen by several keys, like a file that two processes open.
 #[derive(Clone, Default)]
 struct SharedStore(Rc<RefCell<MemoryStore>>);
+
+impl SharedStore {
+    // The next index of the stored HSS state, which ends with u64 index and the checksum.
+    fn index(&self) -> u64 {
+        let store = self.0.borrow();
+
+        let state = store.state.as_deref().expect("a stored state");
+
+        u64::from_be_bytes(
+            state[state.len() - 24..state.len() - 16]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    fn writes(&self) -> usize {
+        self.0.borrow().writes
+    }
+}
 
 impl StateStore for SharedStore {
     fn read(&mut self) -> Result<Option<Vec<u8>>, Error> {
@@ -209,6 +233,7 @@ fn hss_acvp_key_generation() {
                 &seed,
                 0,
                 MemoryStore::default(),
+                &StatefulKeyGenOptions::default(),
             )
             .unwrap();
 
@@ -294,6 +319,7 @@ fn hss_rfc_vectors() {
             &seed,
             index,
             MemoryStore::default(),
+            &StatefulKeyGenOptions::default(),
         )
         .unwrap();
 
@@ -320,7 +346,11 @@ fn hss_state_handling() {
     let store = SharedStore::default();
 
     let mut pair = HSS_LMS
-        .generate_key_pair(StatefulParameters::Levels(&SMALL), store.clone())
+        .generate_key_pair(
+            StatefulParameters::Levels(&SMALL),
+            store.clone(),
+            &StatefulKeyGenOptions::default(),
+        )
         .unwrap();
 
     assert_eq!(pair.private_key.remaining_signatures(), 32);
@@ -337,7 +367,9 @@ fn hss_state_handling() {
 
     assert_eq!(pair.private_key.remaining_signatures(), 30);
 
-    let mut loaded = HSS_LMS.load_private_key(store.clone()).unwrap();
+    let mut loaded = HSS_LMS
+        .load_private_key(store.clone(), &StatefulLoadOptions::default())
+        .unwrap();
 
     assert_eq!(loaded.public_key(), pair.public_key);
 
@@ -362,13 +394,19 @@ fn hss_state_handling() {
 
     assert_eq!(
         HSS_LMS
-            .generate_key_pair(StatefulParameters::Levels(&SMALL), store.clone())
+            .generate_key_pair(
+                StatefulParameters::Levels(&SMALL),
+                store.clone(),
+                &StatefulKeyGenOptions::default()
+            )
             .err()
             .map(|error| error.code()),
         Some("STATE_CONFLICT")
     );
 
-    let reloaded = HSS_LMS.load_private_key(store).unwrap();
+    let reloaded = HSS_LMS
+        .load_private_key(store, &StatefulLoadOptions::default())
+        .unwrap();
 
     assert_eq!(reloaded.remaining_signatures(), 0);
 }
@@ -378,7 +416,11 @@ fn hss_store_failures() {
     let mut broken = BrokenStore::default();
 
     let mut pair = HSS_LMS
-        .generate_key_pair(StatefulParameters::Levels(&SMALL), &mut broken)
+        .generate_key_pair(
+            StatefulParameters::Levels(&SMALL),
+            &mut broken,
+            &StatefulKeyGenOptions::default(),
+        )
         .unwrap();
 
     assert_eq!(
@@ -400,20 +442,28 @@ fn hss_store_failures() {
 
     for store in [MemoryStore::holding(&damaged), MemoryStore::default()] {
         assert_eq!(
-            HSS_LMS.load_private_key(store).err(),
+            HSS_LMS
+                .load_private_key(store, &StatefulLoadOptions::default())
+                .err(),
             Some(Error::InvalidPrivateKey)
         );
     }
 
     assert_eq!(
-        XMSS.load_private_key(MemoryStore::holding(&state)).err(),
+        XMSS.load_private_key(
+            MemoryStore::holding(&state),
+            &StatefulLoadOptions::default()
+        )
+        .err(),
         Some(Error::AlgorithmMismatch)
     );
 
     broken.unreadable = true;
 
     assert_eq!(
-        HSS_LMS.load_private_key(&mut broken).err(),
+        HSS_LMS
+            .load_private_key(&mut broken, &StatefulLoadOptions::default())
+            .err(),
         Some(Error::StatePersistFailed)
     );
 
@@ -425,7 +475,10 @@ fn hss_store_failures() {
 
     assert_eq!(
         HSS_LMS
-            .load_private_key(MemoryStore::holding(&truncated))
+            .load_private_key(
+                MemoryStore::holding(&truncated),
+                &StatefulLoadOptions::default()
+            )
             .err(),
         Some(Error::InvalidPrivateKey)
     );
@@ -456,7 +509,11 @@ fn hss_parameters() {
     ];
 
     for parameters in invalid {
-        let result = HSS_LMS.generate_key_pair(parameters, MemoryStore::default());
+        let result = HSS_LMS.generate_key_pair(
+            parameters,
+            MemoryStore::default(),
+            &StatefulKeyGenOptions::default(),
+        );
 
         assert_eq!(result.err(), Some(Error::InvalidOption), "{parameters:?}");
     }
@@ -468,19 +525,42 @@ fn hss_parameters() {
     let mut store = MemoryStore::default();
 
     assert_eq!(
-        hazmat::generate_stateful_key_pair(HSS_LMS, small, &seed[..39], 0, &mut store).err(),
+        hazmat::generate_stateful_key_pair(
+            HSS_LMS,
+            small,
+            &seed[..39],
+            0,
+            &mut store,
+            &StatefulKeyGenOptions::default()
+        )
+        .err(),
         Some(Error::InvalidLength)
     );
 
     assert_eq!(
-        hazmat::generate_stateful_key_pair(HSS_LMS, small, &seed, 33, &mut store).err(),
+        hazmat::generate_stateful_key_pair(
+            HSS_LMS,
+            small,
+            &seed,
+            33,
+            &mut store,
+            &StatefulKeyGenOptions::default()
+        )
+        .err(),
         Some(Error::InvalidOption)
     );
 
     assert!(store.state.is_none());
 
-    let mut exhausted =
-        hazmat::generate_stateful_key_pair(HSS_LMS, small, &seed, 32, store).unwrap();
+    let mut exhausted = hazmat::generate_stateful_key_pair(
+        HSS_LMS,
+        small,
+        &seed,
+        32,
+        store,
+        &StatefulKeyGenOptions::default(),
+    )
+    .unwrap();
 
     assert_eq!(exhausted.private_key.remaining_signatures(), 0);
 
@@ -500,6 +580,7 @@ fn hss_tree_boundary() {
         &[0; 40],
         31,
         MemoryStore::default(),
+        &StatefulKeyGenOptions::default(),
     )
     .unwrap();
 
@@ -517,7 +598,11 @@ fn hss_tree_boundary() {
 #[test]
 fn hss_formats() {
     let pair = HSS_LMS
-        .generate_key_pair(StatefulParameters::Levels(&SMALL), MemoryStore::default())
+        .generate_key_pair(
+            StatefulParameters::Levels(&SMALL),
+            MemoryStore::default(),
+            &StatefulKeyGenOptions::default(),
+        )
         .unwrap();
 
     for format in [KeyFormat::Raw, KeyFormat::Der, KeyFormat::Pem] {
@@ -612,6 +697,7 @@ fn xmss_reference_vectors() {
             &unhex(&record["seed"]),
             index,
             MemoryStore::default(),
+            &StatefulKeyGenOptions::default(),
         )
         .unwrap();
 
@@ -635,7 +721,9 @@ fn xmss_state_handling() {
 
     let parameters = StatefulParameters::Name("XMSSMT-SHAKE256_20/4_192");
 
-    let mut pair = XMSS_MT.generate_key_pair(parameters, &mut store).unwrap();
+    let mut pair = XMSS_MT
+        .generate_key_pair(parameters, &mut store, &StatefulKeyGenOptions::default())
+        .unwrap();
 
     let signature = pair.private_key.sign(b"message").unwrap();
 
@@ -645,7 +733,9 @@ fn xmss_state_handling() {
 
     drop(pair);
 
-    let loaded = XMSS_MT.load_private_key(&mut store).unwrap();
+    let loaded = XMSS_MT
+        .load_private_key(&mut store, &StatefulLoadOptions::default())
+        .unwrap();
 
     assert_eq!(loaded.remaining_signatures(), (1 << 20) - 1);
 
@@ -670,7 +760,11 @@ fn xmss_state_handling() {
     for (algorithm, parameters) in invalid {
         assert_eq!(
             algorithm
-                .generate_key_pair(parameters, MemoryStore::default())
+                .generate_key_pair(
+                    parameters,
+                    MemoryStore::default(),
+                    &StatefulKeyGenOptions::default()
+                )
                 .err(),
             Some(Error::InvalidOption)
         );
@@ -691,7 +785,8 @@ fn xmss_state_handling() {
     );
 
     assert_eq!(
-        XMSS.load_private_key(&mut store).err(),
+        XMSS.load_private_key(&mut store, &StatefulLoadOptions::default())
+            .err(),
         Some(Error::AlgorithmMismatch)
     );
 
@@ -711,6 +806,7 @@ fn cross_language_state() {
         &hss_seed,
         3,
         &mut store,
+        &StatefulKeyGenOptions::default(),
     )
     .unwrap();
 
@@ -749,7 +845,7 @@ fn cross_language_state() {
 
     for state in [&hss_state, &next_state] {
         let loaded = HSS_LMS
-            .load_private_key(MemoryStore::holding(state))
+            .load_private_key(MemoryStore::holding(state), &StatefulLoadOptions::default())
             .unwrap();
 
         assert_eq!(
@@ -768,6 +864,7 @@ fn cross_language_state() {
         &xmss_seed,
         5,
         &mut store,
+        &StatefulKeyGenOptions::default(),
     )
     .unwrap();
 
@@ -791,8 +888,330 @@ fn cross_language_state() {
     assert_eq!(store.state.as_deref(), Some(&xmss_state[..]));
 
     let loaded = XMSS_MT
-        .load_private_key(MemoryStore::holding(&xmss_state))
+        .load_private_key(
+            MemoryStore::holding(&xmss_state),
+            &StatefulLoadOptions::default(),
+        )
         .unwrap();
 
     assert_eq!(loaded.public_key(), public_key);
+}
+
+fn generating(reserve: u64) -> StatefulKeyGenOptions {
+    StatefulKeyGenOptions { reserve }
+}
+
+fn loading(reserve: u64) -> StatefulLoadOptions {
+    StatefulLoadOptions { reserve }
+}
+
+// The LMS leaf index q of a one-level HSS signature.
+fn leaf(signature: &[u8]) -> u32 {
+    read_u32(signature, 4)
+}
+
+#[test]
+fn reserve_claims_indices_ahead() {
+    let store = SharedStore::default();
+
+    let small = StatefulParameters::Levels(&SMALL);
+
+    let mut key = HSS_LMS
+        .generate_key_pair(small, store.clone(), &generating(4))
+        .unwrap()
+        .private_key;
+
+    assert_eq!((store.index(), store.writes()), (0, 1));
+
+    let mut stored = Vec::new();
+
+    for i in 0..10u8 {
+        let signature = key.sign(&[i]).unwrap();
+
+        assert_eq!(leaf(&signature), u32::from(i));
+
+        assert_eq!(key.remaining_signatures(), 31 - u64::from(i));
+
+        stored.push(store.index());
+    }
+
+    assert_eq!(stored, [4, 4, 4, 4, 8, 8, 8, 8, 12, 12]);
+
+    assert_eq!(store.writes(), 4);
+}
+
+// Indices reserved but not used before a stop are skipped: loading starts after them.
+#[test]
+fn reload_skips_the_reserved_range() {
+    let store = SharedStore::default();
+
+    let small = StatefulParameters::Levels(&SMALL);
+
+    let mut pair = HSS_LMS
+        .generate_key_pair(small, store.clone(), &generating(5))
+        .unwrap();
+
+    for message in [b"a", b"b"] {
+        pair.private_key.sign(message).unwrap();
+    }
+
+    drop(pair);
+
+    let mut loaded = HSS_LMS
+        .load_private_key(store.clone(), &StatefulLoadOptions::default())
+        .unwrap();
+
+    assert_eq!(loaded.remaining_signatures(), 27);
+
+    assert_eq!(leaf(&loaded.sign(b"c").unwrap()), 5);
+
+    assert_eq!((store.index(), store.writes()), (6, 3));
+}
+
+// Two keys on one store hold disjoint reservations. A key that runs out of its own cannot claim
+// more once the store has moved on.
+#[test]
+fn reservations_never_overlap() {
+    let store = SharedStore::default();
+
+    let small = StatefulParameters::Levels(&SMALL);
+
+    let mut first = HSS_LMS
+        .generate_key_pair(small, store.clone(), &generating(4))
+        .unwrap()
+        .private_key;
+
+    assert_eq!(leaf(&first.sign(b"0").unwrap()), 0);
+
+    let mut second = HSS_LMS
+        .load_private_key(store.clone(), &loading(4))
+        .unwrap();
+
+    assert_eq!(leaf(&second.sign(b"4").unwrap()), 4);
+
+    for q in 1..4 {
+        assert_eq!(leaf(&first.sign(b"own").unwrap()), q);
+    }
+
+    assert_eq!(first.sign(b"4 again").err(), Some(Error::StateConflict));
+
+    assert_eq!(first.remaining_signatures(), 28);
+
+    assert_eq!(store.index(), 8);
+}
+
+// Reservation never changes what is signed: the same seed and index give the same bytes,
+// across a boundary of the lower HSS trees and of the XMSS^MT layers.
+#[test]
+fn reserve_keeps_the_signatures() {
+    let hss_seed: Vec<u8> = (0..40).collect();
+
+    let levels = [("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W4"); 2];
+
+    let xmss_seed: Vec<u8> = (0..72).collect();
+
+    let cases = [
+        (HSS_LMS, StatefulParameters::Levels(&levels), &hss_seed, 29),
+        (
+            XMSS_MT,
+            StatefulParameters::Name("XMSSMT-SHA2_20/4_192"),
+            &xmss_seed,
+            1021,
+        ),
+    ];
+
+    for (algorithm, parameters, seed, first) in cases {
+        let signatures = |reserve| {
+            let mut key = hazmat::generate_stateful_key_pair(
+                algorithm,
+                parameters,
+                seed,
+                first,
+                MemoryStore::default(),
+                &generating(reserve),
+            )
+            .unwrap()
+            .private_key;
+
+            (0..6u8)
+                .map(|i| key.sign(&[i]).unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let expected = signatures(1);
+
+        for reserve in [2, 5, u64::MAX] {
+            assert_eq!(signatures(reserve), expected, "{reserve}");
+        }
+    }
+}
+
+// A reservation stops at the capacity, even a reservation as large as u64::MAX.
+#[test]
+fn reserve_stops_at_the_capacity() {
+    for reserve in [100, u64::MAX] {
+        let store = SharedStore::default();
+
+        let small = StatefulParameters::Levels(&SMALL);
+
+        let mut key = HSS_LMS
+            .generate_key_pair(small, store.clone(), &generating(reserve))
+            .unwrap()
+            .private_key;
+
+        for q in 0..32 {
+            assert_eq!(leaf(&key.sign(b"m").unwrap()), q);
+        }
+
+        assert_eq!(key.sign(b"m").err(), Some(Error::KeyExhausted));
+
+        assert_eq!((store.index(), store.writes()), (32, 2));
+
+        let loaded = HSS_LMS
+            .load_private_key(store, &StatefulLoadOptions::default())
+            .unwrap();
+
+        assert_eq!(loaded.remaining_signatures(), 0);
+    }
+}
+
+#[test]
+fn reserve_must_be_positive() {
+    let small = StatefulParameters::Levels(&SMALL);
+
+    let mut store = MemoryStore::default();
+
+    assert_eq!(
+        HSS_LMS
+            .generate_key_pair(small, &mut store, &generating(0))
+            .err(),
+        Some(Error::InvalidOption)
+    );
+
+    assert_eq!(
+        hazmat::generate_stateful_key_pair(HSS_LMS, small, &[0; 40], 0, &mut store, &generating(0))
+            .err(),
+        Some(Error::InvalidOption)
+    );
+
+    assert!(store.state.is_none());
+
+    HSS_LMS
+        .generate_key_pair(small, &mut store, &StatefulKeyGenOptions::default())
+        .unwrap();
+
+    assert_eq!(
+        HSS_LMS.load_private_key(&mut store, &loading(0)).err(),
+        Some(Error::InvalidOption)
+    );
+
+    assert_eq!(StatefulKeyGenOptions::default(), generating(1));
+
+    assert_eq!(StatefulLoadOptions::default(), loading(1));
+}
+
+type KeySlot = Rc<RefCell<Option<StatefulPrivateKey<ReachingStore>>>>;
+
+// A store that tries to sign with the key it serves, from inside update.
+struct ReachingStore {
+    inner: MemoryStore,
+    key: KeySlot,
+    refused: Rc<Cell<usize>>,
+}
+
+impl StateStore for ReachingStore {
+    fn read(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        self.inner.read()
+    }
+
+    fn update(&mut self, previous: Option<&[u8]>, next: &[u8]) -> Result<bool, Error> {
+        match self.key.try_borrow_mut() {
+            Ok(mut key) => {
+                if let Some(key) = key.as_mut() {
+                    key.sign(b"from the store")?;
+                }
+            }
+            Err(_) => {
+                assert!(self.key.try_borrow().is_err());
+
+                self.refused.set(self.refused.get() + 1);
+            }
+        }
+
+        self.inner.update(previous, next)
+    }
+}
+
+// sign holds the key exclusively while the store runs, so a store cannot reach the key that is
+// signing, even when it holds the key itself: the borrow is refused, and no index is used twice.
+#[test]
+fn the_store_cannot_reach_the_signing_key() {
+    let slot: KeySlot = Rc::default();
+
+    let refused = Rc::new(Cell::new(0));
+
+    let store = ReachingStore {
+        inner: MemoryStore::default(),
+        key: Rc::clone(&slot),
+        refused: Rc::clone(&refused),
+    };
+
+    let small = StatefulParameters::Levels(&SMALL);
+
+    let pair = HSS_LMS
+        .generate_key_pair(small, store, &StatefulKeyGenOptions::default())
+        .unwrap();
+
+    *slot.borrow_mut() = Some(pair.private_key);
+
+    for q in 0..3 {
+        let signature = slot.borrow_mut().as_mut().unwrap().sign(b"m").unwrap();
+
+        assert_eq!(leaf(&signature), q);
+
+        assert!(pair.public_key.verify(&signature, b"m"));
+    }
+
+    assert_eq!(refused.get(), 3);
+
+    slot.borrow_mut().take();
+}
+
+// The upper XMSS^MT layers keep their part of the signature: a running key must sign exactly as
+// fresh keys at the same indices, across boundaries of the first and second layers.
+#[test]
+fn xmss_mt_kept_layers_match_fresh_keys() {
+    let seed: Vec<u8> = (0..72).collect();
+
+    let parameters = StatefulParameters::Name("XMSSMT-SHA2_20/4_192");
+
+    let options = StatefulKeyGenOptions::default();
+
+    let fresh = |index| {
+        hazmat::generate_stateful_key_pair(
+            XMSS_MT,
+            parameters,
+            &seed,
+            index,
+            MemoryStore::default(),
+            &options,
+        )
+        .unwrap()
+    };
+
+    for first in [30, 1022] {
+        let mut running = fresh(first);
+
+        for index in first..first + 4 {
+            let signature = running.private_key.sign(b"m").unwrap();
+
+            assert!(running.public_key.verify(&signature, b"m"));
+
+            assert_eq!(
+                fresh(index).private_key.sign(b"m").unwrap(),
+                signature,
+                "{index}"
+            );
+        }
+    }
 }

@@ -11,6 +11,7 @@ use crate::keys::{
     encode_expanded, encode_seed, export_private, export_public, import_private, import_public,
 };
 use crate::mldsa;
+use crate::once::{OnceBox, Shared};
 use crate::rng::random_bytes;
 use crate::slhdsa;
 use crate::wipe::SecretBytes;
@@ -234,6 +235,8 @@ impl SignatureAlgorithm {
         }
     }
 
+    // The self-test is the first use of the new keys, so it computes their cached forms from the
+    // encoded keys and checks those too.
     pub fn generate_key_pair(&self, options: &KeyGenOptions) -> Result<SignatureKeyPair, Error> {
         let private_key = self.key_from_seed(&random_bytes(self.seed_size())?);
 
@@ -267,15 +270,9 @@ impl SignatureAlgorithm {
 
         check_size(format, key.len(), self.public_key_size())?;
 
-        let expanded = match self.scheme {
-            Scheme::MlDsa(p) => Some(mldsa::VerifyingKey::new(&key, &p)),
-            Scheme::SlhDsa(_) => None,
-        };
-
         Ok(SignaturePublicKey {
             algorithm: *self,
-            key,
-            expanded,
+            public: Shared::new(PublicPart::new(self.scheme, key)),
         })
     }
 
@@ -299,7 +296,7 @@ impl SignatureAlgorithm {
             }
         };
 
-        if public_key.is_some_and(|public_key| public_key != key.public) {
+        if public_key.is_some_and(|public_key| public_key != key.public.key) {
             return Err(Error::InvalidPrivateKey);
         }
 
@@ -330,8 +327,8 @@ impl SignatureAlgorithm {
             algorithm: *self,
             seed: None,
             private: SecretBytes::concat(&[sk]),
-            public: sk[2 * n..].to_vec(),
-            expanded: None,
+            public: Shared::new(PublicPart::new(self.scheme, sk[2 * n..].to_vec())),
+            signing: None,
         })
     }
 
@@ -374,30 +371,18 @@ impl SignatureAlgorithm {
         p: mldsa::Parameters,
         sk: &[u8],
     ) -> Result<SignaturePrivateKey, Error> {
-        let (public, signing) = mldsa::check_private_key(sk, &p).ok_or(Error::InvalidPrivateKey)?;
+        let public = mldsa::check_private_key(sk, &p).ok_or(Error::InvalidPrivateKey)?;
 
-        Ok(SignaturePrivateKey {
-            algorithm: *self,
-            seed: None,
-            private: SecretBytes::concat(&[sk]),
-            public,
-            expanded: Some(signing),
-        })
+        Ok(self.ml_dsa_key(p, None, SecretBytes::concat(&[sk]), public))
     }
 
     // ML-DSA keeps the seed as its private key; SLH-DSA keeps the 4n-byte key.
     pub(crate) fn key_from_seed(&self, seed: &[u8]) -> SignaturePrivateKey {
         match self.scheme {
             Scheme::MlDsa(p) => {
-                let (public, private, signing) = mldsa::keygen_internal(seed, &p);
+                let (public, private) = mldsa::keygen_internal(seed, &p);
 
-                SignaturePrivateKey {
-                    algorithm: *self,
-                    seed: Some(SecretBytes::concat(&[seed])),
-                    private,
-                    public,
-                    expanded: Some(signing),
-                }
+                self.ml_dsa_key(p, Some(SecretBytes::concat(&[seed])), private, public)
             }
             Scheme::SlhDsa(p) => {
                 let n = p.n;
@@ -409,10 +394,28 @@ impl SignatureAlgorithm {
                     algorithm: *self,
                     seed: None,
                     private,
-                    public,
-                    expanded: None,
+                    public: Shared::new(PublicPart::new(self.scheme, public)),
+                    signing: None,
                 }
             }
+        }
+    }
+
+    fn ml_dsa_key(
+        &self,
+        p: mldsa::Parameters,
+        seed: Option<SecretBytes>,
+        private: SecretBytes,
+        public: Vec<u8>,
+    ) -> SignaturePrivateKey {
+        let signing = OnceBox::new(|| mldsa::SigningKey::new(&private, &p));
+
+        SignaturePrivateKey {
+            algorithm: *self,
+            seed,
+            private,
+            public: Shared::new(PublicPart::new(self.scheme, public)),
+            signing: Some(signing),
         }
     }
 
@@ -450,19 +453,61 @@ impl fmt::Debug for SignatureAlgorithm {
     }
 }
 
-// For ML-DSA, `expanded` is derived from `key` when the key is created, so that no verification
-// samples the matrix or hashes the key again; SLH-DSA has nothing to derive. Equality and
-// hashing look at the key alone.
+// What ML-DSA derives from a public key, computed on first use so that no signature or
+// verification samples the matrix or hashes the key again: Â for both, t̂1 and tr for
+// verification alone.
+#[derive(Clone)]
+struct Derived {
+    matrix: OnceBox<mldsa::Matrix>,
+    verifying: OnceBox<mldsa::VerifyingKey>,
+}
+
+impl Derived {
+    fn new(key: &[u8], p: mldsa::Parameters) -> Self {
+        Self {
+            matrix: OnceBox::new(|| mldsa::Matrix::new(key, &p)),
+            verifying: OnceBox::new(|| mldsa::VerifyingKey::new(key)),
+        }
+    }
+
+    fn matrix(&self, key: &[u8], p: &mldsa::Parameters) -> &mldsa::Matrix {
+        self.matrix.get_or_init(|| mldsa::Matrix::new(key, p))
+    }
+
+    fn verifying(&self, key: &[u8]) -> &mldsa::VerifyingKey {
+        self.verifying.get_or_init(|| mldsa::VerifyingKey::new(key))
+    }
+}
+
+// A public key and what ML-DSA derives from it; SLH-DSA derives nothing. A private key and every
+// public key that comes from it, clones included, share one.
+#[derive(Clone)]
+struct PublicPart {
+    key: Vec<u8>,
+    derived: Option<Derived>,
+}
+
+impl PublicPart {
+    fn new(scheme: Scheme, key: Vec<u8>) -> Self {
+        let derived = match scheme {
+            Scheme::MlDsa(p) => Some(Derived::new(&key, p)),
+            Scheme::SlhDsa(_) => None,
+        };
+
+        Self { key, derived }
+    }
+}
+
+// Equality and hashing look at the key alone.
 #[derive(Clone)]
 pub struct SignaturePublicKey {
     algorithm: SignatureAlgorithm,
-    key: Vec<u8>,
-    expanded: Option<mldsa::VerifyingKey>,
+    public: Shared<PublicPart>,
 }
 
 impl PartialEq for SignaturePublicKey {
     fn eq(&self, other: &Self) -> bool {
-        self.algorithm == other.algorithm && self.key == other.key
+        self.algorithm == other.algorithm && self.public.key == other.public.key
     }
 }
 
@@ -472,7 +517,7 @@ impl Hash for SignaturePublicKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.algorithm.hash(state);
 
-        self.key.hash(state);
+        self.public.key.hash(state);
     }
 }
 
@@ -506,18 +551,22 @@ impl SignaturePublicKey {
 
         let parts = representative.parts();
 
-        match (algorithm.scheme, &self.expanded) {
-            (Scheme::MlDsa(p), Some(expanded)) => {
-                mldsa::verify_internal(expanded, &parts, signature, &p)
+        let key = &self.public.key;
+
+        match (algorithm.scheme, &self.public.derived) {
+            (Scheme::MlDsa(p), Some(derived)) => {
+                let matrix = derived.matrix(key, &p);
+
+                mldsa::verify_internal(matrix, derived.verifying(key), &parts, signature, &p)
             }
-            (Scheme::SlhDsa(p), _) => slhdsa::verify_internal(&parts, signature, &self.key, &p),
-            // Every ML-DSA key is created with its expanded form.
+            (Scheme::SlhDsa(p), _) => slhdsa::verify_internal(&parts, signature, key, &p),
+            // Every ML-DSA key is made with its caches.
             (Scheme::MlDsa(_), None) => false,
         }
     }
 
     pub fn export_key(&self, format: KeyFormat) -> Result<Vec<u8>, Error> {
-        export_public(format, Some(&self.algorithm.oid), &self.key)
+        export_public(format, Some(&self.algorithm.oid), &self.public.key)
     }
 }
 
@@ -529,14 +578,14 @@ impl fmt::Debug for SignaturePublicKey {
     }
 }
 
-// The secret fields are SecretBytes, which wipe themselves when the key is dropped, as does the
-// secret part of `expanded`: for ML-DSA, the form of the key that signing uses.
+// The secret fields are SecretBytes, which wipe themselves when the key is dropped, as does
+// `signing`, the form of an ML-DSA key that signing computes on first use.
 pub struct SignaturePrivateKey {
     algorithm: SignatureAlgorithm,
     seed: Option<SecretBytes>,
     private: SecretBytes,
-    public: Vec<u8>,
-    expanded: Option<mldsa::SigningKey>,
+    public: Shared<PublicPart>,
+    signing: Option<OnceBox<mldsa::SigningKey>>,
 }
 
 impl SignaturePrivateKey {
@@ -547,11 +596,7 @@ impl SignaturePrivateKey {
     pub fn public_key(&self) -> SignaturePublicKey {
         SignaturePublicKey {
             algorithm: self.algorithm,
-            key: self.public.clone(),
-            expanded: self
-                .expanded
-                .as_ref()
-                .map(|signing| signing.verifying_key().clone()),
+            public: self.public.clone(),
         }
     }
 
@@ -589,12 +634,18 @@ impl SignaturePrivateKey {
 
         let parts = representative.parts();
 
-        match (self.algorithm.scheme, &self.expanded) {
-            (Scheme::MlDsa(p), Some(expanded)) => {
-                mldsa::sign_internal(expanded, &parts, randomness, &p)
+        let sk = &self.private;
+
+        match (self.algorithm.scheme, &self.public.derived, &self.signing) {
+            (Scheme::MlDsa(p), Some(derived), Some(signing)) => {
+                let matrix = derived.matrix(&self.public.key, &p);
+
+                let key = signing.get_or_init(|| mldsa::SigningKey::new(sk, &p));
+
+                mldsa::sign_internal(matrix, key, sk, &parts, randomness, &p)
             }
-            (Scheme::SlhDsa(p), _) => slhdsa::sign_internal(&parts, &self.private, randomness, &p),
-            (Scheme::MlDsa(_), None) => unreachable!("every ML-DSA key has its expanded form"),
+            (Scheme::SlhDsa(p), ..) => slhdsa::sign_internal(&parts, sk, randomness, &p),
+            (Scheme::MlDsa(_), ..) => unreachable!("every ML-DSA key is made with its caches"),
         }
     }
 
@@ -623,4 +674,101 @@ impl fmt::Debug for SignaturePrivateKey {
 pub struct SignatureKeyPair {
     pub public_key: SignaturePublicKey,
     pub private_key: SignaturePrivateKey,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hazmat;
+
+    // Whether Â, t̂1 and tr, and the signing form of a private key, are filled.
+    fn filled(key: &SignaturePrivateKey) -> (bool, bool, bool) {
+        let derived = key.public.derived.as_ref().expect("an ML-DSA key");
+
+        (
+            derived.matrix.get().is_some(),
+            derived.verifying.get().is_some(),
+            key.signing.as_ref().and_then(OnceBox::get).is_some(),
+        )
+    }
+
+    const MESSAGE: &[u8] = b"lazy caches";
+
+    // The caches fill on first use, which for a generated key is its self-test, and a key pair
+    // shares one public part. Signing needs Â but not t̂1.
+    #[test]
+    fn caches_fill_on_first_use_and_are_shared() {
+        let options = SignOptions {
+            deterministic: true,
+            ..SignOptions::default()
+        };
+
+        for algorithm in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
+            let pair = hazmat::generate_signature_key_pair(algorithm, &[5; 32]).expect("key pair");
+
+            let (public_key, private_key) = (&pair.public_key, &pair.private_key);
+
+            assert!(core::ptr::eq(&*public_key.public, &*private_key.public));
+
+            assert_eq!(filled(private_key), (false, false, false));
+
+            let signed = private_key.sign(MESSAGE, &options).expect("signature");
+
+            assert_eq!(filled(private_key), (true, false, true));
+
+            assert!(public_key.verify(&signed, MESSAGE, &VerifyOptions::default()));
+
+            assert_eq!(filled(private_key), (true, true, true));
+
+            let raw = public_key.export_key(KeyFormat::Raw).expect("export");
+
+            let imported = algorithm
+                .import_public_key(&raw, KeyFormat::Raw)
+                .expect("import");
+
+            let derived = imported.public.derived.as_ref().expect("an ML-DSA key");
+
+            assert!(derived.matrix.get().is_none() && derived.verifying.get().is_none());
+
+            assert!(imported.verify(&signed, MESSAGE, &VerifyOptions::default()));
+
+            assert!(derived.matrix.get().is_some() && derived.verifying.get().is_some());
+
+            for format in [KeyFormat::Raw, KeyFormat::Der] {
+                let exported = private_key.export_key(format).expect("export");
+
+                let reimported = algorithm
+                    .import_private_key(&exported, format)
+                    .expect("import");
+
+                assert_eq!(filled(&reimported), (false, false, false));
+
+                assert_eq!(reimported.sign(MESSAGE, &options), Ok(signed.clone()));
+            }
+
+            let generated = algorithm
+                .generate_key_pair(&KeyGenOptions::default())
+                .expect("key pair");
+
+            assert_eq!(filled(&generated.private_key), (true, true, true));
+
+            let untested = algorithm
+                .generate_key_pair(&KeyGenOptions { self_test: false })
+                .expect("key pair");
+
+            assert_eq!(filled(&untested.private_key), (false, false, false));
+        }
+    }
+
+    #[test]
+    fn slh_dsa_keys_have_no_caches() {
+        let pair = hazmat::generate_signature_key_pair(SLH_DSA_SHAKE_128F, &[4; 48]).expect("key");
+
+        assert!(pair.private_key.public.derived.is_none() && pair.private_key.signing.is_none());
+
+        assert!(core::ptr::eq(
+            &*pair.public_key.public,
+            &*pair.private_key.public
+        ));
+    }
 }

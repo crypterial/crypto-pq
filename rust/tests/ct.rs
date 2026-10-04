@@ -10,8 +10,8 @@ use crypto_pq::{
     Error, HSS_LMS, KemAlgorithm, KemPrivateKey, KemPublicKey, KeyFormat, KeyGenOptions, ML_DSA_44,
     ML_DSA_65, ML_DSA_87, ML_KEM_512, ML_KEM_768, ML_KEM_1024, SLH_DSA_SHA2_192F,
     SLH_DSA_SHAKE_128F, SignOptions, SignatureAlgorithm, SignaturePrivateKey, SignaturePublicKey,
-    StateStore, StatefulParameters, StatefulSignatureAlgorithm, VerifyOptions, X_WING, XMSS_MT,
-    hazmat,
+    StateStore, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
+    StatefulSignatureAlgorithm, VerifyOptions, X_WING, XMSS_MT, hazmat,
 };
 
 const MESSAGE: &[u8] = b"crypto-pq constant-time check";
@@ -369,9 +369,15 @@ fn stateful(
     let seed = secret_bytes(seed_size, 5);
 
     let public_key = {
-        let mut pair =
-            hazmat::generate_stateful_key_pair(algorithm, parameters, &seed, 0, &mut store)
-                .unwrap();
+        let mut pair = hazmat::generate_stateful_key_pair(
+            algorithm,
+            parameters,
+            &seed,
+            0,
+            &mut store,
+            &StatefulKeyGenOptions::default(),
+        )
+        .unwrap();
 
         let signed = pair.private_key.sign(MESSAGE).unwrap();
 
@@ -381,14 +387,20 @@ fn stateful(
     };
 
     // Loading rebuilds the trees from the seeds in the stored state.
-    let mut loaded = algorithm.load_private_key(&mut store).unwrap();
+    let mut loaded = algorithm
+        .load_private_key(&mut store, &StatefulLoadOptions::default())
+        .unwrap();
 
     let signed = loaded.sign(MESSAGE).unwrap();
 
     assert!(public_key.verify(&signed, MESSAGE));
 
     let mut generated = algorithm
-        .generate_key_pair(parameters, Store::default())
+        .generate_key_pair(
+            parameters,
+            Store::default(),
+            &StatefulKeyGenOptions::default(),
+        )
         .unwrap();
 
     let signed = generated.private_key.sign(MESSAGE).unwrap();

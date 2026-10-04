@@ -15,8 +15,8 @@ use crypto_pq::{
     SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F,
     SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F,
     SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, SignaturePrivateKey, SignaturePublicKey,
-    StateStore, StatefulParameters, StatefulSignatureAlgorithm, VerifyOptions, X_WING, XMSS,
-    XMSS_MT, XofAlgorithm, hazmat,
+    StateStore, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
+    StatefulSignatureAlgorithm, VerifyOptions, X_WING, XMSS, XMSS_MT, XofAlgorithm, hazmat,
 };
 
 // Counts the bytes that each thread holds, so that a test can bound what one call allocates.
@@ -1157,6 +1157,7 @@ fn verify_stateful() {
         &pattern(40, 0),
         33,
         MemoryStore::default(),
+        &StatefulKeyGenOptions::default(),
     )
     .expect("key");
 
@@ -1174,6 +1175,7 @@ fn verify_stateful() {
         &pattern(72, 0),
         7,
         MemoryStore::default(),
+        &StatefulKeyGenOptions::default(),
     )
     .expect("key");
 
@@ -1504,6 +1506,7 @@ fn hss_state(levels: &[(&str, &str)], seed: &[u8], index: u64) -> Vec<u8> {
         seed,
         index,
         store.clone(),
+        &StatefulKeyGenOptions::default(),
     )
     .expect("key");
 
@@ -1521,6 +1524,7 @@ fn xmss_state(algorithm: StatefulSignatureAlgorithm, name: &str, index: u64) -> 
         &pattern(3 * n, 0),
         index,
         store.clone(),
+        &StatefulKeyGenOptions::default(),
     )
     .expect("key");
 
@@ -1534,7 +1538,7 @@ fn check_state(algorithm: StatefulSignatureAlgorithm, state: &[u8], budget: u64)
         Err(code) => {
             assert_eq!(
                 algorithm
-                    .load_private_key(MemoryStore::holding(state))
+                    .load_private_key(MemoryStore::holding(state), &StatefulLoadOptions::default())
                     .err(),
                 Some(code),
                 "{} loaded {}",
@@ -1550,7 +1554,7 @@ fn check_state(algorithm: StatefulSignatureAlgorithm, state: &[u8], budget: u64)
     if index > capacity {
         assert_eq!(
             algorithm
-                .load_private_key(MemoryStore::holding(state))
+                .load_private_key(MemoryStore::holding(state), &StatefulLoadOptions::default())
                 .err(),
             Some(Error::InvalidPrivateKey)
         );
@@ -1565,7 +1569,7 @@ fn check_state(algorithm: StatefulSignatureAlgorithm, state: &[u8], budget: u64)
     let store = MemoryStore::holding(state);
 
     let mut key = algorithm
-        .load_private_key(store.clone())
+        .load_private_key(store.clone(), &StatefulLoadOptions::default())
         .unwrap_or_else(|error| panic!("{}: {error} for {}", algorithm.name(), hex(state)));
 
     assert_eq!(key.remaining_signatures(), capacity - index);
@@ -1657,7 +1661,10 @@ fn claimed_state_sizes() {
 
         assert_eq!(
             HSS_LMS
-                .load_private_key(MemoryStore::holding(&sealed(&claimed)))
+                .load_private_key(
+                    MemoryStore::holding(&sealed(&claimed)),
+                    &StatefulLoadOptions::default()
+                )
                 .err(),
             Some(Error::InvalidPrivateKey)
         );
@@ -1672,7 +1679,10 @@ fn claimed_state_sizes() {
 
             assert_eq!(
                 HSS_LMS
-                    .load_private_key(MemoryStore::holding(&sealed(&padded)))
+                    .load_private_key(
+                        MemoryStore::holding(&sealed(&padded)),
+                        &StatefulLoadOptions::default()
+                    )
                     .err(),
                 Some(Error::InvalidPrivateKey)
             );
@@ -1688,7 +1698,10 @@ fn claimed_state_sizes() {
 
     assert_eq!(
         HSS_LMS
-            .load_private_key(MemoryStore::holding(&sealed(&tall)))
+            .load_private_key(
+                MemoryStore::holding(&sealed(&tall)),
+                &StatefulLoadOptions::default()
+            )
             .err(),
         Some(Error::InvalidPrivateKey)
     );
@@ -1698,7 +1711,10 @@ fn claimed_state_sizes() {
 
         assert_eq!(
             HSS_LMS
-                .load_private_key(MemoryStore::holding(&sealed(&beyond)))
+                .load_private_key(
+                    MemoryStore::holding(&sealed(&beyond)),
+                    &StatefulLoadOptions::default()
+                )
                 .err(),
             Some(Error::InvalidPrivateKey)
         );
@@ -1716,7 +1732,10 @@ fn claimed_state_sizes() {
 
         assert_eq!(
             XMSS_MT
-                .load_private_key(MemoryStore::holding(&sealed(&beyond)))
+                .load_private_key(
+                    MemoryStore::holding(&sealed(&beyond)),
+                    &StatefulLoadOptions::default()
+                )
                 .err(),
             Some(Error::InvalidPrivateKey)
         );
@@ -1724,13 +1743,20 @@ fn claimed_state_sizes() {
 
     for value in [Vec::new(), vec![1; 17], vec![0; 18]] {
         assert_eq!(
-            XMSS_MT.load_private_key(MemoryStore::holding(&value)).err(),
+            XMSS_MT
+                .load_private_key(
+                    MemoryStore::holding(&value),
+                    &StatefulLoadOptions::default()
+                )
+                .err(),
             Some(Error::InvalidPrivateKey)
         );
     }
 
     assert_eq!(
-        XMSS_MT.load_private_key(MemoryStore::default()).err(),
+        XMSS_MT
+            .load_private_key(MemoryStore::default(), &StatefulLoadOptions::default())
+            .err(),
         Some(Error::InvalidPrivateKey)
     );
 }
@@ -1873,6 +1899,7 @@ fn large_and_empty_messages() {
         .generate_key_pair(
             StatefulParameters::Levels(&[("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1")]),
             MemoryStore::default(),
+            &StatefulKeyGenOptions::default(),
         )
         .expect("key");
 
@@ -1880,6 +1907,7 @@ fn large_and_empty_messages() {
         .generate_key_pair(
             StatefulParameters::Name("XMSSMT-SHA2_20/4_192"),
             MemoryStore::default(),
+            &StatefulKeyGenOptions::default(),
         )
         .expect("key");
 
@@ -2099,7 +2127,11 @@ fn concurrent_shared_key() {
     let store = MemoryStore::default();
 
     let pair = HSS_LMS
-        .generate_key_pair(StatefulParameters::Levels(&LEVELS), store.clone())
+        .generate_key_pair(
+            StatefulParameters::Levels(&LEVELS),
+            store.clone(),
+            &StatefulKeyGenOptions::default(),
+        )
         .expect("key");
 
     let key = Arc::new(Mutex::new(pair.private_key));
@@ -2138,7 +2170,7 @@ fn concurrent_shared_key() {
 
     assert_eq!(
         HSS_LMS
-            .load_private_key(store)
+            .load_private_key(store, &StatefulLoadOptions::default())
             .expect("key")
             .remaining_signatures(),
         0
@@ -2152,7 +2184,11 @@ fn concurrent_keys_sharing_a_store() {
     let store = MemoryStore::default();
 
     HSS_LMS
-        .generate_key_pair(StatefulParameters::Levels(&LEVELS), store.clone())
+        .generate_key_pair(
+            StatefulParameters::Levels(&LEVELS),
+            store.clone(),
+            &StatefulKeyGenOptions::default(),
+        )
         .expect("key");
 
     let barrier = Barrier::new(6);
@@ -2165,7 +2201,9 @@ fn concurrent_keys_sharing_a_store() {
                 let barrier = &barrier;
 
                 scope.spawn(move || {
-                    let mut key = HSS_LMS.load_private_key(store.clone()).expect("key");
+                    let mut key = HSS_LMS
+                        .load_private_key(store.clone(), &StatefulLoadOptions::default())
+                        .expect("key");
 
                     barrier.wait();
 
@@ -2174,7 +2212,12 @@ fn concurrent_keys_sharing_a_store() {
                             let result = key.sign(b"m");
 
                             if result.as_ref().err() == Some(&Error::StateConflict) {
-                                key = HSS_LMS.load_private_key(store.clone()).expect("key");
+                                key = HSS_LMS
+                                    .load_private_key(
+                                        store.clone(),
+                                        &StatefulLoadOptions::default(),
+                                    )
+                                    .expect("key");
                             }
 
                             result
@@ -2211,7 +2254,7 @@ fn concurrent_keys_sharing_a_store() {
 
     assert_eq!(
         HSS_LMS
-            .load_private_key(store)
+            .load_private_key(store, &StatefulLoadOptions::default())
             .expect("key")
             .remaining_signatures(),
         32 - indices.len() as u64
@@ -2393,6 +2436,7 @@ fn transcripts() {
         &pattern(40, 0),
         33,
         MemoryStore::default(),
+        &StatefulKeyGenOptions::default(),
     )
     .expect("key");
 
@@ -2610,7 +2654,10 @@ fn state_case(rng: &mut Random, transcript: &mut Transcript, base: &[u8]) {
             continue;
         }
 
-        let (code, key) = outcome(algorithm.load_private_key(MemoryStore::holding(&state)));
+        let (code, key) = outcome(algorithm.load_private_key(
+            MemoryStore::holding(&state),
+            &StatefulLoadOptions::default(),
+        ));
 
         let output = key.map_or_else(Vec::new, |key| {
             [
@@ -2639,6 +2686,7 @@ fn edge_structures() {
         &pattern(40, 0),
         33,
         MemoryStore::default(),
+        &StatefulKeyGenOptions::default(),
     )
     .expect("key");
 

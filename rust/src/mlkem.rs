@@ -460,57 +460,35 @@ pub(crate) struct EncapsulationKey {
 }
 
 impl EncapsulationKey {
-    // For a valid ek (check_encapsulation_key) and its hash.
-    fn with_hash(ek: &[u8], h: [u8; 32], p: &Parameters) -> Self {
+    // For a valid ek (check_encapsulation_key).
+    pub(crate) fn new(ek: &[u8], p: &Parameters) -> Self {
         let (t, rho) = ek.split_at(384 * p.k);
 
         Self {
             matrix: sample_matrix(rho, p.k),
             t: decode_vector(t),
-            h,
+            h: sha3_256(&[ek]),
         }
     }
-
-    pub(crate) fn new(ek: &[u8], p: &Parameters) -> Self {
-        Self::with_hash(ek, sha3_256(&[ek]), p)
-    }
 }
 
-// The decoded NTT-form secret ŝ of a decapsulation key, wiped when dropped, next to what its
-// encapsulation key yields.
-pub(crate) struct DecapsulationKey {
-    s: Vec<Poly>,
-    public: EncapsulationKey,
-}
+// The decoded NTT-form secret ŝ of a decapsulation key, wiped when dropped.
+pub(crate) struct DecapsulationKey(Vec<Poly>);
 
 impl DecapsulationKey {
-    // For a dk that passed check_decapsulation_key, which compared its H(ek) with ek.
-    pub(crate) fn from_expanded(dk: &[u8], p: &Parameters) -> Self {
-        let k = p.k;
-
-        let mut h = [0; 32];
-
-        h.copy_from_slice(&dk[768 * k + 32..768 * k + 64]);
-
-        Self {
-            s: decode_vector(&dk[..384 * k]),
-            public: EncapsulationKey::with_hash(public_key_of(dk, p), h, p),
-        }
-    }
-
-    pub(crate) const fn public(&self) -> &EncapsulationKey {
-        &self.public
+    // For a dk from key generation or one that passed check_decapsulation_key.
+    pub(crate) fn new(dk: &[u8], p: &Parameters) -> Self {
+        Self(decode_vector(&dk[..384 * p.k]))
     }
 }
 
 impl Drop for DecapsulationKey {
     fn drop(&mut self) {
-        wipe(self.s.as_flattened_mut());
+        wipe(self.0.as_flattened_mut());
     }
 }
 
-// Keeps Â, t̂ and ŝ as they are computed; the caller fills in H(ek).
-fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) -> DecapsulationKey {
+fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) {
     let k = p.k;
 
     let mut g = sha3_512(&[d, &[k as u8]]);
@@ -520,18 +498,11 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) -> Decapsu
     // rho is part of the public key.
     declassify(rho);
 
-    let mut key = DecapsulationKey {
-        s: vec![[0; 256]; k],
-        public: EncapsulationKey {
-            matrix: sample_matrix(rho, k),
-            t: Vec::with_capacity(k),
-            h: [0; 32],
-        },
-    };
+    let mut s = [[0; 256]; 4];
 
     let mut e = [[0; 256]; 4];
 
-    for (n, (s_n, e_n)) in key.s.iter_mut().zip(&mut e).enumerate() {
+    for (n, (s_n, e_n)) in s[..k].iter_mut().zip(&mut e).enumerate() {
         *s_n = sample_noise(p.eta1, sigma, n);
 
         ntt(s_n);
@@ -544,8 +515,8 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) -> Decapsu
     for i in 0..k {
         let mut acc = [0; 256];
 
-        for (a, s_j) in key.public.matrix[i * k..(i + 1) * k].iter().zip(&key.s) {
-            multiply_accumulate(&mut acc, a, s_j);
+        for (j, s_j) in s[..k].iter().enumerate() {
+            multiply_accumulate(&mut acc, &sample_ntt(rho, j, i), s_j);
         }
 
         let mut t = canonical(&acc);
@@ -556,23 +527,18 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) -> Decapsu
 
         byte_encode(&t, 12, &mut ek[384 * i..384 * (i + 1)]);
 
-        byte_encode(&key.s[i], 12, &mut dk[384 * i..384 * (i + 1)]);
-
-        // t̂ is the public key.
-        declassify(&t);
-
-        key.public.t.push(t);
+        byte_encode(&s[i], 12, &mut dk[384 * i..384 * (i + 1)]);
     }
 
     declassify(&ek[..384 * k]);
 
     ek[384 * k..].copy_from_slice(rho);
 
+    wipe(s.as_flattened_mut());
+
     wipe(e.as_flattened_mut());
 
     wipe(&mut g);
-
-    key
 }
 
 fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &mut [u8]) {
@@ -671,28 +637,22 @@ fn pke_decrypt(s: &[Poly], c: &[u8], p: &Parameters) -> [u8; 32] {
     m
 }
 
-pub(crate) fn keygen_internal(
-    d: &[u8],
-    z: &[u8],
-    p: &Parameters,
-) -> (Vec<u8>, SecretBytes, DecapsulationKey) {
+pub(crate) fn keygen_internal(d: &[u8], z: &[u8], p: &Parameters) -> (Vec<u8>, SecretBytes) {
     let k = p.k;
 
     let mut ek = vec![0; p.encapsulation_key_size()];
 
     let mut dk = SecretBytes::zeroed(p.decapsulation_key_size());
 
-    let mut key = pke_keygen(d, p, &mut ek, &mut dk[..384 * k]);
-
-    key.public.h = sha3_256(&[&ek]);
+    pke_keygen(d, p, &mut ek, &mut dk[..384 * k]);
 
     dk[384 * k..768 * k + 32].copy_from_slice(&ek);
 
-    dk[768 * k + 32..768 * k + 64].copy_from_slice(&key.public.h);
+    dk[768 * k + 32..768 * k + 64].copy_from_slice(&sha3_256(&[&ek]));
 
     dk[768 * k + 64..].copy_from_slice(z);
 
-    (ek, dk, key)
+    (ek, dk)
 }
 
 pub(crate) fn encaps_internal(
@@ -719,18 +679,19 @@ pub(crate) fn encaps_internal(
 
 // Implicit rejection: a ciphertext that does not re-encrypt to itself yields J(z || c), chosen
 // by a mask so that the comparison result never steers a branch. dk supplies z; everything else
-// comes from its decoded form.
+// comes from the decoded forms of the key and of its encapsulation key.
 pub(crate) fn decaps_internal(
-    key: &DecapsulationKey,
+    public: &EncapsulationKey,
+    secret: &DecapsulationKey,
     dk: &[u8],
     c: &[u8],
     p: &Parameters,
 ) -> [u8; 32] {
     let z = &dk[768 * p.k + 64..];
 
-    let mut m = pke_decrypt(&key.s, c, p);
+    let mut m = pke_decrypt(&secret.0, c, p);
 
-    let mut g = sha3_512(&[&m, &key.public.h]);
+    let mut g = sha3_512(&[&m, &public.h]);
 
     let mut rejected = [0; 32];
 
@@ -738,7 +699,7 @@ pub(crate) fn decaps_internal(
 
     let mut reencrypted = SecretBytes::zeroed(c.len());
 
-    pke_encrypt(&key.public, &m, &g[32..], p, &mut reencrypted);
+    pke_encrypt(public, &m, &g[32..], p, &mut reencrypted);
 
     let mut shared_secret = [0; 32];
 

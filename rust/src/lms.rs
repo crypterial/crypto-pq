@@ -751,16 +751,7 @@ impl Tree {
         }
     }
 
-    fn key(&self) -> TreeKey<'_> {
-        TreeKey {
-            lms: &self.lms,
-            ots: &self.ots,
-            i: &self.i,
-            seed: &self.seed,
-        }
-    }
-
-    fn sign(&self, q: u32, message: &[u8]) -> Vec<u8> {
+    fn sign(&mut self, q: u32, message: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.lms.signature_size(&self.ots));
 
         out.extend_from_slice(&q.to_be_bytes());
@@ -771,7 +762,14 @@ impl Tree {
 
         out.extend_from_slice(&self.lms.code.to_be_bytes());
 
-        out.extend_from_slice(&self.merkle.auth_path(q, self.lms.m, &self.key()));
+        let key = TreeKey {
+            lms: &self.lms,
+            ots: &self.ots,
+            i: &self.i,
+            seed: &self.seed,
+        };
+
+        out.extend_from_slice(&self.merkle.auth_path(q, self.lms.m, &key));
 
         out
     }
@@ -844,20 +842,24 @@ impl Hss {
 
             let (lms, ots) = self.levels[level];
 
-            let parent = &self.trees[level - 1];
+            let parent = &mut self.trees[level - 1];
 
             let tree = parent.child(lms, ots, q);
 
-            self.signed
-                .push([parent.sign(q, &tree.public_key), tree.public_key.clone()].concat());
+            let signed = [parent.sign(q, &tree.public_key), tree.public_key.clone()].concat();
+
+            self.signed.push(signed);
 
             self.trees.push(tree);
 
             self.prefixes.push(prefix);
         }
 
-        let bottom = self.trees[self.levels.len() - 1]
-            .sign(self.leaf_index(index, self.levels.len() - 1), message);
+        let last = self.levels.len() - 1;
+
+        let q = self.leaf_index(index, last);
+
+        let bottom = self.trees[last].sign(q, message);
 
         let count = (self.levels.len() as u32 - 1).to_be_bytes();
 

@@ -590,24 +590,16 @@ fn ntt_all(signed: &[Poly]) -> Polys {
     hat
 }
 
-// t = A * s1 + s2 from NTT(s1) and the signed s2, and the products A * s1 as the NTT domain
-// holds them, times 2^-32.
-fn public_t(a: &[Poly], s1_hat: &Polys, s2: &[Poly], p: &Parameters) -> (Polys, Polys) {
+// t = A * s1 + s2 from the matrix and the signed s1 and s2.
+fn public_t(a: &[Poly], s1: &[Poly], s2: &[Poly], p: &Parameters) -> Polys {
+    let s1_hat = ntt_all(s1);
+
     let mut t = Polys::new(p.k);
 
-    let mut products = Polys::new(p.k);
-
-    for (((t_i, product), row), s2_i) in t
-        .iter_mut()
-        .zip(products.iter_mut())
-        .zip(a.chunks_exact(p.l))
-        .zip(s2)
-    {
+    for ((t_i, row), s2_i) in t.iter_mut().zip(a.chunks_exact(p.l)).zip(s2) {
         for (a_ij, s_j) in row.iter().zip(s1_hat.iter()) {
-            multiply_add(product, a_ij, s_j);
+            multiply_add(t_i, a_ij, s_j);
         }
-
-        *t_i = *product;
 
         inverse_ntt(t_i);
 
@@ -616,7 +608,7 @@ fn public_t(a: &[Poly], s1_hat: &Polys, s2: &[Poly], p: &Parameters) -> (Polys, 
         }
     }
 
-    (t, products)
+    t
 }
 
 fn encode_public_key(rho: &[u8], t: &Polys, p: &Parameters) -> Vec<u8> {
@@ -664,14 +656,8 @@ fn encode_private_key(parts: [&[u8]; 3], s: &Polys, t: &Polys, p: &Parameters) -
     sk
 }
 
-// rho, K and the signed s1 and s2; tr and t0 are checked by re-encoding instead.
-struct PrivateKey<'a> {
-    rho: &'a [u8],
-    key: &'a [u8],
-    s: Polys,
-}
-
-fn decode_private_key<'a>(sk: &'a [u8], p: &Parameters) -> PrivateKey<'a> {
+// The signed coefficients of s1 and s2 of an expanded private key.
+fn decode_s(sk: &[u8], p: &Parameters) -> Polys {
     let size = 32 * p.eta_bits() as usize;
 
     let mut s = Polys::new(p.l + p.k);
@@ -680,11 +666,7 @@ fn decode_private_key<'a>(sk: &'a [u8], p: &Parameters) -> PrivateKey<'a> {
         *poly = unpack(chunk, p.eta_bits()).map(|x| p.eta - x);
     }
 
-    PrivateKey {
-        rho: &sk[..32],
-        key: &sk[32..64],
-        s,
-    }
+    s
 }
 
 fn hash_public_key(pk: &[u8]) -> [u8; 64] {
@@ -695,17 +677,25 @@ fn hash_public_key(pk: &[u8]) -> [u8; 64] {
     tr
 }
 
-// What verification derives from a public key alone: Â, t̂1 = NTT(t1 * 2^d) and tr = H(pk, 64),
-// computed once per key instead of on every verification.
+// Â of a public key, which signing and verification both use. It is public, so it is not wiped.
+#[derive(Clone)]
+pub(crate) struct Matrix(Vec<Poly>);
+
+impl Matrix {
+    pub(crate) fn new(pk: &[u8], p: &Parameters) -> Self {
+        Self(expand_a(&pk[..32], p))
+    }
+}
+
+// What verification alone derives from a public key: t̂1 = NTT(t1 * 2^d) and tr = H(pk, 64).
 #[derive(Clone)]
 pub(crate) struct VerifyingKey {
-    matrix: Vec<Poly>,
     t1: Vec<Poly>,
     tr: [u8; 64],
 }
 
 impl VerifyingKey {
-    pub(crate) fn new(pk: &[u8], p: &Parameters) -> Self {
+    pub(crate) fn new(pk: &[u8]) -> Self {
         let t1 = pk[32..]
             .as_chunks::<320>()
             .0
@@ -720,89 +710,53 @@ impl VerifyingKey {
             .collect();
 
         Self {
-            matrix: expand_a(&pk[..32], p),
             t1,
             tr: hash_public_key(pk),
         }
     }
 }
 
-// What signing derives from a private key: the NTT forms of s1, s2 and t0 and K, wiped when the
-// key is dropped, and its verifying key.
+// The NTT forms of s1, s2 and t0 that signing uses, wiped when dropped. K and tr are read from the
+// expanded private key itself.
 pub(crate) struct SigningKey {
     s1: Polys,
     s2: Polys,
     t0: Polys,
-    key: [u8; 32],
-    public: VerifyingKey,
 }
 
 impl SigningKey {
-    // From what key generation and the import check compute anyway. NTT(t0) needs no transform of
-    // its own: t = t0 + t1 * 2^d and t = A * s1 + s2, so NTT(t0) = NTT(A * s1) + NTT(s2) - t̂1, and
-    // the products hold NTT(A * s1) times 2^-32, which a Montgomery product with 2^64 undoes. The
-    // sum stays below 19q, and its values differ from those of a transform of t0 only by
-    // multiples of q, which signing reduces.
-    fn new(
-        matrix: Vec<Poly>,
-        tr: [u8; 64],
-        s1: Polys,
-        s2: &[Poly],
-        t: &Polys,
-        products: &Polys,
-        key: &[u8],
-    ) -> Self {
-        let s2 = ntt_all(s2);
+    // For an expanded private key from key generation or one that passed check_private_key.
+    pub(crate) fn new(sk: &[u8], p: &Parameters) -> Self {
+        let size = 32 * p.eta_bits() as usize;
 
-        let mut t0 = Polys::new(t.len());
+        let s = decode_s(sk, p);
 
-        let mut t1 = Vec::with_capacity(t.len());
+        let (s1, s2) = s.split_at(p.l);
 
-        for (((t0_i, t_i), product), s2_i) in t0
+        let mut t0 = Polys::new(p.k);
+
+        let t0_bytes = &sk[128 + (p.l + p.k) * size..];
+
+        for (hat, chunk) in t0
             .iter_mut()
-            .zip(t.iter())
-            .zip(products.iter())
-            .zip(s2.iter())
+            .zip(t0_bytes.as_chunks::<{ 32 * D as usize }>().0)
         {
-            let mut t1_i = t_i.map(|x| power2round(x).0 << D);
+            let mut t0_i = unpack(chunk, D).map(|x| (1 << (D - 1)) - x);
 
-            // t1 is the public key.
-            declassify(&t1_i);
+            *hat = ntt_of(&t0_i);
 
-            ntt(&mut t1_i);
-
-            for (((x, &a), &s), &h) in t0_i.iter_mut().zip(product).zip(s2_i).zip(&t1_i) {
-                *x = reduce(montgomery_mul(a, R2) + s - h);
-            }
-
-            t1.push(t1_i);
+            wipe(&mut t0_i);
         }
 
-        let mut signing = Self {
-            s1,
-            s2,
+        Self {
+            s1: ntt_all(s1),
+            s2: ntt_all(s2),
             t0,
-            key: [0; 32],
-            public: VerifyingKey { matrix, t1, tr },
-        };
-
-        signing.key.copy_from_slice(key);
-
-        signing
-    }
-
-    pub(crate) const fn verifying_key(&self) -> &VerifyingKey {
-        &self.public
+        }
     }
 }
 
-impl Drop for SigningKey {
-    fn drop(&mut self) {
-        wipe(&mut self.key);
-    }
-}
-
-pub(crate) fn keygen_internal(xi: &[u8], p: &Parameters) -> (Vec<u8>, SecretBytes, SigningKey) {
+pub(crate) fn keygen_internal(xi: &[u8], p: &Parameters) -> (Vec<u8>, SecretBytes) {
     let mut seeds = [0u8; 128];
 
     shake256_into(&[xi, &[p.k as u8, p.l as u8]], &mut seeds);
@@ -818,64 +772,46 @@ pub(crate) fn keygen_internal(xi: &[u8], p: &Parameters) -> (Vec<u8>, SecretByte
 
     let (s1, s2) = s.split_at(p.l);
 
-    let matrix = expand_a(rho, p);
-
-    let s1_hat = ntt_all(s1);
-
-    let (t, products) = public_t(&matrix, &s1_hat, s2, p);
+    let t = public_t(&expand_a(rho, p), s1, s2, p);
 
     let pk = encode_public_key(rho, &t, p);
 
     declassify(&pk);
 
-    let tr = hash_public_key(&pk);
-
-    let sk = encode_private_key([rho, key, &tr], &s, &t, p);
-
-    let signing = SigningKey::new(matrix, tr, s1_hat, s2, &t, &products, key);
+    let sk = encode_private_key([rho, key, &hash_public_key(&pk)], &s, &t, p);
 
     wipe(&mut seeds);
 
-    (pk, sk, signing)
+    (pk, sk)
 }
 
 // An expanded private key carries everything needed to rebuild the public key, so a key whose
 // parts disagree is rejected instead of producing signatures that never verify. Re-encoding the
-// key from its own s1, s2, rho and K compares t0 and tr in one constant-time pass.
-pub(crate) fn check_private_key(sk: &[u8], p: &Parameters) -> Option<(Vec<u8>, SigningKey)> {
+// key from its own s1, s2, rho and K compares t0 and tr in one constant-time pass. Returns pk.
+pub(crate) fn check_private_key(sk: &[u8], p: &Parameters) -> Option<Vec<u8>> {
     // rho is part of the public key.
     declassify(&sk[..32]);
 
-    let key = decode_private_key(sk, p);
+    let (rho, key) = (&sk[..32], &sk[32..64]);
+
+    let s = decode_s(sk, p);
 
     // Whether the key is valid is public: importing it fails otherwise.
-    if declassify_value(reaches(key.s.iter().flatten().copied(), p.eta + 1) != 0) {
+    if declassify_value(reaches(s.iter().flatten().copied(), p.eta + 1) != 0) {
         return None;
     }
 
-    let (s1, s2) = key.s.split_at(p.l);
+    let (s1, s2) = s.split_at(p.l);
 
-    let matrix = expand_a(key.rho, p);
+    let t = public_t(&expand_a(rho, p), s1, s2, p);
 
-    let s1_hat = ntt_all(s1);
-
-    let (t, products) = public_t(&matrix, &s1_hat, s2, p);
-
-    let pk = encode_public_key(key.rho, &t, p);
+    let pk = encode_public_key(rho, &t, p);
 
     declassify(&pk);
 
-    let tr = hash_public_key(&pk);
+    let rebuilt = encode_private_key([rho, key, &hash_public_key(&pk)], &s, &t, p);
 
-    let rebuilt = encode_private_key([key.rho, key.key, &tr], &key.s, &t, p);
-
-    if !declassify_value(ct::equal(&rebuilt, sk)) {
-        return None;
-    }
-
-    let signing = SigningKey::new(matrix, tr, s1_hat, s2, &t, &products, key.key);
-
-    Some((pk, signing))
+    declassify_value(ct::equal(&rebuilt, sk)).then_some(pk)
 }
 
 fn hint_bit_pack(h: &Polys, p: &Parameters, out: &mut [u8]) {
@@ -958,20 +894,22 @@ fn message_hash(tr: &[u8], message: &[&[u8]]) -> [u8; 64] {
 }
 
 // FIPS 204 Algorithm 7. The norm checks run over every coefficient without branching; only their
-// combined outcome, the rejection decision, steers the loop.
+// combined outcome, the rejection decision, steers the loop. sk supplies K and tr.
 pub(crate) fn sign_internal(
+    matrix: &Matrix,
     key: &SigningKey,
+    sk: &[u8],
     message: &[&[u8]],
     rnd: &[u8],
     p: &Parameters,
 ) -> Vec<u8> {
-    let (a, s1_hat, s2_hat, t0_hat) = (&key.public.matrix, &key.s1, &key.s2, &key.t0);
+    let (a, s1_hat, s2_hat, t0_hat) = (&matrix.0, &key.s1, &key.s2, &key.t0);
 
-    let mu = message_hash(&key.public.tr, message);
+    let mu = message_hash(&sk[64..128], message);
 
     let mut rho_prime = [0u8; 64];
 
-    shake256_into(&[&key.key, rnd, &mu], &mut rho_prime);
+    shake256_into(&[&sk[32..64], rnd, &mu], &mut rho_prime);
 
     let mut y = Polys::new(p.l);
 
@@ -1115,6 +1053,7 @@ pub(crate) fn sign_internal(
 }
 
 pub(crate) fn verify_internal(
+    matrix: &Matrix,
     key: &VerifyingKey,
     message: &[&[u8]],
     sig: &[u8],
@@ -1156,7 +1095,7 @@ pub(crate) fn verify_internal(
 
     let mut w = Polys::new(p.k);
 
-    for ((w_i, t1), row) in w.iter_mut().zip(&key.t1).zip(key.matrix.chunks_exact(p.l)) {
+    for ((w_i, t1), row) in w.iter_mut().zip(&key.t1).zip(matrix.0.chunks_exact(p.l)) {
         *w_i = pointwise(&c_hat, t1).map(|x| -x);
 
         for (a, z_j) in row.iter().zip(z.iter()) {

@@ -11,7 +11,8 @@ use crate::signature::{
     VerifyOptions,
 };
 use crate::stateful::{
-    StateStore, StatefulKeyPair, StatefulParameters, StatefulSignatureAlgorithm,
+    StateStore, StatefulKeyGenOptions, StatefulKeyPair, StatefulParameters,
+    StatefulSignatureAlgorithm, check_reserve,
 };
 use crate::wipe::SecretBytes;
 
@@ -85,7 +86,10 @@ pub fn generate_stateful_key_pair<S: StateStore>(
     seed: &[u8],
     index: u64,
     store: S,
+    options: &StatefulKeyGenOptions,
 ) -> Result<StatefulKeyPair<S>, Error> {
+    let reserve = check_reserve(options.reserve)?;
+
     let parameters = algorithm.parameters(parameters)?;
 
     require_length(seed, parameters.seed_size())?;
@@ -94,5 +98,11 @@ pub fn generate_stateful_key_pair<S: StateStore>(
         return Err(Error::InvalidOption);
     }
 
-    algorithm.create(parameters, SecretBytes::concat(&[seed]), index, store)
+    algorithm.create(
+        parameters,
+        SecretBytes::concat(&[seed]),
+        index,
+        reserve,
+        store,
+    )
 }

@@ -20,11 +20,14 @@ pub(crate) trait TreeHasher {
 // A Merkle tree that keeps its nodes from height low = max(0, h - 15) upwards. Building it
 // computes every leaf once. An authentication path takes its upper nodes from the cache and
 // rebuilds only the 2^low-leaf subtree under the signed leaf, so memory stays below 2^16 nodes
-// for every height while trees of height 15 or less never recompute a leaf.
+// for every height while trees of height 15 or less never recompute a leaf. The last rebuilt
+// subtree is kept, levels 0 to low - 1 with its first leaf: signatures follow the index, so the
+// next 2^low of them read it instead of rebuilding it, for 2^(low + 1) nodes more at most.
 pub(crate) struct MerkleTree {
     height: u32,
     low: u32,
     levels: Vec<Vec<Node>>,
+    last: Option<(u32, Vec<Vec<Node>>)>,
 }
 
 impl MerkleTree {
@@ -35,6 +38,7 @@ impl MerkleTree {
             height,
             low,
             levels: Vec::with_capacity((height - low + 1) as usize),
+            last: None,
         };
 
         let batch = low.max(LEAF_BATCH).min(height);
@@ -67,15 +71,20 @@ impl MerkleTree {
     }
 
     // The siblings from the leaf upwards, n bytes each.
-    pub(crate) fn auth_path(&self, index: u32, n: usize, hasher: &impl TreeHasher) -> Vec<u8> {
+    pub(crate) fn auth_path(&mut self, index: u32, n: usize, hasher: &impl TreeHasher) -> Vec<u8> {
         let mut path = Vec::with_capacity(self.height as usize * n);
 
         if self.low > 0 {
             let first = index >> self.low << self.low;
 
-            let levels = levels(first, self.low, self.low, hasher);
+            let low = self.low;
 
-            for (z, level) in levels.iter().take(self.low as usize).enumerate() {
+            let (_, subtree) = match &mut self.last {
+                Some(last) if last.0 == first => last,
+                last => last.insert((first, subtree(first, low, hasher))),
+            };
+
+            for (z, level) in subtree.iter().enumerate() {
                 let sibling = ((index >> z) ^ 1) & ((1 << (self.low - z as u32)) - 1);
 
                 path.extend_from_slice(&level[sibling as usize][..n]);
@@ -90,6 +99,15 @@ impl MerkleTree {
 
         path
     }
+}
+
+// Levels 0 to low - 1 of the subtree of 2^low leaves from first on; the tree caches level low.
+fn subtree(first: u32, low: u32, hasher: &impl TreeHasher) -> Vec<Vec<Node>> {
+    let mut levels = levels(first, low, low, hasher);
+
+    levels.truncate(low as usize);
+
+    levels
 }
 
 // The levels 0 to top of the subtree of 2^size leaves from first on, from the leaves up.
@@ -122,11 +140,16 @@ fn levels(first: u32, size: u32, top: u32, hasher: &impl TreeHasher) -> Vec<Vec<
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
+    use core::cell::Cell;
 
     use super::{MerkleTree, Node, TreeHasher};
     use crate::primitives::sha256;
 
-    struct Tagged;
+    // Counts the leaves it computes.
+    #[derive(Default)]
+    struct Tagged {
+        leaves: Cell<usize>,
+    }
 
     impl Tagged {
         fn leaf(index: u32) -> Node {
@@ -136,6 +159,8 @@ mod tests {
 
     impl TreeHasher for Tagged {
         fn leaves(&self, first: u32, out: &mut [Node]) {
+            self.leaves.set(self.leaves.get() + out.len());
+
             for (index, node) in (first..).zip(out) {
                 *node = Self::leaf(index);
             }
@@ -158,7 +183,7 @@ mod tests {
                 .0
                 .iter()
                 .enumerate()
-                .map(|(j, pair)| Tagged.combine(z, j as u32, &pair[0], &pair[1]))
+                .map(|(j, pair)| Tagged::default().combine(z, j as u32, &pair[0], &pair[1]))
                 .collect();
 
             levels.push(core::mem::replace(&mut level, parents));
@@ -169,29 +194,63 @@ mod tests {
         levels
     }
 
+    fn expected_path(levels: &[Vec<Node>], height: u32, index: u32) -> Vec<u8> {
+        (0..height as usize)
+            .flat_map(|z| levels[z][((index >> z) ^ 1) as usize][..24].to_vec())
+            .collect()
+    }
+
     // Heights above 15 rebuild the subtree under the leaf, which only the slow vectors reach.
     #[test]
     fn cached_paths_match_the_full_tree() {
         for height in [2, 5, 15, 16, 18] {
             let levels = full_tree(height);
 
-            let tree = MerkleTree::new(height, &Tagged);
+            let hasher = Tagged::default();
+
+            let mut tree = MerkleTree::new(height, &hasher);
 
             assert_eq!(tree.root(), &levels[height as usize][0]);
 
             let last = (1 << height) - 1;
 
             for index in [0, 1, 2, last / 3, last / 2 + 1, last - 1, last] {
-                let expected: Vec<u8> = (0..height as usize)
-                    .flat_map(|z| levels[z][((index >> z) ^ 1) as usize][..24].to_vec())
-                    .collect();
-
                 assert_eq!(
-                    tree.auth_path(index, 24, &Tagged),
-                    expected,
+                    tree.auth_path(index, 24, &hasher),
+                    expected_path(&levels, height, index),
                     "{height} {index}"
                 );
             }
         }
+    }
+
+    // Consecutive leaves of one subtree rebuild it once; the next subtree replaces it.
+    #[test]
+    fn the_last_subtree_is_kept() {
+        let height = 18;
+
+        let levels = full_tree(height);
+
+        let hasher = Tagged::default();
+
+        let mut tree = MerkleTree::new(height, &hasher);
+
+        assert_eq!(hasher.leaves.get(), 1 << height);
+
+        for (index, rebuilt) in [(8, 8), (9, 0), (15, 0), (16, 8), (8, 8), (12, 0)] {
+            hasher.leaves.set(0);
+
+            let path = tree.auth_path(index, 24, &hasher);
+
+            assert_eq!(path, expected_path(&levels, height, index), "{index}");
+
+            assert_eq!(hasher.leaves.get(), rebuilt, "{index}");
+        }
+
+        let (first, subtree) = tree.last.as_ref().unwrap();
+
+        assert_eq!(*first, 8);
+
+        assert_eq!(subtree.iter().map(Vec::len).collect::<Vec<_>>(), [8, 4, 2]);
     }
 }

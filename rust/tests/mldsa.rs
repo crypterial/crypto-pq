@@ -727,3 +727,63 @@ fn properties() {
         Some(Error::InvalidLength)
     );
 }
+
+fn shareable<T: Send + Sync>() {}
+
+// Keys computed by no one yet are used by many threads at once: whichever thread fills a cache,
+// every deterministic signature must be the same and verify.
+#[test]
+fn concurrent_first_use() {
+    shareable::<crypto_pq::SignaturePublicKey>();
+
+    shareable::<crypto_pq::SignaturePrivateKey>();
+
+    let options = SignOptions {
+        deterministic: true,
+        ..SignOptions::default()
+    };
+
+    for algorithm in [ML_DSA_44, ML_DSA_87] {
+        let pair = hazmat::generate_signature_key_pair(algorithm, &[9; 32]).unwrap();
+
+        let expected = pair.private_key.sign(b"threads", &options).unwrap();
+
+        let public = pair.public_key.export_key(KeyFormat::Raw).unwrap();
+
+        let private = pair.private_key.export_key(KeyFormat::Der).unwrap();
+
+        for _ in 0..10 {
+            let public_key = algorithm
+                .import_public_key(&public, KeyFormat::Raw)
+                .unwrap();
+
+            let private_key = algorithm
+                .import_private_key(&private, KeyFormat::Der)
+                .unwrap();
+
+            let barrier = std::sync::Barrier::new(8);
+
+            std::thread::scope(|scope| {
+                for thread in 0..8 {
+                    let (public_key, private_key, barrier) = (&public_key, &private_key, &barrier);
+
+                    let (expected, options) = (&expected, &options);
+
+                    scope.spawn(move || {
+                        barrier.wait();
+
+                        if thread % 2 == 0 {
+                            assert!(public_key.verify(
+                                expected,
+                                b"threads",
+                                &VerifyOptions::default()
+                            ));
+                        } else {
+                            assert_eq!(&private_key.sign(b"threads", options).unwrap(), expected);
+                        }
+                    });
+                }
+            });
+        }
+    }
+}

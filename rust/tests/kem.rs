@@ -699,3 +699,65 @@ fn errors_and_debug() {
         Some(Error::InvalidLength)
     );
 }
+
+fn shareable<T: Send + Sync>() {}
+
+// Keys computed by no one yet are used by many threads at once: whichever thread fills a cache,
+// every result must match, and the keys stay usable from any thread.
+#[test]
+fn concurrent_first_use() {
+    shareable::<crypto_pq::KemPublicKey>();
+
+    shareable::<crypto_pq::KemPrivateKey>();
+
+    for (algorithm, seed_size) in [(ML_KEM_768, 64), (X_WING, 32)] {
+        let pair = hazmat::generate_kem_key_pair(algorithm, &vec![8; seed_size]).unwrap();
+
+        let encapsulations: Vec<_> = (0..4)
+            .map(|_| pair.public_key.encapsulate().unwrap())
+            .collect();
+
+        let public = pair.public_key.export_key(KeyFormat::Raw).unwrap();
+
+        let private = pair.private_key.export_key(KeyFormat::Raw).unwrap();
+
+        for _ in 0..20 {
+            let public_key = algorithm
+                .import_public_key(&public, KeyFormat::Raw)
+                .unwrap();
+
+            let private_key = algorithm
+                .import_private_key(&private, KeyFormat::Raw)
+                .unwrap();
+
+            let barrier = std::sync::Barrier::new(8);
+
+            std::thread::scope(|scope| {
+                for thread in 0..8 {
+                    let (public_key, private_key, barrier) = (&public_key, &private_key, &barrier);
+
+                    let (encapsulation, original) =
+                        (&encapsulations[thread % 4], &pair.private_key);
+
+                    scope.spawn(move || {
+                        barrier.wait();
+
+                        if thread % 2 == 0 {
+                            let fresh = public_key.encapsulate().unwrap();
+
+                            assert_eq!(
+                                original.decapsulate(&fresh.ciphertext).unwrap(),
+                                fresh.shared_secret
+                            );
+                        } else {
+                            assert_eq!(
+                                private_key.decapsulate(&encapsulation.ciphertext).unwrap(),
+                                encapsulation.shared_secret
+                            );
+                        }
+                    });
+                }
+            });
+        }
+    }
+}

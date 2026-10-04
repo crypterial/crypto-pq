@@ -7,8 +7,8 @@ use crypto_pq::{
     SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S,
     SLH_DSA_SHAKE_128F, SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S,
     SLH_DSA_SHAKE_256F, SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, StateStore,
-    StatefulParameters, StatefulPrivateKey, StatefulSignatureAlgorithm, VerifyOptions, X_WING,
-    XMSS, XMSS_MT, hazmat,
+    StatefulKeyGenOptions, StatefulParameters, StatefulPrivateKey, StatefulSignatureAlgorithm,
+    VerifyOptions, X_WING, XMSS, XMSS_MT, hazmat,
 };
 
 const MIN_TIME: Duration = Duration::from_secs(1);
@@ -276,8 +276,15 @@ fn stateful(
     let seed = bytes(seed_size);
 
     let generate = || {
-        hazmat::generate_stateful_key_pair(algorithm, parameters, &seed, 0, MemoryStore::default())
-            .unwrap()
+        hazmat::generate_stateful_key_pair(
+            algorithm,
+            parameters,
+            &seed,
+            0,
+            MemoryStore::default(),
+            &StatefulKeyGenOptions::default(),
+        )
+        .unwrap()
     };
 
     runner.case(&keygen, |count| {

@@ -24,7 +24,6 @@ pub(crate) struct Expanded {
     pub(crate) public: Vec<u8>,
     pub(crate) dk: SecretBytes,
     pub(crate) scalar: SecretBytes,
-    pub(crate) key: mlkem::DecapsulationKey,
 }
 
 pub(crate) fn expand(seed: &[u8]) -> Expanded {
@@ -32,8 +31,7 @@ pub(crate) fn expand(seed: &[u8]) -> Expanded {
 
     shake256_into(&[seed], &mut expanded);
 
-    let (mut public, dk, key) =
-        mlkem::keygen_internal(&expanded[..32], &expanded[32..64], &ML_KEM_768);
+    let (mut public, dk) = mlkem::keygen_internal(&expanded[..32], &expanded[32..64], &ML_KEM_768);
 
     let scalar = SecretBytes::concat(&[&expanded[64..]]);
 
@@ -45,12 +43,7 @@ pub(crate) fn expand(seed: &[u8]) -> Expanded {
 
     wipe(&mut expanded);
 
-    Expanded {
-        public,
-        dk,
-        scalar,
-        key,
-    }
+    Expanded { public, dk, scalar }
 }
 
 fn combine(ss_m: &[u8], ss_x: &[u8], ct_x: &[u8], pk_x: &[u8]) -> [u8; 32] {
@@ -62,9 +55,13 @@ pub(crate) fn check_public_key(pk: &[u8]) -> bool {
         && mlkem::check_encapsulation_key(&pk[..ML_KEM_PUBLIC_KEY_SIZE], &ML_KEM_768)
 }
 
-// The form of the ML-KEM part of a valid public key that encapsulation uses.
+// The forms of the ML-KEM parts of a valid public key and of a private key.
 pub(crate) fn encapsulation_key(pk: &[u8]) -> mlkem::EncapsulationKey {
     mlkem::EncapsulationKey::new(&pk[..ML_KEM_PUBLIC_KEY_SIZE], &ML_KEM_768)
+}
+
+pub(crate) fn decapsulation_key(dk: &[u8]) -> mlkem::DecapsulationKey {
+    mlkem::DecapsulationKey::new(dk, &ML_KEM_768)
 }
 
 pub(crate) fn encapsulate(
@@ -94,7 +91,8 @@ pub(crate) fn encapsulate(
 }
 
 pub(crate) fn decapsulate(
-    key: &mlkem::DecapsulationKey,
+    public: &mlkem::EncapsulationKey,
+    secret: &mlkem::DecapsulationKey,
     dk: &[u8],
     scalar: &[u8],
     pk_x: &[u8],
@@ -102,7 +100,7 @@ pub(crate) fn decapsulate(
 ) -> [u8; 32] {
     let (ct_m, ct_x) = ct.split_at(ML_KEM_CIPHERTEXT_SIZE);
 
-    let mut ss_m = mlkem::decaps_internal(key, dk, ct_m, &ML_KEM_768);
+    let mut ss_m = mlkem::decaps_internal(public, secret, dk, ct_m, &ML_KEM_768);
 
     let mut ss_x = x25519(scalar, ct_x);
 

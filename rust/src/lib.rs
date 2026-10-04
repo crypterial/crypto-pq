@@ -30,6 +30,8 @@ mod mldsa;
 
 mod mlkem;
 
+mod once;
+
 mod primitives;
 
 mod rng;
@@ -69,8 +71,9 @@ pub use signature::{
     SignaturePublicKey, VerifyOptions,
 };
 pub use stateful::{
-    HSS_LMS, StateStore, StatefulKeyPair, StatefulParameters, StatefulPrivateKey,
-    StatefulPublicKey, StatefulSignatureAlgorithm, XMSS, XMSS_MT,
+    HSS_LMS, StateStore, StatefulKeyGenOptions, StatefulKeyPair, StatefulLoadOptions,
+    StatefulParameters, StatefulPrivateKey, StatefulPublicKey, StatefulSignatureAlgorithm, XMSS,
+    XMSS_MT,
 };
 
 // What the constant-time check of tests/ct.rs needs; it exists only under the crypto_pq_ct cfg.

@@ -11,7 +11,8 @@ use crypto_pq::{
     SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S,
     SLH_DSA_SHAKE_128F, SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S,
     SLH_DSA_SHAKE_256F, SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, StateStore,
-    StatefulParameters, StatefulSignatureAlgorithm, VerifyOptions, X_WING, XMSS, XMSS_MT, hazmat,
+    StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters, StatefulSignatureAlgorithm,
+    VerifyOptions, X_WING, XMSS, XMSS_MT, hazmat,
 };
 use vectors::{Fields, der, parallel, records, unhex};
 
@@ -523,6 +524,7 @@ fn check_stateful(name: &str) {
             &seed,
             index,
             store.clone(),
+            &StatefulKeyGenOptions::default(),
         )
         .unwrap();
 
@@ -581,7 +583,9 @@ fn check_stateful(name: &str) {
         // The key loaded from the first state signs at the same index, the same way.
         let store = MemoryStore::holding(&state);
 
-        let mut loaded = algorithm.load_private_key(store.clone()).unwrap();
+        let mut loaded = algorithm
+            .load_private_key(store.clone(), &StatefulLoadOptions::default())
+            .unwrap();
 
         assert_eq!(loaded.public_key(), pair.public_key, "{context}");
 
@@ -751,6 +755,7 @@ fn execute(header: &Fields, record: &Fields) -> Outcome {
                     &data,
                     index,
                     store,
+                    &StatefulKeyGenOptions::default(),
                 )
                 .map(|p| {
                     (
@@ -760,16 +765,17 @@ fn execute(header: &Fields, record: &Fields) -> Outcome {
                 }),
             )
         }
-        (Algorithm::Stateful(a), "loadPrivateKey") => {
-            counted(a.load_private_key(MemoryStore::holding(&data)).map(|k| {
-                (
-                    k.public_key().export_key(KeyFormat::Raw).unwrap(),
-                    k.remaining_signatures(),
-                )
-            }))
-        }
+        (Algorithm::Stateful(a), "loadPrivateKey") => counted(
+            a.load_private_key(MemoryStore::holding(&data), &StatefulLoadOptions::default())
+                .map(|k| {
+                    (
+                        k.public_key().export_key(KeyFormat::Raw).unwrap(),
+                        k.remaining_signatures(),
+                    )
+                }),
+        ),
         (Algorithm::Stateful(a), "sign") => finished(
-            a.load_private_key(MemoryStore::holding(&data))
+            a.load_private_key(MemoryStore::holding(&data), &StatefulLoadOptions::default())
                 .and_then(|mut k| k.sign(&message)),
         ),
         (Algorithm::Stateful(a), "verify") => {

@@ -790,13 +790,24 @@ pub(crate) fn verify(p: &Parameters, public_key: &[u8], message: &[u8], signatur
     node[..n] == *root
 }
 
-// The signing side of an XMSS or XMSS^MT key, with one cached tree per layer.
+// What a layer above the bottom adds to a signature: the WOTS+ signature of the root of the tree
+// below and the authentication path. Both depend on prefix = index >> (layer * h') alone, so they
+// are kept until the index leaves the subtree, as HSS keeps its signed child keys, with the root
+// of the layer's tree that the next layer signs.
+struct SignedRoot {
+    prefix: u64,
+    part: Vec<u8>,
+    root: Node,
+}
+
+// The signing side of an XMSS or XMSS^MT key, with one cached tree and one signed root per layer.
 pub(crate) struct Xmss {
     p: &'static Parameters,
     sk_seed: SecretBytes,
     sk_prf: SecretBytes,
     pub_seed: Vec<u8>,
     trees: Vec<Option<(u64, MerkleTree)>>,
+    signed: Vec<Option<SignedRoot>>,
     root: Node,
 }
 
@@ -805,7 +816,7 @@ fn cached_tree<'t>(
     hashes: &Hashes,
     layer: u32,
     tree: u64,
-) -> &'t MerkleTree {
+) -> &'t mut MerkleTree {
     let slot = &mut trees[layer as usize];
 
     if slot.as_ref().is_some_and(|(cached, _)| *cached != tree) {
@@ -843,6 +854,7 @@ impl Xmss {
             sk_prf: SecretBytes::concat(&[&seed[n..2 * n]]),
             pub_seed: seed[2 * n..].to_vec(),
             trees: (0..p.d).map(|_| None).collect(),
+            signed: (0..p.d).map(|_| None).collect(),
             root: [0; 32],
         };
 
@@ -884,30 +896,49 @@ impl Xmss {
 
         let height = p.tree_height();
 
-        let mut rest = index;
-
         for layer in 0..p.d {
-            let leaf = (rest & ((1 << height) - 1)) as u32;
+            let prefix = index >> (layer * height);
 
-            rest >>= height;
+            let signed = &mut self.signed[layer as usize];
 
-            let mut ots = address(layer, rest, OTS);
+            if let Some(kept) = signed.as_ref().filter(|kept| kept.prefix == prefix) {
+                out.extend_from_slice(&kept.part);
+
+                node = kept.root;
+
+                continue;
+            }
+
+            let (leaf, tree) = ((prefix & ((1 << height) - 1)) as u32, prefix >> height);
+
+            let start = out.len();
+
+            let mut ots = address(layer, tree, OTS);
 
             set_word(&mut ots, 4, leaf);
 
             hashes.wots_sign(&node[..n], &ots, &mut out);
 
-            let merkle = cached_tree(&mut self.trees, &hashes, layer, rest);
+            let merkle = cached_tree(&mut self.trees, &hashes, layer, tree);
 
             let subtree = Subtree {
                 hashes: &hashes,
                 layer,
-                tree: rest,
+                tree,
             };
 
             out.extend_from_slice(&merkle.auth_path(leaf, n, &subtree));
 
             node = *merkle.root();
+
+            // The bottom layer signs the message, which changes every time.
+            if layer > 0 {
+                *signed = Some(SignedRoot {
+                    prefix,
+                    part: out[start..].to_vec(),
+                    root: node,
+                });
+            }
         }
 
         declassify(&out);
