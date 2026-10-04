@@ -41,8 +41,9 @@ pub fn build(b: *std.Build) void {
 
     run(b, step, tests);
 
-    // X25519 and the Merkle cache are internal, so their tests live in their own files.
-    for ([_][]const u8{ "src/x25519.zig", "src/merkle.zig" }) |path| {
+    // X25519, the key caches and the Merkle cache are internal, so their tests live in their own
+    // files.
+    for ([_][]const u8{ "src/x25519.zig", "src/cache.zig", "src/merkle.zig" }) |path| {
         run(b, step, b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(path),

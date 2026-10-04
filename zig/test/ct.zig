@@ -37,12 +37,14 @@ fn same(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-fn kem(algorithm: pq.KemAlgorithm, comptime seed_size: usize, comptime randomness_size: usize) !void {
+fn kem(allocator: Allocator, algorithm: pq.KemAlgorithm, comptime seed_size: usize, comptime randomness_size: usize) !void {
     const seed = secretBytes(seed_size, 1);
 
-    var pair = try hazmat.generateKemKeyPair(algorithm, &seed);
+    var pair = try hazmat.generateKemKeyPair(algorithm, allocator, &seed);
 
     defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
 
     const randomness = secretBytes(randomness_size, 2);
 
@@ -57,9 +59,11 @@ fn kem(algorithm: pq.KemAlgorithm, comptime seed_size: usize, comptime randomnes
 
     try check(same(&shared_secret, &encapsulation.shared_secret) and !same(&rejected, &shared_secret));
 
-    var generated = try algorithm.generateKeyPair(.{});
+    var generated = try algorithm.generateKeyPair(allocator, .{});
 
     defer generated.private_key.deinit();
+
+    defer generated.public_key.deinit();
 
     var fresh = try generated.public_key.encapsulate();
 
@@ -71,9 +75,11 @@ fn kem(algorithm: pq.KemAlgorithm, comptime seed_size: usize, comptime randomnes
 fn signature(allocator: Allocator, algorithm: pq.SignatureAlgorithm, comptime seed_size: usize, comptime randomness_size: usize) !void {
     const seed = secretBytes(seed_size, 3);
 
-    var pair = try hazmat.generateSignatureKeyPair(algorithm, &seed);
+    var pair = try hazmat.generateSignatureKeyPair(algorithm, allocator, &seed);
 
     defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
 
     const randomness = secretBytes(randomness_size, 4);
 
@@ -84,9 +90,11 @@ fn signature(allocator: Allocator, algorithm: pq.SignatureAlgorithm, comptime se
     try check(pair.public_key.verify(signed, message, .{}));
 
     // Key generation signs and verifies once more as its pairwise self-test.
-    var generated = try algorithm.generateKeyPair(.{});
+    var generated = try algorithm.generateKeyPair(allocator, .{});
 
     defer generated.private_key.deinit();
+
+    defer generated.public_key.deinit();
 
     for ([_]bool{ false, true }) |deterministic| {
         const output = try generated.private_key.sign(allocator, message, .{ .deterministic = deterministic, .context = "context" });
@@ -100,21 +108,25 @@ fn signature(allocator: Allocator, algorithm: pq.SignatureAlgorithm, comptime se
 // A private key from outside is secret as a whole: the library declassifies only what it holds
 // of the public key. Each key also goes out and back in as DER; PEM is only exported. Public keys
 // come from the pair, from the private key and from their bytes, so the cached forms of the keys
-// are built in every way there is.
+// are built in every way there is: at generation, and on first use from either key of a pair.
 fn importedKem(allocator: Allocator, algorithm: pq.KemAlgorithm) !void {
-    var pair = try hazmat.generateKemKeyPair(algorithm, &secretBytes(64, 6));
+    var pair = try hazmat.generateKemKeyPair(algorithm, allocator, &secretBytes(64, 6));
 
     defer pair.private_key.deinit();
 
-    const imported_public = try algorithm.importPublicKey(pair.public_key.bytes[0..algorithm.public_key_size], .raw);
+    defer pair.public_key.deinit();
+
+    var imported_public = try algorithm.importPublicKey(allocator, pair.public_key.public.bytes[0..algorithm.public_key_size], .raw);
+
+    defer imported_public.deinit();
 
     const size = 2 * algorithm.public_key_size + 32;
 
-    var expanded = pair.private_key.dk;
+    var expanded = pair.private_key.secret.dk;
 
     memcheck.makeMemUndefined(expanded[0..size]);
 
-    var imported = try algorithm.importPrivateKey(expanded[0..size], .raw);
+    var imported = try algorithm.importPrivateKey(allocator, expanded[0..size], .raw);
 
     defer imported.deinit();
 
@@ -125,12 +137,16 @@ fn importedKem(allocator: Allocator, algorithm: pq.KemAlgorithm) !void {
 
         defer allocator.free(der);
 
-        var again = try algorithm.importPrivateKey(der, .der);
+        var again = try algorithm.importPrivateKey(allocator, der, .der);
 
         defer again.deinit();
 
         for ([_]*const pq.KemPrivateKey{ key, &again }) |decapsulator| {
-            for ([_]pq.KemPublicKey{ pair.public_key, decapsulator.publicKey(), imported_public }) |encapsulator| {
+            var derived = decapsulator.publicKey();
+
+            defer derived.deinit();
+
+            for ([_]*const pq.KemPublicKey{ &pair.public_key, &derived, &imported_public }) |encapsulator| {
                 var encapsulation = try encapsulator.encapsulate();
 
                 var shared_secret = try decapsulator.decapsulate(encapsulation.ciphertext());
@@ -142,17 +158,21 @@ fn importedKem(allocator: Allocator, algorithm: pq.KemAlgorithm) !void {
 }
 
 fn importedSignature(allocator: Allocator, algorithm: pq.SignatureAlgorithm, comptime seed_size: usize, comptime secret_size: usize) !void {
-    var pair = try hazmat.generateSignatureKeyPair(algorithm, &secretBytes(seed_size, 7));
+    var pair = try hazmat.generateSignatureKeyPair(algorithm, allocator, &secretBytes(seed_size, 7));
 
     defer pair.private_key.deinit();
 
-    const imported_public = try algorithm.importPublicKey(pair.public_key.bytes[0..algorithm.public_key_size], .raw);
+    defer pair.public_key.deinit();
 
-    var raw = pair.private_key.secret_bytes[0..secret_size].*;
+    var imported_public = try algorithm.importPublicKey(allocator, pair.public_key.public.bytes[0..algorithm.public_key_size], .raw);
+
+    defer imported_public.deinit();
+
+    var raw = pair.private_key.secret.bytes[0..secret_size].*;
 
     memcheck.makeMemUndefined(&raw);
 
-    var imported = try algorithm.importPrivateKey(&raw, .raw);
+    var imported = try algorithm.importPrivateKey(allocator, &raw, .raw);
 
     defer imported.deinit();
 
@@ -163,7 +183,7 @@ fn importedSignature(allocator: Allocator, algorithm: pq.SignatureAlgorithm, com
 
         defer allocator.free(der);
 
-        var again = try algorithm.importPrivateKey(der, .der);
+        var again = try algorithm.importPrivateKey(allocator, der, .der);
 
         defer again.deinit();
 
@@ -172,7 +192,11 @@ fn importedSignature(allocator: Allocator, algorithm: pq.SignatureAlgorithm, com
 
             defer allocator.free(signed);
 
-            for ([_]pq.SignaturePublicKey{ pair.public_key, signer.publicKey(), imported_public }) |verifier| {
+            var derived = signer.publicKey();
+
+            defer derived.deinit();
+
+            for ([_]*const pq.SignaturePublicKey{ &pair.public_key, &derived, &imported_public }) |verifier| {
                 try check(verifier.verify(signed, message, .{}));
             }
         }
@@ -232,14 +256,14 @@ fn stateful(allocator: Allocator, algorithm: pq.StatefulSignatureAlgorithm, para
 
     const seed = secretBytes(seed_size, 5);
 
-    var pair = try hazmat.generateStatefulKeyPair(algorithm, allocator, parameters, &seed, 0, store.store());
+    var pair = try hazmat.generateStatefulKeyPair(algorithm, allocator, parameters, &seed, 0, store.store(), .{});
 
     defer pair.private_key.deinit(allocator);
 
     try signs(allocator, &pair.public_key, &pair.private_key);
 
     // Loading rebuilds the trees from the seeds in the stored state.
-    var loaded = try algorithm.loadPrivateKey(allocator, store.store());
+    var loaded = try algorithm.loadPrivateKey(allocator, store.store(), .{});
 
     defer loaded.deinit(allocator);
 
@@ -249,7 +273,7 @@ fn stateful(allocator: Allocator, algorithm: pq.StatefulSignatureAlgorithm, para
 
     defer fresh.deinit();
 
-    var generated = try algorithm.generateKeyPair(allocator, parameters, fresh.store());
+    var generated = try algorithm.generateKeyPair(allocator, parameters, fresh.store(), .{});
 
     defer generated.private_key.deinit(allocator);
 
@@ -260,14 +284,14 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
     for ([_]pq.KemAlgorithm{ pq.ml_kem_512, pq.ml_kem_768, pq.ml_kem_1024 }) |algorithm| {
-        try kem(algorithm, 64, 32);
+        try kem(allocator, algorithm, 64, 32);
 
         try importedKem(allocator, algorithm);
 
         std.debug.print("{s}: ok\n", .{algorithm.name});
     }
 
-    try kem(pq.x_wing, 32, 64);
+    try kem(allocator, pq.x_wing, 32, 64);
 
     std.debug.print("{s}: ok\n", .{pq.x_wing.name});
 

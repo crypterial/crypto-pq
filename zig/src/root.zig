@@ -131,6 +131,8 @@ pub const HssLevel = stateful.HssLevel;
 
 pub const StateStore = stateful.StateStore;
 
+pub const StatefulOptions = stateful.StatefulOptions;
+
 pub const hss_lms = stateful.hss_lms;
 
 pub const xmss = stateful.xmss;

@@ -28,6 +28,17 @@ pub const StatefulParameters = union(enum) {
     name: []const u8,
 };
 
+// reserve: how many indices one write to the store claims, a positive integer. The key then signs
+// that many times before it writes again; a key that stops earlier loses the rest, because
+// loading starts after them. It is not part of the stored state.
+pub const StatefulOptions = struct {
+    reserve: u64 = 1,
+};
+
+pub fn checkOptions(options: StatefulOptions) Error!void {
+    if (options.reserve == 0) return error.InvalidOption;
+}
+
 pub const StateStore = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -55,7 +66,9 @@ pub const StatefulSignatureAlgorithm = struct {
 
     pub const Kind = enum(u8) { hss_lms = 1, xmss = 2, xmss_mt = 3 };
 
-    pub fn generateKeyPair(self: StatefulSignatureAlgorithm, allocator: Allocator, parameters: StatefulParameters, store: StateStore) (Error || Allocator.Error)!StatefulKeyPair {
+    pub fn generateKeyPair(self: StatefulSignatureAlgorithm, allocator: Allocator, parameters: StatefulParameters, store: StateStore, options: StatefulOptions) (Error || Allocator.Error)!StatefulKeyPair {
+        try checkOptions(options);
+
         const setup = try Setup.parse(self.kind, parameters);
 
         var seed: [16 + 3 * 32]u8 = undefined;
@@ -66,10 +79,14 @@ pub const StatefulSignatureAlgorithm = struct {
 
         try rng.fill(seed[0..size]);
 
-        return create(self, allocator, setup, seed[0..size], 0, store);
+        return create(self, allocator, setup, seed[0..size], 0, store, options);
     }
 
-    pub fn loadPrivateKey(self: StatefulSignatureAlgorithm, allocator: Allocator, store: StateStore) (Error || Allocator.Error)!StatefulPrivateKey {
+    // The stored index is the first one not handed out, so signing resumes there even when the
+    // last key reserved more than it used.
+    pub fn loadPrivateKey(self: StatefulSignatureAlgorithm, allocator: Allocator, store: StateStore, options: StatefulOptions) (Error || Allocator.Error)!StatefulPrivateKey {
+        try checkOptions(options);
+
         const stored = (store.read(allocator) catch return error.StatePersistFailed) orelse return error.InvalidPrivateKey;
 
         defer {
@@ -90,7 +107,7 @@ pub const StatefulSignatureAlgorithm = struct {
 
         const signer = try Signer.build(allocator, decoded.setup, decoded.seed);
 
-        return .{ .algorithm = self, .signer = signer, .store = store, .state = state, .index = decoded.index };
+        return .{ .algorithm = self, .signer = signer, .store = store, .state = state, .index = .init(decoded.index), .reserved = decoded.index, .reserve = options.reserve };
     }
 
     pub fn importPublicKey(self: StatefulSignatureAlgorithm, data: []const u8, format: KeyFormat) Error!StatefulPublicKey {
@@ -138,12 +155,53 @@ pub const StatefulPublicKey = struct {
     }
 };
 
+// A u64 that one thread at a time writes and any thread reads without a lock, also on targets
+// without 64-bit atomics: the halves are written between two increments of a sequence number, and
+// a reader retries while that number is odd or changes under it.
+const Counter = struct {
+    sequence: std.atomic.Value(u32) = .init(0),
+    high: std.atomic.Value(u32),
+    low: std.atomic.Value(u32),
+
+    fn init(value: u64) Counter {
+        return .{ .high = .init(@truncate(value >> 32)), .low = .init(@truncate(value)) };
+    }
+
+    fn load(self: *const Counter) u64 {
+        while (true) {
+            const before = self.sequence.load(.acquire);
+
+            const value = @as(u64, self.high.load(.acquire)) << 32 | self.low.load(.acquire);
+
+            if (before % 2 == 0 and self.sequence.load(.monotonic) == before) return value;
+
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn store(self: *Counter, value: u64) void {
+        _ = self.sequence.fetchAdd(1, .acq_rel);
+
+        self.high.store(@truncate(value >> 32), .release);
+
+        self.low.store(@truncate(value), .release);
+
+        _ = self.sequence.fetchAdd(1, .release);
+    }
+};
+
+// `index` is the next index to sign with and `reserved` the one the stored state holds, never below
+// it: the indices in between were claimed by an earlier write. `signing` is set while a sign call
+// runs, and only that call writes `index`, `reserved`, `state` and the signer; remainingSignatures
+// may read `index` at any time, from the store's update included.
 pub const StatefulPrivateKey = struct {
     algorithm: StatefulSignatureAlgorithm,
     signer: Signer,
     store: StateStore,
     state: State,
-    index: u64,
+    index: Counter,
+    reserved: u64,
+    reserve: u64,
     signing: std.atomic.Value(bool) = .init(false),
 
     pub fn publicKey(self: *const StatefulPrivateKey) StatefulPublicKey {
@@ -155,38 +213,49 @@ pub const StatefulPrivateKey = struct {
     }
 
     pub fn remainingSignatures(self: *const StatefulPrivateKey) u64 {
-        return self.signer.capacity() - self.index;
+        return self.signer.capacity() - self.index.load();
     }
 
-    // The next index is written to the store before the signature exists, so a crash or a failed
-    // write can waste an index but never use one twice. A call made while another is signing with
-    // the same key fails with StateConflict: locks in Zig 0.16 need an Io, which this API omits.
+    // The store holds an index above every one used before the signature exists, so a crash or a
+    // failed write can waste indices but never use one twice. When the claimed indices run out,
+    // one write claims the next `reserve` of them. A call made while another is signing with the
+    // same key, from the store's update included, fails with StateConflict at once: locks in Zig
+    // 0.16 need an Io, which this API omits, and waiting there could never end.
     pub fn sign(self: *StatefulPrivateKey, allocator: Allocator, message: []const u8) (Error || Allocator.Error)![]u8 {
         if (self.signing.swap(true, .acquire)) return error.StateConflict;
 
         defer self.signing.store(false, .release);
 
-        const index = self.index;
+        const index = self.index.load();
 
-        if (index >= self.signer.capacity()) return error.KeyExhausted;
+        const capacity = self.signer.capacity();
+
+        if (index >= capacity) return error.KeyExhausted;
 
         const out = try allocator.alloc(u8, self.signer.signatureSize());
 
         errdefer allocator.free(out);
 
-        var next = self.state;
+        if (index == self.reserved) {
+            const claimed = @min(index +| self.reserve, capacity);
 
-        defer ct.wipe(&next.bytes);
+            var next = self.state;
 
-        reseal(self.algorithm.kind, next.slice(), index + 1);
+            defer ct.wipe(&next.bytes);
 
-        const updated = self.store.update(self.state.slice(), next.slice()) catch return error.StatePersistFailed;
+            reseal(self.algorithm.kind, next.slice(), claimed);
 
-        if (!updated) return error.StateConflict;
+            const updated = self.store.update(self.state.slice(), next.slice()) catch return error.StatePersistFailed;
 
-        self.state = next;
+            if (!updated) return error.StateConflict;
 
-        self.index = index + 1;
+            // The superseded state is overwritten in place, and the copy is wiped on return.
+            self.state = next;
+
+            self.reserved = claimed;
+        }
+
+        self.index.store(index + 1);
 
         self.signer.sign(index, message, out);
 
@@ -194,9 +263,13 @@ pub const StatefulPrivateKey = struct {
     }
 
     pub fn deinit(self: *StatefulPrivateKey, allocator: Allocator) void {
+        std.debug.assert(!self.signing.load(.acquire));
+
         self.signer.destroy(allocator);
 
         ct.wipe(&self.state.bytes);
+
+        self.* = undefined;
     }
 };
 
@@ -290,7 +363,7 @@ const Signer = union(enum) {
     hss: *lms.Hss,
     xmss: *xmss_scheme.Xmss,
 
-    fn build(allocator: Allocator, setup: Setup, seed: []const u8) Allocator.Error!Signer {
+    fn build(allocator: Allocator, setup: Setup, seed: []const u8) (Error || Allocator.Error)!Signer {
         switch (setup) {
             .hss => {
                 const hss = try allocator.create(lms.Hss);
@@ -379,13 +452,13 @@ fn reseal(kind: StatefulSignatureAlgorithm.Kind, state: []u8, index: u64) void {
     seal(state);
 }
 
-fn encode(kind: StatefulSignatureAlgorithm.Kind, setup: Setup, seed: []const u8, index: u64) State {
+fn encode(kind: StatefulSignatureAlgorithm.Kind, setup: Setup, seed: []const u8, index: u64, blob: *State) void {
     const header = switch (setup) {
         .hss => |hss| 3 + 8 * hss.count,
         .xmss => 6,
     };
 
-    var blob: State = .{ .bytes = @splat(0), .size = header + seed.len + 8 + 16 };
+    blob.* = .{ .bytes = @splat(0), .size = header + seed.len + 8 + 16 };
 
     const state = blob.slice();
 
@@ -413,8 +486,6 @@ fn encode(kind: StatefulSignatureAlgorithm.Kind, setup: Setup, seed: []const u8,
     }
 
     reseal(kind, state, index);
-
-    return blob;
 }
 
 const Decoded = struct {
@@ -475,13 +546,17 @@ fn decode(kind: StatefulSignatureAlgorithm.Kind, state: []const u8) Error!Decode
     return .{ .setup = .{ .xmss = p }, .seed = rest[12..], .index = std.mem.readInt(u64, rest[4..12], .big) };
 }
 
-// Builds the signer, then writes the first state with update(null, state).
-pub fn create(algorithm: StatefulSignatureAlgorithm, allocator: Allocator, setup: Setup, seed: []const u8, index: u64, store: StateStore) (Error || Allocator.Error)!StatefulKeyPair {
+// Builds the signer, then writes the first state with update(null, state). The new state holds
+// `index` itself: the first signature claims the reserve. The key is built in the result, so that
+// the only other copy of the state, which holds the seed, is the local one wiped here.
+pub fn create(algorithm: StatefulSignatureAlgorithm, allocator: Allocator, setup: Setup, seed: []const u8, index: u64, store: StateStore, options: StatefulOptions) (Error || Allocator.Error)!StatefulKeyPair {
     const signer = try Signer.build(allocator, setup, seed);
 
     errdefer signer.destroy(allocator);
 
-    var state = encode(algorithm.kind, setup, seed, index);
+    var state: State = undefined;
+
+    encode(algorithm.kind, setup, seed, index, &state);
 
     defer ct.wipe(&state.bytes);
 
@@ -489,9 +564,14 @@ pub fn create(algorithm: StatefulSignatureAlgorithm, allocator: Allocator, setup
 
     if (!created) return error.StateConflict;
 
-    const private_key: StatefulPrivateKey = .{ .algorithm = algorithm, .signer = signer, .store = store, .state = state, .index = index };
+    var public_key: StatefulPublicKey = .{ .algorithm = algorithm, .bytes = @splat(0), .size = 0 };
 
-    return .{ .public_key = private_key.publicKey(), .private_key = private_key };
+    public_key.size = signer.publicKey(&public_key.bytes).len;
+
+    return .{
+        .public_key = public_key,
+        .private_key = .{ .algorithm = algorithm, .signer = signer, .store = store, .state = state, .index = .init(index), .reserved = index, .reserve = options.reserve },
+    };
 }
 
 pub const hss_lms: StatefulSignatureAlgorithm = .{ .name = "HSS/LMS", .kind = .hss_lms };

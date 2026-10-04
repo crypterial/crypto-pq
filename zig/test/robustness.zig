@@ -367,14 +367,18 @@ fn kemCodes(algorithm: pq.KemAlgorithm, format: pq.KeyFormat, check: anyerror) [
 }
 
 fn checkKemPublic(allocator: Allocator, algorithm: pq.KemAlgorithm, data: []const u8, format: pq.KeyFormat) !void {
-    const key = algorithm.importPublicKey(data, format) catch |err| return expectCode(err, kemCodes(algorithm, format, error.InvalidPublicKey), algorithm.name, data);
+    var key = algorithm.importPublicKey(allocator, data, format) catch |err| return expectCode(err, kemCodes(algorithm, format, error.InvalidPublicKey), algorithm.name, data);
+
+    defer key.deinit();
 
     try sameEncoding(allocator, try key.exportKey(allocator, format), data, format);
 
     for (formats) |other| {
         const exported = key.exportKey(allocator, other) catch continue;
 
-        const again = try algorithm.importPublicKey(exported, other);
+        var again = try algorithm.importPublicKey(allocator, exported, other);
+
+        defer again.deinit();
 
         try testing.expect(again.eql(&key));
     }
@@ -389,7 +393,7 @@ fn checkKemPublic(allocator: Allocator, algorithm: pq.KemAlgorithm, data: []cons
 }
 
 fn checkKemPrivate(allocator: Allocator, algorithm: pq.KemAlgorithm, data: []const u8, format: pq.KeyFormat) !void {
-    var key = algorithm.importPrivateKey(data, format) catch |err| return expectCode(err, kemCodes(algorithm, format, error.InvalidPrivateKey), algorithm.name, data);
+    var key = algorithm.importPrivateKey(allocator, data, format) catch |err| return expectCode(err, kemCodes(algorithm, format, error.InvalidPrivateKey), algorithm.name, data);
 
     defer key.deinit();
 
@@ -400,7 +404,7 @@ fn checkKemPrivate(allocator: Allocator, algorithm: pq.KemAlgorithm, data: []con
     for (formats) |other| {
         const exported = key.exportKey(allocator, other) catch continue;
 
-        var again = try algorithm.importPrivateKey(exported, other);
+        var again = try algorithm.importPrivateKey(allocator, exported, other);
 
         defer again.deinit();
 
@@ -414,7 +418,9 @@ fn checkKemPrivate(allocator: Allocator, algorithm: pq.KemAlgorithm, data: []con
 
     @memset(randomness, 0);
 
-    const public_key = key.publicKey();
+    var public_key = key.publicKey();
+
+    defer public_key.deinit();
 
     const encapsulation = try hazmat.encapsulate(&public_key, randomness);
 
@@ -458,11 +464,13 @@ test "robustness: an inconsistent expanded ML-KEM key decapsulates to the implic
 
         dk[0] ^= 1;
 
-        var key = try algorithm.importPrivateKey(dk, .raw);
+        var key = try algorithm.importPrivateKey(allocator, dk, .raw);
 
         defer key.deinit();
 
-        const public_key = key.publicKey();
+        var public_key = key.publicKey();
+
+        defer public_key.deinit();
 
         const encapsulation = try hazmat.encapsulate(&public_key, try pattern(allocator, 32, 0x80));
 
@@ -488,11 +496,13 @@ test "robustness: KEM key import takes any bytes" {
     var rng: Random = .{ .state = 3 };
 
     for (kems) |algorithm| {
-        var pair = try hazmat.generateKemKeyPair(algorithm, try pattern(allocator, kemSizes(algorithm)[0], 0));
+        var pair = try hazmat.generateKemKeyPair(algorithm, testing.allocator, try pattern(allocator, kemSizes(algorithm)[0], 0));
 
         defer pair.private_key.deinit();
 
-        var expanded: ?pq.KemPrivateKey = if (algorithm.kind == .x_wing) null else try algorithm.importPrivateKey(try expandedKey(allocator, acvp.records, algorithm), .raw);
+        defer pair.public_key.deinit();
+
+        var expanded: ?pq.KemPrivateKey = if (algorithm.kind == .x_wing) null else try algorithm.importPrivateKey(testing.allocator, try expandedKey(allocator, acvp.records, algorithm), .raw);
 
         defer if (expanded) |*key| key.deinit();
 
@@ -570,12 +580,16 @@ fn signatureCodes(format: pq.KeyFormat, check: anyerror) []const anyerror {
 }
 
 fn checkSignaturePublic(allocator: Allocator, algorithm: pq.SignatureAlgorithm, data: []const u8, format: pq.KeyFormat) !void {
-    const key = algorithm.importPublicKey(data, format) catch |err| return expectCode(err, signatureCodes(format, error.InvalidLength), algorithm.name, data);
+    var key = algorithm.importPublicKey(allocator, data, format) catch |err| return expectCode(err, signatureCodes(format, error.InvalidLength), algorithm.name, data);
+
+    defer key.deinit();
 
     try sameEncoding(allocator, try key.exportKey(allocator, format), data, format);
 
     for (formats) |other| {
-        const again = try algorithm.importPublicKey(try key.exportKey(allocator, other), other);
+        var again = try algorithm.importPublicKey(allocator, try key.exportKey(allocator, other), other);
+
+        defer again.deinit();
 
         try testing.expect(again.eql(&key));
     }
@@ -588,7 +602,7 @@ fn checkSignaturePublic(allocator: Allocator, algorithm: pq.SignatureAlgorithm, 
 }
 
 fn checkSignaturePrivate(allocator: Allocator, algorithm: pq.SignatureAlgorithm, data: []const u8, format: pq.KeyFormat) !void {
-    var key = algorithm.importPrivateKey(data, format) catch |err| return expectCode(err, signatureCodes(format, error.InvalidPrivateKey), algorithm.name, data);
+    var key = algorithm.importPrivateKey(allocator, data, format) catch |err| return expectCode(err, signatureCodes(format, error.InvalidPrivateKey), algorithm.name, data);
 
     defer key.deinit();
 
@@ -597,14 +611,16 @@ fn checkSignaturePrivate(allocator: Allocator, algorithm: pq.SignatureAlgorithm,
     if (format == .raw) try testing.expectEqualSlices(u8, data, raw);
 
     for (formats) |other| {
-        var again = try algorithm.importPrivateKey(try key.exportKey(allocator, other), other);
+        var again = try algorithm.importPrivateKey(allocator, try key.exportKey(allocator, other), other);
 
         defer again.deinit();
 
         try testing.expectEqualSlices(u8, raw, try again.exportKey(allocator, .raw));
     }
 
-    const public_key = key.publicKey();
+    var public_key = key.publicKey();
+
+    defer public_key.deinit();
 
     if (!isMlDsa(algorithm)) {
         try testing.expectEqualSlices(u8, raw[raw.len / 2 ..], try public_key.exportKey(allocator, .raw));
@@ -629,9 +645,11 @@ test "robustness: signature key import takes any bytes" {
     for (signatures) |algorithm| {
         if (!selected(algorithm)) continue;
 
-        var pair = try hazmat.generateSignatureKeyPair(algorithm, try pattern(allocator, signatureSeedSize(algorithm), 0));
+        var pair = try hazmat.generateSignatureKeyPair(algorithm, testing.allocator, try pattern(allocator, signatureSeedSize(algorithm), 0));
 
         defer pair.private_key.deinit();
+
+        defer pair.public_key.deinit();
 
         const rounds = (if (isMlDsa(algorithm)) @as(usize, 25) else 4) * scale();
 
@@ -718,13 +736,17 @@ test "robustness: PEM import takes any text" {
 
     var rng: Random = .{ .state = 10 };
 
-    var kem = try hazmat.generateKemKeyPair(pq.ml_kem_768, try pattern(allocator, 64, 0));
+    var kem = try hazmat.generateKemKeyPair(pq.ml_kem_768, testing.allocator, try pattern(allocator, 64, 0));
 
     defer kem.private_key.deinit();
 
-    var dsa = try hazmat.generateSignatureKeyPair(pq.ml_dsa_44, try pattern(allocator, 32, 0));
+    defer kem.public_key.deinit();
+
+    var dsa = try hazmat.generateSignatureKeyPair(pq.ml_dsa_44, testing.allocator, try pattern(allocator, 32, 0));
 
     defer dsa.private_key.deinit();
+
+    defer dsa.public_key.deinit();
 
     const seeds = [_][]const u8{
         try kem.public_key.exportKey(allocator, .pem),
@@ -806,8 +828,9 @@ test "robustness: verification takes any signature, message, context and pre-has
 
         // SLH-DSA keys are expensive to make, so verification gets a public key of the right
         // size, which is all that it checks, and an all-zero signature.
+        // The public key outlives the private key, which it was taken from.
         if (real) {
-            var pair = try hazmat.generateSignatureKeyPair(algorithm, try pattern(allocator, 32, 0));
+            var pair = try hazmat.generateSignatureKeyPair(algorithm, testing.allocator, try pattern(allocator, 32, 0));
 
             defer pair.private_key.deinit();
 
@@ -817,8 +840,10 @@ test "robustness: verification takes any signature, message, context and pre-has
 
             signature = try hazmat.sign(&pair.private_key, allocator, message, try pattern(allocator, 32, 0x60), .{ .context = "context" });
         } else {
-            public_key = try algorithm.importPublicKey(try pattern(allocator, algorithm.public_key_size, 0x20), .raw);
+            public_key = try algorithm.importPublicKey(testing.allocator, try pattern(allocator, algorithm.public_key_size, 0x20), .raw);
         }
+
+        defer public_key.deinit();
 
         var scratch = std.heap.ArenaAllocator.init(testing.allocator);
 
@@ -957,7 +982,7 @@ test "robustness: stateful verification takes any signature and public key" {
 
     defer hss_store.deinit();
 
-    var hss = try hazmat.generateStatefulKeyPair(pq.hss_lms, testing.allocator, .{ .levels = &levels }, try pattern(allocator, 40, 0), 33, hss_store.store());
+    var hss = try hazmat.generateStatefulKeyPair(pq.hss_lms, testing.allocator, .{ .levels = &levels }, try pattern(allocator, 40, 0), 33, hss_store.store(), .{});
 
     defer hss.private_key.deinit(testing.allocator);
 
@@ -965,7 +990,7 @@ test "robustness: stateful verification takes any signature and public key" {
 
     defer mt_store.deinit();
 
-    var mt = try hazmat.generateStatefulKeyPair(pq.xmss_mt, testing.allocator, .{ .name = "XMSSMT-SHA2_20/4_192" }, try pattern(allocator, 72, 0), 7, mt_store.store());
+    var mt = try hazmat.generateStatefulKeyPair(pq.xmss_mt, testing.allocator, .{ .name = "XMSSMT-SHA2_20/4_192" }, try pattern(allocator, 72, 0), 7, mt_store.store(), .{});
 
     defer mt.private_key.deinit(testing.allocator);
 
@@ -1034,9 +1059,11 @@ test "robustness: decapsulation takes any ciphertext" {
     for (kems) |algorithm| {
         const sizes = kemSizes(algorithm);
 
-        var pair = try hazmat.generateKemKeyPair(algorithm, try pattern(allocator, sizes[0], 0));
+        var pair = try hazmat.generateKemKeyPair(algorithm, testing.allocator, try pattern(allocator, sizes[0], 0));
 
         defer pair.private_key.deinit();
+
+        defer pair.public_key.deinit();
 
         const encapsulation = try hazmat.encapsulate(&pair.public_key, try pattern(allocator, sizes[1], 0x80));
 
@@ -1232,7 +1259,7 @@ fn storedState(allocator: Allocator, algorithm: pq.StatefulSignatureAlgorithm, p
 
     defer store.deinit();
 
-    var pair = try hazmat.generateStatefulKeyPair(algorithm, testing.allocator, parameters, seed, index, store.store());
+    var pair = try hazmat.generateStatefulKeyPair(algorithm, testing.allocator, parameters, seed, index, store.store(), .{});
 
     pair.private_key.deinit(testing.allocator);
 
@@ -1245,7 +1272,7 @@ fn checkState(allocator: Allocator, algorithm: pq.StatefulSignatureAlgorithm, st
 
         defer store.deinit();
 
-        if (algorithm.loadPrivateKey(testing.allocator, store.store())) |loaded| {
+        if (algorithm.loadPrivateKey(testing.allocator, store.store(), .{})) |loaded| {
             var key = loaded;
 
             key.deinit(testing.allocator);
@@ -1265,14 +1292,14 @@ fn checkState(allocator: Allocator, algorithm: pq.StatefulSignatureAlgorithm, st
     defer store.deinit();
 
     if (expected.index > expected.capacity) {
-        try testing.expectError(error.InvalidPrivateKey, algorithm.loadPrivateKey(testing.allocator, store.store()));
+        try testing.expectError(error.InvalidPrivateKey, algorithm.loadPrivateKey(testing.allocator, store.store(), .{}));
 
         return;
     }
 
     if (expected.cost > budget) return;
 
-    var key = try algorithm.loadPrivateKey(testing.allocator, store.store());
+    var key = try algorithm.loadPrivateKey(testing.allocator, store.store(), .{});
 
     defer key.deinit(testing.allocator);
 
@@ -1413,7 +1440,7 @@ fn expectRefused(allocator: Allocator, algorithm: pq.StatefulSignatureAlgorithm,
 
     defer store.deinit();
 
-    try testing.expectError(error.InvalidPrivateKey, algorithm.loadPrivateKey(testing.allocator, store.store()));
+    try testing.expectError(error.InvalidPrivateKey, algorithm.loadPrivateKey(testing.allocator, store.store(), .{}));
 }
 
 // ReleaseSafe keeps the safety checks and runs these in seconds; a Debug build takes far longer,
@@ -1512,9 +1539,11 @@ test "robustness: 16 MiB and empty messages sign and verify; contexts stop at 25
     const longest = try pattern(allocator, 255, 0);
 
     for ([_]pq.SignatureAlgorithm{ pq.ml_dsa_44, pq.slh_dsa_sha2_128f }) |algorithm| {
-        var pair = try hazmat.generateSignatureKeyPair(algorithm, try pattern(allocator, signatureSeedSize(algorithm), 0));
+        var pair = try hazmat.generateSignatureKeyPair(algorithm, testing.allocator, try pattern(allocator, signatureSeedSize(algorithm), 0));
 
         defer pair.private_key.deinit();
+
+        defer pair.public_key.deinit();
 
         const cases = [_]struct { text: []const u8, context: []const u8, pre_hash: ?pq.PreHash }{
             .{ .text = message, .context = "", .pre_hash = null },
@@ -1546,7 +1575,7 @@ test "robustness: 16 MiB and empty messages sign and verify; contexts stop at 25
 
     defer hss_store.deinit();
 
-    var hss = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &levels }, hss_store.store());
+    var hss = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &levels }, hss_store.store(), .{});
 
     defer hss.private_key.deinit(testing.allocator);
 
@@ -1554,7 +1583,7 @@ test "robustness: 16 MiB and empty messages sign and verify; contexts stop at 25
 
     defer mt_store.deinit();
 
-    var mt = try pq.xmss_mt.generateKeyPair(testing.allocator, .{ .name = "XMSSMT-SHA2_20/4_192" }, mt_store.store());
+    var mt = try pq.xmss_mt.generateKeyPair(testing.allocator, .{ .name = "XMSSMT-SHA2_20/4_192" }, mt_store.store(), .{});
 
     defer mt.private_key.deinit(testing.allocator);
 
@@ -1599,14 +1628,16 @@ test "robustness: PEM with very long lines or huge bodies" {
     const allocator = arena.allocator();
 
     // The header and the footer share their dashes, leaving no body between them.
-    try testing.expectError(error.InvalidEncoding, pq.ml_kem_768.importPublicKey("-----BEGIN PUBLIC KEY-----END PUBLIC KEY-----", .pem));
+    try testing.expectError(error.InvalidEncoding, pq.ml_kem_768.importPublicKey(testing.allocator, "-----BEGIN PUBLIC KEY-----END PUBLIC KEY-----", .pem));
 
     // The last base64 quantum of an ML-DSA-44 key carries two unused bits, which must be zero.
     const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-    var dsa = try hazmat.generateSignatureKeyPair(pq.ml_dsa_44, try pattern(allocator, 32, 0));
+    var dsa = try hazmat.generateSignatureKeyPair(pq.ml_dsa_44, testing.allocator, try pattern(allocator, 32, 0));
 
     defer dsa.private_key.deinit();
+
+    defer dsa.public_key.deinit();
 
     const flipped = try dsa.public_key.exportKey(allocator, .pem);
 
@@ -1614,13 +1645,15 @@ test "robustness: PEM with very long lines or huge bodies" {
 
     flipped[last] = alphabet[std.mem.findScalar(u8, alphabet, flipped[last]).? ^ 1];
 
-    try testing.expectError(error.InvalidEncoding, pq.ml_dsa_44.importPublicKey(flipped, .pem));
+    try testing.expectError(error.InvalidEncoding, pq.ml_dsa_44.importPublicKey(testing.allocator, flipped, .pem));
 
-    try testing.expectError(error.InvalidEncoding, pq.ml_dsa_44.importPrivateKey("-----BEGIN PRIVATE KEY-----END PRIVATE KEY-----", .pem));
+    try testing.expectError(error.InvalidEncoding, pq.ml_dsa_44.importPrivateKey(testing.allocator, "-----BEGIN PRIVATE KEY-----END PRIVATE KEY-----", .pem));
 
-    var pair = try hazmat.generateKemKeyPair(pq.ml_kem_768, try pattern(allocator, 64, 0));
+    var pair = try hazmat.generateKemKeyPair(pq.ml_kem_768, testing.allocator, try pattern(allocator, 64, 0));
 
     defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
 
     const body = try base64(allocator, try pair.public_key.exportKey(allocator, .der));
 
@@ -1632,13 +1665,17 @@ test "robustness: PEM with very long lines or huge bodies" {
 
     try narrow.appendSlice(allocator, "-----END PUBLIC KEY-----\n");
 
-    const from_narrow = try pq.ml_kem_768.importPublicKey(narrow.items, .pem);
+    var from_narrow = try pq.ml_kem_768.importPublicKey(testing.allocator, narrow.items, .pem);
+
+    defer from_narrow.deinit();
 
     try testing.expect(from_narrow.eql(&pair.public_key));
 
     const wide = try std.mem.concat(allocator, u8, &.{ "-----BEGIN PUBLIC KEY-----", body, "-----END PUBLIC KEY-----" });
 
-    const from_wide = try pq.ml_kem_768.importPublicKey(wide, .pem);
+    var from_wide = try pq.ml_kem_768.importPublicKey(testing.allocator, wide, .pem);
+
+    defer from_wide.deinit();
 
     try testing.expect(from_wide.eql(&pair.public_key));
 
@@ -1651,7 +1688,7 @@ test "robustness: PEM with very long lines or huge bodies" {
     for ([_][]const u8{ huge, huge[0 .. huge.len - 1] }) |text| {
         const pem = try std.mem.concat(allocator, u8, &.{ "-----BEGIN PUBLIC KEY-----\n", text, "\n-----END PUBLIC KEY-----\n" });
 
-        try testing.expectError(error.InvalidEncoding, pq.ml_kem_768.importPublicKey(pem, .pem));
+        try testing.expectError(error.InvalidEncoding, pq.ml_kem_768.importPublicKey(testing.allocator, pem, .pem));
     }
 }
 
@@ -1665,9 +1702,11 @@ test "robustness: DER lengths that claim gigabytes" {
 
     const allocator = arena.allocator();
 
-    var pair = try hazmat.generateSignatureKeyPair(pq.ml_dsa_65, try pattern(allocator, 32, 0));
+    var pair = try hazmat.generateSignatureKeyPair(pq.ml_dsa_65, testing.allocator, try pattern(allocator, 32, 0));
 
     defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
 
     const public = try pair.public_key.exportKey(allocator, .der);
 
@@ -1688,13 +1727,13 @@ test "robustness: DER lengths that claim gigabytes" {
     };
 
     for (cases) |data| {
-        try testing.expectError(error.InvalidEncoding, pq.ml_dsa_65.importPublicKey(data, .der));
+        try testing.expectError(error.InvalidEncoding, pq.ml_dsa_65.importPublicKey(testing.allocator, data, .der));
 
-        try testing.expectError(error.InvalidEncoding, pq.ml_dsa_65.importPrivateKey(data, .der));
+        try testing.expectError(error.InvalidEncoding, pq.ml_dsa_65.importPrivateKey(testing.allocator, data, .der));
 
         const pem = try std.mem.concat(allocator, u8, &.{ "-----BEGIN PUBLIC KEY-----\n", try base64(allocator, data), "\n-----END PUBLIC KEY-----\n" });
 
-        try testing.expectError(error.InvalidEncoding, pq.ml_dsa_65.importPublicKey(pem, .pem));
+        try testing.expectError(error.InvalidEncoding, pq.ml_dsa_65.importPublicKey(testing.allocator, pem, .pem));
     }
 }
 
@@ -1731,7 +1770,7 @@ test "robustness: one key signing on several threads" {
 
     defer store.deinit();
 
-    var pair = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small_levels }, store.store());
+    var pair = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small_levels }, store.store(), .{});
 
     defer pair.private_key.deinit(testing.allocator);
 
@@ -1773,7 +1812,7 @@ const StoreSigning = struct {
     // Loads its own key, signs until the key is exhausted and loads it again whenever another
     // thread has used the stored index.
     fn run(self: *StoreSigning) !void {
-        var key = try pq.hss_lms.loadPrivateKey(testing.allocator, self.store.store());
+        var key = try pq.hss_lms.loadPrivateKey(testing.allocator, self.store.store(), .{});
 
         defer key.deinit(testing.allocator);
 
@@ -1785,7 +1824,7 @@ const StoreSigning = struct {
                 error.StateConflict => {
                     key.deinit(testing.allocator);
 
-                    key = try pq.hss_lms.loadPrivateKey(testing.allocator, self.store.store());
+                    key = try pq.hss_lms.loadPrivateKey(testing.allocator, self.store.store(), .{});
 
                     continue;
                 },
@@ -1806,7 +1845,7 @@ test "robustness: keys sharing a store on several threads" {
 
     defer store.deinit();
 
-    var pair = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small_levels }, store.store());
+    var pair = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small_levels }, store.store(), .{});
 
     pair.private_key.deinit(testing.allocator);
 
@@ -1919,14 +1958,22 @@ fn importer(comptime algorithm: anytype, comptime private: bool) Import {
     return struct {
         fn run(allocator: Allocator, data: []const u8, format: pq.KeyFormat) anyerror![]u8 {
             if (private) {
-                var key = try algorithm.importPrivateKey(data, format);
+                var key = try algorithm.importPrivateKey(allocator, data, format);
 
                 defer key.deinit();
 
                 return key.exportKey(allocator, .raw);
             }
 
-            const key = try algorithm.importPublicKey(data, format);
+            if (@TypeOf(algorithm) == pq.StatefulSignatureAlgorithm) {
+                const key = try algorithm.importPublicKey(data, format);
+
+                return key.exportKey(allocator, .raw);
+            }
+
+            var key = try algorithm.importPublicKey(allocator, data, format);
+
+            defer key.deinit();
 
             return key.exportKey(allocator, .raw);
         }
@@ -2030,7 +2077,7 @@ fn stateCase(rng: *Random, allocator: Allocator, transcript: *Transcript, base: 
 
         defer store.deinit();
 
-        var key = algorithm.loadPrivateKey(testing.allocator, store.store()) catch |err| {
+        var key = algorithm.loadPrivateKey(testing.allocator, store.store(), .{}) catch |err| {
             transcript.add(state, @intCast(choice), codeOf(err), "");
 
             continue;
@@ -2055,25 +2102,33 @@ test "robustness: all implementations agree on untrusted input" {
 
     const allocator = arena.allocator();
 
-    var kem = try hazmat.generateKemKeyPair(pq.ml_kem_768, try pattern(allocator, 64, 0));
+    var kem = try hazmat.generateKemKeyPair(pq.ml_kem_768, testing.allocator, try pattern(allocator, 64, 0));
 
     defer kem.private_key.deinit();
 
+    defer kem.public_key.deinit();
+
     const encapsulation = try hazmat.encapsulate(&kem.public_key, try pattern(allocator, 32, 0x80));
 
-    var xwing = try hazmat.generateKemKeyPair(pq.x_wing, try pattern(allocator, 32, 0));
+    var xwing = try hazmat.generateKemKeyPair(pq.x_wing, testing.allocator, try pattern(allocator, 32, 0));
 
     defer xwing.private_key.deinit();
 
-    var dsa = try hazmat.generateSignatureKeyPair(pq.ml_dsa_44, try pattern(allocator, 32, 0));
+    defer xwing.public_key.deinit();
+
+    var dsa = try hazmat.generateSignatureKeyPair(pq.ml_dsa_44, testing.allocator, try pattern(allocator, 32, 0));
 
     defer dsa.private_key.deinit();
 
+    defer dsa.public_key.deinit();
+
     const signature = try hazmat.sign(&dsa.private_key, allocator, message_text, try pattern(allocator, 32, 0x60), .{ .context = "context" });
 
-    var slh = try hazmat.generateSignatureKeyPair(pq.slh_dsa_sha2_128f, try pattern(allocator, 48, 0));
+    var slh = try hazmat.generateSignatureKeyPair(pq.slh_dsa_sha2_128f, testing.allocator, try pattern(allocator, 48, 0));
 
     defer slh.private_key.deinit();
+
+    defer slh.public_key.deinit();
 
     const levels = [_]pq.HssLevel{ .{ .lms = "LMS_SHA256_M24_H5", .ots = "LMOTS_SHA256_N24_W1" }, .{ .lms = "LMS_SHA256_M24_H5", .ots = "LMOTS_SHA256_N24_W1" } };
 
@@ -2081,7 +2136,7 @@ test "robustness: all implementations agree on untrusted input" {
 
     defer hss_store.deinit();
 
-    var hss = try hazmat.generateStatefulKeyPair(pq.hss_lms, testing.allocator, .{ .levels = &levels }, try pattern(allocator, 40, 0), 33, hss_store.store());
+    var hss = try hazmat.generateStatefulKeyPair(pq.hss_lms, testing.allocator, .{ .levels = &levels }, try pattern(allocator, 40, 0), 33, hss_store.store(), .{});
 
     defer hss.private_key.deinit(testing.allocator);
 
@@ -2167,7 +2222,7 @@ test "robustness: verification refuses crafted structures" {
 
     defer store.deinit();
 
-    var pair = try hazmat.generateStatefulKeyPair(pq.hss_lms, testing.allocator, .{ .levels = &levels }, try pattern(allocator, 40, 0), 33, store.store());
+    var pair = try hazmat.generateStatefulKeyPair(pq.hss_lms, testing.allocator, .{ .levels = &levels }, try pattern(allocator, 40, 0), 33, store.store(), .{});
 
     defer pair.private_key.deinit(testing.allocator);
 
@@ -2203,9 +2258,11 @@ test "robustness: verification refuses crafted structures" {
         try testing.expectError(error.InvalidPublicKey, pq.hss_lms.importPublicKey(public, .raw));
     }
 
-    var dsa = try hazmat.generateSignatureKeyPair(pq.ml_dsa_44, try pattern(allocator, 32, 0));
+    var dsa = try hazmat.generateSignatureKeyPair(pq.ml_dsa_44, testing.allocator, try pattern(allocator, 32, 0));
 
     defer dsa.private_key.deinit();
+
+    defer dsa.public_key.deinit();
 
     const valid = try hazmat.sign(&dsa.private_key, allocator, message, &([_]u8{0} ** 32), .{});
 

@@ -1,6 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const ct = @import("ct.zig");
+
+// Debug builds give every temporary of every unrolled round its own stack slot, about 180 KiB for
+// eight SHA-512 lanes, so they run the same rounds as a loop with run-time indices.
+const unrolled = builtin.mode != .Debug;
 
 const k256 = [64]u32{
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -98,6 +103,8 @@ fn shr(comptime W: type, x: W, comptime r: comptime_int) W {
 // keeps its last 16 words: word t lives at t % 16, so t - 15, t - 7 and t - 2 are at (t + 1) % 16,
 // (t + 9) % 16 and (t + 14) % 16, and t - 16 is the slot it replaces.
 pub fn rounds256(comptime W: type, state: *[8]W, words: *const [16]W) void {
+    if (!unrolled) return looped(W, &k256, .{ 7, 18, 3, 17, 19, 10 }, .{ 6, 11, 25, 2, 13, 22 }, state, words);
+
     var w = words.*;
 
     var v = state.*;
@@ -124,6 +131,8 @@ pub fn rounds256(comptime W: type, state: *[8]W, words: *const [16]W) void {
 }
 
 pub fn rounds512(comptime W: type, state: *[8]W, words: *const [16]W) void {
+    if (!unrolled) return looped(W, &k512, .{ 1, 8, 7, 19, 61, 6 }, .{ 14, 18, 41, 28, 34, 39 }, state, words);
+
     @setEvalBranchQuota(4000);
 
     var w = words.*;
@@ -147,6 +156,56 @@ pub fn rounds512(comptime W: type, state: *[8]W, words: *const [16]W) void {
     }
 
     inline for (state, v) |*word, value| {
+        word.* +%= value;
+    }
+}
+
+// The rounds above with t known only at run time: `sigma` holds the rotations and the shift of
+// the two schedule functions, `r` the rotations of the round functions.
+fn looped(comptime W: type, k: anytype, comptime sigma: [6]comptime_int, comptime r: [6]comptime_int, state: *[8]W, words: *const [16]W) void {
+    var w = words.*;
+
+    var v = state.*;
+
+    for (k, 0..) |constant, t| {
+        if (t >= 16) {
+            const x = w[(t + 1) % 16];
+
+            const y = w[(t + 14) % 16];
+
+            const s0 = std.math.rotr(W, x, sigma[0]) ^ std.math.rotr(W, x, sigma[1]) ^ shr(W, x, sigma[2]);
+
+            const s1 = std.math.rotr(W, y, sigma[3]) ^ std.math.rotr(W, y, sigma[4]) ^ shr(W, y, sigma[5]);
+
+            w[t % 16] = w[t % 16] +% s0 +% w[(t + 9) % 16] +% s1;
+        }
+
+        const kw = broadcast(W, constant) +% w[t % 16];
+
+        const a = v[(8 - t % 8) % 8];
+
+        const b = v[(9 - t % 8) % 8];
+
+        const c = v[(10 - t % 8) % 8];
+
+        const e = v[(12 - t % 8) % 8];
+
+        const f = v[(13 - t % 8) % 8];
+
+        const g = v[(14 - t % 8) % 8];
+
+        const s1 = std.math.rotr(W, e, r[0]) ^ std.math.rotr(W, e, r[1]) ^ std.math.rotr(W, e, r[2]);
+
+        const t1 = v[(15 - t % 8) % 8] +% s1 +% (((f ^ g) & e) ^ g) +% kw;
+
+        const s0 = std.math.rotr(W, a, r[3]) ^ std.math.rotr(W, a, r[4]) ^ std.math.rotr(W, a, r[5]);
+
+        v[(11 - t % 8) % 8] +%= t1;
+
+        v[(15 - t % 8) % 8] = t1 +% s0 +% (((a ^ b) & c) ^ (a & b));
+    }
+
+    for (state, v) |*word, value| {
         word.* +%= value;
     }
 }

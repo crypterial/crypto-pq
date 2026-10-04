@@ -234,3 +234,46 @@ pub fn parallel(records: []const Record, context: anytype, comptime run: fn (@Ty
 
     if (shared.failures.load(.monotonic) != 0) return error.TestUnexpectedResult;
 }
+
+// An allocator that records whether memory was freed while it still held one of `secrets`, so
+// that a test can check that keys wipe what they free.
+pub const WipeCheck = struct {
+    child: Allocator,
+    secrets: []const []const u8,
+    leaked: bool = false,
+    frees: usize = 0,
+
+    pub fn allocator(self: *WipeCheck) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *WipeCheck = @ptrCast(@alignCast(context));
+
+        return self.child.rawAlloc(len, alignment, ret);
+    }
+
+    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
+        const self: *WipeCheck = @ptrCast(@alignCast(context));
+
+        return self.child.rawResize(memory, alignment, new_len, ret);
+    }
+
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+        const self: *WipeCheck = @ptrCast(@alignCast(context));
+
+        return self.child.rawRemap(memory, alignment, new_len, ret);
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const self: *WipeCheck = @ptrCast(@alignCast(context));
+
+        for (self.secrets) |secret| {
+            if (std.mem.indexOf(u8, memory, secret) != null) self.leaked = true;
+        }
+
+        self.frees += 1;
+
+        self.child.rawFree(memory, alignment, ret);
+    }
+};

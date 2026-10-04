@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const ct = @import("ct.zig");
+const Error = @import("errors.zig").Error;
 const hash = @import("hash.zig");
 const merkle = @import("merkle.zig");
 const primitives = @import("primitives.zig");
@@ -362,8 +363,9 @@ const Hashes = struct {
     }
 };
 
-// Independent SHA-256 computations run side by side in the lanes of vectors.
-const max_lanes = 8;
+// Independent SHA-256 computations run side by side in the lanes of vectors. A target without
+// vector registers computes one at a time: emulated lanes cost as much each and spill to the stack.
+const max_lanes = if (std.simd.suggestVectorLength(u32) == null) 1 else 8;
 
 // SHA-256 of L hashes at once, lane l of every vector belonging to the l-th, for SHA2 parameter
 // sets with m-word values. Every input is a sequence of whole 32-bit words: the padded prefix,
@@ -863,23 +865,36 @@ pub fn verify(p: Parameters, public_key: []const u8, message: []const u8, signat
 // The signing side of an XMSS or XMSS^MT key, with one cached tree per layer. It is allocated so
 // that the trees can point back at its hashes, and every layer has its tree memory from the start
 // so that signing never allocates.
+//
+// The part of an XMSS^MT signature that layer L >= 1 contributes (the WOTS+ signature of the root
+// below and the authentication path) depends only on index >> (L * h / d), so it is kept until
+// that prefix changes, as HSS keeps the signed public keys of its child trees. A layer whose part
+// is current has every layer above it current too.
 pub const Xmss = struct {
     hashes: Hashes,
     sk_prf: [max_n]u8,
     root: [max_n]u8,
     layers: [12]Layer,
+    upper: []u8,
+    upper_prefixes: [12]?u64,
 
     const Layer = struct {
         index: ?u64,
         tree: merkle.MerkleTree(TreeContext),
     };
 
-    pub fn create(allocator: Allocator, p: Parameters, seed: []const u8) Allocator.Error!*Xmss {
+    pub fn create(allocator: Allocator, p: Parameters, seed: []const u8) (Error || Allocator.Error)!*Xmss {
         const n = p.n;
 
         const self = try allocator.create(Xmss);
 
         errdefer allocator.destroy(self);
+
+        self.upper = try allocator.alloc(u8, (p.d - 1) * layerSize(p));
+
+        errdefer allocator.free(self.upper);
+
+        self.upper_prefixes = @splat(null);
 
         var built: usize = 0;
 
@@ -906,6 +921,8 @@ pub const Xmss = struct {
     pub fn destroy(self: *Xmss, allocator: Allocator) void {
         for (self.layers[0..self.hashes.p.d]) |*layer| layer.tree.deinit(allocator);
 
+        allocator.free(self.upper);
+
         self.hashes.wipe();
 
         ct.wipe(&self.sk_prf);
@@ -929,7 +946,12 @@ pub const Xmss = struct {
         return out[0 .. 4 + 2 * n];
     }
 
-    fn tree(self: *Xmss, layer: usize, index: u64) *const merkle.MerkleTree(TreeContext) {
+    // The bytes one layer adds to a signature: a WOTS+ signature and an authentication path.
+    fn layerSize(p: Parameters) usize {
+        return (p.length() + p.treeHeight()) * p.n;
+    }
+
+    fn tree(self: *Xmss, layer: usize, index: u64) *merkle.MerkleTree(TreeContext) {
         const cached = &self.layers[layer];
 
         if (cached.index == null or cached.index.? != index) {
@@ -974,7 +996,19 @@ pub const Xmss = struct {
 
         var rest = index;
 
+        const part = layerSize(p);
+
         for (0..p.d) |layer| {
+            if (layer > 0 and self.upper_prefixes[layer] == rest) {
+                const kept = self.upper[(layer - 1) * part ..];
+
+                @memcpy(out[offset..][0..kept.len], kept);
+
+                break;
+            }
+
+            const prefix = rest;
+
             const leaf_index: u32 = @intCast(rest & ((@as(u64, 1) << th) - 1));
 
             rest >>= th;
@@ -1021,6 +1055,15 @@ pub const Xmss = struct {
             offset += th * n;
 
             @memcpy(node[0..n], layer_tree.root[0..n]);
+
+            if (layer > 0) {
+                // The root below and this layer's tree are public, and so is what they give.
+                ct.declassify(out[offset - part .. offset]);
+
+                @memcpy(self.upper[(layer - 1) * part ..][0..part], out[offset - part .. offset]);
+
+                self.upper_prefixes[layer] = prefix;
+            }
         }
 
         ct.declassify(out);

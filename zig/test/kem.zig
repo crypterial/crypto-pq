@@ -47,19 +47,23 @@ fn keyGeneration(_: void, r: vectors.Record, allocator: Allocator) !void {
 
     const dk = try vectors.decode(allocator, r.values.get("dk"));
 
-    var pair = try hazmat.generateKemKeyPair(algorithm, seed);
+    var pair = try hazmat.generateKemKeyPair(algorithm, allocator, seed);
 
     defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
 
     try expectExport(allocator, ek, &pair.public_key, .raw);
 
     try expectExport(allocator, seed, &pair.private_key, .raw);
 
-    var expanded = try algorithm.importPrivateKey(dk, .raw);
+    var expanded = try algorithm.importPrivateKey(allocator, dk, .raw);
 
     defer expanded.deinit();
 
-    const expanded_public = expanded.publicKey();
+    var expanded_public = expanded.publicKey();
+
+    defer expanded_public.deinit();
 
     try expectExport(allocator, ek, &expanded_public, .raw);
 
@@ -67,7 +71,7 @@ fn keyGeneration(_: void, r: vectors.Record, allocator: Allocator) !void {
 
     const both = try pkcs8(allocator, algorithm, try vectors.der(allocator, 0x30, &.{ try vectors.der(allocator, 0x04, &.{seed}), try vectors.der(allocator, 0x04, &.{dk}) }));
 
-    var imported = try algorithm.importPrivateKey(both, .der);
+    var imported = try algorithm.importPrivateKey(allocator, both, .der);
 
     defer imported.deinit();
 
@@ -82,10 +86,12 @@ test "ML-KEM ACVP key generation" {
     try vectors.parallel(v.records, {}, keyGeneration);
 }
 
-fn checkImport(function: anytype, algorithm: pq.KemAlgorithm, data: []const u8, passed: []const u8) !void {
+fn checkImport(function: anytype, algorithm: pq.KemAlgorithm, allocator: Allocator, data: []const u8, passed: []const u8) !void {
     if (std.mem.eql(u8, passed, "true")) {
-        _ = try function(algorithm, data, .raw);
-    } else if (function(algorithm, data, .raw)) |_| {
+        var key = try function(algorithm, allocator, data, .raw);
+
+        key.deinit();
+    } else if (function(algorithm, allocator, data, .raw)) |_| {
         return error.TestExpectedError;
     } else |_| {}
 }
@@ -96,7 +102,9 @@ fn encapsulationAndDecapsulation(_: void, r: vectors.Record, allocator: Allocato
     const function = r.header.get("function");
 
     if (std.mem.eql(u8, function, "encapsulation")) {
-        const public_key = try algorithm.importPublicKey(try vectors.decode(allocator, r.values.get("ek")), .raw);
+        var public_key = try algorithm.importPublicKey(allocator, try vectors.decode(allocator, r.values.get("ek")), .raw);
+
+        defer public_key.deinit();
 
         const result = try hazmat.encapsulate(&public_key, try vectors.decode(allocator, r.values.get("m")));
 
@@ -105,9 +113,9 @@ fn encapsulationAndDecapsulation(_: void, r: vectors.Record, allocator: Allocato
         try testing.expectEqualSlices(u8, try vectors.decode(allocator, r.values.get("k")), &result.shared_secret);
     } else if (std.mem.eql(u8, function, "decapsulation")) {
         var private_key = if (r.header.is("keyFormat", "seed"))
-            (try hazmat.generateKemKeyPair(algorithm, try std.mem.concat(allocator, u8, &.{ try vectors.decode(allocator, r.values.get("d")), try vectors.decode(allocator, r.values.get("z")) }))).private_key
+            try algorithm.importPrivateKey(allocator, try std.mem.concat(allocator, u8, &.{ try vectors.decode(allocator, r.values.get("d")), try vectors.decode(allocator, r.values.get("z")) }), .raw)
         else
-            try algorithm.importPrivateKey(try vectors.decode(allocator, r.values.get("dk")), .raw);
+            try algorithm.importPrivateKey(allocator, try vectors.decode(allocator, r.values.get("dk")), .raw);
 
         defer private_key.deinit();
 
@@ -115,9 +123,9 @@ fn encapsulationAndDecapsulation(_: void, r: vectors.Record, allocator: Allocato
 
         try testing.expectEqualSlices(u8, try vectors.decode(allocator, r.values.get("k")), &shared_secret);
     } else if (std.mem.eql(u8, function, "encapsulationKeyCheck")) {
-        try checkImport(pq.KemAlgorithm.importPublicKey, algorithm, try vectors.decode(allocator, r.values.get("ek")), r.values.get("testPassed"));
+        try checkImport(pq.KemAlgorithm.importPublicKey, algorithm, allocator, try vectors.decode(allocator, r.values.get("ek")), r.values.get("testPassed"));
     } else {
-        try checkImport(pq.KemAlgorithm.importPrivateKey, algorithm, try vectors.decode(allocator, r.values.get("dk")), r.values.get("testPassed"));
+        try checkImport(pq.KemAlgorithm.importPrivateKey, algorithm, allocator, try vectors.decode(allocator, r.values.get("dk")), r.values.get("testPassed"));
     }
 }
 
@@ -137,9 +145,11 @@ fn wycheproofDecapsulation(_: void, r: vectors.Record, allocator: Allocator) !vo
     const c = try vectors.decode(allocator, r.values.get("c"));
 
     if (r.values.is("result", "valid")) {
-        var pair = try hazmat.generateKemKeyPair(algorithm, seed);
+        var pair = try hazmat.generateKemKeyPair(algorithm, allocator, seed);
 
         defer pair.private_key.deinit();
+
+        defer pair.public_key.deinit();
 
         try expectExport(allocator, try vectors.decode(allocator, r.values.get("ek")), &pair.public_key, .raw);
 
@@ -147,11 +157,13 @@ fn wycheproofDecapsulation(_: void, r: vectors.Record, allocator: Allocator) !vo
 
         try testing.expectEqualSlices(u8, try vectors.decode(allocator, r.values.get("K")), &shared_secret);
     } else if (seed.len != 64) {
-        try testing.expectError(error.InvalidLength, hazmat.generateKemKeyPair(algorithm, seed));
+        try testing.expectError(error.InvalidLength, hazmat.generateKemKeyPair(algorithm, allocator, seed));
     } else {
-        var pair = try hazmat.generateKemKeyPair(algorithm, seed);
+        var pair = try hazmat.generateKemKeyPair(algorithm, allocator, seed);
 
         defer pair.private_key.deinit();
+
+        defer pair.public_key.deinit();
 
         try testing.expectError(error.InvalidLength, pair.private_key.decapsulate(c));
     }
@@ -171,7 +183,9 @@ fn wycheproofEncapsulation(_: void, r: vectors.Record, allocator: Allocator) !vo
     const ek = try vectors.decode(allocator, r.values.get("ek"));
 
     if (r.values.is("result", "valid")) {
-        const public_key = try algorithm.importPublicKey(ek, .raw);
+        var public_key = try algorithm.importPublicKey(allocator, ek, .raw);
+
+        defer public_key.deinit();
 
         const result = try hazmat.encapsulate(&public_key, try vectors.decode(allocator, r.values.get("m")));
 
@@ -181,7 +195,7 @@ fn wycheproofEncapsulation(_: void, r: vectors.Record, allocator: Allocator) !vo
     } else {
         const code = if (ek.len != algorithm.public_key_size) error.InvalidLength else error.InvalidPublicKey;
 
-        try testing.expectError(code, algorithm.importPublicKey(ek, .raw));
+        try testing.expectError(code, algorithm.importPublicKey(allocator, ek, .raw));
     }
 }
 
@@ -203,11 +217,13 @@ fn wycheproofExpandedDecapsulation(_: void, r: vectors.Record, allocator: Alloca
     const flags = r.values.find("flags") orelse "";
 
     if (r.values.is("result", "valid")) {
-        var private_key = try algorithm.importPrivateKey(dk, .raw);
+        var private_key = try algorithm.importPrivateKey(allocator, dk, .raw);
 
         defer private_key.deinit();
 
-        const public_key = private_key.publicKey();
+        var public_key = private_key.publicKey();
+
+        defer public_key.deinit();
 
         try expectExport(allocator, try vectors.decode(allocator, r.values.get("ek")), &public_key, .raw);
 
@@ -215,15 +231,15 @@ fn wycheproofExpandedDecapsulation(_: void, r: vectors.Record, allocator: Alloca
 
         try testing.expectEqualSlices(u8, try vectors.decode(allocator, r.values.get("K")), &shared_secret);
     } else if (std.mem.find(u8, flags, "IncorrectCiphertextLength") != null) {
-        var private_key = try algorithm.importPrivateKey(dk, .raw);
+        var private_key = try algorithm.importPrivateKey(allocator, dk, .raw);
 
         defer private_key.deinit();
 
         try testing.expectError(error.InvalidLength, private_key.decapsulate(c));
     } else if (std.mem.find(u8, flags, "IncorrectDecapsulationKeyLength") != null) {
-        try testing.expectError(error.InvalidLength, algorithm.importPrivateKey(dk, .raw));
+        try testing.expectError(error.InvalidLength, algorithm.importPrivateKey(allocator, dk, .raw));
     } else {
-        try testing.expectError(error.InvalidPrivateKey, algorithm.importPrivateKey(dk, .raw));
+        try testing.expectError(error.InvalidPrivateKey, algorithm.importPrivateKey(allocator, dk, .raw));
     }
 }
 
@@ -237,9 +253,11 @@ test "ML-KEM Wycheproof expanded decapsulation" {
 
 test "KEM round trip" {
     for (algorithms ++ [_]pq.KemAlgorithm{pq.x_wing}) |algorithm| {
-        var pair = try algorithm.generateKeyPair(.{});
+        var pair = try algorithm.generateKeyPair(testing.allocator, .{});
 
         defer pair.private_key.deinit();
+
+        defer pair.public_key.deinit();
 
         const encapsulation = try pair.public_key.encapsulate();
 
@@ -269,9 +287,11 @@ test "KEM round trip" {
 
         try testing.expectEqual(algorithm.public_key_size, raw.len);
 
-        var unchecked = try algorithm.generateKeyPair(.{ .self_test = false });
+        var unchecked = try algorithm.generateKeyPair(testing.allocator, .{ .self_test = false });
 
         defer unchecked.private_key.deinit();
+
+        defer unchecked.public_key.deinit();
 
         try testing.expectEqual(algorithm.kind, unchecked.public_key.algorithm.kind);
     }
@@ -285,20 +305,26 @@ test "KEM formats" {
     const allocator = arena.allocator();
 
     for (algorithms) |algorithm| {
-        var pair = try algorithm.generateKeyPair(.{});
+        var pair = try algorithm.generateKeyPair(testing.allocator, .{});
 
         defer pair.private_key.deinit();
 
+        defer pair.public_key.deinit();
+
         for ([_]pq.KeyFormat{ .raw, .der, .pem }) |format| {
-            const public_key = try algorithm.importPublicKey(try pair.public_key.exportKey(allocator, format), format);
+            var public_key = try algorithm.importPublicKey(testing.allocator, try pair.public_key.exportKey(allocator, format), format);
+
+            defer public_key.deinit();
 
             try testing.expect(public_key.eql(&pair.public_key));
 
-            var private_key = try algorithm.importPrivateKey(try pair.private_key.exportKey(allocator, format), format);
+            var private_key = try algorithm.importPrivateKey(testing.allocator, try pair.private_key.exportKey(allocator, format), format);
 
             defer private_key.deinit();
 
-            const derived = private_key.publicKey();
+            var derived = private_key.publicKey();
+
+            defer derived.deinit();
 
             try testing.expect(derived.eql(&pair.public_key));
         }
@@ -315,20 +341,22 @@ test "KEM formats" {
 
         const public_der = try pair.public_key.exportKey(allocator, .der);
 
-        try testing.expectError(error.InvalidEncoding, algorithm.importPublicKey(try std.mem.concat(allocator, u8, &.{ public_der, &.{0} }), .der));
+        try testing.expectError(error.InvalidEncoding, algorithm.importPublicKey(testing.allocator, try std.mem.concat(allocator, u8, &.{ public_der, &.{0} }), .der));
 
-        try testing.expectError(error.InvalidEncoding, algorithm.importPublicKey(try pair.private_key.exportKey(allocator, .pem), .pem));
+        try testing.expectError(error.InvalidEncoding, algorithm.importPublicKey(testing.allocator, try pair.private_key.exportKey(allocator, .pem), .pem));
 
-        try testing.expectError(error.InvalidLength, algorithm.importPrivateKey(&([_]u8{0} ** 63), .raw));
+        try testing.expectError(error.InvalidLength, algorithm.importPrivateKey(testing.allocator, &([_]u8{0} ** 63), .raw));
     }
 
-    var pair = try pq.ml_kem_768.generateKeyPair(.{});
+    var pair = try pq.ml_kem_768.generateKeyPair(testing.allocator, .{});
 
     defer pair.private_key.deinit();
 
-    try testing.expectError(error.AlgorithmMismatch, pq.ml_kem_512.importPublicKey(try pair.public_key.exportKey(allocator, .der), .der));
+    defer pair.public_key.deinit();
 
-    try testing.expectError(error.AlgorithmMismatch, pq.ml_kem_1024.importPrivateKey(try pair.private_key.exportKey(allocator, .pem), .pem));
+    try testing.expectError(error.AlgorithmMismatch, pq.ml_kem_512.importPublicKey(testing.allocator, try pair.public_key.exportKey(allocator, .der), .der));
+
+    try testing.expectError(error.AlgorithmMismatch, pq.ml_kem_1024.importPrivateKey(testing.allocator, try pair.private_key.exportKey(allocator, .pem), .pem));
 }
 
 test "X-Wing" {
@@ -343,9 +371,11 @@ test "X-Wing" {
     defer v.deinit();
 
     for (v.records) |r| {
-        var pair = try hazmat.generateKemKeyPair(pq.x_wing, try vectors.decode(allocator, r.values.get("seed")));
+        var pair = try hazmat.generateKemKeyPair(pq.x_wing, testing.allocator, try vectors.decode(allocator, r.values.get("seed")));
 
         defer pair.private_key.deinit();
+
+        defer pair.public_key.deinit();
 
         try expectExport(allocator, try vectors.decode(allocator, r.values.get("pk")), &pair.public_key, .raw);
 
@@ -362,37 +392,56 @@ test "X-Wing" {
         try testing.expectEqualSlices(u8, &result.shared_secret, &shared_secret);
     }
 
-    var pair = try pq.x_wing.generateKeyPair(.{});
+    var pair = try pq.x_wing.generateKeyPair(testing.allocator, .{});
 
     defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
 
     for ([_]pq.KeyFormat{ .der, .pem }) |format| {
         try testing.expectError(error.Unsupported, pair.public_key.exportKey(allocator, format));
 
         try testing.expectError(error.Unsupported, pair.private_key.exportKey(allocator, format));
 
-        try testing.expectError(error.Unsupported, pq.x_wing.importPublicKey("", format));
+        try testing.expectError(error.Unsupported, pq.x_wing.importPublicKey(testing.allocator, "", format));
 
-        try testing.expectError(error.Unsupported, pq.x_wing.importPrivateKey("", format));
+        try testing.expectError(error.Unsupported, pq.x_wing.importPrivateKey(testing.allocator, "", format));
     }
 
-    var imported = try pq.x_wing.importPrivateKey(try pair.private_key.exportKey(allocator, .raw), .raw);
+    var imported = try pq.x_wing.importPrivateKey(testing.allocator, try pair.private_key.exportKey(allocator, .raw), .raw);
 
     defer imported.deinit();
 
-    const derived = imported.publicKey();
+    var derived = imported.publicKey();
+
+    defer derived.deinit();
 
     try testing.expect(derived.eql(&pair.public_key));
 }
 
+// Every byte of the seed and of the decoded secret is wiped before its memory is freed.
 test "KEM private keys are wiped by deinit" {
-    var pair = try pq.ml_kem_512.generateKeyPair(.{ .self_test = false });
+    var seed: [64]u8 = undefined;
+
+    for (&seed, 0..) |*byte, i| byte.* = @intCast(i + 1);
+
+    var check: vectors.WipeCheck = .{ .child = testing.allocator, .secrets = &.{} };
+
+    var pair = try hazmat.generateKemKeyPair(pq.ml_kem_512, check.allocator(), &seed);
+
+    const encoded_s = try testing.allocator.dupe(u8, pair.private_key.secret.dk[0..32]);
+
+    defer testing.allocator.free(encoded_s);
+
+    const secrets = [_][]const u8{ &seed, encoded_s };
+
+    check.secrets = &secrets;
+
+    pair.public_key.deinit();
 
     pair.private_key.deinit();
 
-    try testing.expect(std.mem.allEqual(u8, &pair.private_key.seed, 0));
-
-    try testing.expect(std.mem.allEqual(u8, &pair.private_key.dk, 0));
+    try testing.expect(!check.leaked and check.frees >= 2);
 }
 
 const Case = struct {
@@ -402,7 +451,7 @@ const Case = struct {
 
 fn expectImports(algorithm: pq.KemAlgorithm, comptime private: bool, format: pq.KeyFormat, cases: []const Case) !void {
     for (cases, 0..) |case, i| {
-        const result = if (private) algorithm.importPrivateKey(case.data, format) else algorithm.importPublicKey(case.data, format);
+        const result = if (private) algorithm.importPrivateKey(testing.allocator, case.data, format) else algorithm.importPublicKey(testing.allocator, case.data, format);
 
         if (case.expected) |code| {
             testing.expectError(code, result) catch |err| {
@@ -417,7 +466,7 @@ fn expectImports(algorithm: pq.KemAlgorithm, comptime private: bool, format: pq.
                 return err;
             };
 
-            if (private) key.deinit();
+            key.deinit();
         }
     }
 }
@@ -438,13 +487,17 @@ test "key encoding strictness" {
 
     for (&seed, 0..) |*byte, i| byte.* = @intCast(i);
 
-    var pair = try hazmat.generateKemKeyPair(algorithm, &seed);
+    var pair = try hazmat.generateKemKeyPair(algorithm, testing.allocator, &seed);
 
     defer pair.private_key.deinit();
 
-    var other = try hazmat.generateKemKeyPair(algorithm, &([_]u8{0} ** 64));
+    defer pair.public_key.deinit();
+
+    var other = try hazmat.generateKemKeyPair(algorithm, testing.allocator, &([_]u8{0} ** 64));
 
     defer other.private_key.deinit();
+
+    defer other.public_key.deinit();
 
     const pk = try pair.public_key.exportKey(allocator, .raw);
 
@@ -555,4 +608,143 @@ test "key encoding strictness" {
         .{ .data = private_pem },
         .{ .data = non_canonical, .expected = error.InvalidEncoding },
     });
+}
+
+fn cached(public_key: *const pq.KemPublicKey) bool {
+    return public_key.public.shared.cache.pointer.load(.acquire) != null;
+}
+
+// The keys of a pair share one cache. Generation fills it only for its self-test, which uses it at
+// once; every other key fills it on first use. A public key keeps it after its private key is gone.
+test "KEM keys share one cache, filled on first use" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
+    for (algorithms ++ [_]pq.KemAlgorithm{pq.x_wing}) |algorithm| {
+        var untested = try algorithm.generateKeyPair(testing.allocator, .{ .self_test = false });
+
+        defer untested.private_key.deinit();
+
+        defer untested.public_key.deinit();
+
+        try testing.expect(!cached(&untested.public_key));
+
+        var pair = try algorithm.generateKeyPair(testing.allocator, .{});
+
+        defer pair.public_key.deinit();
+
+        try testing.expectEqual(pair.private_key.public, pair.public_key.public);
+
+        try testing.expect(cached(&pair.public_key));
+
+        const seed = try pair.private_key.exportKey(allocator, .raw);
+
+        pair.private_key.deinit();
+
+        var private_key = try algorithm.importPrivateKey(testing.allocator, seed, .raw);
+
+        defer private_key.deinit();
+
+        var derived = private_key.publicKey();
+
+        defer derived.deinit();
+
+        try testing.expectEqual(private_key.public, derived.public);
+
+        try testing.expect(!cached(&derived));
+
+        const encapsulation = try pair.public_key.encapsulate();
+
+        try testing.expectEqualSlices(u8, &encapsulation.shared_secret, &try private_key.decapsulate(encapsulation.ciphertext()));
+
+        try testing.expect(cached(&derived));
+
+        const again = try derived.encapsulate();
+
+        try testing.expectEqualSlices(u8, &again.shared_secret, &try private_key.decapsulate(again.ciphertext()));
+    }
+}
+
+// When the cache cannot be allocated, each call computes what it needs for itself.
+test "KEM keys without memory for their cache" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
+    for (algorithms ++ [_]pq.KemAlgorithm{pq.x_wing}) |algorithm| {
+        var pair = try algorithm.generateKeyPair(testing.allocator, .{ .self_test = false });
+
+        defer pair.private_key.deinit();
+
+        defer pair.public_key.deinit();
+
+        var public_memory = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+
+        var public_key = try algorithm.importPublicKey(public_memory.allocator(), try pair.public_key.exportKey(allocator, .raw), .raw);
+
+        defer public_key.deinit();
+
+        // A private key has a public and a secret part.
+        var private_memory = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+
+        var private_key = try algorithm.importPrivateKey(private_memory.allocator(), try pair.private_key.exportKey(allocator, .raw), .raw);
+
+        defer private_key.deinit();
+
+        for (0..2) |_| {
+            const encapsulation = try public_key.encapsulate();
+
+            try testing.expectEqualSlices(u8, &encapsulation.shared_secret, &try pair.private_key.decapsulate(encapsulation.ciphertext()));
+
+            const other = try pair.public_key.encapsulate();
+
+            try testing.expectEqualSlices(u8, &other.shared_secret, &try private_key.decapsulate(other.ciphertext()));
+        }
+
+        try testing.expect(!cached(&public_key));
+
+        try testing.expect(private_key.public.shared.cache.pointer.load(.acquire) == null);
+    }
+}
+
+// Threads that use a fresh key at the same time each compute the cache; one copy is kept.
+test "KEM cache under concurrent first use" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var pair = try pq.ml_kem_768.generateKeyPair(testing.allocator, .{ .self_test = false });
+
+    defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
+
+    const raw = try pair.public_key.exportKey(testing.allocator, .raw);
+
+    defer testing.allocator.free(raw);
+
+    var public_key = try pq.ml_kem_768.importPublicKey(testing.allocator, raw, .raw);
+
+    defer public_key.deinit();
+
+    var results: [8]pq.Encapsulation = undefined;
+
+    var threads: [8]std.Thread = undefined;
+
+    const Worker = struct {
+        fn run(key: *const pq.KemPublicKey, out: *pq.Encapsulation) void {
+            out.* = key.encapsulate() catch unreachable;
+        }
+    };
+
+    for (&threads, &results) |*thread, *result| thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &public_key, result });
+
+    for (threads) |thread| thread.join();
+
+    for (results) |result| try testing.expectEqualSlices(u8, &result.shared_secret, &try pair.private_key.decapsulate(result.ciphertext()));
+
+    try testing.expect(cached(&public_key));
 }

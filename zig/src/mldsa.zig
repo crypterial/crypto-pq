@@ -321,10 +321,19 @@ fn pointwise(a: *const Poly, b: *const Poly, out: *Poly) void {
 
 // The NTT-domain inner product of a matrix row with a vector, reduced below q.
 fn dot(comptime n: usize, row: *const [n]Poly, vector: *const [n]Poly, out: *Poly) void {
+    var entries: [n]*const Poly = undefined;
+
+    for (&entries, row) |*entry, *f| entry.* = f;
+
+    dotEntries(n, &entries, vector, out);
+}
+
+// The same for a row whose entries are apart. The sums of n products below q stay below 2^31.
+fn dotEntries(comptime n: usize, row: *const [n]*const Poly, vector: *const [n]Poly, out: *Poly) void {
     for (0..32) |i| {
         var sum = splat(0);
 
-        for (row, vector) |*f, *g| {
+        for (row, vector) |f, *g| {
             sum += montgomeryProduct(load(f, 8 * i), load(g, 8 * i));
         }
 
@@ -465,13 +474,10 @@ fn parseBounded(comptime eta: u8, buffer: *[257]i32, start: usize, block: *const
     return count;
 }
 
-// The k * l matrix A, entry (r, s) from SHAKE128(rho || s || r), four entries at a time.
-fn expandMatrix(comptime p: Parameters, rho: *const [32]u8, a: *[p.k][p.l]Poly) void {
-    const count = @as(usize, p.k) * p.l;
-
-    var first: usize = 0;
-
-    while (first + 4 <= count) : (first += 4) {
+// Entries first .. first + outs.len - 1 of the k * l matrix A in row-major order, entry (r, s)
+// from SHAKE128(rho || s || r): four at a time, or one by one.
+fn sampleMatrix(comptime p: Parameters, rho: *const [32]u8, first: usize, outs: []const *Poly) void {
+    if (outs.len == 4) {
         var inputs: [4][34]u8 = undefined;
 
         for (&inputs, first..) |*input, e| input.* = rho.* ++ [2]u8{ @intCast(e % p.l), @intCast(e / p.l) };
@@ -485,11 +491,13 @@ fn expandMatrix(comptime p: Parameters, rho: *const [32]u8, a: *[p.k][p.l]Poly) 
 
             sponge.squeeze(.{ &blocks[0], &blocks[1], &blocks[2], &blocks[3] });
 
-            for (&counts, &blocks, first..) |*filled, *block, e| filled.* = parseUniform(&a[e / p.l][e % p.l], filled.*, block);
+            for (&counts, &blocks, outs) |*filled, *block, out| filled.* = parseUniform(out, filled.*, block);
         }
+
+        return;
     }
 
-    for (first..count) |e| {
+    for (outs, first..) |out, e| {
         var xof = hash.shake128.create();
 
         xof.update(rho);
@@ -503,8 +511,68 @@ fn expandMatrix(comptime p: Parameters, rho: *const [32]u8, a: *[p.k][p.l]Poly) 
         while (filled < 256) {
             xof.read(&block);
 
-            filled = parseUniform(&a[e / p.l][e % p.l], filled, &block);
+            filled = parseUniform(out, filled, &block);
         }
+    }
+}
+
+fn expandMatrix(comptime p: Parameters, rho: *const [32]u8, matrix: *[p.k][p.l]Poly) void {
+    const count = @as(usize, p.k) * p.l;
+
+    var first: usize = 0;
+
+    while (first < count) {
+        const size: usize = if (count - first >= 4) 4 else 1;
+
+        var outs: [4]*Poly = undefined;
+
+        for (outs[0..size], first..) |*out, e| out.* = &matrix[e / p.l][e % p.l];
+
+        sampleMatrix(p, rho, first, outs[0..size]);
+
+        first += size;
+    }
+}
+
+// t_hat = A * s_hat in the NTT domain, reduced below q, with the entries of A sampled four at a
+// time. They go into `matrix` when it is given. Otherwise they go into a ring of l + 3 entries,
+// enough for the row in progress and the next four, and each row is multiplied once it is
+// complete: summing a whole row in registers is twice as fast as adding each entry to memory.
+fn multiplyMatrix(comptime p: Parameters, rho: *const [32]u8, s_hat: *const [p.l]Poly, t_hat: *[p.k]Poly, matrix: ?*[p.k][p.l]Poly) void {
+    if (matrix) |m| {
+        expandMatrix(p, rho, m);
+
+        for (t_hat, m) |*f, *row| dot(p.l, row, s_hat, f);
+
+        return;
+    }
+
+    const count = @as(usize, p.k) * p.l;
+
+    const slots = @as(usize, p.l) + 3;
+
+    var ring: [slots]Poly = undefined;
+
+    var first: usize = 0;
+
+    for (t_hat, 0..) |*f, i| {
+        while (first < (i + 1) * p.l) {
+            const size: usize = if (count - first >= 4) 4 else 1;
+
+            var outs: [4]*Poly = undefined;
+
+            for (outs[0..size], first..) |*out, e| out.* = &ring[e % slots];
+
+            sampleMatrix(p, rho, first, outs[0..size]);
+
+            first += size;
+        }
+
+        var row: [p.l]*const Poly = undefined;
+
+        for (&row, i * p.l..) |*entry, e| entry.* = &ring[e % slots];
+
+        dotEntries(p.l, &row, s_hat, f);
     }
 }
 
@@ -658,231 +726,237 @@ fn sampleInBall(comptime p: Parameters, seed: []const u8, c: *Poly) void {
     }
 }
 
-fn w1Encode(comptime p: Parameters, w1: *const [p.k]Poly, out: *[32 * @as(usize, p.k) * p.w1Bits()]u8) void {
-    const size = 32 * @as(usize, p.w1Bits());
+// w1Encode of one row of w1, absorbed into the challenge hash: the rows are hashed as they are
+// produced instead of being kept.
+fn absorbHigh(comptime p: Parameters, challenge: *hash.Xof, w1: *const Poly) void {
+    var values: [256]u32 = undefined;
 
-    for (w1, 0..) |*f, i| {
-        var values: [256]u32 = undefined;
+    var encoded: [32 * @as(usize, p.w1Bits())]u8 = undefined;
 
-        for (&values, f) |*value, c| {
-            value.* = @intCast(c);
-        }
+    defer {
+        ct.wipe(std.mem.asBytes(&values));
 
-        pack(p.w1Bits(), &values, out[size * i ..][0..size]);
+        ct.wipe(&encoded);
     }
+
+    for (&values, w1) |*value, c| value.* = @intCast(c);
+
+    pack(p.w1Bits(), &values, &encoded);
+
+    challenge.update(&encoded);
 }
 
-fn challengeHash(comptime p: Parameters, mu: *const [64]u8, w1: *const [p.k]Poly, out: *[p.lambda / 4]u8) void {
-    var encoded: [32 * @as(usize, p.k) * p.w1Bits()]u8 = undefined;
+fn packHigh(t1: *const Poly, out: *[320]u8) void {
+    var values: [256]u32 = undefined;
 
-    w1Encode(p, w1, &encoded);
+    for (&values, t1) |*value, c| value.* = @intCast(c);
 
-    primitives.shake256(&.{ mu, &encoded }, out);
+    pack(10, &values, out);
 }
 
-fn encodePublicKey(comptime p: Parameters, rho: *const [32]u8, t1: *const [p.k]Poly, pk: *[p.publicKeySize()]u8) void {
-    pk[0..32].* = rho.*;
+fn unpackHigh(bytes: *const [320]u8, t1: *Poly) void {
+    var values: [256]u32 = undefined;
 
-    for (t1, 0..) |*f, i| {
-        var values: [256]u32 = undefined;
+    unpack(10, bytes, &values);
 
-        for (&values, f) |*value, c| {
-            value.* = @intCast(c);
-        }
-
-        pack(10, &values, pk[32 + 320 * i ..][0..320]);
-    }
+    for (t1, values) |*c, value| c.* = @intCast(value);
 }
 
-// The public t = A * s1 + s2, in standard representatives.
-fn publicT(comptime p: Parameters, rho: *const [32]u8, s1: *const [p.l]Poly, s2: *const [p.k]Poly, t: *[p.k]Poly) void {
-    var s1_hat = s1.*;
+// NTT(t1 * 2^d), which verification multiplies by c.
+fn shiftedNtt(t1: *const Poly, out: *Poly) void {
+    for (out, t1) |*c, value| c.* = value << d;
 
-    defer ct.wipe(std.mem.asBytes(&s1_hat));
-
-    for (&s1_hat) |*f| ntt(f);
-
-    var a: [p.k][p.l]Poly = undefined;
-
-    expandMatrix(p, rho, &a);
-
-    for (t, &a, 0..) |*f, *row, i| {
-        dot(p.l, row, &s1_hat, f);
-
-        inverseNtt(f);
-
-        for (0..32) |j| store(f, 8 * j, freeze(load(f, 8 * j) + load(&s2[i], 8 * j)));
-    }
+    ntt(out);
 }
 
-fn SecretParts(comptime p: Parameters) type {
+// What signing and verification read from a public key: A and NTT(t1 * 2^d).
+pub fn PublicCache(comptime p: Parameters) type {
     return struct {
-        rho: [32]u8,
-        key: [32]u8,
-        tr: [64]u8,
-        s1: [p.l]Poly,
-        s2: [p.k]Poly,
-        t0: [p.k]Poly,
+        matrix: [p.k][p.l]Poly,
+        t1: [p.k]Poly,
 
-        fn wipe(self: *@This()) void {
-            ct.wipe(std.mem.asBytes(self));
+        pub fn fill(self: *@This(), pk: *const [p.publicKeySize()]u8) void {
+            expandMatrix(p, pk[0..32], &self.matrix);
+
+            for (&self.t1, 0..) |*f, i| {
+                var t1: Poly = undefined;
+
+                unpackHigh(pk[32 + 320 * i ..][0..320], &t1);
+
+                shiftedNtt(&t1, f);
+            }
         }
     };
 }
 
-fn encodePrivateKey(comptime p: Parameters, parts: *const SecretParts(p), sk: *[p.privateKeySize()]u8) void {
-    const eta_size = 32 * @as(usize, p.etaBits());
+// The NTT forms of s1, s2 and t0 that signing multiplies by c.
+pub fn SecretCache(comptime p: Parameters) type {
+    return struct {
+        s1: [p.l]Poly,
+        s2: [p.k]Poly,
+        t0: [p.k]Poly,
 
-    sk[0..32].* = parts.rho;
+        pub fn fill(self: *@This(), sk: *const [p.privateKeySize()]u8) void {
+            const eta_size = 32 * @as(usize, p.etaBits());
 
-    sk[32..64].* = parts.key;
+            const t0_offset = 128 + eta_size * (@as(usize, p.l) + p.k);
 
-    sk[64..128].* = parts.tr;
+            for (&self.s1, 0..) |*f, i| bitUnpack(p.etaBits(), p.eta, sk[128 + eta_size * i ..][0..eta_size], f);
 
-    var offset: usize = 128;
+            for (&self.s2, 0..) |*f, i| bitUnpack(p.etaBits(), p.eta, sk[128 + eta_size * (p.l + i) ..][0..eta_size], f);
 
-    for ([_][]const Poly{ &parts.s1, &parts.s2 }) |vector| {
-        for (vector) |*f| {
-            bitPack(p.etaBits(), p.eta, f, sk[offset..][0..eta_size]);
+            for (&self.t0, 0..) |*f, i| bitUnpack(d, 1 << (d - 1), sk[t0_offset + 32 * d * i ..][0 .. 32 * d], f);
 
-            offset += eta_size;
+            inline for (.{ &self.s1, &self.s2, &self.t0 }) |vector| {
+                for (vector) |*f| ntt(f);
+            }
         }
-    }
-
-    for (&parts.t0) |*f| {
-        bitPack(d, 1 << (d - 1), f, sk[offset..][0 .. 32 * d]);
-
-        offset += 32 * d;
-    }
+    };
 }
 
-fn decodePrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, parts: *SecretParts(p)) void {
+// The secret vectors are encoded into sk as they are produced, and A is used as it is sampled; a
+// generated key also fills `public` from the same computation. s1 and s2 come four at a time from
+// one run of nonces, so s2 passes through `t` before the product overwrites it, and its rows are
+// read back from sk. The entry points are not inlined, so that callers that dispatch over the
+// parameter sets do not hold the frames of all of them at once.
+pub noinline fn keyGen(comptime p: Parameters, seed: *const [32]u8, pk: *[p.publicKeySize()]u8, sk: *[p.privateKeySize()]u8, public: ?*PublicCache(p)) void {
     const eta_size = 32 * @as(usize, p.etaBits());
 
-    parts.rho = sk[0..32].*;
+    const s2_offset = 128 + eta_size * @as(usize, p.l);
 
-    parts.key = sk[32..64].*;
+    const t0_offset = s2_offset + eta_size * @as(usize, p.k);
 
-    parts.tr = sk[64..128].*;
-
-    var offset: usize = 128;
-
-    for (&parts.s1) |*f| {
-        bitUnpack(p.etaBits(), p.eta, sk[offset..][0..eta_size], f);
-
-        offset += eta_size;
-    }
-
-    for (&parts.s2) |*f| {
-        bitUnpack(p.etaBits(), p.eta, sk[offset..][0..eta_size], f);
-
-        offset += eta_size;
-    }
-
-    for (&parts.t0) |*f| {
-        bitUnpack(d, 1 << (d - 1), sk[offset..][0 .. 32 * d], f);
-
-        offset += 32 * d;
-    }
-}
-
-pub fn keyGen(comptime p: Parameters, seed: *const [32]u8, pk: *[p.publicKeySize()]u8, sk: *[p.privateKeySize()]u8) void {
     var expanded: [128]u8 = undefined;
 
-    var parts: SecretParts(p) = undefined;
+    var s1: [p.l]Poly = undefined;
 
     var t: [p.k]Poly = undefined;
+
+    var row: Poly = undefined;
 
     defer {
         ct.wipe(&expanded);
 
-        parts.wipe();
-
-        ct.wipe(std.mem.asBytes(&t));
+        inline for (.{ &s1, &t, &row }) |value| ct.wipe(std.mem.asBytes(value));
     }
 
     primitives.shake256(&.{ seed, &.{ p.k, p.l } }, &expanded);
 
-    parts.rho = expanded[0..32].*;
+    const rho = expanded[0..32];
 
     // rho is part of the public key.
-    ct.declassify(&parts.rho);
-
-    parts.key = expanded[96..128].*;
+    ct.declassify(rho);
 
     var outs: [@as(usize, p.l) + p.k]*Poly = undefined;
 
-    for (outs[0..p.l], &parts.s1) |*out, *f| out.* = f;
+    for (outs[0..p.l], &s1) |*out, *f| out.* = f;
 
-    for (outs[p.l..], &parts.s2) |*out, *f| out.* = f;
+    for (outs[p.l..], &t) |*out, *f| out.* = f;
 
     expandSecret(p.eta, expanded[32..96], 0, &outs);
 
-    publicT(p, &parts.rho, &parts.s1, &parts.s2, &t);
+    sk[0..32].* = rho.*;
 
-    var t1: [p.k]Poly = undefined;
+    sk[32..64].* = expanded[96..128].*;
 
-    for (&t, &t1, &parts.t0) |*f, *high, *low| {
-        for (0..32) |i| {
-            const r1, const r0 = power2Round(load(f, 8 * i));
+    for (outs, 0..) |f, i| bitPack(p.etaBits(), p.eta, f, sk[128 + eta_size * i ..][0..eta_size]);
 
-            store(high, 8 * i, r1);
+    for (&s1) |*f| ntt(f);
 
-            store(low, 8 * i, r0);
+    multiplyMatrix(p, rho, &s1, &t, if (public) |cache| &cache.matrix else null);
+
+    for (&t, 0..) |*f, i| {
+        inverseNtt(f);
+
+        bitUnpack(p.etaBits(), p.eta, sk[s2_offset + eta_size * i ..][0..eta_size], &row);
+
+        // row turns from s2 into t1, and f into t0.
+        for (0..32) |j| {
+            const r1, const r0 = power2Round(freeze(load(f, 8 * j) + load(&row, 8 * j)));
+
+            store(&row, 8 * j, r1);
+
+            store(f, 8 * j, r0);
         }
+
+        // t1 is part of the public key.
+        ct.declassify(std.mem.asBytes(&row));
+
+        packHigh(&row, pk[32 + 320 * i ..][0..320]);
+
+        bitPack(d, 1 << (d - 1), f, sk[t0_offset + 32 * d * i ..][0 .. 32 * d]);
+
+        if (public) |cache| shiftedNtt(&row, &cache.t1[i]);
     }
 
-    encodePublicKey(p, &parts.rho, &t1, pk);
+    pk[0..32].* = rho.*;
 
     ct.declassify(pk);
 
-    primitives.shake256(&.{pk}, &parts.tr);
-
-    encodePrivateKey(p, &parts, sk);
+    primitives.shake256(&.{pk}, sk[64..128]);
 }
 
 // An expanded private key carries everything needed to rebuild the public key, so a key whose
 // parts disagree is rejected instead of producing signatures that never verify. The checks
-// accumulate differences so that the secret values do not decide any branch.
-pub fn checkPrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, pk: *[p.publicKeySize()]u8) bool {
-    var parts: SecretParts(p) = undefined;
+// accumulate differences so that the secret values do not decide any branch. The rows of s2 and
+// t0 are read from sk as they are needed.
+pub noinline fn checkPrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, pk: *[p.publicKeySize()]u8) bool {
+    const eta_size = 32 * @as(usize, p.etaBits());
+
+    const s2_offset = 128 + eta_size * @as(usize, p.l);
+
+    const t0_offset = s2_offset + eta_size * @as(usize, p.k);
+
+    var s1: [p.l]Poly = undefined;
 
     var t: [p.k]Poly = undefined;
 
-    defer {
-        parts.wipe();
+    var row: Poly = undefined;
 
-        ct.wipe(std.mem.asBytes(&t));
+    defer {
+        inline for (.{ &s1, &t, &row }) |value| ct.wipe(std.mem.asBytes(value));
     }
 
     // rho is part of the public key.
     ct.declassify(sk[0..32]);
 
-    decodePrivateKey(p, sk, &parts);
+    const rho = sk[0..32];
 
     var invalid = splat(0);
 
-    for ([_][]const Poly{ &parts.s1, &parts.s2 }) |vector| {
-        for (vector) |*f| {
-            for (0..32) |i| invalid |= splat(p.eta) - absolute(load(f, 8 * i));
-        }
+    for (0..@as(usize, p.l) + p.k) |i| {
+        const f = if (i < p.l) &s1[i] else &row;
+
+        bitUnpack(p.etaBits(), p.eta, sk[128 + eta_size * i ..][0..eta_size], f);
+
+        for (0..32) |j| invalid |= splat(p.eta) - absolute(load(f, 8 * j));
     }
 
-    publicT(p, &parts.rho, &parts.s1, &parts.s2, &t);
+    for (&s1) |*f| ntt(f);
 
-    var t1: [p.k]Poly = undefined;
+    multiplyMatrix(p, rho, &s1, &t, null);
 
-    for (&t, &t1, &parts.t0) |*f, *high, *low| {
-        for (0..32) |i| {
-            const r1, const r0 = power2Round(load(f, 8 * i));
+    for (&t, 0..) |*f, i| {
+        inverseNtt(f);
 
-            store(high, 8 * i, r1);
+        bitUnpack(p.etaBits(), p.eta, sk[s2_offset + eta_size * i ..][0..eta_size], &row);
 
-            invalid |= -absolute(r0 - load(low, 8 * i));
+        for (0..32) |j| store(f, 8 * j, freeze(load(f, 8 * j) + load(&row, 8 * j)));
+
+        bitUnpack(d, 1 << (d - 1), sk[t0_offset + 32 * d * i ..][0 .. 32 * d], &row);
+
+        for (0..32) |j| {
+            const r1, const r0 = power2Round(load(f, 8 * j));
+
+            store(f, 8 * j, r1);
+
+            invalid |= -absolute(r0 - load(&row, 8 * j));
         }
+
+        packHigh(f, pk[32 + 320 * i ..][0..320]);
     }
 
-    encodePublicKey(p, &parts.rho, &t1, pk);
+    pk[0..32].* = rho.*;
 
     ct.declassify(pk);
 
@@ -895,7 +969,7 @@ pub fn checkPrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8
     const barrier: *volatile i32 = &negative;
 
     // Whether the key is valid is public: importing it fails otherwise.
-    const valid = @intFromBool(barrier.* >= 0) & @intFromBool(ct.equal(&tr, &parts.tr));
+    const valid = @intFromBool(barrier.* >= 0) & @intFromBool(ct.equal(&tr, sk[64..128]));
 
     if (ct.declassifyValue(u1, valid) == 0) return false;
 
@@ -905,52 +979,49 @@ pub fn checkPrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8
     return true;
 }
 
-pub fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, message: []const []const u8, rnd: *const [32]u8, signature: *[p.signatureSize()]u8) void {
-    const k = p.k;
+// The memory of one signing call, which the caller allocates: an attempt keeps y, its NTT form,
+// w and the hints, while w1 goes into the challenge hash row by row, z replaces y and w - c * s2
+// replaces w.
+pub fn Workspace(comptime p: Parameters) type {
+    return struct {
+        y: [p.l]Poly,
+        y_hat: [p.l]Poly,
+        w: [p.k]Poly,
+        h: [p.k][256]bool,
+        c_hat: Poly,
+        product: Poly,
+    };
+}
 
+// The caches hold A and the NTT forms of the secret vectors; `work` is wiped before it returns.
+pub noinline fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, secret: *const SecretCache(p), public: *const PublicCache(p), work: *Workspace(p), message: []const []const u8, rnd: *const [32]u8, signature: *[p.signatureSize()]u8) void {
     const l = p.l;
 
-    var parts: SecretParts(p) = undefined;
+    const y = &work.y;
+
+    const y_hat = &work.y_hat;
+
+    const w = &work.w;
+
+    const h = &work.h;
+
+    const c_hat = &work.c_hat;
+
+    const product = &work.product;
 
     var mu: [64]u8 = undefined;
 
     var rho_prime: [64]u8 = undefined;
 
-    var y: [l]Poly = undefined;
-
-    var cs1: [l]Poly = undefined;
-
-    var cs2: [k]Poly = undefined;
-
-    var ct0: [k]Poly = undefined;
-
-    var u: [k]Poly = undefined;
-
     defer {
-        parts.wipe();
-
         ct.wipe(&rho_prime);
 
-        inline for (.{ &y, &cs1, &cs2, &ct0, &u }) |vector| {
-            ct.wipe(std.mem.asBytes(vector));
-        }
+        ct.wipe(std.mem.asBytes(work));
     }
-
-    decodePrivateKey(p, sk, &parts);
-
-    for (&parts.s1) |*f| ntt(f);
-
-    for (&parts.s2) |*f| ntt(f);
-
-    for (&parts.t0) |*f| ntt(f);
-
-    var a: [k][l]Poly = undefined;
-
-    expandMatrix(p, &parts.rho, &a);
 
     var mu_hasher = hash.shake256.create();
 
-    mu_hasher.update(&parts.tr);
+    mu_hasher.update(sk[64..128]);
 
     for (message) |part| {
         mu_hasher.update(part);
@@ -958,31 +1029,25 @@ pub fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, message: 
 
     mu_hasher.read(&mu);
 
-    primitives.shake256(&.{ &parts.key, rnd, &mu }, &rho_prime);
+    primitives.shake256(&.{ sk[32..64], rnd, &mu }, &rho_prime);
 
     var kappa: u16 = 0;
 
     while (true) : (kappa += l) {
-        expandMask(p, &rho_prime, kappa, &y);
+        expandMask(p, &rho_prime, kappa, y);
 
-        var y_hat = y;
+        y_hat.* = y.*;
 
-        defer ct.wipe(std.mem.asBytes(&y_hat));
+        for (y_hat) |*f| ntt(f);
 
-        for (&y_hat) |*f| ntt(f);
+        var challenge = hash.shake256.create();
 
-        var w: [k]Poly = undefined;
+        defer ct.wipe(std.mem.asBytes(&challenge));
 
-        var w1: [k]Poly = undefined;
+        challenge.update(&mu);
 
-        defer {
-            ct.wipe(std.mem.asBytes(&w));
-
-            ct.wipe(std.mem.asBytes(&w1));
-        }
-
-        for (&w, &w1, &a) |*f, *high, *row| {
-            dot(l, row, &y_hat, f);
+        for (w, &public.matrix) |*f, *row| {
+            dot(l, row, y_hat, f);
 
             inverseNtt(f);
 
@@ -991,29 +1056,29 @@ pub fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, message: 
 
                 store(f, 8 * i, c);
 
-                store(high, 8 * i, decompose(p.gamma2, c)[0]);
+                store(product, 8 * i, decompose(p.gamma2, c)[0]);
             }
+
+            absorbHigh(p, &challenge, product);
         }
 
         const c_tilde = signature[0 .. p.lambda / 4];
 
-        challengeHash(p, &mu, &w1, c_tilde);
+        challenge.read(c_tilde);
 
-        var c_hat: Poly = undefined;
+        sampleInBall(p, c_tilde, c_hat);
 
-        sampleInBall(p, c_tilde, &c_hat);
-
-        ntt(&c_hat);
+        ntt(c_hat);
 
         var invalid = splat(0);
 
-        for (&cs1, &parts.s1, &y) |*f, *s, *mask| {
-            pointwise(&c_hat, s, f);
+        for (y, &secret.s1) |*f, *s| {
+            pointwise(c_hat, s, product);
 
-            inverseNtt(f);
+            inverseNtt(product);
 
             for (0..32) |i| {
-                const c = centered(freeze(load(f, 8 * i) + load(mask, 8 * i)));
+                const c = centered(freeze(load(product, 8 * i) + load(f, 8 * i)));
 
                 store(f, 8 * i, c);
 
@@ -1021,38 +1086,32 @@ pub fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, message: 
             }
         }
 
-        for (&cs2, &parts.s2, &w, &u) |*f, *s, *wf, *uf| {
-            pointwise(&c_hat, s, f);
+        var counts = splat(0);
 
-            inverseNtt(f);
+        for (w, &secret.s2, &secret.t0, h) |*f, *s, *t, *hf| {
+            pointwise(c_hat, s, product);
+
+            inverseNtt(product);
 
             for (0..32) |i| {
-                const uc = freeze(load(wf, 8 * i) - load(f, 8 * i));
+                const uc = freeze(load(f, 8 * i) - load(product, 8 * i));
 
-                store(uf, 8 * i, uc);
+                store(f, 8 * i, uc);
 
                 invalid |= splat(p.gamma2 - p.beta() - 1) - absolute(decompose(p.gamma2, uc)[1]);
             }
-        }
 
-        var counts = splat(0);
+            pointwise(c_hat, t, product);
 
-        var h: [k][256]bool = undefined;
-
-        for (&ct0, &parts.t0, &u, &h) |*f, *t, *uf, *hf| {
-            pointwise(&c_hat, t, f);
-
-            inverseNtt(f);
+            inverseNtt(product);
 
             for (0..32) |i| {
-                const c = centered(freeze(load(f, 8 * i)));
-
-                store(f, 8 * i, c);
+                const c = centered(freeze(load(product, 8 * i)));
 
                 invalid |= splat(p.gamma2 - 1) - absolute(c);
 
                 // MakeHint(-ct0, w - cs2 + ct0): whether adding ct0 moves the high bits.
-                const uc = load(uf, 8 * i);
+                const uc = load(f, 8 * i);
 
                 const moved = decompose(p.gamma2, freeze(uc + c))[0] ^ decompose(p.gamma2, uc)[0];
 
@@ -1077,11 +1136,11 @@ pub fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, message: 
         // The accepted c_tilde, z and h form the signature.
         ct.declassify(c_tilde);
 
-        ct.declassify(std.mem.asBytes(&cs1));
+        ct.declassify(std.mem.asBytes(y));
 
-        ct.declassify(std.mem.asBytes(&h));
+        ct.declassify(std.mem.asBytes(h));
 
-        encodeSignature(p, &cs1, &h, signature);
+        encodeSignature(p, y, h, signature);
 
         return;
     }
@@ -1145,15 +1204,14 @@ fn decodeHint(comptime p: Parameters, data: *const [p.omega + p.k]u8, h: *[p.k][
     return true;
 }
 
-// tr = H(pk, 64), which the key computed when it was created.
-pub fn verify(comptime p: Parameters, pk: *const [p.publicKeySize()]u8, tr: *const [64]u8, message: []const []const u8, signature: *const [p.signatureSize()]u8) bool {
+// tr = H(pk, 64), which the key computed when it was created. Without a cache, which happens
+// only when it cannot be allocated, A is sampled again as the product uses it.
+pub noinline fn verify(comptime p: Parameters, pk: *const [p.publicKeySize()]u8, tr: *const [64]u8, public: ?*const PublicCache(p), message: []const []const u8, signature: *const [p.signatureSize()]u8) bool {
     const k = p.k;
 
     const l = p.l;
 
     const bits = p.gamma1Bits();
-
-    const rho = pk[0..32];
 
     const c_tilde = signature[0 .. p.lambda / 4];
 
@@ -1195,39 +1253,45 @@ pub fn verify(comptime p: Parameters, pk: *const [p.publicKeySize()]u8, tr: *con
 
     for (&z) |*f| ntt(f);
 
-    var a: [k][l]Poly = undefined;
+    var w: [k]Poly = undefined;
 
-    expandMatrix(p, rho, &a);
+    if (public) |cache| {
+        for (&w, &cache.matrix) |*f, *row| dot(l, row, &z, f);
+    } else {
+        multiplyMatrix(p, pk[0..32], &z, &w, null);
+    }
 
-    var w1: [k]Poly = undefined;
+    var challenge = hash.shake256.create();
 
-    for (&w1, &a, 0..) |*f, *row, i| {
-        dot(l, row, &z, f);
+    challenge.update(&mu);
 
-        var t1: [256]u32 = undefined;
-
-        unpack(10, pk[32 + 320 * i ..][0..320], &t1);
-
+    for (&w, &h, 0..) |*f, *hints, i| {
         var ct1: Poly = undefined;
 
-        for (&ct1, t1) |*c, value| {
-            c.* = @intCast(value << d);
+        if (public) |cache| {
+            pointwise(&c_hat, &cache.t1[i], &ct1);
+        } else {
+            var t1: Poly = undefined;
+
+            unpackHigh(pk[32 + 320 * i ..][0..320], &t1);
+
+            shiftedNtt(&t1, &ct1);
+
+            pointwise(&c_hat, &ct1, &ct1);
         }
-
-        ntt(&ct1);
-
-        pointwise(&c_hat, &ct1, &ct1);
 
         for (0..32) |j| store(f, 8 * j, reduce32(load(f, 8 * j) - load(&ct1, 8 * j)));
 
         inverseNtt(f);
 
-        for (0..32) |j| store(f, 8 * j, useHint(p.gamma2, h[i][8 * j ..][0..8].*, freeze(load(f, 8 * j))));
+        for (0..32) |j| store(f, 8 * j, useHint(p.gamma2, hints[8 * j ..][0..8].*, freeze(load(f, 8 * j))));
+
+        absorbHigh(p, &challenge, f);
     }
 
     var expected: [p.lambda / 4]u8 = undefined;
 
-    challengeHash(p, &mu, &w1, &expected);
+    challenge.read(&expected);
 
     return std.mem.eql(u8, &expected, c_tilde);
 }

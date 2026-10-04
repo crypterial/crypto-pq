@@ -44,25 +44,29 @@ fn keyGeneration(_: void, r: vectors.Record, allocator: Allocator) !void {
 
     const sk = try vectors.decode(allocator, r.values.get("sk"));
 
-    var pair = try hazmat.generateSignatureKeyPair(algorithm, seed);
+    var pair = try hazmat.generateSignatureKeyPair(algorithm, allocator, seed);
 
     defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
 
     try testing.expectEqualSlices(u8, try vectors.decode(allocator, r.values.get("pk")), try pair.public_key.exportKey(allocator, .raw));
 
     try testing.expectEqualSlices(u8, sk, try pair.private_key.exportKey(allocator, .raw));
 
-    var imported = try algorithm.importPrivateKey(sk, .raw);
+    var imported = try algorithm.importPrivateKey(allocator, sk, .raw);
 
     defer imported.deinit();
 
-    const imported_public = imported.publicKey();
+    var imported_public = imported.publicKey();
+
+    defer imported_public.deinit();
 
     try testing.expect(imported_public.eql(&pair.public_key));
 
     sk[sk.len - 1] ^= 1;
 
-    try testing.expectError(error.InvalidPrivateKey, algorithm.importPrivateKey(sk, .raw));
+    try testing.expectError(error.InvalidPrivateKey, algorithm.importPrivateKey(allocator, sk, .raw));
 }
 
 test "SLH-DSA ACVP key generation" {
@@ -78,7 +82,7 @@ fn signatureGeneration(_: void, r: vectors.Record, allocator: Allocator) !void {
 
     const sk = try vectors.decode(allocator, r.values.get("sk"));
 
-    var private_key = try algorithm.importPrivateKey(sk, .raw);
+    var private_key = try algorithm.importPrivateKey(allocator, sk, .raw);
 
     defer private_key.deinit();
 
@@ -105,7 +109,9 @@ test "SLH-DSA ACVP signature generation" {
 fn signatureVerification(_: void, r: vectors.Record, allocator: Allocator) !void {
     const algorithm = try algorithmNamed(r.header.get("parameterSet"));
 
-    const public_key = try algorithm.importPublicKey(try vectors.decode(allocator, r.values.get("pk")), .raw);
+    var public_key = try algorithm.importPublicKey(allocator, try vectors.decode(allocator, r.values.get("pk")), .raw);
+
+    defer public_key.deinit();
 
     const result = hazmat.verify(&public_key, try vectors.decode(allocator, r.values.get("signature")), try vectors.decode(allocator, r.values.get("message")), .{
         .context = try vectors.decode(allocator, r.values.get("context")),
@@ -132,9 +138,11 @@ test "SLH-DSA round trip" {
 
     const algorithm = pq.slh_dsa_shake_128f;
 
-    var pair = try algorithm.generateKeyPair(.{ .self_test = false });
+    var pair = try algorithm.generateKeyPair(testing.allocator, .{ .self_test = false });
 
     defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
 
     const signature = try pair.private_key.sign(allocator, "message", .{ .context = "context", .deterministic = true });
 
@@ -147,11 +155,13 @@ test "SLH-DSA round trip" {
     const raw = try pair.private_key.exportKey(allocator, .raw);
 
     for ([_]pq.KeyFormat{ .raw, .der, .pem }) |format| {
-        const public_key = try algorithm.importPublicKey(try pair.public_key.exportKey(allocator, format), format);
+        var public_key = try algorithm.importPublicKey(testing.allocator, try pair.public_key.exportKey(allocator, format), format);
+
+        defer public_key.deinit();
 
         try testing.expect(public_key.eql(&pair.public_key));
 
-        var private_key = try algorithm.importPrivateKey(try pair.private_key.exportKey(allocator, format), format);
+        var private_key = try algorithm.importPrivateKey(testing.allocator, try pair.private_key.exportKey(allocator, format), format);
 
         defer private_key.deinit();
 
@@ -173,7 +183,7 @@ test "SLH-DSA RFC 9909 private key" {
         \\
     ;
 
-    var private_key = try pq.slh_dsa_sha2_128s.importPrivateKey(pem, .pem);
+    var private_key = try pq.slh_dsa_sha2_128s.importPrivateKey(testing.allocator, pem, .pem);
 
     defer private_key.deinit();
 

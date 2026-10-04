@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const cache = @import("cache.zig");
 const ct = @import("ct.zig");
 const encoding = @import("encoding.zig");
 const Error = @import("errors.zig").Error;
@@ -21,8 +22,6 @@ const self_test_message = "crypto-pq pairwise consistency test";
 const max_public_key_size = mldsa.ml_dsa_87.publicKeySize();
 
 const max_secret_size = mldsa.ml_dsa_87.privateKeySize();
-
-const max_signature_size = slhdsa.sha2_256f.signatureSize();
 
 const max_seed_size = 3 * 32;
 
@@ -68,7 +67,10 @@ pub const SignatureAlgorithm = struct {
         slh_dsa_shake_256f,
     };
 
-    pub fn generateKeyPair(self: SignatureAlgorithm, options: KeyGenOptions) Error!SignatureKeyPair {
+    // `allocator` provides the memory of the keys and of their ML-DSA caches, and the workspace
+    // of the self-test signature. A key may fill its caches from any thread that uses it, so the
+    // allocator must be thread-safe if the keys are.
+    pub fn generateKeyPair(self: SignatureAlgorithm, allocator: Allocator, options: KeyGenOptions) (Error || Allocator.Error)!SignatureKeyPair {
         var seed: [max_seed_size]u8 = undefined;
 
         defer ct.wipe(&seed);
@@ -77,22 +79,24 @@ pub const SignatureAlgorithm = struct {
 
         try rng.fill(seed[0..size]);
 
-        var private_key = fromSeed(self, seed[0..size]);
+        var private_key = try fromSeed(self, allocator, seed[0..size], options.self_test);
 
         errdefer private_key.deinit();
 
-        const public_key = private_key.publicKey();
+        var public_key = private_key.publicKey();
+
+        errdefer public_key.deinit();
 
         if (options.self_test) {
-            var buffer: [max_signature_size]u8 = undefined;
+            const signature = try allocator.alloc(u8, signatureSize(self.kind));
 
-            const signature = buffer[0..signatureSize(self.kind)];
+            defer allocator.free(signature);
 
             var representative: Representative = undefined;
 
             representative.init(self_test_message, "", null);
 
-            signRaw(self.kind, private_key.secret(), representative.parts(), deterministicRandomness(&private_key), signature);
+            try signRaw(&private_key, allocator, representative.parts(), deterministicRandomness(&private_key), signature);
 
             if (!public_key.verify(signature, self_test_message, .{})) return error.SelfTestFailed;
         }
@@ -100,34 +104,35 @@ pub const SignatureAlgorithm = struct {
         return .{ .public_key = public_key, .private_key = private_key };
     }
 
-    pub fn importPublicKey(self: SignatureAlgorithm, data: []const u8, format: KeyFormat) Error!SignaturePublicKey {
-        var buffer: keys.PemBuffer = undefined;
+    // An ML-DSA key's cache is filled on its first use.
+    pub fn importPublicKey(self: SignatureAlgorithm, allocator: Allocator, data: []const u8, format: KeyFormat) (Error || Allocator.Error)!SignaturePublicKey {
+        const buffer = try keys.pemBuffer(allocator, format);
 
-        const key = try keys.importPublic(format, data, objectIdentifier(self.kind), &buffer);
+        defer keys.freePemBuffer(allocator, buffer);
+
+        const key = try keys.importPublic(format, data, objectIdentifier(self.kind), buffer);
 
         if (key.len != publicKeySize(self.kind)) return if (format == .raw) error.InvalidLength else error.InvalidEncoding;
 
-        var public_key: SignaturePublicKey = .{ .algorithm = self, .bytes = undefined, .tr = @splat(0) };
+        const public = try createPublic(allocator);
 
-        ct.wipe(&public_key.bytes);
+        @memcpy(public.bytes[0..key.len], key);
 
-        @memcpy(public_key.bytes[0..key.len], key);
+        if (isMlDsa(self.kind)) primitives.shake256(&.{key}, &public.tr);
 
-        if (isMlDsa(self.kind)) primitives.shake256(&.{key}, &public_key.tr);
-
-        return public_key;
+        return .{ .algorithm = self, .public = public };
     }
 
-    pub fn importPrivateKey(self: SignatureAlgorithm, data: []const u8, format: KeyFormat) Error!SignaturePrivateKey {
-        var buffer: keys.PemBuffer = undefined;
+    pub fn importPrivateKey(self: SignatureAlgorithm, allocator: Allocator, data: []const u8, format: KeyFormat) (Error || Allocator.Error)!SignaturePrivateKey {
+        const buffer = try keys.pemBuffer(allocator, format);
 
-        defer if (format == .pem) ct.wipe(&buffer);
+        defer keys.freePemBuffer(allocator, buffer);
 
-        const input = try keys.importPrivate(format, data, objectIdentifier(self.kind), &buffer);
+        const input = try keys.importPrivate(format, data, objectIdentifier(self.kind), buffer);
 
         var key = switch (input) {
-            .raw => |raw| try self.importRaw(raw),
-            .pkcs8 => |pkcs8| try self.importOctets(pkcs8.octets),
+            .raw => |raw| try self.importRaw(allocator, raw),
+            .pkcs8 => |pkcs8| try self.importOctets(allocator, pkcs8.octets),
         };
 
         errdefer key.deinit();
@@ -141,45 +146,63 @@ pub const SignatureAlgorithm = struct {
         return key;
     }
 
-    fn importRaw(self: SignatureAlgorithm, raw: []const u8) Error!SignaturePrivateKey {
-        if (isMlDsa(self.kind) and raw.len == seedSize(self.kind)) return fromSeed(self, raw);
+    fn importRaw(self: SignatureAlgorithm, allocator: Allocator, raw: []const u8) (Error || Allocator.Error)!SignaturePrivateKey {
+        if (isMlDsa(self.kind) and raw.len == seedSize(self.kind)) return fromSeed(self, allocator, raw, false);
 
         if (raw.len != secretSize(self.kind)) return error.InvalidLength;
 
-        return fromSecret(self, raw);
+        return fromSecret(self, allocator, raw);
     }
 
     // SLH-DSA stores its 4n-byte key directly in the PKCS#8 octets; ML-DSA uses the seed/expanded
     // CHOICE.
-    fn importOctets(self: SignatureAlgorithm, octets: []const u8) Error!SignaturePrivateKey {
+    fn importOctets(self: SignatureAlgorithm, allocator: Allocator, octets: []const u8) (Error || Allocator.Error)!SignaturePrivateKey {
         if (!isMlDsa(self.kind)) {
             if (octets.len != secretSize(self.kind)) return error.InvalidEncoding;
 
-            return fromSecret(self, octets);
+            return fromSecret(self, allocator, octets);
         }
 
         const choice = try keys.decodeSeedChoice(octets, seedSize(self.kind), secretSize(self.kind));
 
-        const seed = choice.seed orelse return fromSecret(self, choice.expanded.?);
+        const seed = choice.seed orelse return fromSecret(self, allocator, choice.expanded.?);
 
-        var key = fromSeed(self, seed);
+        var key = try fromSeed(self, allocator, seed, false);
 
         errdefer key.deinit();
 
         if (choice.expanded) |expanded| {
-            if (!ct.equal(expanded, key.secret())) return error.InvalidPrivateKey;
+            if (!ct.equal(expanded, key.secretBytes())) return error.InvalidPrivateKey;
         }
 
         return key;
     }
 };
 
-// For ML-DSA, `tr` = H(pk, 64) is computed when the key is created, so that no verification
-// hashes the key again; SLH-DSA leaves it zero.
+// The public part of a key pair, which its keys share: the key, H(pk, 64) for ML-DSA, computed
+// when the key is created so that no verification hashes the key again, and the ML-DSA cache of A
+// and NTT(t1 * 2^d), filled on first use.
+const Public = struct {
+    shared: cache.Shared,
+    tr: [64]u8,
+    bytes: [max_public_key_size]u8,
+};
+
+// The secret part, which only the private key holds: the seed, the expanded ML-DSA key or the
+// SLH-DSA key, and the ML-DSA cache of the NTT forms of s1, s2 and t0, filled on first use. It is
+// wiped before it is freed.
+const Secret = struct {
+    seed: [32]u8,
+    has_seed: bool,
+    bytes: [max_secret_size]u8,
+    cache: cache.Slot,
+};
+
+// The keys are small handles: the key material is in the heap, so copies stay cheap and the
+// stack small. deinit releases the public part, which the last key of a pair frees.
 pub const SignaturePublicKey = struct {
     algorithm: SignatureAlgorithm,
-    bytes: [max_public_key_size]u8,
-    tr: [64]u8,
+    public: *Public,
 
     pub fn verify(self: *const SignaturePublicKey, signature: []const u8, message: []const u8, options: VerifyOptions) bool {
         return verifyWith(self, signature, message, options, true);
@@ -193,25 +216,27 @@ pub const SignaturePublicKey = struct {
         return self.algorithm.kind == other.algorithm.kind and std.mem.eql(u8, self.raw(), other.raw());
     }
 
+    pub fn deinit(self: *SignaturePublicKey) void {
+        release(self.algorithm.kind, self.public);
+
+        self.* = undefined;
+    }
+
     fn raw(self: *const SignaturePublicKey) []const u8 {
-        return self.bytes[0..publicKeySize(self.algorithm.kind)];
+        return self.public.bytes[0..publicKeySize(self.algorithm.kind)];
     }
 };
 
 pub const SignaturePrivateKey = struct {
     algorithm: SignatureAlgorithm,
-    seed: [32]u8,
-    has_seed: bool,
-    secret_bytes: [max_secret_size]u8,
-    public: [max_public_key_size]u8,
+    public: *Public,
+    secret: *Secret,
 
-    // An ML-DSA private key holds tr, which the import check compares with the public key.
+    // The public key shares this key's public part and its cache; deinitialize it as well.
     pub fn publicKey(self: *const SignaturePrivateKey) SignaturePublicKey {
-        var public_key: SignaturePublicKey = .{ .algorithm = self.algorithm, .bytes = self.public, .tr = @splat(0) };
+        self.public.shared.retain();
 
-        if (isMlDsa(self.algorithm.kind)) public_key.tr = self.secret_bytes[64..128].*;
-
-        return public_key;
+        return .{ .algorithm = self.algorithm, .public = self.public };
     }
 
     pub fn sign(self: *const SignaturePrivateKey, allocator: Allocator, message: []const u8, options: SignOptions) (Error || Allocator.Error)![]u8 {
@@ -235,25 +260,27 @@ pub const SignaturePrivateKey = struct {
     pub fn exportKey(self: *const SignaturePrivateKey, allocator: Allocator, format: KeyFormat) (Error || Allocator.Error)![]u8 {
         const oid = objectIdentifier(self.algorithm.kind);
 
-        if (!isMlDsa(self.algorithm.kind)) return keys.exportPrivate(allocator, format, oid, null, self.secret());
+        if (!isMlDsa(self.algorithm.kind)) return keys.exportPrivate(allocator, format, oid, null, self.secretBytes());
 
-        if (self.has_seed) return keys.exportPrivate(allocator, format, oid, encoding.context_0, &self.seed);
+        if (self.secret.has_seed) return keys.exportPrivate(allocator, format, oid, encoding.context_0, &self.secret.seed);
 
-        return keys.exportPrivate(allocator, format, oid, encoding.octet_string, self.secret());
+        return keys.exportPrivate(allocator, format, oid, encoding.octet_string, self.secretBytes());
     }
 
     pub fn deinit(self: *SignaturePrivateKey) void {
-        ct.wipe(&self.seed);
+        destroySecret(self.algorithm.kind, self.public.shared.allocator, self.secret);
 
-        ct.wipe(&self.secret_bytes);
+        release(self.algorithm.kind, self.public);
+
+        self.* = undefined;
     }
 
-    fn secret(self: *const SignaturePrivateKey) []const u8 {
-        return self.secret_bytes[0..secretSize(self.algorithm.kind)];
+    fn secretBytes(self: *const SignaturePrivateKey) []const u8 {
+        return self.secret.bytes[0..secretSize(self.algorithm.kind)];
     }
 
     fn publicBytes(self: *const SignaturePrivateKey) []const u8 {
-        return self.public[0..publicKeySize(self.algorithm.kind)];
+        return self.public.bytes[0..publicKeySize(self.algorithm.kind)];
     }
 };
 
@@ -363,50 +390,113 @@ fn deterministicRandomness(key: *const SignaturePrivateKey) []const u8 {
 
     const n = randomnessSize(key.algorithm.kind);
 
-    return key.secret_bytes[2 * n ..][0..n];
+    return key.secret.bytes[2 * n ..][0..n];
 }
 
-fn empty(algorithm: SignatureAlgorithm) SignaturePrivateKey {
-    var key: SignaturePrivateKey = .{ .algorithm = algorithm, .seed = undefined, .has_seed = false, .secret_bytes = undefined, .public = undefined };
+fn createPublic(allocator: Allocator) Allocator.Error!*Public {
+    const public = try allocator.create(Public);
 
-    inline for (.{ &key.seed, &key.secret_bytes, &key.public }) |buffer| ct.wipe(buffer);
+    public.shared = .{ .allocator = allocator };
 
-    return key;
+    ct.wipe(&public.tr);
+
+    ct.wipe(&public.bytes);
+
+    return public;
 }
 
-pub fn fromSeed(algorithm: SignatureAlgorithm, seed: []const u8) SignaturePrivateKey {
-    var key = empty(algorithm);
+fn release(kind: SignatureAlgorithm.Kind, public: *Public) void {
+    if (!public.shared.release()) return;
+
+    const allocator = public.shared.allocator;
+
+    switch (kind) {
+        inline else => |tag| switch (comptime family(tag)) {
+            .ml_dsa => |p| public.shared.cache.deinit(mldsa.PublicCache(p), allocator),
+            .slh_dsa => {},
+        },
+    }
+
+    allocator.destroy(public);
+}
+
+fn createSecret(allocator: Allocator) Allocator.Error!*Secret {
+    const secret = try allocator.create(Secret);
+
+    ct.wipe(&secret.seed);
+
+    ct.wipe(&secret.bytes);
+
+    secret.has_seed = false;
+
+    secret.cache = .{};
+
+    return secret;
+}
+
+fn destroySecret(kind: SignatureAlgorithm.Kind, allocator: Allocator, secret: *Secret) void {
+    switch (kind) {
+        inline else => |tag| switch (comptime family(tag)) {
+            .ml_dsa => |p| secret.cache.deinit(mldsa.SecretCache(p), allocator),
+            .slh_dsa => {},
+        },
+    }
+
+    ct.wipe(std.mem.asBytes(secret));
+
+    allocator.destroy(secret);
+}
+
+// With `fill`, the ML-DSA public cache is filled now from the matrix that key generation samples
+// anyway, for a self-test that uses it at once; otherwise the key fills it on its first use, so
+// that a key that is only generated or imported costs no more. The memory comes first, so that a
+// failure leaves nothing secret behind.
+pub fn fromSeed(algorithm: SignatureAlgorithm, allocator: Allocator, seed: []const u8, fill: bool) Allocator.Error!SignaturePrivateKey {
+    const public = try createPublic(allocator);
+
+    errdefer release(algorithm.kind, public);
+
+    const secret = try createSecret(allocator);
+
+    errdefer destroySecret(algorithm.kind, allocator, secret);
 
     switch (algorithm.kind) {
         inline else => |tag| switch (comptime family(tag)) {
             .ml_dsa => |p| {
-                key.has_seed = true;
+                const form = if (fill) try public.shared.cache.allocate(mldsa.PublicCache(p), allocator) else null;
 
-                @memcpy(&key.seed, seed);
+                secret.has_seed = true;
 
-                mldsa.keyGen(p, seed[0..32], key.public[0..p.publicKeySize()], key.secret_bytes[0..p.privateKeySize()]);
+                @memcpy(&secret.seed, seed);
+
+                mldsa.keyGen(p, seed[0..32], public.bytes[0..p.publicKeySize()], secret.bytes[0..p.privateKeySize()], form);
+
+                public.tr = secret.bytes[64..128].*;
             },
             .slh_dsa => |p| {
                 const n: usize = p.n;
 
-                slhdsa.Scheme(p).keyGen(seed[0..n], seed[n..][0..n], seed[2 * n ..][0..n], key.secret_bytes[0 .. 4 * n], key.public[0 .. 2 * n]);
+                slhdsa.Scheme(p).keyGen(seed[0..n], seed[n..][0..n], seed[2 * n ..][0..n], secret.bytes[0 .. 4 * n], public.bytes[0 .. 2 * n]);
             },
         },
     }
 
-    return key;
+    return .{ .algorithm = algorithm, .public = public, .secret = secret };
 }
 
 // Validates an expanded ML-DSA key or an SLH-DSA key against the public key it implies.
-fn fromSecret(algorithm: SignatureAlgorithm, bytes: []const u8) Error!SignaturePrivateKey {
-    var key = empty(algorithm);
+fn fromSecret(algorithm: SignatureAlgorithm, allocator: Allocator, bytes: []const u8) (Error || Allocator.Error)!SignaturePrivateKey {
+    const public = try createPublic(allocator);
 
-    errdefer key.deinit();
+    errdefer release(algorithm.kind, public);
 
     switch (algorithm.kind) {
         inline else => |tag| switch (comptime family(tag)) {
             .ml_dsa => |p| {
-                if (!mldsa.checkPrivateKey(p, bytes[0..p.privateKeySize()], key.public[0..p.publicKeySize()])) return error.InvalidPrivateKey;
+                if (!mldsa.checkPrivateKey(p, bytes[0..p.privateKeySize()], public.bytes[0..p.publicKeySize()])) return error.InvalidPrivateKey;
+
+                // tr = H(pk) was checked against pk and is public from here.
+                public.tr = bytes[64..128].*;
             },
             .slh_dsa => |p| {
                 const n: usize = p.n;
@@ -419,15 +509,17 @@ fn fromSecret(algorithm: SignatureAlgorithm, bytes: []const u8) Error!SignatureP
 
                 if (!ct.declassifyValue(bool, ct.equal(&root, bytes[3 * n ..][0..n]))) return error.InvalidPrivateKey;
 
-                @memcpy(key.public[0 .. 2 * n], bytes[2 * n ..][0 .. 2 * n]);
+                @memcpy(public.bytes[0 .. 2 * n], bytes[2 * n ..][0 .. 2 * n]);
             },
         },
     }
 
-    // Copied after the checks, which declassify the public parts of the key.
-    @memcpy(key.secret_bytes[0..bytes.len], bytes);
+    const secret = try createSecret(allocator);
 
-    return key;
+    // Copied after the checks, which declassify the public parts of the key.
+    @memcpy(secret.bytes[0..bytes.len], bytes);
+
+    return .{ .algorithm = algorithm, .public = public, .secret = secret };
 }
 
 const Entry = struct {
@@ -539,20 +631,44 @@ const Representative = struct {
     }
 };
 
-fn signRaw(kind: SignatureAlgorithm.Kind, secret: []const u8, message: []const []const u8, randomness: []const u8, out: []u8) void {
-    switch (kind) {
+// ML-DSA signs with the key's caches and a workspace from `allocator`, which keeps its large
+// vectors off the stack.
+fn signRaw(key: *const SignaturePrivateKey, allocator: Allocator, message: []const []const u8, randomness: []const u8, out: []u8) Allocator.Error!void {
+    switch (key.algorithm.kind) {
         inline else => |tag| switch (comptime family(tag)) {
-            .ml_dsa => |p| mldsa.sign(p, secret[0..p.privateKeySize()], message, randomness[0..32], out[0..p.signatureSize()]),
-            .slh_dsa => |p| slhdsa.Scheme(p).sign(secret[0..p.privateKeySize()], message, randomness[0..p.n], out[0..p.signatureSize()]),
+            .ml_dsa => |p| {
+                const shared = &key.public.shared;
+
+                const sk = key.secret.bytes[0..p.privateKeySize()];
+
+                const public = shared.cache.get(mldsa.PublicCache(p), shared.allocator, key.public.bytes[0..p.publicKeySize()]) orelse return error.OutOfMemory;
+
+                const secrets = key.secret.cache.get(mldsa.SecretCache(p), shared.allocator, sk) orelse return error.OutOfMemory;
+
+                const work = try allocator.create(mldsa.Workspace(p));
+
+                defer allocator.destroy(work);
+
+                mldsa.sign(p, sk, secrets, public, work, message, randomness[0..32], out[0..p.signatureSize()]);
+            },
+            .slh_dsa => |p| slhdsa.Scheme(p).sign(key.secret.bytes[0..p.privateKeySize()], message, randomness[0..p.n], out[0..p.signatureSize()]),
         },
     }
 }
 
-fn verifyRaw(kind: SignatureAlgorithm.Kind, public: []const u8, tr: *const [64]u8, message: []const []const u8, signature: []const u8) bool {
-    return switch (kind) {
+// Without its cache, which happens only when it cannot be allocated, ML-DSA verification samples
+// the matrix again.
+fn verifyRaw(key: *const SignaturePublicKey, message: []const []const u8, signature: []const u8) bool {
+    return switch (key.algorithm.kind) {
         inline else => |tag| switch (comptime family(tag)) {
-            .ml_dsa => |p| mldsa.verify(p, public[0..p.publicKeySize()], tr, message, signature[0..p.signatureSize()]),
-            .slh_dsa => |p| slhdsa.Scheme(p).verify(public[0..p.publicKeySize()], message, signature[0..p.signatureSize()]),
+            .ml_dsa => |p| {
+                const shared = &key.public.shared;
+
+                const pk = key.public.bytes[0..p.publicKeySize()];
+
+                return mldsa.verify(p, pk, &key.public.tr, shared.cache.get(mldsa.PublicCache(p), shared.allocator, pk), message, signature[0..p.signatureSize()]);
+            },
+            .slh_dsa => |p| slhdsa.Scheme(p).verify(key.public.bytes[0..p.publicKeySize()], message, signature[0..p.signatureSize()]),
         },
     };
 }
@@ -561,11 +677,13 @@ fn verifyRaw(kind: SignatureAlgorithm.Kind, public: []const u8, tr: *const [64]u
 fn signWith(key: *const SignaturePrivateKey, allocator: Allocator, message: []const u8, randomness: []const u8, context: []const u8, entry: ?Entry) Allocator.Error![]u8 {
     const out = try allocator.alloc(u8, signatureSize(key.algorithm.kind));
 
+    errdefer allocator.free(out);
+
     var representative: Representative = undefined;
 
     representative.init(message, context, entry);
 
-    signRaw(key.algorithm.kind, key.secret(), representative.parts(), randomness, out);
+    try signRaw(key, allocator, representative.parts(), randomness, out);
 
     return out;
 }
@@ -593,7 +711,7 @@ pub fn verifyWith(key: *const SignaturePublicKey, signature: []const u8, message
 
     representative.init(message, options.context, entry);
 
-    return verifyRaw(kind, key.raw(), &key.tr, representative.parts(), signature);
+    return verifyRaw(key, representative.parts(), signature);
 }
 
 fn define(comptime kind: SignatureAlgorithm.Kind, name: []const u8) SignatureAlgorithm {

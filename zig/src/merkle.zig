@@ -1,23 +1,29 @@
 const std = @import("std");
 
+const Error = @import("errors.zig").Error;
+
 const Allocator = std.mem.Allocator;
 
 const cached_height = 15;
 
 const max_node_size = 32;
 
+// The kept bottom subtree has 2^low leaves and 2^(low + 1) - 1 nodes: 64 KiB at low = 10, which
+// today's largest tree (height 25) needs. A larger low is refused rather than allocated.
 const max_low = 10;
 
 // A Merkle tree that keeps its nodes from height `low` upwards, where low = max(0, h - 15).
 //
 // Building it computes every leaf once. An authentication path takes its upper nodes from the
-// cache and rebuilds only the 2^low-leaf subtree under the signed leaf, so memory stays below
-// 2^16 nodes for every height while trees of height 15 or less never recompute a leaf.
+// cache and its lower ones from the 2^low-leaf subtree under the signed leaf. That subtree is
+// kept, every level of it, so the consecutive signatures under one subtree rebuild it once:
+// memory stays below 2^16 nodes plus the subtree for every height, and trees of height 15 or less
+// never recompute a leaf.
 //
 // `Context` provides leaf(index, out), or leaves(first, out) with a `lanes` count, and
 // combine(z, j, left, right, out), where z is the height of the children and j the index of the
-// parent; `out` may alias `left`. The node memory is allocated once, so that a tree can be rebuilt
-// for another context without allocating.
+// parent. The node memory is allocated once, so that a tree can be rebuilt for another context
+// without allocating.
 pub fn MerkleTree(comptime Context: type) type {
     return struct {
         const Self = @This();
@@ -27,25 +33,30 @@ pub fn MerkleTree(comptime Context: type) type {
         low: u6,
         n: usize,
         nodes: []u8,
+        subtree: []u8,
+        subtree_index: ?u64,
         root: [max_node_size]u8,
 
-        pub fn init(allocator: Allocator, height: u6, n: usize) Allocator.Error!Self {
+        pub fn init(allocator: Allocator, height: u6, n: usize) (Error || Allocator.Error)!Self {
             const low = height -| cached_height;
 
-            std.debug.assert(low <= max_low and n <= max_node_size);
+            // Checked in every build mode: the root holds at most max_node_size bytes, and the
+            // subtree size grows as 2^low.
+            if (low > max_low or n == 0 or n > max_node_size) return error.InvalidOption;
 
-            return .{
-                .context = undefined,
-                .height = height,
-                .low = low,
-                .n = n,
-                .nodes = try allocator.alloc(u8, ((@as(usize, 2) << @intCast(height - low)) - 1) * n),
-                .root = undefined,
-            };
+            const nodes = try allocator.alloc(u8, ((@as(usize, 2) << @intCast(height - low)) - 1) * n);
+
+            errdefer allocator.free(nodes);
+
+            const subtree = try allocator.alloc(u8, if (low == 0) 0 else ((@as(usize, 2) << @intCast(low)) - 1) * n);
+
+            return .{ .context = undefined, .height = height, .low = low, .n = n, .nodes = nodes, .subtree = subtree, .subtree_index = null, .root = undefined };
         }
 
         pub fn deinit(self: *Self, allocator: Allocator) void {
             allocator.free(self.nodes);
+
+            allocator.free(self.subtree);
         }
 
         pub fn build(self: *Self, context: Context) void {
@@ -53,15 +64,15 @@ pub fn MerkleTree(comptime Context: type) type {
 
             self.context = context;
 
+            self.subtree_index = null;
+
             if (self.low == 0) {
                 self.leaves(0, self.nodes[0 .. (@as(usize, 1) << @intCast(self.height)) * n]);
             } else {
                 for (0..@as(usize, 1) << @intCast(self.height - self.low)) |chunk| {
-                    var buffer: [(1 << max_low) * max_node_size]u8 = undefined;
+                    self.rebuild(chunk);
 
-                    self.subtree(chunk, &buffer, null);
-
-                    @memcpy(self.node(self.low, chunk), buffer[0..n]);
+                    @memcpy(self.node(self.low, chunk), self.subtreeNode(self.low, 0));
                 }
             }
 
@@ -105,39 +116,43 @@ pub fn MerkleTree(comptime Context: type) type {
             return self.nodes[(offset + index) * self.n ..][0..self.n];
         }
 
-        // Reduces the 2^low leaves under `chunk` to their root in buffer[0..n], copying the
-        // sibling of `index` at every height into `path` when it is given.
-        fn subtree(self: *const Self, chunk: usize, buffer: []u8, path: ?struct { index: u64, out: []u8 }) void {
-            const n = self.n;
+        // Level z of the kept subtree holds 2^(low - z) nodes, stored after the levels below it.
+        fn subtreeNode(self: *const Self, z: usize, index: usize) []u8 {
+            const offset = (@as(usize, 2) << @intCast(self.low)) - (@as(usize, 2) << @intCast(self.low - z));
 
-            const base = chunk << @intCast(self.low);
-
-            self.leaves(base, buffer[0 .. (@as(usize, 1) << @intCast(self.low)) * n]);
-
-            for (0..self.low) |z| {
-                const count = @as(usize, 1) << @intCast(self.low - z);
-
-                if (path) |p| {
-                    const sibling: usize = @intCast(((p.index >> @intCast(z)) ^ 1) & (count - 1));
-
-                    @memcpy(p.out[z * n ..][0..n], buffer[sibling * n ..][0..n]);
-                }
-
-                const offset = base >> @intCast(z + 1);
-
-                for (0..count / 2) |j| {
-                    self.context.combine(@intCast(z), offset + j, buffer[2 * j * n ..][0..n], buffer[(2 * j + 1) * n ..][0..n], buffer[j * n ..][0..n]);
-                }
-            }
+            return self.subtree[(offset + index) * self.n ..][0..self.n];
         }
 
-        pub fn authPath(self: *const Self, index: u64, out: []u8) void {
+        // Every node of the subtree with 2^low leaves under `chunk`, its root last.
+        fn rebuild(self: *Self, chunk: u64) void {
+            const base = chunk << self.low;
+
+            self.leaves(base, self.subtree[0 .. (@as(usize, 1) << @intCast(self.low)) * self.n]);
+
+            for (0..self.low) |z| {
+                const offset = base >> @intCast(z + 1);
+
+                for (0..@as(usize, 1) << @intCast(self.low - z - 1)) |j| {
+                    self.context.combine(@intCast(z), offset + j, self.subtreeNode(z, 2 * j), self.subtreeNode(z, 2 * j + 1), self.subtreeNode(z + 1, j));
+                }
+            }
+
+            self.subtree_index = chunk;
+        }
+
+        pub fn authPath(self: *Self, index: u64, out: []u8) void {
             const n = self.n;
 
             if (self.low > 0) {
-                var buffer: [(1 << max_low) * max_node_size]u8 = undefined;
+                const chunk = index >> self.low;
 
-                self.subtree(@intCast(index >> self.low), &buffer, .{ .index = index, .out = out });
+                if (self.subtree_index != chunk) self.rebuild(chunk);
+
+                for (0..self.low) |z| {
+                    const sibling: usize = @intCast(((index >> @intCast(z)) ^ 1) & ((@as(u64, 1) << @intCast(self.low - z)) - 1));
+
+                    @memcpy(out[z * n ..][0..n], self.subtreeNode(z, sibling));
+                }
             }
 
             for (self.low..self.height) |z| {
@@ -147,50 +162,59 @@ pub fn MerkleTree(comptime Context: type) type {
     };
 }
 
-// Trees above height 15 rebuild the bottom of every authentication path; compare them with a
-// tree kept whole.
-test "merkle cache above the cached height" {
-    const testing = std.testing;
+const TestContext = struct {
+    calls: *usize,
 
     const hash = @import("hash.zig");
 
-    const Context = struct {
-        pub fn leaf(_: *const @This(), index: u64, out: []u8) void {
-            var bytes: [8]u8 = undefined;
+    pub fn leaf(self: *const TestContext, index: u64, out: []u8) void {
+        self.calls.* += 1;
 
-            std.mem.writeInt(u64, &bytes, index, .big);
+        var bytes: [8]u8 = undefined;
 
-            hash.sha_256.digest(&bytes, out[0..32]);
-        }
+        std.mem.writeInt(u64, &bytes, index, .big);
 
-        pub fn combine(_: *const @This(), z: u32, j: u64, left: []const u8, right: []const u8, out: []u8) void {
-            var hasher = hash.sha_256.create();
+        hash.sha_256.digest(&bytes, out[0..32]);
+    }
 
-            var position: [12]u8 = undefined;
+    pub fn combine(_: *const TestContext, z: u32, j: u64, left: []const u8, right: []const u8, out: []u8) void {
+        var hasher = hash.sha_256.create();
 
-            std.mem.writeInt(u32, position[0..4], z, .big);
+        var position: [12]u8 = undefined;
 
-            std.mem.writeInt(u64, position[4..12], j, .big);
+        std.mem.writeInt(u32, position[0..4], z, .big);
 
-            hasher.update(&position);
+        std.mem.writeInt(u64, position[4..12], j, .big);
 
-            hasher.update(left);
+        hasher.update(&position);
 
-            hasher.update(right);
+        hasher.update(left);
 
-            hasher.digest(out[0..32]);
-        }
-    };
+        hasher.update(right);
+
+        hasher.digest(out[0..32]);
+    }
+};
+
+// Trees above height 15 take the bottom of every authentication path from the subtree under the
+// signed leaf, rebuilt only when the leaf moves to another subtree; compare them with a tree kept
+// whole.
+test "merkle cache above the cached height" {
+    const testing = std.testing;
 
     const height = 17;
 
-    var tree = try MerkleTree(Context).init(testing.allocator, height, 32);
+    var calls: usize = 0;
+
+    const context: TestContext = .{ .calls = &calls };
+
+    var tree = try MerkleTree(TestContext).init(testing.allocator, height, 32);
 
     defer tree.deinit(testing.allocator);
 
-    tree.build(.{});
+    tree.build(context);
 
-    const context: Context = .{};
+    try testing.expectEqual(@as(usize, 1) << height, calls);
 
     var levels: [height + 1][][32]u8 = undefined;
 
@@ -206,13 +230,40 @@ test "merkle cache above the cached height" {
 
     try testing.expectEqualSlices(u8, &levels[height][0], tree.root[0..32]);
 
-    for ([_]u64{ 0, 1, 2, 3, 77777, (1 << height) - 1 }) |index| {
+    // Index 0 starts in another subtree than the one left by the build, the next three share it,
+    // and every later one moves to a new subtree.
+    const cases = [_]struct { index: u64, rebuilt: bool }{
+        .{ .index = 0, .rebuilt = true },
+        .{ .index = 1, .rebuilt = false },
+        .{ .index = 2, .rebuilt = false },
+        .{ .index = 3, .rebuilt = false },
+        .{ .index = 4, .rebuilt = true },
+        .{ .index = 77777, .rebuilt = true },
+        .{ .index = (1 << height) - 1, .rebuilt = true },
+        .{ .index = (1 << height) - 2, .rebuilt = false },
+    };
+
+    for (cases) |case| {
         var path: [height * 32]u8 = undefined;
 
-        tree.authPath(index, &path);
+        calls = 0;
+
+        tree.authPath(case.index, &path);
+
+        try testing.expectEqual(@as(usize, if (case.rebuilt) 1 << (height - cached_height) else 0), calls);
 
         for (0..height) |z| {
-            try testing.expectEqualSlices(u8, &levels[z][@intCast((index >> @intCast(z)) ^ 1)], path[z * 32 ..][0..32]);
+            try testing.expectEqualSlices(u8, &levels[z][@intCast((case.index >> @intCast(z)) ^ 1)], path[z * 32 ..][0..32]);
         }
     }
+}
+
+test "merkle bounds are checked" {
+    const testing = std.testing;
+
+    try testing.expectError(error.InvalidOption, MerkleTree(TestContext).init(testing.allocator, cached_height + max_low + 1, 32));
+
+    try testing.expectError(error.InvalidOption, MerkleTree(TestContext).init(testing.allocator, 5, max_node_size + 1));
+
+    try testing.expectError(error.InvalidOption, MerkleTree(TestContext).init(testing.allocator, 5, 0));
 }

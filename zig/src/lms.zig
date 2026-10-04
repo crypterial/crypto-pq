@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const ct = @import("ct.zig");
+const Error = @import("errors.zig").Error;
 const hash = @import("hash.zig");
 const merkle = @import("merkle.zig");
 const primitives = @import("primitives.zig");
@@ -493,8 +494,9 @@ pub fn hssVerify(public_key: []const u8, message: []const u8, signature: []const
     return lmsVerify(key, message, signature[offset..]);
 }
 
-// Independent SHA-256 computations run side by side in the lanes of vectors.
-const max_lanes = 8;
+// Independent SHA-256 computations run side by side in the lanes of vectors. A target without
+// vector registers computes one at a time: emulated lanes cost as much each and spill to the stack.
+const max_lanes = if (std.simd.suggestVectorLength(u32) == null) 1 else 8;
 
 // SHA-256 of L hashes at once: lane l of every vector belongs to the l-th. Values are kept as
 // big-endian 32-bit words. Every hash starts with I || u32: a chain step or seed derivation then
@@ -805,7 +807,7 @@ const TreeContext = struct {
 const Tree = struct {
     merkle: merkle.MerkleTree(TreeContext),
 
-    fn init(allocator: Allocator, level: Level) Allocator.Error!Tree {
+    fn init(allocator: Allocator, level: Level) (Error || Allocator.Error)!Tree {
         return .{ .merkle = try .init(allocator, level.lms.h, level.lms.m) };
     }
 
@@ -844,7 +846,7 @@ const Tree = struct {
         return out[0..lms.publicKeySize()];
     }
 
-    fn sign(self: *const Tree, q: u32, message: []const u8, out: []u8) void {
+    fn sign(self: *Tree, q: u32, message: []const u8, out: []u8) void {
         const context = &self.merkle.context;
 
         const ots = context.level.ots;
@@ -887,7 +889,7 @@ pub const Hss = struct {
     signed: [7][]u8,
     prefixes: [8]u64,
 
-    pub fn init(allocator: Allocator, levels: []const Level, i_value: *const [16]u8, seed: []const u8) Allocator.Error!Hss {
+    pub fn init(allocator: Allocator, levels: []const Level, i_value: *const [16]u8, seed: []const u8) (Error || Allocator.Error)!Hss {
         var self: Hss = .{ .levels = undefined, .count = levels.len, .trees = undefined, .built = 1, .signed = undefined, .prefixes = @splat(0) };
 
         @memcpy(self.levels[0..levels.len], levels);

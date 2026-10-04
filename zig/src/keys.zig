@@ -16,18 +16,29 @@ pub const KeyGenOptions = struct {
 // ML-DSA-87 private key).
 const der_capacity = 8192;
 
-// PEM input is decoded into a buffer of this size on the stack, because importing a key does not
-// allocate; any DER encoding of a supported key is far smaller, and a longer one is read as a
-// stream (see encoding.pemPublicKey).
+// PEM input is decoded into a buffer of this size; any DER encoding of a supported key is far
+// smaller, and a longer one is read as a stream (see encoding.pemPublicKey).
 const pem_capacity = 16384;
 
 pub const PemBuffer = [pem_capacity]u8;
+
+// The PEM buffer of an import that has an allocator, so that it stays off the stack; the other
+// formats need none.
+pub fn pemBuffer(allocator: Allocator, format: KeyFormat) Allocator.Error![]u8 {
+    return if (format == .pem) allocator.alloc(u8, pem_capacity) else &.{};
+}
+
+pub fn freePemBuffer(allocator: Allocator, buffer: []u8) void {
+    ct.wipe(buffer);
+
+    allocator.free(buffer);
+}
 
 const public_label = "PUBLIC KEY";
 
 const private_label = "PRIVATE KEY";
 
-pub fn importPublic(format: KeyFormat, data: []const u8, oid: ?[]const u8, buffer: *PemBuffer) Error![]const u8 {
+pub fn importPublic(format: KeyFormat, data: []const u8, oid: ?[]const u8, buffer: []u8) Error![]const u8 {
     if (format == .raw) return data;
 
     const expected = oid orelse return error.Unsupported;
@@ -47,7 +58,7 @@ const PrivateInput = union(enum) {
     },
 };
 
-pub fn importPrivate(format: KeyFormat, data: []const u8, oid: ?[]const u8, buffer: *PemBuffer) Error!PrivateInput {
+pub fn importPrivate(format: KeyFormat, data: []const u8, oid: ?[]const u8, buffer: []u8) Error!PrivateInput {
     if (format == .raw) return .{ .raw = data };
 
     const expected = oid orelse return error.Unsupported;

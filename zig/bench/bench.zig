@@ -223,11 +223,13 @@ fn kem(runner: *const Runner, algorithm: pq.KemAlgorithm, comptime seed_size: us
             const start = r.now();
 
             for (0..count) |_| {
-                var pair = try pq.hazmat.generateKemKeyPair(self.algorithm, blackBox(self.seed));
+                var pair = try pq.hazmat.generateKemKeyPair(self.algorithm, r.allocator, blackBox(self.seed));
 
                 std.mem.doNotOptimizeAway(&pair);
 
                 pair.private_key.deinit();
+
+                pair.public_key.deinit();
             }
 
             return r.now() - start;
@@ -238,9 +240,11 @@ fn kem(runner: *const Runner, algorithm: pq.KemAlgorithm, comptime seed_size: us
 
     if (!runner.selects(encaps) and !runner.selects(decaps)) return;
 
-    var pair = try pq.hazmat.generateKemKeyPair(algorithm, &seed);
+    var pair = try pq.hazmat.generateKemKeyPair(algorithm, runner.allocator, &seed);
 
     defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
 
     const randomness = bytes(randomness_size);
 
@@ -303,11 +307,13 @@ fn signature(runner: *const Runner, algorithm: pq.SignatureAlgorithm, seed_size:
             const start = r.now();
 
             for (0..count) |_| {
-                var pair = try pq.hazmat.generateSignatureKeyPair(self.algorithm, blackBox(self.seed));
+                var pair = try pq.hazmat.generateSignatureKeyPair(self.algorithm, r.allocator, blackBox(self.seed));
 
                 std.mem.doNotOptimizeAway(&pair);
 
                 pair.private_key.deinit();
+
+                pair.public_key.deinit();
             }
 
             return r.now() - start;
@@ -318,9 +324,11 @@ fn signature(runner: *const Runner, algorithm: pq.SignatureAlgorithm, seed_size:
 
     if (!runner.selects(sign) and !runner.selects(verify)) return;
 
-    var pair = try pq.hazmat.generateSignatureKeyPair(algorithm, seed);
+    var pair = try pq.hazmat.generateSignatureKeyPair(algorithm, runner.allocator, seed);
 
     defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
 
     const messages: Messages = .init();
 
@@ -399,7 +407,7 @@ const Stateful = struct {
     fn generate(self: *const Stateful, allocator: Allocator, store: *MemoryStore) !pq.StatefulKeyPair {
         store.deinit();
 
-        return pq.hazmat.generateStatefulKeyPair(self.algorithm, allocator, self.parameters, self.seed, 0, store.store());
+        return pq.hazmat.generateStatefulKeyPair(self.algorithm, allocator, self.parameters, self.seed, 0, store.store(), .{});
     }
 };
 

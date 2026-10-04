@@ -211,9 +211,12 @@ pub const Keccak = struct {
 pub const Sponge4 = struct {
     states: [4][25]u64,
     rate: usize,
+    position: usize,
 
+    // Built in place rather than from start: SLH-DSA builds millions of these per signature, and
+    // copying the state out of start made it 1.45 times slower.
     pub fn init(rate: usize, suffix: u8, messages: [4][]const u8) Sponge4 {
-        var self: Sponge4 = .{ .states = undefined, .rate = rate };
+        var self: Sponge4 = .{ .states = undefined, .rate = rate, .position = 0 };
 
         ct.wipe(std.mem.asBytes(&self.states));
 
@@ -238,6 +241,50 @@ pub const Sponge4 = struct {
         }
 
         return self;
+    }
+
+    // An empty sponge, for messages that arrive in parts through absorb and end with finish.
+    pub fn start(rate: usize) Sponge4 {
+        var self: Sponge4 = .{ .states = undefined, .rate = rate, .position = 0 };
+
+        ct.wipe(std.mem.asBytes(&self.states));
+
+        return self;
+    }
+
+    // The next part of every message; the four parts have one length.
+    pub fn absorb(self: *Sponge4, parts: [4][]const u8) void {
+        const length = parts[0].len;
+
+        var offset: usize = 0;
+
+        while (offset < length) {
+            const take = @min(self.rate - self.position, length - offset);
+
+            for (&self.states, parts) |*state, part| {
+                std.debug.assert(part.len == length);
+
+                xorBytes(state, self.position, part[offset..][0..take]);
+            }
+
+            offset += take;
+
+            self.position += take;
+
+            if (self.position == self.rate) {
+                permute4(&self.states);
+
+                self.position = 0;
+            }
+        }
+    }
+
+    pub fn finish(self: *Sponge4, suffix: u8) void {
+        for (&self.states) |*state| {
+            xorBytes(state, self.position, &.{suffix});
+
+            xorBytes(state, self.rate - 1, &.{0x80});
+        }
     }
 
     // The next block of every sponge, the first out.len bytes of each.

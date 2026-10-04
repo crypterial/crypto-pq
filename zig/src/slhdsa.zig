@@ -125,8 +125,9 @@ fn compressed(adrs: *const Address) [22]u8 {
 
 // Independent SHA-2 computations run side by side in the lanes of vectors. Eight lanes keep the
 // vector units busy despite the serial rounds of each computation; more lanes cost as much per
-// lane and leave more of them idle when the work does not fill them.
-const max_lanes = 8;
+// lane and leave more of them idle when the work does not fill them. A target without vector
+// registers computes one at a time: emulated lanes cost as much each and spill to the stack.
+const max_lanes = if (std.simd.suggestVectorLength(u32) == null) 1 else 8;
 
 // Trees are built from subtrees of at most 2^chunk_height leaves, so that the node buffers stay
 // small for the FORS trees of height 14.
@@ -764,7 +765,10 @@ pub fn Scheme(comptime p: Parameters) type {
         const Shake4 = struct {
             const lanes = 4;
 
-            const max_input = n + 32 + len * n;
+            // F, H and PRF take at most 2n bytes, which are gathered with the seed and the address
+            // into one block; T over a WOTS public key, which is far longer, is absorbed in parts
+            // by `leaves`.
+            const max_input = n + 32 + 2 * n;
 
             fn shake(hashes: *const Hashes, adrs: *const [lanes]Address, messages: [lanes][]const u8, out: [lanes]*Node) void {
                 const length = n + 32 + messages[0].len;
@@ -810,11 +814,24 @@ pub fn Scheme(comptime p: Parameters) type {
                 return .{ first, first + 1, first + 2, first + 3 };
             }
 
-            // The WOTS public keys of key pairs first .. first + out.len - 1 of one tree.
+            // The WOTS public keys of key pairs first .. first + out.len - 1 of one tree. Each chain
+            // end goes into the public key hash as soon as it is computed.
             fn leaves(hashes: *const Hashes, adrs: *const Address, first: u32, out: []Node, capture: ?*const Capture) void {
-                var values: [lanes][len * n]u8 = undefined;
+                var values: [lanes]Node = undefined;
 
-                defer ct.wipe(std.mem.asBytes(&values));
+                var public_key: keccak.Sponge4 = .start(136);
+
+                defer {
+                    ct.wipe(std.mem.asBytes(&values));
+
+                    public_key.wipe();
+                }
+
+                public_key.absorb(same(&hashes.pk_seed));
+
+                const pk_adrs = addresses(adrs, wots_pk, consecutive(first));
+
+                public_key.absorb(.{ &pk_adrs[0], &pk_adrs[1], &pk_adrs[2], &pk_adrs[3] });
 
                 var prf_adrs = addresses(adrs, wots_prf, consecutive(first));
 
@@ -826,16 +843,12 @@ pub fn Scheme(comptime p: Parameters) type {
                     if (c.keypair >= first and c.keypair - first < out.len) lane = c.keypair - first;
                 }
 
+                const nodes: [lanes]*Node = .{ &values[0], &values[1], &values[2], &values[3] };
+
+                const messages: [lanes][]const u8 = .{ &values[0], &values[1], &values[2], &values[3] };
+
                 for (0..len) |i| {
-                    var nodes: [lanes]*Node = undefined;
-
-                    var messages: [lanes][]const u8 = undefined;
-
-                    for (&nodes, &messages, &values, &prf_adrs, &chain_adrs) |*node, *message, *value, *prf_address, *chain_address| {
-                        node.* = value[i * n ..][0..n];
-
-                        message.* = node.*;
-
+                    for (&prf_adrs, &chain_adrs) |*prf_address, *chain_address| {
                         setChain(prf_address, @intCast(i));
 
                         setChain(chain_address, @intCast(i));
@@ -854,6 +867,8 @@ pub fn Scheme(comptime p: Parameters) type {
 
                         shake(hashes, &chain_adrs, messages, nodes);
                     }
+
+                    public_key.absorb(messages);
                 }
 
                 var spare: [lanes]Node = undefined;
@@ -862,7 +877,9 @@ pub fn Scheme(comptime p: Parameters) type {
 
                 for (&roots, &spare, 0..) |*root_node, *slot, l| root_node.* = if (l < out.len) &out[l] else slot;
 
-                shake(hashes, &addresses(adrs, wots_pk, consecutive(first)), .{ &values[0], &values[1], &values[2], &values[3] }, roots);
+                public_key.finish(0x1f);
+
+                public_key.squeeze(.{ roots[0], roots[1], roots[2], roots[3] });
             }
 
             // FORS leaves first .. first + out.len - 1 (tree indices).
@@ -1123,7 +1140,9 @@ pub fn Scheme(comptime p: Parameters) type {
             return tops[0];
         }
 
-        pub fn root(sk_seed: *const Node, pk_seed: *const Node) Node {
+        // Not inlined, like sign and verify, so that callers that dispatch over the parameter sets
+        // do not hold the frames of all of them at once.
+        pub noinline fn root(sk_seed: *const Node, pk_seed: *const Node) Node {
             var hashes = Hashes.init(pk_seed, sk_seed);
 
             defer hashes.wipe();
@@ -1273,7 +1292,7 @@ pub fn Scheme(comptime p: Parameters) type {
         // Every tree is built whole: the signature parts (FORS secret values, WOTS signatures and
         // authentication paths) are taken on the way, and each tree's root is what the next
         // layer signs.
-        pub fn sign(sk: *const [4 * n]u8, message: []const []const u8, opt_rand: *const Node, signature: *[p.signatureSize()]u8) void {
+        pub noinline fn sign(sk: *const [4 * n]u8, message: []const []const u8, opt_rand: *const Node, signature: *[p.signatureSize()]u8) void {
             const pk_seed = sk[2 * n ..][0..n];
 
             const pk_root = sk[3 * n ..][0..n];
@@ -1359,7 +1378,7 @@ pub fn Scheme(comptime p: Parameters) type {
             ct.declassify(signature);
         }
 
-        pub fn verify(pk: *const [2 * n]u8, message: []const []const u8, signature: *const [p.signatureSize()]u8) bool {
+        pub noinline fn verify(pk: *const [2 * n]u8, message: []const []const u8, signature: *const [p.signatureSize()]u8) bool {
             const pk_seed = pk[0..n];
 
             const pk_root = pk[n..][0..n];

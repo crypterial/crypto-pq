@@ -5,5 +5,6 @@ test {
     _ = @import("mldsa.zig");
     _ = @import("robustness.zig");
     _ = @import("slhdsa.zig");
+    _ = @import("stack.zig");
     _ = @import("stateful.zig");
 }

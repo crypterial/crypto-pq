@@ -10,10 +10,12 @@ const Allocator = std.mem.Allocator;
 
 const small = [_]pq.HssLevel{.{ .lms = "LMS_SHA256_M24_H5", .ots = "LMOTS_SHA256_N24_W1" }};
 
-// A compare-and-swap store in memory; `broken` makes every update of an existing state fail.
+// A compare-and-swap store in memory; `broken` makes every update of an existing state fail, and
+// `writes` counts the successful updates.
 const MemoryStore = struct {
     state: ?[]u8 = null,
     broken: bool = false,
+    writes: usize = 0,
 
     const vtable: pq.StateStore.VTable = .{ .read = read, .update = update };
 
@@ -52,7 +54,16 @@ const MemoryStore = struct {
 
         self.state = copy;
 
+        self.writes += 1;
+
         return true;
+    }
+
+    // The index that the stored state holds.
+    fn index(self: *const MemoryStore) u64 {
+        const state = self.state.?;
+
+        return std.mem.readInt(u64, state[if (state[1] == 1) state.len - 24 else 6..][0..8], .big);
     }
 };
 
@@ -164,7 +175,7 @@ fn acvpKeyGeneration(_: void, r: vectors.Record, allocator: Allocator) !void {
 
     const seed = try std.mem.concat(allocator, u8, &.{ try vectors.decode(allocator, r.values.get("i")), try vectors.decode(allocator, r.values.get("seed")) });
 
-    var pair = try hazmat.generateStatefulKeyPair(pq.hss_lms, allocator, .{ .levels = &levels }, seed, 0, store.store());
+    var pair = try hazmat.generateStatefulKeyPair(pq.hss_lms, allocator, .{ .levels = &levels }, seed, 0, store.store(), .{});
 
     defer pair.private_key.deinit(allocator);
 
@@ -234,7 +245,7 @@ fn rfcVector(slow: bool, r: vectors.Record, allocator: Allocator) !void {
 
     const key_seed = try std.mem.concat(allocator, u8, &.{ try vectors.decode(allocator, r.values.get("i")), try vectors.decode(allocator, seed) });
 
-    var pair = try hazmat.generateStatefulKeyPair(pq.hss_lms, allocator, .{ .levels = levels }, key_seed, index, store.store());
+    var pair = try hazmat.generateStatefulKeyPair(pq.hss_lms, allocator, .{ .levels = levels }, key_seed, index, store.store(), .{});
 
     defer pair.private_key.deinit(allocator);
 
@@ -262,7 +273,7 @@ test "HSS state handling" {
 
     defer store.deinit();
 
-    var pair = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small }, store.store());
+    var pair = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small }, store.store(), .{});
 
     defer pair.private_key.deinit(testing.allocator);
 
@@ -280,7 +291,7 @@ test "HSS state handling" {
 
     try testing.expectEqual(30, pair.private_key.remainingSignatures());
 
-    var loaded = try pq.hss_lms.loadPrivateKey(testing.allocator, store.store());
+    var loaded = try pq.hss_lms.loadPrivateKey(testing.allocator, store.store(), .{});
 
     defer loaded.deinit(testing.allocator);
 
@@ -300,7 +311,7 @@ test "HSS state handling" {
 
     try testing.expectError(error.KeyExhausted, loaded.sign(allocator, "m"));
 
-    try testing.expectError(error.StateConflict, pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small }, store.store()));
+    try testing.expectError(error.StateConflict, pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small }, store.store(), .{}));
 }
 
 test "HSS store failures" {
@@ -308,7 +319,7 @@ test "HSS store failures" {
 
     defer broken.deinit();
 
-    var pair = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small }, broken.store());
+    var pair = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small }, broken.store(), .{});
 
     defer pair.private_key.deinit(testing.allocator);
 
@@ -322,17 +333,17 @@ test "HSS store failures" {
 
     damaged.state.?[damaged.state.?.len - 20] ^= 1;
 
-    try testing.expectError(error.InvalidPrivateKey, pq.hss_lms.loadPrivateKey(testing.allocator, damaged.store()));
+    try testing.expectError(error.InvalidPrivateKey, pq.hss_lms.loadPrivateKey(testing.allocator, damaged.store(), .{}));
 
     var empty: MemoryStore = .{};
 
-    try testing.expectError(error.InvalidPrivateKey, pq.hss_lms.loadPrivateKey(testing.allocator, empty.store()));
+    try testing.expectError(error.InvalidPrivateKey, pq.hss_lms.loadPrivateKey(testing.allocator, empty.store(), .{}));
 
     var copy = try MemoryStore.init(broken.state);
 
     defer copy.deinit();
 
-    try testing.expectError(error.AlgorithmMismatch, pq.xmss.loadPrivateKey(testing.allocator, copy.store()));
+    try testing.expectError(error.AlgorithmMismatch, pq.xmss.loadPrivateKey(testing.allocator, copy.store(), .{}));
 }
 
 test "HSS parameters" {
@@ -351,7 +362,7 @@ test "HSS parameters" {
     for (invalid) |parameters| {
         var store: MemoryStore = .{};
 
-        try testing.expectError(error.InvalidOption, pq.hss_lms.generateKeyPair(testing.allocator, parameters, store.store()));
+        try testing.expectError(error.InvalidOption, pq.hss_lms.generateKeyPair(testing.allocator, parameters, store.store(), .{}));
 
         try testing.expect(store.state == null);
     }
@@ -372,7 +383,7 @@ test "HSS tree boundary" {
 
     const zeros: [40]u8 = @splat(0);
 
-    var pair = try hazmat.generateStatefulKeyPair(pq.hss_lms, testing.allocator, .{ .levels = &levels }, &zeros, 31, store.store());
+    var pair = try hazmat.generateStatefulKeyPair(pq.hss_lms, testing.allocator, .{ .levels = &levels }, &zeros, 31, store.store(), .{});
 
     defer pair.private_key.deinit(testing.allocator);
 
@@ -398,7 +409,7 @@ test "HSS formats" {
 
     defer store.deinit();
 
-    var pair = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small }, store.store());
+    var pair = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small }, store.store(), .{});
 
     defer pair.private_key.deinit(testing.allocator);
 
@@ -446,7 +457,7 @@ fn xmssVector(_: void, r: vectors.Record, allocator: Allocator) !void {
 
     defer store.deinit();
 
-    var pair = try hazmat.generateStatefulKeyPair(algorithm, allocator, .{ .name = name }, try vectors.decode(allocator, r.values.get("seed")), index, store.store());
+    var pair = try hazmat.generateStatefulKeyPair(algorithm, allocator, .{ .name = name }, try vectors.decode(allocator, r.values.get("seed")), index, store.store(), .{});
 
     defer pair.private_key.deinit(allocator);
 
@@ -474,7 +485,7 @@ test "XMSS state handling" {
 
     defer store.deinit();
 
-    var pair = try pq.xmss_mt.generateKeyPair(testing.allocator, .{ .name = "XMSSMT-SHAKE256_20/4_192" }, store.store());
+    var pair = try pq.xmss_mt.generateKeyPair(testing.allocator, .{ .name = "XMSSMT-SHAKE256_20/4_192" }, store.store(), .{});
 
     defer pair.private_key.deinit(testing.allocator);
 
@@ -482,7 +493,7 @@ test "XMSS state handling" {
 
     try testing.expect(pair.public_key.verify(signature, "message"));
 
-    var loaded = try pq.xmss_mt.loadPrivateKey(testing.allocator, store.store());
+    var loaded = try pq.xmss_mt.loadPrivateKey(testing.allocator, store.store(), .{});
 
     defer loaded.deinit(testing.allocator);
 
@@ -496,7 +507,7 @@ test "XMSS state handling" {
 
     var other: MemoryStore = .{};
 
-    try testing.expectError(error.InvalidOption, pq.xmss.generateKeyPair(testing.allocator, .{ .name = "XMSSMT-SHAKE256_20/4_192" }, other.store()));
+    try testing.expectError(error.InvalidOption, pq.xmss.generateKeyPair(testing.allocator, .{ .name = "XMSSMT-SHAKE256_20/4_192" }, other.store(), .{}));
 }
 
 fn sequence(comptime n: usize) [n]u8 {
@@ -525,7 +536,7 @@ test "stateful state compatibility" {
 
     defer store.deinit();
 
-    var hss = try hazmat.generateStatefulKeyPair(pq.hss_lms, testing.allocator, .{ .levels = &small }, &sequence(40), 3, store.store());
+    var hss = try hazmat.generateStatefulKeyPair(pq.hss_lms, testing.allocator, .{ .levels = &small }, &sequence(40), 3, store.store(), .{});
 
     defer hss.private_key.deinit(testing.allocator);
 
@@ -547,7 +558,7 @@ test "stateful state compatibility" {
 
     defer xmss_store.deinit();
 
-    var xmss = try hazmat.generateStatefulKeyPair(pq.xmss_mt, testing.allocator, .{ .name = "XMSSMT-SHAKE256_20/4_192" }, &sequence(72), 5, xmss_store.store());
+    var xmss = try hazmat.generateStatefulKeyPair(pq.xmss_mt, testing.allocator, .{ .name = "XMSSMT-SHAKE256_20/4_192" }, &sequence(72), 5, xmss_store.store(), .{});
 
     defer xmss.private_key.deinit(testing.allocator);
 
@@ -563,7 +574,7 @@ test "stateful state compatibility" {
 
         defer fresh.deinit();
 
-        var loaded = try case.algorithm.loadPrivateKey(testing.allocator, fresh.store());
+        var loaded = try case.algorithm.loadPrivateKey(testing.allocator, fresh.store(), .{});
 
         defer loaded.deinit(testing.allocator);
 
@@ -579,6 +590,7 @@ const ReentrantStore = struct {
     inner: MemoryStore = .{},
     key: ?*pq.StatefulPrivateKey = null,
     result: ?anyerror = null,
+    remaining: ?u64 = null,
 
     const vtable: pq.StateStore.VTable = .{ .read = read, .update = update };
 
@@ -598,6 +610,8 @@ const ReentrantStore = struct {
         if (self.key) |key| {
             self.key = null;
 
+            self.remaining = key.remainingSignatures();
+
             if (key.sign(testing.allocator, "inner")) |signature| {
                 testing.allocator.free(signature);
             } else |err| {
@@ -614,7 +628,7 @@ test "stateful sign refuses a concurrent call" {
 
     defer reentrant.inner.deinit();
 
-    var pair = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small }, reentrant.store());
+    var pair = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small }, reentrant.store(), .{});
 
     defer pair.private_key.deinit(testing.allocator);
 
@@ -626,7 +640,189 @@ test "stateful sign refuses a concurrent call" {
 
     try testing.expectEqual(error.StateConflict, reentrant.result.?);
 
+    // The store may read the count, which does not change before the update succeeds.
+    try testing.expectEqual(32, reentrant.remaining.?);
+
     try testing.expect(pair.public_key.verify(signature, "outer"));
 
     try testing.expectEqual(31, pair.private_key.remainingSignatures());
+}
+
+// The leaf index of a one-level HSS signature: u32 Nspk = 0, then q.
+fn hssIndex(signature: []const u8) u32 {
+    return std.mem.readInt(u32, signature[4..8], .big);
+}
+
+// reserve = 5: one write claims five indices. The signatures are those of a key that writes every
+// time, and a key loaded after a stop that left claimed indices unused starts after them, while
+// the stopped key can still use only what it had claimed.
+test "stateful reserve" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
+    const seed = sequence(40);
+
+    var store: MemoryStore = .{};
+
+    defer store.deinit();
+
+    var pair = try hazmat.generateStatefulKeyPair(pq.hss_lms, testing.allocator, .{ .levels = &small }, &seed, 0, store.store(), .{ .reserve = 5 });
+
+    defer pair.private_key.deinit(testing.allocator);
+
+    var reference_store: MemoryStore = .{};
+
+    defer reference_store.deinit();
+
+    var reference = try hazmat.generateStatefulKeyPair(pq.hss_lms, testing.allocator, .{ .levels = &small }, &seed, 0, reference_store.store(), .{});
+
+    defer reference.private_key.deinit(testing.allocator);
+
+    try testing.expectEqual(1, store.writes);
+
+    try testing.expectEqual(0, store.index());
+
+    for (0..12) |i| {
+        const signature = try pair.private_key.sign(allocator, "message");
+
+        try testing.expectEqualSlices(u8, try reference.private_key.sign(allocator, "message"), signature);
+
+        try testing.expectEqual(i, hssIndex(signature));
+
+        try testing.expectEqual(1 + i / 5 + 1, store.writes);
+
+        try testing.expectEqual(5 * (i / 5 + 1), store.index());
+
+        try testing.expectEqual(32 - i - 1, pair.private_key.remainingSignatures());
+    }
+
+    try testing.expectEqual(13, reference_store.writes);
+
+    var loaded = try pq.hss_lms.loadPrivateKey(testing.allocator, store.store(), .{ .reserve = 5 });
+
+    defer loaded.deinit(testing.allocator);
+
+    try testing.expectEqual(32 - 15, loaded.remainingSignatures());
+
+    try testing.expectEqual(15, hssIndex(try loaded.sign(allocator, "message")));
+
+    try testing.expectEqual(20, store.index());
+
+    for (12..15) |i| try testing.expectEqual(i, hssIndex(try pair.private_key.sign(allocator, "message")));
+
+    try testing.expectError(error.StateConflict, pair.private_key.sign(allocator, "message"));
+
+    // The last write claims only what is left.
+    var reloaded = try pq.hss_lms.loadPrivateKey(testing.allocator, store.store(), .{ .reserve = 1000 });
+
+    defer reloaded.deinit(testing.allocator);
+
+    _ = try reloaded.sign(allocator, "message");
+
+    try testing.expectEqual(32, store.index());
+
+    while (reloaded.remainingSignatures() > 0) _ = try reloaded.sign(allocator, "message");
+
+    try testing.expectError(error.KeyExhausted, reloaded.sign(allocator, "message"));
+
+    var empty: MemoryStore = .{};
+
+    try testing.expectError(error.InvalidOption, pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small }, empty.store(), .{ .reserve = 0 }));
+
+    try testing.expectError(error.InvalidOption, hazmat.generateStatefulKeyPair(pq.hss_lms, testing.allocator, .{ .levels = &small }, &seed, 0, empty.store(), .{ .reserve = 0 }));
+
+    try testing.expectError(error.InvalidOption, pq.hss_lms.loadPrivateKey(testing.allocator, store.store(), .{ .reserve = 0 }));
+
+    try testing.expect(empty.state == null);
+}
+
+// XMSS^MT keeps the part of the signature that each upper layer adds until that layer moves on;
+// signatures across the boundaries of every layer equal those of fresh keys at the same indices.
+test "XMSS^MT layer cache" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
+    const parameters: pq.StatefulParameters = .{ .name = "XMSSMT-SHA2_20/4_256" };
+
+    const seed = sequence(96);
+
+    const start = (1 << 10) - 3;
+
+    var store: MemoryStore = .{};
+
+    defer store.deinit();
+
+    var pair = try hazmat.generateStatefulKeyPair(pq.xmss_mt, testing.allocator, parameters, &seed, start, store.store(), .{ .reserve = 8 });
+
+    defer pair.private_key.deinit(testing.allocator);
+
+    for (start..start + 6) |index| {
+        const signature = try pair.private_key.sign(allocator, "message");
+
+        try testing.expect(pair.public_key.verify(signature, "message"));
+
+        var fresh_store: MemoryStore = .{};
+
+        defer fresh_store.deinit();
+
+        var fresh = try hazmat.generateStatefulKeyPair(pq.xmss_mt, testing.allocator, parameters, &seed, index, fresh_store.store(), .{});
+
+        defer fresh.private_key.deinit(testing.allocator);
+
+        try testing.expectEqualSlices(u8, try fresh.private_key.sign(allocator, "message"), signature);
+    }
+}
+
+// remainingSignatures may be read from another thread while the key signs: every value read is
+// one the count really had.
+test "stateful remaining signatures read during signing" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+
+    defer arena.deinit();
+
+    var store: MemoryStore = .{};
+
+    defer store.deinit();
+
+    var pair = try pq.hss_lms.generateKeyPair(testing.allocator, .{ .levels = &small }, store.store(), .{});
+
+    defer pair.private_key.deinit(testing.allocator);
+
+    const Reader = struct {
+        fn run(key: *const pq.StatefulPrivateKey, done: *std.atomic.Value(bool), bad: *std.atomic.Value(bool)) void {
+            var previous: u64 = 32;
+
+            while (!done.load(.acquire)) {
+                const remaining = key.remainingSignatures();
+
+                if (remaining > previous or remaining < 32 - 24) bad.store(true, .release);
+
+                previous = remaining;
+            }
+        }
+    };
+
+    var done: std.atomic.Value(bool) = .init(false);
+
+    var bad: std.atomic.Value(bool) = .init(false);
+
+    const thread = try std.Thread.spawn(.{}, Reader.run, .{ &pair.private_key, &done, &bad });
+
+    for (0..24) |_| _ = try pair.private_key.sign(arena.allocator(), "message");
+
+    done.store(true, .release);
+
+    thread.join();
+
+    try testing.expect(!bad.load(.acquire));
+
+    try testing.expectEqual(32 - 24, pair.private_key.remainingSignatures());
 }

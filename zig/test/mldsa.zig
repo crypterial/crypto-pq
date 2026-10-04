@@ -66,19 +66,23 @@ fn keyGeneration(_: void, r: vectors.Record, allocator: Allocator) !void {
 
     const sk = try vectors.decode(allocator, r.values.get("sk"));
 
-    var pair = try hazmat.generateSignatureKeyPair(algorithm, seed);
+    var pair = try hazmat.generateSignatureKeyPair(algorithm, allocator, seed);
 
     defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
 
     try expectExport(allocator, pk, &pair.public_key, .raw);
 
     try expectExport(allocator, seed, &pair.private_key, .raw);
 
-    var expanded = try algorithm.importPrivateKey(sk, .raw);
+    var expanded = try algorithm.importPrivateKey(allocator, sk, .raw);
 
     defer expanded.deinit();
 
-    const expanded_public = expanded.publicKey();
+    var expanded_public = expanded.publicKey();
+
+    defer expanded_public.deinit();
 
     try expectExport(allocator, pk, &expanded_public, .raw);
 
@@ -86,7 +90,7 @@ fn keyGeneration(_: void, r: vectors.Record, allocator: Allocator) !void {
 
     const both = try pkcs8(allocator, algorithm, try vectors.der(allocator, 0x30, &.{ try vectors.der(allocator, 0x04, &.{seed}), try vectors.der(allocator, 0x04, &.{sk}) }));
 
-    var imported = try algorithm.importPrivateKey(both, .der);
+    var imported = try algorithm.importPrivateKey(allocator, both, .der);
 
     defer imported.deinit();
 
@@ -94,7 +98,7 @@ fn keyGeneration(_: void, r: vectors.Record, allocator: Allocator) !void {
 
     sk[sk.len - 1] ^= 1;
 
-    try testing.expectError(error.InvalidPrivateKey, algorithm.importPrivateKey(sk, .raw));
+    try testing.expectError(error.InvalidPrivateKey, algorithm.importPrivateKey(allocator, sk, .raw));
 }
 
 test "ML-DSA ACVP key generation" {
@@ -109,13 +113,15 @@ fn signatureGeneration(_: void, r: vectors.Record, allocator: Allocator) !void {
     const algorithm = try algorithmNamed(r.header.get("parameterSet"));
 
     var private_key = if (r.header.is("keyFormat", "seed"))
-        (try hazmat.generateSignatureKeyPair(algorithm, try vectors.decode(allocator, r.values.get("seed")))).private_key
+        try algorithm.importPrivateKey(allocator, try vectors.decode(allocator, r.values.get("seed")), .raw)
     else
-        try algorithm.importPrivateKey(try vectors.decode(allocator, r.values.get("sk")), .raw);
+        try algorithm.importPrivateKey(allocator, try vectors.decode(allocator, r.values.get("sk")), .raw);
 
     defer private_key.deinit();
 
-    const public_key = private_key.publicKey();
+    var public_key = private_key.publicKey();
+
+    defer public_key.deinit();
 
     try expectExport(allocator, try vectors.decode(allocator, r.values.get("pk")), &public_key, .raw);
 
@@ -147,7 +153,9 @@ test "ML-DSA ACVP signature generation" {
 fn signatureVerification(_: void, r: vectors.Record, allocator: Allocator) !void {
     const algorithm = try algorithmNamed(r.header.get("parameterSet"));
 
-    const public_key = try algorithm.importPublicKey(try vectors.decode(allocator, r.values.get("pk")), .raw);
+    var public_key = try algorithm.importPublicKey(allocator, try vectors.decode(allocator, r.values.get("pk")), .raw);
+
+    defer public_key.deinit();
 
     const result = hazmat.verify(&public_key, try vectors.decode(allocator, r.values.get("signature")), try vectors.decode(allocator, r.values.get("message")), .{
         .context = try vectors.decode(allocator, r.values.get("context")),
@@ -171,17 +179,21 @@ fn wycheproofVerification(_: void, r: vectors.Record, allocator: Allocator) !voi
     const key = try vectors.decode(allocator, r.header.get("publicKey"));
 
     if (key.len != algorithm.public_key_size) {
-        try testing.expectError(error.InvalidLength, algorithm.importPublicKey(key, .raw));
+        try testing.expectError(error.InvalidLength, algorithm.importPublicKey(allocator, key, .raw));
 
         return;
     }
 
-    const public_key = try algorithm.importPublicKey(key, .raw);
+    var public_key = try algorithm.importPublicKey(allocator, key, .raw);
+
+    defer public_key.deinit();
 
     const der = r.header.get("publicKeyDer");
 
     if (der.len > 0) {
-        const imported = try algorithm.importPublicKey(try vectors.decode(allocator, der), .der);
+        var imported = try algorithm.importPublicKey(allocator, try vectors.decode(allocator, der), .der);
+
+        defer imported.deinit();
 
         try testing.expect(imported.eql(&public_key));
     }
@@ -215,7 +227,7 @@ fn wycheproofSigning(_: void, r: vectors.Record, allocator: Allocator) !void {
     const flags = r.values.find("flags") orelse "";
 
     if (std.mem.find(u8, flags, "IncorrectPrivateKeyLength") != null) {
-        try testing.expectError(error.InvalidLength, hazmat.generateSignatureKeyPair(algorithm, seed));
+        try testing.expectError(error.InvalidLength, hazmat.generateSignatureKeyPair(algorithm, allocator, seed));
 
         return;
     }
@@ -223,13 +235,15 @@ fn wycheproofSigning(_: void, r: vectors.Record, allocator: Allocator) !void {
     const encoded = r.header.get("privateKeyPkcs8");
 
     var private_key = if (encoded.len > 0)
-        try algorithm.importPrivateKey(try vectors.decode(allocator, encoded), .der)
+        try algorithm.importPrivateKey(allocator, try vectors.decode(allocator, encoded), .der)
     else
-        (try hazmat.generateSignatureKeyPair(algorithm, seed)).private_key;
+        try algorithm.importPrivateKey(allocator, seed, .raw);
 
     defer private_key.deinit();
 
-    const public_key = private_key.publicKey();
+    var public_key = private_key.publicKey();
+
+    defer public_key.deinit();
 
     try expectExport(allocator, try vectors.decode(allocator, r.header.get("publicKey")), &public_key, .raw);
 
@@ -260,9 +274,11 @@ test "signature round trip" {
     const allocator = arena.allocator();
 
     for (algorithms) |algorithm| {
-        var pair = try algorithm.generateKeyPair(.{});
+        var pair = try algorithm.generateKeyPair(testing.allocator, .{});
 
         defer pair.private_key.deinit();
+
+        defer pair.public_key.deinit();
 
         const public_key = &pair.public_key;
 
@@ -327,9 +343,11 @@ test "pre-hash strength" {
     const zeros: [32]u8 = @splat(0);
 
     for (algorithms, allowed) |algorithm, names| {
-        var pair = try hazmat.generateSignatureKeyPair(algorithm, &zeros);
+        var pair = try hazmat.generateSignatureKeyPair(algorithm, testing.allocator, &zeros);
 
         defer pair.private_key.deinit();
+
+        defer pair.public_key.deinit();
 
         for (pre_hashes) |entry| {
             const permitted = for (names) |name| {
@@ -361,18 +379,22 @@ test "signature formats" {
     const allocator = arena.allocator();
 
     for (algorithms) |algorithm| {
-        var pair = try algorithm.generateKeyPair(.{ .self_test = false });
+        var pair = try algorithm.generateKeyPair(testing.allocator, .{ .self_test = false });
 
         defer pair.private_key.deinit();
+
+        defer pair.public_key.deinit();
 
         const raw = try pair.private_key.exportKey(allocator, .raw);
 
         for ([_]pq.KeyFormat{ .raw, .der, .pem }) |format| {
-            const public_key = try algorithm.importPublicKey(try pair.public_key.exportKey(allocator, format), format);
+            var public_key = try algorithm.importPublicKey(testing.allocator, try pair.public_key.exportKey(allocator, format), format);
+
+            defer public_key.deinit();
 
             try testing.expect(public_key.eql(&pair.public_key));
 
-            var private_key = try algorithm.importPrivateKey(try pair.private_key.exportKey(allocator, format), format);
+            var private_key = try algorithm.importPrivateKey(testing.allocator, try pair.private_key.exportKey(allocator, format), format);
 
             defer private_key.deinit();
 
@@ -383,26 +405,216 @@ test "signature formats" {
 
         try testing.expectEqualSlices(u8, &.{ 0x80, 0x20 }, der[der.len - 34 .. der.len - 32]);
 
-        var expanded = try hazmat.generateSignatureKeyPair(algorithm, raw);
+        var expanded = try hazmat.generateSignatureKeyPair(algorithm, testing.allocator, raw);
 
         defer expanded.private_key.deinit();
+
+        defer expanded.public_key.deinit();
 
         try testing.expect(expanded.public_key.eql(&pair.public_key));
 
         const other = if (algorithm.kind != pq.ml_dsa_44.kind) pq.ml_dsa_44 else pq.ml_dsa_65;
 
-        try testing.expectError(error.AlgorithmMismatch, other.importPublicKey(try pair.public_key.exportKey(allocator, .der), .der));
+        try testing.expectError(error.AlgorithmMismatch, other.importPublicKey(testing.allocator, try pair.public_key.exportKey(allocator, .der), .der));
 
-        try testing.expectError(error.InvalidLength, algorithm.importPrivateKey(&([_]u8{0} ** 33), .raw));
+        try testing.expectError(error.InvalidLength, algorithm.importPrivateKey(testing.allocator, &([_]u8{0} ** 33), .raw));
     }
 }
 
+// Every byte of the seed and of the expanded key is wiped before its memory is freed.
 test "signature private keys are wiped by deinit" {
-    var pair = try pq.ml_dsa_44.generateKeyPair(.{ .self_test = false });
+    var seed: [32]u8 = undefined;
+
+    for (&seed, 0..) |*byte, i| byte.* = @intCast(i + 1);
+
+    var check: vectors.WipeCheck = .{ .child = testing.allocator, .secrets = &.{} };
+
+    var pair = try hazmat.generateSignatureKeyPair(pq.ml_dsa_44, check.allocator(), &seed);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+
+    defer arena.deinit();
+
+    _ = try pair.private_key.sign(arena.allocator(), "message", .{});
+
+    const encoded_s1 = try testing.allocator.dupe(u8, pair.private_key.secret.bytes[128..160]);
+
+    defer testing.allocator.free(encoded_s1);
+
+    const secrets = [_][]const u8{ &seed, encoded_s1 };
+
+    check.secrets = &secrets;
+
+    pair.public_key.deinit();
 
     pair.private_key.deinit();
 
-    try testing.expect(std.mem.allEqual(u8, &pair.private_key.seed, 0));
+    try testing.expect(!check.leaked and check.frees >= 4);
+}
 
-    try testing.expect(std.mem.allEqual(u8, &pair.private_key.secret_bytes, 0));
+fn cached(slot: anytype) bool {
+    return slot.pointer.load(.acquire) != null;
+}
+
+// The keys of a pair share one cache of A and NTT(t1 * 2^d), and the private key has its own cache
+// of the secret vectors. Generation fills them only for its self-test, which uses them at once;
+// every other key fills them on first use.
+test "ML-DSA keys share one cache, filled on first use" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
+    for (algorithms) |algorithm| {
+        var untested = try algorithm.generateKeyPair(testing.allocator, .{ .self_test = false });
+
+        defer untested.private_key.deinit();
+
+        defer untested.public_key.deinit();
+
+        try testing.expect(!cached(&untested.public_key.public.shared.cache) and !cached(&untested.private_key.secret.cache));
+
+        _ = try untested.private_key.sign(allocator, "message", .{});
+
+        try testing.expect(cached(&untested.public_key.public.shared.cache) and cached(&untested.private_key.secret.cache));
+
+        var pair = try algorithm.generateKeyPair(testing.allocator, .{});
+
+        defer pair.public_key.deinit();
+
+        try testing.expectEqual(pair.private_key.public, pair.public_key.public);
+
+        try testing.expect(cached(&pair.public_key.public.shared.cache) and cached(&pair.private_key.secret.cache));
+
+        const signature = try pair.private_key.sign(allocator, "message", .{});
+
+        const seed = try pair.private_key.exportKey(allocator, .raw);
+
+        pair.private_key.deinit();
+
+        try testing.expect(pair.public_key.verify(signature, "message", .{}));
+
+        var public_key = try algorithm.importPublicKey(testing.allocator, try pair.public_key.exportKey(allocator, .raw), .raw);
+
+        defer public_key.deinit();
+
+        try testing.expect(!cached(&public_key.public.shared.cache));
+
+        try testing.expect(public_key.verify(signature, "message", .{}));
+
+        try testing.expect(cached(&public_key.public.shared.cache));
+
+        var private_key = try algorithm.importPrivateKey(testing.allocator, seed, .raw);
+
+        defer private_key.deinit();
+
+        try testing.expect(!cached(&private_key.public.shared.cache));
+
+        try testing.expect(pair.public_key.verify(try private_key.sign(allocator, "other", .{}), "other", .{}));
+
+        try testing.expect(cached(&private_key.public.shared.cache) and cached(&private_key.secret.cache));
+    }
+}
+
+// Without memory for the cache, verification samples A as it goes and signing reports
+// OutOfMemory.
+test "ML-DSA keys without memory for their cache" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
+    for (algorithms) |algorithm| {
+        var pair = try algorithm.generateKeyPair(testing.allocator, .{ .self_test = false });
+
+        defer pair.private_key.deinit();
+
+        defer pair.public_key.deinit();
+
+        const signature = try pair.private_key.sign(allocator, "message", .{ .context = "context" });
+
+        var public_memory = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+
+        var public_key = try algorithm.importPublicKey(public_memory.allocator(), try pair.public_key.exportKey(allocator, .raw), .raw);
+
+        defer public_key.deinit();
+
+        try testing.expect(public_key.verify(signature, "message", .{ .context = "context" }));
+
+        try testing.expect(!public_key.verify(signature, "message", .{}));
+
+        try testing.expect(!cached(&public_key.public.shared.cache));
+
+        // A private key has a public and a secret part.
+        var private_memory = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+
+        var private_key = try algorithm.importPrivateKey(private_memory.allocator(), try pair.private_key.exportKey(allocator, .raw), .raw);
+
+        defer private_key.deinit();
+
+        try testing.expectError(error.OutOfMemory, private_key.sign(allocator, "message", .{}));
+
+        var workspace_memory = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+
+        try testing.expectError(error.OutOfMemory, pair.private_key.sign(workspace_memory.allocator(), "message", .{}));
+    }
+}
+
+// Threads that use a fresh key at the same time each compute the caches; one copy of each is kept.
+test "ML-DSA caches under concurrent first use" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
+    var pair = try pq.ml_dsa_65.generateKeyPair(testing.allocator, .{ .self_test = false });
+
+    defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
+
+    const signature = try pair.private_key.sign(allocator, "message", .{});
+
+    var public_key = try pq.ml_dsa_65.importPublicKey(testing.allocator, try pair.public_key.exportKey(allocator, .raw), .raw);
+
+    defer public_key.deinit();
+
+    var private_key = try pq.ml_dsa_65.importPrivateKey(testing.allocator, try pair.private_key.exportKey(allocator, .raw), .raw);
+
+    defer private_key.deinit();
+
+    var verified: [4]bool = undefined;
+
+    var signatures: [4][]u8 = undefined;
+
+    var threads: [8]std.Thread = undefined;
+
+    const Worker = struct {
+        fn verify(key: *const pq.SignaturePublicKey, data: []const u8, out: *bool) void {
+            out.* = key.verify(data, "message", .{});
+        }
+
+        fn sign(key: *const pq.SignaturePrivateKey, out: *[]u8) void {
+            out.* = key.sign(testing.allocator, "message", .{}) catch unreachable;
+        }
+    };
+
+    for (threads[0..4], &verified) |*thread, *result| thread.* = try std.Thread.spawn(.{}, Worker.verify, .{ &public_key, signature, result });
+
+    for (threads[4..], &signatures) |*thread, *result| thread.* = try std.Thread.spawn(.{}, Worker.sign, .{ &private_key, result });
+
+    for (threads) |thread| thread.join();
+
+    for (verified) |result| try testing.expect(result);
+
+    for (signatures) |result| {
+        defer testing.allocator.free(result);
+
+        try testing.expect(public_key.verify(result, "message", .{}));
+    }
 }

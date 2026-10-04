@@ -162,19 +162,23 @@ fn kem(_: void, r: vectors.Record, allocator: Allocator) !void {
 
     const public = try field(allocator, r.values, "publicKey");
 
-    var pair = try hazmat.generateKemKeyPair(algorithm, seed);
+    var pair = try hazmat.generateKemKeyPair(algorithm, allocator, seed);
 
     defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
 
     try expectExport(allocator, public, &pair.public_key, .raw);
 
     try expectExport(allocator, seed, &pair.private_key, .raw);
 
-    const imported = try algorithm.importPublicKey(public, .raw);
+    var imported = try algorithm.importPublicKey(allocator, public, .raw);
+
+    defer imported.deinit();
 
     try testing.expect(imported.eql(&pair.public_key));
 
-    var from_seed = try algorithm.importPrivateKey(seed, .raw);
+    var from_seed = try algorithm.importPrivateKey(allocator, seed, .raw);
 
     defer from_seed.deinit();
 
@@ -188,7 +192,9 @@ fn kem(_: void, r: vectors.Record, allocator: Allocator) !void {
 
             try expectExport(allocator, public_encoded, &pair.public_key, encoding.format);
 
-            const imported_public = try algorithm.importPublicKey(public_encoded, encoding.format);
+            var imported_public = try algorithm.importPublicKey(allocator, public_encoded, encoding.format);
+
+            defer imported_public.deinit();
 
             try testing.expect(imported_public.eql(&pair.public_key));
 
@@ -196,7 +202,7 @@ fn kem(_: void, r: vectors.Record, allocator: Allocator) !void {
 
             try expectExport(allocator, private_encoded, &pair.private_key, encoding.format);
 
-            var imported_private = try algorithm.importPrivateKey(private_encoded, encoding.format);
+            var imported_private = try algorithm.importPrivateKey(allocator, private_encoded, encoding.format);
 
             defer imported_private.deinit();
 
@@ -205,13 +211,15 @@ fn kem(_: void, r: vectors.Record, allocator: Allocator) !void {
 
         const expanded = try vectors.decode(allocator, text);
 
-        expanded_key = try algorithm.importPrivateKey(expanded, .raw);
+        expanded_key = try algorithm.importPrivateKey(allocator, expanded, .raw);
 
         const key = &expanded_key.?;
 
         try expectExport(allocator, expanded, key, .raw);
 
-        const key_public = key.publicKey();
+        var key_public = key.publicKey();
+
+        defer key_public.deinit();
 
         try testing.expect(key_public.eql(&pair.public_key));
 
@@ -220,14 +228,14 @@ fn kem(_: void, r: vectors.Record, allocator: Allocator) !void {
 
             try expectExport(allocator, expanded_encoded, key, encoding.format);
 
-            var imported_private = try algorithm.importPrivateKey(expanded_encoded, encoding.format);
+            var imported_private = try algorithm.importPrivateKey(allocator, expanded_encoded, encoding.format);
 
             defer imported_private.deinit();
 
             try expectExport(allocator, expanded, &imported_private, .raw);
         }
 
-        var both = try algorithm.importPrivateKey(try field(allocator, r.values, "bothKeyDer"), .der);
+        var both = try algorithm.importPrivateKey(allocator, try field(allocator, r.values, "bothKeyDer"), .der);
 
         defer both.deinit();
 
@@ -280,9 +288,11 @@ fn signature(_: void, r: vectors.Record, allocator: Allocator) !void {
 
     const seed = try vectors.decode(allocator, r.header.get("seed"));
 
-    var pair = try hazmat.generateSignatureKeyPair(algorithm, seed);
+    var pair = try hazmat.generateSignatureKeyPair(algorithm, allocator, seed);
 
     defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
 
     if (r.values.find("signature") == null) return signatureKey(algorithm, &pair, seed, r.values, allocator);
 
@@ -311,7 +321,9 @@ fn signatureKey(algorithm: pq.SignatureAlgorithm, pair: *const pq.SignatureKeyPa
 
     try expectExport(allocator, public, &pair.public_key, .raw);
 
-    const imported = try algorithm.importPublicKey(public, .raw);
+    var imported = try algorithm.importPublicKey(allocator, public, .raw);
+
+    defer imported.deinit();
 
     try testing.expect(imported.eql(&pair.public_key));
 
@@ -320,11 +332,13 @@ fn signatureKey(algorithm: pq.SignatureAlgorithm, pair: *const pq.SignatureKeyPa
 
     try expectExport(allocator, private, &pair.private_key, .raw);
 
-    var from_raw = try algorithm.importPrivateKey(private, .raw);
+    var from_raw = try algorithm.importPrivateKey(allocator, private, .raw);
 
     defer from_raw.deinit();
 
-    const raw_public = from_raw.publicKey();
+    var raw_public = from_raw.publicKey();
+
+    defer raw_public.deinit();
 
     try testing.expect(raw_public.eql(&pair.public_key));
 
@@ -333,7 +347,9 @@ fn signatureKey(algorithm: pq.SignatureAlgorithm, pair: *const pq.SignatureKeyPa
 
         try expectExport(allocator, public_encoded, &pair.public_key, encoding.format);
 
-        const imported_public = try algorithm.importPublicKey(public_encoded, encoding.format);
+        var imported_public = try algorithm.importPublicKey(allocator, public_encoded, encoding.format);
+
+        defer imported_public.deinit();
 
         try testing.expect(imported_public.eql(&pair.public_key));
 
@@ -341,7 +357,7 @@ fn signatureKey(algorithm: pq.SignatureAlgorithm, pair: *const pq.SignatureKeyPa
 
         try expectExport(allocator, private_encoded, &pair.private_key, encoding.format);
 
-        var imported_private = try algorithm.importPrivateKey(private_encoded, encoding.format);
+        var imported_private = try algorithm.importPrivateKey(allocator, private_encoded, encoding.format);
 
         defer imported_private.deinit();
 
@@ -352,13 +368,15 @@ fn signatureKey(algorithm: pq.SignatureAlgorithm, pair: *const pq.SignatureKeyPa
 
     const expanded = try vectors.decode(allocator, text);
 
-    var key = try algorithm.importPrivateKey(expanded, .raw);
+    var key = try algorithm.importPrivateKey(allocator, expanded, .raw);
 
     defer key.deinit();
 
     try expectExport(allocator, expanded, &key, .raw);
 
-    const key_public = key.publicKey();
+    var key_public = key.publicKey();
+
+    defer key_public.deinit();
 
     try testing.expect(key_public.eql(&pair.public_key));
 
@@ -367,14 +385,14 @@ fn signatureKey(algorithm: pq.SignatureAlgorithm, pair: *const pq.SignatureKeyPa
 
         try expectExport(allocator, expanded_encoded, &key, encoding.format);
 
-        var imported_private = try algorithm.importPrivateKey(expanded_encoded, encoding.format);
+        var imported_private = try algorithm.importPrivateKey(allocator, expanded_encoded, encoding.format);
 
         defer imported_private.deinit();
 
         try expectExport(allocator, expanded, &imported_private, .raw);
     }
 
-    var both = try algorithm.importPrivateKey(try field(allocator, values, "bothKeyDer"), .der);
+    var both = try algorithm.importPrivateKey(allocator, try field(allocator, values, "bothKeyDer"), .der);
 
     defer both.deinit();
 
@@ -414,7 +432,7 @@ fn statefulKey(_: void, r: vectors.Record, allocator: Allocator) !void {
 
     var store: MemoryStore = .{ .allocator = allocator };
 
-    var pair = try hazmat.generateStatefulKeyPair(algorithm, allocator, try parameters(allocator, r.values), try field(allocator, r.values, "seed"), try vectors.number(u64, r.values.get("index")), store.store());
+    var pair = try hazmat.generateStatefulKeyPair(algorithm, allocator, try parameters(allocator, r.values), try field(allocator, r.values, "seed"), try vectors.number(u64, r.values.get("index")), store.store(), .{});
 
     defer pair.private_key.deinit(allocator);
 
@@ -445,7 +463,7 @@ fn statefulKey(_: void, r: vectors.Record, allocator: Allocator) !void {
     // The key loaded from the first state signs at the same index, the same way.
     var loaded_store: MemoryStore = .{ .allocator = allocator, .state = state };
 
-    var loaded = try algorithm.loadPrivateKey(allocator, loaded_store.store());
+    var loaded = try algorithm.loadPrivateKey(allocator, loaded_store.store(), .{});
 
     defer loaded.deinit(allocator);
 
@@ -542,17 +560,21 @@ fn execute(r: vectors.Record, allocator: Allocator) !Outcome {
 
     if (named(pq.KemAlgorithm, &kems, name)) |algorithm| {
         if (is(operation, "importPublicKey")) {
-            const public_key = algorithm.importPublicKey(data, format) catch |err| return failed(err);
+            var public_key = algorithm.importPublicKey(allocator, data, format) catch |err| return failed(err);
+
+            defer public_key.deinit();
 
             return finished(public_key.exportKey(allocator, .raw));
         }
 
         if (is(operation, "importPrivateKey") or is(operation, "decapsulate")) {
-            var private_key = algorithm.importPrivateKey(if (is(operation, "decapsulate")) key else data, if (is(operation, "decapsulate")) .raw else format) catch |err| return failed(err);
+            var private_key = algorithm.importPrivateKey(allocator, if (is(operation, "decapsulate")) key else data, if (is(operation, "decapsulate")) .raw else format) catch |err| return failed(err);
 
             defer private_key.deinit();
 
-            const public_key = private_key.publicKey();
+            var public_key = private_key.publicKey();
+
+            defer public_key.deinit();
 
             if (is(operation, "importPrivateKey")) return finished(public_key.exportKey(allocator, .raw));
 
@@ -562,9 +584,11 @@ fn execute(r: vectors.Record, allocator: Allocator) !Outcome {
         }
 
         if (is(operation, "exportPublicKey") or is(operation, "exportPrivateKey") or is(operation, "generate")) {
-            var pair = hazmat.generateKemKeyPair(algorithm, if (is(operation, "generate")) data else key) catch |err| return failed(err);
+            var pair = hazmat.generateKemKeyPair(algorithm, allocator, if (is(operation, "generate")) data else key) catch |err| return failed(err);
 
             defer pair.private_key.deinit();
+
+            defer pair.public_key.deinit();
 
             if (is(operation, "exportPrivateKey")) return finished(pair.private_key.exportKey(allocator, format));
 
@@ -572,7 +596,9 @@ fn execute(r: vectors.Record, allocator: Allocator) !Outcome {
         }
 
         if (is(operation, "encapsulate")) {
-            const public_key = algorithm.importPublicKey(key, .raw) catch |err| return failed(err);
+            var public_key = algorithm.importPublicKey(allocator, key, .raw) catch |err| return failed(err);
+
+            defer public_key.deinit();
 
             const encapsulation = hazmat.encapsulate(&public_key, randomness) catch |err| return failed(err);
 
@@ -580,17 +606,21 @@ fn execute(r: vectors.Record, allocator: Allocator) !Outcome {
         }
     } else if (named(pq.SignatureAlgorithm, &signatures, name)) |algorithm| {
         if (is(operation, "importPublicKey")) {
-            const public_key = algorithm.importPublicKey(data, format) catch |err| return failed(err);
+            var public_key = algorithm.importPublicKey(allocator, data, format) catch |err| return failed(err);
+
+            defer public_key.deinit();
 
             return finished(public_key.exportKey(allocator, .raw));
         }
 
         if (is(operation, "importPrivateKey") or is(operation, "sign") or is(operation, "hazmatSign")) {
-            var private_key = algorithm.importPrivateKey(if (is(operation, "importPrivateKey")) data else key, if (is(operation, "importPrivateKey")) format else .raw) catch |err| return failed(err);
+            var private_key = algorithm.importPrivateKey(allocator, if (is(operation, "importPrivateKey")) data else key, if (is(operation, "importPrivateKey")) format else .raw) catch |err| return failed(err);
 
             defer private_key.deinit();
 
-            const public_key = private_key.publicKey();
+            var public_key = private_key.publicKey();
+
+            defer public_key.deinit();
 
             if (is(operation, "importPrivateKey")) return finished(public_key.exportKey(allocator, .raw));
 
@@ -600,15 +630,19 @@ fn execute(r: vectors.Record, allocator: Allocator) !Outcome {
         }
 
         if (is(operation, "generate")) {
-            var pair = hazmat.generateSignatureKeyPair(algorithm, data) catch |err| return failed(err);
+            var pair = hazmat.generateSignatureKeyPair(algorithm, allocator, data) catch |err| return failed(err);
 
             defer pair.private_key.deinit();
+
+            defer pair.public_key.deinit();
 
             return finished(pair.public_key.exportKey(allocator, .raw));
         }
 
         if (is(operation, "verify") or is(operation, "hazmatVerify")) {
-            const public_key = try algorithm.importPublicKey(key, .raw);
+            var public_key = try algorithm.importPublicKey(allocator, key, .raw);
+
+            defer public_key.deinit();
 
             const options: pq.VerifyOptions = .{ .context = context, .pre_hash = pre_hash };
 
@@ -632,7 +666,7 @@ fn execute(r: vectors.Record, allocator: Allocator) !Outcome {
         var store: MemoryStore = .{ .allocator = allocator };
 
         if (is(operation, "generate")) {
-            var pair = hazmat.generateStatefulKeyPair(algorithm, allocator, try parameters(allocator, r.values), data, try vectors.number(u64, r.values.get("index")), store.store()) catch |err| return failed(err);
+            var pair = hazmat.generateStatefulKeyPair(algorithm, allocator, try parameters(allocator, r.values), data, try vectors.number(u64, r.values.get("index")), store.store(), .{}) catch |err| return failed(err);
 
             defer pair.private_key.deinit(allocator);
 
@@ -642,7 +676,7 @@ fn execute(r: vectors.Record, allocator: Allocator) !Outcome {
         store.state = data;
 
         if (is(operation, "loadPrivateKey") or is(operation, "sign")) {
-            var private_key = algorithm.loadPrivateKey(allocator, store.store()) catch |err| return failed(err);
+            var private_key = algorithm.loadPrivateKey(allocator, store.store(), .{}) catch |err| return failed(err);
 
             defer private_key.deinit(allocator);
 

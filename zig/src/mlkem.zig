@@ -34,7 +34,7 @@ pub const ml_kem_1024: Parameters = .{ .k = 4, .eta1 = 2, .eta2 = 2, .du = 11, .
 
 const q = 3329;
 
-const Poly = [256]i16;
+pub const Poly = [256]i16;
 
 // Powers of 17 in bit-reversed order, times the Montgomery factor 2^16, reduced to (-q/2, q/2].
 const zetas: [128]i16 = blk: {
@@ -553,56 +553,33 @@ fn fromMessage(m: *const [32]u8, out: *Poly) void {
     }
 }
 
-// What an encapsulation key yields before any message, sized for the largest parameter set: the
-// transposed matrix (entry (i, j) of Â at j * k + i, so that row i gives u_i), t̂ and H(ek).
-// Encapsulation and the re-encryption in decapsulation read them instead of sampling the matrix
-// and decoding and hashing the key on every call.
-pub const EncapsulationKey = struct {
-    matrix: [16]Poly,
-    t: [4]Poly,
-    h: [32]u8,
-};
+// What an encapsulation key yields before any message: the transposed matrix (entry (i, j) of Â
+// at j * k + i, so that row i gives u_i), t̂ and H(ek). Encapsulation and the re-encryption in
+// decapsulation read them instead of sampling the matrix and decoding and hashing the key on
+// every call. Its size is exact for k, so a smaller parameter set keeps less.
+pub fn EncapsulationKey(comptime k: usize) type {
+    return struct {
+        matrix: [k * k]Poly,
+        t: [k]Poly,
+        h: [32]u8,
 
-// The decoded NTT-form secret s of a decapsulation key, which its owner wipes, next to what its
-// encapsulation key yields.
-pub const DecapsulationKey = struct {
-    s: [4]Poly,
-    public: EncapsulationKey,
-};
+        // For a valid ek (checkEncapsulationKey).
+        pub fn fill(self: *@This(), ek: *const [384 * k + 32]u8) void {
+            primitives.digest(hash.sha3_256, &.{ek}, &self.h);
 
-// Zeroes the entries that k leaves unused, so that nothing of an earlier stack frame stays in a
-// key, which its owner may copy around.
-fn clearUnused(comptime k: usize, key: *EncapsulationKey) void {
-    ct.wipe(std.mem.sliceAsBytes(key.matrix[k * k ..]));
+            sampleMatrix(k, ek[384 * k ..][0..32], true, &self.matrix);
 
-    ct.wipe(std.mem.sliceAsBytes(key.t[k..]));
+            for (&self.t, 0..) |*f, i| decode12(ek[384 * i ..][0..384], f);
+        }
+    };
 }
 
-// For a valid ek (checkEncapsulationKey) and its hash.
-pub fn expandPublic(comptime p: Parameters, ek: *const [p.encapsulationKeySize()]u8, h: *const [32]u8, key: *EncapsulationKey) void {
-    const k: usize = p.k;
-
-    clearUnused(k, key);
-
-    sampleMatrix(k, ek[384 * k ..][0..32], true, key.matrix[0 .. k * k]);
-
-    for (key.t[0..k], 0..) |*f, i| decode12(ek[384 * i ..][0..384], f);
-
-    key.h = h.*;
+// The NTT-form secret s of a decapsulation key, as decryption reads it.
+pub fn decodeSecret(comptime p: Parameters, dk: *const [p.decapsulationKeySize()]u8, s: *[p.k]Poly) void {
+    for (s, 0..) |*f, i| decode12(dk[384 * i ..][0..384], f);
 }
 
-// For a dk that passed checkDecapsulationKey, which compared its H(ek) with ek.
-pub fn expandPrivate(comptime p: Parameters, dk: *const [p.decapsulationKeySize()]u8, key: *DecapsulationKey) void {
-    const k: usize = p.k;
-
-    expandPublic(p, dk[384 * k ..][0..p.encapsulationKeySize()], dk[768 * k + 32 ..][0..32], &key.public);
-
-    ct.wipe(std.mem.sliceAsBytes(key.s[k..]));
-
-    for (key.s[0..k], 0..) |*f, i| decode12(dk[384 * i ..][0..384], f);
-}
-
-fn encrypt(comptime p: Parameters, key: *const EncapsulationKey, m: *const [32]u8, r: *const [32]u8, c: *[p.ciphertextSize()]u8) void {
+fn encrypt(comptime p: Parameters, key: *const EncapsulationKey(p.k), m: *const [32]u8, r: *const [32]u8, c: *[p.ciphertextSize()]u8) void {
     const k: usize = p.k;
 
     var y: [k]Poly = undefined;
@@ -667,7 +644,7 @@ fn encrypt(comptime p: Parameters, key: *const EncapsulationKey, m: *const [32]u
 
     defer ct.wipe(std.mem.asBytes(&v));
 
-    dot(k, key.t[0..k], &y, &v);
+    dot(k, &key.t, &y, &v);
 
     inverseNtt(&v);
 
@@ -714,7 +691,10 @@ fn decrypt(comptime p: Parameters, s: *const [p.k]Poly, c: *const [p.ciphertextS
     }
 }
 
-pub fn keyGen(comptime p: Parameters, d: *const [32]u8, z: *const [32]u8, ek: *[p.encapsulationKeySize()]u8, dk: *[p.decapsulationKeySize()]u8, key: *DecapsulationKey) void {
+// Fills `public` when it is given, so that a generated key starts with its cache; otherwise the
+// matrix lives on the stack for this call only. It is not inlined, so that a caller that
+// dispatches over the parameter sets does not hold the frames of all of them at once.
+pub noinline fn keyGen(comptime p: Parameters, d: *const [32]u8, z: *const [32]u8, ek: *[p.encapsulationKeySize()]u8, dk: *[p.decapsulationKeySize()]u8, s_hat: *[p.k]Poly, public: ?*EncapsulationKey(p.k)) void {
     const k: usize = p.k;
 
     var g: [64]u8 = undefined;
@@ -722,6 +702,8 @@ pub fn keyGen(comptime p: Parameters, d: *const [32]u8, z: *const [32]u8, ek: *[
     var s: [k]Poly = undefined;
 
     var e: [k]Poly = undefined;
+
+    var spare: [k * k]Poly = undefined;
 
     defer {
         ct.wipe(&g);
@@ -750,17 +732,15 @@ pub fn keyGen(comptime p: Parameters, d: *const [32]u8, z: *const [32]u8, ek: *[
 
     for (outs) |f| ntt(f);
 
-    clearUnused(k, &key.public);
-
-    ct.wipe(std.mem.sliceAsBytes(key.s[k..]));
+    const matrix = if (public) |key| &key.matrix else &spare;
 
     // The transposed matrix, as encryption reads it; row i of the matrix is its column i.
-    sampleMatrix(k, rho, true, key.public.matrix[0 .. k * k]);
+    sampleMatrix(k, rho, true, matrix);
 
     for (0..k) |i| {
         var row: [k]Poly = undefined;
 
-        for (&row, 0..) |*f, j| f.* = key.public.matrix[k * j + i];
+        for (&row, 0..) |*f, j| f.* = matrix[k * j + i];
 
         var t: Poly = undefined;
 
@@ -786,16 +766,16 @@ pub fn keyGen(comptime p: Parameters, d: *const [32]u8, z: *const [32]u8, ek: *[
     @memcpy(dk[768 * k + 64 ..], z);
 
     // t and s exactly as encryption and decryption would decode them from the key.
-    for (key.public.t[0..k], key.s[0..k], 0..) |*t_i, *s_i, i| {
-        decode12(ek[384 * i ..][0..384], t_i);
+    decodeSecret(p, dk, s_hat);
 
-        decode12(dk[384 * i ..][0..384], s_i);
+    if (public) |key| {
+        for (&key.t, 0..) |*f, i| decode12(ek[384 * i ..][0..384], f);
+
+        key.h = dk[768 * k + 32 ..][0..32].*;
     }
-
-    key.public.h = dk[768 * k + 32 ..][0..32].*;
 }
 
-pub fn encaps(comptime p: Parameters, key: *const EncapsulationKey, m: *const [32]u8, shared_secret: *[32]u8, c: *[p.ciphertextSize()]u8) void {
+pub fn encaps(comptime p: Parameters, key: *const EncapsulationKey(p.k), m: *const [32]u8, shared_secret: *[32]u8, c: *[p.ciphertextSize()]u8) void {
     var g: [64]u8 = undefined;
 
     defer ct.wipe(&g);
@@ -812,7 +792,7 @@ pub fn encaps(comptime p: Parameters, key: *const EncapsulationKey, m: *const [3
 // Implicit rejection: a ciphertext that does not re-encrypt to itself yields J(z || c), chosen
 // with a mask so that the comparison result never reaches a branch. dk supplies z; everything
 // else comes from its decoded form.
-pub fn decaps(comptime p: Parameters, key: *const DecapsulationKey, dk: *const [p.decapsulationKeySize()]u8, c: *const [p.ciphertextSize()]u8) [32]u8 {
+pub fn decaps(comptime p: Parameters, s_hat: *const [p.k]Poly, key: *const EncapsulationKey(p.k), dk: *const [p.decapsulationKeySize()]u8, c: *const [p.ciphertextSize()]u8) [32]u8 {
     const k: usize = p.k;
 
     const z = dk[768 * k + 64 ..][0..32];
@@ -835,13 +815,13 @@ pub fn decaps(comptime p: Parameters, key: *const DecapsulationKey, dk: *const [
         ct.wipe(&again);
     }
 
-    decrypt(p, key.s[0..k], c, &m);
+    decrypt(p, s_hat, c, &m);
 
-    primitives.digest(hash.sha3_512, &.{ &m, &key.public.h }, &g);
+    primitives.digest(hash.sha3_512, &.{ &m, &key.h }, &g);
 
     primitives.shake256(&.{ z, c }, &rejected);
 
-    encrypt(p, &key.public, &m, g[32..64], &again);
+    encrypt(p, key, &m, g[32..64], &again);
 
     var shared_secret: [32]u8 = undefined;
 
