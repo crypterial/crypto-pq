@@ -4,7 +4,7 @@ use crate::ct::declassify;
 use crate::mlkem::{self, ML_KEM_768};
 use crate::primitives::{sha3_256, shake256_into};
 use crate::wipe::{SecretBytes, wipe};
-use crate::x25519::{BASE, x25519};
+use crate::x25519::{x25519, x25519_base};
 
 const LABEL: &[u8] = b"\\.//^\\";
 
@@ -24,6 +24,7 @@ pub(crate) struct Expanded {
     pub(crate) public: Vec<u8>,
     pub(crate) dk: SecretBytes,
     pub(crate) scalar: SecretBytes,
+    pub(crate) key: mlkem::DecapsulationKey,
 }
 
 pub(crate) fn expand(seed: &[u8]) -> Expanded {
@@ -31,11 +32,12 @@ pub(crate) fn expand(seed: &[u8]) -> Expanded {
 
     shake256_into(&[seed], &mut expanded);
 
-    let (mut public, dk) = mlkem::keygen_internal(&expanded[..32], &expanded[32..64], &ML_KEM_768);
+    let (mut public, dk, key) =
+        mlkem::keygen_internal(&expanded[..32], &expanded[32..64], &ML_KEM_768);
 
     let scalar = SecretBytes::concat(&[&expanded[64..]]);
 
-    let pk_x = x25519(&scalar, &BASE);
+    let pk_x = x25519_base(&scalar);
 
     declassify(&pk_x);
 
@@ -43,7 +45,12 @@ pub(crate) fn expand(seed: &[u8]) -> Expanded {
 
     wipe(&mut expanded);
 
-    Expanded { public, dk, scalar }
+    Expanded {
+        public,
+        dk,
+        scalar,
+        key,
+    }
 }
 
 fn combine(ss_m: &[u8], ss_x: &[u8], ct_x: &[u8], pk_x: &[u8]) -> [u8; 32] {
@@ -55,12 +62,21 @@ pub(crate) fn check_public_key(pk: &[u8]) -> bool {
         && mlkem::check_encapsulation_key(&pk[..ML_KEM_PUBLIC_KEY_SIZE], &ML_KEM_768)
 }
 
-pub(crate) fn encapsulate(pk: &[u8], eseed: &[u8]) -> ([u8; 32], Vec<u8>) {
-    let (pk_m, pk_x) = pk.split_at(ML_KEM_PUBLIC_KEY_SIZE);
+// The form of the ML-KEM part of a valid public key that encapsulation uses.
+pub(crate) fn encapsulation_key(pk: &[u8]) -> mlkem::EncapsulationKey {
+    mlkem::EncapsulationKey::new(&pk[..ML_KEM_PUBLIC_KEY_SIZE], &ML_KEM_768)
+}
 
-    let (mut ss_m, mut ct) = mlkem::encaps_internal(pk_m, &eseed[..32], &ML_KEM_768);
+pub(crate) fn encapsulate(
+    key: &mlkem::EncapsulationKey,
+    pk: &[u8],
+    eseed: &[u8],
+) -> ([u8; 32], Vec<u8>) {
+    let pk_x = public_point(pk);
 
-    let ct_x = x25519(&eseed[32..], &BASE);
+    let (mut ss_m, mut ct) = mlkem::encaps_internal(key, &eseed[..32], &ML_KEM_768);
+
+    let ct_x = x25519_base(&eseed[32..]);
 
     declassify(&ct_x);
 
@@ -77,10 +93,16 @@ pub(crate) fn encapsulate(pk: &[u8], eseed: &[u8]) -> ([u8; 32], Vec<u8>) {
     (shared_secret, ct)
 }
 
-pub(crate) fn decapsulate(dk: &[u8], scalar: &[u8], pk_x: &[u8], ct: &[u8]) -> [u8; 32] {
+pub(crate) fn decapsulate(
+    key: &mlkem::DecapsulationKey,
+    dk: &[u8],
+    scalar: &[u8],
+    pk_x: &[u8],
+    ct: &[u8],
+) -> [u8; 32] {
     let (ct_m, ct_x) = ct.split_at(ML_KEM_CIPHERTEXT_SIZE);
 
-    let mut ss_m = mlkem::decaps_internal(dk, ct_m, &ML_KEM_768);
+    let mut ss_m = mlkem::decaps_internal(key, dk, ct_m, &ML_KEM_768);
 
     let mut ss_x = x25519(scalar, ct_x);
 

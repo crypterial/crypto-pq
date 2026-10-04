@@ -5,7 +5,7 @@
 // public; results are declassified here before they are compared.
 #![cfg(crypto_pq_ct)]
 
-use crypto_pq::ct_check::{declassify, secret, x25519};
+use crypto_pq::ct_check::{declassify, secret, x25519, x25519_base};
 use crypto_pq::{
     Error, HSS_LMS, KemAlgorithm, KemPrivateKey, KemPublicKey, KeyFormat, KeyGenOptions, ML_DSA_44,
     ML_DSA_65, ML_DSA_87, ML_KEM_512, ML_KEM_768, ML_KEM_1024, SLH_DSA_SHA2_192F,
@@ -54,6 +54,18 @@ fn kem(algorithm: KemAlgorithm, seed_size: usize, randomness_size: usize) {
     assert!(same(&shared_secret, &encapsulation.shared_secret));
 
     assert!(!same(&rejected, &shared_secret));
+
+    // A public key imported from its bytes builds its cached form itself.
+    let imported = algorithm
+        .import_public_key(
+            &pair.public_key.export_key(KeyFormat::Raw).unwrap(),
+            KeyFormat::Raw,
+        )
+        .unwrap();
+
+    let again = hazmat::encapsulate(&imported, &randomness).unwrap();
+
+    assert!(same(&again.shared_secret, &encapsulation.shared_secret));
 
     let generated = algorithm
         .generate_key_pair(&KeyGenOptions::default())
@@ -112,6 +124,37 @@ fn x25519_alone() {
         shared.to_vec(),
         unhex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
     );
+}
+
+// The fixed-base path selects table entries by the secret digits of the scalar: every entry is
+// read and masked, so no branch or index depends on them. The filled scalars have digits 0, -8
+// and 8, the ends of the selection.
+#[test]
+fn x25519_base_alone() {
+    let alice = unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+
+    secret(&alice);
+
+    let public = x25519_base(&alice);
+
+    declassify(&public);
+
+    assert_eq!(
+        public.to_vec(),
+        unhex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+    );
+
+    let mut base = [0; 32];
+
+    base[0] = 9;
+
+    for fill in [0x00, 0x88, 0xFF] {
+        let scalar = [fill; 32];
+
+        secret(&scalar);
+
+        assert!(same(&x25519_base(&scalar), &x25519(&scalar, &base)));
+    }
 }
 
 fn signature(algorithm: SignatureAlgorithm, seed_size: usize, randomness_size: usize) {

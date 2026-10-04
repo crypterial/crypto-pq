@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 use core::fmt;
+use core::hash::{Hash, Hasher};
 
 use crate::ct;
 use crate::error::Error;
@@ -120,9 +121,15 @@ impl KemAlgorithm {
             return Err(Error::InvalidPublicKey);
         }
 
+        let expanded = match self.scheme {
+            Scheme::MlKem(p, _) => mlkem::EncapsulationKey::new(&key, &p),
+            Scheme::XWing => xwing::encapsulation_key(&key),
+        };
+
         Ok(KemPublicKey {
             algorithm: *self,
             key,
+            expanded,
         })
     }
 
@@ -188,13 +195,14 @@ impl KemAlgorithm {
                 seed: None,
                 dk: SecretBytes::concat(&[dk]),
             },
+            expanded: mlkem::DecapsulationKey::from_expanded(dk, &p),
         })
     }
 
     pub(crate) fn key_from_seed(&self, seed: &[u8]) -> KemPrivateKey {
         match self.scheme {
             Scheme::MlKem(p, _) => {
-                let (public, dk) = mlkem::keygen_internal(&seed[..32], &seed[32..], &p);
+                let (public, dk, expanded) = mlkem::keygen_internal(&seed[..32], &seed[32..], &p);
 
                 KemPrivateKey {
                     algorithm: *self,
@@ -204,6 +212,7 @@ impl KemAlgorithm {
                         seed: Some(SecretBytes::concat(&[seed])),
                         dk,
                     },
+                    expanded,
                 }
             }
             Scheme::XWing => {
@@ -217,6 +226,7 @@ impl KemAlgorithm {
                         dk: expanded.dk,
                         scalar: expanded.scalar,
                     },
+                    expanded: expanded.key,
                 }
             }
         }
@@ -250,10 +260,29 @@ impl fmt::Debug for KemAlgorithm {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+// `expanded` is derived from `key` when the key is created, so that no encapsulation samples the
+// matrix or hashes the key again; equality and hashing look at the key alone.
+#[derive(Clone)]
 pub struct KemPublicKey {
     algorithm: KemAlgorithm,
     key: Vec<u8>,
+    expanded: mlkem::EncapsulationKey,
+}
+
+impl PartialEq for KemPublicKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.algorithm == other.algorithm && self.key == other.key
+    }
+}
+
+impl Eq for KemPublicKey {}
+
+impl Hash for KemPublicKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.algorithm.hash(state);
+
+        self.key.hash(state);
+    }
 }
 
 impl KemPublicKey {
@@ -269,8 +298,8 @@ impl KemPublicKey {
 
     pub(crate) fn encapsulate_with(&self, randomness: &[u8]) -> Encapsulation {
         let (mut shared_secret, ciphertext) = match self.algorithm.scheme {
-            Scheme::MlKem(p, _) => mlkem::encaps_internal(&self.key, randomness, &p),
-            Scheme::XWing => xwing::encapsulate(&self.key, randomness),
+            Scheme::MlKem(p, _) => mlkem::encaps_internal(&self.expanded, randomness, &p),
+            Scheme::XWing => xwing::encapsulate(&self.expanded, &self.key, randomness),
         };
 
         let encapsulation = Encapsulation {
@@ -323,11 +352,14 @@ enum Secret {
     },
 }
 
-// The secret fields are SecretBytes, which wipe themselves when the key is dropped.
+// The secret fields are SecretBytes, which wipe themselves when the key is dropped, as does the
+// decoded secret in `expanded`: the form of the ML-KEM key, X-Wing's included, that
+// decapsulation uses.
 pub struct KemPrivateKey {
     algorithm: KemAlgorithm,
     public: Vec<u8>,
     secret: Secret,
+    expanded: mlkem::DecapsulationKey,
 }
 
 impl KemPrivateKey {
@@ -339,6 +371,7 @@ impl KemPrivateKey {
         KemPublicKey {
             algorithm: self.algorithm,
             key: self.public.clone(),
+            expanded: self.expanded.public().clone(),
         }
     }
 
@@ -347,10 +380,14 @@ impl KemPrivateKey {
             return Err(Error::InvalidLength);
         }
 
+        let key = &self.expanded;
+
         let mut shared_secret = match &self.secret {
-            Secret::MlKem { params, dk, .. } => mlkem::decaps_internal(dk, ciphertext, params),
+            Secret::MlKem { params, dk, .. } => mlkem::decaps_internal(key, dk, ciphertext, params),
             Secret::XWing { dk, scalar, .. } => {
-                xwing::decapsulate(dk, scalar, xwing::public_point(&self.public), ciphertext)
+                let pk_x = xwing::public_point(&self.public);
+
+                xwing::decapsulate(key, dk, scalar, pk_x, ciphertext)
             }
         };
 

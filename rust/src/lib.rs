@@ -82,4 +82,8 @@ pub mod ct_check {
     pub fn x25519(scalar: &[u8], u: &[u8]) -> [u8; 32] {
         crate::x25519::x25519(scalar, u)
     }
+
+    pub fn x25519_base(scalar: &[u8]) -> [u8; 32] {
+        crate::x25519::x25519_base(scalar)
+    }
 }

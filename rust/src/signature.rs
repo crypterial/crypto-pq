@@ -1,6 +1,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use core::hash::{Hash, Hasher};
 
 use crate::ct::{self, declassify};
 use crate::error::Error;
@@ -266,9 +267,15 @@ impl SignatureAlgorithm {
 
         check_size(format, key.len(), self.public_key_size())?;
 
+        let expanded = match self.scheme {
+            Scheme::MlDsa(p) => Some(mldsa::VerifyingKey::new(&key, &p)),
+            Scheme::SlhDsa(_) => None,
+        };
+
         Ok(SignaturePublicKey {
             algorithm: *self,
             key,
+            expanded,
         })
     }
 
@@ -324,6 +331,7 @@ impl SignatureAlgorithm {
             seed: None,
             private: SecretBytes::concat(&[sk]),
             public: sk[2 * n..].to_vec(),
+            expanded: None,
         })
     }
 
@@ -366,13 +374,14 @@ impl SignatureAlgorithm {
         p: mldsa::Parameters,
         sk: &[u8],
     ) -> Result<SignaturePrivateKey, Error> {
-        let public = mldsa::check_private_key(sk, &p).ok_or(Error::InvalidPrivateKey)?;
+        let (public, signing) = mldsa::check_private_key(sk, &p).ok_or(Error::InvalidPrivateKey)?;
 
         Ok(SignaturePrivateKey {
             algorithm: *self,
             seed: None,
             private: SecretBytes::concat(&[sk]),
             public,
+            expanded: Some(signing),
         })
     }
 
@@ -380,13 +389,14 @@ impl SignatureAlgorithm {
     pub(crate) fn key_from_seed(&self, seed: &[u8]) -> SignaturePrivateKey {
         match self.scheme {
             Scheme::MlDsa(p) => {
-                let (public, private) = mldsa::keygen_internal(seed, &p);
+                let (public, private, signing) = mldsa::keygen_internal(seed, &p);
 
                 SignaturePrivateKey {
                     algorithm: *self,
                     seed: Some(SecretBytes::concat(&[seed])),
                     private,
                     public,
+                    expanded: Some(signing),
                 }
             }
             Scheme::SlhDsa(p) => {
@@ -400,6 +410,7 @@ impl SignatureAlgorithm {
                     seed: None,
                     private,
                     public,
+                    expanded: None,
                 }
             }
         }
@@ -439,10 +450,30 @@ impl fmt::Debug for SignatureAlgorithm {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+// For ML-DSA, `expanded` is derived from `key` when the key is created, so that no verification
+// samples the matrix or hashes the key again; SLH-DSA has nothing to derive. Equality and
+// hashing look at the key alone.
+#[derive(Clone)]
 pub struct SignaturePublicKey {
     algorithm: SignatureAlgorithm,
     key: Vec<u8>,
+    expanded: Option<mldsa::VerifyingKey>,
+}
+
+impl PartialEq for SignaturePublicKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.algorithm == other.algorithm && self.key == other.key
+    }
+}
+
+impl Eq for SignaturePublicKey {}
+
+impl Hash for SignaturePublicKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.algorithm.hash(state);
+
+        self.key.hash(state);
+    }
 }
 
 impl SignaturePublicKey {
@@ -475,9 +506,13 @@ impl SignaturePublicKey {
 
         let parts = representative.parts();
 
-        match algorithm.scheme {
-            Scheme::MlDsa(p) => mldsa::verify_internal(&self.key, &parts, signature, &p),
-            Scheme::SlhDsa(p) => slhdsa::verify_internal(&parts, signature, &self.key, &p),
+        match (algorithm.scheme, &self.expanded) {
+            (Scheme::MlDsa(p), Some(expanded)) => {
+                mldsa::verify_internal(expanded, &parts, signature, &p)
+            }
+            (Scheme::SlhDsa(p), _) => slhdsa::verify_internal(&parts, signature, &self.key, &p),
+            // Every ML-DSA key is created with its expanded form.
+            (Scheme::MlDsa(_), None) => false,
         }
     }
 
@@ -494,12 +529,14 @@ impl fmt::Debug for SignaturePublicKey {
     }
 }
 
-// The secret fields are SecretBytes, which wipe themselves when the key is dropped.
+// The secret fields are SecretBytes, which wipe themselves when the key is dropped, as does the
+// secret part of `expanded`: for ML-DSA, the form of the key that signing uses.
 pub struct SignaturePrivateKey {
     algorithm: SignatureAlgorithm,
     seed: Option<SecretBytes>,
     private: SecretBytes,
     public: Vec<u8>,
+    expanded: Option<mldsa::SigningKey>,
 }
 
 impl SignaturePrivateKey {
@@ -511,6 +548,10 @@ impl SignaturePrivateKey {
         SignaturePublicKey {
             algorithm: self.algorithm,
             key: self.public.clone(),
+            expanded: self
+                .expanded
+                .as_ref()
+                .map(|signing| signing.verifying_key().clone()),
         }
     }
 
@@ -548,9 +589,12 @@ impl SignaturePrivateKey {
 
         let parts = representative.parts();
 
-        match self.algorithm.scheme {
-            Scheme::MlDsa(p) => mldsa::sign_internal(&self.private, &parts, randomness, &p),
-            Scheme::SlhDsa(p) => slhdsa::sign_internal(&parts, &self.private, randomness, &p),
+        match (self.algorithm.scheme, &self.expanded) {
+            (Scheme::MlDsa(p), Some(expanded)) => {
+                mldsa::sign_internal(expanded, &parts, randomness, &p)
+            }
+            (Scheme::SlhDsa(p), _) => slhdsa::sign_internal(&parts, &self.private, randomness, &p),
+            (Scheme::MlDsa(_), None) => unreachable!("every ML-DSA key has its expanded form"),
         }
     }
 
