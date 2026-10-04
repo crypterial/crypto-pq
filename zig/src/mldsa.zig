@@ -897,7 +897,12 @@ pub fn checkPrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8
     // Whether the key is valid is public: importing it fails otherwise.
     const valid = @intFromBool(barrier.* >= 0) & @intFromBool(ct.equal(&tr, &parts.tr));
 
-    return ct.declassifyValue(u1, valid) == 1;
+    if (ct.declassifyValue(u1, valid) == 0) return false;
+
+    // tr = H(pk) is public once it is known to match pk; the public key takes it from here.
+    ct.declassify(sk[64..128]);
+
+    return true;
 }
 
 pub fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, message: []const []const u8, rnd: *const [32]u8, signature: *[p.signatureSize()]u8) void {
@@ -1140,7 +1145,8 @@ fn decodeHint(comptime p: Parameters, data: *const [p.omega + p.k]u8, h: *[p.k][
     return true;
 }
 
-pub fn verify(comptime p: Parameters, pk: *const [p.publicKeySize()]u8, message: []const []const u8, signature: *const [p.signatureSize()]u8) bool {
+// tr = H(pk, 64), which the key computed when it was created.
+pub fn verify(comptime p: Parameters, pk: *const [p.publicKeySize()]u8, tr: *const [64]u8, message: []const []const u8, signature: *const [p.signatureSize()]u8) bool {
     const k = p.k;
 
     const l = p.l;
@@ -1169,15 +1175,11 @@ pub fn verify(comptime p: Parameters, pk: *const [p.publicKeySize()]u8, message:
 
     if (!decodeHint(p, signature[offset..][0 .. p.omega + p.k], &h)) return false;
 
-    var tr: [64]u8 = undefined;
-
-    primitives.shake256(&.{pk}, &tr);
-
     var mu: [64]u8 = undefined;
 
     var mu_hasher = hash.shake256.create();
 
-    mu_hasher.update(&tr);
+    mu_hasher.update(tr);
 
     for (message) |part| {
         mu_hasher.update(part);

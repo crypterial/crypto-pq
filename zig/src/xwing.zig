@@ -23,18 +23,18 @@ const ek_size = params.encapsulationKeySize();
 const ct_size = params.ciphertextSize();
 
 // SHAKE256(seed) gives the ML-KEM-768 seeds d and z, then the X25519 private scalar.
-pub fn expand(seed: *const [seed_size]u8, public_key: *[public_key_size]u8, dk: *DecapsulationKey, scalar: *[32]u8) void {
+pub fn expand(seed: *const [seed_size]u8, public_key: *[public_key_size]u8, dk: *DecapsulationKey, scalar: *[32]u8, key: *mlkem.DecapsulationKey) void {
     var expanded: [96]u8 = undefined;
 
     defer ct.wipe(&expanded);
 
     primitives.shake256(&.{seed}, &expanded);
 
-    mlkem.keyGen(params, expanded[0..32], expanded[32..64], public_key[0..ek_size], dk);
+    mlkem.keyGen(params, expanded[0..32], expanded[32..64], public_key[0..ek_size], dk, key);
 
     scalar.* = expanded[64..96].*;
 
-    public_key[ek_size..].* = x25519.x25519(scalar, &x25519.base_point);
+    public_key[ek_size..].* = x25519.x25519Base(scalar);
 
     ct.declassify(public_key[ek_size..]);
 }
@@ -51,7 +51,16 @@ pub fn checkPublicKey(public_key: *const [public_key_size]u8) bool {
     return mlkem.checkEncapsulationKey(params, public_key[0..ek_size]);
 }
 
-pub fn encapsulate(public_key: *const [public_key_size]u8, eseed: *const [randomness_size]u8, shared_secret: *[32]u8, ciphertext: *[ciphertext_size]u8) void {
+// The form of the ML-KEM part of a valid public key that encapsulation uses.
+pub fn expandPublic(public_key: *const [public_key_size]u8, key: *mlkem.EncapsulationKey) void {
+    var h: [32]u8 = undefined;
+
+    primitives.digest(hash.sha3_256, &.{public_key[0..ek_size]}, &h);
+
+    mlkem.expandPublic(params, public_key[0..ek_size], &h, key);
+}
+
+pub fn encapsulate(key: *const mlkem.EncapsulationKey, public_key: *const [public_key_size]u8, eseed: *const [randomness_size]u8, shared_secret: *[32]u8, ciphertext: *[ciphertext_size]u8) void {
     const pk_x = public_key[ek_size..];
 
     var ss_m: [32]u8 = undefined;
@@ -64,9 +73,9 @@ pub fn encapsulate(public_key: *const [public_key_size]u8, eseed: *const [random
         ct.wipe(&ss_x);
     }
 
-    mlkem.encaps(params, public_key[0..ek_size], eseed[0..32], &ss_m, ciphertext[0..ct_size]);
+    mlkem.encaps(params, key, eseed[0..32], &ss_m, ciphertext[0..ct_size]);
 
-    ciphertext[ct_size..].* = x25519.x25519(eseed[32..64], &x25519.base_point);
+    ciphertext[ct_size..].* = x25519.x25519Base(eseed[32..64]);
 
     ct.declassify(ciphertext[ct_size..]);
 
@@ -75,10 +84,10 @@ pub fn encapsulate(public_key: *const [public_key_size]u8, eseed: *const [random
     shared_secret.* = combine(&ss_m, &ss_x, ciphertext[ct_size..], pk_x);
 }
 
-pub fn decapsulate(dk: *const DecapsulationKey, scalar: *const [32]u8, public_key: *const [public_key_size]u8, ciphertext: *const [ciphertext_size]u8) [32]u8 {
+pub fn decapsulate(key: *const mlkem.DecapsulationKey, dk: *const DecapsulationKey, scalar: *const [32]u8, public_key: *const [public_key_size]u8, ciphertext: *const [ciphertext_size]u8) [32]u8 {
     const ct_x = ciphertext[ct_size..];
 
-    var ss_m = mlkem.decaps(params, dk, ciphertext[0..ct_size]);
+    var ss_m = mlkem.decaps(params, key, dk, ciphertext[0..ct_size]);
 
     var ss_x = x25519.x25519(scalar, ct_x);
 

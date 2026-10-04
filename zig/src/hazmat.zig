@@ -15,9 +15,13 @@ const Allocator = std.mem.Allocator;
 pub fn generateKemKeyPair(algorithm: kem.KemAlgorithm, seed: []const u8) Error!kem.KemKeyPair {
     try keys.requireLength(seed, kem.seedSize(algorithm.kind));
 
-    const private_key = kem.fromSeed(algorithm, seed);
+    var pair: kem.KemKeyPair = undefined;
 
-    return .{ .public_key = private_key.publicKey(), .private_key = private_key };
+    kem.fromSeed(&pair.private_key, algorithm, seed);
+
+    pair.public_key = pair.private_key.publicKey();
+
+    return pair;
 }
 
 // Seeds are 32 bytes for ML-DSA and SK.seed || SK.prf || PK.seed for SLH-DSA.

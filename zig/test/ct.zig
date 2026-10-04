@@ -98,11 +98,15 @@ fn signature(allocator: Allocator, algorithm: pq.SignatureAlgorithm, comptime se
 }
 
 // A private key from outside is secret as a whole: the library declassifies only what it holds
-// of the public key. Each key also goes out and back in as DER; PEM is only exported.
+// of the public key. Each key also goes out and back in as DER; PEM is only exported. Public keys
+// come from the pair, from the private key and from their bytes, so the cached forms of the keys
+// are built in every way there is.
 fn importedKem(allocator: Allocator, algorithm: pq.KemAlgorithm) !void {
     var pair = try hazmat.generateKemKeyPair(algorithm, &secretBytes(64, 6));
 
     defer pair.private_key.deinit();
+
+    const imported_public = try algorithm.importPublicKey(pair.public_key.bytes[0..algorithm.public_key_size], .raw);
 
     const size = 2 * algorithm.public_key_size + 32;
 
@@ -126,7 +130,7 @@ fn importedKem(allocator: Allocator, algorithm: pq.KemAlgorithm) !void {
         defer again.deinit();
 
         for ([_]*const pq.KemPrivateKey{ key, &again }) |decapsulator| {
-            for ([_]pq.KemPublicKey{ pair.public_key, decapsulator.publicKey() }) |encapsulator| {
+            for ([_]pq.KemPublicKey{ pair.public_key, decapsulator.publicKey(), imported_public }) |encapsulator| {
                 var encapsulation = try encapsulator.encapsulate();
 
                 var shared_secret = try decapsulator.decapsulate(encapsulation.ciphertext());
@@ -141,6 +145,8 @@ fn importedSignature(allocator: Allocator, algorithm: pq.SignatureAlgorithm, com
     var pair = try hazmat.generateSignatureKeyPair(algorithm, &secretBytes(seed_size, 7));
 
     defer pair.private_key.deinit();
+
+    const imported_public = try algorithm.importPublicKey(pair.public_key.bytes[0..algorithm.public_key_size], .raw);
 
     var raw = pair.private_key.secret_bytes[0..secret_size].*;
 
@@ -166,7 +172,7 @@ fn importedSignature(allocator: Allocator, algorithm: pq.SignatureAlgorithm, com
 
             defer allocator.free(signed);
 
-            for ([_]pq.SignaturePublicKey{ pair.public_key, signer.publicKey() }) |verifier| {
+            for ([_]pq.SignaturePublicKey{ pair.public_key, signer.publicKey(), imported_public }) |verifier| {
                 try check(verifier.verify(signed, message, .{}));
             }
         }

@@ -3,8 +3,10 @@ const std = @import("std");
 const ct = @import("ct.zig");
 const encoding = @import("encoding.zig");
 const Error = @import("errors.zig").Error;
+const hash = @import("hash.zig");
 const keys = @import("keys.zig");
 const mlkem = @import("mlkem.zig");
+const primitives = @import("primitives.zig");
 const rng = @import("rng.zig");
 const xwing = @import("xwing.zig");
 
@@ -40,18 +42,21 @@ pub const KemAlgorithm = struct {
 
         try rng.fill(seed[0..size]);
 
-        var private_key = fromSeed(self, seed[0..size]);
+        // Built in place: the keys are large enough that copies show in the timings.
+        var pair: KemKeyPair = undefined;
 
-        errdefer private_key.deinit();
+        fromSeed(&pair.private_key, self, seed[0..size]);
 
-        const public_key = private_key.publicKey();
+        errdefer pair.private_key.deinit();
+
+        pair.public_key = pair.private_key.publicKey();
 
         if (options.self_test) {
-            var encapsulation = try public_key.encapsulate();
+            var encapsulation = try pair.public_key.encapsulate();
 
             defer ct.wipe(&encapsulation.shared_secret);
 
-            var shared_secret = try private_key.decapsulate(encapsulation.ciphertext());
+            var shared_secret = try pair.private_key.decapsulate(encapsulation.ciphertext());
 
             defer ct.wipe(&shared_secret);
 
@@ -59,7 +64,7 @@ pub const KemAlgorithm = struct {
             if (!ct.declassifyValue(bool, ct.equal(&shared_secret, &encapsulation.shared_secret))) return error.SelfTestFailed;
         }
 
-        return .{ .public_key = public_key, .private_key = private_key };
+        return pair;
     }
 
     pub fn importPublicKey(self: KemAlgorithm, data: []const u8, format: KeyFormat) Error!KemPublicKey {
@@ -71,11 +76,26 @@ pub const KemAlgorithm = struct {
 
         if (!checkPublicKey(self.kind, key)) return error.InvalidPublicKey;
 
-        var public_key: KemPublicKey = .{ .algorithm = self, .bytes = undefined };
+        var public_key: KemPublicKey = .{ .algorithm = self, .bytes = undefined, .cache = undefined };
 
         ct.wipe(&public_key.bytes);
 
         @memcpy(public_key.bytes[0..key.len], key);
+
+        switch (self.kind) {
+            inline .ml_kem_512, .ml_kem_768, .ml_kem_1024 => |kind| {
+                const p = comptime parameters(kind);
+
+                const ek = public_key.bytes[0..p.encapsulationKeySize()];
+
+                var h: [32]u8 = undefined;
+
+                primitives.digest(hash.sha3_256, &.{ek}, &h);
+
+                mlkem.expandPublic(p, ek, &h, &public_key.cache);
+            },
+            .x_wing => xwing.expandPublic(public_key.bytes[0..xwing.public_key_size], &public_key.cache),
+        }
 
         return public_key;
     }
@@ -85,18 +105,22 @@ pub const KemAlgorithm = struct {
 
         defer if (format == .pem) ct.wipe(&buffer);
 
+        var key: KemPrivateKey = undefined;
+
         switch (try keys.importPrivate(format, data, objectIdentifier(self.kind), &buffer)) {
             .raw => |raw| {
-                if (raw.len == seedSize(self.kind)) return fromSeed(self, raw);
+                if (raw.len == seedSize(self.kind)) {
+                    fromSeed(&key, self, raw);
+                } else if (self.kind != .x_wing and raw.len == expandedSize(self.kind)) {
+                    try fromExpanded(&key, self, raw);
+                } else return error.InvalidLength;
 
-                if (self.kind != .x_wing and raw.len == expandedSize(self.kind)) return fromExpanded(self, raw);
-
-                return error.InvalidLength;
+                return key;
             },
             .pkcs8 => |pkcs8| {
                 const choice = try keys.decodeSeedChoice(pkcs8.octets, max_seed_size, expandedSize(self.kind));
 
-                var key = if (choice.seed) |seed| fromSeed(self, seed) else try fromExpanded(self, choice.expanded.?);
+                if (choice.seed) |seed| fromSeed(&key, self, seed) else try fromExpanded(&key, self, choice.expanded.?);
 
                 errdefer key.deinit();
 
@@ -124,9 +148,12 @@ pub const Encapsulation = struct {
     }
 };
 
+// `cache` is derived from `bytes` when the key is created, so that no encapsulation samples the
+// matrix or hashes the key again.
 pub const KemPublicKey = struct {
     algorithm: KemAlgorithm,
     bytes: [max_public_key_size]u8,
+    cache: mlkem.EncapsulationKey,
 
     pub fn encapsulate(self: *const KemPublicKey) Error!Encapsulation {
         var randomness: [xwing.randomness_size]u8 = undefined;
@@ -153,6 +180,8 @@ pub const KemPublicKey = struct {
     }
 };
 
+// `cache` holds the form of the ML-KEM key, X-Wing's included, that decapsulation uses; its secret
+// part is wiped with the other secrets.
 pub const KemPrivateKey = struct {
     algorithm: KemAlgorithm,
     seed: [max_seed_size]u8,
@@ -160,9 +189,10 @@ pub const KemPrivateKey = struct {
     dk: [max_decapsulation_key_size]u8,
     scalar: [32]u8,
     public: [max_public_key_size]u8,
+    cache: mlkem.DecapsulationKey,
 
     pub fn publicKey(self: *const KemPrivateKey) KemPublicKey {
-        return .{ .algorithm = self.algorithm, .bytes = self.public };
+        return .{ .algorithm = self.algorithm, .bytes = self.public, .cache = self.cache.public };
     }
 
     pub fn decapsulate(self: *const KemPrivateKey, ciphertext: []const u8) Error![32]u8 {
@@ -172,12 +202,12 @@ pub const KemPrivateKey = struct {
 
                 try keys.requireLength(ciphertext, p.ciphertextSize());
 
-                return mlkem.decaps(p, self.dk[0..p.decapsulationKeySize()], ciphertext[0..p.ciphertextSize()]);
+                return mlkem.decaps(p, &self.cache, self.dk[0..p.decapsulationKeySize()], ciphertext[0..p.ciphertextSize()]);
             },
             .x_wing => {
                 try keys.requireLength(ciphertext, xwing.ciphertext_size);
 
-                return xwing.decapsulate(self.dk[0..@sizeOf(xwing.DecapsulationKey)], &self.scalar, self.public[0..xwing.public_key_size], ciphertext[0..xwing.ciphertext_size]);
+                return xwing.decapsulate(&self.cache, self.dk[0..@sizeOf(xwing.DecapsulationKey)], &self.scalar, self.public[0..xwing.public_key_size], ciphertext[0..xwing.ciphertext_size]);
             },
         }
     }
@@ -196,6 +226,8 @@ pub const KemPrivateKey = struct {
         ct.wipe(&self.dk);
 
         ct.wipe(&self.scalar);
+
+        ct.wipe(std.mem.asBytes(&self.cache.s));
     }
 
     fn expanded(self: *const KemPrivateKey) []const u8 {
@@ -259,17 +291,19 @@ fn checkPublicKey(kind: KemAlgorithm.Kind, key: []const u8) bool {
     };
 }
 
-fn empty(algorithm: KemAlgorithm) KemPrivateKey {
-    var key: KemPrivateKey = .{ .algorithm = algorithm, .seed = undefined, .has_seed = false, .dk = undefined, .scalar = undefined, .public = undefined };
+// Zeroes the byte buffers, so that nothing of an earlier stack frame stays in the key; whoever
+// completes the key fills its cache.
+fn clear(key: *KemPrivateKey, algorithm: KemAlgorithm) void {
+    key.algorithm = algorithm;
+
+    key.has_seed = false;
 
     inline for (.{ &key.seed, &key.dk, &key.scalar, &key.public }) |buffer| ct.wipe(buffer);
-
-    return key;
 }
 
 // `seed` has the length of the algorithm's seed: d || z for ML-KEM, 32 bytes for X-Wing.
-pub fn fromSeed(algorithm: KemAlgorithm, seed: []const u8) KemPrivateKey {
-    var key = empty(algorithm);
+pub fn fromSeed(key: *KemPrivateKey, algorithm: KemAlgorithm, seed: []const u8) void {
+    clear(key, algorithm);
 
     key.has_seed = true;
 
@@ -279,15 +313,14 @@ pub fn fromSeed(algorithm: KemAlgorithm, seed: []const u8) KemPrivateKey {
         inline .ml_kem_512, .ml_kem_768, .ml_kem_1024 => |kind| {
             const p = comptime parameters(kind);
 
-            mlkem.keyGen(p, seed[0..32], seed[32..64], key.public[0..p.encapsulationKeySize()], key.dk[0..p.decapsulationKeySize()]);
+            mlkem.keyGen(p, seed[0..32], seed[32..64], key.public[0..p.encapsulationKeySize()], key.dk[0..p.decapsulationKeySize()], &key.cache);
         },
-        .x_wing => xwing.expand(seed[0..xwing.seed_size], key.public[0..xwing.public_key_size], key.dk[0..@sizeOf(xwing.DecapsulationKey)], &key.scalar),
+        .x_wing => xwing.expand(seed[0..xwing.seed_size], key.public[0..xwing.public_key_size], key.dk[0..@sizeOf(xwing.DecapsulationKey)], &key.scalar, &key.cache),
     }
-
-    return key;
 }
 
-fn fromExpanded(algorithm: KemAlgorithm, dk: []const u8) Error!KemPrivateKey {
+// Leaves `key` untouched when dk is invalid.
+fn fromExpanded(key: *KemPrivateKey, algorithm: KemAlgorithm, dk: []const u8) Error!void {
     switch (algorithm.kind) {
         inline .ml_kem_512, .ml_kem_768, .ml_kem_1024 => |kind| {
             const p = comptime parameters(kind);
@@ -296,13 +329,13 @@ fn fromExpanded(algorithm: KemAlgorithm, dk: []const u8) Error!KemPrivateKey {
 
             if (!mlkem.checkDecapsulationKey(p, dk[0..p.decapsulationKeySize()])) return error.InvalidPrivateKey;
 
-            var key = empty(algorithm);
+            clear(key, algorithm);
 
             @memcpy(key.dk[0..dk.len], dk);
 
             @memcpy(key.public[0..p.encapsulationKeySize()], dk[384 * k ..][0..p.encapsulationKeySize()]);
 
-            return key;
+            mlkem.expandPrivate(p, key.dk[0..p.decapsulationKeySize()], &key.cache);
         },
         .x_wing => unreachable,
     }
@@ -320,12 +353,12 @@ pub fn encapsulateWith(public_key: *const KemPublicKey, randomness: []const u8) 
 
             encapsulation.ciphertext_size = p.ciphertextSize();
 
-            mlkem.encaps(p, public_key.bytes[0..p.encapsulationKeySize()], randomness[0..32], &encapsulation.shared_secret, encapsulation.ciphertext_buffer[0..p.ciphertextSize()]);
+            mlkem.encaps(p, &public_key.cache, randomness[0..32], &encapsulation.shared_secret, encapsulation.ciphertext_buffer[0..p.ciphertextSize()]);
         },
         .x_wing => {
             encapsulation.ciphertext_size = xwing.ciphertext_size;
 
-            xwing.encapsulate(public_key.bytes[0..xwing.public_key_size], randomness[0..xwing.randomness_size], &encapsulation.shared_secret, encapsulation.ciphertext_buffer[0..xwing.ciphertext_size]);
+            xwing.encapsulate(&public_key.cache, public_key.bytes[0..xwing.public_key_size], randomness[0..xwing.randomness_size], &encapsulation.shared_secret, encapsulation.ciphertext_buffer[0..xwing.ciphertext_size]);
         },
     }
 

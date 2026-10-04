@@ -6,6 +6,7 @@ const Error = @import("errors.zig").Error;
 const hash = @import("hash.zig");
 const keys = @import("keys.zig");
 const mldsa = @import("mldsa.zig");
+const primitives = @import("primitives.zig");
 const rng = @import("rng.zig");
 const slhdsa = @import("slhdsa.zig");
 
@@ -106,11 +107,13 @@ pub const SignatureAlgorithm = struct {
 
         if (key.len != publicKeySize(self.kind)) return if (format == .raw) error.InvalidLength else error.InvalidEncoding;
 
-        var public_key: SignaturePublicKey = .{ .algorithm = self, .bytes = undefined };
+        var public_key: SignaturePublicKey = .{ .algorithm = self, .bytes = undefined, .tr = @splat(0) };
 
         ct.wipe(&public_key.bytes);
 
         @memcpy(public_key.bytes[0..key.len], key);
+
+        if (isMlDsa(self.kind)) primitives.shake256(&.{key}, &public_key.tr);
 
         return public_key;
     }
@@ -171,9 +174,12 @@ pub const SignatureAlgorithm = struct {
     }
 };
 
+// For ML-DSA, `tr` = H(pk, 64) is computed when the key is created, so that no verification
+// hashes the key again; SLH-DSA leaves it zero.
 pub const SignaturePublicKey = struct {
     algorithm: SignatureAlgorithm,
     bytes: [max_public_key_size]u8,
+    tr: [64]u8,
 
     pub fn verify(self: *const SignaturePublicKey, signature: []const u8, message: []const u8, options: VerifyOptions) bool {
         return verifyWith(self, signature, message, options, true);
@@ -199,8 +205,13 @@ pub const SignaturePrivateKey = struct {
     secret_bytes: [max_secret_size]u8,
     public: [max_public_key_size]u8,
 
+    // An ML-DSA private key holds tr, which the import check compares with the public key.
     pub fn publicKey(self: *const SignaturePrivateKey) SignaturePublicKey {
-        return .{ .algorithm = self.algorithm, .bytes = self.public };
+        var public_key: SignaturePublicKey = .{ .algorithm = self.algorithm, .bytes = self.public, .tr = @splat(0) };
+
+        if (isMlDsa(self.algorithm.kind)) public_key.tr = self.secret_bytes[64..128].*;
+
+        return public_key;
     }
 
     pub fn sign(self: *const SignaturePrivateKey, allocator: Allocator, message: []const u8, options: SignOptions) (Error || Allocator.Error)![]u8 {
@@ -537,10 +548,10 @@ fn signRaw(kind: SignatureAlgorithm.Kind, secret: []const u8, message: []const [
     }
 }
 
-fn verifyRaw(kind: SignatureAlgorithm.Kind, public: []const u8, message: []const []const u8, signature: []const u8) bool {
+fn verifyRaw(kind: SignatureAlgorithm.Kind, public: []const u8, tr: *const [64]u8, message: []const []const u8, signature: []const u8) bool {
     return switch (kind) {
         inline else => |tag| switch (comptime family(tag)) {
-            .ml_dsa => |p| mldsa.verify(p, public[0..p.publicKeySize()], message, signature[0..p.signatureSize()]),
+            .ml_dsa => |p| mldsa.verify(p, public[0..p.publicKeySize()], tr, message, signature[0..p.signatureSize()]),
             .slh_dsa => |p| slhdsa.Scheme(p).verify(public[0..p.publicKeySize()], message, signature[0..p.signatureSize()]),
         },
     };
@@ -582,7 +593,7 @@ pub fn verifyWith(key: *const SignaturePublicKey, signature: []const u8, message
 
     representative.init(message, options.context, entry);
 
-    return verifyRaw(kind, key.raw(), representative.parts(), signature);
+    return verifyRaw(kind, key.raw(), &key.tr, representative.parts(), signature);
 }
 
 fn define(comptime kind: SignatureAlgorithm.Kind, name: []const u8) SignatureAlgorithm {
