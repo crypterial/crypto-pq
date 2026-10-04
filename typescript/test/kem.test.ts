@@ -220,6 +220,9 @@ test("KEM key caches", () => {
   for (const [algorithm, [seed, dk]] of keys) {
     const pair = hazmat.generateKeyPair(algorithm, seed);
 
+    // The cache lives with the public key, which the private key reads: one per key pair.
+    assert.equal(pair.privateKey.publicKey, pair.publicKey);
+
     const imported = algorithm.importPublicKey(pair.publicKey.exportKey("raw"), "raw");
 
     const expanded = dk === null ? pair.privateKey : algorithm.importPrivateKey(dk, "raw");

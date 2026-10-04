@@ -1,7 +1,7 @@
 import { bytes, concat, equal, readUint32, readUint64, uint32, uint64, wipe } from "./bytes.ts";
 import { type KeyFormat, objectIdentifier } from "./encoding.ts";
 import { CryptoPQError } from "./errors.ts";
-import { exportPublic, importPublic, mismatch, requireLength } from "./keys.ts";
+import { exportPublic, importPublic, mismatch, readOptions, requireLength } from "./keys.ts";
 import * as lms from "./lms.ts";
 import { sha256 } from "./primitives.ts";
 import { randomBytes } from "./rng.ts";
@@ -15,15 +15,22 @@ const XMSS_KIND = 2;
 
 const XMSS_MT_KIND = 3;
 
+// Both methods answer synchronously: a signature may only exist once its index is stored. Each
+// blob holds the secret seed, so update gets copies: previous is wiped when the call returns, and
+// next belongs to the store.
 export interface StateStore {
-  read(): Uint8Array | null | Promise<Uint8Array | null>;
+  read(): Uint8Array | null;
 
-  update(previous: Uint8Array | null, next: Uint8Array): boolean | Promise<boolean>;
+  update(previous: Uint8Array | null, next: Uint8Array): boolean;
 }
 
 export type StatefulParameters = string | readonly (readonly [string, string])[];
 
-export interface StatefulKeyGenOptions {
+export interface StatefulLoadOptions {
+  reserve?: number | bigint;
+}
+
+export interface StatefulKeyGenOptions extends StatefulLoadOptions {
   parameters: StatefulParameters;
 
   stateStore: StateStore;
@@ -76,10 +83,37 @@ function option(message: string): CryptoPQError {
   return new CryptoPQError("INVALID_OPTION", message);
 }
 
+// How many indices one store update claims, so that the store is written once per that many
+// signatures. Indices claimed but unused when the key is dropped are skipped, never reused.
+function reserveOption(options: StatefulLoadOptions | undefined): bigint {
+  const { reserve = 1 } = readOptions(options);
+
+  if (typeof reserve === "bigint" ? reserve >= 1n : Number.isSafeInteger(reserve) && reserve >= 1) {
+    return BigInt(reserve);
+  }
+
+  throw option("reserve must be a positive integer");
+}
+
+// A thenable means the store has not finished, and a signature must not exist before its index is
+// stored; without this check a Promise would read as a refusal or as damaged state.
+function synchronous(value: unknown): void {
+  const object = (typeof value === "object" && value !== null) || typeof value === "function";
+
+  if (object && typeof (value as { then?: unknown }).then === "function") {
+    throw new TypeError("stateStore methods must return their result, not a promise");
+  }
+}
+
 // State blob: version, kind, the parameters, the secret seeds and the next index, closed by the
-// first 16 bytes of its SHA-256 so that a damaged state is refused rather than reused.
+// first 16 bytes of its SHA-256 so that a damaged state is refused rather than reused. The body is
+// a temporary copy of the seeds, so it is wiped once sealed.
 function seal(body: Uint8Array): Uint8Array {
-  return concat(body, sha256(body).subarray(0, 16));
+  const state = concat(body, sha256(body).subarray(0, 16));
+
+  wipe(body);
+
+  return state;
 }
 
 function unseal(state: unknown, kind: number): Uint8Array {
@@ -266,7 +300,8 @@ let createKey: (
   seed: Uint8Array,
   index: bigint,
   store: StateStore,
-) => Promise<StatefulKeyPair>;
+  reserve: bigint,
+) => StatefulKeyPair;
 
 export class StatefulPublicKey {
   readonly algorithm: StatefulSignatureAlgorithm;
@@ -323,11 +358,17 @@ export class StatefulPrivateKey {
 
   readonly #capacity: bigint;
 
+  readonly #reserve: bigint;
+
+  // The blob in the store, whose next index is #reserved: the indices from #index up to it are
+  // claimed and not used yet.
   #state: Uint8Array;
 
   #index: bigint;
 
-  #queue: Promise<unknown> = Promise.resolve();
+  #reserved: bigint;
+
+  #busy = false;
 
   constructor(
     algorithm: StatefulSignatureAlgorithm,
@@ -337,6 +378,7 @@ export class StatefulPrivateKey {
     store: StateStore,
     state: Uint8Array,
     index: bigint,
+    reserve: bigint,
   ) {
     this.algorithm = algorithm;
 
@@ -352,9 +394,13 @@ export class StatefulPrivateKey {
 
     this.#capacity = backendOf(algorithm).capacity(parameters);
 
+    this.#reserve = reserve;
+
     this.#state = state;
 
     this.#index = index;
+
+    this.#reserved = index;
 
     Object.freeze(this);
   }
@@ -363,47 +409,74 @@ export class StatefulPrivateKey {
     return this.#capacity - this.#index;
   }
 
-  // Calls on one key run one after another, so that two signatures never claim the same index.
-  sign(message: Uint8Array): Promise<Uint8Array> {
-    const data = message instanceof Uint8Array ? message.slice() : message;
+  // A call made while this key is signing can only come from inside the store, and on one thread
+  // waiting for the first call would never end, so it fails at once.
+  sign(message: Uint8Array): Uint8Array {
+    if (this.#busy) {
+      throw new CryptoPQError("STATE_CONFLICT", "the key is signing in another call");
+    }
 
-    const result = this.#queue.then(() => this.#sign(data));
+    this.#busy = true;
 
-    this.#queue = result.catch(() => undefined);
-
-    return result;
+    try {
+      return this.#sign(bytes(message, "message"));
+    } finally {
+      this.#busy = false;
+    }
   }
 
-  // The next index is written to the store before the signature exists, so a crash or a failed
-  // write can waste an index but never use one twice.
-  async #sign(message: unknown): Promise<Uint8Array> {
-    const data = bytes(message, "message");
-
+  // An index is in the store before its signature exists, so a crash or a failed write can waste
+  // indices but never use one twice.
+  #sign(message: Uint8Array): Uint8Array {
     const index = this.#index;
 
     if (index >= this.#capacity) {
       throw new CryptoPQError("KEY_EXHAUSTED", "every one-time key has been used");
     }
 
-    const state = backendOf(this.algorithm).encode(this.#parameters, this.#seed, index + 1n);
+    if (index === this.#reserved) {
+      const end = index + this.#reserve;
+
+      this.#claim(end < this.#capacity ? end : this.#capacity);
+    }
+
+    this.#index = index + 1n;
+
+    return this.#signer.sign(index, message);
+  }
+
+  // Stores reserved as the next index. Every blob holds the seed, so the key wipes the copy it hands
+  // to update as previous, the blob it replaces, and the new blob if the store refuses it.
+  #claim(reserved: bigint): void {
+    const state = backendOf(this.algorithm).encode(this.#parameters, this.#seed, reserved);
+
+    const previous = this.#state.slice();
 
     let updated: unknown;
 
     try {
-      updated = await this.#store.update(this.#state.slice(), state.slice());
+      updated = this.#store.update(previous, state.slice());
     } catch (error) {
+      wipe(state);
+
       throw new CryptoPQError("STATE_PERSIST_FAILED", "the state store failed to save the key state", { cause: error });
+    } finally {
+      wipe(previous);
     }
 
     if (updated !== true) {
+      wipe(state);
+
+      synchronous(updated);
+
       throw new CryptoPQError("STATE_CONFLICT", "the stored key state changed; load the key again");
     }
 
+    wipe(this.#state);
+
     this.#state = state;
 
-    this.#index = index + 1n;
-
-    return this.#signer.sign(index, data);
+    this.#reserved = reserved;
   }
 }
 
@@ -420,7 +493,7 @@ export class StatefulSignatureAlgorithm {
     Object.freeze(this);
   }
 
-  async generateKeyPair(options: StatefulKeyGenOptions): Promise<StatefulKeyPair> {
+  generateKeyPair(options: StatefulKeyGenOptions): StatefulKeyPair {
     if (typeof options !== "object" || options === null) {
       throw new TypeError("options must be an object");
     }
@@ -429,19 +502,27 @@ export class StatefulSignatureAlgorithm {
 
     const parameters = this.#backend.parameters(options.parameters);
 
-    return this.#create(parameters, randomBytes(this.#backend.seedSize(parameters)), 0n, store);
+    const reserve = reserveOption(options);
+
+    return this.#create(parameters, randomBytes(this.#backend.seedSize(parameters)), 0n, store, reserve);
   }
 
-  async loadPrivateKey(stateStore: StateStore): Promise<StatefulPrivateKey> {
+  // The key starts at the stored index, so indices that an earlier key claimed and never used are
+  // skipped.
+  loadPrivateKey(stateStore: StateStore, options?: StatefulLoadOptions): StatefulPrivateKey {
     const store = checkStore(stateStore);
+
+    const reserve = reserveOption(options);
 
     let state: unknown;
 
     try {
-      state = await store.read();
+      state = store.read();
     } catch (error) {
       throw new CryptoPQError("STATE_PERSIST_FAILED", "the state store failed to read the key state", { cause: error });
     }
+
+    synchronous(state);
 
     const { parameters, seed, index } = this.#backend.decode(state);
 
@@ -455,7 +536,7 @@ export class StatefulSignatureAlgorithm {
 
     const copy = (state as Uint8Array).slice();
 
-    return new StatefulPrivateKey(this, parameters, seed, signer, store, copy, index);
+    return new StatefulPrivateKey(this, parameters, seed, signer, store, copy, index, reserve);
   }
 
   importPublicKey(data: Uint8Array | string, format: KeyFormat): StatefulPublicKey {
@@ -468,7 +549,8 @@ export class StatefulSignatureAlgorithm {
     return new StatefulPublicKey(this, key);
   }
 
-  async #create(parameters: unknown, seed: Uint8Array, index: bigint, store: StateStore): Promise<StatefulKeyPair> {
+  // The store gets the starting index; the first signature then claims the reserved indices.
+  #create(parameters: unknown, seed: Uint8Array, index: bigint, store: StateStore, reserve: bigint): StatefulKeyPair {
     const backend = this.#backend;
 
     const signer = backend.signer(parameters, seed);
@@ -478,7 +560,7 @@ export class StatefulSignatureAlgorithm {
     let created: unknown;
 
     try {
-      created = await store.update(null, state.slice());
+      created = store.update(null, state.slice());
     } catch (error) {
       wipe(seed, state);
 
@@ -488,10 +570,12 @@ export class StatefulSignatureAlgorithm {
     if (created !== true) {
       wipe(seed, state);
 
+      synchronous(created);
+
       throw new CryptoPQError("STATE_CONFLICT", "the state store already holds a key");
     }
 
-    const privateKey = new StatefulPrivateKey(this, parameters, seed, signer, store, state, index);
+    const privateKey = new StatefulPrivateKey(this, parameters, seed, signer, store, state, index, reserve);
 
     return Object.freeze({ publicKey: privateKey.publicKey, privateKey });
   }
@@ -499,7 +583,8 @@ export class StatefulSignatureAlgorithm {
   static {
     backendOf = (algorithm) => algorithm.#backend;
 
-    createKey = (algorithm, parameters, seed, index, store) => algorithm.#create(parameters, seed, index, store);
+    createKey = (algorithm, parameters, seed, index, store, reserve) =>
+      algorithm.#create(parameters, seed, index, store, reserve);
   }
 }
 
@@ -508,11 +593,11 @@ export interface HazmatStatefulOptions extends StatefulKeyGenOptions {
 }
 
 // Stateful seeds are I || SEED of the top LMS tree, or SK_SEED || SK_PRF || PUB_SEED for XMSS.
-export async function keyPairFromSeed(
+export function keyPairFromSeed(
   algorithm: StatefulSignatureAlgorithm,
   seed: Uint8Array,
   options: HazmatStatefulOptions,
-): Promise<StatefulKeyPair> {
+): StatefulKeyPair {
   const data = bytes(seed, "seed");
 
   if (typeof options !== "object" || options === null) {
@@ -537,7 +622,7 @@ export async function keyPairFromSeed(
     throw option("the index must lie between 0 and the key's capacity");
   }
 
-  return createKey(algorithm, parameters, data.slice(), index, store);
+  return createKey(algorithm, parameters, data.slice(), index, store, reserveOption(options));
 }
 
 export const HSS_LMS = new StatefulSignatureAlgorithm("HSS/LMS", HSS_BACKEND as StatefulBackend<unknown>);

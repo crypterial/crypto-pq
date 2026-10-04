@@ -252,16 +252,6 @@ function guarded<T>(codes: readonly pq.ErrorCode[], what: string, data: Uint8Arr
   }
 }
 
-async function guardedAsync<T>(codes: readonly pq.ErrorCode[], what: string, data: Uint8Array, run: () => Promise<T>): Promise<T | null> {
-  try {
-    return await run();
-  } catch (error) {
-    assert.ok(error instanceof pq.CryptoPQError && codes.includes(error.code), `${what}: ${String(error)} for ${toHex(data)}`);
-
-    return null;
-  }
-}
-
 function asBytes(encoded: Uint8Array | string): Uint8Array {
   return typeof encoded === "string" ? ascii(encoded) : encoded;
 }
@@ -652,7 +642,7 @@ test("PEM import takes any text", () => {
   }
 });
 
-test("verification takes any signature, message, context and pre-hash", async () => {
+test("verification takes any signature, message, context and pre-hash", () => {
   const rng = new Random(6);
 
   for (const algorithm of SIGNATURES) {
@@ -738,15 +728,15 @@ test("verification takes any signature, message, context and pre-hash", async ()
     ["LMS_SHAKE_M24_H5", "LMOTS_SHAKE_N24_W1"],
   ];
 
-  const hss = await hazmat.generateStatefulKeyPair(pq.HSS_LMS, pattern(40), { parameters: levels, stateStore: new MemoryStore(), index: 33n });
+  const hss = hazmat.generateStatefulKeyPair(pq.HSS_LMS, pattern(40), { parameters: levels, stateStore: new MemoryStore(), index: 33n });
 
-  const mt = await hazmat.generateStatefulKeyPair(pq.XMSS_MT, pattern(72), { parameters: "XMSSMT-SHA2_20/4_192", stateStore: new MemoryStore(), index: 7n });
+  const mt = hazmat.generateStatefulKeyPair(pq.XMSS_MT, pattern(72), { parameters: "XMSSMT-SHA2_20/4_192", stateStore: new MemoryStore(), index: 7n });
 
   const message = ascii("crypto-pq robustness");
 
   const cases: [pq.StatefulSignatureAlgorithm, Uint8Array, Uint8Array][] = [
-    [pq.HSS_LMS, asBytes(hss.publicKey.exportKey("raw")), await hss.privateKey.sign(message)],
-    [pq.XMSS_MT, asBytes(mt.publicKey.exportKey("raw")), await mt.privateKey.sign(message)],
+    [pq.HSS_LMS, asBytes(hss.publicKey.exportKey("raw")), hss.privateKey.sign(message)],
+    [pq.XMSS_MT, asBytes(mt.publicKey.exportKey("raw")), mt.privateKey.sign(message)],
     [pq.XMSS, concat(Uint8Array.of(0, 0, 0, 0x0d), pattern(48)), new Uint8Array(4 + 24 + (51 + 10) * 24)],
   ];
 
@@ -987,19 +977,19 @@ function mutateState(rng: Random, state: Uint8Array): Uint8Array {
   return rng.below(4) !== 0 ? sealed(body) : concat(body, state.subarray(state.length - 16));
 }
 
-async function storedState(algorithm: pq.StatefulSignatureAlgorithm, parameters: pq.StatefulParameters, seed: Uint8Array, index: bigint): Promise<Uint8Array> {
+function storedState(algorithm: pq.StatefulSignatureAlgorithm, parameters: pq.StatefulParameters, seed: Uint8Array, index: bigint): Uint8Array {
   const store = new MemoryStore();
 
-  await hazmat.generateStatefulKeyPair(algorithm, seed, { parameters, stateStore: store, index });
+  hazmat.generateStatefulKeyPair(algorithm, seed, { parameters, stateStore: store, index });
 
   return store.state!;
 }
 
-async function checkState(algorithm: pq.StatefulSignatureAlgorithm, state: Uint8Array, budget: number): Promise<void> {
+function checkState(algorithm: pq.StatefulSignatureAlgorithm, state: Uint8Array, budget: number): void {
   const expected = expectedState(algorithm, state);
 
   if (typeof expected === "string") {
-    await assert.rejects(algorithm.loadPrivateKey(new MemoryStore(state)), isCode(expected), `${algorithm.name} loaded ${toHex(state)}`);
+    assert.throws(() => algorithm.loadPrivateKey(new MemoryStore(state)), isCode(expected), `${algorithm.name} loaded ${toHex(state)}`);
 
     return;
   }
@@ -1007,7 +997,7 @@ async function checkState(algorithm: pq.StatefulSignatureAlgorithm, state: Uint8
   const [index, capacity, cost] = expected;
 
   if (index > capacity) {
-    await assert.rejects(algorithm.loadPrivateKey(new MemoryStore(state)), isCode("INVALID_PRIVATE_KEY"));
+    assert.throws(() => algorithm.loadPrivateKey(new MemoryStore(state)), isCode("INVALID_PRIVATE_KEY"));
 
     return;
   }
@@ -1018,17 +1008,17 @@ async function checkState(algorithm: pq.StatefulSignatureAlgorithm, state: Uint8
 
   const store = new MemoryStore(state);
 
-  const key = await guardedAsync([], algorithm.name, state, () => algorithm.loadPrivateKey(store));
+  const key = guarded([], algorithm.name, state, () => algorithm.loadPrivateKey(store));
 
   assert.equal(key!.remainingSignatures(), capacity - index);
 
   if (index === capacity) {
-    await assert.rejects(key!.sign(ascii("m")), isCode("KEY_EXHAUSTED"));
+    assert.throws(() => key!.sign(ascii("m")), isCode("KEY_EXHAUSTED"));
 
     return;
   }
 
-  const signature = await key!.sign(ascii("m"));
+  const signature = key!.sign(ascii("m"));
 
   assert.ok(key!.publicKey.verify(signature, ascii("m")));
 
@@ -1039,12 +1029,12 @@ async function checkState(algorithm: pq.StatefulSignatureAlgorithm, state: Uint8
   assert.ok(same(store.state!, sealed(next)));
 }
 
-test("state loading takes any blob", async () => {
+test("state loading takes any blob", () => {
   const rng = new Random(9);
 
   const seeds = [
-    await storedState(pq.HSS_LMS, [["LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1"]], pattern(40), 3n),
-    await storedState(
+    storedState(pq.HSS_LMS, [["LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1"]], pattern(40), 3n),
+    storedState(
       pq.HSS_LMS,
       [
         ["LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W4"],
@@ -1053,8 +1043,8 @@ test("state loading takes any blob", async () => {
       pattern(40),
       3n,
     ),
-    await storedState(pq.XMSS, "XMSS-SHA2_10_256", pattern(96), 3n),
-    await storedState(pq.XMSS_MT, "XMSSMT-SHAKE256_20/4_192", pattern(72), 3n),
+    storedState(pq.XMSS, "XMSS-SHA2_10_256", pattern(96), 3n),
+    storedState(pq.XMSS_MT, "XMSSMT-SHAKE256_20/4_192", pattern(72), 3n),
   ];
 
   for (let round = 0; round < 200 * SCALE; round++) {
@@ -1067,55 +1057,55 @@ test("state loading takes any blob", async () => {
     // Mostly the algorithm the blob names, so that more blobs get past the kind check.
     const named = [pq.HSS_LMS, pq.XMSS, pq.XMSS_MT][state.length > 1 ? state[1] - 1 : -1];
 
-    await checkState(named !== undefined && rng.below(4) !== 0 ? named : rng.choice([pq.HSS_LMS, pq.XMSS, pq.XMSS_MT]), state, 1 << 17);
+    checkState(named !== undefined && rng.below(4) !== 0 ? named : rng.choice([pq.HSS_LMS, pq.XMSS, pq.XMSS_MT]), state, 1 << 17);
   }
 
   for (const value of ["state", 7, new Uint8Array(17), [1, 2, 3]]) {
-    await assert.rejects(pq.XMSS.loadPrivateKey(new MemoryStore(value as Uint8Array)), isCode("INVALID_PRIVATE_KEY"));
+    assert.throws(() => pq.XMSS.loadPrivateKey(new MemoryStore(value as Uint8Array)), isCode("INVALID_PRIVATE_KEY"));
   }
 });
 
-test("state blobs that claim many levels or indices are refused", async () => {
-  const state = await storedState(pq.HSS_LMS, [["LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1"]], new Uint8Array(40), 0n);
+test("state blobs that claim many levels or indices are refused", () => {
+  const state = storedState(pq.HSS_LMS, [["LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1"]], new Uint8Array(40), 0n);
 
   const body = state.subarray(0, state.length - 16);
 
-  const load = (bytes: Uint8Array) => assert.rejects(pq.HSS_LMS.loadPrivateKey(new MemoryStore(sealed(bytes))), isCode("INVALID_PRIVATE_KEY"));
+  const load = (bytes: Uint8Array) => assert.throws(() => pq.HSS_LMS.loadPrivateKey(new MemoryStore(sealed(bytes))), isCode("INVALID_PRIVATE_KEY"));
 
   for (const count of [0, 2, 9, 0xff]) {
     const claimed = body.slice();
 
     claimed[2] = count;
 
-    await load(claimed);
+    load(claimed);
 
     if (count !== 2) {
       const level = Uint8Array.of(0, 0, 0, 10, 0, 0, 0, 5);
 
-      await load(concat(claimed.subarray(0, 3), ...Array.from({ length: count }, () => level), claimed.subarray(11)));
+      load(concat(claimed.subarray(0, 3), ...Array.from({ length: count }, () => level), claimed.subarray(11)));
     }
   }
 
   const tall = concat(Uint8Array.of(1, 1, 3), ...Array.from({ length: 3 }, () => Uint8Array.of(0, 0, 0, 14, 0, 0, 0, 5)), new Uint8Array(48));
 
-  await load(tall);
+  load(tall);
 
   for (const index of [33n, MASK]) {
     const beyond = body.slice();
 
     new DataView(beyond.buffer).setBigUint64(beyond.length - 8, index);
 
-    await load(beyond);
+    load(beyond);
   }
 
-  const mt = await storedState(pq.XMSS_MT, "XMSSMT-SHA2_60/12_256", new Uint8Array(96), 0n);
+  const mt = storedState(pq.XMSS_MT, "XMSSMT-SHA2_60/12_256", new Uint8Array(96), 0n);
 
   for (const index of [(1n << 60n) + 1n, MASK]) {
     const beyond = mt.slice(0, mt.length - 16);
 
     new DataView(beyond.buffer).setBigUint64(6, index);
 
-    await assert.rejects(pq.XMSS_MT.loadPrivateKey(new MemoryStore(sealed(beyond))), isCode("INVALID_PRIVATE_KEY"));
+    assert.throws(() => pq.XMSS_MT.loadPrivateKey(new MemoryStore(sealed(beyond))), isCode("INVALID_PRIVATE_KEY"));
   }
 });
 
@@ -1165,7 +1155,7 @@ test("16 MiB messages hash as an independent implementation does", () => {
   assert.equal(toHex(pq.HMAC_SHA_256.digest(pattern(32), message)), "e9fb7e5b1f5d2702eba341df5e51ec9e4ed48db395f66dff93e30808b88f0750");
 });
 
-test("16 MiB and empty messages sign and verify; contexts stop at 255 bytes", async () => {
+test("16 MiB and empty messages sign and verify; contexts stop at 255 bytes", () => {
   const message = largeMessage();
 
   const changed = message.slice();
@@ -1197,13 +1187,13 @@ test("16 MiB and empty messages sign and verify; contexts stop at 255 bytes", as
     assert.throws(() => privateKey.sign(new Uint8Array(), { context: new Uint8Array(256) }), isCode("INVALID_CONTEXT"));
   }
 
-  const hss = await pq.HSS_LMS.generateKeyPair({ parameters: [["LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1"]], stateStore: new MemoryStore() });
+  const hss = pq.HSS_LMS.generateKeyPair({ parameters: [["LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1"]], stateStore: new MemoryStore() });
 
-  const mt = await pq.XMSS_MT.generateKeyPair({ parameters: "XMSSMT-SHA2_20/4_192", stateStore: new MemoryStore() });
+  const mt = pq.XMSS_MT.generateKeyPair({ parameters: "XMSSMT-SHA2_20/4_192", stateStore: new MemoryStore() });
 
   for (const text of [message, new Uint8Array()]) {
     for (const pair of [hss, mt]) {
-      const signature = await pair.privateKey.sign(text);
+      const signature = pair.privateKey.sign(text);
 
       assert.ok(pair.publicKey.verify(signature, text));
 
@@ -1288,44 +1278,42 @@ test("DER lengths that claim gigabytes", () => {
 
 const LEVELS: [string, string][] = [["LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1"]];
 
-// Keys loaded from one store whose writes yield to the event loop, signing at the same time: the
-// compare-and-swap lets one of them use each index, the others get STATE_CONFLICT and reload.
-test("keys sharing a store never use an index twice", async () => {
-  const store = new MemoryStore();
+// Keys loaded from one store sign in a random order: the compare-and-swap lets one of them claim
+// each index, or each range of indices with reserve, and the others get STATE_CONFLICT and reload.
+// A key uses every index it claimed, so all of them are used, each once.
+test("keys sharing a store never use an index twice", () => {
+  const rng = new Random(12);
 
-  await pq.HSS_LMS.generateKeyPair({ parameters: LEVELS, stateStore: store });
+  for (const reserve of [1, 3]) {
+    const store = new MemoryStore();
 
-  const slow: pq.StateStore = {
-    read: () => store.read(),
-    update: (previous, next) => new Promise((resolve) => setImmediate(() => resolve(store.update(previous, next)))),
-  };
+    pq.HSS_LMS.generateKeyPair({ parameters: LEVELS, stateStore: store });
 
-  const indices: number[] = [];
+    const keys = Array.from({ length: 6 }, () => pq.HSS_LMS.loadPrivateKey(store, { reserve }));
 
-  const workers = Array.from({ length: 6 }, async () => {
-    let key = await pq.HSS_LMS.loadPrivateKey(slow);
+    const indices: number[] = [];
 
-    for (;;) {
+    while (keys.length > 0) {
+      const which = rng.below(keys.length);
+
       try {
-        indices.push(u32(await key.sign(ascii("m")), 4));
+        indices.push(u32(keys[which].sign(ascii("m")), 4));
       } catch (error) {
         assert.ok(error instanceof pq.CryptoPQError && (error.code === "STATE_CONFLICT" || error.code === "KEY_EXHAUSTED"));
 
         if (error.code === "KEY_EXHAUSTED") {
-          return;
+          keys.splice(which, 1);
+        } else {
+          keys[which] = pq.HSS_LMS.loadPrivateKey(store, { reserve });
         }
-
-        key = await pq.HSS_LMS.loadPrivateKey(slow);
       }
     }
-  });
 
-  await Promise.all(workers);
-
-  assert.deepEqual(
-    indices.sort((a, b) => a - b),
-    Array.from({ length: 32 }, (_, i) => i),
-  );
+    assert.deepEqual(
+      indices.sort((a, b) => a - b),
+      Array.from({ length: 32 }, (_, i) => i),
+    );
+  }
 });
 
 // The same on worker threads: each loads the key from a store in shared memory and counts the
@@ -1333,13 +1321,13 @@ test("keys sharing a store never use an index twice", async () => {
 test("worker threads sharing a store never use an index twice", async () => {
   const buffer = new SharedArrayBuffer(COUNTERS + 4 * 32);
 
-  await pq.HSS_LMS.generateKeyPair({ parameters: LEVELS, stateStore: new SharedStore(buffer) });
+  pq.HSS_LMS.generateKeyPair({ parameters: LEVELS, stateStore: new SharedStore(buffer) });
 
   await parallel(new URL("./shared-store.ts", import.meta.url), "signFromSharedStore", Array.from({ length: 4 }, () => buffer));
 
   assert.deepEqual(Array.from(new Int32Array(buffer, COUNTERS)), Array.from({ length: 32 }, () => 1));
 
-  assert.equal((await pq.HSS_LMS.loadPrivateKey(new SharedStore(buffer))).remainingSignatures(), 0n);
+  assert.equal(pq.HSS_LMS.loadPrivateKey(new SharedStore(buffer)).remainingSignatures(), 0n);
 });
 
 // Every implementation runs these rounds on the same inputs, made by the same generator from
@@ -1465,7 +1453,7 @@ function importer(algorithm: { importPublicKey(data: Uint8Array, format: Format)
 
 // Loading builds the key's trees, so a valid state of a key larger than the budget is only
 // recorded as skipped.
-async function stateCase(rng: Random, transcript: Transcript, base: Uint8Array): Promise<void> {
+function stateCase(rng: Random, transcript: Transcript, base: Uint8Array): void {
   const stateful = [pq.HSS_LMS, pq.XMSS, pq.XMSS_MT];
 
   for (let round = 0; round < TRANSCRIPT_ROUNDS; round++) {
@@ -1490,7 +1478,7 @@ async function stateCase(rng: Random, transcript: Transcript, base: Uint8Array):
     }
 
     try {
-      const key = await algorithm.loadPrivateKey(new MemoryStore(state));
+      const key = algorithm.loadPrivateKey(new MemoryStore(state));
 
       const remaining = new Uint8Array(8);
 
@@ -1505,7 +1493,7 @@ async function stateCase(rng: Random, transcript: Transcript, base: Uint8Array):
   }
 }
 
-test("all implementations agree on untrusted input", async () => {
+test("all implementations agree on untrusted input", () => {
   const message = ascii("crypto-pq transcript");
 
   const kem = hazmat.generateKeyPair(pq.ML_KEM_768, pattern(64));
@@ -1525,11 +1513,11 @@ test("all implementations agree on untrusted input", async () => {
     ["LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1"],
   ];
 
-  const hss = await hazmat.generateStatefulKeyPair(pq.HSS_LMS, pattern(40), { parameters: levels, stateStore: new MemoryStore(), index: 33n });
+  const hss = hazmat.generateStatefulKeyPair(pq.HSS_LMS, pattern(40), { parameters: levels, stateStore: new MemoryStore(), index: 33n });
 
-  const hssSignature = await hss.privateKey.sign(message);
+  const hssSignature = hss.privateKey.sign(message);
 
-  const state = await storedState(pq.HSS_LMS, levels.slice(0, 1), pattern(40), 3n);
+  const state = storedState(pq.HSS_LMS, levels.slice(0, 1), pattern(40), 3n);
 
   const xmssPublic = concat(Uint8Array.of(0, 0, 0, 1), pattern(64));
 
@@ -1541,7 +1529,7 @@ test("all implementations agree on untrusted input", async () => {
 
   const ciphertext = encapsulation.ciphertext;
 
-  const cases: ((rng: Random, transcript: Transcript) => void | Promise<void>)[] = [
+  const cases: ((rng: Random, transcript: Transcript) => void)[] = [
     (rng, t) => importCase(rng, t, exportsOf(kem.publicKey), [importer(pq.ML_KEM_768)]),
     (rng, t) => importCase(rng, t, exportsOf(kem.privateKey), [importer(pq.ML_KEM_768, true)]),
     (rng, t) =>
@@ -1577,7 +1565,7 @@ test("all implementations agree on untrusted input", async () => {
   for (const [number, run] of cases.entries()) {
     const transcript = new Transcript();
 
-    await run(new Random(101 + number), transcript);
+    run(new Random(101 + number), transcript);
 
     digests.push(transcript.hex());
   }
@@ -1588,7 +1576,7 @@ test("all implementations agree on untrusted input", async () => {
 // Structures that random edits rarely build: an HSS signature cut inside a field or inside a
 // signed child key, counts and leaf indices beyond their range, and hint sections that claim more
 // than omega hints, repeat an index or leave padding. Verification refuses every one.
-test("verification refuses crafted structures", async () => {
+test("verification refuses crafted structures", () => {
   const message = ascii("crypto-pq edge");
 
   const levels: [string, string][] = [
@@ -1596,9 +1584,9 @@ test("verification refuses crafted structures", async () => {
     ["LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1"],
   ];
 
-  const pair = await hazmat.generateStatefulKeyPair(pq.HSS_LMS, pattern(40), { parameters: levels, stateStore: new MemoryStore(), index: 33n });
+  const pair = hazmat.generateStatefulKeyPair(pq.HSS_LMS, pattern(40), { parameters: levels, stateStore: new MemoryStore(), index: 33n });
 
-  const signature = await pair.privateKey.sign(message);
+  const signature = pair.privateKey.sign(message);
 
   // Nspk, then the first LMS signature (4956 bytes), the signed child key (48) and the second.
   const end = 4 + 4956;

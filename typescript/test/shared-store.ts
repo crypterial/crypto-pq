@@ -65,16 +65,16 @@ export class SharedStore implements pq.StateStore {
 
 // Loads the key from the shared store and signs until the key is exhausted, loading it again
 // whenever another worker has used the stored index; counts every index it signs with.
-export async function signFromSharedStore(buffer: SharedArrayBuffer): Promise<void> {
+export function signFromSharedStore(buffer: SharedArrayBuffer): void {
   const store = new SharedStore(buffer);
 
   const counters = new Int32Array(buffer, COUNTERS);
 
-  let key = await pq.HSS_LMS.loadPrivateKey(store);
+  let key = pq.HSS_LMS.loadPrivateKey(store);
 
   for (;;) {
     try {
-      const signature = await key.sign(Uint8Array.of(1));
+      const signature = key.sign(Uint8Array.of(1));
 
       Atomics.add(counters, new DataView(signature.buffer).getUint32(4), 1);
     } catch (error) {
@@ -90,7 +90,7 @@ export async function signFromSharedStore(buffer: SharedArrayBuffer): Promise<vo
         throw error;
       }
 
-      key = await pq.HSS_LMS.loadPrivateKey(store);
+      key = pq.HSS_LMS.loadPrivateKey(store);
     }
   }
 }

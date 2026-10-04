@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import * as hazmat from "../src/hazmat.ts";
 import * as pq from "../src/index.ts";
+import * as mldsa from "../src/mldsa.ts";
 import { PRE_HASHES, concat, der, hex, preHash, records, throwsCode, toHex, utf8 } from "./vectors.ts";
 
 const ALGORITHMS: Record<string, pq.SignatureAlgorithm> = {
@@ -230,6 +231,9 @@ test("ML-DSA key caches", () => {
   for (const [algorithm, [seed, sk]] of keys) {
     const pair = hazmat.generateKeyPair(algorithm, seed);
 
+    // The cache lives with the public key, which the private key reads: one per key pair.
+    assert.equal(pair.privateKey.publicKey, pair.publicKey);
+
     const imported = algorithm.importPublicKey(pair.publicKey.exportKey("raw"), "raw");
 
     const expanded = algorithm.importPrivateKey(sk, "raw");
@@ -249,6 +253,31 @@ test("ML-DSA key caches", () => {
         assert.ok(!publicKey.verify(want, Uint8Array.of(round, 1, 2, 4)), algorithm.name);
       }
     }
+  }
+});
+
+// A key that is made or imported holds tr only; signing expands Â, and only verification adds t̂1.
+test("ML-DSA keys expand their caches on first use", () => {
+  const message = utf8("m");
+
+  for (const p of [mldsa.ML_DSA_44, mldsa.ML_DSA_65, mldsa.ML_DSA_87]) {
+    const [pk, sk, cache] = mldsa.keygenInternal(new Uint8Array(32), p);
+
+    const checked = mldsa.checkPrivateKey(sk, p);
+
+    assert.ok(checked !== null);
+
+    for (const fresh of [cache, checked[1]]) {
+      assert.deepEqual([fresh.tr, fresh.matrix, fresh.t1], [pq.SHAKE256.digest(pk, 64), null, null]);
+    }
+
+    const signature = mldsa.signInternal(sk, cache, { vectors: null }, message, new Uint8Array(32), p);
+
+    assert.ok(cache.matrix !== null && cache.t1 === null);
+
+    assert.ok(mldsa.verifyInternal(pk, cache, message, signature, p));
+
+    assert.ok(cache.t1 !== null);
   }
 });
 

@@ -288,7 +288,7 @@ export function statefulTasks(name: string): [string, number][] {
   return heaviestFirst(name, "stateAfter");
 }
 
-export async function stateful([name, index]: [string, number]): Promise<void> {
+export function stateful([name, index]: [string, number]): void {
   const [header, record] = vectors(name, "stateAfter")[index];
 
   const scheme = algorithm(header.algorithm, pq.StatefulSignatureAlgorithm);
@@ -301,7 +301,7 @@ export async function stateful([name, index]: [string, number]): Promise<void> {
 
   const store = new MemoryStore();
 
-  const pair = await hazmat.generateStatefulKeyPair(scheme, hex(record.seed), {
+  const pair = hazmat.generateStatefulKeyPair(scheme, hex(record.seed), {
     parameters: parameters(record),
     stateStore: store,
     index: BigInt(record.index),
@@ -321,7 +321,7 @@ export async function stateful([name, index]: [string, number]): Promise<void> {
 
   assert.equal(pair.privateKey.remainingSignatures(), remaining, context);
 
-  assert.equal(toHex(await pair.privateKey.sign(message)), record.signature, context);
+  assert.equal(toHex(pair.privateKey.sign(message)), record.signature, context);
 
   assert.equal(toHex(store.state ?? new Uint8Array()), record.stateAfter, context);
 
@@ -332,13 +332,13 @@ export async function stateful([name, index]: [string, number]): Promise<void> {
   // The key loaded from the first state signs at the same index, the same way.
   const reloaded = new MemoryStore(hex(record.state));
 
-  const loaded = await scheme.loadPrivateKey(reloaded);
+  const loaded = scheme.loadPrivateKey(reloaded);
 
   assert.ok(loaded.publicKey.equals(pair.publicKey), context);
 
   assert.equal(loaded.remainingSignatures(), remaining, context);
 
-  assert.equal(toHex(await loaded.sign(message)), record.signature, context);
+  assert.equal(toHex(loaded.sign(message)), record.signature, context);
 
   assert.equal(toHex(reloaded.state ?? new Uint8Array()), record.stateAfter, context);
 
@@ -350,7 +350,7 @@ function field(record: Fields, name: string): Uint8Array {
 }
 
 // Runs one record of cross/errors.txt, whose input is `data` (bytes, or a string for PEM).
-export async function execute(header: Fields, record: Fields, data: Uint8Array | string): Promise<Outcome> {
+export function execute(header: Fields, record: Fields, data: Uint8Array | string): Outcome {
   const found = ALGORITHMS.get(header.algorithm);
 
   const format = record.format as pq.KeyFormat;
@@ -410,7 +410,7 @@ export async function execute(header: Fields, record: Fields, data: Uint8Array |
         case "importPublicKey":
           return { result: "ok", output: bytes(found.importPublicKey(data, format).exportKey("raw")) };
         case "generate": {
-          const pair = await hazmat.generateStatefulKeyPair(found, input, {
+          const pair = hazmat.generateStatefulKeyPair(found, input, {
             parameters: parameters(record),
             stateStore: new MemoryStore(),
             index: BigInt(record.index),
@@ -423,7 +423,7 @@ export async function execute(header: Fields, record: Fields, data: Uint8Array |
           };
         }
         case "loadPrivateKey": {
-          const privateKey = await found.loadPrivateKey(new MemoryStore(input));
+          const privateKey = found.loadPrivateKey(new MemoryStore(input));
 
           return {
             result: "ok",
@@ -432,7 +432,7 @@ export async function execute(header: Fields, record: Fields, data: Uint8Array |
           };
         }
         case "sign":
-          return { result: "ok", output: await (await found.loadPrivateKey(new MemoryStore(input))).sign(message) };
+          return { result: "ok", output: found.loadPrivateKey(new MemoryStore(input)).sign(message) };
         case "verify":
           return { result: String(found.importPublicKey(key, "raw").verify(input, message)) };
       }

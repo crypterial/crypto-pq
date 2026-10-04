@@ -5,7 +5,7 @@ import * as hazmat from "../src/hazmat.ts";
 import * as pq from "../src/index.ts";
 
 // Times one batch of iterations and returns the elapsed milliseconds.
-type Run = (iterations: number) => number | Promise<number>;
+type Run = (iterations: number) => number;
 
 interface Case {
   readonly name: string;
@@ -14,7 +14,7 @@ interface Case {
   // that repeats: the 16 ML-DSA messages, or the lower trees a stateful key rebuilds.
   readonly period: number;
 
-  prepare(): Run | Promise<Run>;
+  prepare(): Run;
 }
 
 const TARGET_MS = 1000;
@@ -37,24 +37,12 @@ function sync(operation: (i: number) => unknown): Run {
   };
 }
 
-function async(operation: (i: number) => Promise<unknown>): Run {
-  return async (iterations) => {
-    const start = performance.now();
-
-    for (let i = 0; i < iterations; i++) {
-      await operation(i);
-    }
-
-    return performance.now() - start;
-  };
-}
-
 // Grows the batch until one takes TARGET_MS, as testing.B does, and reports that batch.
-async function measure(run: Run, period: number): Promise<[number, number]> {
+function measure(run: Run, period: number): [number, number] {
   let iterations = period;
 
   for (;;) {
-    const elapsed = await run(iterations);
+    const elapsed = run(iterations);
 
     if (elapsed >= TARGET_MS) {
       return [iterations, elapsed];
@@ -196,14 +184,14 @@ function statefulCases(
   const generate = () => hazmat.generateStatefulKeyPair(algorithm, seed, { parameters, stateStore: new MemoryStore() });
 
   return [
-    { name: `${name}/keygen`, period: 1, prepare: () => async(generate) },
+    { name: `${name}/keygen`, period: 1, prepare: () => sync(generate) },
     {
       name: `${name}/sign`,
       period,
-      async prepare() {
-        let { privateKey } = await generate();
+      prepare() {
+        let { privateKey } = generate();
 
-        return async (iterations) => {
+        return (iterations) => {
           let elapsed = 0;
 
           let start = performance.now();
@@ -212,12 +200,12 @@ function statefulCases(
             if (privateKey.remainingSignatures() === 0n) {
               elapsed += performance.now() - start;
 
-              ({ privateKey } = await generate());
+              ({ privateKey } = generate());
 
               start = performance.now();
             }
 
-            await privateKey.sign(MESSAGES[i & 15]);
+            privateKey.sign(MESSAGES[i & 15]);
           }
 
           return elapsed + performance.now() - start;
@@ -227,10 +215,10 @@ function statefulCases(
     {
       name: `${name}/verify`,
       period: 1,
-      async prepare() {
-        const { publicKey, privateKey } = await generate();
+      prepare() {
+        const { publicKey, privateKey } = generate();
 
-        const signature = await privateKey.sign(MESSAGES[0]);
+        const signature = privateKey.sign(MESSAGES[0]);
 
         return sync(() => publicKey.verify(signature, MESSAGES[0]));
       },
@@ -285,7 +273,7 @@ for (const { name, period, prepare } of CASES) {
     continue;
   }
 
-  const [iterations, elapsed] = await measure(await prepare(), period);
+  const [iterations, elapsed] = measure(prepare(), period);
 
   const micros = ((1000 * elapsed) / iterations).toFixed(2);
 

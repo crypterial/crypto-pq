@@ -21,7 +21,7 @@ test("cross XMSS vectors", () => parallel(CHECKS, "stateful", statefulTasks("cro
 
 // Every disagreement is collected, so that one run lists them all. PEM input is also given as a
 // string, which the import functions accept too.
-test("cross error codes", async () => {
+test("cross error codes", () => {
   const cases = vectors("cross/errors.txt", "result");
 
   const failures: string[] = [];
@@ -30,7 +30,7 @@ test("cross error codes", async () => {
     const data = hex(record.input ?? "");
 
     for (const value of record.format === "pem" ? [data, latin1(data)] : [data]) {
-      const outcome = await execute(header, record, value);
+      const outcome = execute(header, record, value);
 
       const output = record.output !== undefined && toHex(outcome.output ?? new Uint8Array()) !== record.output;
 

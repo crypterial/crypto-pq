@@ -767,7 +767,8 @@ function power2Round(t: Int32Array[], high: boolean): Int32Array[] {
 // What verification and signing derive from a public key, kept with the key object and shared by a
 // private key with its public key: tr, Â in the NTT domain, entry [r][s] being
 // RejNTTPoly(rho || s || r), and t̂1 = NTT(t1 2^d), which only verification reads. Each is computed on
-// first use unless the key's creator supplies it.
+// first use, so that a key made or imported but never used holds none of them; only tr, which a
+// key's creator already has, may come with the key.
 export interface PublicCache {
   tr: Uint8Array | null;
 
@@ -781,8 +782,8 @@ export interface SecretCache {
   vectors: [Int32Array[], Int32Array[], Int32Array[]] | null;
 }
 
-export function publicCache(tr: Uint8Array | null = null, a: Int32Array[][] | null = null): PublicCache {
-  return { tr, matrix: a, t1: null };
+export function publicCache(tr: Uint8Array | null = null): PublicCache {
+  return { tr, matrix: null, t1: null };
 }
 
 function t1Hat(pk: Uint8Array, p: Parameters): Int32Array[] {
@@ -797,7 +798,7 @@ function t1Hat(pk: Uint8Array, p: Parameters): Int32Array[] {
   });
 }
 
-// Also returns the cache of the new public key, which key generation fills.
+// Also returns the cache of the new public key, holding tr; Â is expanded again on first use.
 export function keygenInternal(xi: Uint8Array, p: Parameters): [Uint8Array, Uint8Array, PublicCache] {
   const expanded = shake256(128, xi, Uint8Array.of(p.k, p.l));
 
@@ -819,12 +820,12 @@ export function keygenInternal(xi: Uint8Array, p: Parameters): [Uint8Array, Uint
 
   wipe(expanded, ...s1, ...s2, ...t, ...t0);
 
-  return [pk, sk, publicCache(tr, a)];
+  return [pk, sk, publicCache(tr)];
 }
 
 // An expanded private key carries everything needed to rebuild the public key, so a key whose
 // parts disagree is rejected instead of producing signatures that never verify. Also returns the
-// cache of the public key, which the check fills.
+// cache of the public key, holding tr.
 export function checkPrivateKey(sk: Uint8Array, p: Parameters): [Uint8Array, PublicCache] | null {
   const { rho, tr, s1, s2, t0 } = skDecode(sk, p);
 
@@ -853,7 +854,7 @@ export function checkPrivateKey(sk: Uint8Array, p: Parameters): [Uint8Array, Pub
 
     wipe(...t);
 
-    return bad === 0 && equal(shake256(64, pk), tr) ? [pk, publicCache(tr.slice(), a)] : null;
+    return bad === 0 && equal(shake256(64, pk), tr) ? [pk, publicCache(tr.slice())] : null;
   } finally {
     wipe(...s1, ...s2, ...t0);
   }

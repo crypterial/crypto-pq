@@ -67,4 +67,10 @@ export {
   StatefulSignatureAlgorithm,
 } from "./stateful.ts";
 
-export type { StateStore, StatefulKeyGenOptions, StatefulKeyPair, StatefulParameters } from "./stateful.ts";
+export type {
+  StateStore,
+  StatefulKeyGenOptions,
+  StatefulKeyPair,
+  StatefulLoadOptions,
+  StatefulParameters,
+} from "./stateful.ts";

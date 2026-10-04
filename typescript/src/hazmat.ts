@@ -48,11 +48,11 @@ export function generateKeyPair(
   throw new TypeError("algorithm must be a KemAlgorithm or a SignatureAlgorithm");
 }
 
-export async function generateStatefulKeyPair(
+export function generateStatefulKeyPair(
   algorithm: StatefulSignatureAlgorithm,
   seed: Uint8Array,
   options: HazmatStatefulOptions,
-): Promise<StatefulKeyPair> {
+): StatefulKeyPair {
   if (!(algorithm instanceof StatefulSignatureAlgorithm)) {
     throw new TypeError("algorithm must be a StatefulSignatureAlgorithm");
   }

@@ -658,7 +658,7 @@ class Tree {
       return digest(lms.shake, lms.m, id, uint32(2 ** (lms.h - z - 1) + j), D_INTR, left, right);
     };
 
-    this.merkle = new MerkleTree(lms.h, leaf, combine);
+    this.merkle = new MerkleTree(lms.h, lms.m, leaf, combine);
 
     this.publicKey = concat(uint32(lms.code), uint32(ots.code), id, this.merkle.root);
   }
@@ -666,7 +666,7 @@ class Tree {
   sign(q: number, message: Uint8Array): Uint8Array {
     const otsSignature = otsSign(this.#chains, this.ots, this.id, q, this.seed, message);
 
-    return concat(uint32(q), otsSignature, uint32(this.lms.code), ...this.merkle.authPath(q));
+    return concat(uint32(q), otsSignature, uint32(this.lms.code), this.merkle.authPath(q));
   }
 
   child(lms: LmsType, ots: OtsType, q: number): Tree {

@@ -115,14 +115,6 @@ export function throwsCode(code: pq.ErrorCode, function_: () => unknown, message
   assert.throws(function_, isCode(code), message);
 }
 
-export async function rejectsCode(
-  code: pq.ErrorCode,
-  function_: () => Promise<unknown>,
-  message?: string,
-): Promise<void> {
-  await assert.rejects(function_, isCode(code), message);
-}
-
 export class MemoryStore implements pq.StateStore {
   state: Uint8Array | null;
 

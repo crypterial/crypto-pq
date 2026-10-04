@@ -983,7 +983,7 @@ function subtree(hashes: Hashes, layer: number, tree: bigint): MerkleTree {
     return randHash(hashes, left, right, adrs);
   };
 
-  return new MerkleTree(hashes.p.treeHeight, (index) => hashes.leaf(layer, tree, index), combine);
+  return new MerkleTree(hashes.p.treeHeight, hashes.p.n, (index) => hashes.leaf(layer, tree, index), combine);
 }
 
 function messageDigest(p: Parameters, r: Uint8Array, root: Uint8Array, index: bigint, message: Uint8Array): Uint8Array {
@@ -1072,6 +1072,11 @@ export class Xmss {
 
   readonly #trees = new Map<number, [bigint, MerkleTree]>();
 
+  // The part of the signature from each layer above the bottom one, which depends only on the index
+  // shifted right by layer * h' bits: it is kept until that value changes, as HSS keeps its signed
+  // child keys, and signing the same root again with the same WOTS+ key gives the same bytes.
+  readonly #signed = new Map<number, [bigint, Uint8Array]>();
+
   constructor(p: Parameters, skSeed: Uint8Array, skPrf: Uint8Array, pubSeed: Uint8Array) {
     this.p = p;
 
@@ -1109,30 +1114,46 @@ export class Xmss {
 
     const r = hashFunction(p, PRF, this.#skPrf, indexBytes);
 
-    let node = messageDigest(p, r, this.root, index, message);
+    const node = messageDigest(p, r, this.root, index, message);
 
-    const out = [uint64(index).subarray(8 - p.indexSize), r];
+    const out = [uint64(index).subarray(8 - p.indexSize), r, this.#layer(0, index, node)];
 
-    const mask = (1n << BigInt(p.treeHeight)) - 1n;
-
-    for (let layer = 0; layer < p.d; layer++) {
-      const leafIndex = Number(index & mask);
-
-      index >>= BigInt(p.treeHeight);
-
-      const ots = address(layer, index, OTS);
-
-      setWord(ots, 4, leafIndex);
-
-      out.push(...wotsSign(this.#hashes, node, ots));
-
-      const tree = this.#tree(layer, index);
-
-      out.push(...tree.authPath(leafIndex));
-
-      node = tree.root;
+    for (let layer = 1; layer < p.d; layer++) {
+      out.push(this.#upper(layer, index >> BigInt(layer * p.treeHeight)));
     }
 
     return concat(...out);
+  }
+
+  // One layer's part of a signature: the WOTS+ signature of node by leaf (at mod 2^h') of tree
+  // (at >> h') on that layer, then the authentication path of that leaf.
+  #layer(layer: number, at: bigint, node: Uint8Array): Uint8Array {
+    const p = this.p;
+
+    const leafIndex = Number(at & ((1n << BigInt(p.treeHeight)) - 1n));
+
+    const tree = at >> BigInt(p.treeHeight);
+
+    const ots = address(layer, tree, OTS);
+
+    setWord(ots, 4, leafIndex);
+
+    return concat(...wotsSign(this.#hashes, node, ots), this.#tree(layer, tree).authPath(leafIndex));
+  }
+
+  // An upper layer's part, which signs the root of tree (at) on the layer below. Layers are visited
+  // from the bottom up, so that tree is already cached whenever the part has to be made again.
+  #upper(layer: number, at: bigint): Uint8Array {
+    const cached = this.#signed.get(layer);
+
+    if (cached !== undefined && cached[0] === at) {
+      return cached[1];
+    }
+
+    const part = this.#layer(layer, at, this.#tree(layer - 1, at).root);
+
+    this.#signed.set(layer, [at, part]);
+
+    return part;
   }
 }
