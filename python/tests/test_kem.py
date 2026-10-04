@@ -232,6 +232,39 @@ class KemApiTest(unittest.TestCase):
 
                 self.assertEqual(results, [(expected[i % 3], secrets[i % 3]) for i in range(4)])
 
+    # The matrix and the secret forms are derived at first use, not when a key is made or
+    # imported, and a key pair holds one public cache: its public key shares the one inside its
+    # private key.
+    def test_lazy_shared_cache(self):
+        def caches(public_key, private_key):
+            public, private = public_key._state, private_key._state
+
+            # X-Wing pairs the ML-KEM-768 key with its X25519 part.
+            return (public[0], private[0]) if isinstance(public, tuple) else (public, private)
+
+        for algorithm in (*ALGORITHMS.values(), crypto_pq.X_WING):
+            with self.subTest(algorithm=algorithm.name):
+                pair = hazmat.generate_key_pair(algorithm, bytes(range(algorithm._backend.seed_size)))
+
+                public, private = caches(pair.public_key, pair.private_key)
+
+                self.assertIs(public, private.public)
+
+                self.assertIs(caches(pair.private_key.public_key, pair.private_key)[0], public)
+
+                imported = caches(algorithm.import_public_key(pair.public_key.export_key("raw"), "raw"), algorithm.import_private_key(pair.private_key.export_key("raw"), "raw"))
+
+                for key, cache in ((public, private), imported):
+                    self.assertEqual((key._state, cache._secret, cache.public._state), (None, None, None))
+
+                encapsulation = pair.public_key.encapsulate()
+
+                self.assertEqual(pair.private_key.decapsulate(encapsulation.ciphertext), encapsulation.shared_secret)
+
+                self.assertIsNotNone(private.public._state)
+
+                self.assertIsNotNone(private._secret)
+
     def test_formats(self):
         for algorithm in ALGORITHMS.values():
             with self.subTest(algorithm=algorithm.name):

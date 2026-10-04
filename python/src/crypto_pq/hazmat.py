@@ -10,7 +10,7 @@ from typing import overload
 from ._kem import Encapsulation, KemAlgorithm, KemKeyPair, KemPublicKey
 from ._keys import require_bytes, require_length
 from ._signature import SignatureAlgorithm, SignatureKeyPair, SignaturePrivateKey, SignaturePublicKey, _Bytes, _PreHash
-from ._stateful import StatefulKeyPair, StatefulSignatureAlgorithm, StateStore
+from ._stateful import StatefulKeyPair, StatefulSignatureAlgorithm, StateStore, require_reserve
 
 
 @overload
@@ -22,19 +22,21 @@ def generate_key_pair(algorithm: SignatureAlgorithm, seed: _Bytes) -> SignatureK
 
 
 @overload
-def generate_key_pair(algorithm: StatefulSignatureAlgorithm, seed: _Bytes, *, parameters: str | Sequence[tuple[str, str]], state_store: StateStore, index: int = 0) -> StatefulKeyPair: ...
+def generate_key_pair(algorithm: StatefulSignatureAlgorithm, seed: _Bytes, *, parameters: str | Sequence[tuple[str, str]], state_store: StateStore, index: int = 0, reserve: int = 1) -> StatefulKeyPair: ...
 
 
 # Stateful seeds are I || SEED of the top LMS tree, or SK_SEED || SK_PRF || PUB_SEED for XMSS.
-def generate_key_pair(algorithm: KemAlgorithm | SignatureAlgorithm | StatefulSignatureAlgorithm, seed: _Bytes, *, parameters: str | Sequence[tuple[str, str]] | None = None, state_store: StateStore | None = None, index: int = 0) -> KemKeyPair | SignatureKeyPair | StatefulKeyPair:
+def generate_key_pair(algorithm: KemAlgorithm | SignatureAlgorithm | StatefulSignatureAlgorithm, seed: _Bytes, *, parameters: str | Sequence[tuple[str, str]] | None = None, state_store: StateStore | None = None, index: int = 0, reserve: int = 1) -> KemKeyPair | SignatureKeyPair | StatefulKeyPair:
     seed = require_bytes(seed, "seed")
 
     if isinstance(algorithm, StatefulSignatureAlgorithm):
         parameters = algorithm._backend.parameters(parameters)
 
+        require_reserve(reserve)
+
         require_length(seed, algorithm._backend.seed_size(parameters), "seed")
 
-        return algorithm._create(parameters, seed, index, state_store)
+        return algorithm._create(parameters, seed, index, state_store, reserve)
 
     if isinstance(algorithm, KemAlgorithm):
         require_length(seed, algorithm._backend.seed_size, "seed")

@@ -409,7 +409,11 @@ def verify(p, public_key, message, signature):
 
 
 class Xmss:
-    """The signing side of an XMSS or XMSS^MT key, with one cached tree per layer."""
+    """The signing side of an XMSS or XMSS^MT key, with one cached tree per layer.
+
+    Above layer 0 a layer's part of the signature, the WOTS+ signature of the root below and its
+    authentication path, depends only on index >> (layer * h / d). It is kept until that value
+    changes, as HSS keeps its signed child keys, so most signatures sign layer 0 only."""
 
     def __init__(self, p, sk_seed, sk_prf, pub_seed):
         self.p = p
@@ -421,6 +425,8 @@ class Xmss:
         self.pub_seed = pub_seed
 
         self.trees = {}
+
+        self.signed = {}
 
         self.root = self._tree(p.d - 1, 0).root
 
@@ -442,6 +448,26 @@ class Xmss:
 
         return cached[1]
 
+    # The part of layer `layer` signs the root of tree `prefix` of the layer below with leaf
+    # prefix mod 2^(h/d) of tree prefix >> (h/d).
+    def _layer(self, layer, prefix):
+        cached = self.signed.get(layer)
+
+        if cached is None or cached[0] != prefix:
+            p = self.p
+
+            leaf, tree = prefix & ((1 << p.tree_height) - 1), prefix >> p.tree_height
+
+            node = self._tree(layer - 1, prefix).root
+
+            part = wots_sign(p, node, self.sk_seed, self.pub_seed, layer, tree, leaf) + b"".join(self._tree(layer, tree).auth_path(leaf))
+
+            cached = (prefix, part)
+
+            self.signed[layer] = cached
+
+        return cached[1]
+
     def sign(self, index, message):
         p = self.p
 
@@ -449,19 +475,12 @@ class Xmss:
 
         node = message_digest(p, r, self.root, index, message)
 
-        out = [index.to_bytes(p.index_size, "big"), r]
+        leaf, tree = index & ((1 << p.tree_height) - 1), index >> p.tree_height
 
-        for layer in range(p.d):
-            leaf_index = index & ((1 << p.tree_height) - 1)
+        out = [index.to_bytes(p.index_size, "big"), r, wots_sign(p, node, self.sk_seed, self.pub_seed, 0, tree, leaf)]
 
-            index >>= p.tree_height
+        out += self._tree(0, tree).auth_path(leaf)
 
-            out.append(wots_sign(p, node, self.sk_seed, self.pub_seed, layer, index, leaf_index))
-
-            tree = self._tree(layer, index)
-
-            out += tree.auth_path(leaf_index)
-
-            node = tree.root
+        out += [self._layer(layer, index >> (layer * p.tree_height)) for layer in range(1, p.d)]
 
         return b"".join(out)

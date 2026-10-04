@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 import tracemalloc
 import unittest
 
@@ -1119,8 +1120,9 @@ class ConcurrencyTest(RobustnessCase):
     def indices(self, signatures):
         return [int.from_bytes(signature[4:8], "big") for signature in signatures]
 
-    # One key shared by many threads: the lock hands out every index once, and the store sees
-    # each write.
+    # One key shared by many threads: a call that finds the key busy fails at once with
+    # STATE_CONFLICT and changes nothing, so callers that try again still get every index once,
+    # and the store sees each write.
     def test_shared_key(self):
         store = MemoryStore()
 
@@ -1129,10 +1131,18 @@ class ConcurrencyTest(RobustnessCase):
         signatures, failures = [], []
 
         def sign(i):
-            try:
-                signatures.append(pair.private_key.sign(bytes([i])))
-            except CryptoPQError as error:
-                failures.append(error.code)
+            while True:
+                try:
+                    signatures.append(pair.private_key.sign(bytes([i])))
+
+                    return
+                except CryptoPQError as error:
+                    if error.code is not ErrorCode.STATE_CONFLICT:
+                        failures.append(error.code)
+
+                        return
+
+                time.sleep(0.001)
 
         threads = [threading.Thread(target=sign, args=(i,)) for i in range(40)]
 

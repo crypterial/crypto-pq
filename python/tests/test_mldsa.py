@@ -222,6 +222,35 @@ class SignatureApiTest(unittest.TestCase):
 
                 self.assertEqual(results, [(sig, True) for sig in expected])
 
+    # The matrix and the secret forms are derived at first use, not when a key is made or
+    # imported, and a key pair holds one public cache: its public key shares the one inside its
+    # private key.
+    def test_lazy_shared_cache(self):
+        for algorithm in ALGORITHMS.values():
+            with self.subTest(algorithm=algorithm.name):
+                pair = hazmat.generate_key_pair(algorithm, bytes(range(32)))
+
+                public, private = pair.public_key._state, pair.private_key._state
+
+                self.assertIs(public, private.public)
+
+                self.assertIs(pair.private_key.public_key._state, public)
+
+                imported = algorithm.import_public_key(pair.public_key.export_key("raw"), "raw")._state, algorithm.import_private_key(pair.private_key.export_key("raw"), "raw")._state
+
+                for key, cache in ((public, private), imported):
+                    self.assertEqual((key._matrix, key._t1, cache._secrets, cache.public._matrix), (None, None, None, None))
+
+                signature = pair.private_key.sign(b"message")
+
+                self.assertTrue(pair.public_key.verify(signature, b"message"))
+
+                self.assertIsNotNone(private.public._matrix)
+
+                self.assertIsNotNone(private.public._t1)
+
+                self.assertIsNotNone(private._secrets)
+
     def test_round_trip(self):
         for algorithm in ALGORITHMS.values():
             with self.subTest(algorithm=algorithm.name):

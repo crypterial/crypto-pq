@@ -38,6 +38,13 @@ def require_store(store):
     return store
 
 
+def require_reserve(reserve):
+    if isinstance(reserve, bool) or not isinstance(reserve, int) or reserve < 1:
+        raise option("reserve must be a positive integer")
+
+    return reserve
+
+
 # State blob: version, kind, the parameters, the secret seeds and the next index, closed by the
 # first 16 bytes of its SHA-256 so that a damaged state is refused rather than reused.
 def seal(body):
@@ -225,9 +232,9 @@ class StatefulPublicKey:
 
 
 class StatefulPrivateKey:
-    __slots__ = ("_algorithm", "_parameters", "_seed", "_signer", "_store", "_state", "_index", "_lock")
+    __slots__ = ("_algorithm", "_parameters", "_seed", "_signer", "_store", "_state", "_index", "_reserved", "_reserve", "_capacity", "_busy")
 
-    def __init__(self, algorithm, parameters, seed, signer, store, state, index):
+    def __init__(self, algorithm, parameters, seed, signer, store, state, index, reserve):
         self._algorithm = algorithm
 
         self._parameters = parameters
@@ -240,9 +247,17 @@ class StatefulPrivateKey:
 
         self._state = state
 
+        # `index` is the next index to sign with; `reserved` is the index that the store holds,
+        # never below it. The indices in between were claimed by one store write.
         self._index = index
 
-        self._lock = threading.Lock()
+        self._reserved = index
+
+        self._reserve = reserve
+
+        self._capacity = signer.capacity
+
+        self._busy = threading.Lock()
 
     @property
     def algorithm(self) -> StatefulSignatureAlgorithm:
@@ -252,22 +267,36 @@ class StatefulPrivateKey:
     def public_key(self) -> StatefulPublicKey:
         return StatefulPublicKey(self._algorithm, self._signer.public_key)
 
+    # A plain read without the lock, so that a store may call it from inside update().
     def remaining_signatures(self) -> int:
-        with self._lock:
-            return self._signer.capacity - self._index
+        return self._capacity - self._index
 
-    # The next index is written to the store before the signature exists, so a crash or a failed
-    # write can waste an index but never use one twice.
+    # A call that finds the key busy, from another thread or from inside the store's update(),
+    # fails at once instead of waiting: waiting would deadlock the re-entrant call and stall the
+    # others for as long as a tree rebuild takes.
     def sign(self, message: _Bytes) -> bytes:
         message = require_bytes(message, "message")
 
-        with self._lock:
-            index = self._index
+        if not self._busy.acquire(blocking=False):
+            raise CryptoPQError(ErrorCode.STATE_CONFLICT, "the key is signing in another call")
 
-            if index >= self._signer.capacity:
-                raise CryptoPQError(ErrorCode.KEY_EXHAUSTED, "every one-time key has been used")
+        try:
+            return self._sign(message)
+        finally:
+            self._busy.release()
 
-            state = self._algorithm._backend.encode(self._parameters, self._seed, index + 1)
+    # The store receives the end of the next reserved range before any index of that range
+    # signs, so a crash or a failed write can waste indices but never use one twice.
+    def _sign(self, message):
+        index = self._index
+
+        if index >= self._capacity:
+            raise CryptoPQError(ErrorCode.KEY_EXHAUSTED, "every one-time key has been used")
+
+        if index == self._reserved:
+            reserved = min(index + self._reserve, self._capacity)
+
+            state = self._algorithm._backend.encode(self._parameters, self._seed, reserved)
 
             try:
                 updated = self._store.update(self._state, state)
@@ -277,11 +306,13 @@ class StatefulPrivateKey:
             if updated is not True:
                 raise CryptoPQError(ErrorCode.STATE_CONFLICT, "the stored key state changed; load the key again")
 
-            self._state = state
+            # Python cannot wipe bytes, so the superseded blob, which holds the seed, stays in
+            # memory until its space is reused.
+            self._state, self._reserved = state, reserved
 
-            self._index = index + 1
+        self._index = index + 1
 
-            return self._signer.sign(index, message)
+        return self._signer.sign(index, message)
 
     def __repr__(self) -> str:
         return f"<StatefulPrivateKey {self._algorithm.name}>"
@@ -305,12 +336,16 @@ class StatefulSignatureAlgorithm:
     def name(self) -> str:
         return self._name
 
-    def generate_key_pair(self, *, parameters: str | Sequence[tuple[str, str]], state_store: StateStore) -> StatefulKeyPair:
+    # `reserve` is how many indices one store write claims. It is not part of the stored state: a
+    # stored index is always the first one not handed out, whatever claimed it.
+    def generate_key_pair(self, *, parameters: str | Sequence[tuple[str, str]], state_store: StateStore, reserve: int = 1) -> StatefulKeyPair:
         parameters = self._backend.parameters(parameters)
 
-        return self._create(parameters, random_bytes(self._backend.seed_size(parameters)), 0, state_store)
+        require_reserve(reserve)
 
-    def _create(self, parameters, seed, index, store):
+        return self._create(parameters, random_bytes(self._backend.seed_size(parameters)), 0, state_store, reserve)
+
+    def _create(self, parameters, seed, index, store, reserve):
         require_store(store)
 
         signer = self._backend.signer(parameters, seed)
@@ -328,11 +363,15 @@ class StatefulSignatureAlgorithm:
         if created is not True:
             raise CryptoPQError(ErrorCode.STATE_CONFLICT, "the state store already holds a key")
 
-        private_key = StatefulPrivateKey(self, parameters, seed, signer, store, state, index)
+        private_key = StatefulPrivateKey(self, parameters, seed, signer, store, state, index, reserve)
 
         return StatefulKeyPair(private_key.public_key, private_key)
 
-    def load_private_key(self, state_store: StateStore) -> StatefulPrivateKey:
+    # The key resumes at the stored index, so the indices that a previous key reserved and never
+    # used are skipped, never reused.
+    def load_private_key(self, state_store: StateStore, *, reserve: int = 1) -> StatefulPrivateKey:
+        require_reserve(reserve)
+
         require_store(state_store)
 
         try:
@@ -350,7 +389,7 @@ class StatefulSignatureAlgorithm:
         if index > signer.capacity:
             raise mismatch("the stored index is beyond the key's capacity")
 
-        return StatefulPrivateKey(self, parameters, seed, signer, state_store, bytes(state), index)
+        return StatefulPrivateKey(self, parameters, seed, signer, state_store, bytes(state), index, reserve)
 
     def import_public_key(self, data: _Bytes | str, format: KeyFormat | str) -> StatefulPublicKey:
         key = import_public(format, data, self._backend.oid)

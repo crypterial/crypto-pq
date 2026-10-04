@@ -1,8 +1,10 @@
 import os
+import threading
 import unittest
+from unittest import mock
 
 import crypto_pq
-from crypto_pq import HSS_LMS, XMSS, XMSS_MT, CryptoPQError, ErrorCode, hazmat
+from crypto_pq import HSS_LMS, XMSS, XMSS_MT, CryptoPQError, ErrorCode, _xmss, hazmat
 from vectors import records, unhex
 
 SLOW = bool(os.environ.get("CRYPTO_PQ_SLOW"))
@@ -32,6 +34,35 @@ class BrokenStore(MemoryStore):
             return super().update(previous, next)
 
         raise OSError("disk full")
+
+
+class RecordingStore(MemoryStore):
+    def __init__(self, state=None):
+        super().__init__(state)
+
+        self.written = []
+
+    def update(self, previous, next):
+        self.written.append(next)
+
+        return super().update(previous, next)
+
+    # The index of each HSS state written: its last 8 bytes before the 16-byte checksum.
+    def indices(self):
+        return [int.from_bytes(state[-24:-16], "big") for state in self.written]
+
+
+class CallbackStore(MemoryStore):
+    def __init__(self, callback):
+        super().__init__()
+
+        self.callback = callback
+
+    def update(self, previous, next):
+        if previous is not None:
+            self.callback()
+
+        return super().update(previous, next)
 
 
 def lms_names(public_key):
@@ -247,6 +278,106 @@ class HssTest(unittest.TestCase):
 
         self.assertNotEqual(signatures[0][4:8], signatures[1][4:8])
 
+    # With reserve = 3 one store write claims three indices, and the signatures are those of
+    # reserve = 1. A key loaded after a stop resumes at the stored index: the indices claimed and
+    # never used are lost, not reused.
+    def test_reserve(self):
+        seed = bytes(range(40))
+
+        store = RecordingStore()
+
+        pair = hazmat.generate_key_pair(HSS_LMS, seed, parameters=SMALL, state_store=store, reserve=3)
+
+        signatures = [pair.private_key.sign(bytes([i])) for i in range(7)]
+
+        self.assertEqual(store.indices(), [0, 3, 6, 9])
+
+        self.assertEqual(pair.private_key.remaining_signatures(), 25)
+
+        reference = hazmat.generate_key_pair(HSS_LMS, seed, parameters=SMALL, state_store=MemoryStore()).private_key
+
+        self.assertEqual(signatures, [reference.sign(bytes([i])) for i in range(7)])
+
+        loaded = HSS_LMS.load_private_key(store, reserve=4)
+
+        self.assertEqual(loaded.remaining_signatures(), 23)
+
+        resumed = hazmat.generate_key_pair(HSS_LMS, seed, parameters=SMALL, state_store=MemoryStore(), index=9).private_key
+
+        self.assertEqual(loaded.sign(b"m"), resumed.sign(b"m"))
+
+        self.assertEqual(store.indices()[-1], 13)
+
+        # A reservation stops at the capacity.
+        store = RecordingStore()
+
+        last = hazmat.generate_key_pair(HSS_LMS, seed, parameters=SMALL, state_store=store, index=30, reserve=5).private_key
+
+        for message in (b"a", b"b"):
+            last.sign(message)
+
+        self.assertEqual(store.indices(), [30, 32])
+
+        self.assertCode(ErrorCode.KEY_EXHAUSTED, last.sign, b"c")
+
+    def test_reserve_option(self):
+        for reserve in (0, -1, 1.5, True, None, "2"):
+            with self.subTest(reserve=reserve):
+                store = MemoryStore()
+
+                self.assertCode(ErrorCode.INVALID_OPTION, HSS_LMS.generate_key_pair, parameters=SMALL, state_store=store, reserve=reserve)
+
+                self.assertCode(ErrorCode.INVALID_OPTION, hazmat.generate_key_pair, HSS_LMS, bytes(40), parameters=SMALL, state_store=store, reserve=reserve)
+
+                self.assertIsNone(store.state)
+
+                self.assertCode(ErrorCode.INVALID_OPTION, XMSS_MT.load_private_key, store, reserve=reserve)
+
+    # A sign that finds the key busy fails at once, whether it comes from inside the store's
+    # update() or from another thread, and remaining_signatures() answers from inside update().
+    # The outer call runs in a daemon thread so that a deadlock fails the test instead of hanging.
+    def test_busy_key(self):
+        seen = []
+
+        def attempt():
+            try:
+                key.sign(b"inner")
+            except CryptoPQError as error:
+                seen.append(error.code)
+
+        def during_update():
+            seen.append(key.remaining_signatures())
+
+            attempt()
+
+            other = threading.Thread(target=attempt)
+
+            other.start()
+
+            other.join(10)
+
+            seen.append(other.is_alive())
+
+        pair = HSS_LMS.generate_key_pair(parameters=SMALL, state_store=CallbackStore(during_update))
+
+        key = pair.private_key
+
+        signed = []
+
+        outer = threading.Thread(target=lambda: signed.append(key.sign(b"outer")), daemon=True)
+
+        outer.start()
+
+        outer.join(60)
+
+        self.assertFalse(outer.is_alive())
+
+        self.assertEqual(seen, [32, ErrorCode.STATE_CONFLICT, ErrorCode.STATE_CONFLICT, False])
+
+        self.assertTrue(pair.public_key.verify(signed[0], b"outer"))
+
+        self.assertEqual(key.remaining_signatures(), 31)
+
     def test_formats(self):
         pair = HSS_LMS.generate_key_pair(parameters=SMALL, state_store=MemoryStore())
 
@@ -264,6 +395,8 @@ class HssTest(unittest.TestCase):
 
 class XmssTest(unittest.TestCase):
     def test_reference_vectors(self):
+        following = None
+
         for _, record in records("xmss/xmss.txt", "signature"):
             name = record["name"]
 
@@ -289,11 +422,33 @@ class XmssTest(unittest.TestCase):
                 if not SLOW and name.split("_")[1] != "20/4":
                     continue
 
-                pair = hazmat.generate_key_pair(algorithm, unhex(record["seed"]), parameters=name, state_store=MemoryStore(), index=index)
+                # The vectors at consecutive indices come from one key, so the key that made the
+                # first signs the next as well, with the upper-layer parts it kept.
+                if (name, record["seed"], index) != following:
+                    pair = hazmat.generate_key_pair(algorithm, unhex(record["seed"]), parameters=name, state_store=MemoryStore(), index=index)
 
-                self.assertEqual(pair.public_key.export_key("raw"), public)
+                    self.assertEqual(pair.public_key.export_key("raw"), public)
 
                 self.assertEqual(pair.private_key.sign(message), signature)
+
+                following = (name, record["seed"], index + 1)
+
+    # From index 31 to 33 the signatures cross the edge of a lowest tree: the layer-1 part is
+    # signed again at 32 only, and the parts above it are signed once.
+    def test_layer_cache(self):
+        pair = hazmat.generate_key_pair(XMSS_MT, bytes(range(72)), parameters="XMSSMT-SHA2_20/4_192", state_store=MemoryStore(), index=31)
+
+        with mock.patch.object(_xmss, "wots_sign", wraps=_xmss.wots_sign) as wots_sign:
+            for index, layers in ((31, 4), (32, 2), (33, 1)):
+                wots_sign.reset_mock()
+
+                signature = pair.private_key.sign(bytes([index]))
+
+                self.assertEqual(wots_sign.call_count, layers)
+
+                self.assertEqual(int.from_bytes(signature[:3], "big"), index)
+
+                self.assertTrue(pair.public_key.verify(signature, bytes([index])))
 
     def test_state_handling(self):
         store = MemoryStore()
