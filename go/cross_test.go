@@ -413,7 +413,7 @@ func crossStatefulKeys(t *testing.T, name string) {
 			// The key loaded from the first state signs at the same index, the same way.
 			store = &memoryStore{state: state}
 
-			loaded, err := algorithm.LoadPrivateKey(store)
+			loaded, err := algorithm.LoadPrivateKey(store, nil)
 
 			check(t, err)
 
@@ -517,7 +517,7 @@ func crossExecute(t *testing.T, r record) crossOutcome {
 
 			return crossCounted(export(t, pair.PublicKey, cryptopq.RAW), pair.PrivateKey.RemainingSignatures(), nil)
 		case "loadPrivateKey":
-			privateKey, err := algorithm.LoadPrivateKey(&memoryStore{state: data})
+			privateKey, err := algorithm.LoadPrivateKey(&memoryStore{state: data}, nil)
 
 			if err != nil {
 				return crossFinished(nil, err)
@@ -525,7 +525,7 @@ func crossExecute(t *testing.T, r record) crossOutcome {
 
 			return crossCounted(export(t, privateKey.PublicKey(), cryptopq.RAW), privateKey.RemainingSignatures(), nil)
 		case "sign":
-			privateKey, err := algorithm.LoadPrivateKey(&memoryStore{state: data})
+			privateKey, err := algorithm.LoadPrivateKey(&memoryStore{state: data}, nil)
 
 			if err != nil {
 				return crossFinished(nil, err)

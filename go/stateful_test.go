@@ -6,10 +6,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	cryptopq "github.com/crypterial/crypto-pq-go"
 )
@@ -234,7 +236,7 @@ func TestHssStateHandling(t *testing.T) {
 		t.Fatalf("remaining %d", pair.PrivateKey.RemainingSignatures())
 	}
 
-	loaded, err := cryptopq.HSS_LMS.LoadPrivateKey(store)
+	loaded, err := cryptopq.HSS_LMS.LoadPrivateKey(store, nil)
 
 	check(t, err)
 
@@ -260,7 +262,7 @@ func TestHssStateHandling(t *testing.T) {
 
 	expectCode(t, err, cryptopq.KEY_EXHAUSTED)
 
-	exhausted, err := cryptopq.HSS_LMS.LoadPrivateKey(store)
+	exhausted, err := cryptopq.HSS_LMS.LoadPrivateKey(store, nil)
 
 	check(t, err)
 
@@ -296,23 +298,23 @@ func TestHssStoreFailures(t *testing.T) {
 
 	damaged[len(damaged)-20] ^= 1
 
-	_, err = cryptopq.HSS_LMS.LoadPrivateKey(&memoryStore{state: damaged})
+	_, err = cryptopq.HSS_LMS.LoadPrivateKey(&memoryStore{state: damaged}, nil)
 
 	expectCode(t, err, cryptopq.INVALID_PRIVATE_KEY)
 
-	_, err = cryptopq.HSS_LMS.LoadPrivateKey(&memoryStore{})
+	_, err = cryptopq.HSS_LMS.LoadPrivateKey(&memoryStore{}, nil)
 
 	expectCode(t, err, cryptopq.INVALID_PRIVATE_KEY)
 
-	_, err = cryptopq.XMSS.LoadPrivateKey(&memoryStore{state: state})
+	_, err = cryptopq.XMSS.LoadPrivateKey(&memoryStore{state: state}, nil)
 
 	expectCode(t, err, cryptopq.ALGORITHM_MISMATCH)
 
-	_, err = cryptopq.HSS_LMS.LoadPrivateKey(&unreadableStore{})
+	_, err = cryptopq.HSS_LMS.LoadPrivateKey(&unreadableStore{}, nil)
 
 	expectCode(t, err, cryptopq.STATE_PERSIST_FAILED)
 
-	_, err = cryptopq.HSS_LMS.LoadPrivateKey(nil)
+	_, err = cryptopq.HSS_LMS.LoadPrivateKey(nil, nil)
 
 	expectCode(t, err, cryptopq.INVALID_OPTION)
 
@@ -353,7 +355,7 @@ func TestStateValidation(t *testing.T) {
 
 	body := state[:len(state)-16]
 
-	loaded, err := cryptopq.HSS_LMS.LoadPrivateKey(&memoryStore{state: seal(body)})
+	loaded, err := cryptopq.HSS_LMS.LoadPrivateKey(&memoryStore{state: seal(body)}, nil)
 
 	check(t, err)
 
@@ -377,7 +379,7 @@ func TestStateValidation(t *testing.T) {
 	}
 
 	for name, data := range invalid {
-		_, err := cryptopq.HSS_LMS.LoadPrivateKey(&memoryStore{state: data})
+		_, err := cryptopq.HSS_LMS.LoadPrivateKey(&memoryStore{state: data}, nil)
 
 		if !errors.Is(err, cryptopq.INVALID_PRIVATE_KEY) {
 			t.Fatalf("%s: %v", name, err)
@@ -386,17 +388,17 @@ func TestStateValidation(t *testing.T) {
 
 	xmssBody := append([]byte{1, 2, 0, 0, 0, 1}, make([]byte, 8+96)...)
 
-	_, err = cryptopq.XMSS.LoadPrivateKey(&memoryStore{state: seal(xmssBody[:len(xmssBody)-1])})
+	_, err = cryptopq.XMSS.LoadPrivateKey(&memoryStore{state: seal(xmssBody[:len(xmssBody)-1])}, nil)
 
 	expectCode(t, err, cryptopq.INVALID_PRIVATE_KEY)
 
 	xmssBody[5] = 0x7f
 
-	_, err = cryptopq.XMSS.LoadPrivateKey(&memoryStore{state: seal(xmssBody)})
+	_, err = cryptopq.XMSS.LoadPrivateKey(&memoryStore{state: seal(xmssBody)}, nil)
 
 	expectCode(t, err, cryptopq.INVALID_PRIVATE_KEY)
 
-	_, err = cryptopq.XMSS_MT.LoadPrivateKey(&memoryStore{state: seal(xmssBody)})
+	_, err = cryptopq.XMSS_MT.LoadPrivateKey(&memoryStore{state: seal(xmssBody)}, nil)
 
 	expectCode(t, err, cryptopq.ALGORITHM_MISMATCH)
 }
@@ -488,7 +490,7 @@ func TestHssThreeLevels(t *testing.T) {
 			t.Fatalf("start %d: verify", start)
 		}
 
-		loaded, err := cryptopq.HSS_LMS.LoadPrivateKey(store)
+		loaded, err := cryptopq.HSS_LMS.LoadPrivateKey(store, nil)
 
 		check(t, err)
 
@@ -601,7 +603,7 @@ func TestXmssStateHandling(t *testing.T) {
 		t.Fatal("verify")
 	}
 
-	loaded, err := cryptopq.XMSS_MT.LoadPrivateKey(store)
+	loaded, err := cryptopq.XMSS_MT.LoadPrivateKey(store, nil)
 
 	check(t, err)
 
@@ -685,7 +687,7 @@ func TestCrossLanguageState(t *testing.T) {
 		algorithm     cryptopq.StatefulSignatureAlgorithm
 		state, public string
 	}{{cryptopq.HSS_LMS, hssState, hssPublic}, {cryptopq.XMSS_MT, xmssState, xmssPublic}} {
-		loaded, err := c.algorithm.LoadPrivateKey(&memoryStore{state: decode(t, c.state)})
+		loaded, err := c.algorithm.LoadPrivateKey(&memoryStore{state: decode(t, c.state)}, nil)
 
 		check(t, err)
 
@@ -693,7 +695,8 @@ func TestCrossLanguageState(t *testing.T) {
 	}
 }
 
-// Sign holds a lock: concurrent calls get distinct indices and the store sees every one.
+// Concurrent calls never wait for each other: each one signs with its own index or fails at once
+// with STATE_CONFLICT and tries again, and the store sees every index used.
 func TestStatefulConcurrentSigning(t *testing.T) {
 	t.Parallel()
 
@@ -709,7 +712,19 @@ func TestStatefulConcurrentSigning(t *testing.T) {
 
 	for i := range signatures {
 		group.Go(func() {
-			signatures[i], _ = pair.PrivateKey.Sign([]byte{byte(i)})
+			signature, err := pair.PrivateKey.Sign([]byte{byte(i)})
+
+			for errors.Is(err, cryptopq.STATE_CONFLICT) {
+				runtime.Gosched()
+
+				signature, err = pair.PrivateKey.Sign([]byte{byte(i)})
+			}
+
+			if err != nil {
+				t.Error(err)
+			}
+
+			signatures[i] = signature
 		})
 	}
 
@@ -729,11 +744,376 @@ func TestStatefulConcurrentSigning(t *testing.T) {
 		t.Fatal("indices were reused")
 	}
 
-	loaded, err := cryptopq.HSS_LMS.LoadPrivateKey(store)
+	loaded, err := cryptopq.HSS_LMS.LoadPrivateKey(store, nil)
 
 	check(t, err)
 
 	if loaded.RemainingSignatures() != 16 {
 		t.Fatal("store")
+	}
+}
+
+// A store that calls back into the key it serves from inside Update.
+type reentrantStore struct {
+	memoryStore
+	key       *cryptopq.StatefulPrivateKey
+	inner     error
+	remaining uint64
+	public    *cryptopq.StatefulPublicKey
+}
+
+func (s *reentrantStore) Update(previous, next []byte) (bool, error) {
+	if s.key != nil {
+		_, s.inner = s.key.Sign([]byte("inner"))
+
+		s.remaining, s.public = s.key.RemainingSignatures(), s.key.PublicKey()
+	}
+
+	return s.memoryStore.Update(previous, next)
+}
+
+// A Sign made from inside the store's Update fails at once instead of deadlocking, the other
+// methods still answer, and the outer call signs normally.
+func TestStatefulReentrantSigning(t *testing.T) {
+	t.Parallel()
+
+	store := &reentrantStore{}
+
+	pair, err := cryptopq.HSS_LMS.GenerateKeyPair(&cryptopq.StatefulKeyGenOptions{Levels: small, StateStore: store})
+
+	check(t, err)
+
+	store.key = pair.PrivateKey
+
+	done := make(chan []byte, 1)
+
+	go func() {
+		signature, err := pair.PrivateKey.Sign([]byte("outer"))
+
+		if err != nil {
+			t.Error(err)
+		}
+
+		done <- signature
+	}()
+
+	var signature []byte
+
+	select {
+	case signature = <-done:
+	case <-time.After(time.Minute):
+		t.Fatal("a call from inside Update blocked")
+	}
+
+	expectCode(t, store.inner, cryptopq.STATE_CONFLICT)
+
+	if store.remaining != 32 || !store.public.Equal(pair.PublicKey) {
+		t.Fatal("the key did not answer from inside Update")
+	}
+
+	if pair.PrivateKey.RemainingSignatures() != 31 || !pair.PublicKey.Verify(signature, []byte("outer")) {
+		t.Fatal("the outer call")
+	}
+}
+
+// A store whose Update waits for the test before it writes.
+type gateStore struct {
+	memoryStore
+	entered, release chan struct{}
+}
+
+func (s *gateStore) Update(previous, next []byte) (bool, error) {
+	if previous != nil {
+		s.entered <- struct{}{}
+
+		<-s.release
+	}
+
+	return s.memoryStore.Update(previous, next)
+}
+
+// While one goroutine signs, a Sign from another fails at once with STATE_CONFLICT and changes
+// nothing.
+func TestStatefulBusyKey(t *testing.T) {
+	t.Parallel()
+
+	store := &gateStore{entered: make(chan struct{}), release: make(chan struct{})}
+
+	pair, err := cryptopq.HSS_LMS.GenerateKeyPair(&cryptopq.StatefulKeyGenOptions{Levels: small, StateStore: store})
+
+	check(t, err)
+
+	first, second := make(chan error, 1), make(chan error, 1)
+
+	go func() {
+		_, err := pair.PrivateKey.Sign([]byte("first"))
+
+		first <- err
+	}()
+
+	<-store.entered
+
+	go func() {
+		_, err := pair.PrivateKey.Sign([]byte("second"))
+
+		second <- err
+	}()
+
+	select {
+	case err = <-second:
+	case <-time.After(time.Minute):
+		t.Fatal("a concurrent call waited")
+	}
+
+	expectCode(t, err, cryptopq.STATE_CONFLICT)
+
+	if pair.PrivateKey.RemainingSignatures() != 32 {
+		t.Fatal("the refused call changed the key")
+	}
+
+	close(store.release)
+
+	check(t, <-first)
+
+	if pair.PrivateKey.RemainingSignatures() != 31 {
+		t.Fatal("the first call")
+	}
+}
+
+// The index a state blob holds.
+func storedIndex(algorithm cryptopq.StatefulSignatureAlgorithm, state []byte) uint64 {
+	if algorithm == cryptopq.HSS_LMS {
+		return binary.BigEndian.Uint64(state[len(state)-24:])
+	}
+
+	return binary.BigEndian.Uint64(state[6:])
+}
+
+// A store that counts its writes.
+type countingStore struct {
+	memoryStore
+	writes int
+}
+
+func (s *countingStore) Update(previous, next []byte) (bool, error) {
+	updated, err := s.memoryStore.Update(previous, next)
+
+	if updated {
+		s.writes++
+	}
+
+	return updated, err
+}
+
+// With Reserve 4, one write claims four indices, and a key loaded after an unclean stop starts
+// after them; the signatures equal those of a key that writes before every signature.
+func TestStatefulReserve(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		algorithm cryptopq.StatefulSignatureAlgorithm
+		options   cryptopq.StatefulKeyGenOptions
+		seed      []byte
+	}{
+		{cryptopq.HSS_LMS, cryptopq.StatefulKeyGenOptions{Levels: small}, sequence(40)},
+		{cryptopq.XMSS_MT, cryptopq.StatefulKeyGenOptions{Parameters: "XMSSMT-SHAKE256_20/4_192"}, sequence(72)},
+	}
+
+	for _, c := range cases {
+		name := c.algorithm.Name()
+
+		plain, reserving := c.options, c.options
+
+		plain.StateStore = &memoryStore{}
+
+		store := &countingStore{}
+
+		reserving.StateStore, reserving.Reserve = store, 4
+
+		reference, err := cryptopq.Hazmat.GenerateStatefulKeyPair(c.algorithm, &plain, c.seed, 0)
+
+		check(t, err)
+
+		pair, err := cryptopq.Hazmat.GenerateStatefulKeyPair(c.algorithm, &reserving, c.seed, 0)
+
+		check(t, err)
+
+		capacity := pair.PrivateKey.RemainingSignatures()
+
+		if store.writes != 1 || storedIndex(c.algorithm, store.state) != 0 {
+			t.Fatalf("%s: the new key stored index %d", name, storedIndex(c.algorithm, store.state))
+		}
+
+		for i := range uint64(10) {
+			message := []byte{byte(i)}
+
+			same(t, sign(t, pair.PrivateKey, message), sign(t, reference.PrivateKey, message), name)
+
+			if store.writes != 2+int(i/4) || storedIndex(c.algorithm, store.state) != 4*(i/4+1) || pair.PrivateKey.RemainingSignatures() != capacity-i-1 {
+				t.Fatalf("%s: signature %d: %d writes, stored index %d", name, i, store.writes, storedIndex(c.algorithm, store.state))
+			}
+		}
+
+		// The key stops after index 9 with 12 stored, as after a crash.
+		loaded, err := c.algorithm.LoadPrivateKey(store, &cryptopq.StatefulLoadOptions{Reserve: 3})
+
+		check(t, err)
+
+		if loaded.RemainingSignatures() != capacity-12 {
+			t.Fatalf("%s: loaded at index %d", name, capacity-loaded.RemainingSignatures())
+		}
+
+		plain.StateStore = &memoryStore{}
+
+		skipped, err := cryptopq.Hazmat.GenerateStatefulKeyPair(c.algorithm, &plain, c.seed, 12)
+
+		check(t, err)
+
+		same(t, sign(t, loaded, []byte("loaded")), sign(t, skipped.PrivateKey, []byte("loaded")), name)
+
+		if storedIndex(c.algorithm, store.state) != 15 {
+			t.Fatalf("%s: the loaded key stored index %d", name, storedIndex(c.algorithm, store.state))
+		}
+	}
+
+	// Near the end, a reservation stops at the capacity, and an exhausted key writes nothing.
+	store := &countingStore{}
+
+	pair, err := cryptopq.Hazmat.GenerateStatefulKeyPair(cryptopq.HSS_LMS, &cryptopq.StatefulKeyGenOptions{Levels: small, StateStore: store, Reserve: 100}, sequence(40), 30)
+
+	check(t, err)
+
+	sign(t, pair.PrivateKey, []byte("30"))
+
+	sign(t, pair.PrivateKey, []byte("31"))
+
+	_, err = pair.PrivateKey.Sign([]byte("32"))
+
+	expectCode(t, err, cryptopq.KEY_EXHAUSTED)
+
+	if store.writes != 2 || storedIndex(cryptopq.HSS_LMS, store.state) != 32 {
+		t.Fatalf("%d writes, stored index %d", store.writes, storedIndex(cryptopq.HSS_LMS, store.state))
+	}
+
+	// A failed write claims nothing.
+	broken, err := cryptopq.HSS_LMS.GenerateKeyPair(&cryptopq.StatefulKeyGenOptions{Levels: small, StateStore: &brokenStore{}, Reserve: 8})
+
+	check(t, err)
+
+	_, err = broken.PrivateKey.Sign([]byte("m"))
+
+	expectCode(t, err, cryptopq.STATE_PERSIST_FAILED)
+
+	if broken.PrivateKey.RemainingSignatures() != 32 {
+		t.Fatal("a failed write used an index")
+	}
+}
+
+// A store that keeps every buffer it receives or returns, against the contract, to observe that
+// the key wipes each one once it has served.
+type retainingStore struct {
+	memoryStore
+	buffers [][]byte
+}
+
+func (s *retainingStore) Read() ([]byte, error) {
+	state, err := s.memoryStore.Read()
+
+	s.buffers = append(s.buffers, state)
+
+	return state, err
+}
+
+func (s *retainingStore) Update(previous, next []byte) (bool, error) {
+	s.buffers = append(s.buffers, previous, next)
+
+	return s.memoryStore.Update(previous, next)
+}
+
+// Every state blob holds the seed: the key wipes the ones it creates, reads and replaces,
+// including those of a refused write.
+func TestStatefulStateWiping(t *testing.T) {
+	t.Parallel()
+
+	for _, options := range []*cryptopq.StatefulKeyGenOptions{{Levels: small}, {Parameters: "XMSSMT-SHAKE256_20/4_192"}} {
+		algorithm := cryptopq.HSS_LMS
+
+		if options.Parameters != "" {
+			algorithm = cryptopq.XMSS_MT
+		}
+
+		store := &retainingStore{}
+
+		options.StateStore = store
+
+		pair, err := algorithm.GenerateKeyPair(options)
+
+		check(t, err)
+
+		sign(t, pair.PrivateKey, []byte("one"))
+
+		loaded, err := algorithm.LoadPrivateKey(store, nil)
+
+		check(t, err)
+
+		sign(t, loaded, []byte("two"))
+
+		_, err = pair.PrivateKey.Sign([]byte("stale"))
+
+		expectCode(t, err, cryptopq.STATE_CONFLICT)
+
+		wiped := 0
+
+		for _, buffer := range store.buffers {
+			if buffer != nil && !bytes.Equal(buffer, make([]byte, len(buffer))) {
+				t.Fatalf("%s: a state was not wiped", algorithm.Name())
+			}
+
+			if buffer != nil {
+				wiped++
+			}
+		}
+
+		if wiped != 8 {
+			t.Fatalf("%s: %d states", algorithm.Name(), wiped)
+		}
+
+		if _, err := algorithm.LoadPrivateKey(store, nil); err != nil {
+			t.Fatalf("%s: the stored copy: %v", algorithm.Name(), err)
+		}
+	}
+}
+
+// XMSS^MT keeps the signature part of each upper layer until its leaf changes: consecutive
+// signatures across the first two layer boundaries equal those of new keys at each index.
+func TestXmssMtLayerCache(t *testing.T) {
+	t.Parallel()
+
+	options := cryptopq.StatefulKeyGenOptions{Parameters: "XMSSMT-SHAKE256_20/4_192"}
+
+	for _, start := range []uint64{31, 1023} {
+		options.StateStore = &memoryStore{}
+
+		pair, err := cryptopq.Hazmat.GenerateStatefulKeyPair(cryptopq.XMSS_MT, &options, sequence(72), start)
+
+		check(t, err)
+
+		for index := start; index < start+3; index++ {
+			message := []byte(strconv.FormatUint(index, 10))
+
+			signature := sign(t, pair.PrivateKey, message)
+
+			options.StateStore = &memoryStore{}
+
+			fresh, err := cryptopq.Hazmat.GenerateStatefulKeyPair(cryptopq.XMSS_MT, &options, sequence(72), index)
+
+			check(t, err)
+
+			same(t, signature, sign(t, fresh.PrivateKey, message), "index "+strconv.FormatUint(index, 10))
+
+			if !pair.PublicKey.Verify(signature, message) {
+				t.Fatalf("index %d: verify", index)
+			}
+		}
 	}
 }

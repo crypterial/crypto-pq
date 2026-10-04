@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"runtime"
 	"runtime/metrics"
 	"sort"
 	"strings"
@@ -300,7 +301,7 @@ func TestClaimedStateSizes(t *testing.T) {
 		t.Helper()
 
 		allocated := heapAllocated(func() {
-			_, err := algorithm.LoadPrivateKey(&fuzzStore{state: fuzzSeal(body)})
+			_, err := algorithm.LoadPrivateKey(&fuzzStore{state: fuzzSeal(body)}, nil)
 
 			fuzzExpect(t, err, INVALID_PRIVATE_KEY)
 		})
@@ -387,8 +388,8 @@ func sortedIndices(signatures [][]byte) []int {
 	return indices
 }
 
-// More goroutines than signatures on one key: each index is used once and the rest of the calls
-// get KEY_EXHAUSTED.
+// More goroutines than signatures on one key, each retrying while the key is busy: each index is
+// used once and the rest of the calls get KEY_EXHAUSTED.
 func TestStatefulConcurrentExhaustion(t *testing.T) {
 	store := &lockedStore{}
 
@@ -405,6 +406,12 @@ func TestStatefulConcurrentExhaustion(t *testing.T) {
 	for i := range 40 {
 		group.Go(func() {
 			signature, err := pair.PrivateKey.Sign([]byte{byte(i)})
+
+			for errors.Is(err, STATE_CONFLICT) {
+				runtime.Gosched()
+
+				signature, err = pair.PrivateKey.Sign([]byte{byte(i)})
+			}
 
 			if err != nil && !errors.Is(err, KEY_EXHAUSTED) {
 				t.Error(err)
@@ -454,7 +461,7 @@ func TestStatefulConcurrentKeys(t *testing.T) {
 
 	for range 6 {
 		group.Go(func() {
-			key, err := HSS_LMS.LoadPrivateKey(store)
+			key, err := HSS_LMS.LoadPrivateKey(store, nil)
 
 			<-start
 
@@ -467,7 +474,7 @@ func TestStatefulConcurrentKeys(t *testing.T) {
 				case errors.Is(err, KEY_EXHAUSTED):
 					return
 				case errors.Is(err, STATE_CONFLICT):
-					key, err = HSS_LMS.LoadPrivateKey(store)
+					key, err = HSS_LMS.LoadPrivateKey(store, nil)
 				case err == nil:
 					mutex.Lock()
 
@@ -902,7 +909,7 @@ func stateCase(rng *splitMix, t *transcript, base []byte) {
 			continue
 		}
 
-		key, err := algorithm.LoadPrivateKey(&fuzzStore{state: state})
+		key, err := algorithm.LoadPrivateKey(&fuzzStore{state: state}, nil)
 
 		if err != nil {
 			t.add(state, choice, outcomeCode(err), nil)

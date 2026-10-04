@@ -319,6 +319,66 @@ func TestKemRoundTrip(t *testing.T) {
 	}
 }
 
+// The matrix of a key is computed on first use, not when the key is made or imported, and the two
+// halves of a key pair share one cache, so using either one fills it for both.
+func TestKeyCaches(t *testing.T) {
+	t.Parallel()
+
+	for _, c := range kemCases {
+		generated, err := c.algorithm.GenerateKeyPair(&cryptopq.KeyGenOptions{SkipSelfTest: true})
+
+		check(t, err)
+
+		seeded, err := cryptopq.Hazmat.GenerateKemKeyPair(c.algorithm, sequence(c.seedSize))
+
+		check(t, err)
+
+		imported, err := c.algorithm.ImportPrivateKey(export(t, seeded.PrivateKey, cryptopq.RAW), cryptopq.RAW)
+
+		check(t, err)
+
+		for _, pair := range []*cryptopq.KemKeyPair{generated, seeded, {PublicKey: imported.PublicKey(), PrivateKey: imported}} {
+			if shared, expanded := cryptopq.KemCache(pair.PublicKey, pair.PrivateKey); !shared || expanded {
+				t.Fatalf("%s: a new key pair", c.algorithm)
+			}
+
+			if _, err := pair.PublicKey.Encapsulate(); err != nil {
+				t.Fatal(err)
+			}
+
+			if shared, expanded := cryptopq.KemCache(pair.PrivateKey.PublicKey(), pair.PrivateKey); !shared || !expanded {
+				t.Fatalf("%s: a used key pair", c.algorithm)
+			}
+		}
+	}
+
+	for _, algorithm := range []cryptopq.SignatureAlgorithm{cryptopq.ML_DSA_44, cryptopq.ML_DSA_65, cryptopq.ML_DSA_87} {
+		generated, err := algorithm.GenerateKeyPair(&cryptopq.KeyGenOptions{SkipSelfTest: true})
+
+		check(t, err)
+
+		seeded := generateSignatureKey(t, algorithm)
+
+		imported, err := algorithm.ImportPrivateKey(export(t, seeded.PrivateKey, cryptopq.RAW), cryptopq.RAW)
+
+		check(t, err)
+
+		for _, pair := range []*cryptopq.SignatureKeyPair{generated, seeded, {PublicKey: imported.PublicKey(), PrivateKey: imported}} {
+			if shared, expanded := cryptopq.SignatureCache(pair.PublicKey, pair.PrivateKey); !shared || expanded {
+				t.Fatalf("%s: a new key pair", algorithm)
+			}
+
+			if _, err := pair.PrivateKey.Sign([]byte("cache"), nil); err != nil {
+				t.Fatal(err)
+			}
+
+			if shared, expanded := cryptopq.SignatureCache(pair.PrivateKey.PublicKey(), pair.PrivateKey); !shared || !expanded {
+				t.Fatalf("%s: a used key pair", algorithm)
+			}
+		}
+	}
+}
+
 // Keys compute what they derive on first use, so goroutines that first use one key, its private and
 // public halves and the public keys it returns, all at once, must race safely and agree with a key
 // that computes everything alone.

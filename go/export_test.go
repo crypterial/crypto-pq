@@ -21,3 +21,13 @@ func LmotsType(code uint32) (string, int) {
 
 	return "", 0
 }
+
+// Whether two KEM keys share one cache, and whether the matrix in it has been computed.
+func KemCache(public *KemPublicKey, private *KemPrivateKey) (shared, expanded bool) {
+	return public.cache == private.cache, private.cache.a != nil
+}
+
+// Whether two ML-DSA keys share one cache, and whether the matrix in it has been computed.
+func SignatureCache(public *SignaturePublicKey, private *SignaturePrivateKey) (shared, expanded bool) {
+	return public.cache == private.cache, private.cache.a != nil
+}

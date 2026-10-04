@@ -83,7 +83,7 @@ func (hazmat) GenerateStatefulKeyPair(algorithm StatefulSignatureAlgorithm, opti
 		return nil, invalidOption("the index must not exceed the key's capacity")
 	}
 
-	return algorithm.create(parameters, bytes.Clone(seed), index, options.StateStore)
+	return algorithm.create(parameters, bytes.Clone(seed), index, options.StateStore, options.Reserve)
 }
 
 func (hazmat) Verify(publicKey *SignaturePublicKey, signature, message []byte, options *VerifyOptions) bool {

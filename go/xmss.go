@@ -620,9 +620,14 @@ func xmssVerify(p *xmssParams, publicKey, message, signature []byte) bool {
 	return equal(node, root)
 }
 
+// The tree of one layer and, above the bottom layer, the signature part at one of its leaves: the
+// WOTS+ signature of the root below and the authentication path. Both depend on the position
+// alone, so the part is reused until the leaf changes, as HSS keeps its signed child keys.
 type xmssLayer struct {
 	index uint64
 	tree  *merkleTree
+	leaf  uint32
+	part  []byte
 }
 
 // The signing side of an XMSS or XMSS^MT key, with one cached tree per layer.
@@ -637,12 +642,12 @@ type xmssSigner struct {
 func newXmssSigner(p *xmssParams, skSeed, skPrf, pubSeed []byte) *xmssSigner {
 	s := &xmssSigner{p: p, hasher: newXmssHasher(p, skSeed, pubSeed), skPrf: skPrf, layers: make([]*xmssLayer, p.d)}
 
-	s.root = s.tree(uint32(p.d-1), 0).root()
+	s.root = s.layer(uint32(p.d-1), 0).tree.root()
 
 	return s
 }
 
-func (s *xmssSigner) tree(layer uint32, index uint64) *merkleTree {
+func (s *xmssSigner) layer(layer uint32, index uint64) *xmssLayer {
 	cached := s.layers[layer]
 
 	if cached == nil || cached.index != index {
@@ -651,7 +656,7 @@ func (s *xmssSigner) tree(layer uint32, index uint64) *merkleTree {
 		s.layers[layer] = cached
 	}
 
-	return cached.tree
+	return cached
 }
 
 func (s *xmssSigner) publicKey() []byte {
@@ -685,24 +690,34 @@ func (s *xmssSigner) sign(index uint64, message []byte) []byte {
 
 	height := p.treeHeight()
 
-	wots := make([]byte, p.wotsLength()*p.n)
-
 	for layer := range uint32(p.d) {
 		leafIndex := uint32(index & (1<<height - 1))
 
 		index >>= height
 
-		ots := newXmssAddress(layer, index, xmssOts)
+		cached := s.layer(layer, index)
 
-		ots[4] = leafIndex
+		if layer > 0 && cached.part != nil && cached.leaf == leafIndex {
+			signature = append(signature, cached.part...)
+		} else {
+			start := len(signature)
 
-		s.hasher.wotsSign(wots, node, &ots)
+			signature = signature[:start+p.wotsLength()*p.n]
 
-		tree := s.tree(layer, index)
+			ots := newXmssAddress(layer, index, xmssOts)
 
-		signature = append(append(signature, wots...), tree.authPath(uint64(leafIndex))...)
+			ots[4] = leafIndex
 
-		node = tree.root()
+			s.hasher.wotsSign(signature[start:], node, &ots)
+
+			signature = append(signature, cached.tree.authPath(uint64(leafIndex))...)
+
+			if layer > 0 {
+				cached.leaf, cached.part = leafIndex, append(cached.part[:0], signature[start:]...)
+			}
+		}
+
+		node = cached.tree.root()
 	}
 
 	return signature

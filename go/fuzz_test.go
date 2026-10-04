@@ -676,7 +676,7 @@ func fuzzLoad(t *testing.T, algorithm StatefulSignatureAlgorithm, state []byte) 
 	if err != nil {
 		fuzzExpect(t, err, INVALID_PRIVATE_KEY, ALGORITHM_MISMATCH)
 
-		_, err = algorithm.LoadPrivateKey(&fuzzStore{state: state})
+		_, err = algorithm.LoadPrivateKey(&fuzzStore{state: state}, nil)
 
 		fuzzExpect(t, err, INVALID_PRIVATE_KEY, ALGORITHM_MISMATCH)
 
@@ -691,7 +691,7 @@ func fuzzLoad(t *testing.T, algorithm StatefulSignatureAlgorithm, state []byte) 
 	capacity := parameters.capacity()
 
 	if index > capacity {
-		_, err = algorithm.LoadPrivateKey(&fuzzStore{state: state})
+		_, err = algorithm.LoadPrivateKey(&fuzzStore{state: state}, nil)
 
 		fuzzExpect(t, err, INVALID_PRIVATE_KEY)
 
@@ -704,7 +704,7 @@ func fuzzLoad(t *testing.T, algorithm StatefulSignatureAlgorithm, state []byte) 
 
 	store := &fuzzStore{state: state}
 
-	key, err := algorithm.LoadPrivateKey(store)
+	key, err := algorithm.LoadPrivateKey(store, nil)
 
 	fuzzCheck(t, err)
 

@@ -6,11 +6,16 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
-	"sync"
+	"sync/atomic"
 )
 
 const stateVersion = 1
 
+// Read returns the stored state, or nil when there is none, in a slice that the caller then
+// owns. Update is a compare-and-swap: it replaces the stored state with next only if the store
+// still holds previous (nil when empty), and reports whether it did. States hold the secret seed,
+// so a key wipes what Read returned and both arguments of Update once they have served: a store
+// copies whatever it keeps.
 type StateStore interface {
 	Read() ([]byte, error)
 	Update(previous, next []byte) (bool, error)
@@ -20,10 +25,18 @@ type HssLevel struct {
 	Lms, Ots string
 }
 
+// Reserve is how many indices one write to the store claims: the key then signs that many times
+// per write, and indices claimed but unused when the key is dropped are skipped, never reused.
+// Zero means 1. StatefulLoadOptions.Reserve is the same option for a loaded key.
 type StatefulKeyGenOptions struct {
 	Parameters string
 	Levels     []HssLevel
 	StateStore StateStore
+	Reserve    uint64
+}
+
+type StatefulLoadOptions struct {
+	Reserve uint64
 }
 
 type StatefulSignatureAlgorithm uint8
@@ -176,12 +189,16 @@ func (s statefulParameters) signer(seed []byte) statefulSigner {
 }
 
 // State blob: version, kind, the parameters, the secret seeds and the next index, closed by the
-// first 16 bytes of its SHA-256 so that a damaged state is refused rather than reused.
+// first 16 bytes of its SHA-256 so that a damaged state is refused rather than reused. The buffer
+// has room for either layout from the start, so append never leaves a partial copy of the seed
+// behind.
 //
 //	HSS:     01 01 L {u32 lms u32 ots}*L I SEED u64(index) checksum
 //	XMSS:    01 02 u32(oid) u64(index) SK_SEED SK_PRF PUB_SEED checksum (XMSS^MT: kind 03)
 func (a StatefulSignatureAlgorithm) encode(parameters statefulParameters, seed []byte, index uint64) []byte {
-	body := []byte{stateVersion, a.spec().kind}
+	body := make([]byte, 0, 2+1+8*len(parameters.levels)+4+len(seed)+8+16)
+
+	body = append(body, stateVersion, a.spec().kind)
 
 	if p := parameters.xmss; p != nil {
 		body = binary.BigEndian.AppendUint32(body, p.oid)
@@ -306,17 +323,24 @@ func (a StatefulSignatureAlgorithm) GenerateKeyPair(options *StatefulKeyGenOptio
 		return nil, err
 	}
 
-	return a.create(parameters, seed, 0, options.StateStore)
+	return a.create(parameters, seed, 0, options.StateStore, options.Reserve)
+}
+
+// Replaces previous with next in the store, then wipes both.
+func writeState(store StateStore, previous, next []byte) (bool, error) {
+	defer clear(previous)
+
+	defer clear(next)
+
+	return store.Update(previous, next)
 }
 
 // The seed becomes part of the key. As in the Python reference, the trees are built before the
-// store is written.
-func (a StatefulSignatureAlgorithm) create(parameters statefulParameters, seed []byte, index uint64, store StateStore) (*StatefulKeyPair, error) {
+// store is written. The new state holds index itself: the first signature claims the reserve.
+func (a StatefulSignatureAlgorithm) create(parameters statefulParameters, seed []byte, index uint64, store StateStore, reserve uint64) (*StatefulKeyPair, error) {
 	signer := parameters.signer(seed)
 
-	state := a.encode(parameters, seed, index)
-
-	created, err := store.Update(nil, state)
+	created, err := writeState(store, nil, a.encode(parameters, seed, index))
 
 	if err != nil || !created {
 		signer.wipe()
@@ -330,17 +354,21 @@ func (a StatefulSignatureAlgorithm) create(parameters statefulParameters, seed [
 		return nil, newError(STATE_CONFLICT, "the state store already holds a key")
 	}
 
-	privateKey := a.newPrivateKey(parameters, seed, signer, store, index)
+	privateKey := a.newPrivateKey(parameters, seed, signer, store, index, reserve)
 
 	return &StatefulKeyPair{privateKey.PublicKey(), privateKey}, nil
 }
 
-func (a StatefulSignatureAlgorithm) LoadPrivateKey(store StateStore) (*StatefulPrivateKey, error) {
+// The key starts at the stored index, so indices that an earlier key reserved but did not use
+// are skipped.
+func (a StatefulSignatureAlgorithm) LoadPrivateKey(store StateStore, options *StatefulLoadOptions) (*StatefulPrivateKey, error) {
 	if store == nil {
 		return nil, invalidOption("a StateStore is required")
 	}
 
 	state, err := store.Read()
+
+	defer clear(state)
 
 	if err != nil {
 		return nil, newError(STATE_PERSIST_FAILED, "the state store failed to read the key state")
@@ -358,7 +386,13 @@ func (a StatefulSignatureAlgorithm) LoadPrivateKey(store StateStore) (*StatefulP
 		return nil, mismatch("the stored index is beyond the key's capacity")
 	}
 
-	return a.newPrivateKey(parameters, seed, parameters.signer(seed), store, index), nil
+	var reserve uint64
+
+	if options != nil {
+		reserve = options.Reserve
+	}
+
+	return a.newPrivateKey(parameters, seed, parameters.signer(seed), store, index, reserve), nil
 }
 
 func (s *statefulSpec) validPublicKey(key []byte) bool {
@@ -426,14 +460,20 @@ func (k *StatefulPublicKey) String() string {
 	return "<StatefulPublicKey " + k.algorithm.Name() + ">"
 }
 
+// index is the next index to sign with and reserved the one the store holds, never below it.
+// signing is set while a Sign call runs, which alone reads and writes reserved and the signer's
+// caches; index is atomic so that RemainingSignatures needs no lock.
 type StatefulPrivateKey struct {
 	algorithm  StatefulSignatureAlgorithm
 	parameters statefulParameters
 	seed       []byte
 	signer     statefulSigner
+	public     []byte
 	store      StateStore
-	mutex      sync.Mutex
-	index      uint64
+	reserve    uint64
+	reserved   uint64
+	index      atomic.Uint64
+	signing    atomic.Bool
 }
 
 type statefulSecrets struct {
@@ -441,8 +481,10 @@ type statefulSecrets struct {
 	signer statefulSigner
 }
 
-func (a StatefulSignatureAlgorithm) newPrivateKey(parameters statefulParameters, seed []byte, signer statefulSigner, store StateStore, index uint64) *StatefulPrivateKey {
-	key := &StatefulPrivateKey{algorithm: a, parameters: parameters, seed: seed, signer: signer, store: store, index: index}
+func (a StatefulSignatureAlgorithm) newPrivateKey(parameters statefulParameters, seed []byte, signer statefulSigner, store StateStore, index, reserve uint64) *StatefulPrivateKey {
+	key := &StatefulPrivateKey{algorithm: a, parameters: parameters, seed: seed, signer: signer, public: signer.publicKey(), store: store, reserve: max(reserve, 1), reserved: index}
+
+	key.index.Store(index)
 
 	runtime.AddCleanup(key, func(secrets statefulSecrets) {
 		clear(secrets.seed)
@@ -458,46 +500,54 @@ func (k *StatefulPrivateKey) Algorithm() StatefulSignatureAlgorithm {
 }
 
 func (k *StatefulPrivateKey) PublicKey() *StatefulPublicKey {
-	return &StatefulPublicKey{algorithm: k.algorithm, key: k.signer.publicKey()}
+	return &StatefulPublicKey{algorithm: k.algorithm, key: k.public}
 }
 
 func (k *StatefulPrivateKey) RemainingSignatures() uint64 {
-	k.mutex.Lock()
+	capacity := k.signer.capacity()
 
-	defer k.mutex.Unlock()
-
-	return k.signer.capacity() - min(k.index, k.signer.capacity())
+	return capacity - min(k.index.Load(), capacity)
 }
 
-// The next index is written to the store before the signature exists, so a crash or a failed
-// write can waste an index but never use one twice. The state the store must hold is the
-// encoding of the current index, which is exactly what was loaded or last written.
+// A call made while another Sign on the same key runs, from another goroutine or from inside the
+// store's Update, fails at once with STATE_CONFLICT: waiting would deadlock the second case and
+// stall callers behind the rebuild of a large tree.
+//
+// Before an index is used, the store holds a later one, so a crash or a failed write can waste
+// indices but never use one twice. When the claimed indices run out, one write replaces the
+// stored state, the encoding of reserved, with one that claims up to Reserve more.
 func (k *StatefulPrivateKey) Sign(message []byte) ([]byte, error) {
 	defer runtime.KeepAlive(k)
 
-	k.mutex.Lock()
+	if !k.signing.CompareAndSwap(false, true) {
+		return nil, newError(STATE_CONFLICT, "the key is signing in another call")
+	}
 
-	defer k.mutex.Unlock()
+	defer k.signing.Store(false)
 
-	index := k.index
+	index, capacity := k.index.Load(), k.signer.capacity()
 
-	if index >= k.signer.capacity() {
+	if index >= capacity {
 		return nil, newError(KEY_EXHAUSTED, "every one-time key has been used")
 	}
 
-	previous := k.algorithm.encode(k.parameters, k.seed, index)
+	if index == k.reserved {
+		reserved := index + min(k.reserve, capacity-index)
 
-	updated, err := k.store.Update(previous, k.algorithm.encode(k.parameters, k.seed, index+1))
+		updated, err := writeState(k.store, k.algorithm.encode(k.parameters, k.seed, index), k.algorithm.encode(k.parameters, k.seed, reserved))
 
-	if err != nil {
-		return nil, newError(STATE_PERSIST_FAILED, "the state store failed to save the key state")
+		if err != nil {
+			return nil, newError(STATE_PERSIST_FAILED, "the state store failed to save the key state")
+		}
+
+		if !updated {
+			return nil, newError(STATE_CONFLICT, "the stored key state changed; load the key again")
+		}
+
+		k.reserved = reserved
 	}
 
-	if !updated {
-		return nil, newError(STATE_CONFLICT, "the stored key state changed; load the key again")
-	}
-
-	k.index = index + 1
+	k.index.Store(index + 1)
 
 	return k.signer.sign(index, message), nil
 }
