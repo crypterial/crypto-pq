@@ -15,7 +15,8 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# The same bash steps on every platform; Windows runs them in Git Bash.
+# The same bash steps on every platform; Windows runs them in Git Bash. A job that sets its own
+# defaults replaces these, so those jobs repeat the shell.
 defaults:
   run:
     shell: bash
@@ -44,6 +45,7 @@ jobs:
           - { os: windows-latest, python: "3.x" }
     defaults:
       run:
+        shell: bash
         working-directory: python
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -68,6 +70,7 @@ jobs:
           - { os: windows-latest, rust: stable }
     defaults:
       run:
+        shell: bash
         working-directory: rust
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -94,6 +97,7 @@ jobs:
           - { os: windows-latest, node: "24" }
     defaults:
       run:
+        shell: bash
         working-directory: typescript
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -121,6 +125,7 @@ jobs:
           - { os: windows-latest, go: stable }
     defaults:
       run:
+        shell: bash
         working-directory: go
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -158,6 +163,7 @@ jobs:
             sha256: 68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e
     defaults:
       run:
+        shell: bash
         working-directory: zig
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -202,6 +208,7 @@ jobs:
         goarch: ["386", s390x]
     defaults:
       run:
+        shell: bash
         working-directory: go
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -229,6 +236,7 @@ jobs:
             packages: gcc-s390x-linux-gnu libc6-dev-s390x-cross qemu-user
     defaults:
       run:
+        shell: bash
         working-directory: rust
     env:
       CARGO_TARGET_S390X_UNKNOWN_LINUX_GNU_LINKER: s390x-linux-gnu-gcc
@@ -248,6 +256,7 @@ jobs:
         target: [x86-linux, s390x-linux]
     defaults:
       run:
+        shell: bash
         working-directory: zig
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

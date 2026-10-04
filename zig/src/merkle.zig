@@ -39,7 +39,7 @@ pub fn MerkleTree(comptime Context: type) type {
                 .height = height,
                 .low = low,
                 .n = n,
-                .nodes = try allocator.alloc(u8, ((@as(usize, 2) << (height - low)) - 1) * n),
+                .nodes = try allocator.alloc(u8, ((@as(usize, 2) << @intCast(height - low)) - 1) * n),
                 .root = undefined,
             };
         }
@@ -54,9 +54,9 @@ pub fn MerkleTree(comptime Context: type) type {
             self.context = context;
 
             if (self.low == 0) {
-                self.leaves(0, self.nodes[0 .. (@as(usize, 1) << self.height) * n]);
+                self.leaves(0, self.nodes[0 .. (@as(usize, 1) << @intCast(self.height)) * n]);
             } else {
-                for (0..@as(usize, 1) << (self.height - self.low)) |chunk| {
+                for (0..@as(usize, 1) << @intCast(self.height - self.low)) |chunk| {
                     var buffer: [(1 << max_low) * max_node_size]u8 = undefined;
 
                     self.subtree(chunk, &buffer, null);
@@ -110,9 +110,9 @@ pub fn MerkleTree(comptime Context: type) type {
         fn subtree(self: *const Self, chunk: usize, buffer: []u8, path: ?struct { index: u64, out: []u8 }) void {
             const n = self.n;
 
-            const base = chunk << self.low;
+            const base = chunk << @intCast(self.low);
 
-            self.leaves(base, buffer[0 .. (@as(usize, 1) << self.low) * n]);
+            self.leaves(base, buffer[0 .. (@as(usize, 1) << @intCast(self.low)) * n]);
 
             for (0..self.low) |z| {
                 const count = @as(usize, 1) << @intCast(self.low - z);
