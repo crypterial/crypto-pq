@@ -1,0 +1,75 @@
+name: fuzz
+
+# Weekly and on demand: the Go fuzzers and the long robustness runs take too long for every push.
+on:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  go-fuzz:
+    name: go ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [FuzzKemImport, FuzzDecapsulate, FuzzSignatureImport, FuzzVerify, FuzzLoadPrivateKey, FuzzStatefulVerify, FuzzStatefulImport, FuzzDer, FuzzPem, FuzzBase64]
+    defaults:
+      run:
+        shell: bash
+        working-directory: go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+      # Minimizing inputs of tens of kilobytes stalls the fuzzer; 300 runs is enough.
+      - run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 10m -fuzzminimizetime 300x .
+      - if: failure()
+        run: for f in testdata/fuzz/*/*; do echo "== $f"; cat "$f"; done
+
+  long:
+    name: long robustness runs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CRYPTO_PQ_FUZZ: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - working-directory: rust
+        run: cargo test --locked --release --test robustness
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - working-directory: typescript
+        run: node --test test/robustness.test.ts
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+      - working-directory: python
+        run: python -m unittest discover -s tests -p test_robustness.py
+        env:
+          PYTHONPATH: src
+          CRYPTO_PQ_SLOW: "1"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/zig-x86_64-linux-0.16.0.tar.xz
+          key: zig-x86_64-linux-0.16.0.tar.xz
+      - run: |
+          archive=~/zig-x86_64-linux-0.16.0.tar.xz
+          [ -f "$archive" ] || curl -fsSL --proto '=https' -o "$archive" https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $archive" | sha256sum -c -
+          mkdir -p ~/zig && tar -xJf "$archive" -C ~/zig --strip-components=1
+          echo ~/zig >> "$GITHUB_PATH"
+      - working-directory: zig
+        run: zig build test -Doptimize=ReleaseSafe --summary all
