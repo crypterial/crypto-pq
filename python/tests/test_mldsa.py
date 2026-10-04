@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 import crypto_pq
@@ -174,6 +175,52 @@ class SignatureApiTest(unittest.TestCase):
             function(*args, **kwargs)
 
         self.assertEqual(caught.exception.code, code)
+
+    # A key keeps what its operations derive from it: using it again, through the public key of
+    # its private key, or from several threads at its first use gives what fresh keys give.
+    def test_reused_keys(self):
+        for algorithm in ALGORITHMS.values():
+            with self.subTest(algorithm=algorithm.name):
+                pair = hazmat.generate_key_pair(algorithm, bytes(range(32)))
+
+                public, private = pair.public_key.export_key("raw"), pair.private_key._private
+
+                messages = [bytes([i]) * 10 for i in range(3)]
+
+                expected = [algorithm.import_private_key(private, "raw").sign(m, deterministic=True) for m in messages]
+
+                for key in (algorithm.import_private_key(private, "raw"), pair.private_key):
+                    for _ in range(2):
+                        self.assertEqual([key.sign(m, deterministic=True) for m in messages], expected)
+
+                for key in (algorithm.import_public_key(public, "raw"), pair.private_key.public_key):
+                    for _ in range(2):
+                        self.assertTrue(all(key.verify(sig, m) for sig, m in zip(expected, messages)))
+
+                        self.assertFalse(key.verify(expected[0], messages[1]))
+
+                public_key, private_key = algorithm.import_public_key(public, "raw"), algorithm.import_private_key(private, "raw")
+
+                barrier = threading.Barrier(3)
+
+                results = [None] * 3
+
+                def work(index):
+                    barrier.wait()
+
+                    signature = private_key.sign(messages[index], deterministic=True)
+
+                    results[index] = (signature, public_key.verify(signature, messages[index]))
+
+                threads = [threading.Thread(target=work, args=(i,)) for i in range(3)]
+
+                for thread in threads:
+                    thread.start()
+
+                for thread in threads:
+                    thread.join()
+
+                self.assertEqual(results, [(sig, True) for sig in expected])
 
     def test_round_trip(self):
         for algorithm in ALGORITHMS.values():

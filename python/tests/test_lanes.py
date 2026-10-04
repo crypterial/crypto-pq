@@ -1,7 +1,8 @@
 import random
+import struct
 import unittest
 
-from crypto_pq import SHAKE128, SHAKE256, _keccak, _lanes, _sha2
+from crypto_pq import SHA3_256, SHAKE128, SHAKE256, _keccak, _lanes, _sha2
 
 # The lane engines must agree with the scalar code, which the CAVP vectors cover, in every lane.
 COUNTS = (1, 2, 3, 17, 64)
@@ -90,6 +91,33 @@ class LanesTest(unittest.TestCase):
                     out = [a + b for a, b in zip(stream.blocks(2), stream.blocks(1))]
 
                     self.assertEqual(out, [algorithm.digest(seed, 3 * rate) for seed in seeds])
+
+    def test_squeeze_rates(self):
+        seeds = [self.random.randbytes(34) for _ in range(3)]
+
+        out = _lanes.Squeeze(seeds, [168, 136, 168]).blocks(2)
+
+        self.assertEqual(out, [SHAKE128.digest(seeds[0], 336), SHAKE256.digest(seeds[1], 272), SHAKE128.digest(seeds[2], 336)])
+
+    # A longer sponge in lane 0 finishes with the scalar permutation after the batch, or inside
+    # it when it has fewer blocks than the batch has permutations.
+    def test_beside(self):
+        for count in (1, 3, 9):
+            for length in (0, 135, 136, 1000):
+                with self.subTest(count=count, length=length):
+                    message = self.random.randbytes(length)
+
+                    seeds = [self.random.randbytes(34) for _ in range(count)]
+
+                    streams = [_lanes.padded_block(seed, 168, 0x1F) for seed in seeds]
+
+                    stream = _lanes.Beside([0] * 25, _lanes.padded_blocks(message, 136, 0x06), streams, [168] * count)
+
+                    out = [a + b for a, b in zip(stream.blocks(2), stream.blocks(3))]
+
+                    self.assertEqual(out, [SHAKE128.digest(seed, 5 * 168) for seed in seeds])
+
+                    self.assertEqual(struct.pack("<4Q", *stream.finish()[:4]), SHA3_256.digest(message))
 
     def test_conversions(self):
         for count in COUNTS:

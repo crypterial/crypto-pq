@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 import crypto_pq
@@ -181,6 +182,55 @@ class KemApiTest(unittest.TestCase):
                 self.assertEqual(algorithm.generate_key_pair(self_test=False).public_key.algorithm, algorithm)
 
                 self.assertCode(ErrorCode.INVALID_OPTION, algorithm.generate_key_pair, self_test=1)
+
+    # A key keeps what its operations derive from it: using it again, through the public key of
+    # its private key, or from several threads at its first use gives what fresh keys give.
+    def test_reused_keys(self):
+        for algorithm in (*ALGORITHMS.values(), crypto_pq.X_WING):
+            with self.subTest(algorithm=algorithm.name):
+                pair = hazmat.generate_key_pair(algorithm, bytes(range(algorithm._backend.seed_size)))
+
+                public, private = pair.public_key.export_key("raw"), pair.private_key.export_key("raw")
+
+                randomness = [bytes([i]) * algorithm._backend.randomness_size for i in range(3)]
+
+                expected = [hazmat.encapsulate(algorithm.import_public_key(public, "raw"), r) for r in randomness]
+
+                secrets = [algorithm.import_private_key(private, "raw").decapsulate(e.ciphertext) for e in expected]
+
+                self.assertEqual(secrets, [e.shared_secret for e in expected])
+
+                for key in (algorithm.import_public_key(public, "raw"), pair.private_key.public_key):
+                    for _ in range(2):
+                        self.assertEqual([hazmat.encapsulate(key, r) for r in randomness], expected)
+
+                key = algorithm.import_private_key(private, "raw")
+
+                for _ in range(2):
+                    self.assertEqual([key.decapsulate(e.ciphertext) for e in expected], secrets)
+
+                public_key, private_key = algorithm.import_public_key(public, "raw"), algorithm.import_private_key(private, "raw")
+
+                barrier = threading.Barrier(4)
+
+                results = [None] * 4
+
+                def work(index):
+                    barrier.wait()
+
+                    encapsulation = hazmat.encapsulate(public_key, randomness[index % 3])
+
+                    results[index] = (encapsulation, private_key.decapsulate(encapsulation.ciphertext))
+
+                threads = [threading.Thread(target=work, args=(i,)) for i in range(4)]
+
+                for thread in threads:
+                    thread.start()
+
+                for thread in threads:
+                    thread.join()
+
+                self.assertEqual(results, [(expected[i % 3], secrets[i % 3]) for i in range(4)])
 
     def test_formats(self):
         for algorithm in ALGORITHMS.values():

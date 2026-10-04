@@ -1,9 +1,10 @@
 import struct
 from typing import NamedTuple
 
-from . import _lanes
+from . import _bits, _lanes
 from ._bytes import equal
-from ._primitives import sha3_256, sha3_512, shake256
+from ._ntt import Ntt
+from ._primitives import sha3_256, sha3_512
 
 Q = 3329
 
@@ -49,73 +50,12 @@ ML_KEM_768 = Parameters("ML-KEM-768", 3, 2, 2, 10, 4)
 
 ML_KEM_1024 = Parameters("ML-KEM-1024", 4, 2, 2, 11, 5)
 
-
-# In both transforms the butterflies reduce only the products: the sums stay below 2^7 q in
-# magnitude, which Python integers hold exactly, and the last line reduces every coefficient once.
-def ntt(f):
-    f = list(f)
-
-    i = 1
-
-    length = 128
-
-    while length >= 2:
-        for start in range(0, 256, 2 * length):
-            zeta = ZETAS[i]
-
-            i += 1
-
-            for j in range(start, start + length):
-                t = zeta * f[j + length] % Q
-
-                x = f[j]
-
-                f[j + length] = x - t
-
-                f[j] = x + t
-
-        length //= 2
-
-    return [x % Q for x in f]
-
-
-def inverse_ntt(f):
-    f = list(f)
-
-    i = 127
-
-    length = 2
-
-    while length <= 128:
-        for start in range(0, 256, 2 * length):
-            zeta = ZETAS[i]
-
-            i -= 1
-
-            for j in range(start, start + length):
-                t = f[j]
-
-                u = f[j + length]
-
-                f[j] = t + u
-
-                f[j + length] = zeta * (u - t) % Q
-
-        length *= 2
-
-    return [x * 3303 % Q for x in f]
-
-
-def add(f, g):
-    return [(a + b) % Q for a, b in zip(f, g)]
-
-
-def subtract(f, g):
-    return [(a - b) % Q for a, b in zip(f, g)]
+_NTT = Ntt(Q, ZETAS, 2, 3303)
 
 
 # The sum of the products of the 128 degree-1 pieces (FIPS 203, Algorithms 11 and 12), with the
-# even and the odd coefficients of every piece in separate lists and one reduction at the end.
+# even and the odd coefficients of every piece in separate lists, unreduced: the caller reduces
+# the sum once.
 def dot(row, vector):
     even = [0] * 128
 
@@ -130,39 +70,35 @@ def dot(row, vector):
 
     h = [0] * 256
 
-    h[0::2] = [e % Q for e in even]
+    h[0::2] = even
 
-    h[1::2] = [o % Q for o in odd]
+    h[1::2] = odd
 
     return h
 
 
 def byte_encode(f, d):
-    value = 0
-
-    for i, coefficient in enumerate(f):
-        value |= coefficient << (d * i)
-
-    return value.to_bytes(32 * d, "little")
+    return _bits.pack(f, d)
 
 
 def byte_decode(data, d):
-    value = int.from_bytes(data, "little")
-
-    mask = (1 << d) - 1
-
-    f = [(value >> (d * i)) & mask for i in range(256)]
+    f = _bits.unpack(data, d)
 
     return [x % Q for x in f] if d == 12 else f
 
 
-# round(2^d * x / q): q is odd, so adding floor(q / 2) before the floor division never meets a tie.
-def compress(x, d):
-    return (((x << d) + 1664) // Q) & ((1 << d) - 1)
+# round(2^d * x / q) of each coefficient x = a - b + e, after its reduction: q is odd, so adding
+# floor(q / 2) before the floor division never meets a tie.
+def compress(f, g, h, d):
+    mask = (1 << d) - 1
+
+    return [((((a - b + e) % Q << d) + 1664) // Q) & mask for a, b, e in zip(f, g, h)]
 
 
-def decompress(y, d):
-    return (y * Q + (1 << (d - 1))) >> d
+def decompress(f, d):
+    half = 1 << (d - 1)
+
+    return [(y * Q + half) >> d for y in f]
 
 
 # FIPS 203, Algorithm 7: two 12-bit candidates from every 3 bytes, in stream order. Each group
@@ -191,21 +127,24 @@ def sample_ntt(data):
     return [c for c in candidates(data) if c < Q][:256]
 
 
-# SampleNTT for the whole matrix: the k * k SHAKE128 streams run in lanes, three blocks at first,
-# which nearly always give 256 coefficients, and another block whenever one stream needs it.
-def matrix(rho, k):
-    stream = _lanes.Squeeze([rho + bytes([j, i]) for i in range(k) for j in range(k)], 168)
+def _matrix_seeds(rho, k):
+    return [rho + bytes([j, i]) for i in range(k) for j in range(k)]
 
+
+# SampleNTT for the whole matrix from streams that run in lanes, with any further streams of the
+# same batch after the k * k of the matrix: three blocks nearly always give 256 coefficients, and
+# another block follows for every stream whenever one of the matrix falls short.
+def _sample_matrix(stream, k):
     data = stream.blocks(3)
 
-    polys = [sample_ntt(d) for d in data]
+    polys = [sample_ntt(d) for d in data[: k * k]]
 
     while any(len(a) < 256 for a in polys):
         data = [d + more for d, more in zip(data, stream.blocks(1))]
 
-        polys = [sample_ntt(d) for d in data]
+        polys = [sample_ntt(d) for d in data[: k * k]]
 
-    return [polys[i * k : (i + 1) * k] for i in range(k)]
+    return [polys[i * k : (i + 1) * k] for i in range(k)], data[k * k :]
 
 
 def _cbd_masks(eta):
@@ -221,9 +160,9 @@ def _cbd_masks(eta):
 _CBD = {eta: _cbd_masks(eta) for eta in (2, 3)}
 
 
-# FIPS 203, Algorithm 8, on every coefficient at once: after the bits of each eta-bit group are
-# added in place, a field of 2 * eta bits holds x and y side by side, and x + eta - y never
-# borrows from the next field.
+# FIPS 203, Algorithm 8, on every coefficient at once, as the values x - y + eta in [0, 2 eta]:
+# after the bits of each eta-bit group are added in place, a field of 2 * eta bits holds x and y
+# side by side, and x + eta - y never borrows from the next field.
 def sample_cbd(data, eta):
     groups, low, bias = _CBD[eta]
 
@@ -233,11 +172,11 @@ def sample_cbd(data, eta):
 
     values = (sums & low) + bias - ((sums >> eta) & low)
 
-    width = 2 * eta
+    return _bits.unpack(values.to_bytes(64 * eta, "little"), 2 * eta)
 
-    mask = (1 << width) - 1
 
-    return [(((values >> (width * i)) & mask) - eta) % Q for i in range(256)]
+def _noise_etas(params):
+    return [params.eta1] * params.k + [params.eta2] * (params.k + 1)
 
 
 # The PRF outputs for nonces 0, 1, ... with the given eta each, as one batch of SHAKE256 streams.
@@ -247,20 +186,25 @@ def prfs(seed, etas):
     return [d[: 64 * eta] for d, eta in zip(data, etas)]
 
 
+# K-PKE.KeyGen; the PRF streams of s and e share the lanes of the matrix.
 def pke_keygen(d, params):
-    k = params.k
+    k, eta = params.k, params.eta1
 
     g = sha3_512(d + bytes([k]))
 
     rho, sigma = g[:32], g[32:]
 
-    a = matrix(rho, k)
+    seeds = [sigma + bytes([n]) for n in range(2 * k)]
 
-    noise = [ntt(sample_cbd(data, params.eta1)) for data in prfs(sigma, [params.eta1] * (2 * k))]
+    stream = _lanes.Squeeze(_matrix_seeds(rho, k) + seeds, [168] * (k * k) + [136] * (2 * k))
 
-    s, e = noise[:k], noise[k:]
+    a, noise = _sample_matrix(stream, k)
 
-    t = [add(dot(a[i], s), e[i]) for i in range(k)]
+    noise = _NTT.forward([[x - eta for x in sample_cbd(data[: 64 * eta], eta)] for data in noise])
+
+    s, e = [[x % Q for x in poly] for poly in noise[:k]], noise[k:]
+
+    t = [[(x + y) % Q for x, y in zip(dot(a[i], s), e[i])] for i in range(k)]
 
     ek = b"".join(byte_encode(x, 12) for x in t) + rho
 
@@ -269,48 +213,226 @@ def pke_keygen(d, params):
     return ek, dk
 
 
-def pke_encrypt(ek, m, r, params):
+# Encryption and decryption multiply in the normal domain by Kronecker substitution: a polynomial
+# evaluated at 2^w is an integer whose base-2^w digits are its coefficients, so one integer product
+# gives the product polynomial, and X^256 = -1 folds its upper 256 digits back. The secret operand
+# (y, or s) carries 2^(w - 1) in every digit, which keeps its size independent of its coefficients;
+# a public correction removes the public operand times that bias and adds 2^(w - 1) to every digit
+# of the result, so that digits of either sign stay apart. Products with y use w = 24: their
+# coefficients stay below k * 256 * (q - 1) * eta1 < 2^23. y comes as the values of sample_cbd,
+# y + eta1, and the lower half of the result carries eta2 less, so that adding the values of e1 and
+# e2 gives u and v directly. Products with s use w = 32 with both operands centred, in groups of at
+# most three: 3 * 256 * 1664^2 < 2^31.
+def _ones(count, size):
+    return int.from_bytes((b"\x01" + bytes(size - 1)) * count, "little")
+
+
+_HALF_24 = 1 << 23
+
+_TEMPLATE_24 = b"\x00\x00\x80" * 256
+
+_HALF_32 = 1 << 31
+
+_OPERAND_32 = _HALF_32 * _ones(256, 4)
+
+_BIAS_32 = _HALF_32 * _ones(512, 4)
+
+
+def _evaluate24(values):
+    data = struct.pack(f"<{len(values)}I", *values)
+
+    packed = bytearray(3 * len(values))
+
+    packed[0::3] = data[0::4]
+
+    packed[1::3] = data[1::4]
+
+    packed[2::3] = data[2::4]
+
+    return int.from_bytes(packed, "little")
+
+
+def _digits24(value):
+    data = value.to_bytes(1536, "little")
+
+    spread = bytearray(2048)
+
+    spread[0::4] = data[0::3]
+
+    spread[1::4] = data[1::3]
+
+    spread[2::4] = data[2::3]
+
+    return struct.unpack("<512I", spread)
+
+
+# The evaluation of y + 2^23 + eta1 at 2^24, from the values of sample_cbd.
+def _noise_operand(values):
+    data = bytearray(_TEMPLATE_24)
+
+    data[0::3] = values
+
+    return int.from_bytes(data, "little")
+
+
+def _evaluate32(values):
+    return int.from_bytes(struct.pack("<256I", *values), "little")
+
+
+# The two halves of the digits of sum(public * secret) - correction, whose difference is the
+# product modulo X^256 + 1.
+def _product24(publics, secrets, correction):
+    digits = _digits24(sum(a * b for a, b in zip(publics, secrets)) - correction)
+
+    return digits[:256], digits[256:]
+
+
+# The matrix columns and t of K-PKE in the normal domain, evaluated at 2^24, with the corrections
+# of their products.
+def _encryption_state(a, t, params):
     k = params.k
 
-    t = [byte_decode(ek[384 * i : 384 * (i + 1)], 12) for i in range(k)]
+    normal = _NTT.inverse([a[j][i] for i in range(k) for j in range(k)] + t)
 
-    a = matrix(ek[384 * k :], k)
+    rows = [[_evaluate24(normal[i * k + j]) for j in range(k)] for i in range(k)] + [[_evaluate24(poly) for poly in normal[k * k :]]]
 
-    noise = prfs(r, [params.eta1] * k + [params.eta2] * (k + 1))
+    operand = (_HALF_24 + params.eta1) * _ones(256, 3)
 
-    y = [ntt(sample_cbd(data, params.eta1)) for data in noise[:k]]
+    bias = (_HALF_24 - params.eta2) * _ones(256, 3) + (_HALF_24 * _ones(256, 3) << 6144)
 
-    e1 = [sample_cbd(data, params.eta2) for data in noise[k : 2 * k]]
-
-    e2 = sample_cbd(noise[2 * k], params.eta2)
-
-    columns = [[a[j][i] for j in range(k)] for i in range(k)]
-
-    u = [add(inverse_ntt(dot(columns[i], y)), e1[i]) for i in range(k)]
-
-    mu = [decompress(bit, 1) for bit in byte_decode(m, 1)]
-
-    v = add(add(inverse_ntt(dot(t, y)), e2), mu)
-
-    c1 = b"".join(byte_encode([compress(x, params.du) for x in f], params.du) for f in u)
-
-    c2 = byte_encode([compress(x, params.dv) for x in v], params.dv)
-
-    return c1 + c2
+    return rows, [sum(row) * operand - bias for row in rows]
 
 
-def pke_decrypt(dk, c, params):
+# K-PKE.Encrypt from the PRF outputs: u = A^T y + e1 and v = t^T y + e2 + Decompress_1(m).
+def _encrypt(state, m, noise, params):
     k, du, dv = params.k, params.du, params.dv
 
-    u = [[decompress(x, du) for x in byte_decode(c[32 * du * i : 32 * du * (i + 1)], du)] for i in range(k)]
+    rows, corrections = state
 
-    v = [decompress(x, dv) for x in byte_decode(c[32 * du * k :], dv)]
+    y = [_noise_operand(sample_cbd(data, params.eta1)) for data in noise[:k]]
 
-    s = [byte_decode(dk[384 * i : 384 * (i + 1)], 12) for i in range(k)]
+    c = []
 
-    w = subtract(v, inverse_ntt(dot(s, [ntt(f) for f in u])))
+    for i in range(k):
+        lo, hi = _product24(rows[i], y, corrections[i])
 
-    return byte_encode([compress(x, 1) for x in w], 1)
+        c.append(byte_encode(compress(lo, hi, sample_cbd(noise[k + i], params.eta2), du), du))
+
+    lo, hi = _product24(rows[k], y, corrections[k])
+
+    e2 = [e + 1665 * bit for e, bit in zip(sample_cbd(noise[2 * k], params.eta2), byte_decode(m, 1))]
+
+    return b"".join(c) + byte_encode(compress(lo, hi, e2, dv), dv)
+
+
+# K-PKE.Decrypt: w = v - s^T u, with the evaluations of s from the decapsulation key.
+def _decrypt(secret, c, params):
+    k, du, dv = params.k, params.du, params.dv
+
+    u = []
+
+    for i in range(k):
+        f = decompress(byte_decode(c[32 * du * i : 32 * du * (i + 1)], du), du)
+
+        u.append(_evaluate32([(x - Q if x > 1664 else x) + _HALF_32 for x in f]) - _OPERAND_32)
+
+    w = decompress(byte_decode(c[32 * du * k :], dv), dv)
+
+    for start in range(0, k, 3):
+        group = range(start, min(start + 3, k))
+
+        product = sum(u[j] * secret[j] for j in group) - sum(u[j] for j in group) * _OPERAND_32 + _BIAS_32
+
+        digits = struct.unpack("<512I", product.to_bytes(2048, "little"))
+
+        lo, hi = digits[:256], digits[256:]
+
+        if start + 3 < k:
+            w = [x - a + b for x, a, b in zip(w, lo, hi)]
+
+    return byte_encode(compress(w, lo, hi, 1), 1)
+
+
+class EncapsulationKey:
+    """An encapsulation key with H(ek) and its encryption state, both computed on first use and
+    kept: each goes once from None to its value, so threads that race there compute equal values."""
+
+    __slots__ = ("ek", "params", "_hash", "_state")
+
+    def __init__(self, ek, params, h=None):
+        self.ek = ek
+
+        self.params = params
+
+        self._hash = h
+
+        self._state = None
+
+    def hash(self):
+        if self._hash is None:
+            self._hash = sha3_256(self.ek)
+
+        return self._hash
+
+    # A key that still needs H(ek) hashes it in lane 0 beside the matrix streams.
+    def state(self):
+        if self._state is None:
+            k = self.params.k
+
+            ek = self.ek
+
+            seeds = _matrix_seeds(ek[384 * k :], k)
+
+            if self._hash is None:
+                stream = _lanes.Beside([0] * 25, _lanes.padded_blocks(ek, 136, 0x06), [_lanes.padded_block(seed, 168, 0x1F) for seed in seeds], [168] * (k * k))
+
+                a, _ = _sample_matrix(stream, k)
+
+                self._hash = struct.pack("<4Q", *stream.finish()[:4])
+            else:
+                a, _ = _sample_matrix(_lanes.Squeeze(seeds, 168), k)
+
+            self._state = _encryption_state(a, [byte_decode(ek[384 * i : 384 * (i + 1)], 12) for i in range(k)], self.params)
+
+        return self._state
+
+
+class DecapsulationKey:
+    """A decapsulation key with its public part, and with s in the normal domain, centred and
+    evaluated for the products of _decrypt on first use."""
+
+    __slots__ = ("dk", "params", "public", "z", "_secret")
+
+    def __init__(self, dk, params, public):
+        self.dk = dk
+
+        self.params = params
+
+        self.public = public
+
+        self.z = dk[768 * params.k + 64 :]
+
+        self._secret = None
+
+    def secret(self):
+        if self._secret is None:
+            k = self.params.k
+
+            s = _NTT.inverse([byte_decode(self.dk[384 * i : 384 * (i + 1)], 12) for i in range(k)])
+
+            self._secret = [_evaluate32([x - (((1664 - x) >> 31) & Q) + _HALF_32 for x in poly]) for poly in s]
+
+        return self._secret
+
+
+def public_state(ek, params):
+    return EncapsulationKey(ek, params)
+
+
+def private_state(dk, params):
+    k = params.k
+
+    return DecapsulationKey(dk, params, EncapsulationKey(dk[384 * k : 768 * k + 32], params, dk[768 * k + 32 : 768 * k + 64]))
 
 
 def keygen_internal(d, z, params):
@@ -319,29 +441,35 @@ def keygen_internal(d, z, params):
     return ek, dk + ek + sha3_256(ek) + z
 
 
-def encaps_internal(ek, m, params):
-    g = sha3_512(m + sha3_256(ek))
+def encaps_internal(key, m, params):
+    state = key.state()
 
-    shared_secret, r = g[:32], g[32:]
+    g = sha3_512(m + key.hash())
 
-    return shared_secret, pke_encrypt(ek, m, r, params)
+    return g[:32], _encrypt(state, m, prfs(g[32:], _noise_etas(params)), params)
 
 
-# Implicit rejection: a ciphertext that does not re-encrypt to itself yields J(z || c).
-def decaps_internal(dk, c, params):
-    k = params.k
+# Implicit rejection: a ciphertext that does not re-encrypt to itself yields J(z || c). J takes one
+# permutation per block of z || c; G(m || h), and then the PRF streams from r, ride in the lanes of
+# its first permutations.
+def decaps_internal(key, c, params):
+    m = _decrypt(key.secret(), c, params)
 
-    dk_pke, ek, h, z = dk[: 384 * k], dk[384 * k : 768 * k + 32], dk[768 * k + 32 : 768 * k + 64], dk[768 * k + 64 :]
+    blocks = _lanes.padded_blocks(key.z + c, 136, 0x1F)
 
-    m = pke_decrypt(dk_pke, c, params)
+    stream = _lanes.Beside([0] * 25, blocks, [_lanes.padded_block(m + key.public.hash(), 72, 0x06)], [72])
 
-    g = sha3_512(m + h)
+    g = stream.blocks(1)[0]
 
-    shared_secret, r = g[:32], g[32:]
+    etas = _noise_etas(params)
 
-    rejected = shake256(z + c, 32)
+    stream = _lanes.Beside(stream.lane, stream.pending, [_lanes.padded_block(g[32:64] + bytes([n]), 136, 0x1F) for n in range(len(etas))], [136] * len(etas))
 
-    return shared_secret if equal(c, pke_encrypt(ek, m, r, params)) else rejected
+    noise = [d[: 64 * eta] for d, eta in zip(stream.blocks(-(-64 * max(etas) // 136)), etas)]
+
+    rejected = struct.pack("<4Q", *stream.finish()[:4])
+
+    return g[:32] if equal(c, _encrypt(key.public.state(), m, noise, params)) else rejected
 
 
 # FIPS 203, 7.2: every coefficient of the encoded vector must already be reduced modulo q.

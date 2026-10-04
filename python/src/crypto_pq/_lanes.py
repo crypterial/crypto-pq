@@ -10,7 +10,7 @@ the FORS leaves and the nodes of one Merkle level.
 import struct
 from functools import lru_cache
 
-from ._keccak import ROUND_CONSTANTS
+from ._keccak import ROUND_CONSTANTS, permute
 from ._sha2 import K256, K512
 
 M32 = 0xFFFFFFFF
@@ -633,32 +633,115 @@ def shake256(message, count, size):
     return state[:size]
 
 
-class Squeeze:
-    """SHAKE streams of several short seeds of equal length, absorbed and squeezed together, one
-    stream per lane. rate is 168 for SHAKE128 and 136 for SHAKE256."""
+# A message of at most rate - 1 bytes with its Keccak padding: the domain suffix (0x06 for SHA-3,
+# 0x1F for SHAKE) right after it and 0x80 in the last byte of the rate; the rest of the 200-byte
+# state stays zero.
+def padded_block(message, rate, suffix):
+    block = bytearray(200)
 
-    __slots__ = ("count", "rate", "engine", "state")
+    block[: len(message)] = message
+
+    block[len(message)] ^= suffix
+
+    block[rate - 1] ^= 0x80
+
+    return bytes(block)
+
+
+# The padded blocks of a longer message, each as the 25 words that it adds to the state.
+def padded_blocks(message, rate, suffix):
+    data = bytearray(message)
+
+    data.append(suffix)
+
+    data += bytes(-len(data) % rate)
+
+    data[-1] |= 0x80
+
+    size = rate // 8
+
+    words = struct.unpack(f"<{len(data) // 8}Q", data)
+
+    return [list(words[i : i + size]) + [0] * (25 - size) for i in range(0, len(words), size)]
+
+
+# The rest of a sponge on the scalar permutation.
+def absorb(state, blocks):
+    for block in blocks:
+        for i, word in enumerate(block):
+            state[i] ^= word
+
+        permute(state)
+
+    return state
+
+
+class Squeeze:
+    """SHAKE streams of short seeds, absorbed and squeezed together, one stream per lane. A rate is
+    168 for SHAKE128 and 136 for SHAKE256; `rate` gives one for every stream or a list of them."""
+
+    __slots__ = ("count", "rates", "engine", "state")
 
     def __init__(self, seeds, rate):
         self.count = len(seeds)
 
-        self.rate = rate
+        self.rates = [rate] * self.count if isinstance(rate, int) else list(rate)
 
         self.engine = keccak_engine(self.count)
 
-        size = len(seeds[0])
-
-        tail = b"\x1f" + bytes(rate - size - 2) + b"\x80"
-
-        self.state = lanes64([seed + tail for seed in seeds]) + [0] * (25 - rate // 8)
+        self.state = lanes64([padded_block(seed, r, 0x1F) for seed, r in zip(seeds, self.rates)])
 
     def blocks(self, number):
         out = [b""] * self.count
 
+        size = max(self.rates) // 8
+
         for _ in range(number):
             self.state = self.engine.permute(self.state)
 
-            out = [a + b for a, b in zip(out, chunks64(self.state[: self.rate // 8], self.count))]
+            out = [a + b[:r] for a, b, r in zip(out, chunks64(self.state[:size], self.count), self.rates)]
 
         return out
 
+
+class Beside:
+    """One-block sponges in lanes 1 .., beside a longer sponge in lane 0 that pays for their
+    permutations: before each permutation lane 0 absorbs its next block, while it has any, and
+    after it every other lane squeezes `rate` bytes. `state` is lane 0's state so far and `blocks`
+    its remaining blocks (see padded_blocks); `streams` are the padded blocks of the others."""
+
+    __slots__ = ("count", "rates", "engine", "words", "pending", "lane")
+
+    def __init__(self, state, blocks, streams, rates):
+        self.count = 1 + len(streams)
+
+        self.rates = rates
+
+        self.engine = keccak_engine(self.count)
+
+        self.words = [(word << 64) | lane for word, lane in zip(lanes64(streams), state)]
+
+        self.pending = list(blocks)
+
+        self.lane = state
+
+    def blocks(self, number):
+        out = [b""] * (self.count - 1)
+
+        size = max(self.rates) // 8
+
+        for _ in range(number):
+            if self.pending:
+                self.words = self.engine.permute([word ^ add for word, add in zip(self.words, self.pending.pop(0))])
+
+                self.lane = [word & M64 for word in self.words]
+            else:
+                self.words = self.engine.permute(self.words)
+
+            out = [a + b[:r] for a, b, r in zip(out, chunks64(self.words[:size], self.count)[1:], self.rates)]
+
+        return out
+
+    # Lane 0 after its last absorbed block, finished on the scalar permutation.
+    def finish(self):
+        return absorb(list(self.lane), self.pending)

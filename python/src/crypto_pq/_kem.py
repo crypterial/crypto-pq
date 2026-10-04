@@ -57,11 +57,20 @@ class _MlKem:
     def check_public_key(self, ek):
         return _mlkem.check_encapsulation_key(ek, self.params)
 
-    def encapsulate(self, ek, randomness):
-        return _mlkem.encaps_internal(ek, randomness, self.params)
+    def public_state(self, ek):
+        return _mlkem.public_state(ek, self.params)
 
-    def decapsulate(self, private, ciphertext):
-        return _mlkem.decaps_internal(private, ciphertext, self.params)
+    def private_state(self, dk):
+        return _mlkem.private_state(dk, self.params)
+
+    def public_state_of(self, state):
+        return state.public
+
+    def encapsulate(self, state, randomness):
+        return _mlkem.encaps_internal(state, randomness, self.params)
+
+    def decapsulate(self, state, ciphertext):
+        return _mlkem.decaps_internal(state, ciphertext, self.params)
 
 
 class _XWing:
@@ -83,11 +92,20 @@ class _XWing:
     def check_public_key(self, pk):
         return _xwing.check_public_key(pk)
 
-    def encapsulate(self, pk, randomness):
-        return _xwing.encapsulate(pk, randomness)
+    def public_state(self, pk):
+        return _xwing.public_state(pk)
 
-    def decapsulate(self, private, ciphertext):
-        return _xwing.decapsulate(private, ciphertext)
+    def private_state(self, private):
+        return _xwing.private_state(private)
+
+    def public_state_of(self, state):
+        return _xwing.public_state_of(state)
+
+    def encapsulate(self, state, randomness):
+        return _xwing.encapsulate(state, randomness)
+
+    def decapsulate(self, state, ciphertext):
+        return _xwing.decapsulate(state, ciphertext)
 
 
 class Encapsulation(NamedTuple):
@@ -96,13 +114,17 @@ class Encapsulation(NamedTuple):
     ciphertext: bytes
 
 
+# A key keeps what its operations derive from it, such as H(ek) and the matrix of ML-KEM, in its
+# state; a private key shares the state of its public part with its public key.
 class KemPublicKey:
-    __slots__ = ("_algorithm", "_key")
+    __slots__ = ("_algorithm", "_key", "_state")
 
-    def __init__(self, algorithm: KemAlgorithm, key: bytes) -> None:
+    def __init__(self, algorithm: KemAlgorithm, key: bytes, state: object = None) -> None:
         self._algorithm = algorithm
 
         self._key = key
+
+        self._state = algorithm._backend.public_state(key) if state is None else state
 
     @property
     def algorithm(self) -> KemAlgorithm:
@@ -114,7 +136,7 @@ class KemPublicKey:
         return self._encapsulate(random_bytes(backend.randomness_size))
 
     def _encapsulate(self, randomness: bytes) -> Encapsulation:
-        shared_secret, ciphertext = self._algorithm._backend.encapsulate(self._key, randomness)
+        shared_secret, ciphertext = self._algorithm._backend.encapsulate(self._state, randomness)
 
         return Encapsulation(shared_secret, ciphertext)
 
@@ -132,7 +154,7 @@ class KemPublicKey:
 
 
 class KemPrivateKey:
-    __slots__ = ("_algorithm", "_seed", "_private", "_public")
+    __slots__ = ("_algorithm", "_seed", "_private", "_public", "_state")
 
     def __init__(self, algorithm: KemAlgorithm, seed: bytes | None, private: object, public: bytes) -> None:
         self._algorithm = algorithm
@@ -143,13 +165,15 @@ class KemPrivateKey:
 
         self._public = public
 
+        self._state = algorithm._backend.private_state(private)
+
     @property
     def algorithm(self) -> KemAlgorithm:
         return self._algorithm
 
     @property
     def public_key(self) -> KemPublicKey:
-        return KemPublicKey(self._algorithm, self._public)
+        return KemPublicKey(self._algorithm, self._public, self._algorithm._backend.public_state_of(self._state))
 
     def decapsulate(self, ciphertext: _Bytes) -> bytes:
         ciphertext = require_bytes(ciphertext, "ciphertext")
@@ -158,7 +182,7 @@ class KemPrivateKey:
 
         require_length(ciphertext, backend.ciphertext_size, "ciphertext")
 
-        return backend.decapsulate(self._private, ciphertext)
+        return backend.decapsulate(self._state, ciphertext)
 
     def export_key(self, format: KeyFormat | str) -> bytes:
         backend = self._algorithm._backend

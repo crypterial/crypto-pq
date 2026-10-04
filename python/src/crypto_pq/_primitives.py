@@ -34,25 +34,9 @@ def sha3_512(data):
     return engine.digest()
 
 
-def shake128(data):
-    engine = Keccak(168, 0x1F, 0)
-
-    engine.update(data)
-
-    return engine
-
-
 def shake256(data, length):
     engine = Keccak(136, 0x1F, 0)
 
     engine.update(data)
 
     return engine.read(length)
-
-
-def shake256_stream(data):
-    engine = Keccak(136, 0x1F, 0)
-
-    engine.update(data)
-
-    return engine

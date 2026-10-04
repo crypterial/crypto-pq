@@ -102,14 +102,23 @@ class _MlDsa:
 
         return pk, sk
 
+    def public_state(self, pk):
+        return _mldsa.public_state(pk, self.params)
+
+    def private_state(self, sk, pk):
+        return _mldsa.private_state(sk, pk, self.params)
+
+    def public_state_of(self, state):
+        return state.public
+
     def deterministic_randomness(self, private):
         return bytes(32)
 
-    def sign(self, private, message, randomness):
-        return _mldsa.sign_internal(private, message, randomness, self.params)
+    def sign(self, state, message, randomness):
+        return _mldsa.sign_internal(state, message, randomness, self.params)
 
-    def verify(self, public, message, signature):
-        return _mldsa.verify_internal(public, message, signature, self.params)
+    def verify(self, state, message, signature):
+        return _mldsa.verify_internal(state, message, signature, self.params)
 
 
 class _SlhDsa:
@@ -144,6 +153,15 @@ class _SlhDsa:
             raise mismatch("the private key does not match its public root")
 
         return sk[2 * n :], sk
+
+    def public_state(self, pk):
+        return pk
+
+    def private_state(self, sk, pk):
+        return sk
+
+    def public_state_of(self, state):
+        return state[2 * self.params.n :]
 
     def deterministic_randomness(self, private):
         n = self.params.n
@@ -181,13 +199,17 @@ def message_representative(message, context, entry):
     return bytes([1, len(context)]) + context + entry.oid + entry.digest(message)
 
 
+# A key keeps what its operations derive from it, such as tr and the matrix of ML-DSA, in its
+# state; a private key shares the state of its public part with its public key.
 class SignaturePublicKey:
-    __slots__ = ("_algorithm", "_key")
+    __slots__ = ("_algorithm", "_key", "_state")
 
-    def __init__(self, algorithm: SignatureAlgorithm, key: bytes) -> None:
+    def __init__(self, algorithm: SignatureAlgorithm, key: bytes, state: object = None) -> None:
         self._algorithm = algorithm
 
         self._key = key
+
+        self._state = algorithm._backend.public_state(key) if state is None else state
 
     @property
     def algorithm(self) -> SignatureAlgorithm:
@@ -210,7 +232,7 @@ class SignaturePublicKey:
         if too_weak(backend, entry, policy) or len(context) > 255 or len(signature) != backend.signature_size:
             return False
 
-        return backend.verify(self._key, message_representative(message, context, entry), signature)
+        return backend.verify(self._state, message_representative(message, context, entry), signature)
 
     def export_key(self, format: KeyFormat | str) -> bytes:
         return export_public(format, self._algorithm._backend.oid, self._key)
@@ -226,7 +248,7 @@ class SignaturePublicKey:
 
 
 class SignaturePrivateKey:
-    __slots__ = ("_algorithm", "_seed", "_private", "_public")
+    __slots__ = ("_algorithm", "_seed", "_private", "_public", "_state")
 
     def __init__(self, algorithm: SignatureAlgorithm, seed: bytes | None, private: bytes, public: bytes) -> None:
         self._algorithm = algorithm
@@ -237,13 +259,15 @@ class SignaturePrivateKey:
 
         self._public = public
 
+        self._state = algorithm._backend.private_state(private, public)
+
     @property
     def algorithm(self) -> SignatureAlgorithm:
         return self._algorithm
 
     @property
     def public_key(self) -> SignaturePublicKey:
-        return SignaturePublicKey(self._algorithm, self._public)
+        return SignaturePublicKey(self._algorithm, self._public, self._algorithm._backend.public_state_of(self._state))
 
     def sign(self, message: _Bytes, *, context: _Bytes = b"", deterministic: bool = False, pre_hash: _PreHash = None) -> bytes:
         require_bool(deterministic, "deterministic")
@@ -272,7 +296,7 @@ class SignaturePrivateKey:
         if len(context) > 255:
             raise CryptoPQError(ErrorCode.INVALID_CONTEXT, "the context must be at most 255 bytes")
 
-        return backend.sign(self._private, message_representative(message, context, entry), randomness)
+        return backend.sign(self._state, message_representative(message, context, entry), randomness)
 
     def export_key(self, format: KeyFormat | str) -> bytes:
         backend = self._algorithm._backend
