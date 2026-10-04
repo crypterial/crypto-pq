@@ -88,12 +88,8 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: rustup toolchain install ${{ matrix.rust }} --profile minimal --component clippy,rustfmt
+      - run: rustup toolchain install ${{ matrix.rust }} --profile minimal
       - run: rustup override set ${{ matrix.rust }}
-      - if: matrix.rust == 'stable' && matrix.os == 'ubuntu-latest'
-        run: cargo fmt --check
-      - if: matrix.rust == 'stable' && matrix.os == 'ubuntu-latest'
-        run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
       - run: cargo test --locked --release
 
@@ -333,30 +329,141 @@ jobs:
           print(crypto_pq.__name__, "wheel OK")
           '
 
-  # Every secret is marked uninitialised under valgrind's memcheck, so a branch or a memory index
-  # that depends on one fails the job; values the specifications make public are declassified.
-  rust-ct:
-    name: rust ${{ matrix.rust }} constant time (valgrind)
+  # fmt and clippy on both toolchains and every cfg. The cross-target clippy runs lint the other
+  # architecture's kernels (cpu/aarch64*, cpu/x86_64.rs) and the Windows and macOS detection,
+  # which only compile for those targets.
+  rust-lint:
+    name: rust ${{ matrix.rust }} lint '${{ matrix.cfg }}'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         rust: ["1.88", stable]
+        cfg: ["", "--cfg crypto_pq_ct", "--cfg crypto_pq_portable"]
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    env:
+      RUSTFLAGS: ${{ matrix.cfg }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install ${{ matrix.rust }} --profile minimal --component clippy,rustfmt
+      - run: rustup override set ${{ matrix.rust }}
+      - run: rustup target add aarch64-unknown-linux-gnu aarch64-apple-darwin aarch64-pc-windows-msvc x86_64-pc-windows-msvc
+      - if: matrix.rust == 'stable' && matrix.cfg == ''
+        run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: |
+          for target in aarch64-unknown-linux-gnu aarch64-apple-darwin aarch64-pc-windows-msvc x86_64-pc-windows-msvc; do
+            cargo clippy --all-targets --locked --target "$target" -- -D warnings
+          done
+
+  # The fallback of every CPU-specific kernel, on runners that have the instructions.
+  rust-portable:
+    name: rust ${{ matrix.rust }} forced portable (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        rust: ["1.88", stable]
+        include:
+          - { os: ubuntu-24.04-arm, rust: stable }
+          - { os: macos-latest, rust: stable }
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    env:
+      RUSTFLAGS: --cfg crypto_pq_portable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install ${{ matrix.rust }} --profile minimal
+      - run: rustup override set ${{ matrix.rust }}
+      - run: cargo test --locked
+      - run: cargo test --locked --release
+
+  # Each x86-64 path whatever the runner's CPU: QEMU user mode runs the suite on a CPU with AVX2
+  # and no SHA-NI, one with SHA-NI and no AVX, and one with neither. The runner itself covers the
+  # CPU it has, usually SHA-NI with AVX2.
+  rust-x86-models:
+    name: rust x86-64 -cpu ${{ matrix.cpu }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu: [Haswell-v4, Denverton, qemu64]
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: qemu-x86_64 -cpu ${{ matrix.cpu }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update -q && sudo apt-get install -yq qemu-user
+      - run: cargo test --locked --release -- --nocapture kernel
+      - run: cargo test --locked --release
+
+  # Every secret is marked uninitialised under valgrind's memcheck, so a branch or a memory index
+  # that depends on one fails the job; values the specifications make public are declassified.
+  # The crypto_pq_ct build leaves out what valgrind cannot execute (SHA-NI on x86-64; SHA3,
+  # SHA512 and DIT on arm64) and detects the rest; the portable run checks the fallback.
+  rust-ct:
+    name: rust ${{ matrix.rust }} constant time (valgrind, ${{ matrix.os }}) '${{ matrix.cfg }}'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        rust: ["1.88", stable]
+        cfg: ["", "--cfg crypto_pq_portable"]
+        include:
+          - { os: ubuntu-24.04-arm, rust: stable, cfg: "" }
+          - { os: ubuntu-24.04-arm, rust: stable, cfg: "--cfg crypto_pq_portable" }
     defaults:
       run:
         shell: bash
         working-directory: rust
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends valgrind
+      - run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends valgrind jq
       - run: rustup toolchain install ${{ matrix.rust }} --profile minimal
       - run: rustup override set ${{ matrix.rust }}
       - env:
-          RUSTFLAGS: --cfg crypto_pq_ct
+          RUSTFLAGS: --cfg crypto_pq_ct ${{ matrix.cfg }}
           CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
         run: |
           binary=$(cargo test --locked --release --test ct --no-run --message-format=json | jq -r 'select(.executable != null) | .executable')
           valgrind --error-exitcode=1 -q "$binary" --test-threads=1
+
+  # Not a gate: the CPU-specific paths against the forced fallback on GitHub's x86-64 and arm64
+  # runners, printed side by side with the CPU model, so that the x86-64 kernels are measured on
+  # real hardware.
+  rust-bench:
+    name: rust benchmark (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup override set stable
+      - run: lscpu | grep -E '^(Model name|Flags)' | cut -c1-600
+      - run: |
+          cargo bench --locked > "$RUNNER_TEMP/kernels.txt"
+          RUSTFLAGS="--cfg crypto_pq_portable" cargo bench --locked > "$RUNNER_TEMP/portable.txt"
+          printf '%-32s %14s %14s %8s\n' case 'portable (us)' 'kernels (us)' speedup
+          paste "$RUNNER_TEMP/portable.txt" "$RUNNER_TEMP/kernels.txt" |
+            awk '{ printf "%-32s %14.3f %14.3f %7.2fx\n", $1, $3, $6, $3 / $6 }' | tee -a "$GITHUB_STEP_SUMMARY"
 
   zig-ct:
     name: zig 0.16.0 constant time (valgrind)
