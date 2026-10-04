@@ -1,5 +1,6 @@
 import { equal, wipe } from "./bytes.ts";
 import { Keccak } from "./keccak.ts";
+import { bitPack3, bitPack4, bitPack13, simpleBitPack10 } from "./mldsa-pack.ts";
 import { shake256 } from "./primitives.ts";
 
 const Q = 8380417;
@@ -239,7 +240,7 @@ function nttOf(values: Int32Array): Float64Array {
   return w;
 }
 
-function pointwise(f: Float64Array, g: Float64Array): Float64Array {
+function pointwise(f: Float64Array, g: Int32Array): Float64Array {
   const h = new Float64Array(256);
 
   for (let i = 0; i < 256; i++) {
@@ -250,7 +251,7 @@ function pointwise(f: Float64Array, g: Float64Array): Float64Array {
 }
 
 // sum(row[i] * vector[i]) in the NTT domain; each product is below 2^48, so the sums are exact.
-function dot(row: Float64Array[], vector: Float64Array[]): Float64Array {
+function dot(row: Int32Array[], vector: Float64Array[]): Float64Array {
   const total = new Float64Array(256);
 
   for (let i = 0; i < row.length; i++) {
@@ -280,7 +281,7 @@ function inverseOf(w: Float64Array): Int32Array {
 }
 
 // t = NTT^-1(A * NTT(s1)) + s2, with canonical coefficients.
-function publicT(a: Float64Array[][], s1: Int32Array[], s2: Int32Array[]): Int32Array[] {
+function publicT(a: Int32Array[][], s1: Int32Array[], s2: Int32Array[]): Int32Array[] {
   const s1Hat = s1.map(nttOf);
 
   const t = a.map((row, i) => {
@@ -470,12 +471,12 @@ const XOF256 = new Keccak(136, 0x1f);
 
 const MASK = new Uint8Array(640);
 
-function rejNttPoly(seed: Uint8Array): Float64Array {
+function rejNttPoly(seed: Uint8Array): Int32Array {
   XOF128.reset();
 
   XOF128.update(seed);
 
-  const a = new Float64Array(256);
+  const a = new Int32Array(256);
 
   let count = 0;
 
@@ -529,15 +530,15 @@ function rejBoundedPoly(rho: Uint8Array, nonce: number, eta: number): Int32Array
 }
 
 // matrix[r][s] = RejNTTPoly(rho || s || r).
-function expandA(rho: Uint8Array, p: Parameters): Float64Array[][] {
+function expandA(rho: Uint8Array, p: Parameters): Int32Array[][] {
   const seed = new Uint8Array(34);
 
   seed.set(rho);
 
-  const rows: Float64Array[][] = [];
+  const rows: Int32Array[][] = [];
 
   for (let r = 0; r < p.k; r++) {
-    const row: Float64Array[] = [];
+    const row: Int32Array[] = [];
 
     for (let s = 0; s < p.l; s++) {
       seed[32] = s;
@@ -658,7 +659,7 @@ function pkEncode(rho: Uint8Array, t1: Int32Array[]): Uint8Array {
 
   pk.set(rho);
 
-  t1.forEach((t, i) => pack(t, 10, pk, 32 + 320 * i));
+  t1.forEach((t, i) => simpleBitPack10(t, pk, 32 + 320 * i));
 
   return pk;
 }
@@ -694,16 +695,18 @@ function skEncode(
 
   sk.set(tr, 64);
 
+  const packS = p.eta === 2 ? bitPack3 : bitPack4;
+
   let offset = 128;
 
   for (const s of [...s1, ...s2]) {
-    bitPack(s, p.eta, p.etaBits, sk, offset);
+    packS(s, p.eta, sk, offset);
 
     offset += 32 * p.etaBits;
   }
 
   for (const t of t0) {
-    bitPack(t, 1 << (D - 1), D, sk, offset);
+    bitPack13(t, 1 << (D - 1), sk, offset);
 
     offset += 32 * D;
   }
@@ -761,29 +764,68 @@ function power2Round(t: Int32Array[], high: boolean): Int32Array[] {
   });
 }
 
-export function keygenInternal(xi: Uint8Array, p: Parameters): [Uint8Array, Uint8Array] {
+// What verification and signing derive from a public key, kept with the key object and shared by a
+// private key with its public key: tr, Â in the NTT domain, entry [r][s] being
+// RejNTTPoly(rho || s || r), and t̂1 = NTT(t1 2^d), which only verification reads. Each is computed on
+// first use unless the key's creator supplies it.
+export interface PublicCache {
+  tr: Uint8Array | null;
+
+  matrix: Int32Array[][] | null;
+
+  t1: Int32Array[] | null;
+}
+
+// ŝ1, ŝ2 and t̂0 of a private key, decoded on first use.
+export interface SecretCache {
+  vectors: [Int32Array[], Int32Array[], Int32Array[]] | null;
+}
+
+export function publicCache(tr: Uint8Array | null = null, a: Int32Array[][] | null = null): PublicCache {
+  return { tr, matrix: a, t1: null };
+}
+
+function t1Hat(pk: Uint8Array, p: Parameters): Int32Array[] {
+  return Array.from({ length: p.k }, (_, i) => {
+    const t1 = unpack(pk, 32 + 320 * i, 10);
+
+    for (let j = 0; j < 256; j++) {
+      t1[j] <<= D;
+    }
+
+    return Int32Array.from(nttOf(t1));
+  });
+}
+
+// Also returns the cache of the new public key, which key generation fills.
+export function keygenInternal(xi: Uint8Array, p: Parameters): [Uint8Array, Uint8Array, PublicCache] {
   const expanded = shake256(128, xi, Uint8Array.of(p.k, p.l));
 
   const rho = expanded.subarray(0, 32);
 
   const [s1, s2] = expandS(expanded.subarray(32, 96), p);
 
-  const t = publicT(expandA(rho, p), s1, s2);
+  const a = expandA(rho, p);
+
+  const t = publicT(a, s1, s2);
 
   const t0 = power2Round(t, false);
 
   const pk = pkEncode(rho, power2Round(t, true));
 
-  const sk = skEncode(rho, expanded.subarray(96), shake256(64, pk), s1, s2, t0, p);
+  const tr = shake256(64, pk);
+
+  const sk = skEncode(rho, expanded.subarray(96), tr, s1, s2, t0, p);
 
   wipe(expanded, ...s1, ...s2, ...t, ...t0);
 
-  return [pk, sk];
+  return [pk, sk, publicCache(tr, a)];
 }
 
 // An expanded private key carries everything needed to rebuild the public key, so a key whose
-// parts disagree is rejected instead of producing signatures that never verify.
-export function checkPrivateKey(sk: Uint8Array, p: Parameters): Uint8Array | null {
+// parts disagree is rejected instead of producing signatures that never verify. Also returns the
+// cache of the public key, which the check fills.
+export function checkPrivateKey(sk: Uint8Array, p: Parameters): [Uint8Array, PublicCache] | null {
   const { rho, tr, s1, s2, t0 } = skDecode(sk, p);
 
   try {
@@ -797,7 +839,9 @@ export function checkPrivateKey(sk: Uint8Array, p: Parameters): Uint8Array | nul
       return null;
     }
 
-    const t = publicT(expandA(rho, p), s1, s2);
+    const a = expandA(rho, p);
+
+    const t = publicT(a, s1, s2);
 
     for (let i = 0; i < p.k; i++) {
       for (let j = 0; j < 256; j++) {
@@ -809,14 +853,14 @@ export function checkPrivateKey(sk: Uint8Array, p: Parameters): Uint8Array | nul
 
     wipe(...t);
 
-    return bad === 0 && equal(shake256(64, pk), tr) ? pk : null;
+    return bad === 0 && equal(shake256(64, pk), tr) ? [pk, publicCache(tr.slice(), a)] : null;
   } finally {
     wipe(...s1, ...s2, ...t0);
   }
 }
 
 // NTT^-1(cHat * sHat), wiping the product left in the NTT domain.
-function multiply(cHat: Float64Array, sHat: Float64Array): Int32Array {
+function multiply(cHat: Float64Array, sHat: Int32Array): Int32Array {
   const product = pointwise(cHat, sHat);
 
   const out = inverseOf(product);
@@ -837,26 +881,49 @@ function lowExceeds(values: Int32Array, gamma2: number, bound: number): number {
   return flag & 1;
 }
 
-export function signInternal(sk: Uint8Array, message: Uint8Array, rnd: Uint8Array, p: Parameters): Uint8Array {
-  const { rho, key, tr, s1, s2, t0 } = skDecode(sk, p);
+// ŝ1, ŝ2 and t̂0, the NTTs of the secret vectors of sk.
+function decodeSecrets(sk: Uint8Array, p: Parameters): [Int32Array[], Int32Array[], Int32Array[]] {
+  const { s1, s2, t0 } = skDecode(sk, p);
 
-  const s1Hat = s1.map(nttOf);
+  const transform = (s: Int32Array) => {
+    const w = nttOf(s);
 
-  const s2Hat = s2.map(nttOf);
+    const out = Int32Array.from(w);
 
-  const t0Hat = t0.map(nttOf);
+    w.fill(0);
 
-  const a = expandA(rho, p);
+    return out;
+  };
 
-  const mu = shake256(64, tr, message);
+  const vectors: [Int32Array[], Int32Array[], Int32Array[]] = [s1.map(transform), s2.map(transform), t0.map(transform)];
 
-  const rhoPrime = shake256(64, key, rnd, mu);
+  wipe(...s1, ...s2, ...t0);
+
+  return vectors;
+}
+
+// cache and secret hold what the key derives from sk.
+export function signInternal(
+  sk: Uint8Array,
+  cache: PublicCache,
+  secret: SecretCache,
+  message: Uint8Array,
+  rnd: Uint8Array,
+  p: Parameters,
+): Uint8Array {
+  const [s1Hat, s2Hat, t0Hat] = (secret.vectors ??= decodeSecrets(sk, p));
+
+  const a = (cache.matrix ??= expandA(sk.subarray(0, 32), p));
+
+  const mu = shake256(64, sk.subarray(64, 128), message);
+
+  const rhoPrime = shake256(64, sk.subarray(32, 64), rnd, mu);
 
   const w1 = Array.from({ length: p.k }, () => new Int32Array(256));
 
   const centeredZ = new Int32Array(256);
 
-  const secrets: (Int32Array | Float64Array)[] = [...s1, ...s2, ...t0, ...s1Hat, ...s2Hat, ...t0Hat, centeredZ];
+  const secrets: (Int32Array | Float64Array)[] = [centeredZ];
 
   try {
     for (let kappa = 0; ; kappa += p.l) {
@@ -973,7 +1040,14 @@ export function signInternal(sk: Uint8Array, message: Uint8Array, rnd: Uint8Arra
   }
 }
 
-export function verifyInternal(pk: Uint8Array, message: Uint8Array, signature: Uint8Array, p: Parameters): boolean {
+// cache holds what the key derives from pk.
+export function verifyInternal(
+  pk: Uint8Array,
+  cache: PublicCache,
+  message: Uint8Array,
+  signature: Uint8Array,
+  p: Parameters,
+): boolean {
   if (pk.length !== p.publicKeySize || signature.length !== p.signatureSize) {
     return false;
   }
@@ -996,29 +1070,21 @@ export function verifyInternal(pk: Uint8Array, message: Uint8Array, signature: U
 
   const cTilde = signature.subarray(0, p.lambda / 4);
 
-  const a = expandA(pk.subarray(0, 32), p);
+  const a = (cache.matrix ??= expandA(pk.subarray(0, 32), p));
 
-  const mu = shake256(64, shake256(64, pk), message);
+  const t1 = (cache.t1 ??= t1Hat(pk, p));
+
+  const mu = shake256(64, (cache.tr ??= shake256(64, pk)), message);
 
   const cHat = nttOf(sampleInBall(cTilde, p.tau));
 
   const zHat = z.map(nttOf);
 
   const w1 = a.map((row, i) => {
-    const t1 = unpack(pk, 32 + 320 * i, 10);
-
-    const t1Hat = new Float64Array(256);
-
-    for (let j = 0; j < 256; j++) {
-      t1Hat[j] = t1[j] << D;
-    }
-
-    ntt(t1Hat);
-
     const w = dot(row, zHat);
 
     for (let j = 0; j < 256; j++) {
-      w[j] = reduceLazy(w[j] - reduceLazy(cHat[j] * t1Hat[j]) + 2 * Q);
+      w[j] = reduceLazy(w[j] - reduceLazy(cHat[j] * t1[i][j]) + 2 * Q);
     }
 
     const r = inverseOf(w);

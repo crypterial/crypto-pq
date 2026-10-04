@@ -1,8 +1,8 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import process from "node:process";
 
-// Writes the unrolled Keccak, SHA-2 and X25519 code of src/ from the definitions below. With --check
-// it writes nothing and exits with status 1 if a module differs from what it would write.
+// Writes the unrolled Keccak, SHA-2, X25519 and ML-DSA packing code of src/ from the definitions below.
+// With --check it writes nothing and exits with status 1 if a module differs from what it would write.
 
 const SOURCE = new URL("../src/", import.meta.url);
 
@@ -721,12 +721,64 @@ function x25519(): string {
     ["const LIMB_INVERSE = 2 ** -16;"],
     [
       "// The product, unrolled into one sum per limb with the terms of weight 2^256 and above folded in as",
-      "// 2^256 = 38. Inputs have limbs below 2^17 in magnitude, so a sum stays below 2^44. One full carry",
-      "// pass leaves every limb below 2^16 except the first, which can reach 2^34; carrying it twice more",
-      "// brings every limb below 2^16 + 3, as two full passes would.",
+      "// 2^256 = 38. Inputs have limbs below 2^19 in magnitude, so a sum stays below 2^48 and exact. One",
+      "// full carry pass leaves every limb in [0, 2^16) except the first, which can reach 2^32; carrying it",
+      "// twice more brings every limb into [-1, 2^16], as two full passes would.",
       ...fieldProduct("multiply", false),
     ],
     ["// The same for a square, in 136 products instead of 256.", ...fieldProduct("square", true)],
+  ]);
+}
+
+// FIPS 204 bit packing, eight coefficients at a time: eight values of b bits fill exactly b bytes.
+
+// The b bytes of eight b-bit values a0 .. a7, least significant bits first.
+function packedBytes(bits: number): string[] {
+  return range(bits).map((j) => {
+    const terms: string[] = [];
+
+    for (let c = 0; c < 8; c++) {
+      const shift = c * bits - 8 * j;
+
+      if (shift > -bits && shift < 8) {
+        terms.push(shift === 0 ? `a${c}` : shift > 0 ? `a${c} << ${shift}` : `a${c} >> ${-shift}`);
+      }
+    }
+
+    return terms.length === 1 ? terms[0] : terms.map((term) => (term.includes(" ") ? `(${term})` : term)).join(" | ");
+  });
+}
+
+// SimpleBitPack (Algorithm 16) stores each coefficient; BitPack (Algorithm 17) stores b - w[i] for
+// coefficients in [-a, b].
+function packer(bits: number, simple: boolean): string[] {
+  const value = (c: number) => `${simple ? "" : "b - "}w[i${c > 0 ? ` + ${c}` : ""}]`;
+
+  const body: Statement[] = [
+    block(`for (let i = 0, o = offset; i < 256; i += 8, o += ${bits})`, [
+      ...range(8).map((c) => `const a${c} = ${value(c)};`),
+      ...packedBytes(bits).map((expression, j) => `out[o${j > 0 ? ` + ${j}` : ""}] = ${expression};`),
+    ]),
+  ];
+
+  const parameters = ["w: Int32Array", ...(simple ? [] : ["b: number"]), "out: Uint8Array", "offset: number"];
+
+  return func(`${simple ? "simpleBitPack" : "bitPack"}${bits}`, parameters, true, body);
+}
+
+// The widths of key generation: t1 (10 bits), s1 and s2 (3 bits for eta = 2, 4 for eta = 4) and t0
+// (13 bits).
+function mldsaPack(): string {
+  return module([
+    [
+      "// FIPS 204 SimpleBitPack (Algorithm 16) and BitPack (Algorithm 17) of the 256 coefficients of w into",
+      "// out at offset, eight coefficients at a time: eight b-bit values fill exactly b bytes. BitPack stores",
+      "// b - w[i], which lies in [0, 2^bits) for coefficients in [-a, b].",
+      ...packer(10, true),
+    ],
+    packer(3, false),
+    packer(4, false),
+    packer(13, false),
   ]);
 }
 
@@ -734,6 +786,7 @@ const MODULES: [string, () => string][] = [
   ["keccak-permute.ts", keccak],
   ["sha2-rounds.ts", sha2],
   ["x25519-field.ts", x25519],
+  ["mldsa-pack.ts", mldsaPack],
 ];
 
 const check = process.argv.includes("--check");

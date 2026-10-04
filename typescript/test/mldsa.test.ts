@@ -217,6 +217,41 @@ test("ML-DSA round trip", () => {
   }
 });
 
+// Keys compute what they derive on first use and keep it: repeated use of one key, through its own
+// public key, an imported copy or the private key imported in expanded form, must agree with fresh
+// keys every time.
+test("ML-DSA key caches", () => {
+  const keys = new Map<pq.SignatureAlgorithm, [Uint8Array, Uint8Array]>();
+
+  for (const [header, record] of records("acvp/ML-DSA-keyGen.txt", "sk")) {
+    keys.set(ALGORITHMS[header.parameterSet], [hex(record.seed), hex(record.sk)]);
+  }
+
+  for (const [algorithm, [seed, sk]] of keys) {
+    const pair = hazmat.generateKeyPair(algorithm, seed);
+
+    const imported = algorithm.importPublicKey(pair.publicKey.exportKey("raw"), "raw");
+
+    const expanded = algorithm.importPrivateKey(sk, "raw");
+
+    for (let round = 0; round < 3; round++) {
+      const message = Uint8Array.of(round, 1, 2, 3);
+
+      const want = hazmat.generateKeyPair(algorithm, seed).privateKey.sign(message, { deterministic: true });
+
+      for (const privateKey of [pair.privateKey, expanded]) {
+        assert.deepEqual(privateKey.sign(message, { deterministic: true }), want, algorithm.name);
+      }
+
+      for (const publicKey of [pair.publicKey, imported, expanded.publicKey]) {
+        assert.ok(publicKey.verify(want, message), algorithm.name);
+
+        assert.ok(!publicKey.verify(want, Uint8Array.of(round, 1, 2, 4)), algorithm.name);
+      }
+    }
+  }
+});
+
 test("ML-DSA pre-hash strength", () => {
   const allowed: Record<string, string[]> = {
     "ML-DSA-44": [

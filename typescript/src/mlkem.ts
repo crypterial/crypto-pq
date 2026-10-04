@@ -143,14 +143,32 @@ function inverseNtt(r: Int16Array): void {
   }
 }
 
-// Returns sum(a[i] * b[i] * R^-1) in the NTT domain, reduced to [-(q - 1) / 2, (q - 1) / 2]. Each
-// group of four coefficients is summed over the vector in registers; the sums stay below 8q < 2^15.
-function multiplyAccumulate(a: Int16Array[], b: Int16Array[]): Int16Array {
+// A polynomial in the NTT domain prepared as the fixed factor of multiplyAccumulate: its coefficients
+// with |f| < q, followed by f[4j + 1] zeta_j and -f[4j + 3] zeta_j mod q for each group of four, the
+// products that the base case would otherwise reduce at every use. Key material that is multiplied
+// again and again is kept in this form.
+function prepare(f: Int16Array): Int16Array {
+  const out = new Int16Array(384);
+
+  out.set(f);
+
+  for (let j = 0; j < 64; j++) {
+    out[256 + 2 * j] = fqmul(f[4 * j + 1], ZETAS[64 + j]);
+
+    out[257 + 2 * j] = fqmul(f[4 * j + 3], -ZETAS[64 + j]);
+  }
+
+  return out;
+}
+
+// Returns sum(f[i] * g[i] * R^-1) in the NTT domain for prepared factors f, with coefficients in
+// (-q, q), which inverseNtt and fqmul accept. Each group of four coefficients sums plain products over
+// the vector: every product is below q^2 in magnitude, so the at most eight of a sum stay below
+// q * 2^15, which one Montgomery reduction accepts.
+function multiplyAccumulate(f: Int16Array[], g: Int16Array[]): Int16Array {
   const r = new Int16Array(256);
 
   for (let j = 0; j < 64; j++) {
-    const zeta = ZETAS[64 + j];
-
     const at = 4 * j;
 
     let r0 = 0;
@@ -161,43 +179,39 @@ function multiplyAccumulate(a: Int16Array[], b: Int16Array[]): Int16Array {
 
     let r3 = 0;
 
-    for (let i = 0; i < a.length; i++) {
-      const f = a[i];
+    for (let i = 0; i < f.length; i++) {
+      const a = f[i];
 
-      const g = b[i];
+      const b = g[i];
 
-      const f0 = f[at];
+      const a0 = a[at];
 
-      const f1 = f[at + 1];
+      const a2 = a[at + 2];
 
-      const f2 = f[at + 2];
+      const b0 = b[at];
 
-      const f3 = f[at + 3];
+      const b1 = b[at + 1];
 
-      const g0 = g[at];
+      const b2 = b[at + 2];
 
-      const g1 = g[at + 1];
+      const b3 = b[at + 3];
 
-      const g2 = g[at + 2];
+      r0 += a0 * b0 + a[256 + 2 * j] * b1;
 
-      const g3 = g[at + 3];
+      r1 += a0 * b1 + a[at + 1] * b0;
 
-      r0 += fqmul(fqmul(f1, g1), zeta) + fqmul(f0, g0);
+      r2 += a2 * b2 + a[257 + 2 * j] * b3;
 
-      r1 += fqmul(f0, g1) + fqmul(f1, g0);
-
-      r2 += fqmul(fqmul(f3, g3), -zeta) + fqmul(f2, g2);
-
-      r3 += fqmul(f2, g3) + fqmul(f3, g2);
+      r3 += a2 * b3 + a[at + 3] * b2;
     }
 
-    r[at] = barrettReduce(r0);
+    r[at] = montgomeryReduce(r0);
 
-    r[at + 1] = barrettReduce(r1);
+    r[at + 1] = montgomeryReduce(r1);
 
-    r[at + 2] = barrettReduce(r2);
+    r[at + 2] = montgomeryReduce(r2);
 
-    r[at + 3] = barrettReduce(r3);
+    r[at + 3] = montgomeryReduce(r3);
   }
 
   return r;
@@ -444,12 +458,14 @@ function pkeKeygen(d: Uint8Array, p: Parameters): [Uint8Array, Uint8Array] {
     ntt(e[i]);
   }
 
+  const sHat = s.map(prepare);
+
   const ek = new Uint8Array(p.encapsulationKeySize);
 
   const dk = new Uint8Array(384 * k);
 
   for (let i = 0; i < k; i++) {
-    const t = multiplyAccumulate(a[i], s);
+    const t = multiplyAccumulate(sHat, a[i]);
 
     for (let j = 0; j < 256; j++) {
       t[j] = barrettReduce(fqmul(t[j], 1353) + e[i][j]);
@@ -462,21 +478,50 @@ function pkeKeygen(d: Uint8Array, p: Parameters): [Uint8Array, Uint8Array] {
 
   ek.set(rho, 384 * k);
 
-  wipe(g, ...s, ...e);
+  wipe(g, ...s, ...sHat, ...e);
 
   return [ek, dk];
 }
 
-function pkeEncrypt(ek: Uint8Array, m: Uint8Array, r: Uint8Array, p: Parameters): Uint8Array {
+// What encryption derives from an encapsulation key, kept with the key object and shared by a private
+// key with its public key: H(ek), and Â in the NTT domain with the decoded vector t̂, both prepared.
+// Each part is computed on first use unless the key's creator supplies it.
+export interface PublicCache {
+  digest: Uint8Array | null;
+
+  matrix: Int16Array[][] | null;
+
+  t: Int16Array[] | null;
+}
+
+// ŝ of a private key, decoded and prepared on first use.
+export interface SecretCache {
+  s: Int16Array[] | null;
+}
+
+export function publicCache(digest: Uint8Array | null = null): PublicCache {
+  return { digest, matrix: null, t: null };
+}
+
+// ByteDecode12 of the first k encoded polynomials of a key, prepared.
+function decodeVector(key: Uint8Array, k: number): Int16Array[] {
+  return Array.from({ length: k }, (_, i) => {
+    const f = decode12(key, 384 * i);
+
+    const prepared = prepare(f);
+
+    f.fill(0);
+
+    return prepared;
+  });
+}
+
+function pkeEncrypt(ek: Uint8Array, cache: PublicCache, m: Uint8Array, r: Uint8Array, p: Parameters): Uint8Array {
   const k = p.k;
 
-  const t: Int16Array[] = [];
+  const a = (cache.matrix ??= matrix(ek.subarray(384 * k), k).map((row) => row.map(prepare)));
 
-  for (let i = 0; i < k; i++) {
-    t.push(decode12(ek, 384 * i));
-  }
-
-  const a = matrix(ek.subarray(384 * k), k);
+  const t = (cache.t ??= decodeVector(ek, k));
 
   const y: Int16Array[] = [];
 
@@ -527,19 +572,15 @@ function pkeEncrypt(ek: Uint8Array, m: Uint8Array, r: Uint8Array, p: Parameters)
   return c;
 }
 
-function pkeDecrypt(dk: Uint8Array, c: Uint8Array, p: Parameters): Uint8Array {
+function pkeDecrypt(s: Int16Array[], c: Uint8Array, p: Parameters): Uint8Array {
   const k = p.k;
 
   const u: Int16Array[] = [];
-
-  const s: Int16Array[] = [];
 
   for (let i = 0; i < k; i++) {
     u.push(decompressPolynomial(c, 32 * p.du * i, p.du));
 
     ntt(u[i]);
-
-    s.push(decode12(dk, 384 * i));
   }
 
   const w = multiplyAccumulate(s, u);
@@ -554,7 +595,7 @@ function pkeDecrypt(dk: Uint8Array, c: Uint8Array, p: Parameters): Uint8Array {
     m[j >> 3] |= compress(canonical(barrettReduce(v[j] - w[j])), 1) << (j & 7);
   }
 
-  wipe(w, ...s);
+  wipe(w);
 
   return m;
 }
@@ -577,10 +618,15 @@ export function keygenInternal(d: Uint8Array, z: Uint8Array, p: Parameters): [Ui
   return [ek, dk];
 }
 
-export function encapsInternal(ek: Uint8Array, m: Uint8Array, p: Parameters): [Uint8Array, Uint8Array] {
-  const g = sha3(64, m, sha3(32, ek));
+export function encapsInternal(
+  ek: Uint8Array,
+  cache: PublicCache,
+  m: Uint8Array,
+  p: Parameters,
+): [Uint8Array, Uint8Array] {
+  const g = sha3(64, m, (cache.digest ??= sha3(32, ek)));
 
-  const ciphertext = pkeEncrypt(ek, m, g.subarray(32), p);
+  const ciphertext = pkeEncrypt(ek, cache, m, g.subarray(32), p);
 
   const sharedSecret = g.slice(0, 32);
 
@@ -590,17 +636,24 @@ export function encapsInternal(ek: Uint8Array, m: Uint8Array, p: Parameters): [U
 }
 
 // Implicit rejection: a ciphertext that does not re-encrypt to itself yields J(z || c). The
-// comparison and the choice between the two secrets use masks, not branches.
-export function decapsInternal(dk: Uint8Array, c: Uint8Array, p: Parameters): Uint8Array {
+// comparison and the choice between the two secrets use masks, not branches. secret and cache hold
+// what the key derives from dk.
+export function decapsInternal(
+  dk: Uint8Array,
+  secret: SecretCache,
+  cache: PublicCache,
+  c: Uint8Array,
+  p: Parameters,
+): Uint8Array {
   const k = p.k;
 
-  const m = pkeDecrypt(dk.subarray(0, 384 * k), c, p);
+  const m = pkeDecrypt((secret.s ??= decodeVector(dk, k)), c, p);
 
   const g = sha3(64, m, dk.subarray(768 * k + 32, 768 * k + 64));
 
   const rejected = shake256(32, dk.subarray(768 * k + 64), c);
 
-  const reencrypted = pkeEncrypt(dk.subarray(384 * k, 768 * k + 32), m, g.subarray(32), p);
+  const reencrypted = pkeEncrypt(dk.subarray(384 * k, 768 * k + 32), cache, m, g.subarray(32), p);
 
   let difference = 0;
 
@@ -650,4 +703,9 @@ export function checkDecapsulationKey(dk: Uint8Array, p: Parameters): boolean {
 
 export function publicKeyOf(dk: Uint8Array, p: Parameters): Uint8Array {
   return dk.slice(384 * p.k, 768 * p.k + 32);
+}
+
+// H(ek), which a decapsulation key holds.
+export function digestOf(dk: Uint8Array, p: Parameters): Uint8Array {
+  return dk.slice(768 * p.k + 32, 768 * p.k + 64);
 }

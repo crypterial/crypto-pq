@@ -205,6 +205,43 @@ test("KEM round trip", () => {
   }
 });
 
+// Keys compute what they derive on first use and keep it: repeated use of one key, through its own
+// public key, an imported copy or the private key imported in expanded form, must agree with fresh
+// keys every time.
+test("KEM key caches", () => {
+  const keys = new Map<pq.KemAlgorithm, [Uint8Array, Uint8Array | null]>();
+
+  for (const [header, record] of records("acvp/ML-KEM-keyGen.txt", "dk")) {
+    keys.set(ALGORITHMS[header.parameterSet], [concat(hex(record.d), hex(record.z)), hex(record.dk)]);
+  }
+
+  keys.set(pq.X_WING, [Uint8Array.from({ length: 32 }, (_, i) => i), null]);
+
+  for (const [algorithm, [seed, dk]] of keys) {
+    const pair = hazmat.generateKeyPair(algorithm, seed);
+
+    const imported = algorithm.importPublicKey(pair.publicKey.exportKey("raw"), "raw");
+
+    const expanded = dk === null ? pair.privateKey : algorithm.importPrivateKey(dk, "raw");
+
+    for (let round = 0; round < 3; round++) {
+      const randomness = Uint8Array.from({ length: algorithm === pq.X_WING ? 64 : 32 }, (_, i) => i + 7 * round);
+
+      const want = hazmat.encapsulate(hazmat.generateKeyPair(algorithm, seed).publicKey, randomness);
+
+      for (const publicKey of [pair.publicKey, imported, expanded.publicKey]) {
+        const got = hazmat.encapsulate(publicKey, randomness);
+
+        assert.deepEqual([got.ciphertext, got.sharedSecret], [want.ciphertext, want.sharedSecret], algorithm.name);
+      }
+
+      for (const privateKey of [pair.privateKey, expanded]) {
+        assert.deepEqual(privateKey.decapsulate(want.ciphertext), want.sharedSecret, algorithm.name);
+      }
+    }
+  }
+});
+
 test("KEM formats", () => {
   for (const algorithm of Object.values(ALGORITHMS)) {
     const context = algorithm.name;

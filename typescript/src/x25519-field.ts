@@ -5,9 +5,9 @@ const LIMB = 65536;
 const LIMB_INVERSE = 2 ** -16;
 
 // The product, unrolled into one sum per limb with the terms of weight 2^256 and above folded in as
-// 2^256 = 38. Inputs have limbs below 2^17 in magnitude, so a sum stays below 2^44. One full carry
-// pass leaves every limb below 2^16 except the first, which can reach 2^34; carrying it twice more
-// brings every limb below 2^16 + 3, as two full passes would.
+// 2^256 = 38. Inputs have limbs below 2^19 in magnitude, so a sum stays below 2^48 and exact. One
+// full carry pass leaves every limb in [0, 2^16) except the first, which can reach 2^32; carrying it
+// twice more brings every limb into [-1, 2^16], as two full passes would.
 export function multiply(o: Float64Array, a: Float64Array, b: Float64Array): void {
   const a0 = a[0];
 

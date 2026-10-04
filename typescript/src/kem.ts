@@ -19,17 +19,22 @@ import { randomBytes } from "./rng.ts";
 import * as xwing from "./xwing.ts";
 
 // The private half of a key as a backend produced it: the expanded encoding when the algorithm
-// has one, and the decapsulation bound to the key material.
+// has one, and the decapsulation bound to the key material, which also reads the cache of its
+// public key.
 interface Secret {
   readonly expanded: Uint8Array | null;
 
-  decapsulate(ciphertext: Uint8Array): Uint8Array;
+  decapsulate(ciphertext: Uint8Array, cache: mlkem.PublicCache): Uint8Array;
 }
+
+// A new key as a backend makes it: the public key, the secret and what the public key's cache can
+// start with. For X-Wing the cache is that of the ML-KEM part.
+type NewKey = [Uint8Array, Secret, mlkem.PublicCache];
 
 interface ExpandedForm {
   readonly size: number;
 
-  load(key: Uint8Array): [Uint8Array, Secret];
+  load(key: Uint8Array): NewKey;
 }
 
 export interface KemBackend {
@@ -45,11 +50,11 @@ export interface KemBackend {
 
   readonly expanded: ExpandedForm | null;
 
-  fromSeed(seed: Uint8Array): [Uint8Array, Secret];
+  fromSeed(seed: Uint8Array): NewKey;
 
   checkPublicKey(key: Uint8Array): boolean;
 
-  encapsulate(key: Uint8Array, randomness: Uint8Array): [Uint8Array, Uint8Array];
+  encapsulate(key: Uint8Array, cache: mlkem.PublicCache, randomness: Uint8Array): [Uint8Array, Uint8Array];
 }
 
 export interface KemKeyPair {
@@ -65,7 +70,12 @@ export interface Encapsulation {
 }
 
 function mlKemSecret(dk: Uint8Array, params: mlkem.Parameters): Secret {
-  return { expanded: dk, decapsulate: (ciphertext) => mlkem.decapsInternal(dk, ciphertext, params) };
+  const secret: mlkem.SecretCache = { s: null };
+
+  return {
+    expanded: dk,
+    decapsulate: (ciphertext, cache) => mlkem.decapsInternal(dk, secret, cache, ciphertext, params),
+  };
 }
 
 function mlKem(params: mlkem.Parameters, arc: number): KemBackend {
@@ -82,16 +92,16 @@ function mlKem(params: mlkem.Parameters, arc: number): KemBackend {
           throw mismatch("the decapsulation key fails the FIPS 203 checks");
         }
 
-        return [mlkem.publicKeyOf(dk, params), mlKemSecret(dk, params)];
+        return [mlkem.publicKeyOf(dk, params), mlKemSecret(dk, params), mlkem.publicCache(mlkem.digestOf(dk, params))];
       },
     },
     fromSeed(seed) {
       const [ek, dk] = mlkem.keygenInternal(seed.subarray(0, 32), seed.subarray(32), params);
 
-      return [ek, mlKemSecret(dk, params)];
+      return [ek, mlKemSecret(dk, params), mlkem.publicCache(mlkem.digestOf(dk, params))];
     },
     checkPublicKey: (key) => mlkem.checkEncapsulationKey(key, params),
-    encapsulate: (key, randomness) => mlkem.encapsInternal(key, randomness, params),
+    encapsulate: (key, cache, randomness) => mlkem.encapsInternal(key, cache, randomness, params),
   };
 }
 
@@ -103,9 +113,13 @@ const X_WING_BACKEND: KemBackend = {
   ciphertextSize: xwing.CIPHERTEXT_SIZE,
   expanded: null,
   fromSeed(seed) {
-    const [pk, key] = xwing.expand(seed);
+    const [pk, key, cache] = xwing.expand(seed);
 
-    return [pk, { expanded: null, decapsulate: (ciphertext) => xwing.decapsulate(key, ciphertext) }];
+    return [
+      pk,
+      { expanded: null, decapsulate: (ciphertext, mlkemCache) => xwing.decapsulate(key, mlkemCache, ciphertext) },
+      cache,
+    ];
   },
   checkPublicKey: xwing.checkPublicKey,
   encapsulate: xwing.encapsulate,
@@ -117,10 +131,18 @@ let fromSeed: (algorithm: KemAlgorithm, seed: Uint8Array) => KemPrivateKey;
 
 let encapsulateWith: (publicKey: KemPublicKey, randomness: Uint8Array) => Encapsulation;
 
+let cacheOf: (publicKey: KemPublicKey) => mlkem.PublicCache;
+
+let useCache: (publicKey: KemPublicKey, cache: mlkem.PublicCache) => KemPublicKey;
+
 export class KemPublicKey {
   readonly algorithm: KemAlgorithm;
 
   readonly #key: Uint8Array;
+
+  // What encapsulation derives from the key, filled on first use unless the key's creator supplies
+  // part of it.
+  #cache = mlkem.publicCache();
 
   constructor(algorithm: KemAlgorithm, key: Uint8Array) {
     this.algorithm = algorithm;
@@ -155,7 +177,7 @@ export class KemPublicKey {
   }
 
   #encapsulate(randomness: Uint8Array): Encapsulation {
-    const [sharedSecret, ciphertext] = backendOf(this.algorithm).encapsulate(this.#key, randomness);
+    const [sharedSecret, ciphertext] = backendOf(this.algorithm).encapsulate(this.#key, this.#cache, randomness);
 
     randomness.fill(0);
 
@@ -164,6 +186,14 @@ export class KemPublicKey {
 
   static {
     encapsulateWith = (publicKey, randomness) => publicKey.#encapsulate(randomness);
+
+    cacheOf = (publicKey) => publicKey.#cache;
+
+    useCache = (publicKey, cache) => {
+      publicKey.#cache = cache;
+
+      return publicKey;
+    };
   }
 }
 
@@ -193,7 +223,7 @@ export class KemPrivateKey {
 
     requireLength(data, this.algorithm.ciphertextSize, "ciphertext");
 
-    return this.#secret.decapsulate(data);
+    return this.#secret.decapsulate(data, cacheOf(this.publicKey));
   }
 
   exportKey(format: "pem"): string;
@@ -297,7 +327,7 @@ export class KemAlgorithm {
 
     octets!.fill(0);
 
-    const [pk, secret] = seed !== null ? backend.fromSeed(seed) : backend.expanded!.load(expanded!);
+    const [pk, secret, cache] = seed !== null ? backend.fromSeed(seed) : backend.expanded!.load(expanded!);
 
     const dk = secret.expanded!;
 
@@ -313,15 +343,15 @@ export class KemAlgorithm {
       throw mismatch(agrees ? "the embedded public key does not match" : "the seed and the expanded key differ");
     }
 
-    return this.#create(seed, pk, secret);
+    return this.#create(seed, pk, secret, cache);
   }
 
   #fromSeed(seed: Uint8Array): KemPrivateKey {
     return this.#create(seed, ...this.#backend.fromSeed(seed));
   }
 
-  #create(seed: Uint8Array | null, pk: Uint8Array, secret: Secret): KemPrivateKey {
-    return new KemPrivateKey(this, seed, secret, new KemPublicKey(this, pk));
+  #create(seed: Uint8Array | null, pk: Uint8Array, secret: Secret, cache: mlkem.PublicCache): KemPrivateKey {
+    return new KemPrivateKey(this, seed, secret, useCache(new KemPublicKey(this, pk), cache));
   }
 
   static {

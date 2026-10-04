@@ -87,6 +87,11 @@ const PRE_HASHES = new Map<unknown, PreHash>([
   [SHAKE256, preHash(12, 256, (message) => SHAKE256.digest(message, 64))],
 ]);
 
+// A new key as a backend makes it: the public key, the private key and what the public key's cache
+// can start with.
+type NewKey = [Uint8Array, Uint8Array, mldsa.PublicCache];
+
+// The caches serve ML-DSA; SLH-DSA keys carry empty ones.
 export interface SignatureBackend {
   readonly oid: Uint8Array;
 
@@ -104,15 +109,21 @@ export interface SignatureBackend {
 
   readonly strength: number;
 
-  fromSeed(seed: Uint8Array): [Uint8Array, Uint8Array];
+  fromSeed(seed: Uint8Array): NewKey;
 
-  fromPrivate(key: Uint8Array): [Uint8Array, Uint8Array];
+  fromPrivate(key: Uint8Array): NewKey;
 
   deterministicRandomness(key: Uint8Array): Uint8Array;
 
-  sign(key: Uint8Array, message: Uint8Array, randomness: Uint8Array): Uint8Array;
+  sign(
+    key: Uint8Array,
+    cache: mldsa.PublicCache,
+    secret: mldsa.SecretCache,
+    message: Uint8Array,
+    randomness: Uint8Array,
+  ): Uint8Array;
 
-  verify(key: Uint8Array, message: Uint8Array, signature: Uint8Array): boolean;
+  verify(key: Uint8Array, cache: mldsa.PublicCache, message: Uint8Array, signature: Uint8Array): boolean;
 }
 
 function mlDsa(params: mldsa.Parameters, arc: number): SignatureBackend {
@@ -127,17 +138,18 @@ function mlDsa(params: mldsa.Parameters, arc: number): SignatureBackend {
     strength: params.lambda,
     fromSeed: (seed) => mldsa.keygenInternal(seed, params),
     fromPrivate(sk) {
-      const pk = mldsa.checkPrivateKey(sk, params);
+      const checked = mldsa.checkPrivateKey(sk, params);
 
-      if (pk === null) {
+      if (checked === null) {
         throw mismatch("the private key fails the consistency checks");
       }
 
-      return [pk, sk];
+      return [checked[0], sk, checked[1]];
     },
     deterministicRandomness: () => new Uint8Array(32),
-    sign: (sk, message, randomness) => mldsa.signInternal(sk, message, randomness, params),
-    verify: (pk, message, signature) => mldsa.verifyInternal(pk, message, signature, params),
+    sign: (sk, cache, secret, message, randomness) =>
+      mldsa.signInternal(sk, cache, secret, message, randomness, params),
+    verify: (pk, cache, message, signature) => mldsa.verifyInternal(pk, cache, message, signature, params),
   };
 }
 
@@ -161,18 +173,18 @@ function slhDsa(params: slhdsa.Parameters, arc: number): SignatureBackend {
         params,
       );
 
-      return [pk, sk];
+      return [pk, sk, mldsa.publicCache()];
     },
     fromPrivate(sk) {
       if (!equal(slhdsa.root(params, sk.subarray(0, n), sk.subarray(2 * n, 3 * n)), sk.subarray(3 * n))) {
         throw mismatch("the private key does not match its public root");
       }
 
-      return [sk.slice(2 * n), sk];
+      return [sk.slice(2 * n), sk, mldsa.publicCache()];
     },
     deterministicRandomness: (sk) => sk.slice(2 * n, 3 * n),
-    sign: (sk, message, randomness) => slhdsa.signInternal(message, sk, randomness, params),
-    verify: (pk, message, signature) => slhdsa.verifyInternal(message, signature, pk, params),
+    sign: (sk, _cache, _secret, message, randomness) => slhdsa.signInternal(message, sk, randomness, params),
+    verify: (pk, _cache, message, signature) => slhdsa.verifyInternal(message, signature, pk, params),
   };
 }
 
@@ -229,10 +241,18 @@ let verifyWith: (
   options: VerifyOptions | undefined,
 ) => boolean;
 
+let cacheOf: (publicKey: SignaturePublicKey) => mldsa.PublicCache;
+
+let useCache: (publicKey: SignaturePublicKey, cache: mldsa.PublicCache) => SignaturePublicKey;
+
 export class SignaturePublicKey {
   readonly algorithm: SignatureAlgorithm;
 
   readonly #key: Uint8Array;
+
+  // What verification derives from the key, filled on first use unless the key's creator supplies
+  // part of it.
+  #cache = mldsa.publicCache();
 
   constructor(algorithm: SignatureAlgorithm, key: Uint8Array) {
     this.algorithm = algorithm;
@@ -279,11 +299,19 @@ export class SignaturePublicKey {
       return false;
     }
 
-    return backend.verify(this.#key, messageRepresentative(text, context, entry), data);
+    return backend.verify(this.#key, this.#cache, messageRepresentative(text, context, entry), data);
   }
 
   static {
     verifyWith = (publicKey, signature, message, value) => publicKey.#verify(signature, message, value, false);
+
+    cacheOf = (publicKey) => publicKey.#cache;
+
+    useCache = (publicKey, cache) => {
+      publicKey.#cache = cache;
+
+      return publicKey;
+    };
   }
 }
 
@@ -295,6 +323,9 @@ export class SignaturePrivateKey {
   readonly #seed: Uint8Array | null;
 
   readonly #key: Uint8Array;
+
+  // The secret vectors in the NTT domain, decoded on first use.
+  readonly #secret: mldsa.SecretCache = { vectors: null };
 
   constructor(algorithm: SignatureAlgorithm, seed: Uint8Array | null, key: Uint8Array, publicKey: SignaturePublicKey) {
     this.algorithm = algorithm;
@@ -358,7 +389,9 @@ export class SignaturePrivateKey {
         throw new CryptoPQError("INVALID_CONTEXT", "the context must be at most 255 bytes");
       }
 
-      return backend.sign(this.#key, messageRepresentative(text, context, entry), randomness);
+      const representative = messageRepresentative(text, context, entry);
+
+      return backend.sign(this.#key, cacheOf(this.publicKey), this.#secret, representative, randomness);
     } finally {
       randomness.fill(0);
     }
@@ -441,7 +474,7 @@ export class SignatureAlgorithm {
   #fromSeed(seed: Uint8Array): SignatureKeyPair {
     const backend = this.#backend;
 
-    const [pk, key] = backend.fromSeed(seed);
+    const [pk, key, cache] = backend.fromSeed(seed);
 
     const kept = backend.expandedSize !== null ? seed : null;
 
@@ -449,19 +482,19 @@ export class SignatureAlgorithm {
       seed.fill(0);
     }
 
-    const privateKey = this.#create(kept, key, pk);
+    const privateKey = this.#create(kept, key, pk, cache);
 
     return Object.freeze({ publicKey: privateKey.publicKey, privateKey });
   }
 
   #fromPrivate(key: Uint8Array): SignaturePrivateKey {
-    const [pk, sk] = this.#backend.fromPrivate(key);
+    const [pk, sk, cache] = this.#backend.fromPrivate(key);
 
-    return this.#create(null, sk, pk);
+    return this.#create(null, sk, pk, cache);
   }
 
-  #create(seed: Uint8Array | null, key: Uint8Array, pk: Uint8Array): SignaturePrivateKey {
-    return new SignaturePrivateKey(this, seed, key, new SignaturePublicKey(this, pk));
+  #create(seed: Uint8Array | null, key: Uint8Array, pk: Uint8Array, cache: mldsa.PublicCache): SignaturePrivateKey {
+    return new SignaturePrivateKey(this, seed, key, useCache(new SignaturePublicKey(this, pk), cache));
   }
 
   #importRaw(raw: Uint8Array): SignaturePrivateKey {
@@ -490,7 +523,7 @@ export class SignatureAlgorithm {
       return this.#fromPrivate(expanded!);
     }
 
-    const [pk, key] = backend.fromSeed(seed);
+    const [pk, key, cache] = backend.fromSeed(seed);
 
     if (expanded !== null) {
       const matches = equal(expanded, key);
@@ -504,7 +537,7 @@ export class SignatureAlgorithm {
       }
     }
 
-    return this.#create(seed, key, pk);
+    return this.#create(seed, key, pk, cache);
   }
 
   static {

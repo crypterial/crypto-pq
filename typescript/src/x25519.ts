@@ -292,3 +292,359 @@ export function x25519(scalar: Uint8Array, u: Uint8Array): Uint8Array {
 
   return out;
 }
+
+// Fixed-base X25519 for public keys, as in ref10 and libsodium: [k]B on the Edwards form of the curve
+// (RFC 7748, 4.1), whose u-coordinate (1 + y) / (1 - y) = (Z + Y) / (Z - Y) is what the ladder gives for
+// the same scalar. [k]B sums one multiple of 16^i B per signed radix-16 digit of k, taken from a table of
+// the multiples 1 to 8 of 256^i B: the odd digits first, then a multiplication by 16, then the even
+// digits. A digit only steers masked moves over all eight entries of its table row.
+
+// A point (X : Y : Z : T) on -x^2 + y^2 = 1 + d x^2 y^2, with x = X / Z, y = Y / Z and xy = T / Z.
+interface Point {
+  readonly x: Field;
+
+  readonly y: Field;
+
+  readonly z: Field;
+
+  readonly t: Field;
+}
+
+// An affine point as y + x, y - x and 2dxy, the form that mixed addition reads.
+interface Affine {
+  readonly yPlusX: Field;
+
+  readonly yMinusX: Field;
+
+  readonly xy2d: Field;
+}
+
+// The x-coordinate of the base point B = (x, 4/5), the even one of the two roots (RFC 8032, 5.1),
+// little-endian.
+const BASE_X = Uint8Array.of(
+  0x1a, 0xd5, 0x25, 0x8f, 0x60, 0x2d, 0x56, 0xc9, 0xb2, 0xa7, 0x25, 0x95, 0x60, 0xc7, 0x2c, 0x69,
+  0x5c, 0xdc, 0xd6, 0xfd, 0x31, 0xe2, 0xa4, 0xc0, 0xfe, 0x53, 0x6e, 0xcd, 0xd3, 0x36, 0x69, 0x21,
+);
+
+// The temporaries of the point formulas, shared since JavaScript runs one call at a time; x25519Base
+// clears them.
+const SCRATCH = Array.from({ length: 9 }, () => field());
+
+const [TA, TB, TC, TD, TE, TF, TG, TH, NEGATED] = SCRATCH;
+
+// The identity, (0 : 1 : 1 : 0).
+function point(): Point {
+  return { x: field(), y: field(1), z: field(1), t: field() };
+}
+
+// The identity in affine form.
+function affine(): Affine {
+  return { yPlusX: field(1), yMinusX: field(1), xy2d: field() };
+}
+
+// v = p + q for an affine q (add-2008-hwcd-3 with k = 2d and Z2 = 1); v may be p. Every product input
+// is a sum of at most three products, as the limb bound of multiply allows.
+function addAffine(v: Point, p: Point, q: Affine): void {
+  add(TA, p.y, p.x);
+
+  subtract(TB, p.y, p.x);
+
+  multiply(TC, TB, q.yMinusX);
+
+  multiply(TD, TA, q.yPlusX);
+
+  multiply(TE, p.t, q.xy2d);
+
+  add(TF, p.z, p.z);
+
+  subtract(TA, TD, TC);
+
+  add(TB, TD, TC);
+
+  subtract(TG, TF, TE);
+
+  add(TH, TF, TE);
+
+  multiply(v.x, TA, TG);
+
+  multiply(v.y, TH, TB);
+
+  multiply(v.z, TG, TH);
+
+  multiply(v.t, TA, TB);
+}
+
+// v = 2p (dbl-2008-hwcd with a = -1) with every coordinate negated, which is the same point; v may be p.
+// The largest product input is a sum of four products.
+function double(v: Point, p: Point): void {
+  square(TA, p.x);
+
+  square(TB, p.y);
+
+  square(TC, p.z);
+
+  add(TC, TC, TC);
+
+  add(TD, p.x, p.y);
+
+  square(TE, TD);
+
+  add(TD, TA, TB);
+
+  subtract(TF, TB, TA);
+
+  subtract(TE, TE, TD);
+
+  subtract(TG, TC, TF);
+
+  multiply(v.x, TE, TG);
+
+  multiply(v.y, TF, TD);
+
+  multiply(v.z, TG, TF);
+
+  multiply(v.t, TE, TD);
+}
+
+// The points in affine form, with one inversion for all of them: the running products of the Z
+// coordinates are inverted once and then unwound (Montgomery's trick).
+function toAffine(points: Point[], d2: Field): Affine[] {
+  const products: Field[] = [];
+
+  let product = field(1);
+
+  for (const p of points) {
+    products.push(product);
+
+    const next = field();
+
+    multiply(next, product, p.z);
+
+    product = next;
+  }
+
+  const inverse = field();
+
+  invert(inverse, product);
+
+  const out: Affine[] = [];
+
+  for (let i = points.length - 1; i >= 0; i--) {
+    const zInverse = field();
+
+    multiply(zInverse, inverse, products[i]);
+
+    multiply(inverse, inverse, points[i].z);
+
+    const x = field();
+
+    const y = field();
+
+    multiply(x, points[i].x, zInverse);
+
+    multiply(y, points[i].y, zInverse);
+
+    const entry = affine();
+
+    add(entry.yPlusX, y, x);
+
+    subtract(entry.yMinusX, y, x);
+
+    multiply(x, x, y);
+
+    multiply(entry.xy2d, x, d2);
+
+    out[i] = entry;
+  }
+
+  return out;
+}
+
+let TABLE: Int32Array | null = null;
+
+// The table of x25519Base: entry 8i + j is (j + 1) 256^i B as y + x, y - x and 2dxy, sixteen limbs each,
+// computed from B on first use. d is -121665 / 121666 (RFC 7748, 4.1).
+export function edwardsTable(): Int32Array {
+  const d2 = field();
+
+  invert(d2, field(121666));
+
+  const minus = field();
+
+  subtract(minus, field(), field(121665));
+
+  multiply(d2, minus, d2);
+
+  add(d2, d2, d2);
+
+  const base = point();
+
+  base.x.set(unpack(BASE_X));
+
+  invert(minus, field(5));
+
+  multiply(base.y, field(4), minus);
+
+  multiply(base.t, base.x, base.y);
+
+  const rows = [base];
+
+  for (let i = 1; i < 32; i++) {
+    const p = point();
+
+    double(p, rows[i - 1]);
+
+    for (let n = 1; n < 8; n++) {
+      double(p, p);
+    }
+
+    rows.push(p);
+  }
+
+  const firsts = toAffine(rows, d2);
+
+  const multiples: Point[] = [];
+
+  for (let i = 0; i < 32; i++) {
+    let previous = rows[i];
+
+    for (let j = 1; j < 8; j++) {
+      const next = point();
+
+      addAffine(next, previous, firsts[i]);
+
+      multiples.push(next);
+
+      previous = next;
+    }
+  }
+
+  const rest = toAffine(multiples, d2);
+
+  const table = new Int32Array(32 * 8 * 48);
+
+  for (let i = 0; i < 32 * 8; i++) {
+    const entry = i % 8 === 0 ? firsts[i / 8] : rest[i - 1 - Math.floor(i / 8)];
+
+    table.set(entry.yPlusX, 48 * i);
+
+    table.set(entry.yMinusX, 48 * i + 16);
+
+    table.set(entry.xy2d, 48 * i + 32);
+  }
+
+  return table;
+}
+
+// Sets out to the multiple digit of row's base point, for |digit| <= 8. Masked moves read all eight
+// entries; a negative digit then swaps y + x with y - x and negates 2dxy, which negates the point.
+function select(out: Affine, table: Int32Array, row: number, digit: number): void {
+  const sign = digit >> 31;
+
+  const magnitude = (digit ^ sign) - sign;
+
+  out.yPlusX.fill(0);
+
+  out.yMinusX.fill(0);
+
+  out.xy2d.fill(0);
+
+  out.yPlusX[0] = 1;
+
+  out.yMinusX[0] = 1;
+
+  for (let j = 0; j < 8; j++) {
+    const mask = -(((magnitude ^ (j + 1)) - 1) >>> 31);
+
+    const offset = 48 * (8 * row + j);
+
+    for (let i = 0; i < 16; i++) {
+      out.yPlusX[i] ^= mask & (out.yPlusX[i] ^ table[offset + i]);
+
+      out.yMinusX[i] ^= mask & (out.yMinusX[i] ^ table[offset + 16 + i]);
+
+      out.xy2d[i] ^= mask & (out.xy2d[i] ^ table[offset + 32 + i]);
+    }
+  }
+
+  swap(out.yPlusX, out.yMinusX, -sign);
+
+  for (let i = 0; i < 16; i++) {
+    NEGATED[i] = -out.xy2d[i];
+  }
+
+  swap(out.xy2d, NEGATED, -sign);
+}
+
+// X25519(scalar, 9): the u-coordinate of [k]B for the clamped scalar k.
+export function x25519Base(scalar: Uint8Array): Uint8Array {
+  const k = scalar.slice();
+
+  k[0] &= 248;
+
+  k[31] &= 127;
+
+  k[31] |= 64;
+
+  // k = sum of digits[i] 16^i with every digit in [-8, 8]: each nibble above 7 becomes the nibble minus 16
+  // and carries one into the next. The top digit stays at most 8 since bit 255 is clear.
+  const digits = new Int8Array(64);
+
+  for (let i = 0; i < 32; i++) {
+    digits[2 * i] = k[i] & 15;
+
+    digits[2 * i + 1] = k[i] >> 4;
+  }
+
+  let up = 0;
+
+  for (let i = 0; i < 63; i++) {
+    digits[i] += up;
+
+    up = (digits[i] + 8) >> 4;
+
+    digits[i] -= up << 4;
+  }
+
+  digits[63] += up;
+
+  const table = (TABLE ??= edwardsTable());
+
+  const h = point();
+
+  const entry = affine();
+
+  for (let i = 1; i < 64; i += 2) {
+    select(entry, table, i >> 1, digits[i]);
+
+    addAffine(h, h, entry);
+  }
+
+  for (let n = 0; n < 4; n++) {
+    double(h, h);
+  }
+
+  for (let i = 0; i < 64; i += 2) {
+    select(entry, table, i >> 1, digits[i]);
+
+    addAffine(h, h, entry);
+  }
+
+  const numerator = field();
+
+  const denominator = field();
+
+  add(numerator, h.z, h.y);
+
+  subtract(denominator, h.z, h.y);
+
+  invert(denominator, denominator);
+
+  multiply(numerator, numerator, denominator);
+
+  const out = pack(numerator);
+
+  wipe(k, digits, h.x, h.y, h.z, h.t, entry.yPlusX, entry.yMinusX, entry.xy2d, numerator, denominator, ...SCRATCH);
+
+  return out;
+}
