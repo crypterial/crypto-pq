@@ -72,3 +72,14 @@ pub use stateful::{
     HSS_LMS, StateStore, StatefulKeyPair, StatefulParameters, StatefulPrivateKey,
     StatefulPublicKey, StatefulSignatureAlgorithm, XMSS, XMSS_MT,
 };
+
+// What the constant-time check of tests/ct.rs needs; it exists only under the crypto_pq_ct cfg.
+#[cfg(crypto_pq_ct)]
+#[doc(hidden)]
+pub mod ct_check {
+    pub use crate::ct::{declassify, secret};
+
+    pub fn x25519(scalar: &[u8], u: &[u8]) -> [u8; 32] {
+        crate::x25519::x25519(scalar, u)
+    }
+}

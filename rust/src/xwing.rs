@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 
+use crate::ct::declassify;
 use crate::mlkem::{self, ML_KEM_768};
 use crate::primitives::{sha3_256, shake256_into};
 use crate::wipe::{SecretBytes, wipe};
@@ -34,7 +35,11 @@ pub(crate) fn expand(seed: &[u8]) -> Expanded {
 
     let scalar = SecretBytes::concat(&[&expanded[64..]]);
 
-    public.extend_from_slice(&x25519(&scalar, &BASE));
+    let pk_x = x25519(&scalar, &BASE);
+
+    declassify(&pk_x);
+
+    public.extend_from_slice(&pk_x);
 
     wipe(&mut expanded);
 
@@ -56,6 +61,8 @@ pub(crate) fn encapsulate(pk: &[u8], eseed: &[u8]) -> ([u8; 32], Vec<u8>) {
     let (mut ss_m, mut ct) = mlkem::encaps_internal(pk_m, &eseed[..32], &ML_KEM_768);
 
     let ct_x = x25519(&eseed[32..], &BASE);
+
+    declassify(&ct_x);
 
     let mut ss_x = x25519(&eseed[32..], pk_x);
 

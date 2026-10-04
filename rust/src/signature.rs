@@ -2,7 +2,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::ct;
+use crate::ct::{self, declassify};
 use crate::error::Error;
 use crate::hash::{HashAlgorithm, SHAKE128, XofAlgorithm};
 use crate::keys::{
@@ -309,9 +309,13 @@ impl SignatureAlgorithm {
 
         let n = p.n;
 
+        // PK.seed and PK.root are public, and so is whether the key is valid: importing it fails
+        // otherwise.
+        declassify(&sk[2 * n..]);
+
         let root = slhdsa::root(&p, &sk[..n], &sk[2 * n..3 * n]);
 
-        if !ct::equal(&root[..n], &sk[3 * n..]) {
+        if !ct::declassify_value(ct::equal(&root[..n], &sk[3 * n..])) {
             return Err(Error::InvalidPrivateKey);
         }
 

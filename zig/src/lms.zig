@@ -300,6 +300,9 @@ fn otsSign(t: OtsType, i_value: *const [16]u8, q: u32, seed: []const u8, message
 
     derive(h, i_value, q, randomizer, seed, c);
 
+    // C is part of the signature, so the digits of Q are public as well.
+    ct.declassify(c);
+
     var q_hash: [max_n]u8 = undefined;
 
     h.digest(&.{ i_value, &u32Bytes(q), &d_mesg, c, message }, &q_hash);
@@ -814,6 +817,11 @@ const Tree = struct {
         @memcpy(context.seed[0..seed.len], seed);
 
         self.merkle.build(context);
+
+        // I and the root form the tree's public key.
+        ct.declassify(&self.merkle.context.i_value);
+
+        ct.declassify(&self.merkle.root);
     }
 
     fn deinit(self: *Tree, allocator: Allocator) void {
@@ -985,5 +993,7 @@ pub const Hss = struct {
         }
 
         self.trees[self.count - 1].sign(self.leafIndex(index, self.count - 1), message, out[offset..]);
+
+        ct.declassify(out);
     }
 };

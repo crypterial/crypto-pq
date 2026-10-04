@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 
+use crate::ct::declassify;
 use crate::merkle::{MerkleTree, Node, TreeHasher};
 use crate::primitives::TruncatedHash;
 use crate::sha2::{IV_256, Sha256};
@@ -445,6 +446,9 @@ fn ots_sign(t: &OtsType, lms: &LmsType, i: &[u8], q: u32, seed: &[u8], message: 
 
     let c = derive(lms, i, q, RANDOMIZER, seed);
 
+    // C is part of the signature, so the digits of Q are public as well.
+    declassify(&c[..n]);
+
     let q_hash = digest(
         t.shake,
         n,
@@ -732,6 +736,11 @@ impl Tree {
 
         public_key.extend_from_slice(&merkle.root()[..lms.m]);
 
+        // I and the root form the tree's public key.
+        declassify(&identifier);
+
+        declassify(&public_key);
+
         Self {
             lms,
             ots,
@@ -852,6 +861,10 @@ impl Hss {
 
         let count = (self.levels.len() as u32 - 1).to_be_bytes();
 
-        [&count[..], &self.signed.concat(), &bottom].concat()
+        let signature = [&count[..], &self.signed.concat(), &bottom].concat();
+
+        declassify(&signature);
+
+        signature
     }
 }

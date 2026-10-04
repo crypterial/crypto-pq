@@ -445,13 +445,15 @@ fn parseUniform(out: *Poly, start: usize, block: *const [168]u8) usize {
 }
 
 // FIPS 204, Algorithm 31, on the secret seed: every candidate is written and the count advances
-// by a mask, so the accepted values never steer a branch; only the loop end depends on them.
+// by the acceptance, so the accepted values never steer a branch. Which candidates are rejected
+// is public, as BoringSSL also has it: the bytes of the SHAKE256 stream are independent of each
+// other, so the rejected ones say nothing about the accepted coefficients.
 fn parseBounded(comptime eta: u8, buffer: *[257]i32, start: usize, block: *const [136]u8) usize {
     var count = start;
 
     for (block) |byte| {
         for ([2]i32{ byte & 0x0f, byte >> 4 }) |half| {
-            const accepted: usize = @intFromBool(if (eta == 2) half < 15 else half < 9);
+            const accepted: usize = @intFromBool(ct.declassifyValue(bool, if (eta == 2) half < 15 else half < 9));
 
             // half mod 5 is half - 5 * floor(205 * half / 1024) for half < 15.
             buffer[count] = if (eta == 2) 2 - (half - 5 * ((205 * half) >> 10)) else 4 - half;
@@ -633,12 +635,20 @@ fn sampleInBall(comptime p: Parameters, seed: []const u8, c: *Poly) void {
 
     ct.wipe(std.mem.asBytes(c));
 
+    // The positions of the nonzero coefficients are public, as in BoringSSL, while their signs
+    // stay secret. For an accepted signature c_tilde is public; for a rejected attempt the
+    // positions say nothing about the key, because whether an attempt is rejected does not depend
+    // on c * s1 or c * s2.
     for (256 - @as(usize, p.tau)..256) |i| {
         var j: [1]u8 = undefined;
 
-        xof.read(&j);
+        while (true) {
+            xof.read(&j);
 
-        while (j[0] > i) xof.read(&j);
+            ct.declassify(&j);
+
+            if (j[0] <= i) break;
+        }
 
         c[i] = c[j[0]];
 
@@ -795,6 +805,9 @@ pub fn keyGen(comptime p: Parameters, seed: *const [32]u8, pk: *[p.publicKeySize
 
     parts.rho = expanded[0..32].*;
 
+    // rho is part of the public key.
+    ct.declassify(&parts.rho);
+
     parts.key = expanded[96..128].*;
 
     var outs: [@as(usize, p.l) + p.k]*Poly = undefined;
@@ -821,6 +834,8 @@ pub fn keyGen(comptime p: Parameters, seed: *const [32]u8, pk: *[p.publicKeySize
 
     encodePublicKey(p, &parts.rho, &t1, pk);
 
+    ct.declassify(pk);
+
     primitives.shake256(&.{pk}, &parts.tr);
 
     encodePrivateKey(p, &parts, sk);
@@ -839,6 +854,9 @@ pub fn checkPrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8
 
         ct.wipe(std.mem.asBytes(&t));
     }
+
+    // rho is part of the public key.
+    ct.declassify(sk[0..32]);
 
     decodePrivateKey(p, sk, &parts);
 
@@ -866,6 +884,8 @@ pub fn checkPrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8
 
     encodePublicKey(p, &parts.rho, &t1, pk);
 
+    ct.declassify(pk);
+
     var tr: [64]u8 = undefined;
 
     primitives.shake256(&.{pk}, &tr);
@@ -874,7 +894,10 @@ pub fn checkPrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8
 
     const barrier: *volatile i32 = &negative;
 
-    return barrier.* >= 0 and ct.equal(&tr, &parts.tr);
+    // Whether the key is valid is public: importing it fails otherwise.
+    const valid = @intFromBool(barrier.* >= 0) & @intFromBool(ct.equal(&tr, &parts.tr));
+
+    return ct.declassifyValue(u1, valid) == 1;
 }
 
 pub fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, message: []const []const u8, rnd: *const [32]u8, signature: *[p.signatureSize()]u8) void {
@@ -1040,7 +1063,18 @@ pub fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, message: 
 
         const barrier: *volatile i32 = &negative;
 
-        if (barrier.* < 0 or @reduce(.Add, counts) > p.omega) continue;
+        // Only the decision to restart is public, not which check failed or where: a restart
+        // reveals nothing, because the next attempt is independent of this one.
+        const rejected = @intFromBool(barrier.* < 0) | @intFromBool(@reduce(.Add, counts) > p.omega);
+
+        if (ct.declassifyValue(u1, rejected) == 1) continue;
+
+        // The accepted c_tilde, z and h form the signature.
+        ct.declassify(c_tilde);
+
+        ct.declassify(std.mem.asBytes(&cs1));
+
+        ct.declassify(std.mem.asBytes(&h));
 
         encodeSignature(p, &cs1, &h, signature);
 

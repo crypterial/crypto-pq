@@ -1,10 +1,14 @@
+use crate::ct::secret;
 use crate::error::Error;
 use crate::wipe::SecretBytes;
 
+// The constant-time check treats random bytes as secret until the library declassifies them.
 pub(crate) fn random_bytes(length: usize) -> Result<SecretBytes, Error> {
     let mut bytes = SecretBytes::zeroed(length);
 
     fill(&mut bytes)?;
+
+    secret(&bytes);
 
     Ok(bytes)
 }

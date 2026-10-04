@@ -318,3 +318,51 @@ jobs:
           assert pair.private_key.decapsulate(sealed.ciphertext) == sealed.shared_secret
           print(crypto_pq.__name__, "wheel OK")
           '
+
+  # Every secret is marked uninitialised under valgrind's memcheck, so a branch or a memory index
+  # that depends on one fails the job; values the specifications make public are declassified.
+  rust-ct:
+    name: rust ${{ matrix.rust }} constant time (valgrind)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.88", stable]
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends valgrind
+      - run: rustup toolchain install ${{ matrix.rust }} --profile minimal
+      - run: rustup override set ${{ matrix.rust }}
+      - env:
+          RUSTFLAGS: --cfg crypto_pq_ct
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+        run: |
+          binary=$(cargo test --locked --release --test ct --no-run --message-format=json | jq -r 'select(.executable != null) | .executable')
+          valgrind --error-exitcode=1 -q "$binary" --test-threads=1
+
+  zig-ct:
+    name: zig 0.16.0 constant time (valgrind)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: zig
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/zig-x86_64-linux-0.16.0.tar.xz
+          key: zig-x86_64-linux-0.16.0.tar.xz
+      - run: |
+          archive=~/zig-x86_64-linux-0.16.0.tar.xz
+          [ -f "$archive" ] || curl -fsSL --proto '=https' -o "$archive" https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $archive" | sha256sum -c -
+          mkdir -p ~/zig && tar -xJf "$archive" -C ~/zig --strip-components=1
+          echo ~/zig >> "$GITHUB_PATH"
+      - run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends valgrind
+      # valgrind cannot decode AVX-512, so the checked build targets x86-64-v3 (AVX2).
+      - run: zig build ct -Dct=true -Dcpu=x86_64_v3

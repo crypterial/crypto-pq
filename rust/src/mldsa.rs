@@ -2,7 +2,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 
-use crate::ct;
+use crate::ct::{self, declassify, declassify_value};
 use crate::primitives::{shake128, shake256, shake256_into};
 use crate::wipe::{SecretBytes, wipe};
 
@@ -456,9 +456,10 @@ fn rej_ntt_poly(rho: &[u8], s: usize, r: usize) -> Poly {
     a
 }
 
-// The rejection decisions are variable time, as FIPS 204 allows, but no branch depends on a
-// candidate: each one is written and only an accepted one advances the count. The accepted values
-// are computed without a division (205 * x >> 10 = x / 5 for x < 15).
+// The accepted values never steer a branch: each candidate is written and only an accepted one
+// advances the count. Which candidates are rejected is public, as BoringSSL also has it: the bytes
+// of the SHAKE256 stream are independent of each other, so the rejected ones say nothing about the
+// accepted coefficients. Those are computed without a division (205 * x >> 10 = x / 5 for x < 15).
 fn rej_bounded_poly(seed: &[u8], r: usize, eta: i32) -> Poly {
     let mut stream = shake256(&[seed, &(r as u16).to_le_bytes()]);
 
@@ -482,7 +483,7 @@ fn rej_bounded_poly(seed: &[u8], r: usize, eta: i32) -> Poly {
 
             a[count] = value;
 
-            count += usize::from(accepted);
+            count += usize::from(declassify_value(accepted));
 
             if count == 256 {
                 break 'blocks;
@@ -545,11 +546,17 @@ fn sample_in_ball(seed: &[u8], tau: usize) -> Poly {
 
     let mut c = [0; 256];
 
+    // The positions of the nonzero coefficients are public, as in BoringSSL, while their signs
+    // stay secret. For an accepted signature c_tilde is public; for a rejected attempt the
+    // positions say nothing about the key, because whether an attempt is rejected does not depend
+    // on c * s1 or c * s2.
     for i in 256 - tau..256 {
         let mut j = [0u8];
 
         loop {
             stream.read(&mut j);
+
+            declassify(&j);
 
             if usize::from(j[0]) <= i {
                 break;
@@ -700,6 +707,9 @@ pub(crate) fn keygen_internal(xi: &[u8], p: &Parameters) -> (Vec<u8>, SecretByte
 
     let (rho_prime, key) = rest.split_at(64);
 
+    // rho is part of the public key.
+    declassify(rho);
+
     let s = expand_s(rho_prime, p);
 
     let (s1, s2) = s.split_at(p.l);
@@ -707,6 +717,8 @@ pub(crate) fn keygen_internal(xi: &[u8], p: &Parameters) -> (Vec<u8>, SecretByte
     let t = public_t(&expand_a(rho, p), s1, s2, p);
 
     let pk = encode_public_key(rho, &t, p);
+
+    declassify(&pk);
 
     let sk = encode_private_key([rho, key, &hash_public_key(&pk)], &s, &t, p);
 
@@ -719,9 +731,13 @@ pub(crate) fn keygen_internal(xi: &[u8], p: &Parameters) -> (Vec<u8>, SecretByte
 // parts disagree is rejected instead of producing signatures that never verify. Re-encoding the
 // key from its own s1, s2, rho and K compares t0 and tr in one constant-time pass.
 pub(crate) fn check_private_key(sk: &[u8], p: &Parameters) -> Option<Vec<u8>> {
+    // rho is part of the public key.
+    declassify(&sk[..32]);
+
     let key = decode_private_key(sk, p);
 
-    if reaches(key.s.iter().flatten().copied(), p.eta + 1) != 0 {
+    // Whether the key is valid is public: importing it fails otherwise.
+    if declassify_value(reaches(key.s.iter().flatten().copied(), p.eta + 1) != 0) {
         return None;
     }
 
@@ -731,9 +747,11 @@ pub(crate) fn check_private_key(sk: &[u8], p: &Parameters) -> Option<Vec<u8>> {
 
     let pk = encode_public_key(key.rho, &t, p);
 
+    declassify(&pk);
+
     let rebuilt = encode_private_key([key.rho, key.key, &hash_public_key(&pk)], &key.s, &t, p);
 
-    ct::equal(&rebuilt, sk).then_some(pk)
+    declassify_value(ct::equal(&rebuilt, sk)).then_some(pk)
 }
 
 fn hint_bit_pack(h: &Polys, p: &Parameters, out: &mut [u8]) {
@@ -924,7 +942,9 @@ pub(crate) fn sign_internal(sk: &[u8], message: &[&[u8]], rnd: &[u8], p: &Parame
             p.gamma2 - p.beta(),
         );
 
-        if z_check | r0_check != 0 {
+        // Only the decision to restart is public, not which check failed or where: a restart
+        // reveals nothing, because the next attempt is independent of this one.
+        if declassify_value(z_check | r0_check != 0) {
             continue;
         }
 
@@ -948,12 +968,15 @@ pub(crate) fn sign_internal(sk: &[u8], message: &[&[u8]], rnd: &[u8], p: &Parame
 
         let ct0_check = reaches(ct0.iter().flatten().map(|&x| centered(x)), p.gamma2);
 
-        if ct0_check != 0 || count > p.omega as i32 {
+        if declassify_value((ct0_check != 0) | (count > p.omega as i32)) {
             continue;
         }
 
         break c_tilde;
     };
+
+    // The accepted c_tilde, z and h form the signature.
+    declassify(&h);
 
     let mut signature = vec![0; p.signature_size()];
 
@@ -972,6 +995,8 @@ pub(crate) fn sign_internal(sk: &[u8], message: &[&[u8]], rnd: &[u8], p: &Parame
     hint_bit_pack(&h, p, hints);
 
     wipe(&mut rho_prime);
+
+    declassify(&signature);
 
     signature
 }

@@ -432,7 +432,8 @@ fn decode(kind: StatefulSignatureAlgorithm.Kind, state: []const u8) Error!Decode
 
     primitives.digest(hash.sha_256, &.{body}, &digest);
 
-    if (!ct.equal(digest[0..16], state[state.len - 16 ..]) or body[0] != version) return error.InvalidPrivateKey;
+    // Whether a stored state is intact is public: loading fails on it.
+    if (!ct.declassifyValue(bool, ct.equal(digest[0..16], state[state.len - 16 ..])) or body[0] != version) return error.InvalidPrivateKey;
 
     if (body[1] != @intFromEnum(kind)) return error.AlgorithmMismatch;
 

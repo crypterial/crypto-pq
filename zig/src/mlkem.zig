@@ -710,6 +710,9 @@ pub fn keyGen(comptime p: Parameters, d: *const [32]u8, z: *const [32]u8, ek: *[
 
     const sigma = g[32..64];
 
+    // rho is part of the public key.
+    ct.declassify(rho);
+
     var outs: [2 * k]*Poly = undefined;
 
     for (outs[0..k], &s) |*out, *f| out.* = f;
@@ -733,6 +736,8 @@ pub fn keyGen(comptime p: Parameters, d: *const [32]u8, z: *const [32]u8, ek: *[
 
         encode12(&t, ek[384 * i ..][0..384]);
     }
+
+    ct.declassify(ek[0 .. 384 * k]);
 
     @memcpy(ek[384 * k ..], rho);
 
@@ -761,6 +766,8 @@ pub fn encaps(comptime p: Parameters, ek: *const [p.encapsulationKeySize()]u8, m
     shared_secret.* = g[0..32].*;
 
     encrypt(p, ek, m, g[32..64], c);
+
+    ct.declassify(c);
 }
 
 // Implicit rejection: a ciphertext that does not re-encrypt to itself yields J(z || c), chosen
@@ -824,6 +831,9 @@ pub fn checkEncapsulationKey(comptime p: Parameters, ek: *const [p.encapsulation
 
 pub fn checkDecapsulationKey(comptime p: Parameters, dk: *const [p.decapsulationKeySize()]u8) bool {
     const k: usize = p.k;
+
+    // dk carries the encapsulation key and its hash, which are public.
+    ct.declassify(dk[384 * k ..][0 .. 384 * k + 64]);
 
     const ek = dk[384 * k ..][0..p.encapsulationKeySize()];
 

@@ -889,6 +889,9 @@ pub const Xmss = struct {
             self.layers[built] = .{ .index = null, .tree = try .init(allocator, p.treeHeight(), n) };
         }
 
+        // PUB_SEED is part of the public key.
+        ct.declassify(seed[2 * n ..][0..n]);
+
         self.hashes = .init(p, seed[2 * n ..][0..n], seed[0..n]);
 
         self.sk_prf = @splat(0);
@@ -932,6 +935,9 @@ pub const Xmss = struct {
         if (cached.index == null or cached.index.? != index) {
             cached.tree.build(.{ .hashes = &self.hashes, .layer = @intCast(layer), .tree = index });
 
+            // Each root is the public key or what the layer above signs.
+            ct.declassify(&cached.tree.root);
+
             cached.index = index;
         }
 
@@ -956,6 +962,9 @@ pub const Xmss = struct {
         const r = out[p.indexSize()..][0..n];
 
         hashFunction(p, prf_prefix, self.sk_prf[0..n], &.{&index_bytes}, r);
+
+        // R is part of the signature, so the message digest is public as well.
+        ct.declassify(r);
 
         var node: [max_n]u8 = undefined;
 
@@ -1013,5 +1022,7 @@ pub const Xmss = struct {
 
             @memcpy(node[0..n], layer_tree.root[0..n]);
         }
+
+        ct.declassify(out);
     }
 };

@@ -1,3 +1,30 @@
+const std = @import("std");
+
+const build_options = @import("build_options");
+
+// With -Dct=true, `zig build ct` runs the library under valgrind's memcheck with every secret
+// marked uninitialised, so that a branch or a memory index that depends on a secret is reported.
+// A value derived from secrets is declassified where the specification makes it public. Without
+// the option these hooks compile to nothing.
+pub inline fn secret(bytes: []const u8) void {
+    if (build_options.ct) std.valgrind.memcheck.makeMemUndefined(bytes);
+}
+
+pub inline fn declassify(bytes: []const u8) void {
+    if (build_options.ct) std.valgrind.memcheck.makeMemDefined(bytes);
+}
+
+// declassify for a value that lives in registers: it passes through memory only under -Dct=true.
+pub inline fn declassifyValue(comptime T: type, value: T) T {
+    if (!build_options.ct) return value;
+
+    var copy = value;
+
+    declassify(std.mem.asBytes(&copy));
+
+    return copy;
+}
+
 pub fn equal(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
 

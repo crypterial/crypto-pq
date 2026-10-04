@@ -335,7 +335,10 @@ impl StatefulSignatureAlgorithm {
 
         let (body, checksum) = state.split_at(state.len() - CHECKSUM_SIZE);
 
-        if !ct::equal(&sha256(&[body])[..CHECKSUM_SIZE], checksum) || body[0] != VERSION {
+        // Whether a stored state is intact is public: loading fails on it.
+        if !ct::declassify_value(ct::equal(&sha256(&[body])[..CHECKSUM_SIZE], checksum))
+            || body[0] != VERSION
+        {
             return Err(Error::InvalidPrivateKey);
         }
 

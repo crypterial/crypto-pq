@@ -394,3 +394,32 @@ test "x25519 Wycheproof" {
         try std.testing.expectEqual(shared, x25519(&private, &public));
     }
 }
+
+// zig build ct runs this test under valgrind with the private scalars marked secret.
+test "x25519 constant time" {
+    var alice: [32]u8 = undefined;
+
+    _ = try std.fmt.hexToBytes(&alice, "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+
+    var bob: [32]u8 = undefined;
+
+    _ = try std.fmt.hexToBytes(&bob, "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+
+    ct.secret(&alice);
+
+    ct.secret(&bob);
+
+    var alice_public = x25519(&alice, &base_point);
+
+    ct.declassify(&alice_public);
+
+    var shared = x25519(&bob, &alice_public);
+
+    ct.declassify(&shared);
+
+    var expected: [32]u8 = undefined;
+
+    _ = try std.fmt.hexToBytes(&expected, "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+
+    try std.testing.expectEqual(expected, shared);
+}

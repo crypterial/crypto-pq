@@ -19,3 +19,7 @@ harness = false
 # assertions and overflow checks but are optimized.
 [profile.test]
 opt-level = 3
+
+# RUSTFLAGS="--cfg crypto_pq_ct" builds the constant-time check of tests/ct.rs.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(crypto_pq_ct)'] }

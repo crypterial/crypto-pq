@@ -1,7 +1,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::ct;
+use crate::ct::{self, declassify};
 use crate::primitives::{sha3_256, sha3_512, shake128, shake256_into};
 use crate::wipe::{SecretBytes, wipe};
 
@@ -442,6 +442,9 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) {
 
     let (rho, sigma) = g.split_at(32);
 
+    // rho is part of the public key.
+    declassify(rho);
+
     let mut s = [[0; 256]; 4];
 
     let mut e = [[0; 256]; 4];
@@ -473,6 +476,8 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) {
 
         byte_encode(&s[i], 12, &mut dk[384 * i..384 * (i + 1)]);
     }
+
+    declassify(&ek[..384 * k]);
 
     ek[384 * k..].copy_from_slice(rho);
 
@@ -610,6 +615,8 @@ pub(crate) fn encaps_internal(ek: &[u8], m: &[u8], p: &Parameters) -> ([u8; 32],
 
     pke_encrypt(ek, m, &g[32..], p, &mut c);
 
+    declassify(&c);
+
     let mut shared_secret = [0; 32];
 
     shared_secret.copy_from_slice(&g[..32]);
@@ -675,8 +682,14 @@ pub(crate) fn check_encapsulation_key(ek: &[u8], p: &Parameters) -> bool {
 pub(crate) fn check_decapsulation_key(dk: &[u8], p: &Parameters) -> bool {
     let k = p.k;
 
-    dk.len() == p.decapsulation_key_size()
-        && check_encapsulation_key(public_key_of(dk, p), p)
+    if dk.len() != p.decapsulation_key_size() {
+        return false;
+    }
+
+    // dk carries the encapsulation key and its hash, which are public.
+    declassify(&dk[384 * k..768 * k + 64]);
+
+    check_encapsulation_key(public_key_of(dk, p), p)
         && ct::equal(
             &sha3_256(&[public_key_of(dk, p)]),
             &dk[768 * k + 32..768 * k + 64],

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const ct = @import("ct.zig");
 const Error = @import("errors.zig").Error;
 
 const os = builtin.os.tag;
@@ -12,7 +13,14 @@ extern "c" fn getentropy(buffer: [*]u8, length: usize) c_int;
 extern "bcryptprimitives" fn ProcessPrng(data: [*]u8, length: usize) callconv(.winapi) std.os.windows.BOOL;
 
 // Fills `buffer` from the operating system's random number generator; there is no fallback.
+// The constant-time check treats random bytes as secret until the library declassifies them.
 pub fn fill(buffer: []u8) Error!void {
+    try system(buffer);
+
+    ct.secret(buffer);
+}
+
+fn system(buffer: []u8) Error!void {
     if (os == .linux) return linuxGetrandom(buffer);
 
     if (os.isDarwin() or os == .openbsd) return chunkedGetentropy(buffer);

@@ -55,7 +55,8 @@ pub const KemAlgorithm = struct {
 
             defer ct.wipe(&shared_secret);
 
-            if (!ct.equal(&shared_secret, &encapsulation.shared_secret)) return error.SelfTestFailed;
+            // The outcome of the pairwise test is public: key generation fails on it.
+            if (!ct.declassifyValue(bool, ct.equal(&shared_secret, &encapsulation.shared_secret))) return error.SelfTestFailed;
         }
 
         return .{ .public_key = public_key, .private_key = private_key };

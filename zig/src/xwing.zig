@@ -35,6 +35,8 @@ pub fn expand(seed: *const [seed_size]u8, public_key: *[public_key_size]u8, dk: 
     scalar.* = expanded[64..96].*;
 
     public_key[ek_size..].* = x25519.x25519(scalar, &x25519.base_point);
+
+    ct.declassify(public_key[ek_size..]);
 }
 
 fn combine(ss_m: *const [32]u8, ss_x: *const [32]u8, ct_x: *const [32]u8, pk_x: *const [32]u8) [32]u8 {
@@ -65,6 +67,8 @@ pub fn encapsulate(public_key: *const [public_key_size]u8, eseed: *const [random
     mlkem.encaps(params, public_key[0..ek_size], eseed[0..32], &ss_m, ciphertext[0..ct_size]);
 
     ciphertext[ct_size..].* = x25519.x25519(eseed[32..64], &x25519.base_point);
+
+    ct.declassify(ciphertext[ct_size..]);
 
     ss_x = x25519.x25519(eseed[32..64], pk_x);
 

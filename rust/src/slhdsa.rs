@@ -1,6 +1,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::ct::declassify;
 use crate::hash::{HMAC_SHA_256, HMAC_SHA_512};
 use crate::primitives::{sha256, sha512, shake256};
 use crate::sha2::{IV_256, IV_512, Sha256, Sha512};
@@ -786,6 +787,8 @@ impl Context<'_> {
 
             root = self.xmss_tree(&adrs, Some((leaf, &root[..n], part)));
 
+            declassify(&root[..n]);
+
             leaf = (tree & self.leaf_mask()) as u32;
 
             tree >>= self.p.hp;
@@ -1102,7 +1105,13 @@ pub(crate) fn keygen_internal(
 
     let sk = SecretBytes::concat(&[sk_seed, sk_prf, pk_seed, pk_root]);
 
-    (sk, [pk_seed, pk_root].concat())
+    let pk = [pk_seed, pk_root].concat();
+
+    declassify(&sk[2 * p.n..]);
+
+    declassify(&pk);
+
+    (sk, pk)
 }
 
 pub(crate) fn sign_internal(
@@ -1126,7 +1135,13 @@ pub(crate) fn sign_internal(
 
     let r = prf_msg(p, sk_prf, addrnd, message);
 
+    // R opens the signature; the digest, and the indices taken from it, follow from R, the public
+    // key and the message.
+    declassify(&r[..n]);
+
     let digest = h_msg(p, &r[..n], pk_seed, pk_root, message);
+
+    declassify(&digest);
 
     let (md, tree, leaf) = split_digest(p, &digest);
 
@@ -1148,7 +1163,13 @@ pub(crate) fn sign_internal(
 
     let pk_fors = context.fors_sign(md, &adrs, fors);
 
+    // The FORS public key and the root of every tree are what the next layer signs; the verifier
+    // recomputes each of them from the signature.
+    declassify(&pk_fors[..n]);
+
     context.ht_sign(&pk_fors[..n], tree, leaf, ht);
+
+    declassify(&signature);
 
     signature
 }

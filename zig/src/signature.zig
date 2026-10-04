@@ -392,8 +392,6 @@ fn fromSecret(algorithm: SignatureAlgorithm, bytes: []const u8) Error!SignatureP
 
     errdefer key.deinit();
 
-    @memcpy(key.secret_bytes[0..bytes.len], bytes);
-
     switch (algorithm.kind) {
         inline else => |tag| switch (comptime family(tag)) {
             .ml_dsa => |p| {
@@ -402,14 +400,21 @@ fn fromSecret(algorithm: SignatureAlgorithm, bytes: []const u8) Error!SignatureP
             .slh_dsa => |p| {
                 const n: usize = p.n;
 
+                // PK.seed and PK.root are public, and so is whether the key is valid: importing
+                // it fails otherwise.
+                ct.declassify(bytes[2 * n ..][0 .. 2 * n]);
+
                 const root = slhdsa.Scheme(p).root(bytes[0..n], bytes[2 * n ..][0..n]);
 
-                if (!ct.equal(&root, bytes[3 * n ..][0..n])) return error.InvalidPrivateKey;
+                if (!ct.declassifyValue(bool, ct.equal(&root, bytes[3 * n ..][0..n]))) return error.InvalidPrivateKey;
 
                 @memcpy(key.public[0 .. 2 * n], bytes[2 * n ..][0 .. 2 * n]);
             },
         },
     }
+
+    // Copied after the checks, which declassify the public parts of the key.
+    @memcpy(key.secret_bytes[0..bytes.len], bytes);
 
     return key;
 }

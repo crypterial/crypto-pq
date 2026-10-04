@@ -829,7 +829,9 @@ func mldsaSign(p *mldsaParams, sk, message, rnd []byte) []byte {
 			}
 		}
 
-		if reject != 0 || count > uint32(p.omega) {
+		// The ct0 bound and the hint count make one restart decision, as in the Rust and Zig
+		// implementations, so which of the two failed stays hidden.
+		if reject|((uint32(p.omega)-count)>>31) != 0 {
 			continue
 		}
 

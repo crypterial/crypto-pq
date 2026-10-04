@@ -87,7 +87,9 @@ impl KemAlgorithm {
 
             let mut shared_secret = private_key.decapsulate(&encapsulation.ciphertext)?;
 
-            let consistent = ct::equal(&shared_secret, &encapsulation.shared_secret);
+            // The outcome of the pairwise test is public: key generation fails on it.
+            let consistent =
+                ct::declassify_value(ct::equal(&shared_secret, &encapsulation.shared_secret));
 
             wipe(&mut shared_secret);
 

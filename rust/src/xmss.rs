@@ -1,6 +1,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::ct::declassify;
 use crate::merkle::{MerkleTree, Node, TreeHasher};
 use crate::primitives::TruncatedHash;
 use crate::sha2::{IV_256, Sha256};
@@ -818,7 +819,12 @@ fn cached_tree<'t>(
             tree,
         };
 
-        (tree, MerkleTree::new(hashes.p.tree_height(), &subtree))
+        let merkle = MerkleTree::new(hashes.p.tree_height(), &subtree);
+
+        // Each root is the public key or what the layer above signs.
+        declassify(merkle.root());
+
+        (tree, merkle)
     });
 
     merkle
@@ -827,6 +833,9 @@ fn cached_tree<'t>(
 impl Xmss {
     pub(crate) fn new(p: &'static Parameters, seed: &[u8]) -> Self {
         let n = p.n;
+
+        // PUB_SEED is part of the public key.
+        declassify(&seed[2 * n..]);
 
         let mut xmss = Self {
             p,
@@ -861,6 +870,9 @@ impl Xmss {
         let hashes = Hashes::new(p, &self.pub_seed, &self.sk_seed);
 
         let r = hashes.hash(PRF, &self.sk_prf, &[&to_byte(index, 32)]);
+
+        // R is part of the signature, so the message digest is public as well.
+        declassify(&r[..n]);
 
         let mut node = hashes.message_digest(&r[..n], &self.root[..n], index, message);
 
@@ -897,6 +909,8 @@ impl Xmss {
 
             node = *merkle.root();
         }
+
+        declassify(&out);
 
         out
     }

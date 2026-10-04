@@ -1264,6 +1264,10 @@ pub fn Scheme(comptime p: Parameters) type {
             sk.* = sk_seed.* ++ sk_prf.* ++ pk_seed.* ++ pk_root;
 
             pk.* = pk_seed.* ++ pk_root;
+
+            ct.declassify(pk);
+
+            ct.declassify(sk[2 * n ..]);
         }
 
         // Every tree is built whole: the signature parts (FORS secret values, WOTS signatures and
@@ -1282,7 +1286,13 @@ pub fn Scheme(comptime p: Parameters) type {
 
             messageRandomizer(sk[n..][0..n], opt_rand, message, r);
 
+            // R opens the signature; the digest, and the indices taken from it, follow from R,
+            // the public key and the message.
+            ct.declassify(r);
+
             const digest = messageDigest(r, pk_seed, pk_root, message);
+
+            ct.declassify(&digest);
 
             const parts = split(&digest);
 
@@ -1312,6 +1322,10 @@ pub fn Scheme(comptime p: Parameters) type {
 
             hashes.t(&secretAddress(&adrs, fors_roots), &roots, &current);
 
+            // The FORS public key and the root of every tree are what the next layer signs; the
+            // verifier recomputes each of them from the signature.
+            ct.declassify(&current);
+
             var idx_tree = parts.tree;
 
             var leaf = parts.leaf;
@@ -1338,7 +1352,11 @@ pub fn Scheme(comptime p: Parameters) type {
                 const context: WotsLeaves = .{ .hashes = &hashes, .adrs = &layer_adrs, .capture = &capture };
 
                 current = merkle(&context, hp, 0, leaf, part[len * n ..]);
+
+                ct.declassify(&current);
             }
+
+            ct.declassify(signature);
         }
 
         pub fn verify(pk: *const [2 * n]u8, message: []const []const u8, signature: *const [p.signatureSize()]u8) bool {
