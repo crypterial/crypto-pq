@@ -17,7 +17,8 @@ pub const KeyGenOptions = struct {
 const der_capacity = 8192;
 
 // PEM input is decoded into a buffer of this size on the stack, because importing a key does not
-// allocate; any DER encoding of a supported key is far smaller.
+// allocate; any DER encoding of a supported key is far smaller, and a longer one is read as a
+// stream (see encoding.pemPublicKey).
 const pem_capacity = 16384;
 
 pub const PemBuffer = [pem_capacity]u8;
@@ -31,9 +32,7 @@ pub fn importPublic(format: KeyFormat, data: []const u8, oid: ?[]const u8, buffe
 
     const expected = oid orelse return error.Unsupported;
 
-    const der = if (format == .pem) try encoding.pemDecode(buffer, public_label, data) else data;
-
-    const decoded = try encoding.decodePublicKey(der);
+    const decoded = if (format == .pem) try encoding.pemPublicKey(buffer, public_label, data) else try encoding.decodePublicKey(data);
 
     if (!std.mem.eql(u8, decoded.oid, expected)) return error.AlgorithmMismatch;
 
@@ -53,9 +52,7 @@ pub fn importPrivate(format: KeyFormat, data: []const u8, oid: ?[]const u8, buff
 
     const expected = oid orelse return error.Unsupported;
 
-    const der = if (format == .pem) try encoding.pemDecode(buffer, private_label, data) else data;
-
-    const decoded = try encoding.decodePrivateKey(der);
+    const decoded = if (format == .pem) try encoding.pemPrivateKey(buffer, private_label, data) else try encoding.decodePrivateKey(data);
 
     if (!std.mem.eql(u8, decoded.oid, expected)) return error.AlgorithmMismatch;
 

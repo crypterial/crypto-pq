@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const ct = @import("ct.zig");
 const Error = @import("errors.zig").Error;
 
 pub const sequence = 0x30;
@@ -333,17 +334,39 @@ fn isWhitespace(character: u8) bool {
     return (@intFromBool(character == ' ') | @intFromBool(character -% 9 < 5)) != 0;
 }
 
-// Decodes the base64 characters of `text`, skipping whitespace. Invalid characters are counted
-// instead of returned early, so that the time taken does not depend on where they are.
-fn base64DecodeSpaced(out: []u8, text: []const u8) Error![]u8 {
-    var count: usize = 0;
+// The padding of the last group of a base64 text: '=' as its last two characters or its last one.
+fn groupPadding(chunk: [4]u8) usize {
+    if (chunk[2] == '=' and chunk[3] == '=') return 2;
 
-    for (text) |character| {
-        count += @intFromBool(!isWhitespace(character));
+    return @intFromBool(chunk[3] == '=');
+}
+
+// Decodes a group of four characters, the last `padding` of them padding, into 24 bits. Invalid
+// characters and padding bits that are not zero make `invalid` negative instead of returning
+// early, so that the time taken does not depend on where they are.
+fn decodeGroup(chunk: [4]u8, padding: usize, invalid: *i32) u32 {
+    var value: u32 = 0;
+
+    for (chunk[0 .. 4 - padding]) |c| {
+        const v = base64Value(c);
+
+        invalid.* |= v;
+
+        value = (value << 6) | (@as(u32, @bitCast(v)) & 0x3f);
     }
 
-    if (count % 4 != 0 or count / 4 * 3 > out.len) return error.InvalidEncoding;
+    value <<= @intCast(6 * padding);
 
+    const low = (@as(u32, 1) << @intCast(8 * padding)) - 1;
+
+    invalid.* |= -@as(i32, @intFromBool(value & low != 0));
+
+    return value;
+}
+
+// Decodes the `count` base64 characters of `text`, skipping whitespace, into `out`, which holds
+// at least count / 4 * 3 bytes.
+fn base64DecodeSpaced(out: []u8, text: []const u8, count: usize) Error![]u8 {
     var invalid: i32 = 0;
 
     var chunk: [4]u8 = undefined;
@@ -367,31 +390,9 @@ fn base64DecodeSpaced(out: []u8, text: []const u8) Error![]u8 {
 
         group += 1;
 
-        var padding: usize = 0;
+        const padding = if (group == count / 4) groupPadding(chunk) else 0;
 
-        if (group == count / 4) {
-            if (chunk[2] == '=' and chunk[3] == '=') {
-                padding = 2;
-            } else if (chunk[3] == '=') {
-                padding = 1;
-            }
-        }
-
-        var value: u32 = 0;
-
-        for (chunk[0 .. 4 - padding]) |c| {
-            const v = base64Value(c);
-
-            invalid |= v;
-
-            value = (value << 6) | (@as(u32, @bitCast(v)) & 0x3f);
-        }
-
-        value <<= @intCast(6 * padding);
-
-        const low = (@as(u32, 1) << @intCast(8 * padding)) - 1;
-
-        invalid |= -@as(i32, @intFromBool(value & low != 0));
+        const value = decodeGroup(chunk, padding, &invalid);
 
         for (0..3 - padding) |i| {
             out[length] = @truncate(value >> @intCast(16 - 8 * i));
@@ -403,6 +404,215 @@ fn base64DecodeSpaced(out: []u8, text: []const u8) Error![]u8 {
     if (invalid < 0) return error.InvalidEncoding;
 
     return out[0..length];
+}
+
+// A body whose DER does not fit in the buffer is read as a stream instead: each element a key
+// needs is kept in its own third of the buffer, and the attributes of a private key are skipped.
+// Valid elements are far smaller than a third (the largest, an expanded ML-DSA-87 key with its
+// seed, takes 4938 bytes), so an element cut to its third fails every later check as the whole
+// one would, and the result is the one decodePublicKey or decodePrivateKey gives on the full DER.
+const Stream = struct {
+    text: []const u8,
+    groups: usize,
+    position: usize = 0,
+    group: usize = 0,
+    decoded: [3]u8 = undefined,
+    size: usize = 0,
+    used: usize = 0,
+    peeked: ?u8 = null,
+    invalid: i32 = 0,
+
+    fn next(self: *Stream) u8 {
+        if (self.peeked) |byte| {
+            self.peeked = null;
+
+            return byte;
+        }
+
+        if (self.used == self.size) self.fill();
+
+        self.used += 1;
+
+        return self.decoded[self.used - 1];
+    }
+
+    fn peek(self: *Stream) u8 {
+        self.peeked = self.next();
+
+        return self.peeked.?;
+    }
+
+    fn fill(self: *Stream) void {
+        var chunk: [4]u8 = undefined;
+
+        var filled: usize = 0;
+
+        while (filled < 4) : (self.position += 1) {
+            if (isWhitespace(self.text[self.position])) continue;
+
+            chunk[filled] = self.text[self.position];
+
+            filled += 1;
+        }
+
+        self.group += 1;
+
+        const padding = if (self.group == self.groups) groupPadding(chunk) else 0;
+
+        const value = decodeGroup(chunk, padding, &self.invalid);
+
+        for (self.decoded[0 .. 3 - padding], 0..) |*byte, i| {
+            byte.* = @truncate(value >> @intCast(16 - 8 * i));
+        }
+
+        self.size = 3 - padding;
+
+        self.used = 0;
+    }
+};
+
+// The content left in an element read from a Stream, with the checks of Reader.
+const Scope = struct {
+    stream: *Stream,
+    left: usize,
+
+    fn peek(self: Scope) ?u8 {
+        return if (self.left > 0) self.stream.peek() else null;
+    }
+
+    fn byte(self: *Scope) u8 {
+        self.left -= 1;
+
+        return self.stream.next();
+    }
+
+    // The next element, which must have `tag`, as the scope of its content.
+    fn open(self: *Scope, tag: u8) Error!Scope {
+        if (self.left < 2 or self.byte() != tag) return error.InvalidEncoding;
+
+        const first = self.byte();
+
+        var length: usize = first;
+
+        if (first >= 0x80) {
+            const size: usize = first & 0x7f;
+
+            if (size == 0 or size > 4 or self.left < size) return error.InvalidEncoding;
+
+            length = 0;
+
+            for (0..size) |i| {
+                const next = self.byte();
+
+                if (i == 0 and next == 0) return error.InvalidEncoding;
+
+                length = (length << 8) | next;
+            }
+
+            if (length < 0x80) return error.InvalidEncoding;
+        }
+
+        if (self.left < length) return error.InvalidEncoding;
+
+        self.left -= length;
+
+        return .{ .stream = self.stream, .left = length };
+    }
+
+    fn skip(self: *Scope) void {
+        while (self.left > 0) _ = self.byte();
+    }
+
+    // Reads the rest of the content and returns as much of it as fits in `out`.
+    fn keep(self: *Scope, out: []u8) []u8 {
+        const kept = @min(self.left, out.len);
+
+        for (out[0..kept]) |*target| target.* = self.byte();
+
+        self.skip();
+
+        return out[0..kept];
+    }
+};
+
+fn streamAlgorithm(info: *Scope, out: []u8) Error![]const u8 {
+    var algorithm = try info.open(sequence);
+
+    var oid = try algorithm.open(object_identifier);
+
+    const kept = oid.keep(out);
+
+    if (algorithm.left != 0) return error.InvalidEncoding;
+
+    return kept;
+}
+
+fn streamPublicKey(out: []u8, stream: *Stream, size: usize) Error!PublicKey {
+    const part = out.len / 3;
+
+    var outer: Scope = .{ .stream = stream, .left = size };
+
+    var info = try outer.open(sequence);
+
+    if (outer.left != 0) return error.InvalidEncoding;
+
+    const oid = try streamAlgorithm(&info, out[0..part]);
+
+    var bits = try info.open(bit_string);
+
+    const key = bits.keep(out[part..][0..part]);
+
+    if (info.left != 0 or stream.invalid < 0 or key.len == 0 or key[0] != 0) return error.InvalidEncoding;
+
+    return .{ .oid = oid, .key = key[1..] };
+}
+
+fn streamPrivateKey(out: []u8, stream: *Stream, size: usize) Error!PrivateKey {
+    const part = out.len / 3;
+
+    var outer: Scope = .{ .stream = stream, .left = size };
+
+    var info = try outer.open(sequence);
+
+    if (outer.left != 0) return error.InvalidEncoding;
+
+    var version = try info.open(integer);
+
+    if (version.left != 1) return error.InvalidEncoding;
+
+    const number = version.byte();
+
+    if (number > 1) return error.InvalidEncoding;
+
+    const oid = try streamAlgorithm(&info, out[0..part]);
+
+    var key = try info.open(octet_string);
+
+    const octets = key.keep(out[part..][0..part]);
+
+    if (info.peek() == context_0_constructed) {
+        var attributes = try info.open(context_0_constructed);
+
+        attributes.skip();
+    }
+
+    var public_key: ?[]const u8 = null;
+
+    if (info.peek() == context_1) {
+        if (number != 1) return error.InvalidEncoding;
+
+        var bits = try info.open(context_1);
+
+        const kept = bits.keep(out[2 * part ..][0..part]);
+
+        if (kept.len == 0 or kept[0] != 0) return error.InvalidEncoding;
+
+        public_key = kept[1..];
+    }
+
+    if (info.left != 0 or stream.invalid < 0) return error.InvalidEncoding;
+
+    return .{ .oid = oid, .octets = octets, .public_key = public_key };
 }
 
 pub fn pemSize(comptime label: []const u8, der_length: usize) usize {
@@ -449,7 +659,9 @@ pub fn pemEncode(out: []u8, comptime label: []const u8, der: []const u8) []u8 {
     return writer.written();
 }
 
-pub fn pemDecode(out: []u8, comptime label: []const u8, data: []const u8) Error![]u8 {
+// The base64 body of a PEM block, which only whitespace may surround, and the number of its
+// base64 characters.
+fn pemBody(comptime label: []const u8, data: []const u8) Error!struct { []const u8, usize } {
     const begin = "-----BEGIN " ++ label ++ "-----";
 
     const end = "-----END " ++ label ++ "-----";
@@ -460,9 +672,58 @@ pub fn pemDecode(out: []u8, comptime label: []const u8, data: []const u8) Error!
 
     const body = text[begin.len .. text.len - end.len];
 
+    var count: usize = 0;
+
     for (body) |character| {
         if (character > 0x7f) return error.InvalidEncoding;
+
+        count += @intFromBool(!isWhitespace(character));
     }
 
-    return base64DecodeSpaced(out, body);
+    if (count % 4 != 0) return error.InvalidEncoding;
+
+    return .{ body, count };
+}
+
+// The decoded size of a body of `count` characters: three bytes per group, less the padding.
+fn decodedSize(body: []const u8, count: usize) usize {
+    var last: [4]u8 = @splat(0);
+
+    var slot: usize = 4;
+
+    var i = body.len;
+
+    while (slot > 2) {
+        i -= 1;
+
+        if (isWhitespace(body[i])) continue;
+
+        slot -= 1;
+
+        last[slot] = body[i];
+    }
+
+    return count / 4 * 3 - groupPadding(last);
+}
+
+pub fn pemPublicKey(out: []u8, comptime label: []const u8, data: []const u8) Error!PublicKey {
+    const body, const count = try pemBody(label, data);
+
+    if (count / 4 * 3 <= out.len) return decodePublicKey(try base64DecodeSpaced(out, body, count));
+
+    var stream: Stream = .{ .text = body, .groups = count / 4 };
+
+    return streamPublicKey(out, &stream, decodedSize(body, count));
+}
+
+pub fn pemPrivateKey(out: []u8, comptime label: []const u8, data: []const u8) Error!PrivateKey {
+    const body, const count = try pemBody(label, data);
+
+    if (count / 4 * 3 <= out.len) return decodePrivateKey(try base64DecodeSpaced(out, body, count));
+
+    var stream: Stream = .{ .text = body, .groups = count / 4 };
+
+    defer ct.wipe(&stream.decoded);
+
+    return streamPrivateKey(out, &stream, decodedSize(body, count));
 }
