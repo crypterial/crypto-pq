@@ -1,5 +1,5 @@
 import { concat, equal, readUint32, uint32, writeUint32 } from "./bytes.ts";
-import { MerkleTree } from "./merkle.ts";
+import { type CachedLevels, type CachedTree, MerkleTree } from "./merkle.ts";
 import {
   type FixedHash,
   blocks,
@@ -621,7 +621,15 @@ export function hssVerify(publicKey: Uint8Array, message: Uint8Array, signature:
   return lmsVerify(key, message, signature.subarray(offset));
 }
 
-// One LMS tree of an HSS key: its I, SEED and the Merkle tree over its OTS public keys.
+// The I and SEED of the child tree that leaf q signs, from the I and SEED of its parent.
+function childKeys(lms: LmsType, id: Uint8Array, seed: Uint8Array, q: number): [Uint8Array, Uint8Array] {
+  const childId = derive(lms.shake, lms.m, id, q, CHILD_I, seed).slice(0, 16);
+
+  return [childId, derive(lms.shake, lms.m, id, q, CHILD_SEED, seed)];
+}
+
+// One LMS tree of an HSS key: its I, SEED and the Merkle tree over its OTS public keys, built or
+// taken from the levels of a tree cache.
 class Tree {
   readonly lms: LmsType;
 
@@ -637,7 +645,7 @@ class Tree {
 
   readonly #chains: Chains;
 
-  constructor(lms: LmsType, ots: OtsType, id: Uint8Array, seed: Uint8Array) {
+  constructor(lms: LmsType, ots: OtsType, id: Uint8Array, seed: Uint8Array, levels?: readonly Uint8Array[]) {
     this.lms = lms;
 
     this.ots = ots;
@@ -658,7 +666,7 @@ class Tree {
       return digest(lms.shake, lms.m, id, uint32(2 ** (lms.h - z - 1) + j), D_INTR, left, right);
     };
 
-    this.merkle = new MerkleTree(lms.h, lms.m, leaf, combine);
+    this.merkle = new MerkleTree(lms.h, lms.m, leaf, combine, levels);
 
     this.publicKey = concat(uint32(lms.code), uint32(ots.code), id, this.merkle.root);
   }
@@ -670,9 +678,7 @@ class Tree {
   }
 
   child(lms: LmsType, ots: OtsType, q: number): Tree {
-    const seed = derive(this.lms.shake, this.lms.m, this.id, q, CHILD_SEED, this.seed);
-
-    const id = derive(this.lms.shake, this.lms.m, this.id, q, CHILD_I, this.seed).slice(0, 16);
+    const [id, seed] = childKeys(this.lms, this.id, this.seed, q);
 
     return new Tree(lms, ots, id, seed);
   }
@@ -681,7 +687,10 @@ class Tree {
 export type Level = readonly [LmsType, OtsType];
 
 // The signing side of an HSS key: the trees on the path to the next leaf, rebuilt when the index
-// leaves a tree, and each child public key signed by its parent.
+// leaves a tree, and each child public key signed by its parent. `cached` holds, by level, the
+// trees of a verified tree cache that the next index signs with: the top one replaces the build,
+// and the lower ones wait in #restored until the first signature needs them. All are checked
+// here, so a bad cache fails the load.
 export class Hss {
   readonly levels: readonly Level[];
 
@@ -693,12 +702,20 @@ export class Hss {
 
   readonly #prefixes: bigint[] = [0n];
 
-  constructor(levels: readonly Level[], id: Uint8Array, seed: Uint8Array) {
+  readonly #restored = new Map<number, [bigint, Tree]>();
+
+  constructor(levels: readonly Level[], id: Uint8Array, seed: Uint8Array, cached?: ReadonlyMap<number, CachedLevels>) {
     this.levels = levels;
 
     this.#heights = levels.map(([lms]) => lms.h);
 
-    this.#trees = [new Tree(levels[0][0], levels[0][1], id, seed)];
+    this.#trees = [new Tree(levels[0][0], levels[0][1], id, seed, cached?.get(0)?.[1])];
+
+    for (const [level, [prefix, nodes]] of cached ?? []) {
+      if (level > 0) {
+        this.#restored.set(level, [prefix, this.#pathTree(level, prefix, nodes)]);
+      }
+    }
   }
 
   get publicKey(): Uint8Array {
@@ -711,6 +728,33 @@ export class Hss {
 
   #leafIndex(index: bigint, level: number): number {
     return Number((index >> this.#below(level + 1)) & ((1n << BigInt(this.#heights[level])) - 1n));
+  }
+
+  // Tree `prefix` of a lower level: the leaves that sign it on the levels above follow from its
+  // number, and with them its I and SEED.
+  #pathTree(level: number, prefix: bigint, nodes: readonly Uint8Array[]): Tree {
+    const top = this.#trees[0];
+
+    let [id, seed] = [top.id, top.seed];
+
+    for (let upper = 0; upper < level; upper++) {
+      const below = BigInt(this.#heights.slice(upper + 1, level).reduce((total, h) => total + h, 0));
+
+      const q = Number((prefix >> below) & ((1n << BigInt(this.#heights[upper])) - 1n));
+
+      [id, seed] = childKeys(top.lms, id, seed, q);
+    }
+
+    return new Tree(this.levels[level][0], this.levels[level][1], id, seed, nodes);
+  }
+
+  // Every tree the key holds, top first.
+  cached(): CachedTree[] {
+    const held = this.#trees.map((tree, level) => ({ level, tree: this.#prefixes[level], merkle: tree.merkle }));
+
+    const waiting = [...this.#restored].sort(([a], [b]) => a - b);
+
+    return [...held, ...waiting.map(([level, [prefix, tree]]) => ({ level, tree: prefix, merkle: tree.merkle }))];
   }
 
   sign(index: bigint, message: Uint8Array): Uint8Array {
@@ -731,7 +775,14 @@ export class Hss {
 
       const q = this.#leafIndex(index, level - 1);
 
-      const tree = trees[level - 1].child(this.levels[level][0], this.levels[level][1], q);
+      const restored = this.#restored.get(level);
+
+      this.#restored.delete(level);
+
+      const tree =
+        restored !== undefined && restored[0] === prefix
+          ? restored[1]
+          : trees[level - 1].child(this.levels[level][0], this.levels[level][1], q);
 
       trees.push(tree);
 

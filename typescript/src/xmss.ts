@@ -1,5 +1,5 @@
 import { concat, equal, readUint32, uint32, uint64, writeUint32 } from "./bytes.ts";
-import { MerkleTree } from "./merkle.ts";
+import { type CachedLevels, type CachedTree, MerkleTree } from "./merkle.ts";
 import { type FixedHash, type PrefixedHash, fixedShake256, prefixedSha256, prefixedShake256 } from "./primitives.ts";
 import { block256, block256x2 } from "./sha2-rounds.ts";
 import { IV_256 } from "./sha2.ts";
@@ -972,7 +972,7 @@ function randHash(hashes: Hashes, left: Uint8Array, right: Uint8Array, adrs: Uin
   return hashes.h(key, xor(left, mask0), xor(right, mask1));
 }
 
-function subtree(hashes: Hashes, layer: number, tree: bigint): MerkleTree {
+function subtree(hashes: Hashes, layer: number, tree: bigint, levels?: readonly Uint8Array[]): MerkleTree {
   const combine = (z: number, j: number, left: Uint8Array, right: Uint8Array) => {
     const adrs = address(layer, tree, HASH_TREE);
 
@@ -983,7 +983,7 @@ function subtree(hashes: Hashes, layer: number, tree: bigint): MerkleTree {
     return randHash(hashes, left, right, adrs);
   };
 
-  return new MerkleTree(hashes.p.treeHeight, hashes.p.n, (index) => hashes.leaf(layer, tree, index), combine);
+  return new MerkleTree(hashes.p.treeHeight, hashes.p.n, (index) => hashes.leaf(layer, tree, index), combine, levels);
 }
 
 function messageDigest(p: Parameters, r: Uint8Array, root: Uint8Array, index: bigint, message: Uint8Array): Uint8Array {
@@ -1060,7 +1060,9 @@ export function verify(p: Parameters, publicKey: Uint8Array, message: Uint8Array
   return equal(node, root);
 }
 
-// The signing side of an XMSS or XMSS^MT key, with one cached tree per layer.
+// The signing side of an XMSS or XMSS^MT key, with one cached tree per layer. `cached` holds, by
+// layer, the trees of a verified tree cache that the next index signs with; they replace the
+// build, checked against their own nodes.
 export class Xmss {
   readonly p: Parameters;
 
@@ -1077,18 +1079,35 @@ export class Xmss {
   // child keys, and signing the same root again with the same WOTS+ key gives the same bytes.
   readonly #signed = new Map<number, [bigint, Uint8Array]>();
 
-  constructor(p: Parameters, skSeed: Uint8Array, skPrf: Uint8Array, pubSeed: Uint8Array) {
+  constructor(
+    p: Parameters,
+    skSeed: Uint8Array,
+    skPrf: Uint8Array,
+    pubSeed: Uint8Array,
+    cached?: ReadonlyMap<number, CachedLevels>,
+  ) {
     this.p = p;
 
     this.#skPrf = skPrf;
 
     this.#hashes = createHashes(p, pubSeed, skSeed);
 
+    for (const [layer, [tree, levels]] of cached ?? []) {
+      this.#trees.set(layer, [tree, subtree(this.#hashes, layer, tree, levels)]);
+    }
+
     this.root = this.#tree(p.d - 1, 0n).root;
   }
 
   get publicKey(): Uint8Array {
     return concat(uint32(this.p.oid), this.root, this.#hashes.pubSeed);
+  }
+
+  // Every tree the key holds, top first.
+  cached(): CachedTree[] {
+    const layers = [...this.#trees].sort(([a], [b]) => b - a);
+
+    return layers.map(([level, [tree, merkle]]) => ({ level, tree, merkle }));
   }
 
   #tree(layer: number, tree: bigint): MerkleTree {

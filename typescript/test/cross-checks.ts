@@ -5,8 +5,8 @@ import * as pq from "../src/index.ts";
 import { type Fields, MemoryStore, PRE_HASHES, hex, records, toHex, utf8 } from "./vectors.ts";
 
 // The checks of the vectors under vectors/cross, computed by the Python reference: keys and their
-// encodings, hazmat signatures with every pre-hash, implicit rejection, state blobs, and the error
-// code of every malformed input. cross.test.ts runs the slow ones on worker threads.
+// encodings, hazmat signatures with every pre-hash, implicit rejection, state blobs and tree caches,
+// and the error code of every malformed input. cross.test.ts runs the slow ones on worker threads.
 type Algorithm = pq.KemAlgorithm | pq.SignatureAlgorithm | pq.StatefulSignatureAlgorithm;
 
 interface Exportable {
@@ -343,6 +343,56 @@ export function stateful([name, index]: [string, number]): void {
   assert.equal(toHex(reloaded.state ?? new Uint8Array()), record.stateAfter, context);
 
   assert.equal(loaded.remainingSignatures(), remaining - 1n, context);
+}
+
+// One record of cross/treecache.txt: an export is made again, and every cache loads, or fails to,
+// as the reference decided; a key that loads signs as the reference did.
+export function treeCache(index: number): void {
+  const [header, record] = vectors("cross/treecache.txt", "treeCache")[index];
+
+  const scheme = algorithm(header.algorithm, pq.StatefulSignatureAlgorithm);
+
+  const context = `${scheme.name}: ${record.name}`;
+
+  if (record.operation === "export") {
+    const store = new MemoryStore();
+
+    const pair = hazmat.generateStatefulKeyPair(scheme, hex(record.seed), {
+      parameters: parameters(record),
+      stateStore: store,
+      index: BigInt(record.index),
+    });
+
+    if (record.signed === "true") {
+      pair.privateKey.sign(hex(record.message));
+    }
+
+    assert.equal(toHex(pair.privateKey.exportTreeCache()), record.treeCache, context);
+
+    assert.equal(toHex(store.state ?? new Uint8Array()), record.state, context);
+  }
+
+  let key: pq.StatefulPrivateKey;
+
+  try {
+    key = scheme.loadPrivateKey(new MemoryStore(hex(record.state)), { treeCache: hex(record.treeCache) });
+  } catch (error) {
+    assert.ok(error instanceof pq.CryptoPQError, context);
+
+    assert.equal(error.code, record.result, context);
+
+    return;
+  }
+
+  assert.equal(record.result, "ok", context);
+
+  assert.equal(exported(key.publicKey, "raw"), record.publicKey, context);
+
+  assert.equal(key.remainingSignatures(), BigInt(record.remaining), context);
+
+  if (record.signature !== undefined) {
+    assert.equal(toHex(key.sign(hex(record.message))), record.signature, context);
+  }
 }
 
 function field(record: Fields, name: string): Uint8Array {
