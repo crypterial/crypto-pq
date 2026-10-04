@@ -5,9 +5,11 @@ from collections.abc import Sequence
 from typing import NamedTuple, Protocol
 
 from . import _lms, _xmss
-from ._encoding import KeyFormat, object_identifier
+from ._encoding import KeyFormat, invalid, object_identifier
 from ._errors import CryptoPQError, ErrorCode
+from ._hash import HMAC_SHA_256
 from ._keys import export_public, import_public, mismatch, require_bytes
+from ._merkle import CACHED_HEIGHT
 from ._primitives import sha256
 from ._rng import random_bytes
 
@@ -16,6 +18,12 @@ _Bytes = bytes | bytearray | memoryview
 VERSION = 1
 
 HSS_KIND, XMSS_KIND, XMSS_MT_KIND = 1, 2, 3
+
+TREE_CACHE_VERSION = 1
+
+TREE_CACHE_LABEL = b"crypto-pq tree cache v1"
+
+TAG_SIZE = 32
 
 
 class StateStore(Protocol):
@@ -68,6 +76,171 @@ def unseal(state, kind):
     return body[2:]
 
 
+# The key of the tree cache tag: HKDF-Extract (RFC 5869) of the seed with the label as salt.
+def tree_cache_key(seed):
+    return bytearray(HMAC_SHA_256.digest(TREE_CACHE_LABEL, seed))
+
+
+# A tree cache holds public nodes only, but the signer trusts the root of a cached lower tree as
+# the child key that its parent signs, and the public key covers only the top root and the top
+# level's types, so the cache is authenticated with a key derived from the seed and names every
+# level's parameters. The body is the version, the kind, the parameters as the state blob encodes
+# them, the public key and every cached tree, top first: its level or layer, its number on that
+# level, its lowest cached height, its height, n, its node count and its nodes, level by level
+# from the lowest, left to right. The tag, HMAC-SHA-256 of the body, follows it.
+def tree_cache_body(kind, section, signer):
+    public_key = signer.public_key
+
+    trees = signer.cached()
+
+    body = bytearray([TREE_CACHE_VERSION, kind]) + section + len(public_key).to_bytes(4, "big") + public_key + bytes([len(trees)])
+
+    for level, tree, merkle in trees:
+        nodes = b"".join(merkle.levels)
+
+        body += bytes([level]) + tree.to_bytes(8, "big") + bytes([merkle.low, merkle.height, merkle.size])
+
+        body += (len(nodes) // merkle.size).to_bytes(4, "big") + nodes
+
+    return bytes(body)
+
+
+# Python cannot wipe every copy of the tag key; the one it holds is zeroed.
+def seal_tree_cache(body, seed):
+    key = tree_cache_key(seed)
+
+    try:
+        return body + HMAC_SHA_256.digest(key, body)
+    finally:
+        key[:] = bytes(len(key))
+
+
+def parse_tree_cache(data):
+    position = 0
+
+    def take(size):
+        nonlocal position
+
+        if size > len(data) - position:
+            raise invalid("the tree cache is truncated")
+
+        position += size
+
+        return data[position - size : position]
+
+    def number(size):
+        return int.from_bytes(take(size), "big")
+
+    version, kind = number(1), number(1)
+
+    # The parameters have the layout of the kind that the cache names: an HSS level count and a
+    # pair of types per level, or an OID. A cache of no known kind cannot be read further.
+    start = position
+
+    if kind == HSS_KIND:
+        take(8 * number(1))
+    elif kind in (XMSS_KIND, XMSS_MT_KIND):
+        take(4)
+    else:
+        raise invalid("the tree cache has an unknown kind")
+
+    section = data[start:position]
+
+    public_key = take(number(4))
+
+    trees = []
+
+    for _ in range(number(1)):
+        level, tree, low, height, n, count = number(1), number(8), number(1), number(1), number(1), number(4)
+
+        trees.append((level, tree, low, height, n, count, take(count * n)))
+
+    body = data[:position]
+
+    tag = take(TAG_SIZE)
+
+    if position != len(data):
+        raise invalid("the tree cache has trailing bytes")
+
+    return version, kind, section, public_key, trees, body, tag
+
+
+# The checks run in this order: the structure, then the version, the kind, the parameters and the
+# parts of the public key that the state gives, then the tag in constant time, then each tree's
+# level and shape. Every failure is INVALID_ENCODING except a cache of another algorithm, which is
+# ALGORITHM_MISMATCH. A tree that the next index does not sign with is stale: it is skipped and
+# built again when needed. The others are returned as {level: (tree number, levels)}, for the
+# signer to check against their own nodes; the caller then compares the signer's public key, and
+# with it the top root, with the cache's.
+def open_tree_cache(backend, parameters, seed, index, data):
+    version, kind, section, public_key, trees, body, tag = parse_tree_cache(data)
+
+    if version != TREE_CACHE_VERSION:
+        raise invalid("the tree cache has an unsupported version")
+
+    if kind != backend.kind:
+        raise CryptoPQError(ErrorCode.ALGORITHM_MISMATCH, "the tree cache belongs to another algorithm")
+
+    if section != backend.parameter_section(parameters):
+        raise invalid("the tree cache belongs to other parameters")
+
+    before, root_size, after = backend.public_parts(parameters, seed)
+
+    if len(public_key) != len(before) + root_size + len(after) or public_key[: len(before)] != before or public_key[len(before) + root_size :] != after:
+        raise invalid("the tree cache belongs to another key")
+
+    key = tree_cache_key(seed)
+
+    try:
+        authentic = HMAC_SHA_256.verify(key, body, tag)
+    finally:
+        key[:] = bytes(len(key))
+
+    if not authentic:
+        raise invalid("the tree cache is not authentic")
+
+    layout = backend.layout(parameters)
+
+    positions = {level: i for i, (level, _, _) in enumerate(layout)}
+
+    previous = -1
+
+    cached = {}
+
+    for level, tree, low, height, n, count, nodes in trees:
+        position = positions.get(level, -1)
+
+        if position <= previous:
+            raise invalid("the tree cache lists an unknown level or its levels out of order")
+
+        previous = position
+
+        _, expected_height, expected_n = layout[position]
+
+        expected_low = max(0, expected_height - CACHED_HEIGHT)
+
+        if (low, height, n, count) != (expected_low, expected_height, expected_n, (2 << (expected_height - expected_low)) - 1):
+            raise invalid("the tree cache does not match the key's parameters")
+
+        if tree == backend.tree_id(parameters, index, level):
+            cached[level] = (tree, split_levels(nodes, low, height, n))
+
+    return public_key, cached
+
+
+def split_levels(nodes, low, height, n):
+    levels, offset = [], 0
+
+    for z in range(low, height + 1):
+        size = n << (height - z)
+
+        levels.append(nodes[offset : offset + size])
+
+        offset += size
+
+    return levels
+
+
 class _Hss:
     kind = HSS_KIND
 
@@ -106,10 +279,31 @@ class _Hss:
     def seed_size(self, levels):
         return 16 + levels[0][0].m
 
-    def encode(self, levels, seed, index):
-        body = bytes([VERSION, self.kind, len(levels)])
+    def capacity(self, levels):
+        return 1 << sum(lms.h for lms, _ in levels)
 
-        body += b"".join(_lms.u32(lms.code) + _lms.u32(ots.code) for lms, ots in levels)
+    # The trees of a tree cache, top first, as (level, height, n).
+    def layout(self, levels):
+        return [(level, lms.h, lms.m) for level, (lms, _) in enumerate(levels)]
+
+    # The number of the tree that `index` signs with on `level`: the top level has one tree.
+    def tree_id(self, levels, index, level):
+        return index >> sum(lms.h for lms, _ in levels[level:]) if level else 0
+
+    # The public key around the root, which only the top tree gives: the bytes before it, its
+    # size and the bytes after it.
+    def public_parts(self, levels, seed):
+        lms, ots = levels[0]
+
+        return _lms.u32(len(levels)) + _lms.u32(lms.code) + _lms.u32(ots.code) + seed[:16], lms.m, b""
+
+    # The level count and the type codes of every level, as the state blob and the tree cache hold
+    # them.
+    def parameter_section(self, levels):
+        return bytes([len(levels)]) + b"".join(_lms.u32(lms.code) + _lms.u32(ots.code) for lms, ots in levels)
+
+    def encode(self, levels, seed, index):
+        body = bytes([VERSION, self.kind]) + self.parameter_section(levels)
 
         return seal(body + seed + index.to_bytes(8, "big"))
 
@@ -137,8 +331,8 @@ class _Hss:
 
         return levels, rest[:size], int.from_bytes(rest[size:], "big")
 
-    def signer(self, levels, seed):
-        return _lms.Hss(levels, seed[:16], seed[16:])
+    def signer(self, levels, seed, cached=None):
+        return _lms.Hss(levels, seed[:16], seed[16:], cached)
 
     def check_public_key(self, key):
         return _lms.check_public_key(key)
@@ -168,8 +362,23 @@ class _Xmss:
     def seed_size(self, p):
         return 3 * p.n
 
+    def capacity(self, p):
+        return 1 << p.h
+
+    def layout(self, p):
+        return [(layer, p.tree_height, p.n) for layer in reversed(range(p.d))]
+
+    def tree_id(self, p, index, layer):
+        return index >> ((layer + 1) * p.tree_height) if layer < p.d - 1 else 0
+
+    def public_parts(self, p, seed):
+        return p.oid.to_bytes(4, "big"), p.n, seed[2 * p.n :]
+
+    def parameter_section(self, p):
+        return p.oid.to_bytes(4, "big")
+
     def encode(self, p, seed, index):
-        body = bytes([VERSION, self.kind]) + p.oid.to_bytes(4, "big") + index.to_bytes(8, "big") + seed
+        body = bytes([VERSION, self.kind]) + self.parameter_section(p) + index.to_bytes(8, "big") + seed
 
         return seal(body)
 
@@ -183,10 +392,10 @@ class _Xmss:
 
         return p, body[12:], int.from_bytes(body[4:12], "big")
 
-    def signer(self, p, seed):
+    def signer(self, p, seed, cached=None):
         n = p.n
 
-        return _xmss.Xmss(p, seed[:n], seed[n : 2 * n], seed[2 * n :])
+        return _xmss.Xmss(p, seed[:n], seed[n : 2 * n], seed[2 * n :], cached)
 
     def check_public_key(self, key):
         p = _xmss.by_oid(self.sets, int.from_bytes(key[:4], "big")) if len(key) >= 4 else None
@@ -314,6 +523,23 @@ class StatefulPrivateKey:
 
         return self._signer.sign(index, message)
 
+    # The trees that the key holds, for load_private_key(tree_cache=...) to skip their build. A
+    # call made while the key signs, from another thread or from inside the store, fails at once,
+    # as the trees are changing. The body is copied under the lock and tagged after it, so that
+    # hashing megabytes in Python does not hold off signatures.
+    def export_tree_cache(self) -> bytes:
+        backend = self._algorithm._backend
+
+        if not self._busy.acquire(blocking=False):
+            raise CryptoPQError(ErrorCode.STATE_CONFLICT, "the key is signing in another call")
+
+        try:
+            body = tree_cache_body(backend.kind, backend.parameter_section(self._parameters), self._signer)
+        finally:
+            self._busy.release()
+
+        return seal_tree_cache(body, self._seed)
+
     def __repr__(self) -> str:
         return f"<StatefulPrivateKey {self._algorithm.name}>"
 
@@ -368,11 +594,15 @@ class StatefulSignatureAlgorithm:
         return StatefulKeyPair(private_key.public_key, private_key)
 
     # The key resumes at the stored index, so the indices that a previous key reserved and never
-    # used are skipped, never reused.
-    def load_private_key(self, state_store: StateStore, *, reserve: int = 1) -> StatefulPrivateKey:
+    # used are skipped, never reused. A tree cache from export_tree_cache() replaces the build of
+    # the trees it holds; the state is checked first, and the key loads only if the cache passes.
+    def load_private_key(self, state_store: StateStore, *, reserve: int = 1, tree_cache: _Bytes | None = None) -> StatefulPrivateKey:
         require_reserve(reserve)
 
         require_store(state_store)
+
+        if tree_cache is not None:
+            tree_cache = require_bytes(tree_cache, "tree_cache")
 
         try:
             state = state_store.read()
@@ -382,12 +612,22 @@ class StatefulSignatureAlgorithm:
         if state is None:
             raise mismatch("the state store holds no key")
 
-        parameters, seed, index = self._backend.decode(state)
+        backend = self._backend
 
-        signer = self._backend.signer(parameters, seed)
+        parameters, seed, index = backend.decode(state)
 
-        if index > signer.capacity:
+        if index > backend.capacity(parameters):
             raise mismatch("the stored index is beyond the key's capacity")
+
+        if tree_cache is None:
+            signer = backend.signer(parameters, seed)
+        else:
+            public_key, cached = open_tree_cache(backend, parameters, seed, index, tree_cache)
+
+            signer = backend.signer(parameters, seed, cached)
+
+            if signer.public_key != public_key:
+                raise invalid("the tree cache belongs to another key")
 
         return StatefulPrivateKey(self, parameters, seed, signer, state_store, bytes(state), index, reserve)
 

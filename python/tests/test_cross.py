@@ -325,6 +325,45 @@ class CrossTest(unittest.TestCase):
 
                 self.assertEqual(loaded.remaining_signatures(), remaining - 1)
 
+    # Each export is made again where the key is cheap to build, and every cache loads, or fails to,
+    # as the reference decided; a key that loads signs as the reference did.
+    def test_tree_cache(self):
+        for header, record in records("cross/treecache.txt", "treeCache"):
+            algorithm = ALGORITHMS[header["algorithm"]]
+
+            with self.subTest(algorithm=algorithm.name, name=record["name"]):
+                state, cache = unhex(record["state"]), unhex(record["treeCache"])
+
+                cheap = "parameters" not in record or "_20/4_" in record["parameters"]
+
+                if record["operation"] == "export" and (SLOW or cheap):
+                    store = MemoryStore()
+
+                    pair = hazmat.generate_key_pair(algorithm, unhex(record["seed"]), parameters=parameters(record), state_store=store, index=int(record["index"]))
+
+                    if record["signed"] == "true":
+                        pair.private_key.sign(unhex(record["message"]))
+
+                    self.assertEqual(pair.private_key.export_tree_cache(), cache)
+
+                    self.assertEqual(store.state, state)
+
+                try:
+                    key = algorithm.load_private_key(MemoryStore(state), tree_cache=cache)
+                except CryptoPQError as error:
+                    self.assertEqual(str(error.code), record["result"])
+
+                    continue
+
+                self.assertEqual(record["result"], "ok")
+
+                self.assertEqual(key.public_key.export_key("raw"), unhex(record["publicKey"]))
+
+                self.assertEqual(key.remaining_signatures(), int(record["remaining"]))
+
+                if "signature" in record:
+                    self.assertEqual(key.sign(unhex(record["message"])), unhex(record["signature"]))
+
     def test_errors(self):
         for header, record in records("cross/errors.txt", "result"):
             algorithm = ALGORITHMS[header["algorithm"]]

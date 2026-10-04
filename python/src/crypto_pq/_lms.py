@@ -403,12 +403,18 @@ def hss_verify(public_key, message, signature):
     return lms_verify(key, message, signature[offset:])
 
 
+# The I and SEED of the child tree that leaf q signs, from the I and SEED of its parent.
+def child_keys(lms, i_value, seed, q):
+    return derive(lms.shake, lms.m, i_value, q, CHILD_I, seed)[:16], derive(lms.shake, lms.m, i_value, q, CHILD_SEED, seed)
+
+
 class Tree:
-    """One LMS tree of an HSS key: its I, SEED and the Merkle tree over its OTS public keys."""
+    """One LMS tree of an HSS key: its I, SEED and the Merkle tree over its OTS public keys, built
+    or taken from the levels of a tree cache."""
 
     __slots__ = ("lms", "ots", "i_value", "seed", "merkle", "public_key")
 
-    def __init__(self, lms, ots, i_value, seed):
+    def __init__(self, lms, ots, i_value, seed, levels=None):
         self.lms = lms
 
         self.ots = ots
@@ -423,7 +429,7 @@ class Tree:
         def tree_combine(z, first, lefts, rights):
             return combine(lms, i_value, z, first, lefts, rights)
 
-        self.merkle = MerkleTree(lms.h, tree_leaves, tree_combine)
+        self.merkle = MerkleTree(lms.h, tree_leaves, tree_combine, levels)
 
         self.public_key = u32(lms.code) + u32(ots.code) + i_value + self.merkle.root
 
@@ -433,27 +439,31 @@ class Tree:
         return u32(q) + ots_signature + u32(self.lms.code) + b"".join(self.merkle.auth_path(q))
 
     def child(self, lms, ots, q):
-        seed = derive(self.lms.shake, self.lms.m, self.i_value, q, CHILD_SEED, self.seed)
-
-        i_value = derive(self.lms.shake, self.lms.m, self.i_value, q, CHILD_I, self.seed)[:16]
-
-        return Tree(lms, ots, i_value, seed)
+        return Tree(lms, ots, *child_keys(self.lms, self.i_value, self.seed, q))
 
 
 class Hss:
     """The signing side of an HSS key: the trees on the path to the next leaf, rebuilt when the
-    index leaves a tree, and each child public key signed by its parent."""
+    index leaves a tree, and each child public key signed by its parent.
 
-    def __init__(self, levels, i_value, seed):
+    `cached` maps levels to (tree number, levels) for the trees of a verified tree cache that the
+    next index signs with. The top one replaces the build; the lower ones wait in `restored` until
+    the first signature needs them, and they are checked now, so a bad cache fails the load."""
+
+    def __init__(self, levels, i_value, seed, cached=None):
+        cached = cached or {}
+
         self.levels = levels
 
         self.heights = [lms.h for lms, _ in levels]
 
-        self.trees = [Tree(*levels[0], i_value, seed)]
+        self.trees = [Tree(*levels[0], i_value, seed, cached.get(0, (0, None))[1])]
 
         self.signed = []
 
         self.prefixes = [0]
+
+        self.restored = {level: (prefix, self._path_tree(level, prefix, nodes)) for level, (prefix, nodes) in cached.items() if level}
 
     @property
     def public_key(self):
@@ -468,6 +478,26 @@ class Hss:
 
         return (index >> below) & ((1 << self.heights[level]) - 1)
 
+    # Tree `prefix` of a lower level: the leaves that sign it on the levels above follow from its
+    # number, and with them its I and SEED.
+    def _path_tree(self, level, prefix, nodes):
+        top = self.trees[0]
+
+        i_value, seed = top.i_value, top.seed
+
+        for upper in range(level):
+            q = (prefix >> sum(self.heights[upper + 1 : level])) & ((1 << self.heights[upper]) - 1)
+
+            i_value, seed = child_keys(top.lms, i_value, seed, q)
+
+        return Tree(*self.levels[level], i_value, seed, nodes)
+
+    # Every tree the key holds, top first, as (level, tree number, Merkle tree).
+    def cached(self):
+        held = [(level, self.prefixes[level], tree.merkle) for level, tree in enumerate(self.trees)]
+
+        return held + [(level, prefix, tree.merkle) for level, (prefix, tree) in sorted(self.restored.items())]
+
     def sign(self, index, message):
         for level in range(1, len(self.levels)):
             prefix = index >> sum(self.heights[level:])
@@ -481,7 +511,9 @@ class Hss:
 
             q = self.leaf_index(index, level - 1)
 
-            tree = parent.child(*self.levels[level], q)
+            restored = self.restored.pop(level, None)
+
+            tree = restored[1] if restored is not None and restored[0] == prefix else parent.child(*self.levels[level], q)
 
             self.trees.append(tree)
 

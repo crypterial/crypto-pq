@@ -316,14 +316,14 @@ def combine(p, pub_seed, layer, tree, z, first, lefts, rights):
     return out
 
 
-def subtree(p, sk_seed, pub_seed, layer, tree):
+def subtree(p, sk_seed, pub_seed, layer, tree, levels=None):
     def tree_leaves(first, count):
         return leaves(p, sk_seed, pub_seed, layer, tree, first, count)
 
     def tree_combine(z, first, lefts, rights):
         return combine(p, pub_seed, layer, tree, z, first, lefts, rights)
 
-    return MerkleTree(p.tree_height, tree_leaves, tree_combine)
+    return MerkleTree(p.tree_height, tree_leaves, tree_combine, levels)
 
 
 def wots_sign(p, message, sk_seed, pub_seed, layer, tree, leaf):
@@ -413,9 +413,12 @@ class Xmss:
 
     Above layer 0 a layer's part of the signature, the WOTS+ signature of the root below and its
     authentication path, depends only on index >> (layer * h / d). It is kept until that value
-    changes, as HSS keeps its signed child keys, so most signatures sign layer 0 only."""
+    changes, as HSS keeps its signed child keys, so most signatures sign layer 0 only.
 
-    def __init__(self, p, sk_seed, sk_prf, pub_seed):
+    `cached` maps layers to (tree number, levels) for the trees of a verified tree cache that the
+    next index signs with; they replace the build, checked against their own nodes."""
+
+    def __init__(self, p, sk_seed, sk_prf, pub_seed, cached=None):
         self.p = p
 
         self.sk_seed = sk_seed
@@ -424,7 +427,7 @@ class Xmss:
 
         self.pub_seed = pub_seed
 
-        self.trees = {}
+        self.trees = {layer: (tree, subtree(p, sk_seed, pub_seed, layer, tree, levels)) for layer, (tree, levels) in (cached or {}).items()}
 
         self.signed = {}
 
@@ -437,6 +440,10 @@ class Xmss:
     @property
     def capacity(self):
         return 1 << self.p.h
+
+    # Every tree the key holds, top first, as (layer, tree number, Merkle tree).
+    def cached(self):
+        return [(layer, *self.trees[layer]) for layer in sorted(self.trees, reverse=True)]
 
     def _tree(self, layer, tree):
         cached = self.trees.get(layer)

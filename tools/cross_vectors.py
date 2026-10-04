@@ -2,6 +2,7 @@ import pathlib
 from concurrent.futures import ProcessPoolExecutor
 
 from crypto_pq import (
+    HMAC_SHA_256,
     HSS_LMS,
     ML_DSA_44,
     ML_DSA_65,
@@ -47,8 +48,8 @@ from crypto_pq._stateful import seal
 
 # The official vectors check the algorithms; these check what no standard fixes byte for byte:
 # key encodings and the PKCS#8 forms, hazmat signing with every pre-hash, implicit rejection, the
-# state blobs, and the error code of each malformed input. The Python reference computes every
-# expected value, so a port that disagrees has a bug.
+# state blobs and tree caches, and the error code of each malformed input. The Python reference
+# computes every expected value, so a port that disagrees has a bug.
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 VECTORS = ROOT / "vectors"
@@ -1788,6 +1789,459 @@ def xmss_errors():
     return [table.group()]
 
 
+# Tree caches: the bytes that a key exports, and the outcome of loading every change of them. A
+# change behind the tag is sealed again with the key's seed, as only its holder could, so that it
+# reaches the checks that follow the tag. The cache format is rebuilt here from its fields, so the
+# exports are checked against an independent writer.
+TREE_CACHE_LABEL = b"crypto-pq tree cache v1"
+
+
+# The parameters of a cache have the layout of its kind: an HSS level count and a pair of type
+# codes per level, or an OID.
+def cache_parts(data):
+    end = 3 + 8 * data[2] if data[1] == 1 else 6
+
+    size = int.from_bytes(data[end : end + 4], "big")
+
+    trees, offset = [], end + 5 + size
+
+    for _ in range(data[end + 4 + size]):
+        n, count = data[offset + 11], int.from_bytes(data[offset + 12 : offset + 16], "big")
+
+        trees.append(
+            {
+                "level": data[offset],
+                "tree": int.from_bytes(data[offset + 1 : offset + 9], "big"),
+                "low": data[offset + 9],
+                "height": data[offset + 10],
+                "n": n,
+                "count": count,
+                "nodes": data[offset + 16 : offset + 16 + count * n],
+            }
+        )
+
+        offset += 16 + count * n
+
+    assert len(data) == offset + 32
+
+    return {"version": data[0], "kind": data[1], "parameters": data[2:end], "publicKey": data[end + 4 : end + 4 + size], "trees": trees}
+
+
+def seal_cache(parts, seed):
+    body = bytes([parts["version"], parts["kind"]]) + parts["parameters"] + u32(len(parts["publicKey"])) + parts["publicKey"]
+
+    body += bytes([len(parts["trees"])])
+
+    for tree in parts["trees"]:
+        body += bytes([tree["level"]]) + tree["tree"].to_bytes(8, "big") + bytes([tree["low"], tree["height"], tree["n"]]) + u32(tree["count"]) + tree["nodes"]
+
+    return body + HMAC_SHA_256.digest(HMAC_SHA_256.digest(TREE_CACHE_LABEL, seed), body)
+
+
+# Where the nodes of tree i of a cache start.
+def nodes_at(cache, i):
+    parts = cache_parts(cache)
+
+    before = 7 + len(parts["parameters"]) + len(parts["publicKey"])
+
+    return before + sum(16 + len(tree["nodes"]) for tree in parts["trees"][:i]) + 16
+
+
+def hss_section(levels):
+    return bytes([len(levels)]) + b"".join(u32(LMS_CODES[lms]) + u32(OTS_CODES[ots]) for lms, ots in levels)
+
+
+def sealed(cache, seed, *edits):
+    parts = cache_parts(cache)
+
+    for edit in edits:
+        edit(parts)
+
+    return seal_cache(parts, seed)
+
+
+def set_tree(i, **fields):
+    def edit(parts):
+        parts["trees"][i].update(fields)
+
+    return edit
+
+
+def change_node(i, position):
+    def edit(parts):
+        parts["trees"][i]["nodes"] = flip(parts["trees"][i]["nodes"], position)
+
+    return edit
+
+
+# A tree of another shape, with as many node bytes as its header claims.
+def reshape(i, low, height, n, count):
+    def edit(parts):
+        tree = parts["trees"][i]
+
+        nodes = tree["nodes"] * (n * count // len(tree["nodes"]) + 1)
+
+        tree.update(low=low, height=height, n=n, count=count, nodes=nodes[: n * count])
+
+    return edit
+
+
+def keep_trees(*order):
+    def edit(parts):
+        parts["trees"] = [dict(parts["trees"][i]) for i in order]
+
+    return edit
+
+
+def change_public_key(function):
+    def edit(parts):
+        parts["publicKey"] = function(parts["publicKey"])
+
+    return edit
+
+
+def set_header(**fields):
+    def edit(parts):
+        parts.update(fields)
+
+    return edit
+
+
+class CacheTable:
+    """The tree cache records of one algorithm: exports, then loads with their outcome. As in
+    Table, `expect` guards the construction of each case. A key that loads signs `message` when
+    it has an index left, so that a port's restored trees give the same signature."""
+
+    def __init__(self, algorithm):
+        self.algorithm = algorithm
+
+        self.records = []
+
+        self.names = set()
+
+    def export(self, name, parameters, seed, index, signed, message):
+        store = MemoryStore()
+
+        pair = hazmat.generate_key_pair(self.algorithm, seed, parameters=parameters, state_store=store, index=index)
+
+        if signed:
+            pair.private_key.sign(message)
+
+        cache = pair.private_key.export_tree_cache()
+
+        parts = cache_parts(cache)
+
+        # The parameters are those of the state blob, byte for byte.
+        assert parts["parameters"] == store.state[2 : 2 + len(parts["parameters"])]
+
+        assert seal_cache(parts, seed) == cache
+
+        fields = named(parameters) if self.algorithm is HSS_LMS else {"parameters": parameters}
+
+        self.add({"name": name, "operation": "export", **fields, "seed": seed, "index": index, "signed": signed}, store.state, cache, "ok", message)
+
+        return store.state, cache
+
+    def load(self, name, state, cache, expect, message=None):
+        self.add({"name": name, "operation": "load"}, state, cache, expect, message)
+
+    def add(self, record, state, cache, expect, message):
+        name = record["name"]
+
+        assert name not in self.names, f"{self.algorithm.name}: duplicate case {name}"
+
+        self.names.add(name)
+
+        record.update(state=state, treeCache=cache)
+
+        try:
+            key = self.algorithm.load_private_key(MemoryStore(state), tree_cache=cache)
+        except CryptoPQError as error:
+            record["result"] = str(error.code)
+        else:
+            record.update(result="ok", publicKey=key.public_key.export_key("raw"), remaining=key.remaining_signatures())
+
+            if message is not None and key.remaining_signatures():
+                record.update(message=message, signature=key.sign(message))
+
+        assert record["result"] == expect, f"{self.algorithm.name}: {name}: {record['result']}, expected {expect}"
+
+        self.records.append(record)
+
+    def group(self):
+        return ({"algorithm": self.algorithm.name}, self.records)
+
+
+def fresh_cache(algorithm, parameters, seed):
+    return hazmat.generate_key_pair(algorithm, seed, parameters=parameters, state_store=MemoryStore()).private_key.export_tree_cache()
+
+
+def tree_cache_hss():
+    table = CacheTable(HSS_LMS)
+
+    stream = Stream(1000)
+
+    table.export("one level before signing", [("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W4")], stream.bytes(40), 5, False, stream.bytes(20))
+
+    table.export("one level of shake", [("LMS_SHAKE_M32_H5", "LMOTS_SHAKE_N32_W2")], stream.bytes(48), 30, True, stream.bytes(20))
+
+    table.export("three levels", [("LMS_SHAKE_M24_H5", "LMOTS_SHAKE_N24_W2"), ("LMS_SHAKE_M24_H5", "LMOTS_SHAKE_N24_W4"), ("LMS_SHAKE_M24_H5", "LMOTS_SHAKE_N24_W1")], stream.bytes(40), 5000, True, stream.bytes(20))
+
+    two = [("LMS_SHA256_M32_H5", "LMOTS_SHA256_N32_W2"), ("LMS_SHA256_M32_H5", "LMOTS_SHA256_N32_W4")]
+
+    seed, message = stream.bytes(48), stream.bytes(20)
+
+    # Index 40 signs with tree 1 of level 1; index 64 has moved on to tree 2.
+    state, cache = table.export("two levels", two, seed, 40, True, message)
+
+    assert state == hss_state(two, seed, 41)
+
+    later, capacity = hss_state(two, seed, 64), hss_state(two, seed, 1024)
+
+    top, lower = nodes_at(cache, 0), nodes_at(cache, 1)
+
+    # The public key length follows the version, the kind and the parameters, a level count and
+    # two pairs of type codes.
+    key_at = 2 + len(hss_section(two))
+
+    count_at = key_at + 4 + len(cache_parts(cache)["publicKey"])
+
+    # A kind of the other layout misreads the parameters, and no other kind has a layout: such a
+    # cache is malformed. Only a cache made for another algorithm is ALGORITHM_MISMATCH.
+    for name, data, expect in (
+        ("level 0 node changed", flip(cache, top + 3), "INVALID_ENCODING"),
+        ("level 1 node changed", flip(cache, lower + 40), "INVALID_ENCODING"),
+        ("first tag byte changed", flip(cache, len(cache) - 32), "INVALID_ENCODING"),
+        ("last tag byte changed", flip(cache, len(cache) - 1), "INVALID_ENCODING"),
+        ("version 0", replace(cache, 0, b"\x00"), "INVALID_ENCODING"),
+        ("version 2", replace(cache, 0, b"\x02"), "INVALID_ENCODING"),
+        ("xmss kind", replace(cache, 1, b"\x02"), "INVALID_ENCODING"),
+        ("xmss^mt kind", replace(cache, 1, b"\x03"), "INVALID_ENCODING"),
+        ("kind 0", replace(cache, 1, b"\x00"), "INVALID_ENCODING"),
+        ("kind 4", replace(cache, 1, b"\x04"), "INVALID_ENCODING"),
+        ("version 2 and xmss kind", replace(cache, 0, b"\x02\x02"), "INVALID_ENCODING"),
+        ("xmss kind and one byte cut", replace(cache, 1, b"\x02")[:-1], "INVALID_ENCODING"),
+        ("xmss kind and one byte appended", replace(cache, 1, b"\x02") + b"\x00", "INVALID_ENCODING"),
+        ("xmss^mt cache", fresh_cache(XMSS_MT, "XMSSMT-SHA2_20/4_192", stream.bytes(72)), "ALGORITHM_MISMATCH"),
+        ("another key", fresh_cache(HSS_LMS, two, stream.bytes(48)), "INVALID_ENCODING"),
+        ("empty", b"", "INVALID_ENCODING"),
+        ("version only", cache[:1], "INVALID_ENCODING"),
+        ("version and kind only", cache[:2], "INVALID_ENCODING"),
+        ("cut in the parameters", cache[:10], "INVALID_ENCODING"),
+        ("cut in the public key length", cache[: key_at + 2], "INVALID_ENCODING"),
+        ("cut in the public key", cache[: key_at + 24], "INVALID_ENCODING"),
+        ("cut before the tree count", cache[:count_at], "INVALID_ENCODING"),
+        ("cut in a tree header", cache[: top - 5], "INVALID_ENCODING"),
+        ("cut in the nodes", cache[: lower + 100], "INVALID_ENCODING"),
+        ("cut before the tag", cache[:-32], "INVALID_ENCODING"),
+        ("one byte cut", cache[:-1], "INVALID_ENCODING"),
+        ("one byte appended", cache + b"\x00", "INVALID_ENCODING"),
+        ("tag appended again", cache + cache[-32:], "INVALID_ENCODING"),
+        ("parameter level count zero", replace(cache, 2, b"\x00"), "INVALID_ENCODING"),
+        ("parameter level count 255", replace(cache, 2, b"\xff"), "INVALID_ENCODING"),
+        ("lower-level LM-OTS type changed", replace(cache, 15, u32(OTS_CODES["LMOTS_SHA256_N32_W8"])), "INVALID_ENCODING"),
+        ("public key length beyond the cache", replace(cache, key_at, u32(0xFFFFFFFF)), "INVALID_ENCODING"),
+        ("public key length zero", replace(cache, key_at, u32(0)), "INVALID_ENCODING"),
+        ("tree count one more", replace(cache, count_at, b"\x03"), "INVALID_ENCODING"),
+        ("tree count one less", replace(cache, count_at, b"\x01"), "INVALID_ENCODING"),
+        ("node count beyond the cache", replace(cache, top - 4, u32(0xFFFFFFFF)), "INVALID_ENCODING"),
+    ):
+        table.load(name, state, data, expect, message)
+
+    one = [("LMS_SHA256_M32_H5", "LMOTS_SHA256_N32_W2")]
+
+    # The same seed with other types below the top level: the same public key and tag key, told
+    # apart by the parameters only.
+    other_ots = [two[0], ("LMS_SHA256_M32_H5", "LMOTS_SHA256_N32_W8")]
+
+    other_lms = [two[0], ("LMS_SHA256_M32_H10", "LMOTS_SHA256_N32_W4")]
+
+    for name, data, expect in (
+        ("stale level 1", later, "ok"),
+        ("at the capacity", capacity, "ok"),
+        ("index beyond the capacity", hss_state(two, seed, 1025), "INVALID_PRIVATE_KEY"),
+        ("damaged state", flip(state, 10), "INVALID_PRIVATE_KEY"),
+        ("xmss^mt state", xmss_state(3, 0x02, 0, stream.bytes(72)), "ALGORITHM_MISMATCH"),
+        ("same I and another SEED", hss_state(two, seed[:16] + stream.bytes(32), 41), "INVALID_ENCODING"),
+        ("one level of the same seed", hss_state(one, seed, 5), "INVALID_ENCODING"),
+        ("same seed with another lower-level LM-OTS type", hss_state(other_ots, seed, 41), "INVALID_ENCODING"),
+        ("same seed with another lower-level LMS type", hss_state(other_lms, seed, 41), "INVALID_ENCODING"),
+    ):
+        table.load(name, data, cache, expect, message)
+
+    root = 62 * 32
+
+    for name, edits, at, expect in (
+        ("sealed level 1 node changed", [change_node(1, 40)], state, "INVALID_ENCODING"),
+        ("sealed level 1 root changed", [change_node(1, root + 31)], state, "INVALID_ENCODING"),
+        ("sealed level 0 leaf changed", [change_node(0, 0)], state, "INVALID_ENCODING"),
+        ("sealed level 0 root changed", [change_node(0, root)], state, "INVALID_ENCODING"),
+        ("sealed public key root changed", [change_public_key(lambda key: flip(key, len(key) - 1))], state, "INVALID_ENCODING"),
+        ("sealed public key one byte longer", [change_public_key(lambda key: key + b"\x00")], state, "INVALID_ENCODING"),
+        ("sealed public key one byte shorter", [change_public_key(lambda key: key[:-1])], state, "INVALID_ENCODING"),
+        ("sealed public key of three levels", [change_public_key(lambda key: u32(3) + key[4:])], state, "INVALID_ENCODING"),
+        ("sealed public key of another lms type", [change_public_key(lambda key: replace(key, 4, u32(LMS_CODES["LMS_SHA256_M32_H10"])))], state, "INVALID_ENCODING"),
+        ("sealed public key of another I", [change_public_key(lambda key: flip(key, 12))], state, "INVALID_ENCODING"),
+        ("sealed public key empty", [change_public_key(lambda key: b"")], state, "INVALID_ENCODING"),
+        ("sealed version 2", [set_header(version=2)], state, "INVALID_ENCODING"),
+        ("sealed xmss kind", [set_header(kind=2)], state, "INVALID_ENCODING"),
+        ("sealed parameters of another lower-level LM-OTS type", [set_header(parameters=hss_section(other_ots))], state, "INVALID_ENCODING"),
+        ("sealed parameters of another lower-level LMS type", [set_header(parameters=hss_section(other_lms))], state, "INVALID_ENCODING"),
+        ("sealed parameters of one level", [set_header(parameters=hss_section(one))], state, "INVALID_ENCODING"),
+        ("sealed parameters of the levels swapped", [set_header(parameters=hss_section(two[::-1]))], state, "INVALID_ENCODING"),
+        ("sealed parameters of no level", [set_header(parameters=b"\x00")], state, "INVALID_ENCODING"),
+        ("sealed no trees", [keep_trees()], state, "ok"),
+        ("sealed level 0 only", [keep_trees(0)], state, "ok"),
+        ("sealed level 1 only", [keep_trees(1)], state, "ok"),
+        ("sealed levels swapped", [keep_trees(1, 0)], state, "INVALID_ENCODING"),
+        ("sealed level 0 twice", [keep_trees(0, 0)], state, "INVALID_ENCODING"),
+        ("sealed level 1 twice", [keep_trees(0, 1, 1)], state, "INVALID_ENCODING"),
+        ("sealed level 2", [set_tree(1, level=2)], state, "INVALID_ENCODING"),
+        ("sealed level 255", [set_tree(1, level=255)], state, "INVALID_ENCODING"),
+        ("sealed height 6", [reshape(1, 0, 6, 32, 127)], state, "INVALID_ENCODING"),
+        ("sealed height 4", [reshape(1, 0, 4, 32, 31)], state, "INVALID_ENCODING"),
+        ("sealed n 24", [reshape(1, 0, 5, 24, 63)], state, "INVALID_ENCODING"),
+        ("sealed n 0", [reshape(1, 0, 5, 0, 63)], state, "INVALID_ENCODING"),
+        ("sealed lowest height 1", [reshape(1, 1, 5, 32, 31)], state, "INVALID_ENCODING"),
+        ("sealed lowest height above the height", [reshape(1, 6, 5, 32, 0)], state, "INVALID_ENCODING"),
+        ("sealed one node less", [reshape(1, 0, 5, 32, 62)], state, "INVALID_ENCODING"),
+        ("sealed one node more", [reshape(1, 0, 5, 32, 64)], state, "INVALID_ENCODING"),
+        ("sealed no nodes", [reshape(1, 0, 5, 32, 0)], state, "INVALID_ENCODING"),
+        ("sealed top tree 1", [set_tree(0, tree=1)], state, "ok"),
+        ("sealed top tree of all ones", [set_tree(0, tree=MASK)], state, "ok"),
+        ("sealed level 1 as tree 2", [set_tree(1, tree=2)], state, "ok"),
+        ("sealed level 1 as tree 2 at index 64", [set_tree(1, tree=2)], later, "INVALID_ENCODING"),
+        ("sealed stale level 1 changed", [change_node(1, 40)], later, "ok"),
+        ("sealed stale level 1 of another height", [set_tree(1, tree=0), reshape(1, 0, 6, 32, 127)], later, "INVALID_ENCODING"),
+        ("sealed top node changed at the capacity", [change_node(0, 5)], capacity, "INVALID_ENCODING"),
+        ("sealed top tree 1 changed at the capacity", [set_tree(0, tree=1), change_node(0, 5)], capacity, "ok"),
+        ("sealed level 1 as tree 32 at the capacity", [set_tree(1, tree=32), change_node(1, 5)], capacity, "INVALID_ENCODING"),
+    ):
+        table.load(name, at, sealed(cache, seed, *edits), expect, message)
+
+    return [table.group()]
+
+
+def tree_cache_xmss_mt():
+    table = CacheTable(XMSS_MT)
+
+    stream = Stream(1001)
+
+    table.export("four layers before signing", "XMSSMT-SHAKE256_20/4_256", stream.bytes(96), 0, False, stream.bytes(20))
+
+    table.export("eight layers", "XMSSMT-SHA2_40/8_256", stream.bytes(96), 0x123456789A, True, stream.bytes(20))
+
+    table.export("twelve layers", "XMSSMT-SHAKE256_60/12_192", stream.bytes(72), 0x0FEDCBA987654321, True, stream.bytes(20))
+
+    name = "XMSSMT-SHA2_20/4_192"
+
+    oid = XMSS_MT._backend.sets[name].oid
+
+    seed, message = stream.bytes(72), stream.bytes(20)
+
+    # Index 0x12345 signs with tree 2330 of layer 0; 0x12360 with tree 2331 and the same trees above.
+    state, cache = table.export("four layers", name, seed, 0x12345, True, message)
+
+    assert state == xmss_state(3, oid, 0x12346, seed)
+
+    later, capacity = xmss_state(3, oid, 0x12360, seed), xmss_state(3, oid, 1 << 20, seed)
+
+    top, bottom = nodes_at(cache, 0), nodes_at(cache, 3)
+
+    for label, data, expect in (
+        ("layer 0 node changed", flip(cache, bottom + 50), "INVALID_ENCODING"),
+        ("top layer node changed", flip(cache, top + 7), "INVALID_ENCODING"),
+        ("tag byte changed", flip(cache, len(cache) - 9), "INVALID_ENCODING"),
+        ("version 2", replace(cache, 0, b"\x02"), "INVALID_ENCODING"),
+        ("hss kind", replace(cache, 1, b"\x01"), "INVALID_ENCODING"),
+        ("xmss kind", replace(cache, 1, b"\x02"), "ALGORITHM_MISMATCH"),
+        ("kind 0", replace(cache, 1, b"\x00"), "INVALID_ENCODING"),
+        ("kind 4", replace(cache, 1, b"\x04"), "INVALID_ENCODING"),
+        ("oid changed", replace(cache, 2, u32(0x21)), "INVALID_ENCODING"),
+        ("hss cache", fresh_cache(HSS_LMS, [("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W4")], stream.bytes(40)), "ALGORITHM_MISMATCH"),
+        ("another key", fresh_cache(XMSS_MT, name, stream.bytes(72)), "INVALID_ENCODING"),
+        ("one byte cut", cache[:-1], "INVALID_ENCODING"),
+        ("one byte appended", cache + b"\x00", "INVALID_ENCODING"),
+        ("empty", b"", "INVALID_ENCODING"),
+    ):
+        table.load(label, state, data, expect, message)
+
+    for label, data, expect in (
+        ("stale layer 0", later, "ok"),
+        ("at the capacity", capacity, "ok"),
+        ("same public seed and other secret seeds", xmss_state(3, oid, 0x12346, stream.bytes(48) + seed[48:]), "INVALID_ENCODING"),
+        ("another parameter set of the same seed", xmss_state(3, XMSS_MT._backend.sets["XMSSMT-SHA2_20/2_192"].oid, 0x12346, seed), "INVALID_ENCODING"),
+    ):
+        table.load(label, data, cache, expect, message)
+
+    root = 62 * 24
+
+    for label, edits, at, expect in (
+        ("sealed layer 0 node changed", [change_node(3, 40)], state, "INVALID_ENCODING"),
+        ("sealed layer 2 root changed", [change_node(1, root)], state, "INVALID_ENCODING"),
+        ("sealed stale layer 0 node changed", [change_node(3, 40)], later, "ok"),
+        ("sealed layer 0 as tree 2331", [set_tree(3, tree=2331)], later, "INVALID_ENCODING"),
+        ("sealed layers swapped", [keep_trees(0, 2, 1, 3)], state, "INVALID_ENCODING"),
+        ("sealed layer 2 twice", [keep_trees(0, 1, 1, 2, 3)], state, "INVALID_ENCODING"),
+        ("sealed layer 4", [set_tree(0, level=4)], state, "INVALID_ENCODING"),
+        ("sealed top layer only", [keep_trees(0)], state, "ok"),
+        ("sealed no top layer", [keep_trees(1, 2, 3)], state, "ok"),
+        ("sealed layer 0 only", [keep_trees(3)], state, "ok"),
+        ("sealed top tree 1", [set_tree(0, tree=1)], state, "ok"),
+        ("sealed top node changed at the capacity", [change_node(0, 9)], capacity, "INVALID_ENCODING"),
+        ("sealed top tree 1 changed at the capacity", [set_tree(0, tree=1), change_node(0, 9)], capacity, "ok"),
+        ("sealed public seed changed", [change_public_key(lambda key: flip(key, len(key) - 1))], state, "INVALID_ENCODING"),
+        ("sealed root changed", [change_public_key(lambda key: flip(key, 4))], state, "INVALID_ENCODING"),
+        ("sealed oid of another set", [change_public_key(lambda key: replace(key, 0, u32(0x32)))], state, "INVALID_ENCODING"),
+        ("sealed height 10", [reshape(2, 0, 10, 24, 2047)], state, "INVALID_ENCODING"),
+        ("sealed n 32", [reshape(2, 0, 5, 32, 63)], state, "INVALID_ENCODING"),
+        ("sealed hss kind", [set_header(kind=1)], state, "INVALID_ENCODING"),
+        ("sealed xmss kind", [set_header(kind=2)], state, "ALGORITHM_MISMATCH"),
+        ("sealed parameters of another set", [set_header(parameters=u32(0x21))], state, "INVALID_ENCODING"),
+    ):
+        table.load(label, at, sealed(cache, seed, *edits), expect, message)
+
+    return [table.group()]
+
+
+# A tree of height 10 takes about ten seconds in Python, so only cases that need no rebuild load.
+def tree_cache_xmss():
+    table = CacheTable(XMSS)
+
+    stream = Stream(1002)
+
+    name = "XMSS-SHA2_10_192"
+
+    oid = XMSS._backend.sets[name].oid
+
+    seed, message = stream.bytes(72), stream.bytes(20)
+
+    state, cache = table.export("one tree", name, seed, 1000, True, message)
+
+    assert state == xmss_state(2, oid, 1001, seed)
+
+    for label, data, expect in (
+        ("node changed", flip(cache, nodes_at(cache, 0) + 77), "INVALID_ENCODING"),
+        ("tag byte changed", flip(cache, len(cache) - 2), "INVALID_ENCODING"),
+        ("xmss^mt kind", replace(cache, 1, b"\x03"), "ALGORITHM_MISMATCH"),
+        ("hss kind", replace(cache, 1, b"\x01"), "INVALID_ENCODING"),
+        ("xmss^mt cache", fresh_cache(XMSS_MT, "XMSSMT-SHA2_20/4_192", stream.bytes(72)), "ALGORITHM_MISMATCH"),
+    ):
+        table.load(label, state, data, expect, message)
+
+    table.load("at the capacity", xmss_state(2, oid, 1024, seed), cache, "ok")
+
+    for label, edits, expect in (
+        ("sealed root changed", [change_node(0, 2046 * 24)], "INVALID_ENCODING"),
+        ("sealed public seed changed", [change_public_key(lambda key: flip(key, len(key) - 1))], "INVALID_ENCODING"),
+        ("sealed layer 1", [set_tree(0, level=1)], "INVALID_ENCODING"),
+        ("sealed parameters of another set", [set_header(parameters=u32(XMSS._backend.sets["XMSS-SHA2_10_256"].oid))], "INVALID_ENCODING"),
+    ):
+        table.load(label, state, sealed(cache, seed, *edits), expect, message)
+
+    return [table.group()]
+
+
 JOBS = {
     "kem": [(kem, ())],
     "mldsa": [(mldsa, ())],
@@ -1802,6 +2256,7 @@ JOBS = {
         (xmss_mt_errors, ()),
         (xmss_errors, ()),
     ],
+    "treecache": [(tree_cache_hss, ()), (tree_cache_xmss_mt, ()), (tree_cache_xmss, ())],
 }
 
 
