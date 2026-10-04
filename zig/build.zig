@@ -106,7 +106,17 @@ pub fn build(b: *std.Build) void {
     });
 
     for ([_]*std.Build.Step.Compile{ checker, x25519 }) |artifact| {
-        const command = b.addSystemCommand(&.{ "valgrind", "--error-exitcode=1", "-q" });
+        // The long unrolled AVX2 blocks of the vector code exhaust the temporary storage of
+        // valgrind's translator unless it translates fewer instructions at a time; how much it
+        // translates at once does not change what memcheck reports.
+        const command = b.addSystemCommand(&.{
+            "valgrind",
+            "--error-exitcode=1",
+            "-q",
+            "--vex-guest-max-insns=10",
+            "--vex-guest-chase=no",
+            "--vex-iropt-unroll-thresh=0",
+        });
 
         command.addArtifactArg(artifact);
 
