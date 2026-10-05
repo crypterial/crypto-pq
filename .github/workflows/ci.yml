@@ -399,9 +399,16 @@ jobs:
           echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $archive" | sha256sum -c -
           mkdir -p ~/zig && tar -xJf "$archive" -C ~/zig --strip-components=1
           echo ~/zig >> "$GITHUB_PATH"
-      - if: matrix.target != 'x86-linux'
+      - if: matrix.target == 's390x-linux'
         run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends qemu-user
-      - run: zig build test -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -fqemu --summary all
+      - if: matrix.target != 'riscv64-linux'
+        run: zig build test -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -fqemu --summary all
+      # Ubuntu 24.04's QEMU 8.2 crashes in the two largest RISC-V test binaries at the test
+      # runner's first write, before any library code runs; QEMU 10 runs them all.
+      - if: matrix.target == 'riscv64-linux'
+        run: |
+          zig build test-binaries -Doptimize=ReleaseSafe -Dtarget=riscv64-linux
+          docker run --rm -v "$GITHUB_WORKSPACE:/w" -w /w/zig debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a sh -c 'apt-get update -q > /dev/null && apt-get install -yq --no-install-recommends qemu-user > /dev/null && for binary in zig-out/bin/*; do echo "== $binary"; qemu-riscv64 "$binary" || exit 1; done'
 
   # The packages that would be published build from their declared contents alone.
   package:
