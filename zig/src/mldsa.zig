@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const aarch64 = @import("aarch64.zig");
+const cpu = @import("cpu.zig");
 const ct = @import("ct.zig");
 const hash = @import("hash.zig");
 const keccak = @import("keccak.zig");
@@ -45,7 +47,7 @@ pub const Parameters = struct {
     }
 };
 
-const q: i32 = 8380417;
+pub const q: i32 = 8380417;
 
 const d = 13;
 
@@ -58,7 +60,7 @@ pub const ml_dsa_87: Parameters = .{ .k = 8, .l = 7, .eta = 2, .tau = 60, .lambd
 const Poly = [256]i32;
 
 // Powers of 1753 in bit-reversed order, times the Montgomery factor 2^32, reduced to (-q/2, q/2].
-const zetas: [256]i32 = blk: {
+pub const zetas: [256]i32 = blk: {
     @setEvalBranchQuota(100000);
 
     var powers: [256]i64 = undefined;
@@ -86,7 +88,7 @@ const inverse_ntt_factor = 41978;
 const V = @Vector(8, i32);
 
 // q^-1 modulo 2^32.
-const q_inverse = 58728449;
+pub const q_inverse = 58728449;
 
 fn splat(value: i32) V {
     return @splat(value);
@@ -136,10 +138,34 @@ fn mulHigh(a: V, b: V) V {
 }
 
 // a * b * 2^-32 modulo q, given b_qinv = b * q^-1 mod 2^32: the low halves of a * b and t * q
-// agree, so the difference of the high halves is the exact quotient.
-fn montgomery(a: V, b: V, b_qinv: V) V {
-    return mulHigh(a, b) - mulHigh(a *% b_qinv, splat(q));
+// agree, so the difference of the high halves is the exact quotient. With SQDMULH the halves are
+// doubled, floor(a * b / 2^31), and differ by twice that quotient: SHSUB halves it exactly, four
+// lanes at a time. The results are identical as long as a and b are not both -2^31, which no
+// zeta and no reduced coefficient is.
+pub fn montgomery(a: V, b: V, b_qinv: V) V {
+    if (comptime cpu.neon) {
+        var out: [2]@Vector(4, i32) = undefined;
+
+        inline for (&out, halves(a), halves(b), halves(a *% b_qinv)) |*half, x, y, t| {
+            half.* = aarch64.halvingSubtract32(aarch64.doublingHigh32(x, y), aarch64.doublingHigh32(t, @splat(q)));
+        }
+
+        return @shuffle(i32, out[0], out[1], [8]i32{ 0, 1, 2, 3, -1, -2, -3, -4 });
+    }
+
+    return portable.montgomery(a, b, b_qinv);
 }
+
+fn halves(a: V) [2]@Vector(4, i32) {
+    return .{ @shuffle(i32, a, undefined, [4]i32{ 0, 1, 2, 3 }), @shuffle(i32, a, undefined, [4]i32{ 4, 5, 6, 7 }) };
+}
+
+// The formula for every target, which the AArch64 one above must equal.
+pub const portable = struct {
+    pub fn montgomery(a: V, b: V, b_qinv: V) V {
+        return mulHigh(a, b) - mulHigh(a *% b_qinv, splat(q));
+    }
+};
 
 fn montgomeryProduct(a: V, b: V) V {
     return montgomery(a, b, b *% splat(q_inverse));

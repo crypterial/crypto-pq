@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const cache = @import("cache.zig");
+const cpu = @import("cpu.zig");
 const ct = @import("ct.zig");
 const encoding = @import("encoding.zig");
 const Error = @import("errors.zig").Error;
@@ -35,6 +36,10 @@ pub const KemAlgorithm = struct {
     // `allocator` provides the memory of the keys and of their cache. A key may fill its cache
     // from any thread that uses it, so the allocator must be thread-safe if the keys are.
     pub fn generateKeyPair(self: KemAlgorithm, allocator: Allocator, options: KeyGenOptions) (Error || Allocator.Error)!KemKeyPair {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         var seed: [max_seed_size]u8 = undefined;
 
         defer ct.wipe(&seed);
@@ -87,6 +92,10 @@ pub const KemAlgorithm = struct {
     }
 
     pub fn importPrivateKey(self: KemAlgorithm, allocator: Allocator, data: []const u8, format: KeyFormat) (Error || Allocator.Error)!KemPrivateKey {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         const buffer = try keys.pemBuffer(allocator, format);
 
         defer keys.freePemBuffer(allocator, buffer);
@@ -154,6 +163,10 @@ pub const KemPublicKey = struct {
     public: *Public,
 
     pub fn encapsulate(self: *const KemPublicKey) Error!Encapsulation {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         var randomness: [xwing.randomness_size]u8 = undefined;
 
         defer ct.wipe(&randomness);
@@ -197,6 +210,10 @@ pub const KemPrivateKey = struct {
     }
 
     pub fn decapsulate(self: *const KemPrivateKey, ciphertext: []const u8) Error![32]u8 {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         switch (self.algorithm.kind) {
             inline .ml_kem_512, .ml_kem_768, .ml_kem_1024 => |kind| {
                 const p = comptime parameters(kind);
@@ -214,6 +231,10 @@ pub const KemPrivateKey = struct {
     }
 
     pub fn exportKey(self: *const KemPrivateKey, allocator: Allocator, format: KeyFormat) (Error || Allocator.Error)![]u8 {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         const oid = objectIdentifier(self.algorithm.kind);
 
         if (self.secret.has_seed) return keys.exportPrivate(allocator, format, oid, encoding.context_0, self.secret.seed[0..seedSize(self.algorithm.kind)]);

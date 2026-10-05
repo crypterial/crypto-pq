@@ -1,8 +1,16 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
+const cpu = @import("cpu.zig");
 const ct = @import("ct.zig");
 
-const round_constants = [24]u64{
+const isa = switch (builtin.cpu.arch) {
+    .aarch64 => @import("aarch64.zig"),
+    .x86_64 => @import("x86_64.zig"),
+    else => struct {},
+};
+
+pub const round_constants = [24]u64{
     0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000,
     0x000000000000808b, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
     0x000000000000008a, 0x0000000000000088, 0x0000000080008009, 0x000000008000000a,
@@ -13,8 +21,43 @@ const round_constants = [24]u64{
 
 const rotations = [25]u6{ 0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14 };
 
-// The state is copied into locals so that it can live in registers across the rounds.
+// One permutation: with the SHA3 instructions on the cores that run them fast, or the portable
+// code below.
 pub fn permute(state: *[25]u64) void {
+    if (comptime cpu.possible(.sha3)) {
+        if (cpu.has(.sha3)) return isa.keccak1(state);
+    }
+
+    portable.permute(state);
+}
+
+// Four independent permutations: two pairs with the SHA3 instructions on the cores that run them
+// fast, all four in AVX2 registers, or the portable code below.
+pub fn permute4(states: *[4][25]u64) void {
+    if (comptime cpu.possible(.sha3)) {
+        if (cpu.has(.sha3)) {
+            isa.keccak2(states[0..2]);
+
+            return isa.keccak2(states[2..4]);
+        }
+    }
+
+    if (comptime cpu.possible(.avx2)) {
+        if (cpu.has(.avx2)) return isa.keccak4(states);
+    }
+
+    portable.permute4(states);
+}
+
+// The code for every target.
+pub const portable = struct {
+    pub const permute = portablePermute;
+
+    pub const permute4 = portablePermute4;
+};
+
+// The state is copied into locals so that it can live in registers across the rounds.
+fn portablePermute(state: *[25]u64) void {
     var a = state.*;
 
     for (round_constants) |constant| round(u64, &a, constant);
@@ -22,10 +65,10 @@ pub fn permute(state: *[25]u64) void {
     state.* = a;
 }
 
-// Four independent permutations: two states in the lanes of 2 x 64-bit vectors and two in
-// integer registers, interleaved round by round so that the vector and the integer units work at
-// the same time. Four states take about a fifth less time than four permutations in a row.
-pub fn permute4(states: *[4][25]u64) void {
+// Two states in the lanes of 2 x 64-bit vectors and two in integer registers, interleaved round
+// by round so that the vector and the integer units work at the same time. Four states take about
+// a fifth less time than four permutations in a row.
+fn portablePermute4(states: *[4][25]u64) void {
     const W = @Vector(2, u64);
 
     var pair: [25]W = undefined;

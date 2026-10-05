@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const cpu = @import("cpu.zig");
 const ct = @import("ct.zig");
 const encoding = @import("encoding.zig");
 const Error = @import("errors.zig").Error;
@@ -364,6 +365,10 @@ const Signer = union(enum) {
     xmss: *xmss_scheme.Xmss,
 
     fn build(allocator: Allocator, setup: Setup, seed: []const u8) (Error || Allocator.Error)!Signer {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         switch (setup) {
             .hss => {
                 const hss = try allocator.create(lms.Hss);
@@ -410,6 +415,10 @@ const Signer = union(enum) {
     }
 
     fn sign(self: Signer, index: u64, message: []const u8, out: []u8) void {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         switch (self) {
             inline else => |signer| signer.sign(index, message, out),
         }

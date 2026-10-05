@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const cpu = @import("cpu.zig");
 const ct = @import("ct.zig");
 const Keccak = @import("keccak.zig").Keccak;
 const sha2 = @import("sha2.zig");
@@ -127,6 +128,10 @@ pub const HmacAlgorithm = struct {
     hash: HashAlgorithm,
 
     pub fn digest(self: HmacAlgorithm, key: []const u8, data: []const u8, out: []u8) void {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         var hmac = self.create(key);
 
         hmac.update(data);
@@ -135,6 +140,10 @@ pub const HmacAlgorithm = struct {
     }
 
     pub fn create(self: HmacAlgorithm, key: []const u8) Hmac {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         const block = self.hash.blockSize();
 
         var pad: [128]u8 = @splat(0);
@@ -167,6 +176,10 @@ pub const HmacAlgorithm = struct {
     }
 
     pub fn verify(self: HmacAlgorithm, key: []const u8, data: []const u8, tag: []const u8) bool {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         var hmac = self.create(key);
 
         hmac.update(data);
@@ -181,10 +194,18 @@ pub const Hmac = struct {
     size: usize,
 
     pub fn update(self: *Hmac, data: []const u8) void {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         self.inner.update(data);
     }
 
     pub fn digest(self: *const Hmac, out: []u8) void {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         checkLength(out.len, self.size);
 
         var inner: [64]u8 = undefined;
@@ -201,6 +222,10 @@ pub const Hmac = struct {
     }
 
     pub fn verify(self: *const Hmac, tag: []const u8) bool {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         if (tag.len != self.size) return false;
 
         var expected: [64]u8 = undefined;

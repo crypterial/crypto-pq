@@ -65,11 +65,7 @@ pub fn sha256Finish(state: *const [8]u32, absorbed: usize, parts: []const []cons
 
     defer ct.wipe(std.mem.asBytes(&words));
 
-    var offset: usize = 0;
-
-    while (offset < end) : (offset += 64) {
-        sha2.compress256(&words, block[offset..][0..64]);
-    }
+    sha2.blocks256(&words, block[0..end]);
 
     for (0..out.len / 4) |i| {
         std.mem.writeInt(u32, out[4 * i ..][0..4], words[i], .big);
@@ -95,11 +91,7 @@ pub fn sha512Finish(state: *const [8]u64, absorbed: usize, parts: []const []cons
 
     defer ct.wipe(std.mem.asBytes(&words));
 
-    var offset: usize = 0;
-
-    while (offset < end) : (offset += 128) {
-        sha2.compress512(&words, block[offset..][0..128]);
-    }
+    sha2.blocks512(&words, block[0..end]);
 
     for (0..out.len / 8) |i| {
         std.mem.writeInt(u64, out[8 * i ..][0..8], words[i], .big);

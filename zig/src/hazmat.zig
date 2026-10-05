@@ -4,6 +4,7 @@
 
 const std = @import("std");
 
+const cpu = @import("cpu.zig");
 const Error = @import("errors.zig").Error;
 const kem = @import("kem.zig");
 const keys = @import("keys.zig");
@@ -13,6 +14,10 @@ const stateful = @import("stateful.zig");
 const Allocator = std.mem.Allocator;
 
 pub fn generateKemKeyPair(algorithm: kem.KemAlgorithm, allocator: Allocator, seed: []const u8) (Error || Allocator.Error)!kem.KemKeyPair {
+    const dit = cpu.Dit.enter();
+
+    defer dit.leave();
+
     try keys.requireLength(seed, kem.seedSize(algorithm.kind));
 
     const private_key = try kem.fromSeed(algorithm, allocator, seed, false);
@@ -22,6 +27,10 @@ pub fn generateKemKeyPair(algorithm: kem.KemAlgorithm, allocator: Allocator, see
 
 // Seeds are 32 bytes for ML-DSA and SK.seed || SK.prf || PK.seed for SLH-DSA.
 pub fn generateSignatureKeyPair(algorithm: signatures.SignatureAlgorithm, allocator: Allocator, seed: []const u8) (Error || Allocator.Error)!signatures.SignatureKeyPair {
+    const dit = cpu.Dit.enter();
+
+    defer dit.leave();
+
     try keys.requireLength(seed, signatures.seedSize(algorithm.kind));
 
     const private_key = try signatures.fromSeed(algorithm, allocator, seed, false);
@@ -44,6 +53,10 @@ pub fn generateStatefulKeyPair(algorithm: stateful.StatefulSignatureAlgorithm, a
 }
 
 pub fn encapsulate(public_key: *const kem.KemPublicKey, randomness: []const u8) Error!kem.Encapsulation {
+    const dit = cpu.Dit.enter();
+
+    defer dit.leave();
+
     try keys.requireLength(randomness, kem.randomnessSize(public_key.algorithm.kind));
 
     return kem.encapsulateWith(public_key, randomness);
@@ -51,6 +64,10 @@ pub fn encapsulate(public_key: *const kem.KemPublicKey, randomness: []const u8) 
 
 // `randomness` is rnd for ML-DSA and opt_rand for SLH-DSA; options.deterministic is ignored.
 pub fn sign(private_key: *const signatures.SignaturePrivateKey, allocator: Allocator, message: []const u8, randomness: []const u8, options: signatures.SignOptions) (Error || Allocator.Error)![]u8 {
+    const dit = cpu.Dit.enter();
+
+    defer dit.leave();
+
     return signatures.signDeterministic(private_key, allocator, message, randomness, options);
 }
 

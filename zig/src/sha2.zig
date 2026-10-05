@@ -1,13 +1,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const cpu = @import("cpu.zig");
 const ct = @import("ct.zig");
+
+const isa = switch (builtin.cpu.arch) {
+    .aarch64 => @import("aarch64.zig"),
+    .x86_64 => @import("x86_64.zig"),
+    else => struct {},
+};
 
 // Debug builds give every temporary of every unrolled round its own stack slot, about 180 KiB for
 // eight SHA-512 lanes, so they run the same rounds as a loop with run-time indices.
 const unrolled = builtin.mode != .Debug;
 
-const k256 = [64]u32{
+pub const k256 = [64]u32{
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
     0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
@@ -18,7 +25,7 @@ const k256 = [64]u32{
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 };
 
-const k512 = [80]u64{
+pub const k512 = [80]u64{
     0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
     0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
     0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
@@ -66,23 +73,60 @@ pub const iv_512_256 = [8]u64{
 };
 
 pub fn compress256(state: *[8]u32, block: *const [64]u8) void {
-    var w: [16]u32 = undefined;
-
-    for (&w, 0..) |*word, t| {
-        word.* = std.mem.readInt(u32, block[4 * t ..][0..4], .big);
-    }
-
-    rounds256(u32, state, &w);
+    blocks256(state, block);
 }
 
 pub fn compress512(state: *[8]u64, block: *const [128]u8) void {
-    var w: [16]u64 = undefined;
+    blocks512(state, block);
+}
 
-    for (&w, 0..) |*word, t| {
-        word.* = std.mem.readInt(u64, block[8 * t ..][0..8], .big);
+// Whole blocks, one after another: with the instructions the state stays in registers between
+// them.
+pub fn blocks256(state: *[8]u32, blocks: []const u8) void {
+    if (comptime cpu.possible(.sha256)) {
+        if (cpu.has(.sha256)) return isa.sha256Blocks(state, blocks);
     }
 
-    rounds512(u64, state, &w);
+    var offset: usize = 0;
+
+    while (offset < blocks.len) : (offset += 64) {
+        portable.compress256(state, blocks[offset..][0..64]);
+    }
+}
+
+pub fn blocks512(state: *[8]u64, blocks: []const u8) void {
+    if (comptime cpu.possible(.sha512)) {
+        if (cpu.has(.sha512)) return isa.sha512Blocks(state, blocks);
+    }
+
+    var offset: usize = 0;
+
+    while (offset < blocks.len) : (offset += 128) {
+        portable.compress512(state, blocks[offset..][0..128]);
+    }
+}
+
+// The rounds on words of type u32, or u64 for SHA-512, or on vectors of them that carry
+// independent computations in their lanes: the SHA-2 instructions where the CPU has them, AVX2
+// for eight SHA-256 lanes otherwise, and the portable code below.
+pub fn rounds256(comptime W: type, state: *[8]W, words: *const [16]W) void {
+    if (comptime cpu.possible(.sha256)) {
+        if (cpu.has(.sha256)) return isa.sha256Rounds(W, state, words);
+    }
+
+    if (comptime W == @Vector(8, u32) and cpu.possible(.avx2)) {
+        if (cpu.has(.avx2)) return isa.sha256x8(state, words);
+    }
+
+    portable.rounds256(W, state, words);
+}
+
+pub fn rounds512(comptime W: type, state: *[8]W, words: *const [16]W) void {
+    if (comptime cpu.possible(.sha512)) {
+        if (cpu.has(.sha512)) return isa.sha512Rounds(W, state, words);
+    }
+
+    portable.rounds512(W, state, words);
 }
 
 fn broadcast(comptime W: type, value: anytype) W {
@@ -97,12 +141,37 @@ fn shr(comptime W: type, x: W, comptime r: comptime_int) W {
     return x >> @as(@Vector(vector.len, std.math.Log2Int(vector.child)), @splat(r));
 }
 
-// The rounds run on words of type u32, or u64 for SHA-512, or on vectors of them that carry
-// independent computations in their lanes. Fully unrolled, the eight working variables rotate by
-// renaming instead of moving: at round t, variable i lives in slot (i - t) mod 8. The schedule
-// keeps its last 16 words: word t lives at t % 16, so t - 15, t - 7 and t - 2 are at (t + 1) % 16,
+// The code for every target. Fully unrolled, the eight working variables rotate by renaming
+// instead of moving: at round t, variable i lives in slot (i - t) mod 8. The schedule keeps its
+// last 16 words: word t lives at t % 16, so t - 15, t - 7 and t - 2 are at (t + 1) % 16,
 // (t + 9) % 16 and (t + 14) % 16, and t - 16 is the slot it replaces.
-pub fn rounds256(comptime W: type, state: *[8]W, words: *const [16]W) void {
+pub const portable = struct {
+    pub fn compress256(state: *[8]u32, block: *const [64]u8) void {
+        var w: [16]u32 = undefined;
+
+        for (&w, 0..) |*word, t| {
+            word.* = std.mem.readInt(u32, block[4 * t ..][0..4], .big);
+        }
+
+        portableRounds256(u32, state, &w);
+    }
+
+    pub fn compress512(state: *[8]u64, block: *const [128]u8) void {
+        var w: [16]u64 = undefined;
+
+        for (&w, 0..) |*word, t| {
+            word.* = std.mem.readInt(u64, block[8 * t ..][0..8], .big);
+        }
+
+        portableRounds512(u64, state, &w);
+    }
+
+    pub const rounds256 = portableRounds256;
+
+    pub const rounds512 = portableRounds512;
+};
+
+fn portableRounds256(comptime W: type, state: *[8]W, words: *const [16]W) void {
     if (!unrolled) return looped(W, &k256, .{ 7, 18, 3, 17, 19, 10 }, .{ 6, 11, 25, 2, 13, 22 }, state, words);
 
     var w = words.*;
@@ -130,7 +199,7 @@ pub fn rounds256(comptime W: type, state: *[8]W, words: *const [16]W) void {
     }
 }
 
-pub fn rounds512(comptime W: type, state: *[8]W, words: *const [16]W) void {
+fn portableRounds512(comptime W: type, state: *[8]W, words: *const [16]W) void {
     if (!unrolled) return looped(W, &k512, .{ 1, 8, 7, 19, 61, 6 }, .{ 14, 18, 41, 28, 34, 39 }, state, words);
 
     @setEvalBranchQuota(4000);
@@ -234,7 +303,7 @@ inline fn round(comptime W: type, v: *[8]W, comptime t: usize, kw: W, comptime r
     v[(15 - t % 8) % 8] = t1 +% s0 +% (((a ^ b) & c) ^ (a & b));
 }
 
-fn Sha2(comptime Word: type, comptime block_size: usize, comptime compress: fn (*[8]Word, *const [block_size]u8) void) type {
+fn Sha2(comptime Word: type, comptime block_size: usize, comptime blocks: fn (*[8]Word, []const u8) void) type {
     return struct {
         const Self = @This();
 
@@ -263,14 +332,16 @@ fn Sha2(comptime Word: type, comptime block_size: usize, comptime compress: fn (
 
                 if (self.used < block_size) return;
 
-                compress(&self.state, &self.buffer);
+                blocks(&self.state, &self.buffer);
 
                 self.used = 0;
             }
 
-            while (rest.len >= block_size) : (rest = rest[block_size..]) {
-                compress(&self.state, rest[0..block_size]);
-            }
+            const whole = rest.len / block_size * block_size;
+
+            if (whole > 0) blocks(&self.state, rest[0..whole]);
+
+            rest = rest[whole..];
 
             @memcpy(self.buffer[0..rest.len], rest);
 
@@ -296,11 +367,7 @@ fn Sha2(comptime Word: type, comptime block_size: usize, comptime compress: fn (
 
             std.mem.writeInt(u64, tail[end - 8 ..][0..8], self.length *% 8, .big);
 
-            var offset: usize = 0;
-
-            while (offset < end) : (offset += block_size) {
-                compress(&state, tail[offset..][0..block_size]);
-            }
+            blocks(&state, tail[0..end]);
 
             var out: [8 * @sizeOf(Word)]u8 = undefined;
 
@@ -317,6 +384,6 @@ fn Sha2(comptime Word: type, comptime block_size: usize, comptime compress: fn (
     };
 }
 
-pub const Sha256 = Sha2(u32, 64, compress256);
+pub const Sha256 = Sha2(u32, 64, blocks256);
 
-pub const Sha512 = Sha2(u64, 128, compress512);
+pub const Sha512 = Sha2(u64, 128, blocks512);

@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const aarch64 = @import("aarch64.zig");
+const cpu = @import("cpu.zig");
 const ct = @import("ct.zig");
 const hash = @import("hash.zig");
 const keccak = @import("keccak.zig");
@@ -32,12 +34,12 @@ pub const ml_kem_768: Parameters = .{ .k = 3, .eta1 = 2, .eta2 = 2, .du = 10, .d
 
 pub const ml_kem_1024: Parameters = .{ .k = 4, .eta1 = 2, .eta2 = 2, .du = 11, .dv = 5 };
 
-const q = 3329;
+pub const q = 3329;
 
 pub const Poly = [256]i16;
 
 // Powers of 17 in bit-reversed order, times the Montgomery factor 2^16, reduced to (-q/2, q/2].
-const zetas: [128]i16 = blk: {
+pub const zetas: [128]i16 = blk: {
     @setEvalBranchQuota(100000);
 
     var table: [128]i16 = undefined;
@@ -69,7 +71,7 @@ const Wide = @Vector(8, i32);
 const U = @Vector(8, u32);
 
 // q^-1 modulo 2^16.
-const q_inverse = -3327;
+pub const q_inverse = -3327;
 
 fn splat(value: i16) V {
     return @splat(value);
@@ -88,9 +90,14 @@ fn mulHigh(a: V, b: V) V {
 }
 
 // a * b * 2^-16 modulo q, in (-q, q), given b_qinv = b * q^-1 mod 2^16: the low halves of a * b
-// and t * q agree, so the difference of the high halves is the exact quotient.
-fn montgomery(a: V, b: V, b_qinv: V) V {
-    return mulHigh(a, b) - mulHigh(a *% b_qinv, splat(q));
+// and t * q agree, so the difference of the high halves is the exact quotient. With SQDMULH the
+// halves are doubled, floor(a * b / 2^15), and differ by twice that quotient: SHSUB halves it
+// exactly. The results are identical as long as a and b are not both -2^15, which no zeta and no
+// reduced coefficient is.
+pub fn montgomery(a: V, b: V, b_qinv: V) V {
+    if (comptime cpu.neon) return aarch64.halvingSubtract16(aarch64.doublingHigh16(a, b), aarch64.doublingHigh16(a *% b_qinv, splat(q)));
+
+    return portable.montgomery(a, b, b_qinv);
 }
 
 fn montgomeryProduct(a: V, b: V) V {
@@ -101,14 +108,33 @@ fn constantProduct(a: V, comptime b: i16) V {
     return montgomery(a, splat(b), splat(b *% q_inverse));
 }
 
-// The representative modulo q in [-(q - 1) / 2, (q - 1) / 2].
-fn barrett(a: V) V {
-    const v = ((1 << 26) + q / 2) / q;
+const barrett_factor = ((1 << 26) + q / 2) / q;
 
-    const t = (@as(Wide, a) * @as(Wide, @splat(v)) + @as(Wide, @splat(1 << 25))) >> @splat(26);
+// The representative modulo q in [-(q - 1) / 2, (q - 1) / 2]. SQDMULH gives floor(a * v / 2^15),
+// and rounding that by 2^11 equals rounding a * v by 2^26, so the results are identical for every
+// input.
+pub fn barrett(a: V) V {
+    if (comptime cpu.neon) {
+        const t = (aarch64.doublingHigh16(a, splat(barrett_factor)) +% splat(1 << 10)) >> @splat(11);
 
-    return @truncate(@as(Wide, a) - t * @as(Wide, @splat(q)));
+        return a -% t *% splat(q);
+    }
+
+    return portable.barrett(a);
 }
+
+// The formulas for every target, which the AArch64 ones above must equal.
+pub const portable = struct {
+    pub fn montgomery(a: V, b: V, b_qinv: V) V {
+        return mulHigh(a, b) - mulHigh(a *% b_qinv, splat(q));
+    }
+
+    pub fn barrett(a: V) V {
+        const t = (@as(Wide, a) * @as(Wide, @splat(barrett_factor)) + @as(Wide, @splat(1 << 25))) >> @splat(26);
+
+        return @truncate(@as(Wide, a) - t * @as(Wide, @splat(q)));
+    }
+};
 
 // Maps (-q, q) to [0, q) with a mask instead of a branch.
 fn canonical(a: V) U {

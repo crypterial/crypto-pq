@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const cache = @import("cache.zig");
+const cpu = @import("cpu.zig");
 const ct = @import("ct.zig");
 const encoding = @import("encoding.zig");
 const Error = @import("errors.zig").Error;
@@ -71,6 +72,10 @@ pub const SignatureAlgorithm = struct {
     // of the self-test signature. A key may fill its caches from any thread that uses it, so the
     // allocator must be thread-safe if the keys are.
     pub fn generateKeyPair(self: SignatureAlgorithm, allocator: Allocator, options: KeyGenOptions) (Error || Allocator.Error)!SignatureKeyPair {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         var seed: [max_seed_size]u8 = undefined;
 
         defer ct.wipe(&seed);
@@ -124,6 +129,10 @@ pub const SignatureAlgorithm = struct {
     }
 
     pub fn importPrivateKey(self: SignatureAlgorithm, allocator: Allocator, data: []const u8, format: KeyFormat) (Error || Allocator.Error)!SignaturePrivateKey {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         const buffer = try keys.pemBuffer(allocator, format);
 
         defer keys.freePemBuffer(allocator, buffer);
@@ -240,6 +249,10 @@ pub const SignaturePrivateKey = struct {
     }
 
     pub fn sign(self: *const SignaturePrivateKey, allocator: Allocator, message: []const u8, options: SignOptions) (Error || Allocator.Error)![]u8 {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         var randomness: [max_randomness_size]u8 = undefined;
 
         defer ct.wipe(&randomness);
@@ -258,6 +271,10 @@ pub const SignaturePrivateKey = struct {
     }
 
     pub fn exportKey(self: *const SignaturePrivateKey, allocator: Allocator, format: KeyFormat) (Error || Allocator.Error)![]u8 {
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
         const oid = objectIdentifier(self.algorithm.kind);
 
         if (!isMlDsa(self.algorithm.kind)) return keys.exportPrivate(allocator, format, oid, null, self.secretBytes());

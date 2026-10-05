@@ -7,9 +7,13 @@ pub fn build(b: *std.Build) void {
 
     const ct = b.option(bool, "ct", "Mark secrets for valgrind's constant-time check (zig build ct)") orelse false;
 
+    const portable = b.option(bool, "portable", "Use only the portable code: no SHA-2, SHA3, SHA-NI, AVX2 or NEON instructions, and no DIT") orelse false;
+
     const options = b.addOptions();
 
     options.addOption(bool, "ct", ct);
+
+    options.addOption(bool, "portable", portable);
 
     const build_options = options.createModule();
 
@@ -41,10 +45,16 @@ pub fn build(b: *std.Build) void {
 
     run(b, step, tests);
 
-    // X25519, the key caches and the Merkle cache are internal, so their tests live in their own
-    // files.
-    for ([_][]const u8{ "src/x25519.zig", "src/cache.zig", "src/merkle.zig" }) |path| {
-        run(b, step, b.addTest(.{
+    // X25519, the key caches, the Merkle cache and the CPU-specific kernels are internal, so their
+    // tests live in their own files. The kernels' tests also run alone, and install as a binary to
+    // run under an emulator given an explicit CPU model: a system emulator registered with
+    // binfmt_misc would otherwise run it with its default CPU, whatever QEMU_CPU says.
+    const kernels = b.step("kernels", "Run only the tests of the CPU-specific kernels");
+
+    const kernels_binary = b.step("kernels-binary", "Install the kernels' tests as zig-out/bin/kernels");
+
+    for ([_][]const u8{ "src/x25519.zig", "src/cache.zig", "src/merkle.zig", "src/cpu_test.zig" }) |path| {
+        const artifact = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(path),
                 .target = target,
@@ -54,8 +64,29 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "build_options", .module = build_options },
                 },
             }),
-        }));
+        });
+
+        run(b, step, artifact);
+
+        if (std.mem.eql(u8, path, "src/cpu_test.zig")) {
+            run(b, kernels, artifact);
+
+            kernels_binary.dependOn(&b.addInstallArtifact(artifact, .{ .dest_sub_path = "kernels" }).step);
+        }
     }
+
+    // The assembly in src/asm/ is generated; the tests check that it is current.
+    const generator = b.addExecutable(.{
+        .name = "asm",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/asm.zig"),
+            .target = b.graph.host,
+        }),
+    });
+
+    step.dependOn(generate(b, generator, "--check"));
+
+    b.step("asm", "Rewrite src/asm/ from tools/asm.zig").dependOn(generate(b, generator, "--write"));
 
     const bench = b.addRunArtifact(b.addExecutable(.{
         .name = "bench",
@@ -123,6 +154,18 @@ pub fn build(b: *std.Build) void {
 
         check.dependOn(&command.step);
     }
+}
+
+fn generate(b: *std.Build, generator: *std.Build.Step.Compile, mode: []const u8) *std.Build.Step {
+    const command = b.addRunArtifact(generator);
+
+    command.addArg(mode);
+
+    command.addDirectoryArg(b.path("src/asm"));
+
+    command.has_side_effects = true;
+
+    return &command.step;
 }
 
 fn run(b: *std.Build, step: *std.Build.Step, artifact: *std.Build.Step.Compile) void {
