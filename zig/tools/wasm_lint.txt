@@ -21,7 +21,8 @@ crypto_pq_ml_dsa capi.signature.importPrivate 0 5 0 0 slot header, lengths, algo
 crypto_pq_ml_dsa capi.signature.keygen 0 2 0 0 slot header, lengths, algorithm id, flags, pre-hash entry and context length
 crypto_pq_ml_dsa capi.signature.preHash 0 43 0 1 the pre-hash id
 crypto_pq_ml_dsa capi.signature.publicFromPrivate 0 10 0 1 slot header, lengths, algorithm id, flags, pre-hash entry and context length
-crypto_pq_ml_dsa capi.signature.sign 0 11 0 1 slot header, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_ml_dsa capi.signature.sign 0 5 0 1 slot header, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_ml_dsa capi.signature.signAs 0 33 0 0 lengths, flags, pre-hash strength and context length, per parameter set
 crypto_pq_ml_dsa heap.BrkAllocator.alloc 0 4 0 0 allocation sizes
 crypto_pq_ml_dsa keccak.Keccak.read 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_ml_dsa keccak.Keccak.update 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
@@ -82,7 +83,8 @@ crypto_pq_slh_dsa capi.signature.importPrivate 0 14 0 0 slot header, lengths, al
 crypto_pq_slh_dsa capi.signature.keygen 0 2 0 0 slot header, lengths, algorithm id, flags, pre-hash entry and context length
 crypto_pq_slh_dsa capi.signature.preHash 0 43 0 1 the pre-hash id
 crypto_pq_slh_dsa capi.signature.publicFromPrivate 0 7 0 1 slot header, lengths, algorithm id, flags, pre-hash entry and context length
-crypto_pq_slh_dsa capi.signature.sign 0 29 0 1 slot header, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_slh_dsa capi.signature.sign 0 5 0 1 slot header, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_slh_dsa capi.signature.signAs 0 132 0 0 lengths, flags, pre-hash strength and context length, per parameter set
 crypto_pq_slh_dsa hash.Engine.digest 5 4 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_slh_dsa hash.Engine.update 2 10 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_slh_dsa hash.HashAlgorithm.digest 0 1 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing

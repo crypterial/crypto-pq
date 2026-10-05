@@ -572,40 +572,44 @@ fn signChecked(memory: ?[*]u8, length: usize, message: ?[*]const u8, message_len
 
     const entry = try preHash(pre_hash);
 
+    // Each parameter set signs in a frame of its own: unoptimized builds give every prong of an
+    // inline switch its own stack slots, which would add up to the deepest signature's stack.
     switch (slot.algorithm) {
         inline 0...count - 1 => |a| {
             if (comptime !enabled(a)) unreachable;
 
-            const S = Set(a);
-
-            const out = try common.exact(signature, signature_length, S.signature_size);
-
-            try common.apart(&.{ slot.bytes, out }, &.{ m, ctx, random });
-
-            if (flags & deterministic == 0 and random.len != S.randomness_size) return error.InvalidLength;
-
-            if (entry) |e| {
-                if (flags & hazmat == 0 and e.strength < S.strength) return error.InvalidOption;
-            }
-
-            if (ctx.len > 255) return error.InvalidContext;
-
-            const dit = cpu.Dit.enter();
-
-            defer dit.leave();
-
-            const private = slot.body(S.Private);
-
-            const rnd = if (flags & deterministic != 0) S.deterministicRandomness(private) else random[0..S.randomness_size];
-
-            var representative: signatures.Representative = undefined;
-
-            representative.init(m, ctx, entry);
-
-            try @call(.never_inline, S.sign, .{ private, representative.parts(), rnd, out[0..S.signature_size] });
+            return @call(.never_inline, signAs, .{ Set(a), slot, m, ctx, random, flags, entry, signature, signature_length });
         },
         else => unreachable,
     }
+}
+
+fn signAs(comptime S: type, slot: Slot, m: []const u8, ctx: []const u8, random: []const u8, flags: u32, entry: ?signatures.Entry, signature: ?[*]u8, signature_length: usize) Failure!void {
+    const out = try common.exact(signature, signature_length, S.signature_size);
+
+    try common.apart(&.{ slot.bytes, out }, &.{ m, ctx, random });
+
+    if (flags & deterministic == 0 and random.len != S.randomness_size) return error.InvalidLength;
+
+    if (entry) |e| {
+        if (flags & hazmat == 0 and e.strength < S.strength) return error.InvalidOption;
+    }
+
+    if (ctx.len > 255) return error.InvalidContext;
+
+    const dit = cpu.Dit.enter();
+
+    defer dit.leave();
+
+    const private = slot.body(S.Private);
+
+    const rnd = if (flags & deterministic != 0) S.deterministicRandomness(private) else random[0..S.randomness_size];
+
+    var representative: signatures.Representative = undefined;
+
+    representative.init(m, ctx, entry);
+
+    try @call(.never_inline, S.sign, .{ private, representative.parts(), rnd, out[0..S.signature_size] });
 }
 
 // rejected for a signature that does not verify, has the wrong length, comes with a context over
