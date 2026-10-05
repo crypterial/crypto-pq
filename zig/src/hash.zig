@@ -208,7 +208,10 @@ pub const Hmac = struct {
 
         checkLength(out.len, self.size);
 
+        // The inner hash and the outer key give the output, which may be a key itself.
         var inner: [64]u8 = undefined;
+
+        defer ct.wipe(&inner);
 
         self.inner.digest(inner[0..self.size]);
 

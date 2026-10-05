@@ -535,6 +535,52 @@ fn stateful(runner: *const Runner, name: []const u8, setup: Stateful) !void {
     try runner.case(verify, &verifier);
 }
 
+// Loading a key builds its trees from the leaves; with a tree cache it recomputes the parents of
+// the cached nodes instead.
+fn load(runner: *const Runner, name: []const u8, setup: Stateful) !void {
+    var storage: [2][64]u8 = undefined;
+
+    const plain = try std.fmt.bufPrint(&storage[0], "{s}/load", .{name});
+
+    const cached = try std.fmt.bufPrint(&storage[1], "{s}/load+cache", .{name});
+
+    if (!runner.selects(plain) and !runner.selects(cached)) return;
+
+    var store: MemoryStore = .{ .allocator = runner.allocator };
+
+    defer store.deinit();
+
+    var pair = try setup.generate(runner.allocator, &store);
+
+    defer pair.private_key.deinit(runner.allocator);
+
+    const cache = try pair.private_key.exportTreeCache(runner.allocator);
+
+    defer runner.allocator.free(cache);
+
+    const Load = struct {
+        algorithm: pq.StatefulSignatureAlgorithm,
+        store: *MemoryStore,
+        cache: ?[]const u8,
+
+        fn batch(self: *const @This(), r: *const Runner, count: u64) !i96 {
+            const start = r.now();
+
+            for (0..count) |_| {
+                var key = try self.algorithm.loadPrivateKey(r.allocator, self.store.store(), .{ .tree_cache = self.cache });
+
+                key.deinit(r.allocator);
+            }
+
+            return r.now() - start;
+        }
+    };
+
+    try runner.case(plain, &Load{ .algorithm = setup.algorithm, .store = &store, .cache = null });
+
+    try runner.case(cached, &Load{ .algorithm = setup.algorithm, .store = &store, .cache = cache });
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
@@ -590,4 +636,19 @@ pub fn main(init: std.process.Init) !void {
     try stateful(&runner, "XMSS-SHA2_10_256", .{ .algorithm = pq.xmss, .parameters = .{ .name = "XMSS-SHA2_10_256" }, .seed = seed[0..96] });
 
     try stateful(&runner, "XMSSMT-SHA2_20/4_256", .{ .algorithm = pq.xmss_mt, .parameters = .{ .name = "XMSSMT-SHA2_20/4_256" }, .seed = seed[0..96] });
+
+    try load(&runner, "HSS-H15-W4", .{
+        .algorithm = pq.hss_lms,
+        .parameters = .{ .levels = &.{.{ .lms = "LMS_SHA256_M32_H15", .ots = "LMOTS_SHA256_N32_W4" }} },
+        .seed = seed[0..48],
+    });
+
+    // A tree of height 20 takes tens of seconds to build, so it runs only when a filter selects it.
+    if (filter != null) {
+        try load(&runner, "HSS-H20-W4", .{
+            .algorithm = pq.hss_lms,
+            .parameters = .{ .levels = &.{.{ .lms = "LMS_SHA256_M32_H20", .ots = "LMOTS_SHA256_N32_W4" }} },
+            .seed = seed[0..48],
+        });
+    }
 }

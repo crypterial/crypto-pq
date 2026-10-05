@@ -496,6 +496,62 @@ test "cross XMSS vectors" {
     try parallelCostliestFirst(v.records, statefulKey);
 }
 
+// Each export is made again, and every cache loads, or fails to, as the reference decided; a key
+// that loads signs as the reference did.
+fn treeCache(_: void, r: vectors.Record, allocator: Allocator) !void {
+    errdefer std.debug.print("tree cache record failed: {s}: {s}\n", .{ r.header.get("algorithm"), r.values.get("name") });
+
+    const algorithm = named(pq.StatefulSignatureAlgorithm, &stateful, r.header.get("algorithm")) orelse return error.TestUnexpectedResult;
+
+    const state = try field(allocator, r.values, "state");
+
+    const cache = try field(allocator, r.values, "treeCache");
+
+    if (r.values.is("operation", "export")) {
+        var store: MemoryStore = .{ .allocator = allocator };
+
+        var pair = try hazmat.generateStatefulKeyPair(algorithm, allocator, try parameters(allocator, r.values), try field(allocator, r.values, "seed"), try vectors.number(u64, r.values.get("index")), store.store(), .{});
+
+        defer pair.private_key.deinit(allocator);
+
+        if (r.values.is("signed", "true")) _ = try pair.private_key.sign(allocator, try field(allocator, r.values, "message"));
+
+        try testing.expectEqualSlices(u8, cache, try pair.private_key.exportTreeCache(allocator));
+
+        try testing.expectEqualSlices(u8, state, store.state.?);
+    }
+
+    var store: MemoryStore = .{ .allocator = allocator, .state = state };
+
+    var key = algorithm.loadPrivateKey(allocator, store.store(), .{ .tree_cache = cache }) catch |err| {
+        try testing.expectEqualStrings(r.values.get("result"), code(err));
+
+        return;
+    };
+
+    defer key.deinit(allocator);
+
+    try testing.expectEqualStrings("ok", r.values.get("result"));
+
+    const public_key = key.publicKey();
+
+    try expectExport(allocator, try field(allocator, r.values, "publicKey"), &public_key, .raw);
+
+    try testing.expectEqual(try vectors.number(u64, r.values.get("remaining")), key.remainingSignatures());
+
+    if (r.values.find("signature") != null) {
+        try testing.expectEqualSlices(u8, try field(allocator, r.values, "signature"), try key.sign(allocator, try field(allocator, r.values, "message")));
+    }
+}
+
+test "cross tree cache vectors" {
+    const v = try vectors.Vectors.load("cross/treecache.txt", "treeCache");
+
+    defer v.deinit();
+
+    try parallelCostliestFirst(v.records, treeCache);
+}
+
 // The result of one error-table record: "ok", "true", "false" or an error code, with the output
 // and the remaining signatures it produced.
 const Outcome = struct {

@@ -406,6 +406,20 @@ fn Stateful(comptime algorithm: pq.StatefulSignatureAlgorithm, comptime label: [
             allocator.free(try loaded.sign(allocator, message));
         }
 
+        // The trees of the key are those that the stored index signs with, so the loaded key
+        // restores them all.
+        fn loadCachedAndSign() !void {
+            const cache = try key.exportTreeCache(allocator);
+
+            defer allocator.free(cache);
+
+            var loaded = try algorithm.loadPrivateKey(allocator, store.store(), .{ .tree_cache = cache });
+
+            defer loaded.deinit(allocator);
+
+            allocator.free(try loaded.sign(allocator, message));
+        }
+
         // The next index of the generated key: for two HSS levels it is the first of a new tree.
         fn sign() !void {
             allocator.free(try key.sign(allocator, message));
@@ -428,6 +442,7 @@ fn Stateful(comptime algorithm: pq.StatefulSignatureAlgorithm, comptime label: [
             .{ .name = label ++ " generateKeyPair", .run = generate },
             .{ .name = label ++ " sign", .run = sign },
             .{ .name = label ++ " loadPrivateKey, sign", .run = loadAndSign },
+            .{ .name = label ++ " exportTreeCache, loadPrivateKey(tree_cache), sign", .run = loadCachedAndSign },
             .{ .name = label ++ " verify", .run = verify },
             .{ .name = label ++ " importPublicKey", .run = importPublic },
         };

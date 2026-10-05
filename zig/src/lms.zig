@@ -826,6 +826,19 @@ const Tree = struct {
         ct.declassify(&self.merkle.root);
     }
 
+    // The tree from the nodes of a tree cache, checked against I; the nodes are public.
+    fn restore(self: *Tree, level: Level, i_value: *const [16]u8, seed: []const u8, nodes: []const u8) Error!void {
+        var context: TreeContext = .{ .level = level, .i_value = i_value.*, .seed = @splat(0) };
+
+        defer ct.wipe(&context.seed);
+
+        @memcpy(context.seed[0..seed.len], seed);
+
+        ct.declassify(&context.i_value);
+
+        try self.merkle.restore(context, nodes);
+    }
+
     fn deinit(self: *Tree, allocator: Allocator) void {
         ct.wipe(&self.merkle.context.seed);
 
@@ -868,19 +881,28 @@ const Tree = struct {
 
         const h = context.hasher();
 
-        derive(h, &context.i_value, q, child_seed, context.seed[0..h.n], seed);
-
-        var full: [max_n]u8 = undefined;
-
-        derive(h, &context.i_value, q, child_i, context.seed[0..h.n], &full);
-
-        i_value.* = full[0..16].*;
+        childKeys(h, &context.i_value, context.seed[0..h.n], q, i_value, seed);
     }
 };
+
+// The I and SEED of the child tree under leaf q of the tree with `i_value` and `seed`.
+fn childKeys(h: Hash, i_value: *const [16]u8, seed: []const u8, q: u32, child_i_value: *[16]u8, child_seed_value: *[max_n]u8) void {
+    derive(h, i_value, q, child_seed, seed, child_seed_value);
+
+    var full: [max_n]u8 = undefined;
+
+    derive(h, i_value, q, child_i, seed, &full);
+
+    child_i_value.* = full[0..16].*;
+}
 
 // The signing side of an HSS key: the trees on the path to the next leaf, rebuilt when the
 // index leaves a tree, and each child public key signed by its parent. Every level has its tree
 // memory from the start, so that signing never allocates.
+//
+// `cached` holds the trees of a verified tree cache that the next index signs with, top first.
+// The top one replaces the build. A lower one is checked now, so that a bad cache fails the load,
+// and stays `restored` until the first signature takes it instead of building its level.
 pub const Hss = struct {
     levels: [8]Level,
     count: usize,
@@ -888,9 +910,10 @@ pub const Hss = struct {
     built: usize,
     signed: [7][]u8,
     prefixes: [8]u64,
+    restored: [8]bool,
 
-    pub fn init(allocator: Allocator, levels: []const Level, i_value: *const [16]u8, seed: []const u8) (Error || Allocator.Error)!Hss {
-        var self: Hss = .{ .levels = undefined, .count = levels.len, .trees = undefined, .built = 1, .signed = undefined, .prefixes = @splat(0) };
+    pub fn init(allocator: Allocator, levels: []const Level, i_value: *const [16]u8, seed: []const u8, cached: []const merkle.CachedTree) (Error || Allocator.Error)!Hss {
+        var self: Hss = .{ .levels = undefined, .count = levels.len, .trees = undefined, .built = 1, .signed = undefined, .prefixes = @splat(0), .restored = @splat(false) };
 
         @memcpy(self.levels[0..levels.len], levels);
 
@@ -910,7 +933,29 @@ pub const Hss = struct {
             self.signed[signed] = try allocator.alloc(u8, lmsSignatureSize(levels[signed]) + levels[signed + 1].lms.publicKeySize());
         }
 
-        self.trees[0].build(levels[0], i_value, seed);
+        if (cached.len > 0 and cached[0].level == 0) {
+            try self.trees[0].restore(levels[0], i_value, seed, cached[0].nodes);
+        } else {
+            self.trees[0].build(levels[0], i_value, seed);
+        }
+
+        for (cached) |tree| {
+            if (tree.level == 0) continue;
+
+            var path_i_value: [16]u8 = undefined;
+
+            var path_seed: [max_n]u8 = undefined;
+
+            defer ct.wipe(&path_seed);
+
+            self.pathKeys(tree.level, tree.tree, &path_i_value, &path_seed);
+
+            try self.trees[tree.level].restore(levels[tree.level], &path_i_value, path_seed[0..levels[tree.level].lms.m], tree.nodes);
+
+            self.prefixes[tree.level] = tree.tree;
+
+            self.restored[tree.level] = true;
+        }
 
         return self;
     }
@@ -935,6 +980,54 @@ pub const Hss = struct {
 
     fn leafIndex(self: *const Hss, index: u64, level: usize) u32 {
         return @intCast((index >> self.heightBelow(level + 1)) & ((@as(u64, 1) << self.levels[level].lms.h) - 1));
+    }
+
+    // The I and SEED of tree `prefix` of `level`: the leaves that sign it on the levels above
+    // follow from its number.
+    fn pathKeys(self: *const Hss, level: usize, prefix: u64, i_value: *[16]u8, seed: *[max_n]u8) void {
+        const top = &self.trees[0].merkle.context;
+
+        const h = top.hasher();
+
+        i_value.* = top.i_value;
+
+        seed.* = top.seed;
+
+        for (0..level) |upper| {
+            var between: u6 = 0;
+
+            for (self.levels[upper + 1 .. level]) |l| between += l.lms.h;
+
+            const q: u32 = @intCast((prefix >> between) & ((@as(u64, 1) << self.levels[upper].lms.h) - 1));
+
+            var next_i_value: [16]u8 = undefined;
+
+            var next_seed: [max_n]u8 = undefined;
+
+            defer ct.wipe(&next_seed);
+
+            childKeys(h, i_value, seed[0..h.n], q, &next_i_value, &next_seed);
+
+            i_value.* = next_i_value;
+
+            seed.* = next_seed;
+        }
+    }
+
+    // Every tree the key holds, top first, as a tree cache lists it: the trees on the path of the
+    // last signature, then the restored ones that no signature has taken yet.
+    pub fn cachedTrees(self: *const Hss, out: []merkle.CachedTree) []merkle.CachedTree {
+        var count: usize = 0;
+
+        for (0..self.count) |level| {
+            if (level >= self.built and !self.restored[level]) continue;
+
+            out[count] = self.trees[level].merkle.cached(@intCast(level), self.prefixes[level]);
+
+            count += 1;
+        }
+
+        return out[0..count];
     }
 
     pub fn signatureSize(self: *const Hss) usize {
@@ -963,15 +1056,19 @@ pub const Hss = struct {
 
             const q = self.leafIndex(index, level - 1);
 
-            var i_value: [16]u8 = undefined;
+            if (!self.restored[level] or self.prefixes[level] != prefix) {
+                var i_value: [16]u8 = undefined;
 
-            var seed: [max_n]u8 = undefined;
+                var seed: [max_n]u8 = undefined;
 
-            defer ct.wipe(&seed);
+                defer ct.wipe(&seed);
 
-            parent.child(q, &i_value, &seed);
+                parent.child(q, &i_value, &seed);
 
-            self.trees[level].build(self.levels[level], &i_value, seed[0..self.levels[level].lms.m]);
+                self.trees[level].build(self.levels[level], &i_value, seed[0..self.levels[level].lms.m]);
+            }
+
+            self.restored[level] = false;
 
             const size = lmsSignatureSize(self.levels[level - 1]);
 

@@ -269,6 +269,18 @@ fn stateful(allocator: Allocator, algorithm: pq.StatefulSignatureAlgorithm, para
 
     try signs(allocator, &pair.public_key, &loaded);
 
+    // A tree cache is public, and its tag key comes from the seeds: loading with it checks the tag
+    // and the nodes, and restores the trees that the stored index still signs with.
+    const cache = try pair.private_key.exportTreeCache(allocator);
+
+    defer allocator.free(cache);
+
+    var restored = try algorithm.loadPrivateKey(allocator, store.store(), .{ .tree_cache = cache });
+
+    defer restored.deinit(allocator);
+
+    try signs(allocator, &pair.public_key, &restored);
+
     var fresh: Store = .{ .allocator = allocator };
 
     defer fresh.deinit();

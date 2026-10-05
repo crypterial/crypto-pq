@@ -4,7 +4,7 @@ const Error = @import("errors.zig").Error;
 
 const Allocator = std.mem.Allocator;
 
-const cached_height = 15;
+pub const cached_height = 15;
 
 const max_node_size = 32;
 
@@ -12,18 +12,31 @@ const max_node_size = 32;
 // today's largest tree (height 25) needs. A larger low is refused rather than allocated.
 const max_low = 10;
 
+// A tree as a tree cache lists it: its level or layer, its number there, the lowest height it
+// keeps, its height, n, and its nodes from height `low` up, level by level, left to right.
+pub const CachedTree = struct {
+    level: u8,
+    tree: u64,
+    low: u8,
+    height: u8,
+    n: u8,
+    nodes: []const u8,
+};
+
 // A Merkle tree that keeps its nodes from height `low` upwards, where low = max(0, h - 15).
 //
 // Building it computes every leaf once. An authentication path takes its upper nodes from the
 // cache and its lower ones from the 2^low-leaf subtree under the signed leaf. That subtree is
 // kept, every level of it, so the consecutive signatures under one subtree rebuild it once:
 // memory stays below 2^16 nodes plus the subtree for every height, and trees of height 15 or less
-// never recompute a leaf.
+// never recompute a leaf. The nodes of a tree cache replace the build: every parent is
+// recomputed from its children, so only the nodes at height `low` are taken as given.
 //
 // `Context` provides leaf(index, out), or leaves(first, out) with a `lanes` count, and
 // combine(z, j, left, right, out), where z is the height of the children and j the index of the
 // parent. The node memory is allocated once, so that a tree can be rebuilt for another context
-// without allocating.
+// without allocating. `computed` counts the leaves computed so far, which tests read to see that
+// a restored tree computes none.
 pub fn MerkleTree(comptime Context: type) type {
     return struct {
         const Self = @This();
@@ -36,6 +49,7 @@ pub fn MerkleTree(comptime Context: type) type {
         subtree: []u8,
         subtree_index: ?u64,
         root: [max_node_size]u8,
+        computed: u64,
 
         pub fn init(allocator: Allocator, height: u6, n: usize) (Error || Allocator.Error)!Self {
             const low = height -| cached_height;
@@ -50,7 +64,7 @@ pub fn MerkleTree(comptime Context: type) type {
 
             const subtree = try allocator.alloc(u8, if (low == 0) 0 else ((@as(usize, 2) << @intCast(low)) - 1) * n);
 
-            return .{ .context = undefined, .height = height, .low = low, .n = n, .nodes = nodes, .subtree = subtree, .subtree_index = null, .root = undefined };
+            return .{ .context = undefined, .height = height, .low = low, .n = n, .nodes = nodes, .subtree = subtree, .subtree_index = null, .root = undefined, .computed = 0 };
         }
 
         pub fn deinit(self: *Self, allocator: Allocator) void {
@@ -68,6 +82,8 @@ pub fn MerkleTree(comptime Context: type) type {
 
             if (self.low == 0) {
                 self.leaves(0, self.nodes[0 .. (@as(usize, 1) << @intCast(self.height)) * n]);
+
+                self.computed += @as(u64, 1) << self.height;
             } else {
                 for (0..@as(usize, 1) << @intCast(self.height - self.low)) |chunk| {
                     self.rebuild(chunk);
@@ -83,6 +99,37 @@ pub fn MerkleTree(comptime Context: type) type {
             }
 
             @memcpy(self.root[0..n], self.node(self.height, 0));
+        }
+
+        // Takes `nodes`, laid out as `self.nodes`, instead of building them, if every parent equals
+        // what its children give; otherwise the tree must be built or restored again before use.
+        pub fn restore(self: *Self, context: Context, nodes: []const u8) Error!void {
+            const n = self.n;
+
+            if (nodes.len != self.nodes.len) return error.InvalidEncoding;
+
+            self.context = context;
+
+            self.subtree_index = null;
+
+            @memcpy(self.nodes, nodes);
+
+            var parent: [max_node_size]u8 = undefined;
+
+            for (self.low..self.height) |z| {
+                for (0..@as(usize, 1) << @intCast(self.height - z - 1)) |j| {
+                    self.context.combine(@intCast(z), j, self.node(@intCast(z), 2 * j), self.node(@intCast(z), 2 * j + 1), parent[0..n]);
+
+                    if (!std.mem.eql(u8, parent[0..n], self.node(@intCast(z + 1), j))) return error.InvalidEncoding;
+                }
+            }
+
+            @memcpy(self.root[0..n], self.node(self.height, 0));
+        }
+
+        // The tree as a tree cache lists it.
+        pub fn cached(self: *const Self, level: u8, tree: u64) CachedTree {
+            return .{ .level = level, .tree = tree, .low = self.low, .height = self.height, .n = @intCast(self.n), .nodes = self.nodes };
         }
 
         // Leaves first .. first + out.len / n - 1, computed `Context.lanes` at a time by contexts
@@ -128,6 +175,8 @@ pub fn MerkleTree(comptime Context: type) type {
             const base = chunk << self.low;
 
             self.leaves(base, self.subtree[0 .. (@as(usize, 1) << @intCast(self.low)) * self.n]);
+
+            self.computed += @as(u64, 1) << self.low;
 
             for (0..self.low) |z| {
                 const offset = base >> @intCast(z + 1);
@@ -255,6 +304,76 @@ test "merkle cache above the cached height" {
         for (0..height) |z| {
             try testing.expectEqualSlices(u8, &levels[z][@intCast((case.index >> @intCast(z)) ^ 1)], path[z * 32 ..][0..32]);
         }
+    }
+}
+
+// The nodes of a built tree restore it without computing a leaf, with the same root and paths, and
+// a change of any one node is refused: every node but the root is a child of a recomputed parent.
+test "merkle restore" {
+    const testing = std.testing;
+
+    var calls: usize = 0;
+
+    const context: TestContext = .{ .calls = &calls };
+
+    for ([_]u6{ 5, 17 }) |height| {
+        var built = try MerkleTree(TestContext).init(testing.allocator, height, 32);
+
+        defer built.deinit(testing.allocator);
+
+        built.build(context);
+
+        var restored = try MerkleTree(TestContext).init(testing.allocator, height, 32);
+
+        defer restored.deinit(testing.allocator);
+
+        calls = 0;
+
+        try restored.restore(context, built.nodes);
+
+        try testing.expectEqual(0, calls);
+
+        try testing.expectEqual(0, restored.computed);
+
+        try testing.expectEqualSlices(u8, built.root[0..32], restored.root[0..32]);
+
+        const size = @as(usize, height) * 32;
+
+        for ([_]u64{ 0, 5, (@as(u64, 1) << height) - 1 }) |index| {
+            var expected: [17 * 32]u8 = undefined;
+
+            var path: [17 * 32]u8 = undefined;
+
+            built.authPath(index, expected[0..size]);
+
+            restored.authPath(index, path[0..size]);
+
+            try testing.expectEqualSlices(u8, expected[0..size], path[0..size]);
+        }
+
+        const nodes = try testing.allocator.dupe(u8, built.nodes);
+
+        defer testing.allocator.free(nodes);
+
+        const count = nodes.len / 32;
+
+        const positions = [_]usize{ 0, 1, count / 2, count - 2, count - 1 };
+
+        for (0..if (height == 5) count else positions.len) |i| {
+            const position = if (height == 5) i else positions[i];
+
+            nodes[32 * position + i % 32] ^= 1;
+
+            try testing.expectError(error.InvalidEncoding, restored.restore(context, nodes));
+
+            nodes[32 * position + i % 32] ^= 1;
+        }
+
+        try testing.expectError(error.InvalidEncoding, restored.restore(context, nodes[32..]));
+
+        try restored.restore(context, nodes);
+
+        try testing.expectEqualSlices(u8, built.root[0..32], restored.root[0..32]);
     }
 }
 

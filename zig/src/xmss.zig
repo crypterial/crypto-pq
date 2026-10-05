@@ -870,6 +870,9 @@ pub fn verify(p: Parameters, public_key: []const u8, message: []const u8, signat
 // below and the authentication path) depends only on index >> (L * h / d), so it is kept until
 // that prefix changes, as HSS keeps the signed public keys of its child trees. A layer whose part
 // is current has every layer above it current too.
+//
+// `cached` holds the trees of a verified tree cache that the next index signs with; each replaces
+// the build of its layer, checked against its own nodes.
 pub const Xmss = struct {
     hashes: Hashes,
     sk_prf: [max_n]u8,
@@ -883,7 +886,7 @@ pub const Xmss = struct {
         tree: merkle.MerkleTree(TreeContext),
     };
 
-    pub fn create(allocator: Allocator, p: Parameters, seed: []const u8) (Error || Allocator.Error)!*Xmss {
+    pub fn create(allocator: Allocator, p: Parameters, seed: []const u8, cached: []const merkle.CachedTree) (Error || Allocator.Error)!*Xmss {
         const n = p.n;
 
         const self = try allocator.create(Xmss);
@@ -913,9 +916,42 @@ pub const Xmss = struct {
 
         @memcpy(self.sk_prf[0..n], seed[n..][0..n]);
 
+        errdefer {
+            self.hashes.wipe();
+
+            ct.wipe(&self.sk_prf);
+        }
+
+        for (cached) |entry| {
+            const layer = &self.layers[entry.level];
+
+            try layer.tree.restore(.{ .hashes = &self.hashes, .layer = entry.level, .tree = entry.tree }, entry.nodes);
+
+            layer.index = entry.tree;
+        }
+
         @memcpy(self.root[0..n], self.tree(p.d - 1, 0).root[0..n]);
 
         return self;
+    }
+
+    // Every tree the key holds, top first, as a tree cache lists it.
+    pub fn cachedTrees(self: *const Xmss, out: []merkle.CachedTree) []merkle.CachedTree {
+        var count: usize = 0;
+
+        var layer: usize = self.hashes.p.d;
+
+        while (layer > 0) {
+            layer -= 1;
+
+            const held = &self.layers[layer];
+
+            out[count] = held.tree.cached(@intCast(layer), held.index orelse continue);
+
+            count += 1;
+        }
+
+        return out[0..count];
     }
 
     pub fn destroy(self: *Xmss, allocator: Allocator) void {
