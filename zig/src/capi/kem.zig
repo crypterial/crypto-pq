@@ -71,13 +71,14 @@ fn MlKem(comptime p: mlkem.Parameters) type {
             mlkem.keyGen(p, seed[0..32], seed[32..64], &private.public.key, &private.dk, &private.s, form);
         }
 
-        // The checks of FIPS 203, 7.3, then the key's parts, as the core imports an expanded key.
+        // The checks of FIPS 203, 7.3, on the copy that is kept, then the key's parts, as the core
+        // imports an expanded key.
         pub fn expand(private: *Private, dk: *const [expanded_size]u8) bool {
-            if (!mlkem.checkDecapsulationKey(p, dk)) return false;
-
             private.dk = dk.*;
 
-            private.public.key = dk[384 * @as(usize, p.k) ..][0..public_key_size].*;
+            if (!mlkem.checkDecapsulationKey(p, &private.dk)) return false;
+
+            private.public.key = private.dk[384 * @as(usize, p.k) ..][0..public_key_size].*;
 
             mlkem.decodeSecret(p, &private.dk, &private.s);
 
@@ -90,8 +91,8 @@ fn MlKem(comptime p: mlkem.Parameters) type {
             mlkem.encaps(p, form, randomness, secret, ciphertext);
         }
 
-        pub fn decapsulate(form: *const Form, private: *const Private, ciphertext: *const [ciphertext_size]u8) [32]u8 {
-            return mlkem.decaps(p, &private.s, form, &private.dk, ciphertext);
+        pub fn decapsulate(form: *const Form, private: *const Private, ciphertext: *const [ciphertext_size]u8, secret: *[32]u8) void {
+            mlkem.decapsInto(p, &private.s, form, &private.dk, ciphertext, secret);
         }
     };
 }
@@ -146,8 +147,8 @@ const XWing = struct {
         xwing.encapsulate(form, &public.key, randomness, secret, ciphertext);
     }
 
-    pub fn decapsulate(form: *const Form, private: *const Private, ciphertext: *const [ciphertext_size]u8) [32]u8 {
-        return xwing.decapsulate(&private.s, form, &private.dk, &private.scalar, &private.public.key, ciphertext);
+    pub fn decapsulate(form: *const Form, private: *const Private, ciphertext: *const [ciphertext_size]u8, secret: *[32]u8) void {
+        xwing.decapsulateInto(&private.s, form, &private.dk, &private.scalar, &private.public.key, ciphertext, secret);
     }
 };
 
@@ -186,11 +187,11 @@ fn known(algorithm: u32) Failure!void {
 }
 
 fn openPublic(memory: ?[*]u8, length: usize) Failure!Slot {
-    return common.open(&.{ .kem_public, .kem_private }, memory, length, size);
+    return common.open(&.{ .kem_public, .kem_private }, memory, length, size, .shared);
 }
 
 fn openPrivate(memory: ?[*]u8, length: usize) Failure!Slot {
-    return common.open(&.{.kem_private}, memory, length, size);
+    return common.open(&.{.kem_private}, memory, length, size, .shared);
 }
 
 // The public part of a public or a private slot.
@@ -225,7 +226,11 @@ fn generate(algorithm: u32, seed_pointer: ?[*]const u8, seed_length: usize, flag
 
             if (seed.len != S.seed_size) return error.InvalidLength;
 
-            @call(.never_inline, fromSeed, .{ S, slot.body(S.Private), seed[0..S.seed_size], flags & fill_cache != 0 });
+            const private = slot.body(S.Private);
+
+            private.seed = seed[0..S.seed_size].*;
+
+            @call(.never_inline, fromSeed, .{ S, private, flags & fill_cache != 0 });
         },
         else => unreachable,
     }
@@ -233,14 +238,14 @@ fn generate(algorithm: u32, seed_pointer: ?[*]const u8, seed_length: usize, flag
     slot.seal(common.has_seed);
 }
 
-fn fromSeed(comptime S: type, private: *S.Private, seed: *const [S.seed_size]u8, fill: bool) void {
+// The key of the seed already in the slot: the caller's buffer is read once, so the key and the
+// seed it keeps are the same whatever that memory does meanwhile.
+fn fromSeed(comptime S: type, private: *S.Private, fill: bool) void {
     private.public.form.init();
 
-    S.generate(private, seed, if (fill) private.public.form.claim() else null);
+    S.generate(private, &private.seed, if (fill) private.public.form.claim() else null);
 
     if (fill) private.public.form.publish();
-
-    private.seed = seed.*;
 }
 
 pub fn importPublic(algorithm: u32, key: ?[*]const u8, key_length: usize, memory: ?[*]u8, length: usize) callconv(.c) c_int {
@@ -264,11 +269,16 @@ fn importPublicKey(algorithm: u32, key: ?[*]const u8, key_length: usize, memory:
 
             if (bytes.len != S.public_key_size) return error.InvalidLength;
 
-            if (!@call(.never_inline, S.check, .{bytes[0..S.public_key_size]})) return error.InvalidPublicKey;
-
+            // The key checked is the copy that is kept.
             const public = slot.body(S.Public);
 
             public.key = bytes[0..S.public_key_size].*;
+
+            if (!@call(.never_inline, S.check, .{&public.key})) {
+                slot.discard();
+
+                return error.InvalidPublicKey;
+            }
 
             public.form.init();
         },
@@ -289,8 +299,6 @@ fn importPrivateKey(algorithm: u32, key: ?[*]const u8, key_length: usize, memory
 
     const slot = try common.place(.kem_private, algorithm, memory, length, size(.kem_private, algorithm));
 
-    errdefer slot.discard();
-
     const bytes = try common.input(key, key_length);
 
     try common.apart(&.{slot.bytes}, &.{bytes});
@@ -305,15 +313,20 @@ fn importPrivateKey(algorithm: u32, key: ?[*]const u8, key_length: usize, memory
 
             const S = Set(a);
 
+            if (bytes.len != S.seed_size and (S.x_wing or bytes.len != S.expanded_size)) return error.InvalidLength;
+
+            // The slot may hold part of the key from here on.
+            errdefer slot.discard();
+
             const private = slot.body(S.Private);
 
             if (bytes.len == S.seed_size) {
-                @call(.never_inline, fromSeed, .{ S, private, bytes[0..S.seed_size], false });
+                private.seed = bytes[0..S.seed_size].*;
+
+                @call(.never_inline, fromSeed, .{ S, private, false });
 
                 return slot.seal(common.has_seed);
             }
-
-            if (S.x_wing or bytes.len != S.expanded_size) return error.InvalidLength;
 
             if (!@call(.never_inline, S.expand, .{ private, bytes[0..S.expanded_size] })) return error.InvalidPrivateKey;
 
@@ -336,6 +349,8 @@ pub fn publicFromPrivate(private_memory: ?[*]u8, private_length: usize, memory: 
 fn derivePublic(private_memory: ?[*]u8, private_length: usize, memory: ?[*]u8, length: usize) Failure!void {
     const private_slot = try openPrivate(private_memory, private_length);
 
+    defer private_slot.close();
+
     const slot = try common.place(.kem_public, private_slot.algorithm, memory, length, size(.kem_public, private_slot.algorithm));
 
     try common.apart(&.{slot.bytes}, &.{private_slot.bytes});
@@ -357,6 +372,8 @@ fn derivePublic(private_memory: ?[*]u8, private_length: usize, memory: ?[*]u8, l
         else => unreachable,
     }
 
+    try private_slot.confirm(&.{slot.bytes});
+
     slot.seal(0);
 }
 
@@ -366,6 +383,8 @@ pub fn exportPublic(memory: ?[*]u8, length: usize, out: ?[*]u8, out_length: usiz
 
 fn exportPublicKey(memory: ?[*]u8, length: usize, out: ?[*]u8, out_length: usize) Failure!void {
     const slot = try openPublic(memory, length);
+
+    defer slot.close();
 
     switch (slot.algorithm) {
         inline 0...count - 1 => |a| {
@@ -378,6 +397,8 @@ fn exportPublicKey(memory: ?[*]u8, length: usize, out: ?[*]u8, out_length: usize
             try common.apart(&.{target}, &.{slot.bytes});
 
             @memcpy(target, &publicPart(S, slot).key);
+
+            try slot.confirm(&.{target});
         },
         else => unreachable,
     }
@@ -390,6 +411,8 @@ pub fn exportPrivate(memory: ?[*]u8, length: usize, which: u32, out: ?[*]u8, out
 
 fn exportPrivateKey(memory: ?[*]u8, length: usize, which: u32, out: ?[*]u8, out_length: usize) Failure!void {
     const slot = try openPrivate(memory, length);
+
+    defer slot.close();
 
     if (which != export_seed and which != export_expanded) return error.BadArgument;
 
@@ -413,6 +436,8 @@ fn exportPrivateKey(memory: ?[*]u8, length: usize, which: u32, out: ?[*]u8, out_
                 try common.apart(&.{target}, &.{slot.bytes});
 
                 @memcpy(target, &private.seed);
+
+                try slot.confirm(&.{target});
             } else {
                 if (S.x_wing) return error.Unsupported;
 
@@ -421,6 +446,8 @@ fn exportPrivateKey(memory: ?[*]u8, length: usize, which: u32, out: ?[*]u8, out_
                 try common.apart(&.{target}, &.{slot.bytes});
 
                 @memcpy(target, &private.dk);
+
+                try slot.confirm(&.{target});
             }
         },
         else => unreachable,
@@ -434,6 +461,8 @@ pub fn encapsulate(memory: ?[*]u8, length: usize, randomness: ?[*]const u8, rand
 
 fn encapsulateChecked(memory: ?[*]u8, length: usize, randomness: ?[*]const u8, randomness_length: usize, ciphertext: ?[*]u8, ciphertext_length: usize, secret: ?[*]u8, secret_length: usize) Failure!void {
     const slot = try openPublic(memory, length);
+
+    defer slot.close();
 
     const random = try common.input(randomness, randomness_length);
 
@@ -456,6 +485,8 @@ fn encapsulateChecked(memory: ?[*]u8, length: usize, randomness: ?[*]const u8, r
             defer dit.leave();
 
             @call(.never_inline, encapsulateWith, .{ S, publicPart(S, slot), random[0..S.randomness_size], c[0..S.ciphertext_size], shared[0..32] });
+
+            try slot.confirm(&.{ c, shared });
         },
         else => unreachable,
     }
@@ -484,6 +515,8 @@ pub fn decapsulate(memory: ?[*]u8, length: usize, ciphertext: ?[*]const u8, ciph
 fn decapsulateChecked(memory: ?[*]u8, length: usize, ciphertext: ?[*]const u8, ciphertext_length: usize, secret: ?[*]u8, secret_length: usize) Failure!void {
     const slot = try openPrivate(memory, length);
 
+    defer slot.close();
+
     const c = try common.input(ciphertext, ciphertext_length);
 
     switch (slot.algorithm) {
@@ -502,24 +535,27 @@ fn decapsulateChecked(memory: ?[*]u8, length: usize, ciphertext: ?[*]const u8, c
 
             defer dit.leave();
 
-            shared[0..32].* = @call(.never_inline, decapsulateWith, .{ S, slot.body(S.Private), c[0..S.ciphertext_size] });
+            @call(.never_inline, decapsulateWith, .{ S, slot.body(S.Private), c[0..S.ciphertext_size], shared[0..32] });
+
+            try slot.confirm(&.{shared});
         },
         else => unreachable,
     }
 }
 
-fn decapsulateWith(comptime S: type, private: *S.Private, ciphertext: *const [S.ciphertext_size]u8) [32]u8 {
-    if (private.public.form.get(private.public.ek())) |form| return S.decapsulate(form, private, ciphertext);
+// The shared secret goes straight to the caller's buffer: no frame keeps a copy of it.
+fn decapsulateWith(comptime S: type, private: *S.Private, ciphertext: *const [S.ciphertext_size]u8, secret: *[32]u8) void {
+    if (private.public.form.get(private.public.ek())) |form| return S.decapsulate(form, private, ciphertext, secret);
 
-    return decapsulateUncached(S, private, ciphertext);
+    decapsulateUncached(S, private, ciphertext, secret);
 }
 
-noinline fn decapsulateUncached(comptime S: type, private: *const S.Private, ciphertext: *const [S.ciphertext_size]u8) [32]u8 {
+noinline fn decapsulateUncached(comptime S: type, private: *const S.Private, ciphertext: *const [S.ciphertext_size]u8, secret: *[32]u8) void {
     var form: S.Form = undefined;
 
     form.fill(private.public.ek());
 
-    return S.decapsulate(&form, private, ciphertext);
+    S.decapsulate(&form, private, ciphertext, secret);
 }
 
 // The pairwise consistency test of key generation, with the caller's randomness for the
@@ -530,6 +566,8 @@ pub fn selfTest(memory: ?[*]u8, length: usize, randomness: ?[*]const u8, randomn
 
 fn selfTestChecked(memory: ?[*]u8, length: usize, randomness: ?[*]const u8, randomness_length: usize) Failure!void {
     const slot = try openPrivate(memory, length);
+
+    defer slot.close();
 
     const random = try common.input(randomness, randomness_length);
 
@@ -547,7 +585,11 @@ fn selfTestChecked(memory: ?[*]u8, length: usize, randomness: ?[*]const u8, rand
 
             defer dit.leave();
 
-            if (!@call(.never_inline, pairwise, .{ S, slot.body(S.Private), random[0..S.randomness_size] })) return error.SelfTestFailed;
+            const passed = @call(.never_inline, pairwise, .{ S, slot.body(S.Private), random[0..S.randomness_size] });
+
+            try slot.confirm(&.{});
+
+            if (!passed) return error.SelfTestFailed;
         },
         else => unreachable,
     }
@@ -568,7 +610,7 @@ fn pairwise(comptime S: type, private: *S.Private, randomness: *const [S.randomn
 
     encapsulateWith(S, &private.public, randomness, &ciphertext, &sent);
 
-    received = decapsulateWith(S, private, &ciphertext);
+    decapsulateWith(S, private, &ciphertext, &received);
 
     // The outcome is public: key generation fails on it.
     return ct.declassifyValue(bool, ct.equal(&sent, &received));

@@ -813,14 +813,13 @@ const Tree = struct {
         return .{ .merkle = try .init(allocator, level.lms.h, level.lms.m) };
     }
 
+    // The context, which holds SEED, is written in the tree itself: no frame keeps a copy of it.
     fn build(self: *Tree, level: Level, i_value: *const [16]u8, seed: []const u8) void {
-        var context: TreeContext = .{ .level = level, .i_value = i_value.*, .seed = @splat(0) };
+        self.merkle.context = .{ .level = level, .i_value = i_value.*, .seed = @splat(0) };
 
-        defer ct.wipe(&context.seed);
+        @memcpy(self.merkle.context.seed[0..seed.len], seed);
 
-        @memcpy(context.seed[0..seed.len], seed);
-
-        self.merkle.build(context);
+        self.merkle.buildInPlace();
 
         // I and the root form the tree's public key.
         ct.declassify(&self.merkle.context.i_value);
@@ -830,15 +829,13 @@ const Tree = struct {
 
     // The tree from the nodes of a tree cache, checked against I; the nodes are public.
     fn restore(self: *Tree, level: Level, i_value: *const [16]u8, seed: []const u8, nodes: []const u8) Error!void {
-        var context: TreeContext = .{ .level = level, .i_value = i_value.*, .seed = @splat(0) };
+        self.merkle.context = .{ .level = level, .i_value = i_value.*, .seed = @splat(0) };
 
-        defer ct.wipe(&context.seed);
+        @memcpy(self.merkle.context.seed[0..seed.len], seed);
 
-        @memcpy(context.seed[0..seed.len], seed);
+        ct.declassify(&self.merkle.context.i_value);
 
-        ct.declassify(&context.i_value);
-
-        try self.merkle.restore(context, nodes);
+        try self.merkle.restoreInPlace(nodes);
     }
 
     fn deinit(self: *Tree, allocator: Allocator) void {
@@ -914,8 +911,9 @@ pub const Hss = struct {
     prefixes: [8]u64,
     restored: [8]bool,
 
-    pub fn init(allocator: Allocator, levels: []const Level, i_value: *const [16]u8, seed: []const u8, cached: []const merkle.CachedTree) (Error || Allocator.Error)!Hss {
-        var self: Hss = .{ .levels = undefined, .count = levels.len, .trees = undefined, .built = 1, .signed = undefined, .prefixes = @splat(0), .restored = @splat(false) };
+    // Built in place: the trees hold their SEEDs, which no dead frame keeps a copy of.
+    pub fn init(self: *Hss, allocator: Allocator, levels: []const Level, i_value: *const [16]u8, seed: []const u8, cached: []const merkle.CachedTree) (Error || Allocator.Error)!void {
+        self.* = .{ .levels = undefined, .count = levels.len, .trees = undefined, .built = 1, .signed = undefined, .prefixes = @splat(0), .restored = @splat(false) };
 
         @memcpy(self.levels[0..levels.len], levels);
 
@@ -958,8 +956,6 @@ pub const Hss = struct {
 
             self.restored[tree.level] = true;
         }
-
-        return self;
     }
 
     pub fn deinit(self: *Hss, allocator: Allocator) void {

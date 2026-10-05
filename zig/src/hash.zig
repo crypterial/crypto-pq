@@ -132,7 +132,11 @@ pub const HmacAlgorithm = struct {
 
         defer dit.leave();
 
-        var hmac = self.create(key);
+        var hmac: Hmac = undefined;
+
+        defer ct.wipe(std.mem.asBytes(&hmac));
+
+        self.init(&hmac, key);
 
         hmac.update(data);
 
@@ -140,6 +144,17 @@ pub const HmacAlgorithm = struct {
     }
 
     pub fn create(self: HmacAlgorithm, key: []const u8) Hmac {
+        var hmac: Hmac = undefined;
+
+        defer ct.wipe(std.mem.asBytes(&hmac));
+
+        self.init(&hmac, key);
+
+        return hmac;
+    }
+
+    // Built in place: the engines' states derive from the key, and no other frame keeps them.
+    pub fn init(self: HmacAlgorithm, hmac: *Hmac, key: []const u8) void {
         const dit = cpu.Dit.enter();
 
         defer dit.leave();
@@ -160,19 +175,19 @@ pub const HmacAlgorithm = struct {
             b.* ^= 0x36;
         }
 
-        var inner = self.hash.create().engine;
+        hmac.size = self.digest_size;
 
-        inner.update(pad[0..block]);
+        hmac.inner = self.hash.create().engine;
+
+        hmac.inner.update(pad[0..block]);
 
         for (&pad) |*b| {
             b.* ^= 0x36 ^ 0x5c;
         }
 
-        var outer = self.hash.create().engine;
+        hmac.outer = self.hash.create().engine;
 
-        outer.update(pad[0..block]);
-
-        return .{ .inner = inner, .outer = outer, .size = self.digest_size };
+        hmac.outer.update(pad[0..block]);
     }
 
     pub fn verify(self: HmacAlgorithm, key: []const u8, data: []const u8, tag: []const u8) bool {
@@ -180,7 +195,11 @@ pub const HmacAlgorithm = struct {
 
         defer dit.leave();
 
-        var hmac = self.create(key);
+        var hmac: Hmac = undefined;
+
+        defer ct.wipe(std.mem.asBytes(&hmac));
+
+        self.init(&hmac, key);
 
         hmac.update(data);
 
@@ -232,6 +251,8 @@ pub const Hmac = struct {
         if (tag.len != self.size) return false;
 
         var expected: [64]u8 = undefined;
+
+        defer ct.wipe(&expected);
 
         self.digest(expected[0..self.size]);
 

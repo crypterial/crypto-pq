@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const capi = @import("../capi.zig");
 const common = @import("common.zig");
 
 const ct = @import("../ct.zig");
@@ -7,49 +8,75 @@ const ct = @import("../ct.zig");
 // WebAssembly only: the host places a call's inputs in linear memory and reads its outputs there,
 // in blocks from this allocator, and zeroes the stack region after an operation on secrets.
 
-// Each block carries its size behind a magic, so that a free with a wrong size, a double free or
-// a pointer that never came from here is refused instead of corrupting the allocator.
-const Block = extern struct {
-    magic: u64,
-    size: u64,
-};
-
-const block_magic: u64 = 0x6b63_6f6c_6271_7063;
-
 const alignment = 16;
 
-comptime {
-    std.debug.assert(@sizeOf(Block) == alignment);
+// The blocks handed out and not yet freed, with their sizes, kept apart from the blocks: data that
+// the host writes in a block can never look like a block, and a free must name one of these
+// exactly. The table grows with the blocks, as long as memory does.
+var blocks: std.AutoHashMapUnmanaged(usize, usize) = .empty;
+
+// A freed block waits here, zeroed, before its memory can be handed out again: a second free of an
+// address, or a use of one, right after the next allocation does not reach that allocation.
+const quarantine_blocks = 16;
+
+const quarantine_bytes = 256 << 10;
+
+var quarantine: [quarantine_blocks][]align(alignment) u8 = undefined;
+
+var quarantine_count: usize = 0;
+
+var quarantine_first: usize = 0;
+
+var quarantined_bytes: usize = 0;
+
+fn release(memory: []align(alignment) u8) void {
+    while (quarantine_count == quarantine_blocks or (quarantine_count > 0 and quarantined_bytes + memory.len > quarantine_bytes)) {
+        const oldest = quarantine[quarantine_first];
+
+        quarantine_first = (quarantine_first + 1) % quarantine_blocks;
+
+        quarantine_count -= 1;
+
+        quarantined_bytes -= oldest.len;
+
+        common.allocator.free(oldest);
+    }
+
+    quarantine[(quarantine_first + quarantine_count) % quarantine_blocks] = memory;
+
+    quarantine_count += 1;
+
+    quarantined_bytes += memory.len;
 }
 
 // A block of `size` bytes, aligned to 16, or 0 when memory cannot grow.
 pub fn alloc(size: usize) callconv(.c) usize {
-    const total = std.math.add(usize, size, alignment) catch return 0;
+    blocks.ensureUnusedCapacity(common.allocator, 1) catch return 0;
 
-    const memory = common.allocator.alignedAlloc(u8, .fromByteUnits(alignment), total) catch return 0;
+    const memory = common.allocator.alignedAlloc(u8, .fromByteUnits(alignment), @max(size, 1)) catch return 0;
 
-    const block: *Block = @ptrCast(memory.ptr);
+    blocks.putAssumeCapacity(@intFromPtr(memory.ptr), size);
 
-    block.* = .{ .magic = block_magic, .size = size };
-
-    return @intFromPtr(memory.ptr) + alignment;
+    return @intFromPtr(memory.ptr);
 }
 
-// Zeroes the block, then frees it.
+// Ends every slot in the block, as cpq_slot_wipe does (a stateful signer is freed: BUSY or
+// STATE_CONFLICT while a call holds one, and the block stays), zeroes it, then frees it. An
+// address that cpq_alloc did not return, or with another size, is BAD_ARGUMENT.
 pub fn free(address: usize, size: usize) callconv(.c) c_int {
-    if (address < alignment or address % alignment != 0) return common.bad_argument;
+    const recorded = blocks.get(address) orelse return common.bad_argument;
 
-    if (size > @wasmMemorySize(0) * std.wasm.page_size - address) return common.bad_argument;
+    if (recorded != size) return common.bad_argument;
 
-    const block: *Block = @ptrFromInt(address - alignment);
+    const memory = @as([*]align(alignment) u8, @ptrFromInt(address))[0..@max(size, 1)];
 
-    if (block.magic != block_magic or block.size != size) return common.bad_argument;
-
-    const memory: []align(alignment) u8 = @as([*]align(alignment) u8, @ptrCast(@alignCast(block)))[0 .. size + alignment];
+    capi.wipeRange(memory[0..size]) catch |err| return common.code(err);
 
     ct.wipe(memory);
 
-    common.allocator.free(memory);
+    _ = blocks.remove(address);
+
+    release(memory);
 
     return common.ok;
 }

@@ -6,23 +6,26 @@
 # marks every secret; a change to a count must be reviewed again before the list is updated.
 #
 # module function select br_if if br_table reason
-crypto_pq_ml_dsa capi.memory.free 0 2 0 0 the block's magic and size
+crypto_pq_ml_dsa capi.common.Slot.close 1 18 0 0 the slot's users word: the last call out of a slot that a wipe marked zeroes it, by its length
+crypto_pq_ml_dsa capi.memory.free 1 24 0 0 the table of live blocks (addresses, sizes), the quarantine, lengths
 crypto_pq_ml_dsa capi.signature.MlDsa(.{.k=4,.l=4,.eta=2,.tau=39,.lambda=128,.gamma1=131072,.gamma2=95232,.omega=80}).importSecret 0 1 0 0 outcome of the expanded-key check, declassified: import fails on it
-crypto_pq_ml_dsa capi.signature.MlDsa(.{.k=4,.l=4,.eta=2,.tau=39,.lambda=128,.gamma1=131072,.gamma2=95232,.omega=80}).sign 4 4 0 2 the state words of the two caches
+crypto_pq_ml_dsa capi.signature.MlDsa(.{.k=4,.l=4,.eta=2,.tau=39,.lambda=128,.gamma1=131072,.gamma2=95232,.omega=80}).sign 4 8 0 0 the state words of the two caches
 crypto_pq_ml_dsa capi.signature.MlDsa(.{.k=4,.l=4,.eta=2,.tau=39,.lambda=128,.gamma1=131072,.gamma2=95232,.omega=80}).signSpare 0 3 0 0 the allocation result and which cache another call is filling
 crypto_pq_ml_dsa capi.signature.MlDsa(.{.k=6,.l=5,.eta=4,.tau=49,.lambda=192,.gamma1=524288,.gamma2=261888,.omega=55}).importSecret 0 1 0 0 outcome of the expanded-key check, declassified: import fails on it
-crypto_pq_ml_dsa capi.signature.MlDsa(.{.k=6,.l=5,.eta=4,.tau=49,.lambda=192,.gamma1=524288,.gamma2=261888,.omega=55}).sign 4 4 0 2 the state words of the two caches
+crypto_pq_ml_dsa capi.signature.MlDsa(.{.k=6,.l=5,.eta=4,.tau=49,.lambda=192,.gamma1=524288,.gamma2=261888,.omega=55}).sign 4 8 0 0 the state words of the two caches
 crypto_pq_ml_dsa capi.signature.MlDsa(.{.k=6,.l=5,.eta=4,.tau=49,.lambda=192,.gamma1=524288,.gamma2=261888,.omega=55}).signSpare 0 3 0 0 the allocation result and which cache another call is filling
 crypto_pq_ml_dsa capi.signature.MlDsa(.{.k=8,.l=7,.eta=2,.tau=60,.lambda=256,.gamma1=524288,.gamma2=261888,.omega=75}).importSecret 0 1 0 0 outcome of the expanded-key check, declassified: import fails on it
-crypto_pq_ml_dsa capi.signature.MlDsa(.{.k=8,.l=7,.eta=2,.tau=60,.lambda=256,.gamma1=524288,.gamma2=261888,.omega=75}).sign 4 4 0 2 the state words of the two caches
+crypto_pq_ml_dsa capi.signature.MlDsa(.{.k=8,.l=7,.eta=2,.tau=60,.lambda=256,.gamma1=524288,.gamma2=261888,.omega=75}).sign 4 8 0 0 the state words of the two caches
 crypto_pq_ml_dsa capi.signature.MlDsa(.{.k=8,.l=7,.eta=2,.tau=60,.lambda=256,.gamma1=524288,.gamma2=261888,.omega=75}).signSpare 0 3 0 0 the allocation result and which cache another call is filling
-crypto_pq_ml_dsa capi.signature.exportPrivate 0 7 0 1 slot header, lengths, algorithm id, flags, pre-hash entry and context length
-crypto_pq_ml_dsa capi.signature.importPrivate 0 5 0 0 slot header, lengths, algorithm id, flags, pre-hash entry and context length
-crypto_pq_ml_dsa capi.signature.keygen 0 2 0 0 slot header, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_ml_dsa capi.signature.exportPrivate 8 169 0 1 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_ml_dsa capi.signature.importPrivate 0 6 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_ml_dsa capi.signature.keygen 0 3 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_ml_dsa capi.signature.openPrivate 1 12 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
 crypto_pq_ml_dsa capi.signature.preHash 0 43 0 1 the pre-hash id
-crypto_pq_ml_dsa capi.signature.publicFromPrivate 0 10 0 1 slot header, lengths, algorithm id, flags, pre-hash entry and context length
-crypto_pq_ml_dsa capi.signature.sign 0 5 0 1 slot header, lengths, algorithm id, flags, pre-hash entry and context length
-crypto_pq_ml_dsa capi.signature.signAs 0 33 0 0 lengths, flags, pre-hash strength and context length, per parameter set
+crypto_pq_ml_dsa capi.signature.publicFromPrivate 3 68 0 1 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_ml_dsa capi.signature.sign 8 146 0 1 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_ml_dsa capi.signature.signAs 0 45 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_ml_dsa capi.wipeRange 4 37 0 0 slot headers in the range (magic, size, users word), the signer registry entries, lengths
 crypto_pq_ml_dsa heap.BrkAllocator.alloc 0 4 0 0 allocation sizes
 crypto_pq_ml_dsa keccak.Keccak.read 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_ml_dsa keccak.Keccak.update 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
@@ -38,22 +41,26 @@ crypto_pq_ml_dsa mldsa.sign 2 68 0 0 an attempt's rejection outcome (declassifie
 crypto_pq_ml_dsa sha2.blocks256 0 1 0 0 block counts from the length
 crypto_pq_ml_dsa sha2.blocks512 0 1 0 0 block counts from the length
 crypto_pq_ml_dsa signature.Representative.init 8 12 0 3 the pre-hash kind and the lengths of the message representative
-crypto_pq_ml_kem capi.common.Lazy(mlkem.EncapsulationKey(2)).get 2 1 0 1 the cache state word
-crypto_pq_ml_kem capi.common.apart 0 33 0 0 the addresses and lengths of the call's buffers
+crypto_pq_ml_kem capi.common.Lazy(mlkem.EncapsulationKey(2)).get 2 3 0 0 the cache state word: empty, or the address the cache was filled or is being filled at
+crypto_pq_ml_kem capi.common.Slot.close 1 18 0 0 the slot's users word: the last call out of a slot that a wipe marked zeroes it, by its length
+crypto_pq_ml_kem capi.common.apart 0 34 0 0 the addresses and lengths of the call's buffers
 crypto_pq_ml_kem capi.kem.MlKem(.{.k=2,.eta1=3,.eta2=2,.du=10,.dv=4}).expand 0 9 0 0 outcome of the FIPS 203 import check, public: import fails on it
 crypto_pq_ml_kem capi.kem.MlKem(.{.k=3,.eta1=2,.eta2=2,.du=10,.dv=4}).expand 0 2 0 0 outcome of the FIPS 203 import check, public: import fails on it
 crypto_pq_ml_kem capi.kem.MlKem(.{.k=4,.eta1=2,.eta2=2,.du=11,.dv=5}).expand 0 2 0 0 outcome of the FIPS 203 import check, public: import fails on it
-crypto_pq_ml_kem capi.kem.decapsulate 0 4 0 1 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_ml_kem capi.kem.decapsulateWith 2 5 0 2 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_ml_kem capi.kem.encapsulate 0 7 0 2 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_ml_kem capi.kem.encapsulateWith 2 5 0 2 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_ml_kem capi.kem.exportPrivate 0 7 0 1 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_ml_kem capi.kem.importPrivate 0 2 0 0 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_ml_kem capi.kem.keygen 0 2 0 0 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_ml_kem capi.kem.pairwise 2 6 0 2 cache state; the self-test outcome, declassified: key generation fails on it
-crypto_pq_ml_kem capi.kem.publicFromPrivate 0 10 0 1 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_ml_kem capi.kem.selfTest 0 7 0 1 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_ml_kem capi.memory.free 0 2 0 0 the block's magic and size
+crypto_pq_ml_kem capi.kem.decapsulate 8 157 0 1 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_ml_kem capi.kem.decapsulateWith 2 9 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_ml_kem capi.kem.encapsulate 8 157 0 1 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_ml_kem capi.kem.encapsulateWith 2 9 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_ml_kem capi.kem.exportPrivate 11 226 0 1 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_ml_kem capi.kem.importPrivate 0 3 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_ml_kem capi.kem.keygen 0 3 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_ml_kem capi.kem.openPrivate 1 12 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_ml_kem capi.kem.openPublic 17 10 0 2 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_ml_kem capi.kem.pairwise 2 10 0 0 cache state; the self-test outcome, declassified: key generation fails on it
+crypto_pq_ml_kem capi.kem.publicFromPrivate 3 66 0 1 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_ml_kem capi.kem.selfTest 11 214 0 1 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_ml_kem capi.memory.free 1 24 0 0 the table of live blocks (addresses, sizes), the quarantine, lengths
+crypto_pq_ml_kem capi.wipeRange 4 37 0 0 slot headers in the range (magic, size, users word), the signer registry entries, lengths
 crypto_pq_ml_kem hash.Hasher.digest 5 3 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_ml_kem hash.Hasher.update 2 10 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_ml_kem keccak.Keccak.read 1 10 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
@@ -65,7 +72,8 @@ crypto_pq_ml_kem mlkem.sampleMatrix 0 15 0 0 rejection sampling of the public ma
 crypto_pq_ml_kem primitives.digest 0 2 0 0 lengths of the parts hashed
 crypto_pq_ml_kem sha2.blocks256 0 1 0 0 block counts from the length
 crypto_pq_ml_kem sha2.blocks512 0 1 0 0 block counts from the length
-crypto_pq_slh_dsa capi.memory.free 0 2 0 0 the block's magic and size
+crypto_pq_slh_dsa capi.common.Slot.close 1 18 0 0 the slot's users word: the last call out of a slot that a wipe marked zeroes it, by its length
+crypto_pq_slh_dsa capi.memory.free 1 24 0 0 the table of live blocks (addresses, sizes), the quarantine, lengths
 crypto_pq_slh_dsa capi.signature.SlhDsa(.{.shake=false,.n=16,.h=63,.d=7,.hp=9,.a=12,.k=14,.m=30}).importSecret 0 1 0 0 outcome of the root check, declassified: import fails on it
 crypto_pq_slh_dsa capi.signature.SlhDsa(.{.shake=false,.n=16,.h=66,.d=22,.hp=3,.a=6,.k=33,.m=34}).importSecret 0 1 0 0 outcome of the root check, declassified: import fails on it
 crypto_pq_slh_dsa capi.signature.SlhDsa(.{.shake=false,.n=24,.h=63,.d=7,.hp=9,.a=14,.k=17,.m=39}).importSecret 0 1 0 0 outcome of the root check, declassified: import fails on it
@@ -78,13 +86,15 @@ crypto_pq_slh_dsa capi.signature.SlhDsa(.{.shake=true,.n=24,.h=63,.d=7,.hp=9,.a=
 crypto_pq_slh_dsa capi.signature.SlhDsa(.{.shake=true,.n=24,.h=66,.d=22,.hp=3,.a=8,.k=33,.m=42}).importSecret 0 1 0 0 outcome of the root check, declassified: import fails on it
 crypto_pq_slh_dsa capi.signature.SlhDsa(.{.shake=true,.n=32,.h=64,.d=8,.hp=8,.a=14,.k=22,.m=47}).importSecret 0 1 0 0 outcome of the root check, declassified: import fails on it
 crypto_pq_slh_dsa capi.signature.SlhDsa(.{.shake=true,.n=32,.h=68,.d=17,.hp=4,.a=9,.k=35,.m=49}).importSecret 0 1 0 0 outcome of the root check, declassified: import fails on it
-crypto_pq_slh_dsa capi.signature.exportPrivate 0 16 0 1 slot header, lengths, algorithm id, flags, pre-hash entry and context length
-crypto_pq_slh_dsa capi.signature.importPrivate 0 14 0 0 slot header, lengths, algorithm id, flags, pre-hash entry and context length
-crypto_pq_slh_dsa capi.signature.keygen 0 2 0 0 slot header, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_slh_dsa capi.signature.exportPrivate 14 349 0 1 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_slh_dsa capi.signature.importPrivate 0 15 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_slh_dsa capi.signature.keygen 0 3 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_slh_dsa capi.signature.openPrivate 1 12 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
 crypto_pq_slh_dsa capi.signature.preHash 0 43 0 1 the pre-hash id
-crypto_pq_slh_dsa capi.signature.publicFromPrivate 0 7 0 1 slot header, lengths, algorithm id, flags, pre-hash entry and context length
-crypto_pq_slh_dsa capi.signature.sign 0 5 0 1 slot header, lengths, algorithm id, flags, pre-hash entry and context length
-crypto_pq_slh_dsa capi.signature.signAs 0 132 0 0 lengths, flags, pre-hash strength and context length, per parameter set
+crypto_pq_slh_dsa capi.signature.publicFromPrivate 3 65 0 1 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_slh_dsa capi.signature.sign 17 308 0 1 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_slh_dsa capi.signature.signAs 0 180 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
+crypto_pq_slh_dsa capi.wipeRange 4 37 0 0 slot headers in the range (magic, size, users word), the signer registry entries, lengths
 crypto_pq_slh_dsa hash.Engine.digest 5 4 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_slh_dsa hash.Engine.update 2 10 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_slh_dsa hash.HashAlgorithm.digest 0 1 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
@@ -145,25 +155,34 @@ crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=32,.h=68,.d=17,.hp=4,.a=9,.k=35
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=32,.h=68,.d=17,.hp=4,.a=9,.k=35,.m=49}).messageDigest 0 2 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=32,.h=68,.d=17,.hp=4,.a=9,.k=35,.m=49}).sign 0 5 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_stateful __ashlti3 0 2 0 0 shift amounts from tree heights
-crypto_pq_stateful capi.memory.free 0 2 0 0 the block's magic and size
-crypto_pq_stateful capi.stateful.Counting.alloc 0 1 0 0 allocation sizes
-crypto_pq_stateful capi.stateful.create 3 26 0 0 signer slot and object fields (magic, owner, busy flag, next index, capacity), kind, parameter codes and lengths
-crypto_pq_stateful capi.stateful.exportTreeCache 2 37 0 0 signer slot and object fields (magic, owner, busy flag, next index, capacity), kind, parameter codes and lengths
-crypto_pq_stateful capi.stateful.finish 0 6 0 0 signer slot and object fields (magic, owner, busy flag, next index, capacity), kind, parameter codes and lengths
-crypto_pq_stateful capi.stateful.freeChecked 2 8 0 0 signer slot and object fields (magic, owner, busy flag, next index, capacity), kind, parameter codes and lengths
-crypto_pq_stateful capi.stateful.load 2 76 0 1 signer slot and object fields (magic, owner, busy flag, next index, capacity), kind, parameter codes and lengths
-crypto_pq_stateful capi.stateful.publicKey 2 15 0 0 signer slot and object fields (magic, owner, busy flag, next index, capacity), kind, parameter codes and lengths
-crypto_pq_stateful capi.stateful.reseal 1 9 0 0 signer slot and object fields (magic, owner, busy flag, next index, capacity), kind, parameter codes and lengths
-crypto_pq_stateful capi.stateful.setupOf 2 66 0 0 signer slot and object fields (magic, owner, busy flag, next index, capacity), kind, parameter codes and lengths
-crypto_pq_stateful capi.stateful.sign 4 87 0 0 signer slot and object fields (magic, owner, busy flag, next index, capacity), kind, parameter codes and lengths
-crypto_pq_stateful capi.stateful.signerInfo 2 8 0 0 signer slot and object fields (magic, owner, busy flag, next index, capacity), kind, parameter codes and lengths
-crypto_pq_stateful capi.stateful.treeCacheSize 2 15 0 0 signer slot and object fields (magic, owner, busy flag, next index, capacity), kind, parameter codes and lengths
+crypto_pq_stateful capi.common.apart 0 24 0 0 the addresses and lengths of the call's buffers
+crypto_pq_stateful capi.memory.free 1 24 0 0 the table of live blocks (addresses, sizes), the quarantine, lengths
+crypto_pq_stateful capi.stateful.Object.overlaps 0 7 0 0 the addresses and sizes of the signer's object and allocations against an output
+crypto_pq_stateful capi.stateful.Tracking.alloc 0 2 0 0 the addresses and sizes of the signer's allocations
+crypto_pq_stateful capi.stateful.Tracking.release 0 3 0 0 the addresses and sizes of the signer's allocations
+crypto_pq_stateful capi.stateful.Tracking.remap 0 3 0 0 the addresses and sizes of the signer's allocations
+crypto_pq_stateful capi.stateful.Tracking.resize 0 3 0 0 the addresses and sizes of the signer's allocations
+crypto_pq_stateful capi.stateful.create 3 37 0 0 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.stateful.exportTreeCache 0 28 0 0 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.stateful.free 0 1 0 0 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.stateful.hold 2 21 0 0 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.stateful.load 2 90 0 1 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.stateful.memoryOf 4 5 0 0 parameter codes and heights
+crypto_pq_stateful capi.stateful.publicKey 0 6 0 0 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.stateful.register 1 13 0 0 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.stateful.reseal 1 10 0 0 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.stateful.retire 1 17 0 0 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.stateful.setupOf 2 66 0 0 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.stateful.sign 2 78 0 0 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.stateful.signerInfo 0 1 0 0 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.stateful.treeCacheSize 0 8 0 0 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.stateful.written 0 17 0 0 signer slot fields (registry index, generation), registry entries (busy word, generation, owner, signer), the signer's next index and capacity, kind, parameter codes and lengths
+crypto_pq_stateful capi.wipeRange 4 47 0 0 slot headers in the range (magic, size, users word), the signer registry entries, lengths
 crypto_pq_stateful hash.Engine.digest 5 2 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_stateful hash.Engine.update 2 10 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_stateful hash.HmacAlgorithm.create 0 0 0 2 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_stateful heap.BrkAllocator.alloc 3 6 0 0 allocation sizes
 crypto_pq_stateful heap.BrkAllocator.free 1 1 0 0 allocation sizes
-crypto_pq_stateful heap.FixedBufferAllocator.alloc 0 2 0 0 allocation sizes
 crypto_pq_stateful keccak.Keccak.read 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_stateful keccak.Keccak.update 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_stateful lms.Hash.digest 0 24 0 1 tree indices, heights, chain lengths from the public digest digits, lane counts, type codes
@@ -190,7 +209,7 @@ crypto_pq_stateful stateful.Signer.build 8 106 0 0 state blob fields and paramet
 crypto_pq_stateful stateful.Signer.cachedTrees 0 8 0 0 state blob fields and parameter codes; the checksum and tree-cache tag comparisons are declassified: loading fails on them
 crypto_pq_stateful stateful.Signer.destroy 0 18 0 0 state blob fields and parameter codes; the checksum and tree-cache tag comparisons are declassified: loading fails on them
 crypto_pq_stateful stateful.Signer.signatureSize 1 3 0 0 state blob fields and parameter codes; the checksum and tree-cache tag comparisons are declassified: loading fails on them
-crypto_pq_stateful stateful.decode 3 32 0 0 state blob fields and parameter codes; the checksum and tree-cache tag comparisons are declassified: loading fails on them
+crypto_pq_stateful stateful.decode 3 35 0 0 state blob fields and parameter codes; the checksum and tree-cache tag comparisons are declassified: loading fails on them
 crypto_pq_stateful stateful.treeCacheKey 0 1 0 0 state blob fields and parameter codes; the checksum and tree-cache tag comparisons are declassified: loading fails on them
 crypto_pq_stateful stateful.treeCacheTag 0 1 0 0 state blob fields and parameter codes; the checksum and tree-cache tag comparisons are declassified: loading fails on them
 crypto_pq_stateful vector.ChainLanes(8,6).advance 0 2 0 0 chain lengths from the base-w digits of the public message digest, lane counts
@@ -208,40 +227,46 @@ crypto_pq_stateful xmss.Lanes(8,8).chains 0 2 0 0 tree indices, layers, heights,
 crypto_pq_stateful xmss.Lanes(8,8).scatter 0 33 0 0 tree indices, layers, heights, chain lengths from the public digest digits, lane counts, n
 crypto_pq_stateful xmss.Xmss.tree 0 28 0 0 tree indices, layers, heights, chain lengths from the public digest digits, lane counts, n
 crypto_pq_stateful xmss.hashFunction 3 21 0 1 tree indices, layers, heights, chain lengths from the public digest digits, lane counts, n
-crypto_pq_x_wing_hash capi.hash.digest 0 2 0 1 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.hash.final 0 2 0 0 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.hash.hmac 0 2 0 0 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.hash.hmacFinal 0 2 0 0 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.hash.hmacFinalVerify 1 1 0 0 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.hash.hmacInit 0 1 0 0 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.hash.hmacUpdate 0 1 0 0 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.hash.hmacVerify 1 0 0 0 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.hash.hold 6 12 0 0 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.hash.init 0 1 0 1 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.hash.update 0 1 0 0 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.hash.xofInit 0 1 0 0 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.hash.xofRead 0 1 0 0 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.hash.xofUpdate 0 2 0 0 slot header, lengths, algorithm id and busy flag
-crypto_pq_x_wing_hash capi.kem.decapsulate 1 3 0 0 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_x_wing_hash capi.kem.decapsulateWith 1 2 0 1 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_x_wing_hash capi.kem.encapsulate 2 5 0 1 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_x_wing_hash capi.kem.encapsulateWith 1 2 0 1 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_x_wing_hash capi.kem.exportPrivate 1 4 0 0 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_x_wing_hash capi.kem.importPrivate 0 1 0 0 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_x_wing_hash capi.kem.keygen 0 1 0 0 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_x_wing_hash capi.kem.pairwise 1 2 0 1 cache state; the self-test outcome, declassified: key generation fails on it
-crypto_pq_x_wing_hash capi.kem.publicFromPrivate 1 7 0 0 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_x_wing_hash capi.kem.selfTest 2 3 0 0 slot header, lengths, algorithm id, flags and cache state
-crypto_pq_x_wing_hash capi.memory.free 0 2 0 0 the block's magic and size
-crypto_pq_x_wing_hash hash.Engine.digest 5 4 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
-crypto_pq_x_wing_hash hash.Engine.update 2 10 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
-crypto_pq_x_wing_hash hash.Hmac.verify 0 1 0 0 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
-crypto_pq_x_wing_hash hash.HmacAlgorithm.create 0 2 0 4 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
-crypto_pq_x_wing_hash keccak.Keccak.read 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
+crypto_pq_x_wing_hash capi.common.Slot.close 1 18 0 0 the slot's users word: the last call out of a slot that a wipe marked zeroes it, by its length
+crypto_pq_x_wing_hash capi.hash.Hmac(0).tag 5 6 0 0 the engines' buffer positions and lengths; the key and the data decide nothing
+crypto_pq_x_wing_hash capi.hash.Hmac(1).tag 5 6 0 0 the engines' buffer positions and lengths; the key and the data decide nothing
+crypto_pq_x_wing_hash capi.hash.Hmac(2).tag 7 6 0 0 the engines' buffer positions and lengths; the key and the data decide nothing
+crypto_pq_x_wing_hash capi.hash.Hmac(3).tag 7 6 0 0 the engines' buffer positions and lengths; the key and the data decide nothing
+crypto_pq_x_wing_hash capi.hash.digest 0 1 0 1 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.hash.final 28 227 0 1 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.hash.hmac 4 20 0 0 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.hash.hmacFinal 6 113 0 1 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.hash.hmacFinalVerify 3 60 0 1 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.hash.hmacInit 0 2 0 0 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.hash.hmacUpdate 6 61 0 1 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.hash.hmacVerify 4 24 0 0 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.hash.hold 11 88 0 4 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.hash.init 0 2 0 0 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.hash.update 8 71 0 1 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.hash.xofInit 0 2 0 0 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.hash.xofRead 2 41 0 0 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.hash.xofUpdate 3 60 0 0 slot header and users word, lengths, algorithm id, the engine's buffer position, length, rate, suffix and squeezing flag as checked; the data decides nothing
+crypto_pq_x_wing_hash capi.kem.decapsulate 5 100 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_x_wing_hash capi.kem.decapsulateWith 1 4 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_x_wing_hash capi.kem.encapsulate 5 102 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_x_wing_hash capi.kem.encapsulateWith 1 4 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_x_wing_hash capi.kem.exportPrivate 5 99 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_x_wing_hash capi.kem.importPrivate 0 2 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_x_wing_hash capi.kem.keygen 0 2 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_x_wing_hash capi.kem.openPrivate 3 10 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_x_wing_hash capi.kem.openPublic 11 10 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_x_wing_hash capi.kem.pairwise 1 4 0 0 cache state; the self-test outcome, declassified: key generation fails on it
+crypto_pq_x_wing_hash capi.kem.publicFromPrivate 2 48 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_x_wing_hash capi.kem.selfTest 6 117 0 0 slot header and users word, lengths, algorithm id, flags and cache state
+crypto_pq_x_wing_hash capi.memory.free 1 24 0 0 the table of live blocks (addresses, sizes), the quarantine, lengths
+crypto_pq_x_wing_hash capi.wipeRange 4 37 0 0 slot headers in the range (magic, size, users word), the signer registry entries, lengths
+crypto_pq_x_wing_hash hash.Hasher.digest 5 3 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
+crypto_pq_x_wing_hash hash.Hasher.update 2 10 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
+crypto_pq_x_wing_hash keccak.Keccak.read 1 10 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_x_wing_hash keccak.Keccak.update 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_x_wing_hash keccak.Sponge4.next 0 2 0 0 the number of sponges in use
 crypto_pq_x_wing_hash keccak.Sponge4.startSome 0 24 0 0 the number of messages and their lengths; the data absorbed decides nothing
 crypto_pq_x_wing_hash mlkem.sampleMatrix 0 3 0 0 rejection sampling of the public matrix from rho
-crypto_pq_x_wing_hash primitives.digest 0 4 0 0 lengths of the parts hashed
+crypto_pq_x_wing_hash primitives.digest 0 2 0 0 lengths of the parts hashed
 crypto_pq_x_wing_hash sha2.blocks256 0 1 0 0 block counts from the length
 crypto_pq_x_wing_hash sha2.blocks512 0 1 0 0 block counts from the length

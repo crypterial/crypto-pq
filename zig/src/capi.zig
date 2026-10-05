@@ -119,15 +119,28 @@ pub fn slotAlign(slot_type: u32, algorithm: u32) callconv(.c) usize {
 }
 
 // out[0] the slot type, out[1] the algorithm, out[2] the flags: bit 0 the key kept its seed, bit 8
-// the public cache is filled, bit 9 the secret cache.
-pub fn slotInfo(memory_pointer: ?[*]u8, length: usize, out: ?*[3]u32) callconv(.c) c_int {
+// the public cache is filled, bit 9 the secret cache. A signer slot is checked through its signer:
+// a copy, or a slot that outlived its signer, is BAD_SLOT.
+pub fn slotInfo(memory_pointer: ?[*]u8, length: usize, out: ?*anyopaque) callconv(.c) c_int {
     return common.status(slotInfoChecked(memory_pointer, length, out));
 }
 
-fn slotInfoChecked(memory_pointer: ?[*]u8, length: usize, out: ?*[3]u32) common.Failure!void {
-    const slot = try common.open(&.{ .kem_public, .kem_private, .signature_public, .signature_private, .hasher, .xof, .hmac, .signer }, memory_pointer, length, sizeOf);
+fn slotInfoChecked(memory_pointer: ?[*]u8, length: usize, out: ?*anyopaque) common.Failure!void {
+    const target = try common.fixed([3]u32, out);
 
-    const target = out orelse return error.BadArgument;
+    if (options.stateful) {
+        if (stateful.inspect(memory_pointer, length)) |slot| {
+            try common.apart(&.{std.mem.asBytes(target)}, &.{slot.bytes});
+
+            target.* = .{ @intFromEnum(slot.slot_type), slot.algorithm, slot.flags };
+
+            return;
+        } else |_| {}
+    }
+
+    const slot = try common.open(&.{ .kem_public, .kem_private, .signature_public, .signature_private, .hasher, .xof, .hmac }, memory_pointer, length, sizeOf, .shared);
+
+    defer slot.close();
 
     try common.apart(&.{std.mem.asBytes(target)}, &.{slot.bytes});
 
@@ -140,16 +153,62 @@ fn slotInfoChecked(memory_pointer: ?[*]u8, length: usize, out: ?*[3]u32) common.
     target.* = .{ @intFromEnum(slot.slot_type), slot.algorithm, slot.flags | caches << 8 };
 }
 
-// Zeroes `length` bytes of the caller's memory, whatever they hold. A key's caches, which hold
-// secret forms of it, go with the slot, and a stateful signer is freed first.
+// Zeroes `length` bytes of the caller's memory, whatever they hold. Every slot whose header lies
+// in them is ended first: a key or a state that a call is inside is BUSY, a signer that a call
+// holds STATE_CONFLICT, and a signer is freed with its trees. A refused wipe has changed nothing
+// from that slot on.
 pub fn slotWipe(memory_pointer: ?[*]u8, length: usize) callconv(.c) c_int {
     const bytes = common.output(memory_pointer, length) catch return common.bad_argument;
 
-    if (options.stateful and bytes.len > 0) _ = stateful.freeIfSigner(bytes.ptr, bytes.len);
+    return common.status(wipeRange(bytes));
+}
 
-    ct.wipe(bytes);
+pub fn wipeRange(bytes: []u8) common.Failure!void {
+    var done: usize = 0;
 
-    return common.ok;
+    var from: usize = 0;
+
+    while (common.nextHeader(bytes, from)) |offset| {
+        const header: *common.Header = @ptrCast(@alignCast(bytes.ptr + offset));
+
+        const slot_type = common.typeOf(common.loadMagic(header)) orelse {
+            from = offset + common.slot_alignment;
+
+            continue;
+        };
+
+        // A slot that the range cuts short ends with the range.
+        const recorded = common.once(u32, &header.size);
+
+        const end = if (recorded >= @sizeOf(common.Header) and recorded <= bytes.len - offset) offset + recorded else bytes.len;
+
+        if (slot_type == .signer) {
+            const claimed: ?stateful.Held = if (options.stateful) try stateful.claimAt(bytes[offset..end]) else null;
+
+            // Not a signer that lives here, such as a copy: plain memory.
+            const signer = claimed orelse {
+                from = offset + common.slot_alignment;
+
+                continue;
+            };
+
+            ct.wipe(bytes[done..offset]);
+
+            if (options.stateful) stateful.retire(signer);
+        } else {
+            try common.claim(header);
+
+            ct.wipe(bytes[done..offset]);
+
+            common.kill(.{ .header = header, .slot_type = slot_type, .size = end - offset }, bytes[offset..end]);
+        }
+
+        done = end;
+
+        from = end;
+    }
+
+    ct.wipe(bytes[done..]);
 }
 
 fn exportAll(comptime list: anytype) void {

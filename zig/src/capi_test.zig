@@ -1028,11 +1028,8 @@ test "a state in use by another call is busy" {
 
     try expectStatus(ok, capi.hash.init(1, state.ptr(), state.len()));
 
-    const body: *capi.hash.HasherState = @ptrFromInt(@intFromPtr(state.ptr()) + common.bodyOffset(capi.hash.HasherState));
-
-    const busy = &body.busy.state;
-
-    busy.store(1, .release);
+    // Another call is inside the state.
+    const inside = try common.open(&.{.hasher}, state.ptr(), state.len(), capi.hash.size, .exclusive);
 
     var out: [32]u8 = undefined;
 
@@ -1040,7 +1037,7 @@ test "a state in use by another call is busy" {
 
     try expectStatus(common.busy, capi.hash.final(state.ptr(), state.len(), &out, 32));
 
-    busy.store(0, .release);
+    inside.close();
 
     try expectStatus(ok, capi.hash.final(state.ptr(), state.len(), &out, 32));
 }
@@ -1065,7 +1062,7 @@ test "a call never waits for a cache another call fills" {
 
         const body: *S.Private = @ptrFromInt(@intFromPtr(private.ptr()) + common.bodyOffset(S.Private));
 
-        body.public.form.state.store(1, .release);
+        setCache(&body.public.form, .filling);
 
         var ciphertext: [S.ciphertext_size]u8 = undefined;
 
@@ -1079,9 +1076,9 @@ test "a call never waits for a cache another call fills" {
 
         try testing.expectEqualSlices(u8, &sent, &received);
 
-        try testing.expectEqual(1, body.public.form.state.load(.acquire));
+        try testing.expectEqual(@intFromPtr(&body.public.form.value) | 1, body.public.form.state.load(.acquire));
 
-        body.public.form.state.store(0, .release);
+        setCache(&body.public.form, .empty);
 
         var again: [32]u8 = undefined;
 
@@ -1107,10 +1104,10 @@ test "a call never waits for a cache another call fills" {
 
         var signature: [S.signature_size]u8 = undefined;
 
-        for ([_][2]u32{ .{ 1, 2 }, .{ 2, 1 }, .{ 1, 1 } }) |states| {
-            body.public.form.state.store(states[0], .release);
+        for ([_][2]CacheState{ .{ .filling, .ready }, .{ .ready, .filling }, .{ .filling, .filling } }) |states| {
+            setCache(&body.public.form, states[0]);
 
-            body.secrets.state.store(states[1], .release);
+            setCache(&body.secrets, states[1]);
 
             try expectStatus(ok, Sig.sign(private, "m", "", 0, &.{}, capi.signature.deterministic, &signature));
 
@@ -1119,6 +1116,19 @@ test "a call never waits for a cache another call fills" {
             try expectStatus(ok, Sig.verify(private, &signature, "m", "", 0, 0));
         }
     }
+}
+
+const CacheState = enum { empty, filling, ready };
+
+// What a call finds in a cache: nothing, another call filling it at this address, or its value.
+fn setCache(lazy: anytype, state: CacheState) void {
+    const here = @intFromPtr(&lazy.value);
+
+    lazy.state.store(switch (state) {
+        .empty => 0,
+        .filling => here | 1,
+        .ready => here,
+    }, .release);
 }
 
 const Shared = struct {
@@ -2583,11 +2593,10 @@ test "a busy stateful signer refuses a second call" {
 
     defer _ = Signer.free(slot);
 
-    const body: *const [2]usize = @ptrCast(@alignCast(slot.ptr() + common.bodyOffset([2]usize)));
+    // Another call holds the signer.
+    const cell = cellOf(slot);
 
-    const object: *capi.stateful.Object = @ptrFromInt(body[0]);
-
-    object.busy.state.store(1, .release);
+    cell.busy.store(1, .release);
 
     var signature: [4 + 8 + (4 + 32 * 35) + 5 * 32]u8 = undefined;
 
@@ -2599,9 +2608,22 @@ test "a busy stateful signer refuses a second call" {
 
     try expectStatus(common.code(error.StateConflict), Signer.free(slot));
 
-    object.busy.state.store(0, .release);
+    try expectStatus(common.code(error.StateConflict), capi.slotWipe(slot.ptr(), slot.len()));
+
+    cell.busy.store(0, .release);
 
     try expectStatus(ok, Signer.sign(slot, 0, "m", &signature));
+}
+
+// The registry cell that a signer slot names.
+fn cellOf(slot: Memory) *capi.stateful.Cell {
+    const body: *const [2]u32 = @ptrCast(@alignCast(slot.ptr() + common.bodyOffset([2]u32)));
+
+    return capi.stateful.cellAt(body[0]).?;
+}
+
+fn objectOf(slot: Memory) *capi.stateful.Object {
+    return @ptrFromInt(cellOf(slot).object.load(.acquire));
 }
 
 fn crossStateful(_: void, r: vectors.Record, allocator: Allocator) !void {
@@ -2754,4 +2776,988 @@ test "cross tree cache vectors through the ABI" {
     defer v.deinit();
 
     try vectors.parallel(v.records, {}, crossTreeCache);
+}
+
+// A key that a call is inside is not wiped under it: the wipe is BUSY, the key stays whole for
+// that call, no new call enters, and the call zeroes the key as it leaves.
+test "a wipe of a key that a call is inside ends it when the call leaves" {
+    const allocator = testing.allocator;
+
+    const kem_slot = try Memory.init(allocator, .kem_private, 1);
+
+    defer kem_slot.deinit();
+
+    try expectStatus(ok, Kem.keygen(1, &pattern(64, 1), 0, kem_slot));
+
+    const sig_slot = try Memory.init(allocator, .signature_private, 1);
+
+    defer sig_slot.deinit();
+
+    try expectStatus(ok, Sig.keygen(1, &pattern(32, 2), 0, sig_slot));
+
+    const hmac_slot = try Memory.init(allocator, .hmac, 1);
+
+    defer hmac_slot.deinit();
+
+    try expectStatus(ok, capi.hash.hmacInit(1, "key", 3, hmac_slot.ptr(), hmac_slot.len()));
+
+    var seed: [64]u8 = undefined;
+
+    try expectStatus(ok, Kem.exportPrivate(kem_slot, 0, &seed));
+
+    const insides = [_]common.Slot{
+        try common.open(&.{.kem_private}, kem_slot.ptr(), kem_slot.len(), capi.kem.size, .shared),
+        try common.open(&.{.signature_private}, sig_slot.ptr(), sig_slot.len(), capi.signature.size, .shared),
+        try common.open(&.{.hmac}, hmac_slot.ptr(), hmac_slot.len(), capi.hash.size, .exclusive),
+    };
+
+    for ([_]Memory{ kem_slot, sig_slot, hmac_slot }, insides) |slot, inside| {
+        try expectStatus(common.busy, capi.slotWipe(slot.ptr(), slot.len()));
+
+        // The key is whole for the call inside, and no new call enters.
+        try testing.expect(common.typeOf(common.loadMagic(inside.header)) != null);
+
+        var out: [3]u32 = undefined;
+
+        try expectStatus(common.bad_slot, capi.slotInfo(slot.ptr(), slot.len(), &out));
+
+        try expectStatus(common.busy, capi.slotWipe(slot.ptr(), slot.len()));
+
+        inside.close();
+
+        for (slot.bytes) |b| try testing.expectEqual(0, b);
+
+        try expectStatus(common.bad_slot, capi.slotInfo(slot.ptr(), slot.len(), &out));
+
+        try slot.wipe();
+    }
+
+    try testing.expectEqualSlices(u8, &pattern(64, 1), &seed);
+
+    try expectStatus(common.bad_slot, Kem.exportPrivate(kem_slot, 0, &seed));
+}
+
+// The review's reproduction: a binding wipes a key while other threads use it. Every answer that
+// comes back OK is the key's own, and none comes from a half-wiped key.
+test "a wipe racing with calls never yields an answer from a half-wiped key" {
+    const allocator = testing.allocator;
+
+    const Race = struct {
+        slot: Memory,
+        go: std.atomic.Value(u32) = .init(0),
+        stop: std.atomic.Value(u32) = .init(0),
+        calls: std.atomic.Value(u32) = .init(0),
+        wrong: std.atomic.Value(u32) = .init(0),
+        ciphertext: *const [1088]u8,
+        expected: *const [32]u8,
+
+        // Until the key is gone, or the wiper has been refused and lets the calls end.
+        fn decapsulate(self: *@This()) void {
+            while (self.go.load(.acquire) == 0) std.atomic.spinLoopHint();
+
+            while (self.stop.load(.acquire) == 0) {
+                var secret: [32]u8 = undefined;
+
+                const status = Kem.decapsulate(self.slot, self.ciphertext, &secret);
+
+                _ = self.calls.fetchAdd(1, .release);
+
+                if (status == ok and !std.mem.eql(u8, &secret, self.expected)) _ = self.wrong.fetchAdd(1, .monotonic);
+
+                if (status != ok) return;
+            }
+        }
+    };
+
+    const slot = try Memory.init(allocator, .kem_private, 1);
+
+    defer slot.deinit();
+
+    const ciphertext = pattern(1088, 9);
+
+    var expected: [32]u8 = undefined;
+
+    var wrong: u32 = 0;
+
+    var refused: u64 = 0;
+
+    for (0..100) |_| {
+        @memset(slot.bytes, 0);
+
+        try expectStatus(ok, Kem.keygen(1, &pattern(64, 5), 0, slot));
+
+        try expectStatus(ok, Kem.decapsulate(slot, &ciphertext, &expected));
+
+        var race: Race = .{ .slot = slot, .ciphertext = &ciphertext, .expected = &expected };
+
+        const threads = [_]std.Thread{ try std.Thread.spawn(.{}, Race.decapsulate, .{&race}), try std.Thread.spawn(.{}, Race.decapsulate, .{&race}) };
+
+        race.go.store(1, .release);
+
+        while (race.calls.load(.acquire) < 4) std.atomic.spinLoopHint();
+
+        while (true) {
+            const status = capi.slotWipe(slot.ptr(), slot.len());
+
+            if (status == ok) break;
+
+            try expectStatus(common.busy, status);
+
+            refused += 1;
+
+            // Calls that follow one another without a gap would hold the wipe off for as long as
+            // they go on: the binding ends them first.
+            if (refused % 1000 == 0) race.stop.store(1, .release);
+        }
+
+        race.stop.store(1, .release);
+
+        for (threads) |thread| thread.join();
+
+        wrong += race.wrong.load(.monotonic);
+
+        var after: [32]u8 = undefined;
+
+        try expectStatus(common.bad_slot, Kem.decapsulate(slot, &ciphertext, &after));
+    }
+
+    try testing.expectEqual(0, wrong);
+
+    try testing.expect(refused > 0);
+}
+
+// A state wiped while another thread updates it: the wipe waits for nothing and refuses, and no
+// byte after the slot is ever written.
+test "a wipe racing with an update never writes past the state" {
+    const allocator = testing.allocator;
+
+    const size = capi.slotSize(@intFromEnum(common.SlotType.xof), 1);
+
+    const memory = try allocator.alignedAlloc(u8, .fromByteUnits(common.slot_alignment), size + 4096);
+
+    defer allocator.free(memory);
+
+    const data = try allocator.alloc(u8, 1 << 16);
+
+    defer allocator.free(data);
+
+    @memset(data, 0x3c);
+
+    const Update = struct {
+        fn run(slot: []u8, bytes: []const u8, go: *std.atomic.Value(u32)) void {
+            go.store(1, .release);
+
+            for (0..8) |_| _ = capi.hash.xofUpdate(slot.ptr, slot.len, bytes.ptr, bytes.len);
+        }
+    };
+
+    for (0..50) |_| {
+        @memset(memory, 0);
+
+        @memset(memory[size..], 0xcc);
+
+        try expectStatus(ok, capi.hash.xofInit(1, memory.ptr, size));
+
+        try expectStatus(ok, capi.hash.xofUpdate(memory.ptr, size, data.ptr, 1));
+
+        var go: std.atomic.Value(u32) = .init(0);
+
+        const thread = try std.Thread.spawn(.{}, Update.run, .{ memory[0..size], data, &go });
+
+        while (go.load(.acquire) == 0) std.atomic.spinLoopHint();
+
+        while (capi.slotWipe(memory.ptr, size) != ok) {}
+
+        thread.join();
+
+        for (memory[size..]) |b| try testing.expectEqual(0xcc, b);
+    }
+}
+
+// The final check of a call: a slot whose header changed during the call gives nothing back.
+test "a call whose slot changes under it returns nothing" {
+    const slot = try Memory.init(testing.allocator, .kem_public, 0);
+
+    defer slot.deinit();
+
+    const private = try Memory.init(testing.allocator, .kem_private, 0);
+
+    defer private.deinit();
+
+    try expectStatus(ok, Kem.keygen(0, &pattern(64, 4), 0, private));
+
+    try expectStatus(ok, Kem.publicFromPrivate(private, slot));
+
+    const opened = try common.open(&.{.kem_public}, slot.ptr(), slot.len(), capi.kem.size, .shared);
+
+    var out: [32]u8 = @splat(0x77);
+
+    try opened.confirm(&.{&out});
+
+    try testing.expectEqual(0x77, out[0]);
+
+    // The binding's own memset reaches the header while the call runs.
+    @memset(slot.bytes[0..8], 0);
+
+    try testing.expectError(error.BadSlot, opened.confirm(&.{&out}));
+
+    for (out) |b| try testing.expectEqual(0, b);
+
+    opened.close();
+}
+
+// The review's reproduction: free racing signer_info on the same slot. No call ever reaches the
+// freed signer: each one either holds it whole or finds it gone.
+test "a signer free racing other calls never reaches a freed signer" {
+    const allocator = testing.allocator;
+
+    const case = stateful_cases[0];
+
+    const slot = try Memory.init(allocator, .signer, 1);
+
+    defer slot.deinit();
+
+    var state: [3 + 8 + 16 + 32 + 8 + 16]u8 = undefined;
+
+    const Hammer = struct {
+        slot: Memory,
+        go: std.atomic.Value(u32) = .init(0),
+        calls: std.atomic.Value(u32) = .init(0),
+        garbage: std.atomic.Value(u32) = .init(0),
+
+        fn run(self: *@This()) void {
+            while (self.go.load(.acquire) == 0) std.atomic.spinLoopHint();
+
+            while (true) {
+                var out: [4]u64 = undefined;
+
+                const status = capi.stateful.signerInfo(self.slot.ptr(), self.slot.len(), &out);
+
+                _ = self.calls.fetchAdd(1, .release);
+
+                if (status == ok and out[0] != 32) _ = self.garbage.fetchAdd(1, .monotonic);
+
+                if (status == common.bad_slot) return;
+            }
+        }
+    };
+
+    var conflicts: u32 = 0;
+
+    for (0..100) |_| {
+        @memset(slot.bytes, 0);
+
+        try expectStatus(ok, Signer.create(1, case.section, &pattern(48, 6), 0, &state, slot));
+
+        var hammer: Hammer = .{ .slot = slot };
+
+        const threads = [_]std.Thread{ try std.Thread.spawn(.{}, Hammer.run, .{&hammer}), try std.Thread.spawn(.{}, Hammer.run, .{&hammer}) };
+
+        hammer.go.store(1, .release);
+
+        while (hammer.calls.load(.acquire) < 8) std.atomic.spinLoopHint();
+
+        while (true) {
+            const status = Signer.free(slot);
+
+            if (status == ok) break;
+
+            try expectStatus(common.code(error.StateConflict), status);
+
+            conflicts += 1;
+        }
+
+        for (threads) |thread| thread.join();
+
+        try testing.expectEqual(0, hammer.garbage.load(.monotonic));
+    }
+
+    try testing.expect(conflicts > 0);
+}
+
+// A copy of a signer slot, whether elsewhere or written back over the slot after its signer was
+// freed, names a signer that is not its own: every call refuses it, and a wipe takes it as plain
+// memory.
+test "a stale or copied signer slot is refused everywhere" {
+    const allocator = testing.allocator;
+
+    const case = stateful_cases[0];
+
+    const slot = try Memory.init(allocator, .signer, 1);
+
+    defer slot.deinit();
+
+    const copy = try Memory.init(allocator, .signer, 1);
+
+    defer copy.deinit();
+
+    var state: [3 + 8 + 16 + 32 + 8 + 16]u8 = undefined;
+
+    try expectStatus(ok, Signer.create(1, case.section, &pattern(48, 7), 0, &state, slot));
+
+    @memcpy(copy.bytes, slot.bytes);
+
+    var out: [3]u32 = undefined;
+
+    try expectStatus(common.bad_slot, capi.slotInfo(copy.ptr(), copy.len(), &out));
+
+    try expectStatus(ok, capi.slotInfo(slot.ptr(), slot.len(), &out));
+
+    try testing.expectEqual([3]u32{ 8, 1, 0 }, out);
+
+    const saved = try allocator.dupe(u8, slot.bytes);
+
+    defer allocator.free(saved);
+
+    try expectStatus(ok, Signer.free(slot));
+
+    // The binding writes the old bytes back: the slot names a signer that is gone.
+    @memcpy(slot.bytes, saved);
+
+    var signature: [4 + 8 + (4 + 32 * 35) + 5 * 32]u8 = undefined;
+
+    var info: [4]u64 = undefined;
+
+    try expectStatus(common.bad_slot, Signer.sign(slot, 0, "m", &signature));
+
+    try expectStatus(common.bad_slot, capi.stateful.signerInfo(slot.ptr(), slot.len(), &info));
+
+    try expectStatus(common.bad_slot, capi.slotInfo(slot.ptr(), slot.len(), &out));
+
+    try expectStatus(common.bad_slot, Signer.free(slot));
+
+    // Another signer may take the cell meanwhile: the old slot still names nothing of its own.
+    const other = try Memory.init(allocator, .signer, 1);
+
+    defer other.deinit();
+
+    try expectStatus(ok, Signer.create(1, case.section, &pattern(48, 8), 0, &state, other));
+
+    try expectStatus(common.bad_slot, Signer.sign(slot, 0, "m", &signature));
+
+    try slot.wipe();
+
+    try expectStatus(ok, Signer.sign(other, 0, "m", &signature));
+
+    try expectStatus(ok, Signer.free(other));
+}
+
+fn cellIndexOf(slot: Memory) [2]u32 {
+    return @as(*const [2]u32, @ptrCast(@alignCast(slot.ptr() + common.bodyOffset([2]u32)))).*;
+}
+
+// The registry adds chunks of cells as live signers fill the ones it has and never moves a cell:
+// signers created across several chunks all stay reachable, a freed signer's cell goes to a later
+// signer under a new generation, and the freed slot's bytes, written back at the address that a
+// later signer took, are refused everywhere, even where the later signer took the same cell.
+test "the signer registry grows and reuses its cells" {
+    const allocator = testing.allocator;
+
+    const levels = [_]pq.HssLevel{.{ .lms = "LMS_SHA256_M24_H5", .ots = "LMOTS_SHA256_N24_W2" }};
+
+    const section = codes(&levels);
+
+    const sizes = try Signer.info(1, &section);
+
+    try testing.expectEqual(40, sizes[0]);
+
+    // Live at once: more than two native chunks of 256 cells and eight WebAssembly chunks of 64.
+    const count = 520;
+
+    const slots = try allocator.alloc(Memory, count);
+
+    defer allocator.free(slots);
+
+    var made: usize = 0;
+
+    defer for (slots[0..made]) |slot| slot.deinit();
+
+    while (made < count) : (made += 1) slots[made] = try Memory.init(allocator, .signer, 1);
+
+    const state = try allocator.alloc(u8, @intCast(sizes[1]));
+
+    defer allocator.free(state);
+
+    const key_size: usize = @intCast(sizes[2]);
+
+    const keys = try allocator.alloc(u8, count * key_size);
+
+    defer allocator.free(keys);
+
+    const signature = try allocator.alloc(u8, @intCast(sizes[3]));
+
+    defer allocator.free(signature);
+
+    const cells = try allocator.alloc([2]u32, count);
+
+    defer allocator.free(cells);
+
+    const create = struct {
+        fn run(parameters: []const u8, slot: Memory, salt: u8, number: usize, state_out: []u8, key: []u8) !void {
+            var seed = pattern(40, salt);
+
+            std.mem.writeInt(u32, seed[0..4], @intCast(number), .little);
+
+            try expectStatus(ok, Signer.create(1, parameters, &seed, 0, state_out, slot));
+
+            try expectStatus(ok, Signer.publicKey(slot, key));
+        }
+    }.run;
+
+    for (slots, 0..) |slot, i| {
+        try create(&section, slot, 9, i, state, keys[i * key_size ..][0..key_size]);
+
+        cells[i] = cellIndexOf(slot);
+    }
+
+    const indices = try allocator.alloc(u32, count);
+
+    defer allocator.free(indices);
+
+    for (cells, 0..) |cell, i| indices[i] = cell[0];
+
+    std.mem.sort(u32, indices, {}, std.sort.asc(u32));
+
+    for (indices[1..], indices[0 .. count - 1]) |next, previous| try testing.expect(next != previous);
+
+    for (slots, 0..) |slot, i| {
+        try expectStatus(ok, Signer.sign(slot, 0, "grown", signature));
+
+        try expectStatus(ok, Signer.verify(1, keys[i * key_size ..][0..key_size], "grown", signature));
+    }
+
+    const saved = try allocator.alloc(u8, count * slots[0].len());
+
+    defer allocator.free(saved);
+
+    // A quarter of the signers freed together, then created again: their cells come back in
+    // another order, to slots at other addresses.
+    for (slots, 0..) |slot, i| {
+        if (i % 4 != 0) continue;
+
+        @memcpy(saved[i * slot.len() ..][0..slot.len()], slot.bytes);
+
+        try expectStatus(ok, Signer.free(slot));
+
+        try testing.expect(std.mem.allEqual(u8, slot.bytes, 0));
+    }
+
+    var reused: usize = 0;
+
+    for (slots, 0..) |slot, i| {
+        if (i % 4 != 0) continue;
+
+        try create(&section, slot, 10, i, state, keys[i * key_size ..][0..key_size]);
+
+        const cell = cellIndexOf(slot);
+
+        for (cells, 0..) |old, j| {
+            if (j % 4 != 0 or old[0] != cell[0]) continue;
+
+            try testing.expect(old[1] != cell[1]);
+
+            reused += 1;
+        }
+    }
+
+    try testing.expect(reused > 0);
+
+    // Another quarter freed and created again one by one: the same cell returns to the same slot,
+    // and only the generation tells the old bytes from the new.
+    var same: usize = 0;
+
+    for (slots, 0..) |slot, i| {
+        if (i % 4 != 2) continue;
+
+        @memcpy(saved[i * slot.len() ..][0..slot.len()], slot.bytes);
+
+        try expectStatus(ok, Signer.free(slot));
+
+        try create(&section, slot, 11, i, state, keys[i * key_size ..][0..key_size]);
+
+        const cell = cellIndexOf(slot);
+
+        if (cell[0] != cells[i][0]) continue;
+
+        try testing.expect(cell[1] != cells[i][1]);
+
+        same += 1;
+    }
+
+    try testing.expect(same > 0);
+
+    var out: [3]u32 = undefined;
+
+    var words: [4]u64 = undefined;
+
+    for (slots, 0..) |slot, i| {
+        if (i % 2 != 0) continue;
+
+        const current = try allocator.dupe(u8, slot.bytes);
+
+        defer allocator.free(current);
+
+        @memcpy(slot.bytes, saved[i * slot.len() ..][0..slot.len()]);
+
+        try expectStatus(common.bad_slot, Signer.sign(slot, 1, "stale", signature));
+
+        try expectStatus(common.bad_slot, capi.stateful.signerInfo(slot.ptr(), slot.len(), &words));
+
+        try expectStatus(common.bad_slot, capi.slotInfo(slot.ptr(), slot.len(), &out));
+
+        try expectStatus(common.bad_slot, Signer.free(slot));
+
+        @memcpy(slot.bytes, current);
+    }
+
+    for (slots, 0..) |slot, i| {
+        const index: u64 = if (i % 2 == 0) 0 else 1;
+
+        try expectStatus(ok, Signer.sign(slot, index, "after reuse", signature));
+
+        try expectStatus(ok, Signer.verify(1, keys[i * key_size ..][0..key_size], "after reuse", signature));
+
+        try expectStatus(ok, Signer.free(slot));
+
+        try testing.expect(std.mem.allEqual(u8, slot.bytes, 0));
+    }
+}
+
+// No output of a call on a signer may land on the signer's own memory: its object, where the index
+// guard lives, any of the blocks its trees take, or the registry of signers.
+test "outputs over the signer's memory are refused" {
+    const allocator = testing.allocator;
+
+    const case = stateful_cases[3];
+
+    const slot = try Memory.init(allocator, .signer, case.kind);
+
+    defer slot.deinit();
+
+    const sizes = try Signer.info(case.kind, case.section);
+
+    const state = try allocator.alloc(u8, @intCast(sizes[1]));
+
+    defer allocator.free(state);
+
+    try expectStatus(ok, Signer.create(case.kind, case.section, &pattern(96, 9), 0, state, slot));
+
+    defer _ = Signer.free(slot);
+
+    const signature = try allocator.alloc(u8, @intCast(sizes[3]));
+
+    defer allocator.free(signature);
+
+    try expectStatus(ok, Signer.sign(slot, 20000, "message A", signature));
+
+    const object = objectOf(slot);
+
+    try testing.expectEqual(20001, object.next);
+
+    try expectStatus(common.bad_argument, capi.stateful.treeCacheSize(slot.ptr(), slot.len(), &object.next));
+
+    const words: *[4]u64 = @ptrFromInt(@intFromPtr(&object.next) - 8);
+
+    try expectStatus(common.bad_argument, capi.stateful.signerInfo(slot.ptr(), slot.len(), words));
+
+    try testing.expectEqual(20001, object.next);
+
+    try expectStatus(common.code(error.StateConflict), Signer.sign(slot, 20000, "message B", signature));
+
+    // The blocks of its trees and its object, for the byte outputs.
+    for (object.tracking.ranges[0..object.tracking.count]) |range| {
+        if (range.len < sizes[3]) continue;
+
+        try expectStatus(common.bad_argument, Signer.sign(slot, 20001, "m", range[0..@intCast(sizes[3])]));
+
+        try expectStatus(common.bad_argument, Signer.publicKey(slot, range[0..@intCast(sizes[2])]));
+
+        break;
+    }
+
+    const bytes = std.mem.asBytes(object);
+
+    try expectStatus(common.bad_argument, Signer.publicKey(slot, bytes[0..@intCast(sizes[2])]));
+
+    var size: u64 = 0;
+
+    try expectStatus(ok, capi.stateful.treeCacheSize(slot.ptr(), slot.len(), &size));
+
+    try expectStatus(common.bad_argument, capi.stateful.exportTreeCache(slot.ptr(), slot.len(), bytes.ptr, @intCast(size)));
+
+    const cell: [*]u8 = @ptrCast(cellOf(slot));
+
+    try expectStatus(common.bad_argument, Signer.publicKey(slot, cell[0..@intCast(sizes[2])]));
+
+    try testing.expectEqual(20001, object.next);
+
+    try expectStatus(ok, Signer.sign(slot, 20001, "message C", signature));
+}
+
+// A state can move forward only: an earlier index would hand indices that were claimed back to the
+// next load.
+test "reseal never moves a state back" {
+    const case = stateful_cases[0];
+
+    const slot = try Memory.init(testing.allocator, .signer, 1);
+
+    defer slot.deinit();
+
+    var state: [3 + 8 + 16 + 32 + 8 + 16]u8 = undefined;
+
+    try expectStatus(ok, Signer.create(1, case.section, &pattern(48, 10), 5, &state, slot));
+
+    try expectStatus(ok, Signer.free(slot));
+
+    try expectStatus(common.code(error.StateConflict), Signer.reseal(1, &state, 4));
+
+    try expectStatus(common.code(error.StateConflict), Signer.reseal(1, &state, 0));
+
+    try expectStatus(ok, Signer.reseal(1, &state, 5));
+
+    try expectStatus(ok, Signer.reseal(1, &state, 9));
+
+    try expectStatus(common.code(error.StateConflict), Signer.reseal(1, &state, 8));
+
+    var index: u64 = 0;
+
+    try expectStatus(ok, Signer.load(1, &state, null, slot, &index));
+
+    try testing.expectEqual(9, index);
+
+    try expectStatus(ok, Signer.free(slot));
+}
+
+// Outputs of a fixed type are checked like byte buffers: present and aligned for their words.
+test "fixed-size outputs are checked" {
+    const allocator = testing.allocator;
+
+    const case = stateful_cases[0];
+
+    const slot = try Memory.init(allocator, .signer, 1);
+
+    defer slot.deinit();
+
+    var state: [3 + 8 + 16 + 32 + 8 + 16]u8 = undefined;
+
+    try expectStatus(ok, Signer.create(1, case.section, &pattern(48, 11), 0, &state, slot));
+
+    var words: [8]u64 align(16) = undefined;
+
+    const unaligned: *anyopaque = @ptrFromInt(@intFromPtr(&words) + 1);
+
+    const word: *anyopaque = @ptrFromInt(@intFromPtr(&words) + 4);
+
+    // Misaligned for uint64_t, whose alignment the target's C ABI sets: 8, or 4 on 32-bit x86.
+    const odd: *anyopaque = @ptrFromInt(@intFromPtr(&words) + @alignOf(u64) / 2);
+
+    try expectStatus(common.bad_argument, capi.slotInfo(slot.ptr(), slot.len(), null));
+
+    try expectStatus(common.bad_argument, capi.slotInfo(slot.ptr(), slot.len(), unaligned));
+
+    try expectStatus(ok, capi.slotInfo(slot.ptr(), slot.len(), word));
+
+    try expectStatus(common.bad_argument, capi.stateful.info(1, case.section.ptr, case.section.len, null));
+
+    try expectStatus(common.bad_argument, capi.stateful.info(1, case.section.ptr, case.section.len, odd));
+
+    try expectStatus(common.bad_argument, capi.stateful.signerInfo(slot.ptr(), slot.len(), odd));
+
+    try expectStatus(common.bad_argument, capi.stateful.treeCacheSize(slot.ptr(), slot.len(), odd));
+
+    try expectStatus(common.bad_argument, capi.stateful.treeCacheSize(slot.ptr(), slot.len(), null));
+
+    const other = try Memory.init(allocator, .signer, 1);
+
+    defer other.deinit();
+
+    try expectStatus(common.bad_argument, capi.stateful.load(1, &state, state.len, null, 0, 0, other.ptr(), other.len(), odd));
+
+    try expectStatus(ok, Signer.free(slot));
+}
+
+// The WebAssembly allocator, which also builds natively: blocks are known by their address and
+// size alone, kept out of band, and a freed block waits before its memory is handed out again.
+test "the allocator keeps its blocks out of band" {
+    const a = capi.memory.alloc(100);
+
+    try testing.expect(a != 0);
+
+    const block: [*]u8 = @ptrFromInt(a);
+
+    // Data in a block that looks like a block header names nothing.
+    @memset(block[0..100], 0x5a);
+
+    try expectStatus(common.bad_argument, capi.memory.free(a + 48, 16));
+
+    try expectStatus(common.bad_argument, capi.memory.free(a, 99));
+
+    try expectStatus(common.bad_argument, capi.memory.free(std.math.maxInt(usize) - 15, 16));
+
+    try expectStatus(ok, capi.memory.free(a, 100));
+
+    try expectStatus(common.bad_argument, capi.memory.free(a, 100));
+
+    // The next block does not take the freed one's place, so a stale second free finds nothing.
+    const b = capi.memory.alloc(100);
+
+    try testing.expect(b != a);
+
+    try expectStatus(common.bad_argument, capi.memory.free(a, 100));
+
+    try expectStatus(ok, capi.memory.free(b, 100));
+
+    const empty = capi.memory.alloc(0);
+
+    try testing.expect(empty != 0);
+
+    try expectStatus(ok, capi.memory.free(empty, 0));
+}
+
+// A block or a wipe range that holds a signer slot frees the signer with it (STATE_CONFLICT while
+// a call holds it), whatever the length beyond the slot.
+test "freeing a block or a wider range frees the signer in it" {
+    const case = stateful_cases[0];
+
+    const size = capi.slotSize(8, 1);
+
+    var state: [3 + 8 + 16 + 32 + 8 + 16]u8 = undefined;
+
+    const address = capi.memory.alloc(size + 64);
+
+    const block = @as([*]align(common.slot_alignment) u8, @ptrFromInt(address))[0 .. size + 64];
+
+    @memset(block, 0);
+
+    const slot: Memory = .{ .bytes = block[0..size], .allocator = testing.allocator };
+
+    try expectStatus(ok, Signer.create(1, case.section, &pattern(48, 12), 0, &state, slot));
+
+    const cell = cellOf(slot);
+
+    cell.busy.store(1, .release);
+
+    try expectStatus(common.code(error.StateConflict), capi.memory.free(address, size + 64));
+
+    try expectStatus(common.code(error.StateConflict), capi.slotWipe(block.ptr, block.len));
+
+    cell.busy.store(0, .release);
+
+    const generation = cell.generation.load(.acquire);
+
+    try expectStatus(ok, capi.memory.free(address, size + 64));
+
+    try testing.expectEqual(0, cell.object.load(.acquire));
+
+    try testing.expect(cell.generation.load(.acquire) != generation);
+
+    // cpq_slot_wipe of the slot and the slack after it.
+    const memory = try testing.allocator.alignedAlloc(u8, .fromByteUnits(common.slot_alignment), size + 16);
+
+    defer testing.allocator.free(memory);
+
+    @memset(memory, 0);
+
+    const wide: Memory = .{ .bytes = memory[0..size], .allocator = testing.allocator };
+
+    try expectStatus(ok, Signer.create(1, case.section, &pattern(48, 13), 0, &state, wide));
+
+    const wide_cell = cellOf(wide);
+
+    try expectStatus(ok, capi.slotWipe(memory.ptr, memory.len));
+
+    try testing.expectEqual(0, wide_cell.object.load(.acquire));
+
+    for (memory) |b| try testing.expectEqual(0, b);
+}
+
+// An import refused for its arguments writes nothing: a key that lies in the slot memory is left as
+// it was.
+test "a refused import leaves its input alone" {
+    const allocator = testing.allocator;
+
+    const kem_slot = try Memory.init(allocator, .kem_private, 1);
+
+    defer kem_slot.deinit();
+
+    const kem_key = kem_slot.bytes[1024..][0..64];
+
+    @memset(kem_key, 0x5a);
+
+    try expectStatus(common.bad_argument, capi.kem.importPrivate(1, kem_key.ptr, kem_key.len, kem_slot.ptr(), kem_slot.len()));
+
+    for (kem_key) |b| try testing.expectEqual(0x5a, b);
+
+    const sig_slot = try Memory.init(allocator, .signature_private, 1);
+
+    defer sig_slot.deinit();
+
+    const sig_key = sig_slot.bytes[2048..][0..32];
+
+    @memset(sig_key, 0x5a);
+
+    try expectStatus(common.bad_argument, capi.signature.importPrivate(1, sig_key.ptr, sig_key.len, sig_slot.ptr(), sig_slot.len()));
+
+    for (sig_key) |b| try testing.expectEqual(0x5a, b);
+
+    // And a key that the checks refuse leaves no part of itself in the slot.
+    var key = pattern(64, 3);
+
+    try expectStatus(common.code(error.InvalidLength), capi.kem.importPrivate(1, &key, 63, kem_slot.ptr(), kem_slot.len()));
+
+    for (kem_slot.bytes) |b| try testing.expect(b == 0xa5 or b == 0x5a);
+}
+
+// A state whose body the binding damaged is refused before any of it is used: no loop on a zero
+// rate, no copy or write out of bounds, no tag that a zeroed state would predictably give.
+test "a damaged state is refused, never used" {
+    const allocator = testing.allocator;
+
+    // A field of the engine, overwritten whole in the target's byte order.
+    const Case = struct {
+        slot_type: common.SlotType,
+        algorithm: u32,
+        offset: usize,
+        width: usize,
+        value: u64,
+    };
+
+    const sha256 = common.bodyOffset(@import("sha2.zig").Sha256);
+
+    const keccak = common.bodyOffset(@import("keccak.zig").Keccak);
+
+    const Keccak = @import("keccak.zig").Keccak;
+
+    const Sha256 = @import("sha2.zig").Sha256;
+
+    const cases = [_]Case{
+        .{ .slot_type = .hasher, .algorithm = 1, .offset = sha256 + @offsetOf(Sha256, "used"), .width = @sizeOf(usize), .value = 200 },
+        .{ .slot_type = .hasher, .algorithm = 1, .offset = sha256 + @offsetOf(Sha256, "length"), .width = 8, .value = 7 },
+        .{ .slot_type = .hasher, .algorithm = 7, .offset = keccak + @offsetOf(Keccak, "rate"), .width = @sizeOf(usize), .value = 0 },
+        .{ .slot_type = .hasher, .algorithm = 7, .offset = keccak + @offsetOf(Keccak, "squeezing"), .width = 1, .value = 1 },
+        .{ .slot_type = .xof, .algorithm = 1, .offset = keccak + @offsetOf(Keccak, "rate"), .width = @sizeOf(usize), .value = 0 },
+        .{ .slot_type = .xof, .algorithm = 1, .offset = keccak + @offsetOf(Keccak, "position"), .width = @sizeOf(usize), .value = 200 },
+        .{ .slot_type = .xof, .algorithm = 1, .offset = keccak + @offsetOf(Keccak, "squeezing"), .width = 1, .value = 2 },
+        .{ .slot_type = .xof, .algorithm = 0, .offset = keccak + @offsetOf(Keccak, "suffix"), .width = 1, .value = 0x06 },
+    };
+
+    for (cases) |case| {
+        const size = capi.slotSize(@intFromEnum(case.slot_type), case.algorithm);
+
+        const memory = try allocator.alignedAlloc(u8, .fromByteUnits(common.slot_alignment), size + 64);
+
+        defer allocator.free(memory);
+
+        @memset(memory, 0);
+
+        @memset(memory[size..], 0xcc);
+
+        const slot = memory[0..size];
+
+        try expectStatus(ok, switch (case.slot_type) {
+            .hasher => capi.hash.init(case.algorithm, slot.ptr, size),
+            else => capi.hash.xofInit(case.algorithm, slot.ptr, size),
+        });
+
+        const damaged = slot[case.offset..][0..case.width];
+
+        switch (case.width) {
+            1 => damaged[0] = @intCast(case.value),
+            4 => std.mem.writeInt(u32, damaged[0..4], @intCast(case.value), builtin.cpu.arch.endian()),
+            8 => std.mem.writeInt(u64, damaged[0..8], case.value, builtin.cpu.arch.endian()),
+            else => unreachable,
+        }
+
+        var out: [64]u8 = undefined;
+
+        const data: [300]u8 = @splat(0x11);
+
+        switch (case.slot_type) {
+            .hasher => {
+                try expectStatus(common.bad_slot, capi.hash.update(slot.ptr, size, &data, data.len));
+
+                try expectStatus(common.bad_slot, capi.hash.final(slot.ptr, size, &out, if (case.algorithm == 1) 32 else 32));
+            },
+            else => {
+                try expectStatus(common.bad_slot, capi.hash.xofUpdate(slot.ptr, size, &data, data.len));
+
+                try expectStatus(common.bad_slot, capi.hash.xofRead(slot.ptr, size, &out, out.len));
+            },
+        }
+
+        for (memory[size..]) |b| try testing.expectEqual(0xcc, b);
+
+        try expectStatus(ok, capi.slotWipe(slot.ptr, size));
+    }
+
+    // An HMAC state with a zeroed body, as a wipe in the middle of a call would have left it.
+    const hmac = try Memory.init(allocator, .hmac, 1);
+
+    defer hmac.deinit();
+
+    try expectStatus(ok, capi.hash.hmacInit(1, "key", 3, hmac.ptr(), hmac.len()));
+
+    const body = common.bodyOffset([2]Sha256);
+
+    @memset(hmac.bytes[body..], 0);
+
+    var tag: [32]u8 = @splat(0);
+
+    try expectStatus(common.bad_slot, capi.hash.hmacFinalVerify(hmac.ptr(), hmac.len(), &tag, 32));
+
+    try expectStatus(common.bad_slot, capi.hash.hmacFinal(hmac.ptr(), hmac.len(), &tag, 32));
+}
+
+// A copy of a key slot, made while another call filled its cache, may hold a value that the copy
+// caught half-written under a state that says it is filled. The state names the address it was
+// filled at, so the copy never trusts it and fills its own: its answers are the key's.
+test "a copied slot never trusts a cache filled elsewhere" {
+    const allocator = testing.allocator;
+
+    const S = capi.kem.Set(1);
+
+    const private = try Memory.init(allocator, .kem_private, 1);
+
+    defer private.deinit();
+
+    try expectStatus(ok, Kem.keygen(1, &pattern(64, 21), capi.kem.fill_cache, private));
+
+    const copy = try Memory.init(allocator, .kem_private, 1);
+
+    defer copy.deinit();
+
+    @memcpy(copy.bytes, private.bytes);
+
+    // The value as a torn copy may hold it, under the original's ready state.
+    const body: *S.Private = @ptrFromInt(@intFromPtr(copy.ptr()) + common.bodyOffset(S.Private));
+
+    @memset(std.mem.asBytes(&body.public.form.value), 0);
+
+    try testing.expect(!body.public.form.isReady());
+
+    var flags: [3]u32 = undefined;
+
+    try expectStatus(ok, capi.slotInfo(copy.ptr(), copy.len(), &flags));
+
+    try testing.expectEqual(0, flags[2] & 0x100);
+
+    const m = pattern(32, 22);
+
+    var ciphertext: [S.ciphertext_size]u8 = undefined;
+
+    var expected: [S.ciphertext_size]u8 = undefined;
+
+    var secret: [32]u8 = undefined;
+
+    try expectStatus(ok, Kem.encapsulate(private, &m, &expected, &secret));
+
+    try expectStatus(ok, Kem.encapsulate(copy, &m, &ciphertext, &secret));
+
+    try testing.expectEqualSlices(u8, &expected, &ciphertext);
+
+    try testing.expect(body.public.form.isReady());
+
+    try copy.wipe();
+
+    try private.wipe();
 }

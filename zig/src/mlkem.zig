@@ -958,6 +958,16 @@ pub fn encaps(comptime p: Parameters, key: *const EncapsulationKey(p.k), m: *con
 // with a mask so that the comparison result never reaches a branch. dk supplies z; everything
 // else comes from its decoded form.
 pub fn decaps(comptime p: Parameters, s_hat: *const [p.k]Poly, key: *const EncapsulationKey(p.k), dk: *const [p.decapsulationKeySize()]u8, c: *const [p.ciphertextSize()]u8) [32]u8 {
+    var shared_secret: [32]u8 = undefined;
+
+    decapsInto(p, s_hat, key, dk, c, &shared_secret);
+
+    return shared_secret;
+}
+
+// The shared secret goes straight to `shared_secret`, and every temporary is wiped: no frame
+// keeps a copy of it, of m' or of r'.
+pub fn decapsInto(comptime p: Parameters, s_hat: *const [p.k]Poly, key: *const EncapsulationKey(p.k), dk: *const [p.decapsulationKeySize()]u8, c: *const [p.ciphertextSize()]u8, shared_secret: *[32]u8) void {
     const k: usize = p.k;
 
     const z = dk[768 * k + 64 ..][0..32];
@@ -988,11 +998,7 @@ pub fn decaps(comptime p: Parameters, s_hat: *const [p.k]Poly, key: *const Encap
 
     encrypt(p, key, &m, g[32..64], &again);
 
-    var shared_secret: [32]u8 = undefined;
-
-    ct.select(ct.equalMask(c, &again), g[0..32], &rejected, &shared_secret);
-
-    return shared_secret;
+    ct.select(ct.equalMask(c, &again), g[0..32], &rejected, shared_secret);
 }
 
 // FIPS 203, 7.2: every coefficient of the encoded vector must already be reduced modulo q.

@@ -193,23 +193,26 @@ const Hashes = struct {
     prf_state: ?[8]u32,
     keygen_state: ?[8]u32,
 
-    fn init(p: Parameters, pub_seed: []const u8, sk_seed: []const u8) Hashes {
-        var self: Hashes = .{ .p = p, .pub_seed = @splat(0), .sk_seed = @splat(0), .prf_state = null, .keygen_state = null };
+    // Built in place: SK_SEED and the state derived from it stay in `self`, not in a dead frame.
+    fn init(self: *Hashes, p: Parameters, pub_seed: []const u8, sk_seed: []const u8) void {
+        self.* = .{ .p = p, .pub_seed = @splat(0), .sk_seed = @splat(0), .prf_state = null, .keygen_state = null };
 
         @memcpy(self.pub_seed[0..p.n], pub_seed);
 
         @memcpy(self.sk_seed[0..p.n], sk_seed);
 
         if (!p.shake and p.n == 32) {
-            self.prf_state = precompute(prf_prefix, pub_seed);
+            self.prf_state = sha2.iv_256;
 
-            self.keygen_state = precompute(prf_keygen_prefix, sk_seed);
+            precompute(prf_prefix, pub_seed, &self.prf_state.?);
+
+            self.keygen_state = sha2.iv_256;
+
+            precompute(prf_keygen_prefix, sk_seed, &self.keygen_state.?);
         }
-
-        return self;
     }
 
-    fn precompute(prefix: u8, key: []const u8) [8]u32 {
+    fn precompute(prefix: u8, key: []const u8, state: *[8]u32) void {
         var block: [64]u8 = @splat(0);
 
         defer ct.wipe(&block);
@@ -218,11 +221,7 @@ const Hashes = struct {
 
         @memcpy(block[32..64], key);
 
-        var state = sha2.iv_256;
-
-        sha2.compress256(&state, &block);
-
-        return state;
+        sha2.compress256(state, &block);
     }
 
     fn wipe(self: *Hashes) void {
@@ -800,7 +799,9 @@ pub fn verify(p: Parameters, public_key: []const u8, message: []const u8, signat
 
     const unused: [max_n]u8 = @splat(0);
 
-    const hashes = Hashes.init(p, public_key[4 + n ..][0..n], unused[0..n]);
+    var hashes: Hashes = undefined;
+
+    hashes.init(p, public_key[4 + n ..][0..n], unused[0..n]);
 
     var index: u64 = 0;
 
@@ -912,7 +913,7 @@ pub const Xmss = struct {
         // PUB_SEED is part of the public key.
         ct.declassify(seed[2 * n ..][0..n]);
 
-        self.hashes = .init(p, seed[2 * n ..][0..n], seed[0..n]);
+        self.hashes.init(p, seed[2 * n ..][0..n], seed[0..n]);
 
         self.sk_prf = @splat(0);
 

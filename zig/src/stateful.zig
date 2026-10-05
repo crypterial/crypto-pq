@@ -473,9 +473,13 @@ pub const Signer = union(enum) {
             .hss => {
                 const hss = try allocator.create(lms.Hss);
 
-                errdefer allocator.destroy(hss);
+                errdefer {
+                    ct.wipe(std.mem.asBytes(hss));
 
-                hss.* = try .init(allocator, setup.hssLevels(), seed[0..16], seed[16..], cached);
+                    allocator.destroy(hss);
+                }
+
+                try hss.init(allocator, setup.hssLevels(), seed[0..16], seed[16..], cached);
 
                 return .{ .hss = hss };
             },

@@ -43,12 +43,8 @@ pub fn expand(seed: *const [seed_size]u8, public_key: *[public_key_size]u8, dk: 
     ct.declassify(public_key[ek_size..]);
 }
 
-fn combine(ss_m: *const [32]u8, ss_x: *const [32]u8, ct_x: *const [32]u8, pk_x: *const [32]u8) [32]u8 {
-    var out: [32]u8 = undefined;
-
-    primitives.digest(hash.sha3_256, &.{ ss_m, ss_x, ct_x, pk_x, label }, &out);
-
-    return out;
+fn combine(ss_m: *const [32]u8, ss_x: *const [32]u8, ct_x: *const [32]u8, pk_x: *const [32]u8, out: *[32]u8) void {
+    primitives.digest(hash.sha3_256, &.{ ss_m, ss_x, ct_x, pk_x, label }, out);
 }
 
 pub fn checkPublicKey(public_key: *const [public_key_size]u8) bool {
@@ -81,15 +77,24 @@ pub fn encapsulate(key: *const EncapsulationKey, public_key: *const [public_key_
 
     ss_x = x25519.x25519(eseed[32..64], pk_x);
 
-    shared_secret.* = combine(&ss_m, &ss_x, ciphertext[ct_size..], pk_x);
+    combine(&ss_m, &ss_x, ciphertext[ct_size..], pk_x, shared_secret);
 }
 
 pub fn decapsulate(s_hat: *const Secret, key: *const EncapsulationKey, dk: *const DecapsulationKey, scalar: *const [32]u8, public_key: *const [public_key_size]u8, ciphertext: *const [ciphertext_size]u8) [32]u8 {
+    var shared_secret: [32]u8 = undefined;
+
+    decapsulateInto(s_hat, key, dk, scalar, public_key, ciphertext, &shared_secret);
+
+    return shared_secret;
+}
+
+// The shared secret goes straight to `shared_secret`; ss_M and ss_X are wiped.
+pub fn decapsulateInto(s_hat: *const Secret, key: *const EncapsulationKey, dk: *const DecapsulationKey, scalar: *const [32]u8, public_key: *const [public_key_size]u8, ciphertext: *const [ciphertext_size]u8, shared_secret: *[32]u8) void {
     const ct_x = ciphertext[ct_size..];
 
-    var ss_m = mlkem.decaps(params, s_hat, key, dk, ciphertext[0..ct_size]);
+    var ss_m: [32]u8 = undefined;
 
-    var ss_x = x25519.x25519(scalar, ct_x);
+    var ss_x: [32]u8 = undefined;
 
     defer {
         ct.wipe(&ss_m);
@@ -97,5 +102,9 @@ pub fn decapsulate(s_hat: *const Secret, key: *const EncapsulationKey, dk: *cons
         ct.wipe(&ss_x);
     }
 
-    return combine(&ss_m, &ss_x, ct_x, public_key[ek_size..]);
+    mlkem.decapsInto(params, s_hat, key, dk, ciphertext[0..ct_size], &ss_m);
+
+    ss_x = x25519.x25519(scalar, ct_x);
+
+    combine(&ss_m, &ss_x, ct_x, public_key[ek_size..], shared_secret);
 }

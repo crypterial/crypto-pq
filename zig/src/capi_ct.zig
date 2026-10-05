@@ -221,11 +221,12 @@ fn hashes(allocator: Allocator) !void {
 
     for (0..2) |id| try check(capi.hash.xof(@intCast(id), &data, data.len, &out, out.len));
 
-    const state = try Slot.init(allocator, .hmac, 3);
-
-    defer state.deinit(allocator);
-
     for ([_]usize{ 28, 32, 48, 64 }, 0..) |size, id| {
+        // A state's size depends on its hash.
+        const state = try Slot.init(allocator, .hmac, @intCast(id));
+
+        defer state.deinit(allocator);
+
         for ([_]usize{ 20, 150 }) |length| {
             try check(capi.hash.hmac(@intCast(id), &key, length, &data, data.len, &out, size));
 

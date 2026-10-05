@@ -78,31 +78,32 @@ fn MlDsa(comptime p: mldsa.Parameters) type {
             secrets: common.Lazy(SecretCache),
         };
 
+        // The seed is copied into the slot first: the caller's buffer is read once.
         pub fn generate(private: *Private, seed: *const [seed_size]u8, fill: bool) void {
+            private.seed = seed.*;
+
             private.public.form.init();
 
             private.secrets.init();
 
-            mldsa.keyGen(p, seed, &private.public.key, &private.key, if (fill) private.public.form.claim() else null);
+            mldsa.keyGen(p, &private.seed, &private.public.key, &private.key, if (fill) private.public.form.claim() else null);
 
             if (fill) private.public.form.publish();
 
             private.public.tr = private.key[64..128].*;
-
-            private.seed = seed.*;
         }
 
-        // An expanded key, checked against the public key it implies.
+        // An expanded key, checked against the public key it implies, on the copy that is kept.
         pub fn importSecret(private: *Private, bytes: *const [secret_size]u8) bool {
-            if (!mldsa.checkPrivateKey(p, bytes, &private.public.key)) return false;
+            private.key = bytes.*;
 
-            private.public.tr = bytes[64..128].*;
+            if (!mldsa.checkPrivateKey(p, &private.key, &private.public.key)) return false;
+
+            private.public.tr = private.key[64..128].*;
 
             private.public.form.init();
 
             private.secrets.init();
-
-            private.key = bytes.*;
 
             @memset(&private.seed, 0);
 
@@ -112,7 +113,7 @@ fn MlDsa(comptime p: mldsa.Parameters) type {
         pub fn importPublic(public: *Public, bytes: *const [public_key_size]u8) void {
             public.key = bytes.*;
 
-            primitives.shake256(&.{bytes}, &public.tr);
+            primitives.shake256(&.{&public.key}, &public.tr);
 
             public.form.init();
         }
@@ -218,26 +219,32 @@ fn SlhDsa(comptime p: slhdsa.Parameters) type {
             key: [secret_size]u8,
         };
 
-        // SK.seed || SK.prf || PK.seed.
+        // SK.seed || SK.prf || PK.seed, read once into the key that the slot keeps.
         pub fn generate(private: *Private, seed: *const [seed_size]u8, fill: bool) void {
             _ = fill;
 
-            Scheme.keyGen(seed[0..n], seed[n..][0..n], seed[2 * n ..][0..n], &private.key, &private.public.key);
+            private.key[0..seed_size].* = seed.*;
+
+            const copy = private.key[0..seed_size];
+
+            Scheme.keyGen(copy[0..n], copy[n..][0..n], copy[2 * n ..][0..n], &private.key, &private.public.key);
         }
 
-        // The key must hold the root that its seeds give.
+        // The key must hold the root that its seeds give, checked on the copy that is kept.
         pub fn importSecret(private: *Private, bytes: *const [secret_size]u8) bool {
+            private.key = bytes.*;
+
+            const key = &private.key;
+
             // PK.seed and PK.root are public, and so is whether the key is valid: importing it
             // fails otherwise.
-            ct.declassify(bytes[2 * n ..]);
+            ct.declassify(key[2 * n ..]);
 
-            const root = Scheme.root(bytes[0..n], bytes[2 * n ..][0..n]);
+            const root = Scheme.root(key[0..n], key[2 * n ..][0..n]);
 
-            if (!ct.declassifyValue(bool, ct.equal(&root, bytes[3 * n ..][0..n]))) return false;
+            if (!ct.declassifyValue(bool, ct.equal(&root, key[3 * n ..][0..n]))) return false;
 
-            private.public.key = bytes[2 * n ..][0 .. 2 * n].*;
-
-            private.key = bytes.*;
+            private.public.key = key[2 * n ..][0 .. 2 * n].*;
 
             return true;
         }
@@ -319,11 +326,11 @@ fn known(algorithm: u32) Failure!void {
 }
 
 fn openPublic(memory: ?[*]u8, length: usize) Failure!Slot {
-    return common.open(&.{ .signature_public, .signature_private }, memory, length, size);
+    return common.open(&.{ .signature_public, .signature_private }, memory, length, size, .shared);
 }
 
 fn openPrivate(memory: ?[*]u8, length: usize) Failure!Slot {
-    return common.open(&.{.signature_private}, memory, length, size);
+    return common.open(&.{.signature_private}, memory, length, size, .shared);
 }
 
 fn publicPart(comptime S: type, slot: Slot) *S.Public {
@@ -421,8 +428,6 @@ fn importPrivateKey(algorithm: u32, key: ?[*]const u8, key_length: usize, memory
 
     const slot = try common.place(.signature_private, algorithm, memory, length, size(.signature_private, algorithm));
 
-    errdefer slot.discard();
-
     const bytes = try common.input(key, key_length);
 
     try common.apart(&.{slot.bytes}, &.{bytes});
@@ -437,6 +442,11 @@ fn importPrivateKey(algorithm: u32, key: ?[*]const u8, key_length: usize, memory
 
             const S = Set(a);
 
+            if (bytes.len != S.secret_size and !(S.ml_dsa and bytes.len == S.seed_size)) return error.InvalidLength;
+
+            // The slot may hold part of the key from here on.
+            errdefer slot.discard();
+
             const private = slot.body(S.Private);
 
             if (S.ml_dsa and bytes.len == S.seed_size) {
@@ -444,8 +454,6 @@ fn importPrivateKey(algorithm: u32, key: ?[*]const u8, key_length: usize, memory
 
                 return slot.seal(common.has_seed);
             }
-
-            if (bytes.len != S.secret_size) return error.InvalidLength;
 
             if (!@call(.never_inline, S.importSecret, .{ private, bytes[0..S.secret_size] })) return error.InvalidPrivateKey;
         },
@@ -461,6 +469,8 @@ pub fn publicFromPrivate(private_memory: ?[*]u8, private_length: usize, memory: 
 
 fn derivePublic(private_memory: ?[*]u8, private_length: usize, memory: ?[*]u8, length: usize) Failure!void {
     const private_slot = try openPrivate(private_memory, private_length);
+
+    defer private_slot.close();
 
     const slot = try common.place(.signature_public, private_slot.algorithm, memory, length, size(.signature_public, private_slot.algorithm));
 
@@ -487,6 +497,8 @@ fn derivePublic(private_memory: ?[*]u8, private_length: usize, memory: ?[*]u8, l
         else => unreachable,
     }
 
+    try private_slot.confirm(&.{slot.bytes});
+
     slot.seal(0);
 }
 
@@ -496,6 +508,8 @@ pub fn exportPublic(memory: ?[*]u8, length: usize, out: ?[*]u8, out_length: usiz
 
 fn exportPublicKey(memory: ?[*]u8, length: usize, out: ?[*]u8, out_length: usize) Failure!void {
     const slot = try openPublic(memory, length);
+
+    defer slot.close();
 
     switch (slot.algorithm) {
         inline 0...count - 1 => |a| {
@@ -508,6 +522,8 @@ fn exportPublicKey(memory: ?[*]u8, length: usize, out: ?[*]u8, out_length: usize
             try common.apart(&.{target}, &.{slot.bytes});
 
             @memcpy(target, &publicPart(S, slot).key);
+
+            try slot.confirm(&.{target});
         },
         else => unreachable,
     }
@@ -519,6 +535,8 @@ pub fn exportPrivate(memory: ?[*]u8, length: usize, which: u32, out: ?[*]u8, out
 
 fn exportPrivateKey(memory: ?[*]u8, length: usize, which: u32, out: ?[*]u8, out_length: usize) Failure!void {
     const slot = try openPrivate(memory, length);
+
+    defer slot.close();
 
     if (which != export_seed and which != export_private) return error.BadArgument;
 
@@ -545,6 +563,8 @@ fn exportPrivateKey(memory: ?[*]u8, length: usize, which: u32, out: ?[*]u8, out_
             try common.apart(&.{target}, &.{slot.bytes});
 
             @memcpy(target, source);
+
+            try slot.confirm(&.{target});
         },
         else => unreachable,
     }
@@ -559,6 +579,8 @@ pub fn sign(memory: ?[*]u8, length: usize, message: ?[*]const u8, message_length
 
 fn signChecked(memory: ?[*]u8, length: usize, message: ?[*]const u8, message_length: usize, context: ?[*]const u8, context_length: usize, pre_hash: u32, randomness: ?[*]const u8, randomness_length: usize, flags: u32, signature: ?[*]u8, signature_length: usize) Failure!void {
     const slot = try openPrivate(memory, length);
+
+    defer slot.close();
 
     const m = try common.input(message, message_length);
 
@@ -610,6 +632,8 @@ fn signAs(comptime S: type, slot: Slot, m: []const u8, ctx: []const u8, random: 
     representative.init(m, ctx, entry);
 
     try @call(.never_inline, S.sign, .{ private, representative.parts(), rnd, out[0..S.signature_size] });
+
+    try slot.confirm(&.{out});
 }
 
 // rejected for a signature that does not verify, has the wrong length, comes with a context over
@@ -620,6 +644,8 @@ pub fn verify(memory: ?[*]u8, length: usize, signature: ?[*]const u8, signature_
 
 fn verifyChecked(memory: ?[*]u8, length: usize, signature: ?[*]const u8, signature_length: usize, message: ?[*]const u8, message_length: usize, context: ?[*]const u8, context_length: usize, pre_hash: u32, flags: u32) Failure!void {
     const slot = try openPublic(memory, length);
+
+    defer slot.close();
 
     const sig = try common.input(signature, signature_length);
 
@@ -649,7 +675,11 @@ fn verifyChecked(memory: ?[*]u8, length: usize, signature: ?[*]const u8, signatu
 
             representative.init(m, ctx, entry);
 
-            if (!@call(.never_inline, S.verify, .{ publicPart(S, slot), representative.parts(), sig[0..S.signature_size] })) return error.Rejected;
+            const valid = @call(.never_inline, S.verify, .{ publicPart(S, slot), representative.parts(), sig[0..S.signature_size] });
+
+            try slot.confirm(&.{});
+
+            if (!valid) return error.Rejected;
         },
         else => unreachable,
     }

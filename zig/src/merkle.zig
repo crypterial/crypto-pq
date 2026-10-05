@@ -74,9 +74,15 @@ pub fn MerkleTree(comptime Context: type) type {
         }
 
         pub fn build(self: *Self, context: Context) void {
-            const n = self.n;
-
             self.context = context;
+
+            self.buildInPlace();
+        }
+
+        // The build with the context already in `self.context`: a context that holds a secret is
+        // written there by its owner and never passed by value.
+        pub fn buildInPlace(self: *Self) void {
+            const n = self.n;
 
             self.subtree_index = null;
 
@@ -104,11 +110,17 @@ pub fn MerkleTree(comptime Context: type) type {
         // Takes `nodes`, laid out as `self.nodes`, instead of building them, if every parent equals
         // what its children give; otherwise the tree must be built or restored again before use.
         pub fn restore(self: *Self, context: Context, nodes: []const u8) Error!void {
-            const n = self.n;
-
             if (nodes.len != self.nodes.len) return error.InvalidEncoding;
 
             self.context = context;
+
+            return self.restoreInPlace(nodes);
+        }
+
+        pub fn restoreInPlace(self: *Self, nodes: []const u8) Error!void {
+            const n = self.n;
+
+            if (nodes.len != self.nodes.len) return error.InvalidEncoding;
 
             self.subtree_index = null;
 
