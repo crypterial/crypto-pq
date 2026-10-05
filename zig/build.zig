@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
     const step = b.step("test", "Run the tests");
 
     const tests = b.addTest(.{
+        .name = "main",
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/main.zig"),
             .target = target,
@@ -45,16 +46,28 @@ pub fn build(b: *std.Build) void {
 
     run(b, step, tests);
 
+    // The test binaries also install, to run where the build cannot run them: under an emulator
+    // given an explicit CPU model (one registered with binfmt_misc would run them with its default
+    // CPU, whatever QEMU_CPU says), or on a machine where only a foreign Zig runs. They read
+    // ../vectors, so they run from this directory.
+    const binaries = b.step("test-binaries", "Install the test binaries in zig-out/bin");
+
+    binaries.dependOn(&b.addInstallArtifact(tests, .{}).step);
+
     // X25519, the key caches, the Merkle cache and the CPU-specific kernels are internal, so their
-    // tests live in their own files. The kernels' tests also run alone, and install as a binary to
-    // run under an emulator given an explicit CPU model: a system emulator registered with
-    // binfmt_misc would otherwise run it with its default CPU, whatever QEMU_CPU says.
+    // tests live in their own files. The kernels' tests also run alone, for emulated CPU models.
     const kernels = b.step("kernels", "Run only the tests of the CPU-specific kernels");
 
-    const kernels_binary = b.step("kernels-binary", "Install the kernels' tests as zig-out/bin/kernels");
+    for ([_][2][]const u8{
+        .{ "x25519", "src/x25519.zig" },
+        .{ "cache", "src/cache.zig" },
+        .{ "merkle", "src/merkle.zig" },
+        .{ "kernels", "src/cpu_test.zig" },
+    }) |entry| {
+        const name, const path = entry;
 
-    for ([_][]const u8{ "src/x25519.zig", "src/cache.zig", "src/merkle.zig", "src/cpu_test.zig" }) |path| {
         const artifact = b.addTest(.{
+            .name = name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(path),
                 .target = target,
@@ -68,11 +81,9 @@ pub fn build(b: *std.Build) void {
 
         run(b, step, artifact);
 
-        if (std.mem.eql(u8, path, "src/cpu_test.zig")) {
-            run(b, kernels, artifact);
+        binaries.dependOn(&b.addInstallArtifact(artifact, .{}).step);
 
-            kernels_binary.dependOn(&b.addInstallArtifact(artifact, .{ .dest_sub_path = "kernels" }).step);
-        }
+        if (std.mem.eql(u8, name, "kernels")) run(b, kernels, artifact);
     }
 
     // The assembly in src/asm/ is generated; the tests check that it is current.

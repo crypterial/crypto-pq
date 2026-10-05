@@ -133,6 +133,7 @@ jobs:
           - { os: ubuntu-24.04-arm, go: stable }
           - { os: macos-latest, go: stable }
           - { os: windows-latest, go: stable }
+          - { os: windows-11-arm, go: stable }
     defaults:
       run:
         shell: bash
@@ -145,12 +146,32 @@ jobs:
           cache: false
       - if: matrix.os == 'ubuntu-latest'
         run: test -z "$(gofmt -l .)"
+      # The committed assembly must be exactly what internal/asmgen writes.
+      - if: matrix.os == 'ubuntu-latest'
+        run: go run ./internal/asmgen -check
       - run: go vet ./...
-      # The race detector needs cgo, which the Windows runner has no C compiler set up for.
+      # go vet's asmdecl checks every assembly function's frame against its Go declaration;
+      # -dynlink makes the assembler reject R15 used after a global access.
+      - if: matrix.os == 'ubuntu-latest'
+        run: |
+          for arch in amd64 arm64 386 s390x riscv64; do GOARCH=$arch go vet ./...; done
+          GOARCH=amd64 GOAMD64=v3 go vet ./...
+          go vet -tags purego ./...
+          GOOS=darwin GOARCH=arm64 go vet ./...
+          GOOS=windows GOARCH=arm64 go vet ./...
+          GOOS=freebsd GOARCH=arm64 go vet ./...
+          GOOS=android GOARCH=arm64 go vet ./...
+          GOARCH=amd64 go build -asmflags=-dynlink ./...
+          GOARCH=arm64 go build -asmflags=-dynlink ./...
+      - run: go test -v -run TestKernelSelection .
+      # The race detector needs cgo, which the Windows runners have no C compiler set up for.
       - if: runner.os != 'Windows'
         run: go test -race ./...
       - if: runner.os == 'Windows'
         run: go test ./...
+      # GOAMD64=v3 selects the AVX2 kernels at compile time instead of at run time.
+      - if: matrix.os == 'ubuntu-latest'
+        run: GOAMD64=v3 go test ./...
 
   zig:
     name: zig 0.16.0 (${{ matrix.os }})
@@ -162,19 +183,19 @@ jobs:
           - os: ubuntu-latest
             archive: zig-x86_64-linux-0.16.0.tar.xz
             sha256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+            cpu: baseline
           - os: ubuntu-24.04-arm
             archive: zig-aarch64-linux-0.16.0.tar.xz
             sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+            cpu: generic
           - os: macos-latest
             archive: zig-aarch64-macos-0.16.0.tar.xz
             sha256: b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489
+            cpu: generic
           - os: windows-latest
             archive: zig-x86_64-windows-0.16.0.zip
             sha256: 68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e
-          # Windows on Arm: the only runner that takes IsProcessorFeaturePresent's path.
-          - os: windows-11-arm
-            archive: zig-aarch64-windows-0.16.0.zip
-            sha256: aee38316ee4111717900f45dd3130145c39289e105541d737eb8c5ed653c78ef
+            cpu: baseline
     defaults:
       run:
         shell: bash
@@ -211,11 +232,46 @@ jobs:
       - run: zig build test -Doptimize=ReleaseSafe --summary all
       # The native CPU: features the runner's CPU model guarantees are chosen at compile time.
       - run: zig build test -Doptimize=ReleaseFast --summary all
-      # A generic CPU: every feature is detected at run time (CPUID, HWCAP, sysctl, kernel32).
-      # Zig's baseline for macOS is apple_m1, which would guarantee them at compile time.
-      - run: zig build test -Doptimize=ReleaseFast -Dcpu=generic --summary all
+      # A CPU model that guarantees none of the features, so every one is detected at run time
+      # (CPUID, HWCAP, sysctl): generic on AArch64, where Zig's baseline for macOS is apple_m1;
+      # the x86-64 baseline on x86-64, where the generic model lacks even SSE.
+      - run: zig build test -Doptimize=ReleaseFast -Dcpu=${{ matrix.cpu }} --summary all
       # The forced-portable build: the fallback stays tested on every platform.
       - run: zig build test -Doptimize=ReleaseFast -Dportable=true --summary all
+
+  # Windows on Arm, the only runner that takes IsProcessorFeaturePresent's path. Zig 0.16.0's own
+  # aarch64-windows build crashes at startup there, so the x86-64 compiler runs under emulation
+  # and builds the tests for aarch64-windows; the test binaries then run natively.
+  zig-windows-arm:
+    name: zig 0.16.0 (windows-11-arm)
+    runs-on: windows-11-arm
+    defaults:
+      run:
+        shell: bash
+        working-directory: zig
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/zig-x86_64-windows-0.16.0.zip
+          key: zig-x86_64-windows-0.16.0.zip
+      - run: |
+          archive="$HOME/zig-x86_64-windows-0.16.0.zip"
+          [ -f "$archive" ] || curl -fsSL --proto '=https' -o "$archive" https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip
+          [ "$(sha256sum "$archive" | cut -d' ' -f1)" = 68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e ]
+          mkdir -p ~/zig
+          7z x -bd -y -o"$(cygpath -w ~/unpacked)" "$(cygpath -w "$archive")" > /dev/null
+          mv ~/unpacked/*/* ~/zig/
+          cygpath -w ~/zig >> "$GITHUB_PATH"
+      - run: |
+          for flags in "-Doptimize=ReleaseSafe" "-Doptimize=ReleaseFast" "-Doptimize=ReleaseFast -Dcpu=generic" "-Doptimize=ReleaseFast -Dportable=true"; do
+            rm -rf zig-out
+            zig build test-binaries -Dtarget=aarch64-windows $flags
+            for binary in zig-out/bin/*.exe; do
+              echo "== $binary ($flags)"
+              "$binary"
+            done
+          done
 
   # The kernels on CPU models the runners do not have, under qemu user mode: x86-64 without
   # SHA-NI, without AVX2, and without either; AArch64 with only the v8.0 SHA-2 instructions, and
@@ -254,7 +310,7 @@ jobs:
       - run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends qemu-user
       # The whole suite would take an hour under emulation; the kernels' differential tests
       # (20,000 random inputs each, and edge cases) take seconds.
-      - run: zig build kernels-binary -Dtarget=${{ matrix.arch }}-linux -Dcpu=baseline -Doptimize=ReleaseFast
+      - run: zig build test-binaries -Dtarget=${{ matrix.arch }}-linux -Dcpu=baseline -Doptimize=ReleaseFast
       - run: |
           out=$(qemu-${{ matrix.arch }} -cpu "${{ matrix.cpu }}" zig-out/bin/kernels 2>&1) || { echo "$out"; exit 1; }
           echo "$out"
@@ -576,9 +632,11 @@ jobs:
           - os: ubuntu-latest
             archive: zig-x86_64-linux-0.16.0.tar.xz
             sha256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+            cpu: baseline
           - os: ubuntu-24.04-arm
             archive: zig-aarch64-linux-0.16.0.tar.xz
             sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+            cpu: generic
     defaults:
       run:
         shell: bash
@@ -597,5 +655,91 @@ jobs:
           echo ~/zig >> "$GITHUB_PATH"
       - run: lscpu | grep -E '^(Model name|Flags)' | cut -c1-600
       - run: zig build bench -Doptimize=ReleaseFast
-      - run: zig build bench -Doptimize=ReleaseFast -Dcpu=generic
+      - run: zig build bench -Doptimize=ReleaseFast -Dcpu=${{ matrix.cpu }}
       - run: zig build bench -Doptimize=ReleaseFast -Dportable=true
+
+  # The forced-portable build: the purego tag leaves out every kernel and the CPU detection.
+  go-purego:
+    name: go purego (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    defaults:
+      run:
+        shell: bash
+        working-directory: go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+      - run: go test -tags purego ./...
+
+  # The x86-64 paths the runner's CPU may lack, under QEMU's CPU models:
+  # Skylake-Client has AVX2, BMI2 and ADX but not the SHA extensions (most Intel desktops
+  # before Ice Lake); Haswell has AVX2 without ADX, so X25519 stays portable; Denverton has the
+  # SHA extensions without AVX; Nehalem has none of them; max has all of them.
+  go-x86-models:
+    name: go x86-64 ${{ matrix.cpu }} (qemu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cpu: Skylake-Client-v1, kernels: "SHA extensions false, AVX2 true, MULX and ADX true" }
+          - { cpu: Haswell-v1, kernels: "SHA extensions false, AVX2 true, MULX and ADX false" }
+          - { cpu: Denverton-v1, kernels: "SHA extensions true, AVX2 false, MULX and ADX false" }
+          - { cpu: Nehalem-v1, kernels: "SHA extensions false, AVX2 false, MULX and ADX false" }
+          - { cpu: max, kernels: "SHA extensions true, AVX2 true, MULX and ADX true" }
+    defaults:
+      run:
+        shell: bash
+        working-directory: go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+      - run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends qemu-user
+      - run: go test -c -o cryptopq.test .
+      # The selection must match the model, or the model did not take effect.
+      - run: |
+          qemu-x86_64 -cpu ${{ matrix.cpu }} ./cryptopq.test -test.v -test.run TestKernelSelection | tee selection.txt
+          grep -F "${{ matrix.kernels }}" selection.txt
+      - run: qemu-x86_64 -cpu ${{ matrix.cpu }} ./cryptopq.test -test.timeout 90m
+      # A GOAMD64=v3 binary refuses to start on a CPU without AVX2, BMI2 and FMA.
+      - if: matrix.cpu == 'Skylake-Client-v1'
+        run: |
+          GOAMD64=v3 go test -c -o cryptopq-v3.test .
+          qemu-x86_64 -cpu ${{ matrix.cpu }} ./cryptopq-v3.test -test.timeout 90m
+
+  # Not a gate: GitHub's runners time the kernels against the portable code. No
+  # other job times the x86-64 kernels, and the arm runner is a Neoverse core, which takes the
+  # portable Keccak.
+  go-bench:
+    name: go benchmark (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    defaults:
+      run:
+        shell: bash
+        working-directory: go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+      - run: lscpu | grep -E '^(Model name|Flags)' | cut -c1-600
+      - run: go test -v -run TestKernelSelection .
+      - run: go test -run '^$' -bench 'BenchmarkPQ' -benchtime 300ms -count 3 . | tee kernels.txt
+      - run: go test -tags purego -run '^$' -bench 'BenchmarkPQ' -benchtime 300ms -count 3 . | tee portable.txt

@@ -37,6 +37,30 @@ jobs:
       - if: failure()
         run: for f in testdata/fuzz/*/*; do echo "== $f"; cat "$f"; done
 
+  # Each kernel against the portable code, on both architectures.
+  go-fuzz-kernels:
+    name: go ${{ matrix.target }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        target: [FuzzSHA256Kernels, FuzzSHA256Chains, FuzzSHA512Kernels, FuzzKeccakKernels, FuzzX25519Kernels, FuzzNTTKernels]
+    defaults:
+      run:
+        shell: bash
+        working-directory: go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+      - run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 10m .
+      - if: failure()
+        run: for f in testdata/fuzz/*/*; do echo "== $f"; cat "$f"; done
+
   long:
     name: long robustness runs
     runs-on: ubuntu-latest
