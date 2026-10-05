@@ -805,3 +805,130 @@ jobs:
         with:
           pattern: dist-*
       - run: diff dist-X64/dist.sha256 dist-ARM64/dist.sha256 && cat dist-X64/dist.sha256
+
+  # The embedded modules are what the Zig source builds, on an x86-64 and an Arm host: each host
+  # rebuilds the five .wasm (zig build dist, ReleaseFast, byte-reproducible), checks them against
+  # typescript/wasm/SHA256SUMS, regenerates src/wasm-*.ts and fails on any difference, and runs the
+  # select/branch lint of the secret-handling functions. Both hosts matching the committed manifest
+  # means they match each other.
+  typescript-wasm-modules:
+    name: typescript wasm modules (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive: zig-x86_64-linux-0.16.0.tar.xz
+            sha256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+          - os: ubuntu-24.04-arm
+            archive: zig-aarch64-linux-0.16.0.tar.xz
+            sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/${{ matrix.archive }}
+          key: ${{ matrix.archive }}
+      - run: |
+          archive="$HOME/${{ matrix.archive }}"
+          [ -f "$archive" ] || curl -fsSL --proto '=https' -o "$archive" "https://ziglang.org/download/0.16.0/${{ matrix.archive }}"
+          echo "${{ matrix.sha256 }}  $archive" | sha256sum -c -
+          mkdir -p ~/zig && tar -xJf "$archive" -C ~/zig --strip-components=1
+          echo ~/zig >> "$GITHUB_PATH"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - run: cd zig && zig build dist
+      - run: cd zig && zig build wasm-lint
+      - run: cd zig/zig-out/dist/wasm && sha256sum -c ../../../../typescript/wasm/SHA256SUMS
+      - run: cd typescript && node tools/embed.ts --check ../zig/zig-out/dist/wasm
+
+  # The whole suite with each backend on the two supported Node lines (the existing typescript job
+  # keeps running npm test, which is backend "auto", on every OS and on Node 26).
+  typescript-backends:
+    name: typescript node ${{ matrix.node }} backend ${{ matrix.backend }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+        backend: [js, wasm, auto]
+    defaults:
+      run:
+        shell: bash
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm test
+        env:
+          CRYPTO_PQ_BACKEND: ${{ matrix.backend }}
+      - run: npm run build
+      # The package carries dist/ with the five embedded modules, as base64 typed as plain strings.
+      - run: |
+          npm pack --dry-run --json > pack.json
+          node -e '
+            const [pack] = JSON.parse(require("fs").readFileSync("pack.json", "utf8"));
+            const files = pack.files.map((f) => f.path);
+            for (const m of ["ml-kem", "ml-dsa", "slh-dsa", "stateful", "x-wing-hash"]) {
+              if (!files.includes("dist/wasm-" + m + ".js")) throw new Error("missing dist/wasm-" + m + ".js");
+            }
+            if (pack.files.some((f) => f.path.endsWith(".d.ts") && f.size > 100000)) throw new Error("a declaration file embeds a module");
+          '
+
+  # Chromium, Firefox and WebKit on the main thread, each with every backend, and pages whose
+  # content security policy forbids WebAssembly compilation (fallback to TypeScript, or
+  # UNSUPPORTED under "wasm"). Playwright is test-only and installed in the job, not a dependency.
+  typescript-browsers:
+    name: typescript browsers
+    runs-on: ubuntu-latest
+    container: mcr.microsoft.com/playwright:v1.47.2-jammy@sha256:eee5be766a342139241c9a51e6449cb8f6ff2847fbd0792f91793aaf0c7f4f46
+    defaults:
+      run:
+        shell: bash
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm install --no-save --ignore-scripts playwright-core@1.47.2
+      - run: node test/browser/runner.ts
+        env:
+          HOME: /root
+
+  # The cross vectors and every error code on WebAssembly and in TypeScript under Deno and Bun,
+  # from their official release archives.
+  typescript-engines:
+    name: typescript deno and bun
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The SHA-256 pins match the checksums each project publishes with the release.
+      - run: |
+          curl -fsSL --proto '=https' -o ~/deno.zip https://github.com/denoland/deno/releases/download/v2.9.6/deno-x86_64-unknown-linux-gnu.zip
+          curl -fsSL --proto '=https' -o ~/bun.zip https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip
+          echo "394f07f4da2bebe6ce6f1e7ce0fa16429b29b08c35e3fac3fe25972676dff4b2  $HOME/deno.zip" | sha256sum -c -
+          echo "36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913  $HOME/bun.zip" | sha256sum -c -
+          unzip -q ~/deno.zip -d ~/deno && unzip -q ~/bun.zip -d ~/bun
+      - run: ~/deno/deno run --allow-read --allow-env test/engines.ts
+        env:
+          DENO_NO_UPDATE_CHECK: "1"
+      - run: ~/bun/bun-linux-x64/bun test/engines.ts
