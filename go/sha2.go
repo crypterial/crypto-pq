@@ -783,12 +783,13 @@ func newSha256(iv *[8]uint32, size int) *sha256Engine {
 	return &sha256Engine{state: *iv, size: size}
 }
 
-func sha256Digest(iv *[8]uint32, size int, data []byte) []byte {
-	e := sha256Engine{state: *iv, size: size}
+// The digest of data into out, on an engine that stays on the stack.
+func sha256DigestInto(iv *[8]uint32, data, out []byte) {
+	e := sha256Engine{state: *iv, size: len(out)}
 
 	e.update(data)
 
-	return e.digest()
+	e.digestInto(out)
 }
 
 func (e *sha256Engine) update(data []byte) {
@@ -821,6 +822,14 @@ func (e *sha256Engine) update(data []byte) {
 
 // FIPS 180-4, 5.1: the 0x80 marker, zeros, then the message length in bits, big-endian.
 func (e *sha256Engine) digest() []byte {
+	out := make([]byte, e.size)
+
+	e.digestInto(out)
+
+	return out
+}
+
+func (e *sha256Engine) digestInto(out []byte) {
 	state := e.state
 
 	var tail [128]byte
@@ -839,13 +848,13 @@ func (e *sha256Engine) digest() []byte {
 
 	compress256(&state, tail[:end])
 
-	out := make([]byte, 32)
+	var full [32]byte
 
 	for i, word := range state {
-		binary.BigEndian.PutUint32(out[4*i:], word)
+		binary.BigEndian.PutUint32(full[4*i:], word)
 	}
 
-	return out[:e.size]
+	copy(out, full[:e.size])
 }
 
 func (e *sha256Engine) clone() engine {
@@ -866,12 +875,13 @@ func newSha512(iv *[8]uint64, size int) *sha512Engine {
 	return &sha512Engine{state: *iv, size: size}
 }
 
-func sha512Digest(iv *[8]uint64, size int, data []byte) []byte {
-	e := sha512Engine{state: *iv, size: size}
+// The digest of data into out, on an engine that stays on the stack.
+func sha512DigestInto(iv *[8]uint64, data, out []byte) {
+	e := sha512Engine{state: *iv, size: len(out)}
 
 	e.update(data)
 
-	return e.digest()
+	e.digestInto(out)
 }
 
 func (e *sha512Engine) update(data []byte) {
@@ -904,6 +914,14 @@ func (e *sha512Engine) update(data []byte) {
 
 // The 128-bit length field holds length*8; its upper half is length>>61.
 func (e *sha512Engine) digest() []byte {
+	out := make([]byte, e.size)
+
+	e.digestInto(out)
+
+	return out
+}
+
+func (e *sha512Engine) digestInto(out []byte) {
 	state := e.state
 
 	var tail [256]byte
@@ -924,13 +942,13 @@ func (e *sha512Engine) digest() []byte {
 
 	compress512(&state, tail[:end])
 
-	out := make([]byte, 64)
+	var full [64]byte
 
 	for i, word := range state {
-		binary.BigEndian.PutUint64(out[8*i:], word)
+		binary.BigEndian.PutUint64(full[8*i:], word)
 	}
 
-	return out[:e.size]
+	copy(out, full[:e.size])
 }
 
 func (e *sha512Engine) clone() engine {

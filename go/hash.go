@@ -3,6 +3,7 @@ package cryptopq
 type engine interface {
 	update(data []byte)
 	digest() []byte
+	digestInto(out []byte)
 	clone() engine
 }
 
@@ -15,12 +16,12 @@ func newSha3(size int) engine {
 	return &sha3Engine{sponge: keccak{rate: 200 - 2*size, suffix: 0x06}, size: size}
 }
 
-func sha3Digest(size int, data []byte) []byte {
-	e := sha3Engine{sponge: keccak{rate: 200 - 2*size, suffix: 0x06}, size: size}
+func sha3DigestInto(data, out []byte) {
+	e := sha3Engine{sponge: keccak{rate: 200 - 2*len(out), suffix: 0x06}, size: len(out)}
 
 	e.update(data)
 
-	return e.digest()
+	e.digestInto(out)
 }
 
 func (e *sha3Engine) update(data []byte) {
@@ -30,11 +31,15 @@ func (e *sha3Engine) update(data []byte) {
 func (e *sha3Engine) digest() []byte {
 	out := make([]byte, e.size)
 
+	e.digestInto(out)
+
+	return out
+}
+
+func (e *sha3Engine) digestInto(out []byte) {
 	sponge := e.sponge
 
 	sponge.read(out)
-
-	return out
 }
 
 func (e *sha3Engine) clone() engine {
@@ -58,26 +63,24 @@ const (
 	SHA3_512
 )
 
-// sum is the one-shot digest, on an engine that stays on the stack rather than behind a Hasher.
 type hashSpec struct {
 	name       string
 	digestSize int
 	blockSize  int
 	create     func() engine
-	sum        func([]byte) []byte
 }
 
 var hashSpecs = [...]hashSpec{
-	SHA_224:     {"SHA-224", 28, 64, func() engine { return newSha256(&iv224, 28) }, func(data []byte) []byte { return sha256Digest(&iv224, 28, data) }},
-	SHA_256:     {"SHA-256", 32, 64, func() engine { return newSha256(&iv256, 32) }, func(data []byte) []byte { return sha256Digest(&iv256, 32, data) }},
-	SHA_384:     {"SHA-384", 48, 128, func() engine { return newSha512(&iv384, 48) }, func(data []byte) []byte { return sha512Digest(&iv384, 48, data) }},
-	SHA_512:     {"SHA-512", 64, 128, func() engine { return newSha512(&iv512, 64) }, func(data []byte) []byte { return sha512Digest(&iv512, 64, data) }},
-	SHA_512_224: {"SHA-512/224", 28, 128, func() engine { return newSha512(&iv512224, 28) }, func(data []byte) []byte { return sha512Digest(&iv512224, 28, data) }},
-	SHA_512_256: {"SHA-512/256", 32, 128, func() engine { return newSha512(&iv512256, 32) }, func(data []byte) []byte { return sha512Digest(&iv512256, 32, data) }},
-	SHA3_224:    {"SHA3-224", 28, 144, func() engine { return newSha3(28) }, func(data []byte) []byte { return sha3Digest(28, data) }},
-	SHA3_256:    {"SHA3-256", 32, 136, func() engine { return newSha3(32) }, func(data []byte) []byte { return sha3Digest(32, data) }},
-	SHA3_384:    {"SHA3-384", 48, 104, func() engine { return newSha3(48) }, func(data []byte) []byte { return sha3Digest(48, data) }},
-	SHA3_512:    {"SHA3-512", 64, 72, func() engine { return newSha3(64) }, func(data []byte) []byte { return sha3Digest(64, data) }},
+	SHA_224:     {"SHA-224", 28, 64, func() engine { return newSha256(&iv224, 28) }},
+	SHA_256:     {"SHA-256", 32, 64, func() engine { return newSha256(&iv256, 32) }},
+	SHA_384:     {"SHA-384", 48, 128, func() engine { return newSha512(&iv384, 48) }},
+	SHA_512:     {"SHA-512", 64, 128, func() engine { return newSha512(&iv512, 64) }},
+	SHA_512_224: {"SHA-512/224", 28, 128, func() engine { return newSha512(&iv512224, 28) }},
+	SHA_512_256: {"SHA-512/256", 32, 128, func() engine { return newSha512(&iv512256, 32) }},
+	SHA3_224:    {"SHA3-224", 28, 144, func() engine { return newSha3(28) }},
+	SHA3_256:    {"SHA3-256", 32, 136, func() engine { return newSha3(32) }},
+	SHA3_384:    {"SHA3-384", 48, 104, func() engine { return newSha3(48) }},
+	SHA3_512:    {"SHA3-512", 64, 72, func() engine { return newSha3(64) }},
 }
 
 func (a HashAlgorithm) spec() *hashSpec {
@@ -97,11 +100,48 @@ func (a HashAlgorithm) DigestSize() int {
 }
 
 func (a HashAlgorithm) Digest(data []byte) []byte {
-	return a.spec().sum(data)
+	out := make([]byte, a.spec().digestSize)
+
+	a.DigestInto(data, out)
+
+	return out
+}
+
+// DigestInto writes the digest into out, which must be DigestSize bytes long, without allocating.
+// Each engine is called directly rather than through a function value, so that it stays on the
+// stack together with out.
+func (a HashAlgorithm) DigestInto(data, out []byte) {
+	checkDigestLength(len(out), a.spec().digestSize)
+
+	switch a {
+	case SHA_224:
+		sha256DigestInto(&iv224, data, out)
+	case SHA_256:
+		sha256DigestInto(&iv256, data, out)
+	case SHA_384:
+		sha512DigestInto(&iv384, data, out)
+	case SHA_512:
+		sha512DigestInto(&iv512, data, out)
+	case SHA_512_224:
+		sha512DigestInto(&iv512224, data, out)
+	case SHA_512_256:
+		sha512DigestInto(&iv512256, data, out)
+	default:
+		sha3DigestInto(data, out)
+	}
 }
 
 func (a HashAlgorithm) Create() *Hasher {
-	return &Hasher{engine: a.spec().create()}
+	spec := a.spec()
+
+	return &Hasher{engine: spec.create(), size: spec.digestSize}
+}
+
+// An output buffer of another length is a programming error, as an index out of range is.
+func checkDigestLength(actual, expected int) {
+	if actual != expected {
+		panic("cryptopq: INVALID_LENGTH: the output must be exactly the digest size")
+	}
 }
 
 func (a HashAlgorithm) String() string {
@@ -110,6 +150,7 @@ func (a HashAlgorithm) String() string {
 
 type Hasher struct {
 	engine engine
+	size   int
 }
 
 func (h *Hasher) Update(data []byte) {
@@ -118,6 +159,12 @@ func (h *Hasher) Update(data []byte) {
 
 func (h *Hasher) Digest() []byte {
 	return h.engine.digest()
+}
+
+func (h *Hasher) DigestInto(out []byte) {
+	checkDigestLength(len(out), h.size)
+
+	h.engine.digestInto(out)
 }
 
 type XofAlgorithm uint8
@@ -157,6 +204,15 @@ func (a XofAlgorithm) Digest(data []byte, length int) []byte {
 	return squeeze(&sponge, length)
 }
 
+// DigestInto fills out with output, without allocating.
+func (a XofAlgorithm) DigestInto(data, out []byte) {
+	sponge := keccak{rate: a.spec().rate, suffix: 0x1f}
+
+	sponge.update(data)
+
+	sponge.read(out)
+}
+
 func (a XofAlgorithm) Create() *Xof {
 	return &Xof{sponge: keccak{rate: a.spec().rate, suffix: 0x1f}}
 }
@@ -175,6 +231,10 @@ func (x *Xof) Update(data []byte) {
 
 func (x *Xof) Read(length int) []byte {
 	return squeeze(&x.sponge, length)
+}
+
+func (x *Xof) ReadInto(out []byte) {
+	x.sponge.read(out)
 }
 
 func squeeze(sponge *keccak, length int) []byte {
@@ -236,6 +296,16 @@ func (a HmacAlgorithm) Digest(key, data []byte) []byte {
 	return hmac.Digest()
 }
 
+func (a HmacAlgorithm) DigestInto(key, data, out []byte) {
+	defer ditLeave(ditEnter())
+
+	hmac := a.Create(key)
+
+	hmac.Update(data)
+
+	hmac.DigestInto(out)
+}
+
 func (a HmacAlgorithm) Create(key []byte) *Hmac {
 	defer ditLeave(ditEnter())
 
@@ -276,7 +346,7 @@ func (a HmacAlgorithm) Create(key []byte) *Hmac {
 	// Best effort: Go cannot promise that no other copy of the key remains.
 	clear(pad)
 
-	return &Hmac{inner: inner, outer: outer}
+	return &Hmac{inner: inner, outer: outer, size: hash.digestSize}
 }
 
 func (a HmacAlgorithm) Verify(key, data, tag []byte) bool {
@@ -296,6 +366,7 @@ func (a HmacAlgorithm) String() string {
 type Hmac struct {
 	inner engine
 	outer engine
+	size  int
 }
 
 func (h *Hmac) Update(data []byte) {
@@ -305,13 +376,28 @@ func (h *Hmac) Update(data []byte) {
 }
 
 func (h *Hmac) Digest() []byte {
+	out := make([]byte, h.size)
+
+	h.DigestInto(out)
+
+	return out
+}
+
+func (h *Hmac) DigestInto(out []byte) {
 	defer ditLeave(ditEnter())
+
+	checkDigestLength(len(out), h.size)
 
 	outer := h.outer.clone()
 
-	outer.update(h.inner.digest())
+	// The inner hash and the outer key give the output, which may be a key itself.
+	inner := h.inner.digest()
 
-	return outer.digest()
+	outer.update(inner)
+
+	clear(inner)
+
+	outer.digestInto(out)
 }
 
 func (h *Hmac) Verify(tag []byte) bool {

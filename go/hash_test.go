@@ -392,3 +392,125 @@ func TestHmacProperties(t *testing.T) {
 		}
 	}
 }
+
+// The Into forms write what the allocating forms return, for messages around every block size.
+func TestDigestIntoMatchesDigest(t *testing.T) {
+	data := sequence(300)
+
+	key := []byte("key")
+
+	for _, length := range []int{0, 1, 55, 56, 63, 64, 111, 112, 127, 128, 135, 136, 167, 168, 300} {
+		message := data[:length]
+
+		for _, h := range hashes {
+			out := make([]byte, h.algorithm.DigestSize())
+
+			h.algorithm.DigestInto(message, out)
+
+			if !bytes.Equal(out, h.algorithm.Digest(message)) {
+				t.Fatalf("%s, %d bytes: DigestInto differs from Digest", h.name, length)
+			}
+
+			hasher := h.algorithm.Create()
+
+			hasher.Update(message)
+
+			streamed := make([]byte, h.algorithm.DigestSize())
+
+			hasher.DigestInto(streamed)
+
+			if !bytes.Equal(streamed, out) {
+				t.Fatalf("%s, %d bytes: Hasher.DigestInto differs from Digest", h.name, length)
+			}
+		}
+
+		for _, x := range xofs {
+			out := make([]byte, 200)
+
+			x.algorithm.DigestInto(message, out)
+
+			if !bytes.Equal(out, x.algorithm.Digest(message, 200)) {
+				t.Fatalf("%s, %d bytes: DigestInto differs from Digest", x.file, length)
+			}
+
+			xof := x.algorithm.Create()
+
+			xof.Update(message)
+
+			read := make([]byte, 200)
+
+			xof.ReadInto(read[:77])
+
+			xof.ReadInto(read[77:])
+
+			if !bytes.Equal(read, out) {
+				t.Fatalf("%s, %d bytes: ReadInto differs from Digest", x.file, length)
+			}
+		}
+
+		for _, h := range hmacs {
+			out := make([]byte, h.algorithm.DigestSize())
+
+			h.algorithm.DigestInto(key, message, out)
+
+			if !bytes.Equal(out, h.algorithm.Digest(key, message)) {
+				t.Fatalf("%s, %d bytes: DigestInto differs from Digest", h.name, length)
+			}
+
+			hmac := h.algorithm.Create(key)
+
+			hmac.Update(message)
+
+			streamed := make([]byte, h.algorithm.DigestSize())
+
+			hmac.DigestInto(streamed)
+
+			if !bytes.Equal(streamed, out) {
+				t.Fatalf("%s, %d bytes: Hmac.DigestInto differs from Digest", h.name, length)
+			}
+		}
+	}
+}
+
+func TestDigestIntoRejectsAnotherLength(t *testing.T) {
+	for _, call := range []func(){
+		func() { cryptopq.SHA_256.DigestInto(nil, make([]byte, 31)) },
+		func() { cryptopq.SHA3_512.Create().DigestInto(make([]byte, 65)) },
+		func() { cryptopq.HMAC_SHA_512.DigestInto(nil, nil, make([]byte, 63)) },
+	} {
+		func() {
+			defer func() {
+				if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), "INVALID_LENGTH") {
+					t.Fatalf("want an INVALID_LENGTH panic, got %v", r)
+				}
+			}()
+
+			call()
+		}()
+	}
+}
+
+// With the output on the caller's side, the one-shot digests allocate nothing.
+func TestDigestIntoAllocatesNothing(t *testing.T) {
+	data := sequence(1000)
+
+	var out [64]byte
+
+	for _, h := range hashes {
+		allocations := testing.AllocsPerRun(20, func() {
+			h.algorithm.DigestInto(data, out[:h.algorithm.DigestSize()])
+		})
+
+		if allocations != 0 {
+			t.Errorf("%s: %v allocations", h.name, allocations)
+		}
+	}
+
+	allocations := testing.AllocsPerRun(20, func() {
+		cryptopq.SHAKE256.DigestInto(data, out[:])
+	})
+
+	if allocations != 0 {
+		t.Errorf("SHAKE256: %v allocations", allocations)
+	}
+}

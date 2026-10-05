@@ -67,16 +67,18 @@ func BenchmarkPQ(b *testing.B) {
 func benchmarkHashes(b *testing.B) {
 	data := sequence(1024)
 
+	var out [64]byte
+
 	cases := []struct {
 		name   string
-		digest func() []byte
+		digest func()
 	}{
-		{"sha-256/64B", func() []byte { return cryptopq.SHA_256.Digest(data[:64]) }},
-		{"sha-256/1KiB", func() []byte { return cryptopq.SHA_256.Digest(data) }},
-		{"sha-512/1KiB", func() []byte { return cryptopq.SHA_512.Digest(data) }},
-		{"sha3-256/1KiB", func() []byte { return cryptopq.SHA3_256.Digest(data) }},
-		{"shake128/1KiB", func() []byte { return cryptopq.SHAKE128.Digest(data, 32) }},
-		{"shake256/1KiB", func() []byte { return cryptopq.SHAKE256.Digest(data, 64) }},
+		{"sha-256/64B", func() { cryptopq.SHA_256.DigestInto(data[:64], out[:32]) }},
+		{"sha-256/1KiB", func() { cryptopq.SHA_256.DigestInto(data, out[:32]) }},
+		{"sha-512/1KiB", func() { cryptopq.SHA_512.DigestInto(data, out[:]) }},
+		{"sha3-256/1KiB", func() { cryptopq.SHA3_256.DigestInto(data, out[:32]) }},
+		{"shake128/1KiB", func() { cryptopq.SHAKE128.DigestInto(data, out[:32]) }},
+		{"shake256/1KiB", func() { cryptopq.SHAKE256.DigestInto(data, out[:]) }},
 	}
 
 	for _, c := range cases {
