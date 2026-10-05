@@ -319,16 +319,17 @@ jobs:
           echo "kernel tests run: $ran, expected ${{ matrix.kernels }}"
           [ "$ran" = "${{ matrix.kernels }}" ]
 
-  # 32-bit and big-endian targets, the big-endian one (s390x) under qemu: the code has no
-  # word-size or byte-order assumptions, and these runs keep it that way. JavaScript and Python
-  # expose neither, so their jobs above cover them.
+  # 32-bit, big-endian and RISC-V targets, all but x86 under qemu: the code has no word-size or
+  # byte-order assumptions, and these runs keep it that way; RISC-V runs the portable code, which
+  # a compiler bug there once broke. JavaScript and Python expose neither, so their jobs above
+  # cover them.
   go-cross:
     name: go ${{ matrix.goarch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        goarch: ["386", s390x]
+        goarch: ["386", s390x, riscv64]
     defaults:
       run:
         shell: bash
@@ -339,13 +340,13 @@ jobs:
         with:
           go-version: stable
           cache: false
-      - if: matrix.goarch == 's390x'
-        run: sudo apt-get update -q && sudo apt-get install -yq qemu-user
+      - if: matrix.goarch != '386'
+        run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends qemu-user
       - if: matrix.goarch == '386'
         run: GOARCH=386 go test ./...
       # Emulation is about twenty times slower, past go test's default ten-minute limit.
-      - if: matrix.goarch == 's390x'
-        run: GOARCH=s390x go test -timeout 60m -exec qemu-s390x ./...
+      - if: matrix.goarch != '386'
+        run: GOARCH=${{ matrix.goarch }} go test -timeout 60m -exec qemu-${{ matrix.goarch }} ./...
 
   rust-cross:
     name: rust ${{ matrix.target }}
@@ -358,6 +359,8 @@ jobs:
             packages: gcc-multilib
           - target: s390x-unknown-linux-gnu
             packages: gcc-s390x-linux-gnu libc6-dev-s390x-cross qemu-user
+          - target: riscv64gc-unknown-linux-gnu
+            packages: gcc-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user
     defaults:
       run:
         shell: bash
@@ -365,6 +368,8 @@ jobs:
     env:
       CARGO_TARGET_S390X_UNKNOWN_LINUX_GNU_LINKER: s390x-linux-gnu-gcc
       CARGO_TARGET_S390X_UNKNOWN_LINUX_GNU_RUNNER: qemu-s390x -L /usr/s390x-linux-gnu
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUNNER: qemu-riscv64 -L /usr/riscv64-linux-gnu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update -q && sudo apt-get install -yq ${{ matrix.packages }}
@@ -377,7 +382,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [x86-linux, s390x-linux]
+        target: [x86-linux, s390x-linux, riscv64-linux]
     defaults:
       run:
         shell: bash
@@ -394,8 +399,8 @@ jobs:
           echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $archive" | sha256sum -c -
           mkdir -p ~/zig && tar -xJf "$archive" -C ~/zig --strip-components=1
           echo ~/zig >> "$GITHUB_PATH"
-      - if: matrix.target == 's390x-linux'
-        run: sudo apt-get update -q && sudo apt-get install -yq qemu-user
+      - if: matrix.target != 'x86-linux'
+        run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends qemu-user
       - run: zig build test -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -fqemu --summary all
 
   # The packages that would be published build from their declared contents alone.
@@ -744,3 +749,52 @@ jobs:
       - run: go test -v -run TestKernelSelection .
       - run: go test -run '^$' -bench 'BenchmarkPQ' -benchtime 300ms -count 3 . | tee kernels.txt
       - run: go test -tags purego -run '^$' -bench 'BenchmarkPQ' -benchtime 300ms -count 3 . | tee portable.txt
+
+  # The C ABI's shipped artifacts (seven native libraries and five WebAssembly modules), built on
+  # an x86-64 and an Arm host: the two sets must be byte-identical, which proves they come from
+  # this source and this pinned Zig alone. The WebAssembly lint lists select and br_if in the
+  # secret-handling functions against the reviewed allowlist.
+  zig-abi-dist:
+    name: zig C ABI dist (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, archive: zig-x86_64-linux-0.16.0.tar.xz, sha256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 }
+          - { os: ubuntu-24.04-arm, archive: zig-aarch64-linux-0.16.0.tar.xz, sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 }
+    defaults:
+      run:
+        shell: bash
+        working-directory: zig
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/${{ matrix.archive }}
+          key: ${{ matrix.archive }}
+      - run: |
+          archive="$HOME/${{ matrix.archive }}"
+          [ -f "$archive" ] || curl -fsSL --proto '=https' -o "$archive" "https://ziglang.org/download/0.16.0/${{ matrix.archive }}"
+          echo "${{ matrix.sha256 }}  $archive" | sha256sum -c -
+          mkdir -p ~/zig && tar -xJf "$archive" -C ~/zig --strip-components=1
+          echo ~/zig >> "$GITHUB_PATH"
+      - run: zig build dist
+      - run: zig build wasm-lint
+      - run: (cd zig-out/dist && find . -type f | LC_ALL=C sort | xargs sha256sum) | tee dist.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ runner.arch }}
+          path: |
+            zig/zig-out/dist
+            zig/dist.sha256
+
+  zig-abi-reproducible:
+    name: zig C ABI dist is byte-identical on x86-64 and Arm hosts
+    needs: zig-abi-dist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+      - run: diff dist-X64/dist.sha256 dist-ARM64/dist.sha256 && cat dist-X64/dist.sha256
