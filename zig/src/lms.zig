@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const ct = @import("ct.zig");
 const Error = @import("errors.zig").Error;
@@ -496,7 +497,8 @@ pub fn hssVerify(public_key: []const u8, message: []const u8, signature: []const
 
 // Independent SHA-256 computations run side by side in the lanes of vectors. A target without
 // vector registers computes one at a time: emulated lanes cost as much each and spill to the stack.
-const max_lanes = if (std.simd.suggestVectorLength(u32) == null) 1 else 8;
+// RV64 computes two: LLVM (Zig 0.16.0) miscompiles rotates of one-element vectors there.
+const max_lanes = if (std.simd.suggestVectorLength(u32) != null) 8 else if (builtin.cpu.arch == .riscv64) 2 else 1;
 
 // SHA-256 of L hashes at once: lane l of every vector belongs to the l-th. Values are kept as
 // big-endian 32-bit words. Every hash starts with I || u32: a chain step or seed derivation then

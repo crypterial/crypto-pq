@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const ct = @import("ct.zig");
 const hash = @import("hash.zig");
@@ -127,7 +128,8 @@ fn compressed(adrs: *const Address) [22]u8 {
 // vector units busy despite the serial rounds of each computation; more lanes cost as much per
 // lane and leave more of them idle when the work does not fill them. A target without vector
 // registers computes one at a time: emulated lanes cost as much each and spill to the stack.
-const max_lanes = if (std.simd.suggestVectorLength(u32) == null) 1 else 8;
+// RV64 computes two: LLVM (Zig 0.16.0) miscompiles rotates of one-element vectors there.
+const max_lanes = if (std.simd.suggestVectorLength(u32) != null) 8 else if (builtin.cpu.arch == .riscv64) 2 else 1;
 
 // Trees are built from subtrees of at most 2^chunk_height leaves, so that the node buffers stay
 // small for the FORS trees of height 14.
