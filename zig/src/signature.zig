@@ -539,7 +539,7 @@ fn fromSecret(algorithm: SignatureAlgorithm, allocator: Allocator, bytes: []cons
     return .{ .algorithm = algorithm, .public = public, .secret = secret };
 }
 
-const Entry = struct {
+pub const Entry = struct {
     arc: u8,
     strength: u16,
     pre_hash: PreHash,
@@ -570,7 +570,7 @@ fn sameXof(a: hash.XofAlgorithm, b: hash.XofAlgorithm) bool {
 }
 
 // Only the hash layer's own constants are pre-hashes; a hand-built value matches none of them.
-fn lookup(pre_hash: PreHash) ?Entry {
+pub fn lookup(pre_hash: PreHash) ?Entry {
     for (hash_entries) |entry| {
         const same = switch (pre_hash) {
             .hash => |h| entry.pre_hash == .hash and sameHash(h, entry.pre_hash.hash),
@@ -602,14 +602,14 @@ fn checkSignOptions(kind: SignatureAlgorithm.Kind, context: []const u8, pre_hash
 
 // FIPS 204 and FIPS 205: M' = 0 || |ctx| || ctx || M, or 1 || |ctx| || ctx || OID || PH(M). The
 // parts point into this struct, so it must stay where `init` filled it.
-const Representative = struct {
+pub const Representative = struct {
     header: [2]u8,
     oid: [11]u8,
     digest: [64]u8,
     slices: [4][]const u8,
     count: usize,
 
-    fn init(self: *Representative, message: []const u8, context: []const u8, entry: ?Entry) void {
+    pub fn init(self: *Representative, message: []const u8, context: []const u8, entry: ?Entry) void {
         self.header = .{ @intFromBool(entry != null), @intCast(context.len) };
 
         self.slices[0] = &self.header;
@@ -643,7 +643,7 @@ const Representative = struct {
         self.count = 4;
     }
 
-    fn parts(self: *const Representative) []const []const u8 {
+    pub fn parts(self: *const Representative) []const []const u8 {
         return self.slices[0..self.count];
     }
 };

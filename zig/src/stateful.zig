@@ -18,13 +18,13 @@ const KeyFormat = keys.KeyFormat;
 
 const version = 1;
 
-const max_public_key_size = 68;
+pub const max_public_key_size = 68;
 
 const tree_cache_version = 1;
 
 const tree_cache_label = "crypto-pq tree cache v1";
 
-const tag_size = 32;
+pub const tag_size = 32;
 
 // The most trees a key holds: one per HSS level or XMSS^MT layer.
 const max_trees = 12;
@@ -117,33 +117,11 @@ pub const StatefulSignatureAlgorithm = struct {
             allocator.free(stored);
         }
 
-        const decoded = try decode(self.kind, stored);
+        var opened = try open(self.kind, allocator, stored, cache);
 
-        if (decoded.index > decoded.setup.capacity()) return error.InvalidPrivateKey;
+        defer ct.wipe(&opened.state.bytes);
 
-        var trees: [max_trees]merkle.CachedTree = undefined;
-
-        const opened = if (cache) |data| try openTreeCache(self.kind, decoded, stored, data, &trees) else null;
-
-        var state: State = .{ .bytes = @splat(0), .size = stored.len };
-
-        defer ct.wipe(&state.bytes);
-
-        @memcpy(state.bytes[0..stored.len], stored);
-
-        const restored: []const merkle.CachedTree = if (opened) |found| found.trees else &.{};
-
-        const signer = try Signer.build(allocator, decoded.setup, decoded.seed, restored);
-
-        errdefer signer.destroy(allocator);
-
-        if (opened) |found| {
-            var public_key: [max_public_key_size]u8 = undefined;
-
-            if (!std.mem.eql(u8, signer.publicKey(&public_key), found.public_key)) return error.InvalidEncoding;
-        }
-
-        return .{ .algorithm = self, .signer = signer, .store = store, .state = state, .index = .init(decoded.index), .reserved = decoded.index, .reserve = options.reserve };
+        return .{ .algorithm = self, .signer = opened.signer, .store = store, .state = opened.state, .index = .init(opened.index), .reserved = opened.index, .reserve = options.reserve };
     }
 
     pub fn importPublicKey(self: StatefulSignatureAlgorithm, data: []const u8, format: KeyFormat) Error!StatefulPublicKey {
@@ -324,53 +302,7 @@ pub const StatefulPrivateKey = struct {
 
         defer self.signing.store(false, .release);
 
-        const kind = self.algorithm.kind;
-
-        const state = self.state.bytes[0..self.state.size];
-
-        const parameters = parameterSection(kind, state);
-
-        var public_key: [max_public_key_size]u8 = undefined;
-
-        const raw = self.signer.publicKey(&public_key);
-
-        var held: [max_trees]merkle.CachedTree = undefined;
-
-        const trees = self.signer.cachedTrees(&held);
-
-        var size = 2 + parameters.len + 4 + raw.len + 1 + tag_size;
-
-        for (trees) |tree| size += 16 + tree.nodes.len;
-
-        const cache = try allocator.alloc(u8, size);
-
-        var writer: encoding.Writer = .{ .buffer = cache };
-
-        writer.bytes(&.{ tree_cache_version, @intFromEnum(kind) });
-
-        writer.bytes(parameters);
-
-        writer.bytes(&bigEndian(u32, @intCast(raw.len)));
-
-        writer.bytes(raw);
-
-        writer.bytes(&.{@intCast(trees.len)});
-
-        for (trees) |tree| {
-            writer.bytes(&.{tree.level});
-
-            writer.bytes(&bigEndian(u64, tree.tree));
-
-            writer.bytes(&.{ tree.low, tree.height, tree.n });
-
-            writer.bytes(&bigEndian(u32, @intCast(tree.nodes.len / tree.n)));
-
-            writer.bytes(tree.nodes);
-        }
-
-        treeCacheKey(seedSection(kind, state), key);
-
-        return cache;
+        return treeCacheBodyOf(allocator, self.algorithm.kind, self.state.bytes[0..self.state.size], self.signer, key);
     }
 
     pub fn deinit(self: *StatefulPrivateKey, allocator: Allocator) void {
@@ -383,6 +315,63 @@ pub const StatefulPrivateKey = struct {
         self.* = undefined;
     }
 };
+
+// The size of the tree cache of a signer and its valid state, the tag included.
+pub fn treeCacheSize(kind: StatefulSignatureAlgorithm.Kind, state: []const u8, signer: Signer) usize {
+    var public_key: [max_public_key_size]u8 = undefined;
+
+    var held: [max_trees]merkle.CachedTree = undefined;
+
+    var size = 2 + parameterSection(kind, state).len + 4 + signer.publicKey(&public_key).len + 1 + tag_size;
+
+    for (signer.cachedTrees(&held)) |tree| size += 16 + tree.nodes.len;
+
+    return size;
+}
+
+// The body of the tree cache of a signer and its valid state, with room for the tag, and the tag
+// key.
+pub fn treeCacheBodyOf(allocator: Allocator, kind: StatefulSignatureAlgorithm.Kind, state: []const u8, signer: Signer, key: *[32]u8) (Error || Allocator.Error)![]u8 {
+    const parameters = parameterSection(kind, state);
+
+    var public_key: [max_public_key_size]u8 = undefined;
+
+    const raw = signer.publicKey(&public_key);
+
+    var held: [max_trees]merkle.CachedTree = undefined;
+
+    const trees = signer.cachedTrees(&held);
+
+    const cache = try allocator.alloc(u8, treeCacheSize(kind, state, signer));
+
+    var writer: encoding.Writer = .{ .buffer = cache };
+
+    writer.bytes(&.{ tree_cache_version, @intFromEnum(kind) });
+
+    writer.bytes(parameters);
+
+    writer.bytes(&bigEndian(u32, @intCast(raw.len)));
+
+    writer.bytes(raw);
+
+    writer.bytes(&.{@intCast(trees.len)});
+
+    for (trees) |tree| {
+        writer.bytes(&.{tree.level});
+
+        writer.bytes(&bigEndian(u64, tree.tree));
+
+        writer.bytes(&.{ tree.low, tree.height, tree.n });
+
+        writer.bytes(&bigEndian(u32, @intCast(tree.nodes.len / tree.n)));
+
+        writer.bytes(tree.nodes);
+    }
+
+    treeCacheKey(seedSection(kind, state), key);
+
+    return cache;
+}
 
 pub const StatefulKeyPair = struct {
     public_key: StatefulPublicKey,
@@ -401,7 +390,7 @@ fn xmssSets(kind: StatefulSignatureAlgorithm.Kind) []const xmss_scheme.Parameter
     return if (kind == .xmss_mt) &xmss_scheme.xmss_mt_sets else &xmss_scheme.xmss_sets;
 }
 
-fn checkPublicKey(kind: StatefulSignatureAlgorithm.Kind, key: []const u8) bool {
+pub fn checkPublicKey(kind: StatefulSignatureAlgorithm.Kind, key: []const u8) bool {
     if (kind == .hss_lms) return lms.checkPublicKey(key);
 
     if (key.len < 4) return false;
@@ -470,12 +459,12 @@ pub const Setup = union(enum) {
     }
 };
 
-const Signer = union(enum) {
+pub const Signer = union(enum) {
     hss: *lms.Hss,
     xmss: *xmss_scheme.Xmss,
 
     // `cached` holds the trees of an opened tree cache that the next index signs with.
-    fn build(allocator: Allocator, setup: Setup, seed: []const u8, cached: []const merkle.CachedTree) (Error || Allocator.Error)!Signer {
+    pub fn build(allocator: Allocator, setup: Setup, seed: []const u8, cached: []const merkle.CachedTree) (Error || Allocator.Error)!Signer {
         const dit = cpu.Dit.enter();
 
         defer dit.leave();
@@ -494,7 +483,7 @@ const Signer = union(enum) {
         }
     }
 
-    fn destroy(self: Signer, allocator: Allocator) void {
+    pub fn destroy(self: Signer, allocator: Allocator) void {
         switch (self) {
             .hss => |hss| {
                 hss.deinit(allocator);
@@ -505,20 +494,20 @@ const Signer = union(enum) {
         }
     }
 
-    fn capacity(self: Signer) u64 {
+    pub fn capacity(self: Signer) u64 {
         return switch (self) {
             inline else => |signer| signer.capacity(),
         };
     }
 
-    fn signatureSize(self: Signer) usize {
+    pub fn signatureSize(self: Signer) usize {
         return switch (self) {
             .hss => |hss| hss.signatureSize(),
             .xmss => |signer| signer.hashes.p.signatureSize(),
         };
     }
 
-    fn publicKey(self: Signer, out: *[max_public_key_size]u8) []u8 {
+    pub fn publicKey(self: Signer, out: *[max_public_key_size]u8) []u8 {
         return switch (self) {
             .hss => |hss| hss.publicKey(out[0..60]),
             .xmss => |signer| signer.publicKey(out),
@@ -531,7 +520,7 @@ const Signer = union(enum) {
         };
     }
 
-    fn sign(self: Signer, index: u64, message: []const u8, out: []u8) void {
+    pub fn sign(self: Signer, index: u64, message: []const u8, out: []u8) void {
         const dit = cpu.Dit.enter();
 
         defer dit.leave();
@@ -545,11 +534,11 @@ const Signer = union(enum) {
 // The largest state belongs to an HSS key with eight levels of 32-byte hashes.
 const max_state_size = 3 + 8 * 8 + 16 + 32 + 8 + 16;
 
-const State = struct {
+pub const State = struct {
     bytes: [max_state_size]u8,
     size: usize,
 
-    fn slice(self: *State) []u8 {
+    pub fn slice(self: *State) []u8 {
         return self.bytes[0..self.size];
     }
 };
@@ -572,13 +561,13 @@ fn indexOffset(kind: StatefulSignatureAlgorithm.Kind, state: []const u8) usize {
     return if (kind == .hss_lms) state.len - 24 else 6;
 }
 
-fn reseal(kind: StatefulSignatureAlgorithm.Kind, state: []u8, index: u64) void {
+pub fn reseal(kind: StatefulSignatureAlgorithm.Kind, state: []u8, index: u64) void {
     std.mem.writeInt(u64, state[indexOffset(kind, state)..][0..8], index, .big);
 
     seal(state);
 }
 
-fn encode(kind: StatefulSignatureAlgorithm.Kind, setup: Setup, seed: []const u8, index: u64, blob: *State) void {
+pub fn encode(kind: StatefulSignatureAlgorithm.Kind, setup: Setup, seed: []const u8, index: u64, blob: *State) void {
     const header = switch (setup) {
         .hss => |hss| 3 + 8 * hss.count,
         .xmss => 6,
@@ -614,13 +603,13 @@ fn encode(kind: StatefulSignatureAlgorithm.Kind, setup: Setup, seed: []const u8,
     reseal(kind, state, index);
 }
 
-const Decoded = struct {
+pub const Decoded = struct {
     setup: Setup,
     seed: []const u8,
     index: u64,
 };
 
-fn decode(kind: StatefulSignatureAlgorithm.Kind, state: []const u8) Error!Decoded {
+pub fn decode(kind: StatefulSignatureAlgorithm.Kind, state: []const u8) Error!Decoded {
     if (state.len < 18) return error.InvalidPrivateKey;
 
     const body = state[0 .. state.len - 16];
@@ -708,7 +697,7 @@ fn treeCacheKey(seed: []const u8, key: *[32]u8) void {
     mac.digest(key);
 }
 
-fn treeCacheTag(key: *const [32]u8, body: []const u8, tag: *[tag_size]u8) void {
+pub fn treeCacheTag(key: *const [32]u8, body: []const u8, tag: *[tag_size]u8) void {
     var mac = hash.hmac_sha_256.create(key);
 
     defer ct.wipe(std.mem.asBytes(&mac));
@@ -909,6 +898,44 @@ fn openTreeCache(kind: StatefulSignatureAlgorithm.Kind, decoded: Decoded, state:
     }
 
     return .{ .public_key = public_key, .trees = out[0..used] };
+}
+
+pub const Opened = struct {
+    signer: Signer,
+    state: State,
+    index: u64,
+};
+
+// The signer of a stored state, and the trees of a tree cache when one is given: what
+// loadPrivateKey does once it has read the store, and what the C ABI's signer starts from.
+pub fn open(kind: StatefulSignatureAlgorithm.Kind, allocator: Allocator, stored: []const u8, cache: ?[]const u8) (Error || Allocator.Error)!Opened {
+    const decoded = try decode(kind, stored);
+
+    if (decoded.index > decoded.setup.capacity()) return error.InvalidPrivateKey;
+
+    var trees: [max_trees]merkle.CachedTree = undefined;
+
+    const opened = if (cache) |data| try openTreeCache(kind, decoded, stored, data, &trees) else null;
+
+    var state: State = .{ .bytes = @splat(0), .size = stored.len };
+
+    defer ct.wipe(&state.bytes);
+
+    @memcpy(state.bytes[0..stored.len], stored);
+
+    const restored: []const merkle.CachedTree = if (opened) |found| found.trees else &.{};
+
+    const signer = try Signer.build(allocator, decoded.setup, decoded.seed, restored);
+
+    errdefer signer.destroy(allocator);
+
+    if (opened) |found| {
+        var public_key: [max_public_key_size]u8 = undefined;
+
+        if (!std.mem.eql(u8, signer.publicKey(&public_key), found.public_key)) return error.InvalidEncoding;
+    }
+
+    return .{ .signer = signer, .state = state, .index = decoded.index };
 }
 
 // Builds the signer, then writes the first state with update(null, state). The new state holds
