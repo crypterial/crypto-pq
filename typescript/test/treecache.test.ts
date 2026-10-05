@@ -4,6 +4,7 @@ import { test } from "node:test";
 import * as hazmat from "../src/hazmat.ts";
 import * as pq from "../src/index.ts";
 import { leavesComputed } from "../src/merkle.ts";
+import { BACKEND } from "./backend.ts";
 import { MemoryStore, SLOW, concat, hex, throwsCode, toHex, utf8 } from "./vectors.ts";
 
 type Algorithm = pq.StatefulSignatureAlgorithm;
@@ -576,11 +577,25 @@ test("tree cache skips the build", () => {
       return leavesComputed() - before;
     };
 
-    assert.equal(leaves(() => load(algorithm, state, cache).sign(utf8("m"))), 0, algorithm.name);
+    const counts = () => [
+      leaves(() => load(algorithm, state, cache).sign(utf8("m"))),
+      leaves(() => algorithm.loadPrivateKey(new MemoryStore(state)).sign(utf8("m"))),
+      leaves(() => load(algorithm, stale, cache).sign(utf8("m"))),
+    ];
 
-    assert.equal(leaves(() => algorithm.loadPrivateKey(new MemoryStore(state)).sign(utf8("m"))), 32 * trees);
+    // The counter sees the TypeScript trees only: on WebAssembly it must stay at zero, and the
+    // counts are then taken on TypeScript.
+    if (algorithm.backend === "wasm") {
+      assert.deepEqual(counts(), [0, 0, 0], algorithm.name);
 
-    assert.equal(leaves(() => load(algorithm, stale, cache).sign(utf8("m"))), 32, algorithm.name);
+      pq.setBackend("js");
+    }
+
+    try {
+      assert.deepEqual(counts(), [0, 32 * trees, 32], algorithm.name);
+    } finally {
+      pq.setBackend(BACKEND);
+    }
   }
 });
 

@@ -1,4 +1,4 @@
-import { readUint32, writeUint32 } from "./bytes.ts";
+import { readUint32, wipe, writeUint32 } from "./bytes.ts";
 import { Keccak, absorbBytes, squeezeBytes } from "./keccak.ts";
 import { IV_256, IV_512, Sha256, Sha512, compress256 } from "./sha2.ts";
 
@@ -57,6 +57,40 @@ export function shake256Stream(...parts: Uint8Array[]): Keccak {
 
 export function shake256(length: number, ...parts: Uint8Array[]): Uint8Array {
   return shake256Stream(...parts).read(length);
+}
+
+// HMAC (RFC 2104) with SHA-256 or SHA-512, chosen by the digest size in bytes, of the concatenated
+// parts; the padded key is zeroed afterwards.
+export function hmac(size: 32 | 64, key: Uint8Array, ...parts: Uint8Array[]): Uint8Array {
+  const hash = size === 32 ? sha256 : sha512;
+
+  const pad = new Uint8Array(2 * size);
+
+  if (key.length > pad.length) {
+    const digest = hash(key);
+
+    pad.set(digest);
+
+    digest.fill(0);
+  } else {
+    pad.set(key);
+  }
+
+  for (let i = 0; i < pad.length; i++) {
+    pad[i] ^= 0x36;
+  }
+
+  const inner = hash(pad, ...parts);
+
+  for (let i = 0; i < pad.length; i++) {
+    pad[i] ^= 0x36 ^ 0x5c;
+  }
+
+  const tag = hash(pad, inner);
+
+  wipe(pad, inner);
+
+  return tag;
 }
 
 export interface PrefixedHash {

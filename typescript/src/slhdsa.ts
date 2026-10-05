@@ -1,10 +1,10 @@
 import { concat, equal, wipe, writeUint32 } from "./bytes.ts";
-import { HMAC_SHA_256, HMAC_SHA_512 } from "./hash.ts";
 import { permute } from "./keccak-permute.ts";
 import { storeLane, xorLane } from "./keccak.ts";
 import {
   type PrefixedHash,
   blocks,
+  hmac,
   loadWords,
   messageBytes,
   messageWords,
@@ -1126,9 +1126,7 @@ function prfMsg(p: Parameters, skPrf: Uint8Array, optRand: Uint8Array, message: 
     return shake256(p.n, skPrf, optRand, message);
   }
 
-  const hmac = (p.n === 16 ? HMAC_SHA_256 : HMAC_SHA_512).create(skPrf);
-
-  return hmac.update(optRand).update(message).digest().slice(0, p.n);
+  return hmac(p.n === 16 ? 32 : 64, skPrf, optRand, message).slice(0, p.n);
 }
 
 function base2b(data: Uint8Array, b: number, count: number): number[] {

@@ -1,12 +1,13 @@
 import { bytes, concat, equal, readUint32, readUint64, uint32, uint64, wipe } from "./bytes.ts";
 import { type KeyFormat, invalid, objectIdentifier } from "./encoding.ts";
 import { CryptoPQError } from "./errors.ts";
-import { HMAC_SHA_256 } from "./hash.ts";
+import { STATEFUL_SIGNATURES } from "./families.ts";
 import { exportPublic, importPublic, mismatch, readOptions, requireLength } from "./keys.ts";
 import * as lms from "./lms.ts";
 import { CACHED_HEIGHT, type CachedLevels, type CachedTree } from "./merkle.ts";
-import { sha256 } from "./primitives.ts";
+import { hmac, sha256 } from "./primitives.ts";
 import { randomBytes } from "./rng.ts";
+import { type Core, OK, PUBLIC, REJECTED, SECRET, check } from "./wasm.ts";
 import * as xmss from "./xmss.ts";
 
 const VERSION = 1;
@@ -54,12 +55,26 @@ export interface StatefulKeyPair {
   readonly privateKey: StatefulPrivateKey;
 }
 
-interface Signer {
+// The trees of a key in TypeScript.
+interface Trees {
   readonly publicKey: Uint8Array;
 
   sign(index: bigint, message: Uint8Array): Uint8Array;
 
   cached(): CachedTree[];
+}
+
+// A key's trees on the backend that made them. index is the key's next index, at which a signer
+// whose WebAssembly instance a fault discarded builds its trees again; free releases the trees of
+// a key that will never sign.
+interface Signer {
+  readonly publicKey: Uint8Array;
+
+  sign(index: bigint, message: Uint8Array): Uint8Array;
+
+  exportTreeCache(index: bigint): Uint8Array;
+
+  free(): void;
 }
 
 // The decoded content of a state blob: the parameter set, the secret seed and the next index.
@@ -86,7 +101,7 @@ export interface StatefulBackend<P> {
 
   decode(state: unknown): State<P>;
 
-  signer(parameters: P, seed: Uint8Array, cached?: ReadonlyMap<number, CachedLevels>): Signer;
+  signer(parameters: P, seed: Uint8Array, cached?: ReadonlyMap<number, CachedLevels>): Trees;
 
   // The trees of a tree cache, top first, as [level, height, n].
   layout(parameters: P): readonly (readonly [number, number, number])[];
@@ -170,7 +185,7 @@ function treeCacheOption(options: StatefulLoadOptions | undefined): Uint8Array |
 
 // The key of the tree cache tag: HKDF-Extract (RFC 5869) of the seed with the label as salt.
 function treeCacheKey(seed: Uint8Array): Uint8Array {
-  return HMAC_SHA_256.digest(TREE_CACHE_LABEL, seed);
+  return hmac(32, TREE_CACHE_LABEL, seed);
 }
 
 // A tree cache holds public nodes only, but the signer trusts the root of a cached lower tree as the
@@ -180,7 +195,7 @@ function treeCacheKey(seed: Uint8Array): Uint8Array {
 // public key and every cached tree, top first: its level or layer, its number on that level, its
 // lowest cached height, its height, n, its node count and its nodes, level by level from the
 // lowest, left to right. The tag, HMAC-SHA-256 of the body, follows it.
-function sealTreeCache(kind: number, section: Uint8Array, signer: Signer, seed: Uint8Array): Uint8Array {
+function sealTreeCache(kind: number, section: Uint8Array, signer: Trees, seed: Uint8Array): Uint8Array {
   const publicKey = signer.publicKey;
 
   const trees = signer.cached();
@@ -202,7 +217,7 @@ function sealTreeCache(kind: number, section: Uint8Array, signer: Signer, seed: 
   const key = treeCacheKey(seed);
 
   try {
-    return concat(body, HMAC_SHA_256.digest(key, body));
+    return concat(body, hmac(32, key, body));
   } finally {
     wipe(key);
   }
@@ -321,13 +336,11 @@ function openTreeCache<P>(
 
   const key = treeCacheKey(seed);
 
-  let authentic: boolean;
+  const expected = hmac(32, key, body);
 
-  try {
-    authentic = HMAC_SHA_256.verify(key, body, tag);
-  } finally {
-    wipe(key);
-  }
+  const authentic = equal(expected, tag);
+
+  wipe(key, expected);
 
   if (!authentic) {
     throw invalid("the tree cache is not authentic");
@@ -546,6 +559,281 @@ function xmssBackend(multi: boolean): StatefulBackend<xmss.Parameters> {
   };
 }
 
+function jsSigner<P>(backend: StatefulBackend<P>, parameters: P, seed: Uint8Array, trees: Trees): Signer {
+  return {
+    publicKey: trees.publicKey,
+    sign: (index, message) => trees.sign(index, message),
+    exportTreeCache: () => sealTreeCache(backend.kind, backend.parameterSection(parameters), trees, seed),
+    free() {},
+  };
+}
+
+const SIGNER_SLOT = 8;
+
+const WITH_TREE_CACHE = 1;
+
+const INVALID_PUBLIC_KEY = 4;
+
+// The largest state blob and public key of any parameter set.
+const STATE_LIMIT = 160;
+
+const PUBLIC_LIMIT = 128;
+
+const TREE_CACHE_ERRORS = {
+  INVALID_ENCODING: "the tree cache is damaged or belongs to another key",
+  ALGORITHM_MISMATCH: "the tree cache belongs to another algorithm",
+};
+
+// A signer's slot in WebAssembly memory: a block of its own, which holds the only pointer that the
+// library keeps, to the trees it allocated.
+interface Handle {
+  readonly core: Core;
+
+  readonly slot: number;
+
+  readonly size: number;
+}
+
+// Frees a signer that no call is using: the key that held it is gone, or never left the call that
+// made it. A refusal can then only be a fault, which discards the instance and zeroes its memory,
+// so nothing remains to free and the caller's own error stands.
+function release({ core, slot, size }: Handle): void {
+  if (!core.live) {
+    return;
+  }
+
+  try {
+    core.run(SECRET, [], () => {
+      if (core.x.cpq_slot_wipe(slot, size) !== OK) {
+        throw new Error("the library refused to free a stateful signer");
+      }
+
+      core.free(slot, size);
+    });
+  } catch {}
+}
+
+let signers: FinalizationRegistry<Handle> | null | undefined;
+
+function watch(signer: object, handle: Handle): void {
+  if (signers === undefined) {
+    signers = typeof FinalizationRegistry === "function" ? new FinalizationRegistry(release) : null;
+  }
+
+  signers?.register(signer, handle, signer);
+}
+
+// Builds the trees of the key from its seed at index, or, given the state that the key's own checks
+// accepted, loads them with the tree cache if any: the handle, the public key and the signature size.
+function open(
+  kind: number,
+  section: Uint8Array,
+  seed: Uint8Array,
+  index: bigint,
+  state: Uint8Array | null,
+  cache: Uint8Array | null,
+): [Handle, Uint8Array, number] {
+  const core = STATEFUL_SIGNATURES.core();
+
+  const size = core.size(SIGNER_SLOT, kind);
+
+  const slot = core.allocate(size);
+
+  const lengths = [section.length, seed.length, STATE_LIMIT, state?.length ?? 0, cache?.length ?? 0, PUBLIC_LIMIT];
+
+  try {
+    return core.run(SECRET, lengths, ([parameters, s, created, stored, c, publicKey]) => {
+      core.write(parameters, section);
+
+      check(core.x.cpq_stateful_info(kind, parameters, section.length, core.scratch));
+
+      const view = new DataView(core.bytes().buffer);
+
+      const [stateSize, publicKeySize, signatureSize] = [1, 2, 3].map((i) =>
+        Number(view.getBigUint64(core.scratch + 8 * i, true)),
+      );
+
+      if (stateSize > STATE_LIMIT || publicKeySize > PUBLIC_LIMIT) {
+        throw new Error("the stateful parameters exceed the sizes this binding expects");
+      }
+
+      if (state === null) {
+        core.write(s, seed);
+
+        check(
+          core.x.cpq_stateful_signer_create(
+            kind,
+            parameters,
+            section.length,
+            s,
+            seed.length,
+            index,
+            created,
+            stateSize,
+            slot,
+            size,
+          ),
+        );
+      } else {
+        core.write(stored, state);
+
+        const flags = cache === null ? 0 : WITH_TREE_CACHE;
+
+        if (cache !== null) {
+          core.write(c, cache);
+        }
+
+        const status = core.x.cpq_stateful_signer_load(
+          kind,
+          stored,
+          state.length,
+          c,
+          cache?.length ?? 0,
+          flags,
+          slot,
+          size,
+          core.scratch,
+        );
+
+        check(status, TREE_CACHE_ERRORS);
+      }
+
+      check(core.x.cpq_stateful_signer_public_key(slot, size, publicKey, publicKeySize));
+
+      return [{ core, slot, size }, core.read(publicKey, publicKeySize), signatureSize];
+    });
+  } catch (error) {
+    release({ core, slot, size });
+
+    throw error;
+  }
+}
+
+// A key's trees in WebAssembly memory, which the library keeps between calls. They are freed when
+// the key is garbage collected, or at once for a key that will never sign.
+class WasmSigner implements Signer {
+  readonly publicKey: Uint8Array;
+
+  readonly #kind: number;
+
+  readonly #section: Uint8Array;
+
+  readonly #seed: Uint8Array;
+
+  readonly #signatureSize: number;
+
+  #handle: Handle;
+
+  constructor(
+    kind: number,
+    section: Uint8Array,
+    seed: Uint8Array,
+    index: bigint,
+    state: Uint8Array | null,
+    cache: Uint8Array | null,
+  ) {
+    const [handle, publicKey, signatureSize] = open(kind, section, seed, index, state, cache);
+
+    this.publicKey = publicKey;
+
+    this.#kind = kind;
+
+    this.#section = section;
+
+    this.#seed = seed;
+
+    this.#signatureSize = signatureSize;
+
+    this.#handle = handle;
+
+    watch(this, handle);
+  }
+
+  sign(index: bigint, message: Uint8Array): Uint8Array {
+    const { core, slot, size } = this.#live(index);
+
+    const length = this.#signatureSize;
+
+    return core.run(SECRET, [message.length, length], ([m, signature]) => {
+      core.write(m, message);
+
+      check(core.x.cpq_stateful_signer_sign(slot, size, index, m, message.length, signature, length));
+
+      return core.read(signature, length);
+    });
+  }
+
+  // The size of the cache changes when a signature starts a new lower tree, so it is read right
+  // before the export.
+  exportTreeCache(index: bigint): Uint8Array {
+    const { core, slot, size } = this.#live(index);
+
+    const length = core.run(PUBLIC, [], () => {
+      check(core.x.cpq_stateful_signer_tree_cache_size(slot, size, core.scratch));
+
+      return Number(new DataView(core.bytes().buffer).getBigUint64(core.scratch, true));
+    });
+
+    return core.run(SECRET, [length], ([out]) => {
+      check(core.x.cpq_stateful_signer_export_tree_cache(slot, size, out, length));
+
+      return core.read(out, length);
+    });
+  }
+
+  free(): void {
+    signers?.unregister(this);
+
+    release(this.#handle);
+  }
+
+  #live(index: bigint): Handle {
+    if (!this.#handle.core.live) {
+      const [handle] = open(this.#kind, this.#section, this.#seed, index, null, null);
+
+      signers?.unregister(this);
+
+      this.#handle = handle;
+
+      watch(this, handle);
+    }
+
+    return this.#handle;
+  }
+}
+
+function wasmVerify(core: Core, kind: number, key: Uint8Array, message: Uint8Array, signature: Uint8Array): boolean {
+  return core.run(PUBLIC, [key.length, message.length, signature.length], ([k, m, s]) => {
+    core.write(k, key);
+
+    core.write(m, message);
+
+    core.write(s, signature);
+
+    const status = core.x.cpq_stateful_verify(kind, k, key.length, m, message.length, s, signature.length);
+
+    if (status !== REJECTED) {
+      check(status);
+    }
+
+    return status === OK;
+  });
+}
+
+function wasmCheck(core: Core, kind: number, key: Uint8Array): boolean {
+  return core.run(PUBLIC, [key.length], ([k]) => {
+    core.write(k, key);
+
+    const status = core.x.cpq_stateful_check_public_key(kind, k, key.length);
+
+    if (status !== INVALID_PUBLIC_KEY) {
+      check(status);
+    }
+
+    return status === OK;
+  });
+}
+
 function checkStore(store: unknown): StateStore {
   if (store === undefined || store === null) {
     throw new CryptoPQError("INVALID_OPTION", "a stateStore is required");
@@ -587,7 +875,15 @@ export class StatefulPublicKey {
   verify(signature: Uint8Array, message: Uint8Array): boolean {
     const data = bytes(signature, "signature");
 
-    return backendOf(this.algorithm).verify(this.#key, bytes(message, "message"), data);
+    const text = bytes(message, "message");
+
+    const backend = backendOf(this.algorithm);
+
+    const core = STATEFUL_SIGNATURES.select();
+
+    return core === null
+      ? backend.verify(this.#key, text, data)
+      : wasmVerify(core, backend.kind, this.#key, text, data);
   }
 
   exportKey(format: "pem"): string;
@@ -684,9 +980,7 @@ export class StatefulPrivateKey {
       throw new CryptoPQError("STATE_CONFLICT", "the key is signing in another call");
     }
 
-    const backend = backendOf(this.algorithm);
-
-    return sealTreeCache(backend.kind, backend.parameterSection(this.#parameters), this.#signer, this.#seed);
+    return this.#signer.exportTreeCache(this.#index);
   }
 
   // A call made while this key is signing can only come from inside the store, and on one thread
@@ -773,6 +1067,11 @@ export class StatefulSignatureAlgorithm {
     Object.freeze(this);
   }
 
+  // Where new keys of this algorithm run, deciding it on first use.
+  get backend(): "wasm" | "js" {
+    return STATEFUL_SIGNATURES.select() === null ? "js" : "wasm";
+  }
+
   generateKeyPair(options: StatefulKeyGenOptions): StatefulKeyPair {
     if (typeof options !== "object" || options === null) {
       throw new TypeError("options must be an object");
@@ -820,17 +1119,7 @@ export class StatefulSignatureAlgorithm {
     let signer: Signer;
 
     try {
-      if (cache === null) {
-        signer = backend.signer(parameters, seed);
-      } else {
-        const [publicKey, cached] = openTreeCache(backend, parameters, seed, index, cache);
-
-        signer = backend.signer(parameters, seed, cached);
-
-        if (!equal(signer.publicKey, publicKey)) {
-          throw invalid("the tree cache belongs to another key");
-        }
-      }
+      signer = this.#signer(parameters, seed, index, state as Uint8Array, cache);
     } catch (error) {
       wipe(seed);
 
@@ -843,9 +1132,13 @@ export class StatefulSignatureAlgorithm {
   }
 
   importPublicKey(data: Uint8Array | string, format: KeyFormat): StatefulPublicKey {
-    const key = importPublic(format, data, this.#backend.oid);
+    const backend = this.#backend;
 
-    if (!this.#backend.checkPublicKey(key)) {
+    const key = importPublic(format, data, backend.oid);
+
+    const core = STATEFUL_SIGNATURES.select();
+
+    if (core === null ? !backend.checkPublicKey(key) : !wasmCheck(core, backend.kind, key)) {
       throw new CryptoPQError("INVALID_PUBLIC_KEY", "the public key is malformed");
     }
 
@@ -856,7 +1149,7 @@ export class StatefulSignatureAlgorithm {
   #create(parameters: unknown, seed: Uint8Array, index: bigint, store: StateStore, reserve: bigint): StatefulKeyPair {
     const backend = this.#backend;
 
-    const signer = backend.signer(parameters, seed);
+    const signer = this.#signer(parameters, seed, index, null, null);
 
     const state = backend.encode(parameters, seed, index);
 
@@ -865,12 +1158,16 @@ export class StatefulSignatureAlgorithm {
     try {
       created = store.update(null, state.slice());
     } catch (error) {
+      signer.free();
+
       wipe(seed, state);
 
       throw new CryptoPQError("STATE_PERSIST_FAILED", "the state store failed to save the new key", { cause: error });
     }
 
     if (created !== true) {
+      signer.free();
+
       wipe(seed, state);
 
       synchronous(created);
@@ -881,6 +1178,44 @@ export class StatefulSignatureAlgorithm {
     const privateKey = new StatefulPrivateKey(this, parameters, seed, signer, store, state, index, reserve);
 
     return Object.freeze({ publicKey: privateKey.publicKey, privateKey });
+  }
+
+  // The trees of a key: built from the seed at index for a new key, or for a stored one from the
+  // state that its checks accepted, with the tree cache if any, which WebAssembly checks with the
+  // codes of openTreeCache. Under "auto", a key that the instance has no memory for runs in
+  // TypeScript.
+  #signer(
+    parameters: unknown,
+    seed: Uint8Array,
+    index: bigint,
+    state: Uint8Array | null,
+    cache: Uint8Array | null,
+  ): Signer {
+    const backend = this.#backend;
+
+    if (STATEFUL_SIGNATURES.select() !== null) {
+      try {
+        return new WasmSigner(backend.kind, backend.parameterSection(parameters), seed, index, state, cache);
+      } catch (error) {
+        if (!STATEFUL_SIGNATURES.fallsBack(error)) {
+          throw error;
+        }
+      }
+    }
+
+    if (cache === null) {
+      return jsSigner(backend, parameters, seed, backend.signer(parameters, seed));
+    }
+
+    const [publicKey, cached] = openTreeCache(backend, parameters, seed, index, cache);
+
+    const trees = backend.signer(parameters, seed, cached);
+
+    if (!equal(trees.publicKey, publicKey)) {
+      throw invalid("the tree cache belongs to another key");
+    }
+
+    return jsSigner(backend, parameters, seed, trees);
   }
 
   static {
@@ -928,8 +1263,17 @@ export function keyPairFromSeed(
   return createKey(algorithm, parameters, data.slice(), index, store, reserveOption(options));
 }
 
-export const HSS_LMS = new StatefulSignatureAlgorithm("HSS/LMS", HSS_BACKEND as StatefulBackend<unknown>);
+export const HSS_LMS = /* @__PURE__ */ new StatefulSignatureAlgorithm(
+  "HSS/LMS",
+  HSS_BACKEND as StatefulBackend<unknown>,
+);
 
-export const XMSS = new StatefulSignatureAlgorithm("XMSS", xmssBackend(false) as StatefulBackend<unknown>);
+export const XMSS = /* @__PURE__ */ new StatefulSignatureAlgorithm(
+  "XMSS",
+  /* @__PURE__ */ xmssBackend(false) as StatefulBackend<unknown>,
+);
 
-export const XMSS_MT = new StatefulSignatureAlgorithm("XMSS^MT", xmssBackend(true) as StatefulBackend<unknown>);
+export const XMSS_MT = /* @__PURE__ */ new StatefulSignatureAlgorithm(
+  "XMSS^MT",
+  /* @__PURE__ */ xmssBackend(true) as StatefulBackend<unknown>,
+);

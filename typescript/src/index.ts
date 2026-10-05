@@ -74,3 +74,7 @@ export type {
   StatefulLoadOptions,
   StatefulParameters,
 } from "./stateful.ts";
+
+export { setBackend } from "./wasm.ts";
+
+export type { Backend } from "./wasm.ts";
