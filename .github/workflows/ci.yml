@@ -171,6 +171,10 @@ jobs:
           - os: windows-latest
             archive: zig-x86_64-windows-0.16.0.zip
             sha256: 68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e
+          # Windows on Arm: the only runner that takes IsProcessorFeaturePresent's path.
+          - os: windows-11-arm
+            archive: zig-aarch64-windows-0.16.0.zip
+            sha256: aee38316ee4111717900f45dd3130145c39289e105541d737eb8c5ed653c78ef
     defaults:
       run:
         shell: bash
@@ -200,11 +204,63 @@ jobs:
       - if: matrix.os == 'ubuntu-latest'
         run: zig fmt --check .
       # Debug builds take a quarter of an hour, so they run once; the other platforms run the
-      # optimized modes, which keep or drop the safety checks.
+      # optimized modes, which keep or drop the safety checks. Debug on x86-64 uses Zig's own
+      # code generator, which takes the portable code.
       - if: matrix.os == 'ubuntu-latest'
         run: zig build test --summary all
       - run: zig build test -Doptimize=ReleaseSafe --summary all
+      # The native CPU: features the runner's CPU model guarantees are chosen at compile time.
       - run: zig build test -Doptimize=ReleaseFast --summary all
+      # A generic CPU: every feature is detected at run time (CPUID, HWCAP, sysctl, kernel32).
+      # Zig's baseline for macOS is apple_m1, which would guarantee them at compile time.
+      - run: zig build test -Doptimize=ReleaseFast -Dcpu=generic --summary all
+      # The forced-portable build: the fallback stays tested on every platform.
+      - run: zig build test -Doptimize=ReleaseFast -Dportable=true --summary all
+
+  # The kernels on CPU models the runners do not have, under qemu user mode: x86-64 without
+  # SHA-NI, without AVX2, and without either; AArch64 with only the v8.0 SHA-2 instructions, and
+  # with everything (whose MIDR names no Apple core, so dispatch keeps the scalar Keccak while the
+  # tests still run the SHA3 kernels). The binary runs under qemu with an explicit -cpu, and the
+  # job counts the kernel tests that ran: a skipped kernel would otherwise pass unnoticed.
+  zig-cpu-models:
+    name: zig kernels on ${{ matrix.arch }} ${{ matrix.cpu }} (qemu)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04-arm, archive: zig-aarch64-linux-0.16.0.tar.xz, sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17, arch: x86_64, cpu: "max", kernels: 3 }
+          - { runner: ubuntu-24.04-arm, archive: zig-aarch64-linux-0.16.0.tar.xz, sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17, arch: x86_64, cpu: "max,-sha-ni", kernels: 2 }
+          - { runner: ubuntu-24.04-arm, archive: zig-aarch64-linux-0.16.0.tar.xz, sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17, arch: x86_64, cpu: "max,-avx2", kernels: 1 }
+          - { runner: ubuntu-24.04-arm, archive: zig-aarch64-linux-0.16.0.tar.xz, sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17, arch: x86_64, cpu: "qemu64", kernels: 0 }
+          - { runner: ubuntu-latest, archive: zig-x86_64-linux-0.16.0.tar.xz, sha256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00, arch: aarch64, cpu: "cortex-a57", kernels: 2 }
+          - { runner: ubuntu-latest, archive: zig-x86_64-linux-0.16.0.tar.xz, sha256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00, arch: aarch64, cpu: "max", kernels: 4 }
+    defaults:
+      run:
+        shell: bash
+        working-directory: zig
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/${{ matrix.archive }}
+          key: ${{ matrix.archive }}
+      - run: |
+          archive="$HOME/${{ matrix.archive }}"
+          [ -f "$archive" ] || curl -fsSL --proto '=https' -o "$archive" "https://ziglang.org/download/0.16.0/${{ matrix.archive }}"
+          echo "${{ matrix.sha256 }}  $archive" | sha256sum -c -
+          mkdir -p ~/zig && tar -xJf "$archive" -C ~/zig --strip-components=1
+          echo ~/zig >> "$GITHUB_PATH"
+      - run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends qemu-user
+      # The whole suite would take an hour under emulation; the kernels' differential tests
+      # (20,000 random inputs each, and edge cases) take seconds.
+      - run: zig build kernels-binary -Dtarget=${{ matrix.arch }}-linux -Dcpu=baseline -Doptimize=ReleaseFast
+      - run: |
+          out=$(qemu-${{ matrix.arch }} -cpu "${{ matrix.cpu }}" zig-out/bin/kernels 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          ran=$(echo "$out" | grep -cE '^[0-9]+/[0-9]+ cpu_test\..*\.\.\.OK$' || true)
+          echo "kernel tests run: $ran, expected ${{ matrix.kernels }}"
+          [ "$ran" = "${{ matrix.kernels }}" ]
 
   # 32-bit and big-endian targets, the big-endian one (s390x) under qemu: the code has no
   # word-size or byte-order assumptions, and these runs keep it that way. JavaScript and Python
@@ -459,15 +515,28 @@ jobs:
       - run: rustup override set stable
       - run: lscpu | grep -E '^(Model name|Flags)' | cut -c1-600
       - run: |
-          cargo bench --locked > "$RUNNER_TEMP/kernels.txt"
-          RUSTFLAGS="--cfg crypto_pq_portable" cargo bench --locked > "$RUNNER_TEMP/portable.txt"
+          cargo bench --locked --bench bench > "$RUNNER_TEMP/kernels.txt"
+          RUSTFLAGS="--cfg crypto_pq_portable" cargo bench --locked --bench bench > "$RUNNER_TEMP/portable.txt"
           printf '%-32s %14s %14s %8s\n' case 'portable (us)' 'kernels (us)' speedup
           paste "$RUNNER_TEMP/portable.txt" "$RUNNER_TEMP/kernels.txt" |
-            awk '{ printf "%-32s %14.3f %14.3f %7.2fx\n", $1, $3, $6, $3 / $6 }' | tee -a "$GITHUB_STEP_SUMMARY"
+            awk 'NF == 6 && $1 == $4 && $6 > 0 { printf "%-32s %14.3f %14.3f %7.2fx\n", $1, $3, $6, $3 / $6 }' | tee -a "$GITHUB_STEP_SUMMARY"
 
   zig-ct:
-    name: zig 0.16.0 constant time (valgrind)
-    runs-on: ubuntu-latest
+    name: zig 0.16.0 constant time (valgrind, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # valgrind cannot decode AVX-512, so the checked build targets x86-64-v3 (AVX2).
+          - os: ubuntu-latest
+            archive: zig-x86_64-linux-0.16.0.tar.xz
+            sha256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+            cpu: x86_64_v3
+          - os: ubuntu-24.04-arm
+            archive: zig-aarch64-linux-0.16.0.tar.xz
+            sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+            cpu: baseline
     defaults:
       run:
         shell: bash
@@ -476,14 +545,57 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/zig-x86_64-linux-0.16.0.tar.xz
-          key: zig-x86_64-linux-0.16.0.tar.xz
+          path: ~/${{ matrix.archive }}
+          key: ${{ matrix.archive }}
       - run: |
-          archive=~/zig-x86_64-linux-0.16.0.tar.xz
-          [ -f "$archive" ] || curl -fsSL --proto '=https' -o "$archive" https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
-          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $archive" | sha256sum -c -
+          archive="$HOME/${{ matrix.archive }}"
+          [ -f "$archive" ] || curl -fsSL --proto '=https' -o "$archive" "https://ziglang.org/download/0.16.0/${{ matrix.archive }}"
+          echo "${{ matrix.sha256 }}  $archive" | sha256sum -c -
           mkdir -p ~/zig && tar -xJf "$archive" -C ~/zig --strip-components=1
           echo ~/zig >> "$GITHUB_PATH"
       - run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends valgrind
-      # valgrind cannot decode AVX-512, so the checked build targets x86-64-v3 (AVX2).
-      - run: zig build ct -Dct=true -Dcpu=x86_64_v3
+      # -Dct=true detects features at run time only, so valgrind's view of the CPU decides: it
+      # hides SHA-NI, the SHA3 instructions and DIT (and, before 3.24, SHA-512), and the code
+      # takes the portable path for those. The first run checks the kernels valgrind can run
+      # (AVX2 on x86-64, SHA-256 and with 3.24 SHA-512 on AArch64); the second the portable code.
+      - run: zig build ct -Dct=true -Dcpu=${{ matrix.cpu }}
+      - run: zig build ct -Dct=true -Dcpu=${{ matrix.cpu }} -Dportable=true
+
+
+  # Not a gate: prints the benchmark for the runner's CPU, for a generic CPU (kernels chosen at
+  # run time) and for the portable code, so the x86-64 kernels (SHA-NI, AVX2) and the
+  # per-core Keccak choice on Arm's Neoverse runners can be measured where they run.
+  zig-bench:
+    name: zig benchmark (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive: zig-x86_64-linux-0.16.0.tar.xz
+            sha256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+          - os: ubuntu-24.04-arm
+            archive: zig-aarch64-linux-0.16.0.tar.xz
+            sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+    defaults:
+      run:
+        shell: bash
+        working-directory: zig
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/${{ matrix.archive }}
+          key: ${{ matrix.archive }}
+      - run: |
+          archive="$HOME/${{ matrix.archive }}"
+          [ -f "$archive" ] || curl -fsSL --proto '=https' -o "$archive" "https://ziglang.org/download/0.16.0/${{ matrix.archive }}"
+          echo "${{ matrix.sha256 }}  $archive" | sha256sum -c -
+          mkdir -p ~/zig && tar -xJf "$archive" -C ~/zig --strip-components=1
+          echo ~/zig >> "$GITHUB_PATH"
+      - run: lscpu | grep -E '^(Model name|Flags)' | cut -c1-600
+      - run: zig build bench -Doptimize=ReleaseFast
+      - run: zig build bench -Doptimize=ReleaseFast -Dcpu=generic
+      - run: zig build bench -Doptimize=ReleaseFast -Dportable=true
