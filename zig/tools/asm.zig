@@ -17,6 +17,8 @@ const Kernel = struct {
 const kernels = [_]Kernel{
     .{ .name = "keccak_x1_sha3.s", .write = keccakSha3One },
     .{ .name = "keccak_x2_sha3.s", .write = keccakSha3Two },
+    .{ .name = "keccak_absorb_sha3.s", .write = keccakSha3Absorb },
+    .{ .name = "keccak_x3_hybrid.s", .write = keccakHybrid },
     .{ .name = "keccak_x4_avx2.s", .write = keccakAvx2 },
     .{ .name = "sha256_x8_avx2.s", .write = sha256Avx2 },
 };
@@ -94,14 +96,12 @@ fn keccakSha3Two(w: *Writer) Writer.Error!void {
 }
 
 // Keccak-f[1600] with the AArch64 SHA3 instructions on one state, or on two: lane i of both
-// lives in vector register i, the first state in the low half. EOR3 sums the theta columns,
-// RAX1 forms D[x] = C[x - 1] ^ rol(C[x + 1], 1), XAR applies D and the rho rotation while lanes
-// move along the 24-cycle of pi, and BCAX computes chi. Inputs: x0 points to the states, x1 to
-// the 24 round constants; x2, x3 and x4 are scratch.
+// lives in vector register i, the first state in the low half. Inputs: x0 points to the states,
+// x1 to the 24 round constants; x2, x3 and x4 are scratch.
 fn keccakSha3(w: *Writer, states: usize) Writer.Error!void {
     try line(w, ".arch_extension sha3", .{});
 
-    try moveStates(w, states, .load);
+    try moveStates(w, states, .load, "x0", "x2");
 
     try line(w, "mov x3, #24", .{});
 
@@ -109,6 +109,80 @@ fn keccakSha3(w: *Writer, states: usize) Writer.Error!void {
 
     try line(w, "1:", .{});
 
+    try keccakRoundSha3(w);
+
+    try line(w, "ld1r {{v26.2d}}, [x4], #8", .{});
+
+    try line(w, "eor v0.16b, v0.16b, v26.16b", .{});
+
+    try line(w, "subs x3, x3, #1", .{});
+
+    try line(w, "b.ne 1b", .{});
+
+    try moveStates(w, states, .store, "x0", "x2");
+}
+
+// Absorbs whole blocks into one state, which stays in the registers from block to block. Inputs:
+// x0 points to the state, x1 to the round constants, x2 to the data, x3 holds the number of
+// blocks (at least one) and x5 the rate in lanes (9, 13, 17, 18 or 21); x4, x6, x7 and x8 are
+// scratch.
+fn keccakSha3Absorb(w: *Writer) Writer.Error!void {
+    try line(w, ".arch_extension sha3", .{});
+
+    try moveStates(w, 1, .load, "x0", "x2");
+
+    try line(w, "mov x6, x2", .{});
+
+    try line(w, "mov x7, x3", .{});
+
+    try line(w, "1:", .{});
+
+    // The data lanes go through the free registers v25-v31 in turn; the rate decides where the
+    // XOR stops. A d-register load clears the high half, which the lone state does not use.
+    for (0..21) |i| {
+        const scratch = 25 + i % 7;
+
+        try line(w, "ldr d{d}, [x6], #8", .{scratch});
+
+        try line(w, "eor v{d}.16b, v{d}.16b, v{d}.16b", .{ i, i, scratch });
+
+        if (i + 1 == 9 or i + 1 == 13 or i + 1 == 17 or i + 1 == 18) {
+            try line(w, "cmp x5, #{d}", .{i + 1});
+
+            try line(w, "b.eq 2f", .{});
+        }
+    }
+
+    try line(w, "2:", .{});
+
+    try line(w, "mov x8, #24", .{});
+
+    try line(w, "mov x4, x1", .{});
+
+    try line(w, "3:", .{});
+
+    try keccakRoundSha3(w);
+
+    try line(w, "ld1r {{v26.2d}}, [x4], #8", .{});
+
+    try line(w, "eor v0.16b, v0.16b, v26.16b", .{});
+
+    try line(w, "subs x8, x8, #1", .{});
+
+    try line(w, "b.ne 3b", .{});
+
+    try line(w, "subs x7, x7, #1", .{});
+
+    try line(w, "b.ne 1b", .{});
+
+    try moveStates(w, 1, .store, "x0", "x2");
+}
+
+// One round but iota, with every lane back in its register: EOR3 sums the theta columns, RAX1
+// forms D[x] = C[x - 1] ^ rol(C[x + 1], 1), XAR applies D and the rho rotation while lanes move
+// along the 24-cycle of pi, and BCAX computes chi. v25-v31 are scratch, and v25 and v26 are free
+// at the end. Register moves cost nothing on the cores that run this code.
+fn keccakRoundSha3(w: *Writer) Writer.Error!void {
     // C[x] in v25 + x.
     for (0..5) |x| {
         try line(w, "eor3 v{d}.16b, v{d}.16b, v{d}.16b, v{d}.16b", .{ 25 + x, x, x + 5, x + 10 });
@@ -166,31 +240,232 @@ fn keccakSha3(w: *Writer, states: usize) Writer.Error!void {
             try line(w, "bcax v{d}.16b, v{d}.16b, v{d}.16b, v{d}.16b", .{ r + x, r + x, two_on, one_on });
         }
     }
-
-    try line(w, "ld1r {{v26.2d}}, [x4], #8", .{});
-
-    try line(w, "eor v0.16b, v0.16b, v26.16b", .{});
-
-    try line(w, "subs x3, x3, #1", .{});
-
-    try line(w, "b.ne 1b", .{});
-
-    try moveStates(w, states, .store);
 }
 
+const Direction = enum { load, store };
+
 // The first state's lanes move as the low halves (writing a d register clears the high half);
-// the second's, 200 bytes on, as the high halves.
-fn moveStates(w: *Writer, states: usize, comptime direction: enum { load, store }) Writer.Error!void {
+// the second's, 200 bytes on, as the high halves, with `walker` running over them.
+fn moveStates(w: *Writer, states: usize, comptime direction: Direction, base: []const u8, walker: []const u8) Writer.Error!void {
     const scalar = if (direction == .load) "ldr" else "str";
 
     const lane = if (direction == .load) "ld1" else "st1";
 
-    if (states == 2) try line(w, "add x2, x0, #200", .{});
+    if (states == 2) try line(w, "add {s}, {s}, #200", .{ walker, base });
 
     for (0..25) |i| {
-        try line(w, "{s} d{d}, [x0, #{d}]", .{ scalar, i, 8 * i });
+        try line(w, "{s} d{d}, [{s}, #{d}]", .{ scalar, i, base, 8 * i });
 
-        if (states == 2) try line(w, "{s} {{v{d}.d}}[1], [x2], #8", .{ lane, i });
+        if (states == 2) try line(w, "{s} {{v{d}.d}}[1], [{s}], #8", .{ lane, i, walker });
+    }
+}
+
+// Three Keccak-f[1600] permutations at once: two states with the SHA3 instructions as in
+// keccakSha3 and the third in general-purpose registers, the two instruction streams interleaved
+// round by round so that the vector and the integer pipelines work at the same time; a loop of
+// two rounds keeps the code small. The scalar state lives in x0-x17 and x19-x25 (x18 is the
+// platform register on some systems, x29 the frame pointer and x30 the link register), x26-x28
+// are its scratch registers, and the stack holds three spilled lanes, the states pointer and the
+// pointers to the next and past the last round constant. Inputs: x0 points to the three states,
+// x1 to the round constants.
+fn keccakHybrid(w: *Writer) Writer.Error!void {
+    try line(w, ".arch_extension sha3", .{});
+
+    try line(w, "sub sp, sp, #48", .{});
+
+    try line(w, "str x0, [sp, #24]", .{});
+
+    try line(w, "add x2, x1, #192", .{});
+
+    try line(w, "stp x1, x2, [sp, #32]", .{});
+
+    try moveStates(w, 2, .load, "x0", "x2");
+
+    for (1..25) |i| try line(w, "ldr {s}, [x0, #{d}]", .{ scalarLane(i), 400 + 8 * i });
+
+    try line(w, "ldr x0, [x0, #400]", .{});
+
+    try line(w, "1:", .{});
+
+    for (0..2) |r| {
+        var vector_buffer: [16 << 10]u8 = undefined;
+
+        var vector: Writer = .fixed(&vector_buffer);
+
+        try keccakRoundSha3(&vector);
+
+        var scalar_buffer: [16 << 10]u8 = undefined;
+
+        var scalar: Writer = .fixed(&scalar_buffer);
+
+        try keccakRoundScalar(&scalar);
+
+        try interleave(w, vector.buffered(), scalar.buffered());
+
+        // Iota for both, from one load of the constant.
+        try line(w, "ldr x26, [sp, #32]", .{});
+
+        try line(w, "ldr x27, [x26], #8", .{});
+
+        try line(w, "str x26, [sp, #32]", .{});
+
+        try line(w, "eor x0, x0, x27", .{});
+
+        try line(w, "dup v26.2d, x27", .{});
+
+        try line(w, "eor v0.16b, v0.16b, v26.16b", .{});
+
+        if (r == 1) {
+            try line(w, "ldr x28, [sp, #40]", .{});
+
+            try line(w, "cmp x26, x28", .{});
+
+            try line(w, "b.ne 1b", .{});
+        }
+    }
+
+    try line(w, "ldr x26, [sp, #24]", .{});
+
+    for (0..25) |i| try line(w, "str {s}, [x26, #{d}]", .{ scalarLane(i), 400 + 8 * i });
+
+    try moveStates(w, 2, .store, "x26", "x27");
+
+    try line(w, "add sp, sp, #48", .{});
+}
+
+fn scalarLane(i: usize) []const u8 {
+    const names = [25][]const u8{
+        "x0",  "x1",  "x2",  "x3",  "x4",  "x5",  "x6",  "x7",  "x8",  "x9",
+        "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x19", "x20",
+        "x21", "x22", "x23", "x24", "x25",
+    };
+
+    return names[i];
+}
+
+// One round but iota in general-purpose registers, every lane back in its own register at the
+// end. Theta first sums column 4 into the register of lane 4, whose value waits on the stack
+// with those of lanes 9 and 14; the other sums go to x26-x28 and lane 9's register, lane 14's
+// register takes D[1] and D[2] in turn, and the sums turn into the other D[x] as their last use
+// passes. Rho and pi move the lanes along the cycle with lane 1 parked in x26, and chi needs
+// three scratch registers per row.
+fn keccakRoundScalar(w: *Writer) Writer.Error!void {
+    const lane = scalarLane;
+
+    try line(w, "stp x4, x9, [sp]", .{});
+
+    try line(w, "str x14, [sp, #16]", .{});
+
+    try line(w, "eor x4, x4, x9", .{});
+
+    for (2..5) |y| try line(w, "eor x4, x4, {s}", .{lane(4 + 5 * y)});
+
+    const sums = [4][]const u8{ "x26", "x27", "x28", "x9" };
+
+    for (sums, 0..) |sum, x| {
+        try line(w, "eor {s}, {s}, {s}", .{ sum, lane(x), lane(x + 5) });
+
+        for (2..5) |y| try line(w, "eor {s}, {s}, {s}", .{ sum, sum, lane(x + 5 * y) });
+    }
+
+    // rol(C, 1) is C rotated right by 63.
+    try line(w, "eor x14, x26, x28, ror #63", .{});
+
+    for (0..5) |y| try line(w, "eor {s}, {s}, x14", .{ lane(1 + 5 * y), lane(1 + 5 * y) });
+
+    try line(w, "eor x14, x27, x9, ror #63", .{});
+
+    try line(w, "eor x28, x28, x4, ror #63", .{});
+
+    try line(w, "eor x9, x9, x26, ror #63", .{});
+
+    try line(w, "eor x4, x4, x27, ror #63", .{});
+
+    for (0..5) |y| try line(w, "eor {s}, {s}, x14", .{ lane(2 + 5 * y), lane(2 + 5 * y) });
+
+    for (0..5) |y| try line(w, "eor {s}, {s}, x4", .{ lane(5 * y), lane(5 * y) });
+
+    for (0..5) |y| try line(w, "eor {s}, {s}, x28", .{ lane(3 + 5 * y), lane(3 + 5 * y) });
+
+    // D[4] is in lane 9's register, which takes lane 9 last.
+    try line(w, "ldr x4, [sp]", .{});
+
+    try line(w, "ldr x14, [sp, #16]", .{});
+
+    try line(w, "ldr x26, [sp, #8]", .{});
+
+    for ([_]usize{ 4, 14, 19, 24 }) |i| try line(w, "eor {s}, {s}, x9", .{ lane(i), lane(i) });
+
+    try line(w, "eor x9, x26, x9", .{});
+
+    var source: [25]usize = undefined;
+
+    for (0..25) |s| source[piTarget(s)] = s;
+
+    try line(w, "mov x26, {s}", .{lane(1)});
+
+    var t: usize = 1;
+
+    while (true) {
+        const s = source[t];
+
+        try line(w, "ror {s}, {s}, #{d}", .{ lane(t), if (s == 1) "x26" else lane(s), 64 - rho[s] });
+
+        if (s == 1) break;
+
+        t = s;
+    }
+
+    // BIC Xd, Xn, Xm computes Xn & ~Xm; chi is b[x] ^ (b[x + 2] & ~b[x + 1]).
+    for (0..5) |y| {
+        const b = [5][]const u8{ lane(5 * y), lane(5 * y + 1), lane(5 * y + 2), lane(5 * y + 3), lane(5 * y + 4) };
+
+        try line(w, "bic x26, {s}, {s}", .{ b[2], b[1] });
+
+        try line(w, "bic x27, {s}, {s}", .{ b[3], b[2] });
+
+        try line(w, "bic x28, {s}, {s}", .{ b[4], b[3] });
+
+        try line(w, "eor {s}, {s}, x28", .{ b[2], b[2] });
+
+        try line(w, "bic x28, {s}, {s}", .{ b[0], b[4] });
+
+        try line(w, "eor {s}, {s}, x28", .{ b[3], b[3] });
+
+        try line(w, "bic x28, {s}, {s}", .{ b[1], b[0] });
+
+        try line(w, "eor {s}, {s}, x28", .{ b[4], b[4] });
+
+        try line(w, "eor {s}, {s}, x26", .{ b[0], b[0] });
+
+        try line(w, "eor {s}, {s}, x27", .{ b[1], b[1] });
+    }
+}
+
+// Merges two instruction streams so that each advances in proportion to its length.
+fn interleave(w: *Writer, first: []const u8, second: []const u8) Writer.Error!void {
+    const a = std.mem.count(u8, first, "\n");
+
+    const b = std.mem.count(u8, second, "\n");
+
+    var left = std.mem.splitScalar(u8, first, '\n');
+
+    var right = std.mem.splitScalar(u8, second, '\n');
+
+    var taken_a: usize = 0;
+
+    var taken_b: usize = 0;
+
+    while (taken_a < a or taken_b < b) {
+        if (taken_b == b or (taken_a < a and taken_a * b <= taken_b * a)) {
+            try line(w, "{s}", .{left.next().?});
+
+            taken_a += 1;
+        } else {
+            try line(w, "{s}", .{right.next().?});
+
+            taken_b += 1;
+        }
     }
 }
 

@@ -7,6 +7,7 @@ const hash = @import("hash.zig");
 const keccak = @import("keccak.zig");
 const primitives = @import("primitives.zig");
 const vec = @import("vector.zig");
+const wasm = @import("wasm.zig");
 
 pub const Parameters = struct {
     k: u8,
@@ -153,6 +154,8 @@ pub fn montgomery(a: V, b: V, b_qinv: V) V {
         return @shuffle(i32, out[0], out[1], [8]i32{ 0, 1, 2, 3, -1, -2, -3, -4 });
     }
 
+    if (comptime cpu.wasm_simd) return wasm.montgomery32(q, a, b, b_qinv);
+
     return portable.montgomery(a, b, b_qinv);
 }
 
@@ -160,10 +163,51 @@ fn halves(a: V) [2]@Vector(4, i32) {
     return .{ @shuffle(i32, a, undefined, [4]i32{ 0, 1, 2, 3 }), @shuffle(i32, a, undefined, [4]i32{ 4, 5, 6, 7 }) };
 }
 
-// The formula for every target, which the AArch64 one above must equal.
+// The formulas for every target, which the AArch64 code must equal.
 pub const portable = struct {
     pub fn montgomery(a: V, b: V, b_qinv: V) V {
         return mulHigh(a, b) - mulHigh(a *% b_qinv, splat(q));
+    }
+
+    // The matrix is public and rejections are rare.
+    pub fn parseUniform(out: *Poly, start: usize, block: *const [168]u8) usize {
+        var count = start;
+
+        var offset: usize = 0;
+
+        while (offset < block.len and count < 256) : (offset += 3) {
+            const z = block[offset] | (@as(i32, block[offset + 1]) << 8) | (@as(i32, block[offset + 2] & 0x7f) << 16);
+
+            if (z < q) {
+                out[count] = z;
+
+                count += 1;
+            }
+        }
+
+        return count;
+    }
+
+    // FIPS 204, Algorithm 31, on the secret seed: every candidate is written and the count
+    // advances by the acceptance, so the accepted values never steer a branch. Which candidates
+    // are rejected is public, as BoringSSL also has it: the bytes of the SHAKE256 stream are
+    // independent of each other, so the rejected ones say nothing about the accepted
+    // coefficients.
+    pub fn parseBounded(comptime eta: u8, buffer: *[sample_buffer]i32, start: usize, block: *const [136]u8) usize {
+        var count = start;
+
+        for (block) |byte| {
+            for ([2]i32{ byte & 0x0f, byte >> 4 }) |half| {
+                const accepted: usize = @intFromBool(ct.declassifyValue(bool, if (eta == 2) half < 15 else half < 9));
+
+                // half mod 5 is half - 5 * floor(205 * half / 1024) for half < 15.
+                buffer[count] = if (eta == 2) 2 - (half - 5 * ((205 * half) >> 10)) else 4 - half;
+
+                count += accepted & @intFromBool(count < 256);
+            }
+        }
+
+        return count;
     }
 };
 
@@ -460,84 +504,53 @@ fn bitUnpack(comptime bits: u5, comptime b: i32, bytes: *const [32 * @as(usize, 
     }
 }
 
-// Candidates from a block of the matrix XOF; the matrix is public and rejections are rare.
+// The room a sampling buffer has past the 256 coefficients: the vector code stores whole vectors
+// at the count.
+pub const sample_buffer = 256 + 8;
+
+// Candidates from a block of the matrix XOF, written to out[start..256]; returns the new count.
 fn parseUniform(out: *Poly, start: usize, block: *const [168]u8) usize {
-    var count = start;
+    if (comptime cpu.neon) return aarch64.uniform23(out, start, block);
 
-    var offset: usize = 0;
-
-    while (offset < block.len and count < 256) : (offset += 3) {
-        const z = block[offset] | (@as(i32, block[offset + 1]) << 8) | (@as(i32, block[offset + 2] & 0x7f) << 16);
-
-        if (z < q) {
-            out[count] = z;
-
-            count += 1;
-        }
-    }
-
-    return count;
+    return portable.parseUniform(out, start, block);
 }
 
-// FIPS 204, Algorithm 31, on the secret seed: every candidate is written and the count advances
-// by the acceptance, so the accepted values never steer a branch. Which candidates are rejected
-// is public, as BoringSSL also has it: the bytes of the SHAKE256 stream are independent of each
-// other, so the rejected ones say nothing about the accepted coefficients.
-fn parseBounded(comptime eta: u8, buffer: *[257]i32, start: usize, block: *const [136]u8) usize {
-    var count = start;
+// Candidates from a block of the secret vectors' XOF, appended to buffer[start..]; returns the new
+// count, which may pass 256, and only the first 256 count.
+fn parseBounded(comptime eta: u8, buffer: *[sample_buffer]i32, start: usize, block: *const [136]u8) usize {
+    if (comptime cpu.neon) return aarch64.bounded(eta, buffer, start, block);
 
-    for (block) |byte| {
-        for ([2]i32{ byte & 0x0f, byte >> 4 }) |half| {
-            const accepted: usize = @intFromBool(ct.declassifyValue(bool, if (eta == 2) half < 15 else half < 9));
-
-            // half mod 5 is half - 5 * floor(205 * half / 1024) for half < 15.
-            buffer[count] = if (eta == 2) 2 - (half - 5 * ((205 * half) >> 10)) else 4 - half;
-
-            count += accepted & @intFromBool(count < 256);
-        }
-    }
-
-    return count;
+    return portable.parseBounded(eta, buffer, start, block);
 }
 
-// Entries first .. first + outs.len - 1 of the k * l matrix A in row-major order, entry (r, s)
-// from SHAKE128(rho || s || r): four at a time, or one by one.
+// Entries first .. first + outs.len - 1 (up to four) of the k * l matrix A in row-major order,
+// entry (r, s) from SHAKE128(rho || s || r).
 fn sampleMatrix(comptime p: Parameters, rho: *const [32]u8, first: usize, outs: []const *Poly) void {
-    if (outs.len == 4) {
-        var inputs: [4][34]u8 = undefined;
+    var inputs: [4][34]u8 = undefined;
 
-        for (&inputs, first..) |*input, e| input.* = rho.* ++ [2]u8{ @intCast(e % p.l), @intCast(e / p.l) };
+    var messages: [4][]const u8 = undefined;
 
-        var sponge: keccak.Sponge4 = .init(168, 0x1f, .{ &inputs[0], &inputs[1], &inputs[2], &inputs[3] });
+    for (inputs[0..outs.len], messages[0..outs.len], first..) |*input, *message, e| {
+        input.* = rho.* ++ [2]u8{ @intCast(e % p.l), @intCast(e / p.l) };
 
-        var counts: [4]usize = @splat(0);
-
-        while (@reduce(.Min, @as(@Vector(4, usize), counts)) < 256) {
-            var blocks: [4][168]u8 = undefined;
-
-            sponge.squeeze(.{ &blocks[0], &blocks[1], &blocks[2], &blocks[3] });
-
-            for (&counts, &blocks, outs) |*filled, *block, out| filled.* = parseUniform(out, filled.*, block);
-        }
-
-        return;
+        message.* = input;
     }
 
-    for (outs, first..) |out, e| {
-        var xof = hash.shake128.create();
+    var sponge: keccak.Sponge4 = undefined;
 
-        xof.update(rho);
+    sponge.startSome(168, 0x1f, messages[0..outs.len]);
 
-        xof.update(&.{ @intCast(e % p.l), @intCast(e / p.l) });
+    var counts: [4]usize = @splat(256);
 
-        var filled: usize = 0;
+    @memset(counts[0..outs.len], 0);
 
-        var block: [168]u8 = undefined;
+    while (@reduce(.Min, @as(@Vector(4, usize), counts)) < 256) {
+        sponge.next();
 
-        while (filled < 256) {
-            xof.read(&block);
+        for (counts[0..outs.len], outs, 0..) |*filled, out, i| {
+            var copy: [168]u8 = undefined;
 
-            filled = parseUniform(out, filled, &block);
+            filled.* = parseUniform(out, filled.*, sponge.block(168, i, &copy));
         }
     }
 }
@@ -548,7 +561,7 @@ fn expandMatrix(comptime p: Parameters, rho: *const [32]u8, matrix: *[p.k][p.l]P
     var first: usize = 0;
 
     while (first < count) {
-        const size: usize = if (count - first >= 4) 4 else 1;
+        const size = keccak.batch(count - first);
 
         var outs: [4]*Poly = undefined;
 
@@ -583,7 +596,7 @@ fn multiplyMatrix(comptime p: Parameters, rho: *const [32]u8, s_hat: *const [p.l
 
     for (t_hat, 0..) |*f, i| {
         while (first < (i + 1) * p.l) {
-            const size: usize = if (count - first >= 4) 4 else 1;
+            const size = keccak.batch(count - first);
 
             var outs: [4]*Poly = undefined;
 
@@ -602,72 +615,60 @@ fn multiplyMatrix(comptime p: Parameters, rho: *const [32]u8, s_hat: *const [p.l
     }
 }
 
-// The secret vectors: outs[i] from SHAKE256(rho || nonce + i), four at a time.
+// The secret vectors: outs[i] from SHAKE256(rho || nonce + i), up to four at a time.
 fn expandSecret(comptime eta: u8, rho: *const [64]u8, nonce: u16, outs: []const *Poly) void {
-    var buffers: [4][257]i32 = undefined;
+    var buffers: [4][sample_buffer]i32 = undefined;
 
-    var blocks: [4][136]u8 = undefined;
+    var inputs: [4][66]u8 = undefined;
+
+    var copy: [136]u8 = undefined;
 
     defer {
         ct.wipe(std.mem.asBytes(&buffers));
 
-        ct.wipe(std.mem.asBytes(&blocks));
+        ct.wipe(std.mem.asBytes(&inputs));
+
+        ct.wipe(&copy);
     }
 
     var first: usize = 0;
 
-    while (first + 4 <= outs.len) : (first += 4) {
-        var inputs: [4][66]u8 = undefined;
+    while (first < outs.len) {
+        const size = keccak.batch(outs.len - first);
 
-        defer ct.wipe(std.mem.asBytes(&inputs));
+        var messages: [4][]const u8 = undefined;
 
-        for (&inputs, first..) |*input, i| {
+        for (inputs[0..size], messages[0..size], first..) |*input, *message, i| {
             input[0..64].* = rho.*;
 
             std.mem.writeInt(u16, input[64..66], nonce + @as(u16, @intCast(i)), .little);
+
+            message.* = input;
         }
 
-        var sponge: keccak.Sponge4 = .init(136, 0x1f, .{ &inputs[0], &inputs[1], &inputs[2], &inputs[3] });
+        var sponge: keccak.Sponge4 = undefined;
+
+        sponge.startSome(136, 0x1f, messages[0..size]);
 
         defer sponge.wipe();
 
-        var counts: [4]usize = @splat(0);
+        var counts: [4]usize = @splat(256);
+
+        @memset(counts[0..size], 0);
 
         while (@reduce(.Min, @as(@Vector(4, usize), counts)) < 256) {
-            sponge.squeeze(.{ &blocks[0], &blocks[1], &blocks[2], &blocks[3] });
+            sponge.next();
 
-            for (&buffers, &counts, &blocks) |*buffer, *filled, *block| filled.* = parseBounded(eta, buffer, filled.*, block);
+            for (buffers[0..size], counts[0..size], 0..) |*buffer, *filled, i| filled.* = parseBounded(eta, buffer, filled.*, sponge.block(136, i, &copy));
         }
 
-        for (&buffers, outs[first..][0..4]) |*buffer, out| out.* = buffer[0..256].*;
-    }
+        for (buffers[0..size], outs[first..][0..size]) |*buffer, out| out.* = buffer[0..256].*;
 
-    for (outs[first..], first..) |out, i| {
-        var xof = hash.shake256.create();
-
-        defer ct.wipe(std.mem.asBytes(&xof));
-
-        xof.update(rho);
-
-        var input: [2]u8 = undefined;
-
-        std.mem.writeInt(u16, &input, nonce + @as(u16, @intCast(i)), .little);
-
-        xof.update(&input);
-
-        var filled: usize = 0;
-
-        while (filled < 256) {
-            xof.read(&blocks[0]);
-
-            filled = parseBounded(eta, &buffers[0], filled, &blocks[0]);
-        }
-
-        out.* = buffers[0][0..256].*;
+        first += size;
     }
 }
 
-// The mask y from SHAKE256(rho' || kappa + r), four polynomials at a time.
+// The mask y from SHAKE256(rho' || kappa + r), up to four polynomials at a time.
 fn expandMask(comptime p: Parameters, rho: *const [64]u8, kappa: u16, y: *[p.l]Poly) void {
     const bits = p.gamma1Bits();
 
@@ -675,22 +676,36 @@ fn expandMask(comptime p: Parameters, rho: *const [64]u8, kappa: u16, y: *[p.l]P
 
     var bytes: [4][size]u8 = undefined;
 
-    defer ct.wipe(std.mem.asBytes(&bytes));
+    var inputs: [4][66]u8 = undefined;
+
+    var copy: [136]u8 = undefined;
+
+    defer {
+        ct.wipe(std.mem.asBytes(&bytes));
+
+        ct.wipe(std.mem.asBytes(&inputs));
+
+        ct.wipe(&copy);
+    }
 
     var first: usize = 0;
 
-    while (first + 4 <= p.l) : (first += 4) {
-        var inputs: [4][66]u8 = undefined;
+    while (first < p.l) {
+        const count = keccak.batch(p.l - first);
 
-        defer ct.wipe(std.mem.asBytes(&inputs));
+        var messages: [4][]const u8 = undefined;
 
-        for (&inputs, first..) |*input, r| {
+        for (inputs[0..count], messages[0..count], first..) |*input, *message, r| {
             input[0..64].* = rho.*;
 
             std.mem.writeInt(u16, input[64..66], kappa + @as(u16, @intCast(r)), .little);
+
+            message.* = input;
         }
 
-        var sponge: keccak.Sponge4 = .init(136, 0x1f, .{ &inputs[0], &inputs[1], &inputs[2], &inputs[3] });
+        var sponge: keccak.Sponge4 = undefined;
+
+        sponge.startSome(136, 0x1f, messages[0..count]);
 
         defer sponge.wipe();
 
@@ -699,20 +714,14 @@ fn expandMask(comptime p: Parameters, rho: *const [64]u8, kappa: u16, y: *[p.l]P
         while (offset < size) : (offset += 136) {
             const take = @min(136, size - offset);
 
-            sponge.squeeze(.{ bytes[0][offset..][0..take], bytes[1][offset..][0..take], bytes[2][offset..][0..take], bytes[3][offset..][0..take] });
+            sponge.next();
+
+            for (bytes[0..count], 0..) |*lane, i| @memcpy(lane[offset..][0..take], sponge.block(136, i, &copy)[0..take]);
         }
 
-        for (&bytes, y[first..][0..4]) |*lane, *f| bitUnpack(bits, p.gamma1, lane, f);
-    }
+        for (bytes[0..count], y[first..][0..count]) |*lane, *f| bitUnpack(bits, p.gamma1, lane, f);
 
-    for (y[first..], first..) |*f, r| {
-        var nonce: [2]u8 = undefined;
-
-        std.mem.writeInt(u16, &nonce, kappa + @as(u16, @intCast(r)), .little);
-
-        primitives.shake256(&.{ rho, &nonce }, &bytes[0]);
-
-        bitUnpack(bits, p.gamma1, &bytes[0], f);
+        first += count;
     }
 }
 

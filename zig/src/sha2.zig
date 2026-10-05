@@ -174,6 +174,8 @@ pub const portable = struct {
 fn portableRounds256(comptime W: type, state: *[8]W, words: *const [16]W) void {
     if (!unrolled) return looped(W, &k256, .{ 7, 18, 3, 17, 19, 10 }, .{ 6, 11, 25, 2, 13, 22 }, state, words);
 
+    if (comptime by_eight and @typeInfo(W) == .vector) return roundsByEight(W, &k256, .{ 7, 18, 3, 17, 19, 10 }, .{ 6, 11, 25, 2, 13, 22 }, state, words);
+
     var w = words.*;
 
     var v = state.*;
@@ -202,6 +204,8 @@ fn portableRounds256(comptime W: type, state: *[8]W, words: *const [16]W) void {
 fn portableRounds512(comptime W: type, state: *[8]W, words: *const [16]W) void {
     if (!unrolled) return looped(W, &k512, .{ 1, 8, 7, 19, 61, 6 }, .{ 14, 18, 41, 28, 34, 39 }, state, words);
 
+    if (comptime by_eight and @typeInfo(W) == .vector) return roundsByEight(W, &k512, .{ 1, 8, 7, 19, 61, 6 }, .{ 14, 18, 41, 28, 34, 39 }, state, words);
+
     @setEvalBranchQuota(4000);
 
     var w = words.*;
@@ -222,6 +226,45 @@ fn portableRounds512(comptime W: type, state: *[8]W, words: *const [16]W) void {
         }
 
         round(W, &v, t, broadcast(W, k) +% w[t % 16], .{ 14, 18, 41, 28, 34, 39 });
+    }
+
+    inline for (state, v) |*word, value| {
+        word.* +%= value;
+    }
+}
+
+// WebAssembly engines compile the fully unrolled rounds of vectors into code whose speed varies
+// widely between versions (V8 13.6 in Node 24 took 1.45 times as long as V8 12.4 in Node 22),
+// while a loop over eight unrolled rounds runs about as fast in both.
+const by_eight = builtin.cpu.arch.isWasm();
+
+// Eight rounds at a time in a loop: within the eight the working variables rotate by renaming as
+// in the unrolled code, and the schedule is a ring of sixteen words.
+fn roundsByEight(comptime W: type, k: anytype, comptime sigma: [6]comptime_int, comptime r: [6]comptime_int, state: *[8]W, words: *const [16]W) void {
+    var w = words.*;
+
+    var v = state.*;
+
+    var t: usize = 0;
+
+    while (t < k.len) : (t += 8) {
+        inline for (0..8) |j| {
+            const u = t + j;
+
+            if (u >= 16) {
+                const x = w[(u + 1) % 16];
+
+                const y = w[(u + 14) % 16];
+
+                const s0 = std.math.rotr(W, x, sigma[0]) ^ std.math.rotr(W, x, sigma[1]) ^ shr(W, x, sigma[2]);
+
+                const s1 = std.math.rotr(W, y, sigma[3]) ^ std.math.rotr(W, y, sigma[4]) ^ shr(W, y, sigma[5]);
+
+                w[u % 16] = w[u % 16] +% s0 +% w[(u + 9) % 16] +% s1;
+            }
+
+            round(W, &v, j, broadcast(W, k[u]) +% w[u % 16], r);
+        }
     }
 
     inline for (state, v) |*word, value| {

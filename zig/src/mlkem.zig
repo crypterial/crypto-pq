@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const aarch64 = @import("aarch64.zig");
 const cpu = @import("cpu.zig");
@@ -7,6 +8,7 @@ const hash = @import("hash.zig");
 const keccak = @import("keccak.zig");
 const primitives = @import("primitives.zig");
 const vec = @import("vector.zig");
+const wasm = @import("wasm.zig");
 
 pub const Parameters = struct {
     k: u8,
@@ -133,6 +135,61 @@ pub const portable = struct {
         const t = (@as(Wide, a) * @as(Wide, @splat(barrett_factor)) + @as(Wide, @splat(1 << 25))) >> @splat(26);
 
         return @truncate(@as(Wide, a) - t * @as(Wide, @splat(q)));
+    }
+
+    // The matrix is public, so the loop may end on its values, but a fifth of the candidates are
+    // rejected at random: every candidate is written and the count advances by the comparison,
+    // which avoids a mispredicted branch per rejection.
+    pub fn parseUniform(buffer: *[sample_buffer]i16, start: usize, block: *const [168]u8) usize {
+        var count = start;
+
+        var offset: usize = 0;
+
+        while (offset < block.len and count < 256) : (offset += 3) {
+            const d1 = block[offset] | (@as(u16, block[offset + 1] & 0x0f) << 8);
+
+            const d2 = (block[offset + 1] >> 4) | (@as(u16, block[offset + 2]) << 4);
+
+            buffer[count] = @intCast(d1);
+
+            count += @intFromBool(d1 < q);
+
+            buffer[count] = @intCast(d2);
+
+            count += @intFromBool(d2 < q) & @intFromBool(count < 256);
+        }
+
+        return count;
+    }
+
+    // Sixteen coefficients at a time: each pair (a, b) of canonical values becomes the 24 bits
+    // a + 2^12 b, written as three bytes.
+    pub fn encode12(f: *const Poly, out: *[384]u8) void {
+        const Words = @Vector(8, u32);
+
+        for (0..16) |i| {
+            const low = canonical(load(f, 16 * i));
+
+            const high = canonical(load(f, 16 * i + 8));
+
+            const even = @shuffle(u32, low, high, [8]i32{ 0, 2, 4, 6, -1, -3, -5, -7 });
+
+            const odd = @shuffle(u32, low, high, [8]i32{ 1, 3, 5, 7, -2, -4, -6, -8 });
+
+            const words: Words = even | odd << @splat(12);
+
+            const first: @Vector(8, u8) = @truncate(words);
+
+            const second: @Vector(8, u8) = @truncate(words >> @splat(8));
+
+            const third: @Vector(8, u8) = @truncate(words >> @splat(16));
+
+            const two = @shuffle(u8, first, second, [16]i32{ 0, 1, 2, 3, 4, 5, 6, 7, -1, -2, -3, -4, -5, -6, -7, -8 });
+
+            out[24 * i ..][0..16].* = @shuffle(u8, two, third, [16]i32{ 0, 8, -1, 1, 9, -2, 2, 10, -3, 3, 11, -4, 4, 12, -5, 5 });
+
+            out[24 * i + 16 ..][0..8].* = @shuffle(u8, two, third, [8]i32{ 13, -6, 6, 14, -7, 7, 15, -8 });
+        }
     }
 };
 
@@ -293,95 +350,103 @@ fn inverseNtt(f: *Poly) void {
     for (0..32) |i| store(f, 8 * i, constantProduct(load(f, 8 * i), inverse_ntt_factor));
 }
 
-// The products of degree-one residues modulo X^2 - zeta, times 2^-16, added to r: for a pair
-// (a0, a1) and (b0, b1), a1 * b1 * zeta + a0 * b0 and a0 * b1 + a1 * b0.
-fn multiplyAdd(r: *Poly, a: *const Poly, b: *const Poly) void {
-    for (0..16) |c| {
-        const a0, const a1 = vec.split(1, load(a, 16 * c), load(a, 16 * c + 8));
+// Every pair (b0, b1) of an NTT-domain polynomial with b1 replaced by b1 * zeta, the pair's zeta
+// from the base multiplication: dot reads it in place of b for the first products.
+fn zetaProducts(b: *const Poly) Poly {
+    var out: Poly = undefined;
 
+    for (0..16) |c| {
         const b0, const b1 = vec.split(1, load(b, 16 * c), load(b, 16 * c + 8));
 
-        const first = montgomery(montgomeryProduct(a1, b1), base_zetas.zeta[c], base_zetas.zeta_qinv[c]) + montgomeryProduct(a0, b0);
+        const low, const high = vec.join(1, b0, montgomery(b1, base_zetas.zeta[c], base_zetas.zeta_qinv[c]));
 
-        const second = montgomeryProduct(a0, b1) + montgomeryProduct(a1, b0);
+        store(&out, 16 * c, low);
 
-        const low, const high = vec.join(1, first, second);
+        store(&out, 16 * c + 8, high);
+    }
 
-        store(r, 16 * c, load(r, 16 * c) + low);
+    return out;
+}
 
-        store(r, 16 * c + 8, load(r, 16 * c + 8) + high);
+// x * 2^-16 modulo q, in (-q, q) for |x| below 2^31 - 2^15 * q: x - t * q is a multiple of 2^16
+// for t = x * q^-1 modulo 2^16.
+fn montgomeryReduce(comptime n: usize, x: @Vector(n, i32)) @Vector(n, i16) {
+    const t = @as(@Vector(n, i16), @truncate(x)) *% @as(@Vector(n, i16), @splat(q_inverse));
+
+    return @intCast((x - @as(@Vector(n, i32), t) * @as(@Vector(n, i32), @splat(q))) >> @splat(16));
+}
+
+// The NTT-domain inner product of a with b, reduced; it carries a factor 2^-16. For pairs (a0, a1)
+// and (b0, b1) the products of degree-one residues modulo X^2 - zeta are a0 * b0 + a1 * b1 * zeta
+// and a0 * b1 + a1 * b0: the lane-wise products of a with b_zeta = zetaProducts(b) and with b's
+// pairs swapped, each added up pairwise. They are summed over the k terms in 32 bits, below 2^27
+// for entries below q, and reduced once.
+fn dot(comptime k: usize, a: [k]*const Poly, b: *const [k]Poly, b_zeta: *const [k]Poly, r: *Poly) void {
+    const Lanes = @Vector(8, i32);
+
+    const swap = [8]i32{ 1, 0, 3, 2, 5, 4, 7, 6 };
+
+    for (0..32) |i| {
+        var with_zeta: Lanes = @splat(0);
+
+        var crossed: Lanes = @splat(0);
+
+        for (a, b, b_zeta) |f, *g, *g_zeta| {
+            const x: Lanes = load(f, 8 * i);
+
+            with_zeta += x * @as(Lanes, load(g_zeta, 8 * i));
+
+            crossed += x * @as(Lanes, @shuffle(i16, load(g, 8 * i), undefined, swap));
+        }
+
+        const evens = [4]i32{ 0, 2, 4, 6 };
+
+        const odds = [4]i32{ 1, 3, 5, 7 };
+
+        const first = @shuffle(i32, with_zeta, undefined, evens) + @shuffle(i32, with_zeta, undefined, odds);
+
+        const second = @shuffle(i32, crossed, undefined, evens) + @shuffle(i32, crossed, undefined, odds);
+
+        const pairs = @shuffle(i16, montgomeryReduce(4, first), montgomeryReduce(4, second), [8]i32{ 0, -1, 1, -2, 2, -3, 3, -4 });
+
+        store(r, 8 * i, barrett(pairs));
     }
 }
 
-// The NTT-domain inner product of two vectors, reduced; it carries a factor 2^-16.
-fn dot(comptime k: usize, a: *const [k]Poly, b: *const [k]Poly, r: *Poly) void {
-    r.* = @splat(0);
+// The entries of a vector of polynomials, as dot takes them.
+fn entries(comptime k: usize, v: *const [k]Poly) [k]*const Poly {
+    var out: [k]*const Poly = undefined;
 
-    for (a, b) |*f, *g| {
-        multiplyAdd(r, f, g);
-    }
+    for (&out, v) |*entry, *f| entry.* = f;
 
-    reduce(r);
+    return out;
 }
 
-// The matrix is public, so the loop may end on its values, but a fifth of the candidates are
-// rejected at random: every candidate is written and the count advances by the comparison, which
-// avoids a mispredicted branch per rejection. The buffer has room for the writes past the end.
-fn parseUniform(buffer: *[258]i16, start: usize, block: *const [168]u8) usize {
-    var count = start;
+// The room a sampling buffer has past the 256 coefficients: the vector code stores whole vectors
+// at the count.
+pub const sample_buffer = 256 + 8;
 
-    var offset: usize = 0;
+// Candidates from a block of the matrix XOF, appended to buffer[start..]; returns the new count,
+// which may pass 256, and only the first 256 count.
+fn parseUniform(buffer: *[sample_buffer]i16, start: usize, block: *const [168]u8) usize {
+    if (comptime cpu.neon) return aarch64.uniform12(buffer, start, block);
 
-    while (offset < block.len and count < 256) : (offset += 3) {
-        const d1 = block[offset] | (@as(u16, block[offset + 1] & 0x0f) << 8);
-
-        const d2 = (block[offset + 1] >> 4) | (@as(u16, block[offset + 2]) << 4);
-
-        buffer[count] = @intCast(d1);
-
-        count += @intFromBool(d1 < q);
-
-        buffer[count] = @intCast(d2);
-
-        count += @intFromBool(d2 < q) & @intFromBool(count < 256);
-    }
-
-    return count;
-}
-
-fn sampleNtt(rho: *const [32]u8, x: u8, y: u8, out: *Poly) void {
-    var xof = hash.shake128.create();
-
-    xof.update(rho);
-
-    xof.update(&.{ x, y });
-
-    var buffer: [258]i16 = undefined;
-
-    var count: usize = 0;
-
-    var block: [168]u8 = undefined;
-
-    while (count < 256) {
-        xof.read(&block);
-
-        count = parseUniform(&buffer, count, &block);
-    }
-
-    out.* = buffer[0..256].*;
+    return portable.parseUniform(buffer, start, block);
 }
 
 // The k * k matrix with entry (i, j) at i * k + j, from XOF(rho, j, i), or from XOF(rho, i, j)
-// for its transpose, four entries at a time.
+// for its transpose, up to four entries at a time.
 fn sampleMatrix(comptime k: usize, rho: *const [32]u8, transposed: bool, out: *[k * k]Poly) void {
     var first: usize = 0;
 
-    while (first + 4 <= k * k) : (first += 4) {
+    while (first < k * k) {
+        const size = keccak.batch(k * k - first);
+
         var inputs: [4][34]u8 = undefined;
 
         var messages: [4][]const u8 = undefined;
 
-        for (&inputs, &messages, first..) |*input, *message, e| {
+        for (inputs[0..size], messages[0..size], first..) |*input, *message, e| {
             const i: u8 = @intCast(e / k);
 
             const j: u8 = @intCast(e % k);
@@ -391,47 +456,99 @@ fn sampleMatrix(comptime k: usize, rho: *const [32]u8, transposed: bool, out: *[
             message.* = input;
         }
 
-        var sponge: keccak.Sponge4 = .init(168, 0x1f, messages);
+        var sponge: keccak.Sponge4 = undefined;
 
-        var buffers: [4][258]i16 = undefined;
+        sponge.startSome(168, 0x1f, messages[0..size]);
 
-        var counts: [4]usize = @splat(0);
+        var buffers: [4][sample_buffer]i16 = undefined;
+
+        var counts: [4]usize = @splat(256);
+
+        @memset(counts[0..size], 0);
 
         while (@reduce(.Min, @as(@Vector(4, usize), counts)) < 256) {
-            var blocks: [4][168]u8 = undefined;
+            sponge.next();
 
-            sponge.squeeze(.{ &blocks[0], &blocks[1], &blocks[2], &blocks[3] });
+            for (buffers[0..size], counts[0..size], 0..) |*buffer, *count, i| {
+                var copy: [168]u8 = undefined;
 
-            for (&buffers, &counts, &blocks) |*buffer, *count, *block| count.* = parseUniform(buffer, count.*, block);
+                count.* = parseUniform(buffer, count.*, sponge.block(168, i, &copy));
+            }
         }
 
-        for (&buffers, first..) |*buffer, e| out[e] = buffer[0..256].*;
-    }
+        for (buffers[0..size], first..) |*buffer, e| out[e] = buffer[0..256].*;
 
-    for (first..k * k) |e| {
-        const i: u8 = @intCast(e / k);
-
-        const j: u8 = @intCast(e % k);
-
-        if (transposed) sampleNtt(rho, i, j, &out[e]) else sampleNtt(rho, j, i, &out[e]);
+        first += size;
     }
 }
 
 // The centered binomial distribution: each coefficient is the difference of the bit counts of
-// two adjacent eta-bit groups.
+// two adjacent eta-bit groups. For eta = 2 a byte holds two coefficients, and sixteen bytes go at
+// once: their bit pairs are summed in place, and each nibble of the sums gives a - b.
 fn binomial(comptime eta: u8, bytes: *const [64 * eta]u8, out: *Poly) void {
     if (eta == 2) {
-        for (0..32) |i| {
-            const t = std.mem.readInt(u32, bytes[4 * i ..][0..4], .little);
+        const Bytes = @Vector(16, u8);
 
-            const d = (t & 0x55555555) + ((t >> 1) & 0x55555555);
+        const Signed = @Vector(16, i8);
 
-            for (0..8) |j| {
-                const a: i16 = @intCast((d >> @intCast(4 * j)) & 3);
+        const pairs: Bytes = @splat(0x55);
 
-                const b: i16 = @intCast((d >> @intCast(4 * j + 2)) & 3);
+        const two: Bytes = @splat(3);
 
-                out[8 * i + j] = a - b;
+        // The coefficients of the first and the second half of the bytes, interleaved.
+        const orders = comptime blk: {
+            var table: [2][16]i32 = undefined;
+
+            for (&table, 0..) |*order, h| {
+                for (order, 0..) |*lane, j| lane.* = if (j % 2 == 0) 8 * h + j / 2 else ~@as(i32, 8 * h + j / 2);
+            }
+
+            break :blk table;
+        };
+
+        for (0..8) |i| {
+            const x: Bytes = bytes[16 * i ..][0..16].*;
+
+            const sums = (x & pairs) + ((x >> @splat(1)) & pairs);
+
+            const first = @as(Signed, @bitCast(sums & two)) - @as(Signed, @bitCast((sums >> @splat(2)) & two));
+
+            const second = @as(Signed, @bitCast((sums >> @splat(4)) & two)) - @as(Signed, @bitCast(sums >> @splat(6)));
+
+            inline for (orders, 0..) |order, h| {
+                out[32 * i + 16 * h ..][0..16].* = @as(@Vector(16, i16), @shuffle(i8, first, second, order));
+            }
+        }
+    } else if (comptime builtin.cpu.arch.endian() == .little) {
+        // For eta = 3, three bytes hold four coefficients. Four such groups go at once as the
+        // 24-bit words of four lanes, whose bit triples are summed in place; the four 6-bit
+        // fields of a word, a + 8b, then move to its four bytes, each giving a - b.
+        const Words = @Vector(4, u32);
+
+        const triples: Words = @splat(0x00249249);
+
+        const groups = [2][16]i32{
+            .{ 0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1 },
+            .{ 4, 5, 6, -1, 7, 8, 9, -1, 10, 11, 12, -1, 13, 14, 15, -1 },
+        };
+
+        for (0..8) |i| {
+            inline for (groups, 0..) |group, h| {
+                const x: @Vector(16, u8) = bytes[24 * i + 8 * h ..][0..16].*;
+
+                const words: Words = @bitCast(@shuffle(u8, x, @as(@Vector(16, u8), @splat(0)), group));
+
+                const sums = (words & triples) + ((words >> @splat(1)) & triples) + ((words >> @splat(2)) & triples);
+
+                var fields = sums & @as(Words, @splat(0x3f));
+
+                inline for (1..4) |j| fields |= (sums << @splat(2 * j)) & @as(Words, @splat(0x3f << (8 * j)));
+
+                const parts: @Vector(16, u8) = @bitCast(fields);
+
+                const coefficients = @as(@Vector(16, i8), @bitCast(parts & @as(@Vector(16, u8), @splat(7)))) - @as(@Vector(16, i8), @bitCast(parts >> @splat(3)));
+
+                out[32 * i + 16 * h ..][0..16].* = @as(@Vector(16, i16), coefficients);
             }
         }
     } else {
@@ -451,59 +568,61 @@ fn binomial(comptime eta: u8, bytes: *const [64 * eta]u8, out: *Poly) void {
     }
 }
 
-// Noise polynomials outs[i] = CBD(PRF(seed, nonce + i)), four at a time.
+// Noise polynomials outs[i] = CBD(PRF(seed, nonce + i)), up to four at a time.
 fn sampleNoise(comptime eta: u8, seed: *const [32]u8, nonce: u8, outs: []const *Poly) void {
     var bytes: [4][64 * eta]u8 = undefined;
 
-    defer ct.wipe(std.mem.asBytes(&bytes));
+    var inputs: [4][33]u8 = undefined;
+
+    var copy: [136]u8 = undefined;
+
+    defer {
+        ct.wipe(std.mem.asBytes(&bytes));
+
+        ct.wipe(std.mem.asBytes(&inputs));
+
+        ct.wipe(&copy);
+    }
 
     var first: usize = 0;
 
-    while (first + 4 <= outs.len) : (first += 4) {
-        var inputs: [4][33]u8 = undefined;
+    while (first < outs.len) {
+        const size = keccak.batch(outs.len - first);
 
-        for (&inputs, first..) |*input, i| input.* = seed.* ++ [1]u8{nonce + @as(u8, @intCast(i))};
+        var messages: [4][]const u8 = undefined;
 
-        var sponge: keccak.Sponge4 = .init(136, 0x1f, .{ &inputs[0], &inputs[1], &inputs[2], &inputs[3] });
+        for (inputs[0..size], messages[0..size], first..) |*input, *message, i| {
+            input.* = seed.* ++ [1]u8{nonce + @as(u8, @intCast(i))};
+
+            message.* = input;
+        }
+
+        var sponge: keccak.Sponge4 = undefined;
+
+        sponge.startSome(136, 0x1f, messages[0..size]);
 
         defer sponge.wipe();
-
-        defer ct.wipe(std.mem.asBytes(&inputs));
 
         var offset: usize = 0;
 
         while (offset < 64 * eta) : (offset += 136) {
-            const size = @min(136, 64 * eta - offset);
+            const take = @min(136, 64 * eta - offset);
 
-            sponge.squeeze(.{ bytes[0][offset..][0..size], bytes[1][offset..][0..size], bytes[2][offset..][0..size], bytes[3][offset..][0..size] });
+            sponge.next();
+
+            for (bytes[0..size], 0..) |*lane, i| @memcpy(lane[offset..][0..take], sponge.block(136, i, &copy)[0..take]);
         }
 
-        for (&bytes, outs[first..][0..4]) |*lane, out| binomial(eta, lane, out);
-    }
+        for (bytes[0..size], outs[first..][0..size]) |*lane, out| binomial(eta, lane, out);
 
-    for (outs[first..], first..) |out, i| {
-        primitives.shake256(&.{ seed, &.{nonce + @as(u8, @intCast(i))} }, &bytes[0]);
-
-        binomial(eta, &bytes[0], out);
+        first += size;
     }
 }
 
 fn encode12(f: *const Poly, out: *[384]u8) void {
-    for (0..32) |i| {
-        const values: [8]u32 = canonical(load(f, 8 * i));
+    if (comptime cpu.neon) return aarch64.encode12(f, out);
 
-        for (0..4) |j| {
-            const a = values[2 * j];
-
-            const b = values[2 * j + 1];
-
-            out[12 * i + 3 * j] = @truncate(a);
-
-            out[12 * i + 3 * j + 1] = @truncate((a >> 8) | (b << 4));
-
-            out[12 * i + 3 * j + 2] = @truncate(b >> 4);
-        }
-    }
+    portable.encode12(f, out);
 }
 
 // Coefficients come back unreduced, below 2^12; the arithmetic tolerates values up to 4095.
@@ -528,7 +647,9 @@ fn compress(x: U, comptime d: u5) U {
 
     const t = (x << @splat(d)) + @as(U, @splat(q / 2));
 
-    return @as(U, @truncate(@as(Long, t) * @as(Long, @splat(20642679)) >> @splat(36))) & @as(U, @splat((1 << d) - 1));
+    const quotient = if (comptime cpu.wasm_simd) wasm.productsShifted(t, 20642679, 4) else @as(U, @truncate(@as(Long, t) * @as(Long, @splat(20642679)) >> @splat(36)));
+
+    return quotient & @as(U, @splat((1 << d) - 1));
 }
 
 fn decompress(y: U, comptime d: u5) V {
@@ -652,10 +773,16 @@ fn encrypt(comptime p: Parameters, key: *const EncapsulationKey(p.k), m: *const 
 
     for (&y) |*f| ntt(f);
 
+    var y_zeta: [k]Poly = undefined;
+
+    defer ct.wipe(std.mem.asBytes(&y_zeta));
+
+    for (&y_zeta, &y) |*products, *f| products.* = zetaProducts(f);
+
     for (0..k) |i| {
         var u: Poly = undefined;
 
-        dot(k, key.matrix[k * i ..][0..k], &y, &u);
+        dot(k, entries(k, key.matrix[k * i ..][0..k]), &y, &y_zeta, &u);
 
         inverseNtt(&u);
 
@@ -670,7 +797,7 @@ fn encrypt(comptime p: Parameters, key: *const EncapsulationKey(p.k), m: *const 
 
     defer ct.wipe(std.mem.asBytes(&v));
 
-    dot(k, &key.t, &y, &v);
+    dot(k, entries(k, &key.t), &y, &y_zeta, &v);
 
     inverseNtt(&v);
 
@@ -704,7 +831,11 @@ fn decrypt(comptime p: Parameters, s: *const [p.k]Poly, c: *const [p.ciphertextS
 
     decodeDecompressed(p.dv, c[32 * @as(usize, p.du) * k ..][0 .. 32 * @as(usize, p.dv)], &v);
 
-    dot(k, s, &u, &w);
+    var u_zeta: [k]Poly = undefined;
+
+    for (&u_zeta, &u) |*products, *f| products.* = zetaProducts(f);
+
+    dot(k, entries(k, s), &u, &u_zeta, &w);
 
     inverseNtt(&w);
 
@@ -763,14 +894,20 @@ pub noinline fn keyGen(comptime p: Parameters, d: *const [32]u8, z: *const [32]u
     // The transposed matrix, as encryption reads it; row i of the matrix is its column i.
     sampleMatrix(k, rho, true, matrix);
 
-    for (0..k) |i| {
-        var row: [k]Poly = undefined;
+    var s_zeta: [k]Poly = undefined;
 
-        for (&row, 0..) |*f, j| f.* = matrix[k * j + i];
+    defer ct.wipe(std.mem.asBytes(&s_zeta));
+
+    for (&s_zeta, &s) |*products, *f| products.* = zetaProducts(f);
+
+    for (0..k) |i| {
+        var row: [k]*const Poly = undefined;
+
+        for (&row, 0..) |*f, j| f.* = &matrix[k * j + i];
 
         var t: Poly = undefined;
 
-        dot(k, &row, &s, &t);
+        dot(k, row, &s, &s_zeta, &t);
 
         for (0..32) |j| store(&t, 8 * j, barrett(constantProduct(load(&t, 8 * j), montgomery_square) + load(&e[i], 8 * j)));
 
@@ -791,8 +928,10 @@ pub noinline fn keyGen(comptime p: Parameters, d: *const [32]u8, z: *const [32]u
 
     @memcpy(dk[768 * k + 64 ..], z);
 
-    // t and s exactly as encryption and decryption would decode them from the key.
-    decodeSecret(p, dk, s_hat);
+    // s exactly as decryption would decode it from the key: its canonical values.
+    for (s_hat, &s) |*decoded, *f| {
+        for (0..32) |j| store(decoded, 8 * j, @intCast(canonical(load(f, 8 * j))));
+    }
 
     if (public) |key| {
         for (&key.t, 0..) |*f, i| decode12(ek[384 * i ..][0..384], f);

@@ -243,10 +243,289 @@ test "AArch64 Keccak pairs with the SHA3 instructions match the portable permuta
     try checkKeccak(1, oneState, prng.random());
 
     try checkKeccak(2, aarch64.keccak2, prng.random());
+
+    try checkKeccak(3, aarch64.keccak3, prng.random());
 }
 
 fn oneState(states: *[1][25]u64) void {
     aarch64.keccak1(&states[0]);
+}
+
+// The absorbing kernel against XOR and the portable permutation block by block, for every rate it
+// takes and one to three blocks.
+test "AArch64 Keccak absorption with the SHA3 instructions matches the portable code" {
+    if (comptime arch != .aarch64 or !cpu.possible(.sha3)) return error.SkipZigTest;
+
+    if (!cpu.has(.sha3)) return error.SkipZigTest;
+
+    var prng: std.Random.DefaultPrng = .init(0xab5);
+
+    const random = prng.random();
+
+    const rates = [_]usize{ 72, 104, 136, 144, 168 };
+
+    for (0..runs / 4) |case| {
+        const rate = rates[case % rates.len];
+
+        const blocks = 1 + case / 5 % 3;
+
+        var state: [25]u64 = undefined;
+
+        var data: [3 * 168]u8 = undefined;
+
+        fill(random, std.mem.asBytes(&state), case / 15);
+
+        fill(random, &data, case / 15);
+
+        var expected = state;
+
+        for (0..blocks) |b| {
+            keccak.xorBytes(&expected, 0, data[rate * b ..][0..rate]);
+
+            keccak.portable.permute(&expected);
+        }
+
+        aarch64.keccakAbsorb(&state, rate, data[0 .. rate * blocks]);
+
+        try testing.expectEqualSlices(u64, &expected, &state);
+    }
+}
+
+// A sponge fed in pieces of every length, which takes the absorbing kernel wherever whole blocks
+// start at a block boundary, against a sponge built from the portable permutation.
+test "Keccak sponges match the portable permutation for every split of the input" {
+    var prng: std.Random.DefaultPrng = .init(0x5f0);
+
+    const random = prng.random();
+
+    var data: [1000]u8 = undefined;
+
+    random.bytes(&data);
+
+    for ([_]usize{ 72, 104, 136, 144, 168 }) |rate| {
+        for ([_]usize{ 0, 1, 7, 8, 71, 72, 73, 135, 136, 137, 167, 168, 169, 400, 1000 }) |length| {
+            for ([_]usize{ 1, 5, 64, 136, 168, 1000 }) |piece| {
+                var sponge = keccak.Keccak.init(rate, 0x1f);
+
+                var offset: usize = 0;
+
+                while (offset < length) : (offset += piece) sponge.update(data[offset..@min(length, offset + piece)]);
+
+                var got: [300]u8 = undefined;
+
+                sponge.read(&got);
+
+                var state: [25]u64 = @splat(0);
+
+                var position: usize = 0;
+
+                for (data[0..length]) |byte| {
+                    keccak.xorBytes(&state, position, &.{byte});
+
+                    position += 1;
+
+                    if (position == rate) {
+                        keccak.portable.permute(&state);
+
+                        position = 0;
+                    }
+                }
+
+                keccak.xorBytes(&state, position, &.{0x1f});
+
+                keccak.xorBytes(&state, rate - 1, &.{0x80});
+
+                var expected: [300]u8 = undefined;
+
+                var written: usize = 0;
+
+                while (written < expected.len) : (written += rate) {
+                    keccak.portable.permute(&state);
+
+                    const take = @min(rate, expected.len - written);
+
+                    keccak.copyBytes(&state, 0, expected[written..][0..take]);
+                }
+
+                try testing.expectEqualSlices(u8, &expected, &got);
+            }
+        }
+    }
+}
+
+// The dispatch of one to four states against the portable permutation; states past the count
+// may be permuted too, as scratch.
+test "Keccak batches of one to four states match the portable permutation" {
+    var prng: std.Random.DefaultPrng = .init(0xb47);
+
+    const random = prng.random();
+
+    for (0..2000) |case| {
+        const count = 1 + case % 4;
+
+        var states: [4][25]u64 = undefined;
+
+        fill(random, std.mem.asBytes(&states), case / 4);
+
+        var expected = states;
+
+        for (expected[0..count]) |*state| keccak.portable.permute(state);
+
+        keccak.permuteSome(&states, count);
+
+        for (expected[0..count], states[0..count]) |*e, *g| try testing.expectEqualSlices(u64, e, g);
+    }
+}
+
+// Blocks for the rejection samplers: random ones after edge cases (all zeros accepts every
+// candidate, all ones rejects every one), and blocks of candidates drawn from values around the
+// bounds, in three-byte groups as the samplers read them.
+fn fillCandidates(random: std.Random, block: []u8, case: usize) void {
+    if (case < 4) return fill(random, block, case);
+
+    switch (case % 4) {
+        0 => {
+            const edges = [_]u16{ 0, 1, mlkem.q - 1, mlkem.q, mlkem.q + 1, 4095 };
+
+            var i: usize = 0;
+
+            while (i + 3 <= block.len) : (i += 3) {
+                const a = edges[random.uintLessThan(usize, edges.len)];
+
+                const b = edges[random.uintLessThan(usize, edges.len)];
+
+                block[i] = @truncate(a);
+
+                block[i + 1] = @truncate((a >> 8) | (b << 4));
+
+                block[i + 2] = @truncate(b >> 4);
+            }
+        },
+        1 => {
+            const edges = [_]u32{ 0, 1, mldsa.q - 1, mldsa.q, mldsa.q + 1, (1 << 23) - 1 };
+
+            var i: usize = 0;
+
+            while (i + 3 <= block.len) : (i += 3) {
+                // The top bit of every third byte is not part of the candidate.
+                const z = edges[random.uintLessThan(usize, edges.len)] | @as(u32, random.int(u1)) << 23;
+
+                block[i] = @truncate(z);
+
+                block[i + 1] = @truncate(z >> 8);
+
+                block[i + 2] = @truncate(z >> 16);
+            }
+        },
+        2 => {
+            // Half-bytes at the bounds of both eta.
+            const edges = [_]u8{ 0, 1, 4, 8, 9, 14, 15 };
+
+            for (block) |*byte| byte.* = edges[random.uintLessThan(usize, edges.len)] | edges[random.uintLessThan(usize, edges.len)] << 4;
+        },
+        else => random.bytes(block),
+    }
+}
+
+// Coefficients anywhere in (-q, q), the range the encoding takes, and its edges.
+test "AArch64 ByteEncode_12 matches the portable code" {
+    if (comptime !cpu.neon) return error.SkipZigTest;
+
+    var prng: std.Random.DefaultPrng = .init(0xe12);
+
+    const random = prng.random();
+
+    const edges = [_]i16{ 0, 1, -1, mlkem.q - 1, 1 - mlkem.q, mlkem.q / 2, -(mlkem.q / 2) };
+
+    for (0..runs / 4) |case| {
+        var f: mlkem.Poly = undefined;
+
+        for (&f, 0..) |*c, i| c.* = if (case < edges.len) edges[case] else if (case % 4 == 0) edges[i % edges.len] else random.intRangeAtMost(i16, 1 - mlkem.q, mlkem.q - 1);
+
+        var expected: [384]u8 = undefined;
+
+        var got: [384]u8 = undefined;
+
+        mlkem.portable.encode12(&f, &expected);
+
+        aarch64.encode12(&f, &got);
+
+        try testing.expectEqualSlices(u8, &expected, &got);
+    }
+}
+
+test "AArch64 rejection sampling matches the portable code" {
+    if (comptime !cpu.neon) return error.SkipZigTest;
+
+    var prng: std.Random.DefaultPrng = .init(0x5a);
+
+    const random = prng.random();
+
+    const starts = [_]usize{ 0, 1, 100, 200, 240, 247, 248, 249, 250, 252, 255 };
+
+    for (0..runs) |case| {
+        var block: [168]u8 = undefined;
+
+        fillCandidates(random, &block, case);
+
+        const start = if (case % 3 == 0) random.uintLessThan(usize, 256) else starts[case % starts.len];
+
+        var prefix: [256]i32 = undefined;
+
+        for (&prefix) |*value| value.* = random.int(i32);
+
+        var expected12: [mlkem.sample_buffer]i16 = undefined;
+
+        var got12: [mlkem.sample_buffer]i16 = undefined;
+
+        for (expected12[0..start], got12[0..start], prefix[0..start]) |*e, *g, value| {
+            e.* = @truncate(value);
+
+            g.* = @truncate(value);
+        }
+
+        const e12 = @min(256, mlkem.portable.parseUniform(&expected12, start, &block));
+
+        const g12 = @min(256, aarch64.uniform12(&got12, start, &block));
+
+        try testing.expectEqual(e12, g12);
+
+        try testing.expectEqualSlices(i16, expected12[0..e12], got12[0..g12]);
+
+        var expected23: [256]i32 = undefined;
+
+        var got23: [256]i32 = undefined;
+
+        @memcpy(expected23[0..start], prefix[0..start]);
+
+        @memcpy(got23[0..start], prefix[0..start]);
+
+        const e23 = mldsa.portable.parseUniform(&expected23, start, &block);
+
+        const g23 = aarch64.uniform23(&got23, start, &block);
+
+        try testing.expectEqual(e23, g23);
+
+        try testing.expectEqualSlices(i32, expected23[0..e23], got23[0..g23]);
+
+        inline for (.{ 2, 4 }) |eta| {
+            var expected: [mldsa.sample_buffer]i32 = undefined;
+
+            var got: [mldsa.sample_buffer]i32 = undefined;
+
+            @memcpy(expected[0..start], prefix[0..start]);
+
+            @memcpy(got[0..start], prefix[0..start]);
+
+            const e = @min(256, mldsa.portable.parseBounded(eta, &expected, start, block[0..136]));
+
+            const g = @min(256, aarch64.bounded(eta, &got, start, block[0..136]));
+
+            try testing.expectEqual(e, g);
+
+            try testing.expectEqualSlices(i32, expected[0..e], got[0..g]);
+        }
+    }
 }
 
 // Every 16-bit input against the zetas and the extremes of the multipliers, and random 32-bit

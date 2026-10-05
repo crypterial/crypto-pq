@@ -31,6 +31,25 @@ pub fn permute(state: *[25]u64) void {
     portable.permute(state);
 }
 
+// Whole blocks XORed into a state and permuted, as many as `data` holds: with the SHA3
+// instructions, which keep the state in registers between the blocks, on the cores that run them
+// fast. Returns the number of bytes absorbed, zero where the code below takes them one by one.
+fn absorbBlocks(state: *[25]u64, rate: usize, data: []const u8) usize {
+    if (comptime cpu.possible(.sha3)) {
+        const supported = rate == 72 or rate == 104 or rate == 136 or rate == 144 or rate == 168;
+
+        if (supported and data.len >= rate and cpu.has(.sha3)) {
+            const length = data.len - data.len % rate;
+
+            isa.keccakAbsorb(state, rate, data[0..length]);
+
+            return length;
+        }
+    }
+
+    return 0;
+}
+
 // Four independent permutations: two pairs with the SHA3 instructions on the cores that run them
 // fast, all four in AVX2 registers, or the portable code below.
 pub fn permute4(states: *[4][25]u64) void {
@@ -47,6 +66,42 @@ pub fn permute4(states: *[4][25]u64) void {
     }
 
     portable.permute4(states);
+}
+
+// The first `count` (one to four) of four independent states, permuted as cheaply as the CPU
+// allows: with the SHA3 instructions a pair costs no more than one state and three little more
+// than two, and the four-way code pays off from three states on.
+pub fn permuteSome(states: *[4][25]u64, count: usize) void {
+    std.debug.assert(count >= 1 and count <= 4);
+
+    if (comptime cpu.possible(.sha3)) {
+        if (cpu.has(.sha3)) {
+            return switch (count) {
+                1 => isa.keccak1(&states[0]),
+                2 => isa.keccak2(states[0..2]),
+                3 => isa.keccak3(states[0..3]),
+                else => {
+                    isa.keccak2(states[0..2]);
+
+                    isa.keccak2(states[2..4]);
+                },
+            };
+        }
+    }
+
+    if (count >= 3) return permute4(states);
+
+    for (states[0..count]) |*state| permute(state);
+}
+
+// How many of `remaining` independent sponges to run together, at most four: in threes where
+// three states cost little more than two, with four as two pairs and the last one or two alone.
+pub fn batch(remaining: usize) usize {
+    if (comptime cpu.possible(.sha3)) {
+        if (remaining > 2 and remaining != 4 and cpu.has(.sha3)) return 3;
+    }
+
+    return @min(4, remaining);
 }
 
 // The code for every target.
@@ -200,6 +255,12 @@ pub const Keccak = struct {
         var rest = data;
 
         while (rest.len > 0) {
+            if (self.position == 0) {
+                rest = rest[absorbBlocks(&self.state, self.rate, rest)..];
+
+                if (rest.len == 0) break;
+            }
+
             const take = @min(self.rate - self.position, rest.len);
 
             xorBytes(&self.state, self.position, rest[0..take]);
@@ -255,6 +316,7 @@ pub const Sponge4 = struct {
     states: [4][25]u64,
     rate: usize,
     position: usize,
+    count: usize = 4,
 
     // Built in place rather than from start: SLH-DSA builds millions of these per signature, and
     // copying the state out of start made it 1.45 times slower.
@@ -284,6 +346,31 @@ pub const Sponge4 = struct {
         }
 
         return self;
+    }
+
+    // One to four sponges, each given a message shorter than a block, to be read block by block
+    // with next and block: only the sponges in use are permuted. Filled in place, since the
+    // states would otherwise be copied out.
+    pub fn startSome(self: *Sponge4, rate: usize, suffix: u8, messages: []const []const u8) void {
+        std.debug.assert(messages.len >= 1 and messages.len <= 4);
+
+        self.rate = rate;
+
+        self.position = 0;
+
+        self.count = messages.len;
+
+        ct.wipe(std.mem.asBytes(&self.states));
+
+        for (self.states[0..messages.len], messages) |*state, message| {
+            std.debug.assert(message.len < rate);
+
+            xorBytes(state, 0, message);
+
+            xorBytes(state, message.len, &.{suffix});
+
+            xorBytes(state, rate - 1, &.{0x80});
+        }
     }
 
     // An empty sponge, for messages that arrive in parts through absorb and end with finish.
@@ -334,7 +421,24 @@ pub const Sponge4 = struct {
     pub fn squeeze(self: *Sponge4, out: [4][]u8) void {
         permute4(&self.states);
 
-        for (&self.states, out) |*state, block| copyBytes(state, 0, block);
+        for (&self.states, out) |*state, bytes| copyBytes(state, 0, bytes);
+    }
+
+    // The next block of every sponge in use, read with block.
+    pub fn next(self: *Sponge4) void {
+        permuteSome(&self.states, self.count);
+    }
+
+    // The block that sponge i squeezed last: its state itself where lanes are stored
+    // little-endian, which is the order of the output bytes, or else a copy in `buffer`.
+    pub fn block(self: *const Sponge4, comptime rate: usize, i: usize, buffer: *[rate]u8) *const [rate]u8 {
+        std.debug.assert(rate == self.rate);
+
+        if (comptime builtin.cpu.arch.endian() == .little) return std.mem.asBytes(&self.states[i])[0..rate];
+
+        copyBytes(&self.states[i], 0, buffer);
+
+        return buffer;
     }
 
     pub fn wipe(self: *Sponge4) void {

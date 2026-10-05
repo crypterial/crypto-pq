@@ -397,6 +397,241 @@ pub inline fn halvingSubtract32(a: @Vector(4, i32), b: @Vector(4, i32)) @Vector(
     );
 }
 
+// ---- Rejection sampling (FIPS 203, Algorithm 7; FIPS 204, Algorithms 30 and 31) ----
+//
+// The candidates of a block are compared with their bound side by side, and TBL moves the
+// accepted ones together, with shuffle indices from a table indexed by the pattern of accepted
+// lanes. Each step stores a whole vector at the count and advances the count by the number
+// accepted, so it writes past the last accepted value into slots that later values, or the room
+// at the end of the buffer, take.
+
+const Bytes = @Vector(16, u8);
+
+inline fn lookup(table: Bytes, indices: Bytes) Bytes {
+    return asm ("tbl %[d].16b, {%[t].16b}, %[i].16b"
+        : [d] "=w" (-> Bytes),
+        : [t] "w" (table),
+          [i] "w" (indices),
+    );
+}
+
+// Indices of eight or more give zero, so only the low half of the table register is read.
+inline fn lookup8(table: @Vector(8, u8), indices: @Vector(8, u8)) @Vector(8, u8) {
+    return asm ("tbl %[d].8b, {%[t].16b}, %[i].8b"
+        : [d] "=w" (-> @Vector(8, u8)),
+        : [t] "w" (table),
+          [i] "w" (indices),
+    );
+}
+
+// Shuffle indices that bring the accepted lanes of a vector of `lanes` lanes of `width` bytes to
+// its start, in order, for every pattern of accepted lanes; 0xff selects zero for the rest.
+fn compaction(comptime lanes: usize, comptime width: usize, comptime size: usize) [1 << lanes]@Vector(size, u8) {
+    @setEvalBranchQuota(100_000);
+
+    var table: [1 << lanes]@Vector(size, u8) = undefined;
+
+    for (&table, 0..) |*entry, pattern| {
+        var indices: [size]u8 = @splat(0xff);
+
+        var next: usize = 0;
+
+        for (0..lanes) |lane| {
+            if (pattern & (1 << lane) == 0) continue;
+
+            for (0..width) |byte| indices[width * next + byte] = width * lane + byte;
+
+            next += 1;
+        }
+
+        entry.* = indices;
+    }
+
+    return table;
+}
+
+const compact16 = compaction(8, 2, 16);
+
+const compact32 = compaction(4, 4, 16);
+
+const compact8 = compaction(8, 1, 8);
+
+// The number of accepted lanes of every pattern, read from memory rather than counted: AArch64
+// counts bits only in vector registers, and the round trip to them is slower than a load.
+const accepted_counts: [256]u8 = blk: {
+    var table: [256]u8 = undefined;
+
+    for (&table, 0..) |*count, pattern| count.* = @popCount(@as(u8, pattern));
+
+    break :blk table;
+};
+
+// ML-KEM: two candidates of 12 bits from every three bytes. Each step takes 24 bytes as two
+// vectors of eight candidates in 16-bit lanes, from bytes 0-11 and 12-23. The matrix is public,
+// so the patterns may decide branches and index memory.
+pub fn uniform12(buffer: *[256 + 8]i16, start: usize, block: *const [168]u8) usize {
+    const pairs = Bytes{ 0, 1, 1, 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 10, 10, 11 };
+
+    const shifts = @Vector(8, u4){ 0, 4, 0, 4, 0, 4, 0, 4 };
+
+    const bits = @Vector(8, u16){ 1, 2, 4, 8, 16, 32, 64, 128 };
+
+    var count = start;
+
+    for (0..7) |step| {
+        inline for (0..2) |half| {
+            if (count >= 256) return count;
+
+            const bytes: Bytes = block[24 * step + 8 * half ..][0..16].*;
+
+            const words: @Vector(8, u16) = @bitCast(lookup(bytes, pairs + @as(Bytes, @splat(4 * half))));
+
+            const candidates = (words >> shifts) & @as(@Vector(8, u16), @splat(0xfff));
+
+            const accepted = candidates < @as(@Vector(8, u16), @splat(3329));
+
+            const pattern = @reduce(.Add, @select(u16, accepted, bits, @as(@Vector(8, u16), @splat(0))));
+
+            const kept: @Vector(8, i16) = @bitCast(lookup(@bitCast(candidates), compact16[pattern]));
+
+            buffer[count..][0..8].* = kept;
+
+            count += accepted_counts[pattern];
+        }
+    }
+
+    return count;
+}
+
+// ML-DSA: a candidate of 23 bits from every three bytes. Each step takes 24 bytes as two vectors
+// of four candidates in 32-bit lanes. Near the end of the polynomial the candidates go one by one,
+// as in the portable code, so that nothing is written past it.
+pub fn uniform23(out: *[256]i32, start: usize, block: *const [168]u8) usize {
+    const triples = [2]Bytes{
+        .{ 0, 1, 2, 0xff, 3, 4, 5, 0xff, 6, 7, 8, 0xff, 9, 10, 11, 0xff },
+        .{ 4, 5, 6, 0xff, 7, 8, 9, 0xff, 10, 11, 12, 0xff, 13, 14, 15, 0xff },
+    };
+
+    const bits = @Vector(4, u32){ 1, 2, 4, 8 };
+
+    var count = start;
+
+    var step: usize = 0;
+
+    while (step < 7 and count <= 256 - 8) : (step += 1) {
+        inline for (0..2) |half| {
+            const bytes: Bytes = block[24 * step + 8 * half ..][0..16].*;
+
+            const candidates = @as(@Vector(4, u32), @bitCast(lookup(bytes, triples[half]))) & @as(@Vector(4, u32), @splat(0x7fffff));
+
+            const accepted = candidates < @as(@Vector(4, u32), @splat(8380417));
+
+            const pattern = @reduce(.Add, @select(u32, accepted, bits, @as(@Vector(4, u32), @splat(0))));
+
+            const kept: @Vector(4, i32) = @bitCast(lookup(@bitCast(candidates), compact32[pattern]));
+
+            out[count..][0..4].* = kept;
+
+            count += accepted_counts[pattern];
+        }
+    }
+
+    var offset = 24 * step;
+
+    while (offset < block.len and count < 256) : (offset += 3) {
+        const z = block[offset] | (@as(i32, block[offset + 1]) << 8) | (@as(i32, block[offset + 2] & 0x7f) << 16);
+
+        if (z < 8380417) {
+            out[count] = z;
+
+            count += 1;
+        }
+    }
+
+    return count;
+}
+
+// ML-DSA's secret vectors: eight half-bytes at a time in stream order, mapped to 2 - (x mod 5)
+// for x below 15 (eta = 2) or to 4 - x for x below 9 (eta = 4). Which half-bytes are rejected is
+// public, as the portable code explains, so the pattern is declassified before it selects the
+// shuffle; the values never decide a branch or an address.
+pub fn bounded(comptime eta: u8, buffer: *[256 + 8]i32, start: usize, block: *const [136]u8) usize {
+    const U8 = @Vector(8, u8);
+
+    const bits = U8{ 1, 2, 4, 8, 16, 32, 64, 128 };
+
+    const orders = [2][8]i32{ .{ 0, -1, 1, -2, 2, -3, 3, -4 }, .{ 4, -5, 5, -6, 6, -7, 7, -8 } };
+
+    var count = start;
+
+    for (0..17) |lane| {
+        const bytes: U8 = block[8 * lane ..][0..8].*;
+
+        const low = bytes & @as(U8, @splat(0x0f));
+
+        const high = bytes >> @splat(4);
+
+        inline for (orders) |order| {
+            if (count >= 256) return count;
+
+            const x = @shuffle(u8, low, high, order);
+
+            // x / 5 is 13x / 64 for x below 15.
+            const values = if (eta == 2) @as(U8, @splat(2)) -% (x -% ((x *% @as(U8, @splat(13))) >> @splat(6)) *% @as(U8, @splat(5))) else @as(U8, @splat(4)) -% x;
+
+            const accepted = x < @as(U8, @splat(if (eta == 2) 15 else 9));
+
+            const pattern = ct.declassifyValue(u8, @reduce(.Add, @select(u8, accepted, bits, @as(U8, @splat(0)))));
+
+            const kept: @Vector(8, i8) = @bitCast(lookup8(values, compact8[pattern]));
+
+            buffer[count..][0..8].* = @as(@Vector(8, i32), kept);
+
+            count += accepted_counts[pattern];
+        }
+    }
+
+    return count;
+}
+
+// ---- ML-KEM's ByteEncode_12 (FIPS 203, Algorithm 5) ----
+
+// Eight bytes from a table of sixteen.
+inline fn lookupHalf(table: Bytes, indices: @Vector(8, u8)) @Vector(8, u8) {
+    return asm ("tbl %[d].8b, {%[t].16b}, %[i].8b"
+        : [d] "=w" (-> @Vector(8, u8)),
+        : [t] "w" (table),
+          [i] "w" (indices),
+    );
+}
+
+// ML-KEM's ByteEncode_12 of coefficients in (-q, q), made canonical first: a pair (a, b) of 16-bit
+// lanes, read as one 32-bit lane, is a + 2^16 b and becomes a + 2^12 b, whose three low bytes TBL
+// gathers. Indices past the table give zero, so two lookups combine with an OR.
+pub fn encode12(f: *const [256]i16, out: *[384]u8) void {
+    const first = Bytes{ 0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 0xff, 0xff, 0xff, 0xff };
+
+    const second = Bytes{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 1, 2, 4 };
+
+    const third = @Vector(8, u8){ 5, 6, 8, 9, 10, 12, 13, 14 };
+
+    for (0..16) |i| {
+        var words: [2]Bytes = undefined;
+
+        inline for (&words, 0..) |*w, h| {
+            const a: @Vector(8, i16) = f[16 * i + 8 * h ..][0..8].*;
+
+            const pairs: Words = @bitCast(a + (a >> @splat(15) & @as(@Vector(8, i16), @splat(3329))));
+
+            w.* = @bitCast((pairs & @as(Words, @splat(0xfff))) | ((pairs >> @splat(4)) & @as(Words, @splat(0xfff000))));
+        }
+
+        out[24 * i ..][0..16].* = lookup(words[0], first) | lookup(words[1], second);
+
+        out[24 * i + 16 ..][0..8].* = lookupHalf(words[1], third);
+    }
+}
+
 // ---- Keccak-f[1600] (FIPS 202) ----
 
 const keccak_clobbers: std.builtin.assembly.Clobbers = blk: {
@@ -427,6 +662,67 @@ pub fn keccak2(states: *[2][25]u64) void {
         : [states] "{x0}" (states),
           [constants] "{x1}" (&keccak.round_constants),
         : keccak_clobbers);
+}
+
+const hybrid_clobbers: std.builtin.assembly.Clobbers = blk: {
+    @setEvalBranchQuota(100_000);
+
+    var clobbers: std.builtin.assembly.Clobbers = .{ .memory = true, .nzcv = true };
+
+    for (0..32) |i| @field(clobbers, std.fmt.comptimePrint("v{d}", .{i})) = true;
+
+    for (2..29) |i| {
+        if (i != 18) @field(clobbers, std.fmt.comptimePrint("x{d}", .{i})) = true;
+    }
+
+    break :blk clobbers;
+};
+
+// Three permutations at once: two states with the SHA3 instructions and the third in
+// general-purpose registers, interleaved so that both kinds of pipelines work (tools/asm.zig).
+// Three states take little longer than two.
+pub fn keccak3(states: *[3][25]u64) void {
+    var first: usize = undefined;
+
+    var second: usize = undefined;
+
+    asm volatile (@embedFile("asm/keccak_x3_hybrid.s")
+        : [first] "={x0}" (first),
+          [second] "={x1}" (second),
+        : [states] "{x0}" (states),
+          [constants] "{x1}" (&keccak.round_constants),
+        : hybrid_clobbers);
+}
+
+const absorb_clobbers: std.builtin.assembly.Clobbers = blk: {
+    var clobbers = keccak_clobbers;
+
+    clobbers.x2 = false;
+
+    clobbers.x3 = false;
+
+    clobbers.x6 = true;
+
+    clobbers.x7 = true;
+
+    clobbers.x8 = true;
+
+    break :blk clobbers;
+};
+
+// Whole blocks of `rate` bytes (9, 13, 17, 18 or 21 lanes) XORed into one state and permuted,
+// with the state kept in registers from one block to the next.
+pub fn keccakAbsorb(state: *[25]u64, rate: usize, blocks: []const u8) void {
+    std.debug.assert(blocks.len > 0 and blocks.len % rate == 0);
+
+    asm volatile (@embedFile("asm/keccak_absorb_sha3.s")
+        :
+        : [state] "{x0}" (state),
+          [constants] "{x1}" (&keccak.round_constants),
+          [data] "{x2}" (blocks.ptr),
+          [count] "{x3}" (blocks.len / rate),
+          [lanes] "{x5}" (rate / 8),
+        : absorb_clobbers);
 }
 
 // ---- DIT and the CPU's implementer ----
