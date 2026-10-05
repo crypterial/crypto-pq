@@ -1,7 +1,8 @@
 use alloc::vec::Vec;
 
 use crate::ct::declassify;
-use crate::merkle::{MerkleTree, Node, TreeHasher};
+use crate::error::Error;
+use crate::merkle::{CachedTree, HeldTree, MerkleTree, Node, TreeHasher};
 use crate::primitives::TruncatedHash;
 use crate::sha2::{IV_256, Sha256};
 use crate::wipe::{SecretBytes, wipe};
@@ -712,10 +713,6 @@ struct Tree {
 
 impl Tree {
     fn new(lms: LmsType, ots: OtsType, i: &[u8], seed: SecretBytes) -> Self {
-        let mut identifier = [0; 16];
-
-        identifier.copy_from_slice(i);
-
         let merkle = MerkleTree::new(
             lms.h,
             &TreeKey {
@@ -725,6 +722,47 @@ impl Tree {
                 seed: &seed,
             },
         );
+
+        Self::with_merkle(lms, ots, i, seed, merkle)
+    }
+
+    // The tree from the nodes of a tree cache, checked against I; the nodes are public, and so is
+    // I, part of the tree's public key.
+    fn restore(
+        lms: LmsType,
+        ots: OtsType,
+        i: &[u8],
+        seed: SecretBytes,
+        nodes: &[u8],
+    ) -> Result<Self, Error> {
+        let mut identifier = [0; 16];
+
+        identifier.copy_from_slice(i);
+
+        declassify(&identifier);
+
+        let key = TreeKey {
+            lms: &lms,
+            ots: &ots,
+            i: &identifier,
+            seed: &seed,
+        };
+
+        let merkle = MerkleTree::restore(lms.h, lms.m, nodes, &key)?;
+
+        Ok(Self::with_merkle(lms, ots, &identifier, seed, merkle))
+    }
+
+    fn with_merkle(
+        lms: LmsType,
+        ots: OtsType,
+        i: &[u8],
+        seed: SecretBytes,
+        merkle: MerkleTree,
+    ) -> Self {
+        let mut identifier = [0; 16];
+
+        identifier.copy_from_slice(i);
 
         let mut public_key = Vec::with_capacity(lms.public_key_size());
 
@@ -775,37 +813,122 @@ impl Tree {
     }
 
     fn child(&self, lms: LmsType, ots: OtsType, q: u32) -> Self {
-        let mut seed = derive(&self.lms, &self.i, q, CHILD_SEED, &self.seed);
+        let (i, seed) = child_keys(&self.lms, &self.i, &self.seed, q);
 
-        let i = derive(&self.lms, &self.i, q, CHILD_I, &self.seed);
-
-        let child_seed = SecretBytes::concat(&[&seed[..self.lms.m]]);
-
-        wipe(&mut seed);
-
-        Self::new(lms, ots, &i[..16], child_seed)
+        Self::new(lms, ots, &i, seed)
     }
+}
+
+// The I and SEED of the child tree under leaf q of the tree with I `i` and SEED `seed`.
+fn child_keys(lms: &LmsType, i: &[u8], seed: &[u8], q: u32) -> ([u8; 16], SecretBytes) {
+    let mut child_seed = derive(lms, i, q, CHILD_SEED, seed);
+
+    let child = SecretBytes::concat(&[&child_seed[..lms.m]]);
+
+    wipe(&mut child_seed);
+
+    let mut identifier = [0; 16];
+
+    identifier.copy_from_slice(&derive(lms, i, q, CHILD_I, seed)[..16]);
+
+    (identifier, child)
 }
 
 // The signing side of an HSS key: the trees on the path to the next leaf, rebuilt when the
 // index leaves a tree, and each child public key signed by its parent.
+//
+// `cached` holds the trees of a verified tree cache that the next index signs with, top first.
+// The top one replaces the build. A lower one is checked now, so that a bad cache fails the load,
+// and waits in `restored`, with its level and number, until the first signature takes it instead
+// of building its level.
 pub(crate) struct Hss {
     levels: Vec<(LmsType, OtsType)>,
     trees: Vec<Tree>,
     signed: Vec<Vec<u8>>,
     prefixes: Vec<u64>,
+    restored: Vec<(usize, u64, Tree)>,
 }
 
 impl Hss {
-    pub(crate) fn new(levels: &[(LmsType, OtsType)], i: &[u8], seed: &[u8]) -> Self {
+    pub(crate) fn new(
+        levels: &[(LmsType, OtsType)],
+        i: &[u8],
+        seed: &[u8],
+        cached: &[CachedTree<'_>],
+    ) -> Result<Self, Error> {
         let (lms, ots) = levels[0];
 
-        Self {
+        let seed = SecretBytes::concat(&[seed]);
+
+        let top = match cached.first().filter(|tree| tree.level == 0) {
+            Some(tree) => Tree::restore(lms, ots, i, seed, tree.nodes)?,
+            None => Tree::new(lms, ots, i, seed),
+        };
+
+        let mut hss = Self {
             levels: levels.to_vec(),
-            trees: alloc::vec![Tree::new(lms, ots, i, SecretBytes::concat(&[seed]))],
+            trees: alloc::vec![top],
             signed: Vec::new(),
             prefixes: alloc::vec![0],
+            restored: Vec::new(),
+        };
+
+        for tree in cached.iter().filter(|tree| tree.level > 0) {
+            let level = usize::from(tree.level);
+
+            let (i, seed) = hss.path_keys(level, tree.tree);
+
+            let (lms, ots) = hss.levels[level];
+
+            let restored = Tree::restore(lms, ots, &i, seed, tree.nodes)?;
+
+            hss.restored.push((level, tree.tree, restored));
         }
+
+        Ok(hss)
+    }
+
+    // The I and SEED of tree `prefix` of `level`: the leaves that sign it on the levels above
+    // follow from its number.
+    fn path_keys(&self, level: usize, prefix: u64) -> ([u8; 16], SecretBytes) {
+        let top = &self.trees[0];
+
+        let mut i = top.i;
+
+        let mut seed = SecretBytes::concat(&[&top.seed]);
+
+        for upper in 0..level {
+            let between: u32 = self.levels[upper + 1..level]
+                .iter()
+                .map(|(lms, _)| lms.h)
+                .sum();
+
+            let q = ((prefix >> between) & ((1 << self.levels[upper].0.h) - 1)) as u32;
+
+            (i, seed) = child_keys(&top.lms, &i, &seed, q);
+        }
+
+        (i, seed)
+    }
+
+    // Every tree the key holds, top first, as a tree cache lists it: the trees on the path of the
+    // last signature, then the restored ones that no signature has taken yet.
+    pub(crate) fn cached_trees(&self) -> Vec<HeldTree<'_>> {
+        let held = self.trees.iter().zip(&self.prefixes).enumerate();
+
+        let waiting = self
+            .restored
+            .iter()
+            .map(|(level, prefix, tree)| (*level, (tree, prefix)));
+
+        held.chain(waiting)
+            .map(|(level, (tree, &prefix))| HeldTree {
+                level: level as u8,
+                tree: prefix,
+                n: tree.lms.m,
+                merkle: &tree.merkle,
+            })
+            .collect()
     }
 
     pub(crate) fn public_key(&self) -> Vec<u8> {
@@ -844,7 +967,16 @@ impl Hss {
 
             let parent = &mut self.trees[level - 1];
 
-            let tree = parent.child(lms, ots, q);
+            let restored = self
+                .restored
+                .iter()
+                .position(|(entry, _, _)| *entry == level)
+                .map(|position| self.restored.remove(position));
+
+            let tree = match restored {
+                Some((_, number, tree)) if number == prefix => tree,
+                _ => parent.child(lms, ots, q),
+            };
 
             let signed = [parent.sign(q, &tree.public_key), tree.public_key.clone()].concat();
 

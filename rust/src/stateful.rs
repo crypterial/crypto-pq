@@ -4,8 +4,10 @@ use core::fmt;
 use crate::cpu::Dit;
 use crate::ct;
 use crate::error::Error;
+use crate::hash::HMAC_SHA_256;
 use crate::keys::{KeyFormat, export_public, import_public};
 use crate::lms::{self, Hss, LmsType, OtsType};
+use crate::merkle::{CACHED_HEIGHT, CachedTree, HeldTree};
 use crate::primitives::sha256;
 use crate::rng::random_bytes;
 use crate::wipe::SecretBytes;
@@ -14,6 +16,12 @@ use crate::xmss::{self, Xmss};
 const VERSION: u8 = 1;
 
 const CHECKSUM_SIZE: usize = 16;
+
+const TREE_CACHE_VERSION: u8 = 1;
+
+const TREE_CACHE_LABEL: &[u8] = b"crypto-pq tree cache v1";
+
+const TAG_SIZE: usize = 32;
 
 const MAX_LEVELS: usize = 8;
 
@@ -57,14 +65,21 @@ impl Default for StatefulKeyGenOptions {
     }
 }
 
+// tree_cache: bytes from export_tree_cache, for load_private_key to take the trees they hold
+// instead of building them; the key loads only if they pass every check. It borrows the caller's
+// bytes, so that the options stay Copy and a cache is never moved or cloned to pass it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct StatefulLoadOptions {
+pub struct StatefulLoadOptions<'a> {
     pub reserve: u64,
+    pub tree_cache: Option<&'a [u8]>,
 }
 
-impl Default for StatefulLoadOptions {
+impl Default for StatefulLoadOptions<'_> {
     fn default() -> Self {
-        Self { reserve: 1 }
+        Self {
+            reserve: 1,
+            tree_cache: None,
+        }
     }
 }
 
@@ -124,6 +139,82 @@ impl Parameters {
             Self::Xmss(p) => p.capacity(),
         }
     }
+
+    // The parameters as the state blob and a tree cache encode them: the HSS level count and the
+    // type codes of every level, or the XMSS OID.
+    fn section(&self) -> Vec<u8> {
+        match self {
+            Self::Hss(levels) => {
+                let mut section = alloc::vec![levels.len() as u8];
+
+                for (lms, ots) in levels {
+                    section.extend_from_slice(&lms.code.to_be_bytes());
+
+                    section.extend_from_slice(&ots.code.to_be_bytes());
+                }
+
+                section
+            }
+            Self::Xmss(p) => p.oid.to_be_bytes().to_vec(),
+        }
+    }
+
+    // Where the trees of a level or layer stand in a tree cache, top first, with their height and
+    // node size.
+    fn tree_shape(&self, level: u8) -> Option<(usize, u32, usize)> {
+        let level = usize::from(level);
+
+        match self {
+            Self::Hss(levels) => levels.get(level).map(|(lms, _)| (level, lms.h, lms.m)),
+            Self::Xmss(p) => {
+                let layers = p.d as usize;
+
+                (level < layers).then(|| (layers - 1 - level, p.tree_height(), p.n))
+            }
+        }
+    }
+
+    // The number of the tree that index signs with on a level or layer; the top one has one tree.
+    fn tree_number(&self, index: u64, level: u8) -> u64 {
+        match self {
+            Self::Hss(_) if level == 0 => 0,
+            Self::Hss(levels) => {
+                index
+                    >> levels[usize::from(level)..]
+                        .iter()
+                        .map(|(lms, _)| lms.h)
+                        .sum::<u32>()
+            }
+            Self::Xmss(p) if u32::from(level) == p.d - 1 => 0,
+            Self::Xmss(p) => index >> ((u32::from(level) + 1) * p.tree_height()),
+        }
+    }
+
+    // Whether a public key has every byte that the seed gives: all but the root. The seed is
+    // secret until the key loads, so the comparison is constant-time and only its result is public.
+    fn matches_seed(&self, seed: &[u8], public_key: &[u8]) -> bool {
+        match self {
+            Self::Hss(levels) => {
+                let (lms, ots) = levels[0];
+
+                let expected = [
+                    &(levels.len() as u32).to_be_bytes()[..],
+                    &lms.code.to_be_bytes(),
+                    &ots.code.to_be_bytes(),
+                    &seed[..16],
+                ]
+                .concat();
+
+                public_key.len() == expected.len() + lms.m
+                    && ct::declassify_value(ct::equal(&public_key[..expected.len()], &expected))
+            }
+            Self::Xmss(p) => {
+                public_key.len() == p.public_key_size()
+                    && public_key[..4] == p.oid.to_be_bytes()
+                    && ct::declassify_value(ct::equal(&public_key[4 + p.n..], &seed[2 * p.n..]))
+            }
+        }
+    }
 }
 
 // 1 to 8 levels with the same hash function and output size and at most 60 levels of height.
@@ -147,10 +238,20 @@ enum Signer {
 }
 
 impl Signer {
-    fn new(parameters: &Parameters, seed: &[u8]) -> Self {
-        match parameters {
-            Parameters::Hss(levels) => Self::Hss(Hss::new(levels, &seed[..16], &seed[16..])),
-            Parameters::Xmss(p) => Self::Xmss(Xmss::new(p, seed)),
+    // `cached` holds the trees of an opened tree cache that the next index signs with.
+    fn new(parameters: &Parameters, seed: &[u8], cached: &[CachedTree<'_>]) -> Result<Self, Error> {
+        Ok(match parameters {
+            Parameters::Hss(levels) => {
+                Self::Hss(Hss::new(levels, &seed[..16], &seed[16..], cached)?)
+            }
+            Parameters::Xmss(p) => Self::Xmss(Xmss::new(p, seed, cached)?),
+        })
+    }
+
+    fn cached_trees(&self) -> Vec<HeldTree<'_>> {
+        match self {
+            Self::Hss(hss) => hss.cached_trees(),
+            Self::Xmss(xmss) => xmss.cached_trees(),
         }
     }
 
@@ -179,6 +280,50 @@ fn read_u64(bytes: &[u8]) -> u64 {
     word.copy_from_slice(bytes);
 
     u64::from_be_bytes(word)
+}
+
+// Reads the big-endian fields of a tree cache from the front.
+struct Reader<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, size: u64) -> Result<&'a [u8], Error> {
+        let size = usize::try_from(size).map_err(|_| Error::InvalidEncoding)?;
+
+        let (head, rest) = self
+            .data
+            .split_at_checked(size)
+            .ok_or(Error::InvalidEncoding)?;
+
+        self.data = rest;
+
+        Ok(head)
+    }
+
+    fn byte(&mut self) -> Result<u8, Error> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn number(&mut self, size: usize) -> Result<u64, Error> {
+        let bytes = self.take(size as u64)?;
+
+        Ok(bytes
+            .iter()
+            .fold(0, |value, &byte| (value << 8) | u64::from(byte)))
+    }
+
+    // How far into `data`, which the reader started from, it has read.
+    const fn position(&self, data: &[u8]) -> usize {
+        data.len() - self.data.len()
+    }
+}
+
+// What a tree cache gives the key that loads it: the public key that it names, and the trees that
+// the next index signs with.
+struct OpenedCache<'a> {
+    public_key: &'a [u8],
+    trees: Vec<CachedTree<'a>>,
 }
 
 // State blob: version, kind, the parameters, the secret seeds and the next index, closed by the
@@ -220,15 +365,21 @@ impl StatefulSignatureAlgorithm {
     }
 
     // The stored index is the first one not handed out, so signing resumes there even when the
-    // last key reserved more than it used.
+    // last key reserved more than it used. A tree cache from export_tree_cache replaces the build
+    // of the trees it holds; the state is checked first, and the key loads only if the cache
+    // passes.
     pub fn load_private_key<S: StateStore>(
         &self,
         mut store: S,
-        options: &StatefulLoadOptions,
+        options: &StatefulLoadOptions<'_>,
     ) -> Result<StatefulPrivateKey<S>, Error> {
         let _dit = Dit::new();
 
         let reserve = check_reserve(options.reserve)?;
+
+        // A copy, so that the trees take the bytes that the tag covers even if the caller's buffer
+        // changes meanwhile, as a mapped file may.
+        let cache = options.tree_cache.map(<[u8]>::to_vec);
 
         let state = store
             .read()
@@ -243,7 +394,23 @@ impl StatefulSignatureAlgorithm {
             return Err(Error::InvalidPrivateKey);
         }
 
-        let signer = Signer::new(&parameters, &seed);
+        let opened = cache
+            .as_deref()
+            .map(|data| self.open_tree_cache(&parameters, &seed, index, data))
+            .transpose()?;
+
+        let restored = opened
+            .as_ref()
+            .map_or(&[][..], |opened| opened.trees.as_slice());
+
+        let signer = Signer::new(&parameters, &seed, restored)?;
+
+        if opened
+            .as_ref()
+            .is_some_and(|opened| signer.public_key() != opened.public_key)
+        {
+            return Err(Error::InvalidEncoding);
+        }
 
         Ok(StatefulPrivateKey {
             algorithm: *self,
@@ -307,7 +474,7 @@ impl StatefulSignatureAlgorithm {
     ) -> Result<StatefulKeyPair<S>, Error> {
         let _dit = Dit::new();
 
-        let signer = Signer::new(&parameters, &seed);
+        let signer = Signer::new(&parameters, &seed, &[])?;
 
         let state = self.encode(&parameters, &seed, index);
 
@@ -364,20 +531,138 @@ impl StatefulSignatureAlgorithm {
     fn encode(&self, parameters: &Parameters, seed: &[u8], index: u64) -> SecretBytes {
         let header = [VERSION, self.kind_byte()];
 
+        let section = parameters.section();
+
         let index = index.to_be_bytes();
 
         match parameters {
-            Parameters::Hss(levels) => {
-                let codes: Vec<u8> = levels
-                    .iter()
-                    .flat_map(|(lms, ots)| [lms.code.to_be_bytes(), ots.code.to_be_bytes()])
-                    .flatten()
-                    .collect();
-
-                seal(&[&header, &[levels.len() as u8], &codes, seed, &index])
-            }
-            Parameters::Xmss(p) => seal(&[&header, &p.oid.to_be_bytes(), &index, seed]),
+            Parameters::Hss(_) => seal(&[&header, &section, seed, &index]),
+            Parameters::Xmss(_) => seal(&[&header, &section, &index, seed]),
         }
+    }
+
+    // Checks a tree cache in this order: the structure, then the version, the kind, the parameters
+    // and the bytes of the public key that the seed gives, then the tag in constant time, then each
+    // tree's level and shape. Every failure is InvalidEncoding except a cache of another algorithm,
+    // which is AlgorithmMismatch. A tree that the index does not sign with is stale: it is skipped
+    // and built again when needed. The others are returned for the signer to recompute their
+    // parents; the caller then compares the signer's public key, and with it the top root, with
+    // the cache's.
+    fn open_tree_cache<'a>(
+        &self,
+        parameters: &Parameters,
+        seed: &[u8],
+        index: u64,
+        data: &'a [u8],
+    ) -> Result<OpenedCache<'a>, Error> {
+        let mut reader = Reader { data };
+
+        let version = reader.byte()?;
+
+        let kind = reader.byte()?;
+
+        // The parameters have the layout of the kind that the cache names: an HSS level count and a
+        // pair of types per level, or an OID. A cache of no known kind cannot be read further.
+        let start = reader.position(data);
+
+        match kind {
+            1 => {
+                let count = reader.byte()?;
+
+                reader.take(8 * u64::from(count))?;
+            }
+            2 | 3 => {
+                reader.take(4)?;
+            }
+            _ => return Err(Error::InvalidEncoding),
+        }
+
+        let section = &data[start..reader.position(data)];
+
+        let size = reader.number(4)?;
+
+        let public_key = reader.take(size)?;
+
+        let count = reader.byte()?;
+
+        let first_tree = reader.position(data);
+
+        for _ in 0..count {
+            let header = reader.take(16)?;
+
+            reader.take(u64::from(read_u32(&header[12..])) * u64::from(header[11]))?;
+        }
+
+        let body = &data[..reader.position(data)];
+
+        let tag = reader.take(TAG_SIZE as u64)?;
+
+        if !reader.data.is_empty() || version != TREE_CACHE_VERSION {
+            return Err(Error::InvalidEncoding);
+        }
+
+        if kind != self.kind_byte() {
+            return Err(Error::AlgorithmMismatch);
+        }
+
+        if *section != parameters.section() || !parameters.matches_seed(seed, public_key) {
+            return Err(Error::InvalidEncoding);
+        }
+
+        let key = SecretBytes::from_vec(HMAC_SHA_256.digest(TREE_CACHE_LABEL, seed));
+
+        // Whether the cache is authentic is public: loading fails on it.
+        if !ct::declassify_value(ct::equal(&HMAC_SHA_256.digest(&key, body), tag)) {
+            return Err(Error::InvalidEncoding);
+        }
+
+        let mut trees = Reader {
+            data: &body[first_tree..],
+        };
+
+        let mut previous = None;
+
+        let mut needed = Vec::new();
+
+        for _ in 0..count {
+            let header = trees.take(16)?;
+
+            let (level, tree) = (header[0], read_u64(&header[1..9]));
+
+            let (low, height, n) = (header[9], header[10], header[11]);
+
+            let (position, expected_height, expected_n) =
+                parameters.tree_shape(level).ok_or(Error::InvalidEncoding)?;
+
+            if previous.is_some_and(|previous| position <= previous) {
+                return Err(Error::InvalidEncoding);
+            }
+
+            previous = Some(position);
+
+            let expected_low = expected_height.saturating_sub(CACHED_HEIGHT);
+
+            let shape = (u32::from(low), u32::from(height), usize::from(n));
+
+            let count = read_u32(&header[12..]);
+
+            if shape != (expected_low, expected_height, expected_n)
+                || count != (2 << (expected_height - expected_low)) - 1
+            {
+                return Err(Error::InvalidEncoding);
+            }
+
+            let nodes = trees.take(u64::from(count) * u64::from(n))?;
+
+            if tree == parameters.tree_number(index, level) {
+                needed.push(CachedTree { level, tree, nodes });
+            }
+        }
+
+        Ok(OpenedCache {
+            public_key,
+            trees: needed,
+        })
     }
 
     fn unseal<'a>(&self, state: &'a [u8]) -> Result<&'a [u8], Error> {
@@ -539,6 +824,71 @@ impl<S> StatefulPrivateKey<S> {
     pub fn remaining_signatures(&self) -> u64 {
         self.parameters.capacity() - self.index
     }
+
+    // The trees that the key holds, for StatefulLoadOptions::tree_cache to skip their build. sign
+    // takes &mut self, so no export can overlap a signature: the StateConflict of the other
+    // languages cannot happen here.
+    //
+    // A tree cache holds public nodes only, but the signer trusts the root of a cached lower tree
+    // as the child key that its parent signs, and the public key covers only the top root and the
+    // top level's types, so the cache is authenticated with a key derived from the seed and names
+    // every level's parameters. The body is the version, the kind, the parameters as the state
+    // blob encodes them, the public key and every cached tree, top first: its level or layer, its
+    // number on that level, its lowest cached height, its height, n, its node count and its nodes,
+    // level by level from the lowest, left to right. The tag, HMAC-SHA-256 of the body, follows it.
+    pub fn export_tree_cache(&self) -> Result<Vec<u8>, Error> {
+        let _dit = Dit::new();
+
+        let section = self.parameters.section();
+
+        let public_key = self.signer.public_key();
+
+        let trees = self.signer.cached_trees();
+
+        let nodes: usize = trees
+            .iter()
+            .map(|tree| 16 + tree.n * tree.merkle.node_count())
+            .sum();
+
+        let size = 2 + section.len() + 4 + public_key.len() + 1 + nodes + TAG_SIZE;
+
+        let mut cache = Vec::with_capacity(size);
+
+        cache.extend_from_slice(&[TREE_CACHE_VERSION, self.algorithm.kind_byte()]);
+
+        cache.extend_from_slice(&section);
+
+        cache.extend_from_slice(&(public_key.len() as u32).to_be_bytes());
+
+        cache.extend_from_slice(&public_key);
+
+        cache.push(trees.len() as u8);
+
+        for tree in &trees {
+            let merkle = tree.merkle;
+
+            cache.push(tree.level);
+
+            cache.extend_from_slice(&tree.tree.to_be_bytes());
+
+            cache.extend_from_slice(&[merkle.low() as u8, merkle.height() as u8, tree.n as u8]);
+
+            cache.extend_from_slice(&(merkle.node_count() as u32).to_be_bytes());
+
+            merkle.write_nodes(tree.n, &mut cache);
+        }
+
+        // The key of the tag is HKDF-Extract (RFC 5869) of the seed with the label as salt.
+        let key = SecretBytes::from_vec(HMAC_SHA_256.digest(TREE_CACHE_LABEL, &self.seed));
+
+        let tag = HMAC_SHA_256.digest(&key, &cache);
+
+        cache.extend_from_slice(&tag);
+
+        ct::declassify(&cache);
+
+        Ok(cache)
+    }
 }
 
 impl<S: StateStore> StatefulPrivateKey<S> {
@@ -598,5 +948,103 @@ impl<S> fmt::Debug for StatefulKeyPair<S> {
             .field("public_key", &self.public_key)
             .field("private_key", &self.private_key)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::{
+        HSS_LMS, StateStore, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
+        XMSS_MT,
+    };
+    use crate::error::Error;
+    use crate::hazmat::generate_stateful_key_pair;
+    use crate::merkle::LEAVES_COMPUTED;
+
+    #[derive(Default)]
+    struct MemoryStore(Option<Vec<u8>>);
+
+    impl StateStore for MemoryStore {
+        fn read(&mut self) -> Result<Option<Vec<u8>>, Error> {
+            Ok(self.0.clone())
+        }
+
+        fn update(&mut self, previous: Option<&[u8]>, next: &[u8]) -> Result<bool, Error> {
+            if self.0.as_deref() != previous {
+                return Ok(false);
+            }
+
+            self.0 = Some(next.to_vec());
+
+            Ok(true)
+        }
+    }
+
+    // The leaves that this thread computed since the last call.
+    fn computed() -> u64 {
+        LEAVES_COMPUTED.with(|count| count.replace(0))
+    }
+
+    // A load with the cache computes no leaf; the trees that the next index has left are built.
+    #[test]
+    fn a_tree_cache_skips_the_build() {
+        let seed: Vec<u8> = (0..72).collect();
+
+        let two = [
+            ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W4"),
+            ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W2"),
+        ];
+
+        let mt = StatefulParameters::Name("XMSSMT-SHA2_20/4_192");
+
+        for (algorithm, parameters, size, index, later, trees) in [
+            (HSS_LMS, StatefulParameters::Levels(&two), 40, 40, 64, 2),
+            (XMSS_MT, mt, 72, 0x12345, 0x12360, 4),
+        ] {
+            let options = StatefulKeyGenOptions::default();
+
+            let seed = &seed[..size];
+
+            let mut pair = generate_stateful_key_pair(
+                algorithm,
+                parameters,
+                seed,
+                index,
+                MemoryStore::default(),
+                &options,
+            )
+            .unwrap();
+
+            pair.private_key.sign(b"first").unwrap();
+
+            let cache = pair.private_key.export_tree_cache().unwrap();
+
+            let state = pair.private_key.store.0.clone().unwrap();
+
+            let stale = algorithm.encode(&algorithm.parameters(parameters).unwrap(), seed, later);
+
+            for (state, tree_cache, leaves) in [
+                (&state[..], Some(&cache[..]), 0),
+                (&state[..], None, 32 * trees),
+                (&stale[..], Some(&cache[..]), 32),
+            ] {
+                let options = StatefulLoadOptions {
+                    reserve: 1,
+                    tree_cache,
+                };
+
+                computed();
+
+                let mut key = algorithm
+                    .load_private_key(MemoryStore(Some(state.to_vec())), &options)
+                    .unwrap();
+
+                key.sign(b"m").unwrap();
+
+                assert_eq!(computed(), leaves);
+            }
+        }
     }
 }

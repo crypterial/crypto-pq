@@ -395,6 +395,23 @@ fn stateful(
 
     assert!(public_key.verify(&signed, MESSAGE));
 
+    // A tree cache is public, and its tag key comes from the seeds: loading with it checks the tag
+    // and the nodes, and restores the trees that the stored index still signs with.
+    let cache = loaded.export_tree_cache().unwrap();
+
+    drop(loaded);
+
+    let options = StatefulLoadOptions {
+        tree_cache: Some(&cache),
+        ..StatefulLoadOptions::default()
+    };
+
+    let mut restored = algorithm.load_private_key(&mut store, &options).unwrap();
+
+    let signed = restored.sign(MESSAGE).unwrap();
+
+    assert!(public_key.verify(&signed, MESSAGE));
+
     let mut generated = algorithm
         .generate_key_pair(
             parameters,

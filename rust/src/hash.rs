@@ -254,7 +254,12 @@ impl Hmac {
 
         let mut outer = self.outer.engine.clone();
 
-        outer.update(&self.inner.digest());
+        // The inner hash and the outer key give the output, which may be a key itself.
+        let mut inner = self.inner.digest();
+
+        outer.update(&inner);
+
+        wipe(&mut inner);
 
         outer.digest(self.outer.size)
     }

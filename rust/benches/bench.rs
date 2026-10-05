@@ -7,8 +7,8 @@ use crypto_pq::{
     SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S,
     SLH_DSA_SHAKE_128F, SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S,
     SLH_DSA_SHAKE_256F, SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, StateStore,
-    StatefulKeyGenOptions, StatefulParameters, StatefulPrivateKey, StatefulSignatureAlgorithm,
-    VerifyOptions, X_WING, XMSS, XMSS_MT, hazmat,
+    StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters, StatefulPrivateKey,
+    StatefulSignatureAlgorithm, VerifyOptions, X_WING, XMSS, XMSS_MT, hazmat,
 };
 
 const MIN_TIME: Duration = Duration::from_secs(1);
@@ -351,6 +351,48 @@ fn stateful(
     });
 }
 
+// Loading a key builds its trees from the leaves; with a tree cache it recomputes the parents of
+// the cached nodes instead.
+fn load(
+    runner: &Runner,
+    name: &str,
+    algorithm: StatefulSignatureAlgorithm,
+    parameters: StatefulParameters,
+    seed_size: usize,
+) {
+    let (plain, cached) = (format!("{name}/load"), format!("{name}/load+cache"));
+
+    if !runner.selects(&plain) && !runner.selects(&cached) {
+        return;
+    }
+
+    let mut store = MemoryStore::default();
+
+    let cache = hazmat::generate_stateful_key_pair(
+        algorithm,
+        parameters,
+        &bytes(seed_size),
+        0,
+        &mut store,
+        &StatefulKeyGenOptions::default(),
+    )
+    .and_then(|pair| pair.private_key.export_tree_cache())
+    .unwrap();
+
+    for (name, tree_cache) in [(plain, None), (cached, Some(&cache[..]))] {
+        let options = StatefulLoadOptions {
+            tree_cache,
+            ..StatefulLoadOptions::default()
+        };
+
+        runner.case(&name, |count| {
+            timed(count, || {
+                black_box(algorithm.load_private_key(&mut store, &options).unwrap());
+            })
+        });
+    }
+}
+
 fn main() {
     let runner = Runner {
         filter: std::env::args().skip(1).find(|arg| !arg.starts_with("--")),
@@ -408,4 +450,23 @@ fn main() {
         StatefulParameters::Name("XMSSMT-SHA2_20/4_256"),
         96,
     );
+
+    load(
+        &runner,
+        "HSS-H15-W4",
+        HSS_LMS,
+        StatefulParameters::Levels(&[("LMS_SHA256_M32_H15", "LMOTS_SHA256_N32_W4")]),
+        48,
+    );
+
+    // A tree of height 20 takes tens of seconds to build, so it runs only when a filter selects it.
+    if runner.filter.is_some() {
+        load(
+            &runner,
+            "HSS-H20-W4",
+            HSS_LMS,
+            StatefulParameters::Levels(&[("LMS_SHA256_M32_H20", "LMOTS_SHA256_N32_W4")]),
+            48,
+        );
+    }
 }

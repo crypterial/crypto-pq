@@ -609,6 +609,86 @@ fn xmss() {
     check_stateful("cross/xmss.txt");
 }
 
+// Each export is made again, and every cache loads, or fails to, as the reference decided; a key
+// that loads signs as the reference did.
+#[test]
+fn tree_cache() {
+    parallel(
+        &records("cross/treecache.txt", "treeCache"),
+        |(header, record)| {
+            let algorithm = stateful_algorithm(&header["algorithm"]);
+
+            let context = format!("{}: {}", algorithm.name(), record["name"]);
+
+            let (state, cache) = (field(record, "state"), field(record, "treeCache"));
+
+            let message = field(record, "message");
+
+            if record["operation"] == "export" {
+                let levels = levels(record);
+
+                let store = MemoryStore::default();
+
+                let mut pair = hazmat::generate_stateful_key_pair(
+                    algorithm,
+                    parameters(record, &levels),
+                    &field(record, "seed"),
+                    record["index"].parse().unwrap(),
+                    store.clone(),
+                    &StatefulKeyGenOptions::default(),
+                )
+                .unwrap();
+
+                if record["signed"] == "true" {
+                    pair.private_key.sign(&message).unwrap();
+                }
+
+                assert_eq!(
+                    pair.private_key.export_tree_cache().unwrap(),
+                    cache,
+                    "{context}"
+                );
+
+                assert_eq!(store.state(), Some(state.clone()), "{context}");
+            }
+
+            let options = StatefulLoadOptions {
+                tree_cache: Some(&cache),
+                ..StatefulLoadOptions::default()
+            };
+
+            let mut key = match algorithm.load_private_key(MemoryStore::holding(&state), &options) {
+                Ok(key) => key,
+                Err(error) => {
+                    assert_eq!(error.code(), record["result"], "{context}");
+
+                    return;
+                }
+            };
+
+            assert_eq!(record["result"], "ok", "{context}");
+
+            assert_eq!(
+                key.public_key().export_key(KeyFormat::Raw).unwrap(),
+                field(record, "publicKey"),
+                "{context}"
+            );
+
+            let remaining: u64 = record["remaining"].parse().unwrap();
+
+            assert_eq!(key.remaining_signatures(), remaining, "{context}");
+
+            if record.contains_key("signature") {
+                assert_eq!(
+                    key.sign(&message).unwrap(),
+                    field(record, "signature"),
+                    "{context}"
+                );
+            }
+        },
+    );
+}
+
 // The result of one error-table record: "ok", "true", "false" or an error code, with the output
 // and remaining signatures it produced.
 struct Outcome {

@@ -2,7 +2,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::ct::declassify;
-use crate::merkle::{MerkleTree, Node, TreeHasher};
+use crate::error::Error;
+use crate::merkle::{CachedTree, HeldTree, MerkleTree, Node, TreeHasher};
 use crate::primitives::TruncatedHash;
 use crate::sha2::{IV_256, Sha256};
 use crate::wipe::{SecretBytes, wipe};
@@ -39,7 +40,7 @@ pub(crate) struct Parameters {
     shake: bool,
     pub(crate) n: usize,
     h: u32,
-    d: u32,
+    pub(crate) d: u32,
     multi: bool,
 }
 
@@ -130,7 +131,7 @@ impl Parameters {
         if self.n == 32 { 32 } else { 4 }
     }
 
-    const fn tree_height(&self) -> u32 {
+    pub(crate) const fn tree_height(&self) -> u32 {
         self.h / self.d
     }
 
@@ -801,6 +802,8 @@ struct SignedRoot {
 }
 
 // The signing side of an XMSS or XMSS^MT key, with one cached tree and one signed root per layer.
+// `cached` holds the trees of a verified tree cache that the next index signs with; each replaces
+// the build of its layer, checked against its own nodes.
 pub(crate) struct Xmss {
     p: &'static Parameters,
     sk_seed: SecretBytes,
@@ -842,7 +845,11 @@ fn cached_tree<'t>(
 }
 
 impl Xmss {
-    pub(crate) fn new(p: &'static Parameters, seed: &[u8]) -> Self {
+    pub(crate) fn new(
+        p: &'static Parameters,
+        seed: &[u8],
+        cached: &[CachedTree<'_>],
+    ) -> Result<Self, Error> {
         let n = p.n;
 
         // PUB_SEED is part of the public key.
@@ -860,9 +867,36 @@ impl Xmss {
 
         let hashes = Hashes::new(p, &xmss.pub_seed, &xmss.sk_seed);
 
+        for tree in cached {
+            let subtree = Subtree {
+                hashes: &hashes,
+                layer: u32::from(tree.level),
+                tree: tree.tree,
+            };
+
+            let merkle = MerkleTree::restore(p.tree_height(), n, tree.nodes, &subtree)?;
+
+            xmss.trees[usize::from(tree.level)] = Some((tree.tree, merkle));
+        }
+
         xmss.root = *cached_tree(&mut xmss.trees, &hashes, p.d - 1, 0).root();
 
-        xmss
+        Ok(xmss)
+    }
+
+    // Every tree the key holds, top first, as a tree cache lists it.
+    pub(crate) fn cached_trees(&self) -> Vec<HeldTree<'_>> {
+        let held = self.trees.iter().enumerate().rev();
+
+        held.filter_map(|(layer, slot)| {
+            slot.as_ref().map(|(tree, merkle)| HeldTree {
+                level: layer as u8,
+                tree: *tree,
+                n: self.p.n,
+                merkle,
+            })
+        })
+        .collect()
     }
 
     pub(crate) fn public_key(&self) -> Vec<u8> {
