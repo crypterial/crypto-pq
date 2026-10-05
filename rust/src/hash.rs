@@ -34,13 +34,21 @@ impl Engine {
         }
     }
 
-    fn digest(&self, size: usize) -> Vec<u8> {
+    fn digest_into(&self, out: &mut [u8]) {
         match self {
-            Self::Sha256(engine) => engine.digest()[..size].to_vec(),
-            Self::Sha512(engine) => engine.digest()[..size].to_vec(),
-            Self::Keccak(engine) => engine.clone().finish(size),
+            Self::Sha256(engine) => out.copy_from_slice(&engine.digest()[..out.len()]),
+            Self::Sha512(engine) => out.copy_from_slice(&engine.digest()[..out.len()]),
+            Self::Keccak(engine) => engine.clone().read(out),
         }
     }
+}
+
+// An output buffer of another size is a programming error, as in copy_from_slice.
+fn check_length(actual: usize, expected: usize) {
+    assert!(
+        actual == expected,
+        "INVALID_LENGTH: the output must be exactly the digest size"
+    );
 }
 
 // oid_arc is the last arc of the NIST identifier 2.16.840.1.101.3.4.2.x, which pre-hashed
@@ -67,15 +75,28 @@ impl HashAlgorithm {
     }
 
     pub fn digest(&self, data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0; self.digest_size];
+
+        self.digest_into(data, &mut out);
+
+        out
+    }
+
+    // The same digest written into out, which must be digest_size() bytes, without allocating.
+    pub fn digest_into(&self, data: &[u8], out: &mut [u8]) {
+        check_length(out.len(), self.digest_size);
+
         match self.kind {
-            Kind::Sha256(iv) => Sha256::digest_message(iv, data)[..self.digest_size].to_vec(),
-            Kind::Sha3 => Keccak::digest(self.block_size(), SHA3_SUFFIX, data, self.digest_size),
+            Kind::Sha256(iv) => {
+                out.copy_from_slice(&Sha256::digest_message(iv, data)[..self.digest_size])
+            }
+            Kind::Sha3 => Keccak::digest_into(self.block_size(), SHA3_SUFFIX, data, out),
             Kind::Sha512(_) => {
                 let mut hasher = self.create();
 
                 hasher.update(data);
 
-                hasher.digest()
+                hasher.engine.digest_into(out);
             }
         }
     }
@@ -113,7 +134,17 @@ impl Hasher {
     }
 
     pub fn digest(&self) -> Vec<u8> {
-        self.engine.digest(self.size)
+        let mut out = vec![0; self.size];
+
+        self.engine.digest_into(&mut out);
+
+        out
+    }
+
+    pub fn digest_into(&self, out: &mut [u8]) {
+        check_length(out.len(), self.size);
+
+        self.engine.digest_into(out);
     }
 }
 
@@ -135,6 +166,11 @@ impl XofAlgorithm {
 
     pub fn digest(&self, data: &[u8], length: usize) -> Vec<u8> {
         Keccak::digest(self.rate, SHAKE_SUFFIX, data, length)
+    }
+
+    // out.len() bytes of output, without allocating.
+    pub fn digest_into(&self, data: &[u8], out: &mut [u8]) {
+        Keccak::digest_into(self.rate, SHAKE_SUFFIX, data, out);
     }
 
     pub fn create(&self) -> Xof {
@@ -159,6 +195,10 @@ impl Xof {
         self.engine.read(&mut out);
 
         out
+    }
+
+    pub fn read_into(&mut self, out: &mut [u8]) {
+        self.engine.read(out);
     }
 }
 
@@ -185,6 +225,16 @@ impl HmacAlgorithm {
         hmac.update(data);
 
         hmac.digest()
+    }
+
+    pub fn digest_into(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
+        let _dit = Dit::new();
+
+        let mut hmac = self.create(key);
+
+        hmac.update(data);
+
+        hmac.digest_into(out);
     }
 
     pub fn create(&self, key: &[u8]) -> Hmac {
@@ -246,18 +296,30 @@ impl Hmac {
     }
 
     pub fn digest(&self) -> Vec<u8> {
+        let mut out = vec![0; self.outer.size];
+
+        self.digest_into(&mut out);
+
+        out
+    }
+
+    pub fn digest_into(&self, out: &mut [u8]) {
         let _dit = Dit::new();
+
+        check_length(out.len(), self.outer.size);
 
         let mut outer = self.outer.engine.clone();
 
         // The inner hash and the outer key give the output, which may be a key itself.
-        let mut inner = self.inner.digest();
+        let mut inner = [0; 64];
 
-        outer.update(&inner);
+        self.inner.engine.digest_into(&mut inner[..self.inner.size]);
+
+        outer.update(&inner[..self.inner.size]);
 
         wipe(&mut inner);
 
-        outer.digest(self.outer.size)
+        outer.digest_into(out);
     }
 
     pub fn verify(&self, tag: &[u8]) -> bool {

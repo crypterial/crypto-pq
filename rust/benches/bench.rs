@@ -120,38 +120,62 @@ fn hashes(runner: &Runner) {
     let data = bytes(1024);
 
     runner.case("sha-256/64B", |count| {
+        let mut out = [0; 32];
+
         timed(count, || {
-            black_box(SHA_256.digest(black_box(&data[..64])));
+            SHA_256.digest_into(black_box(&data[..64]), &mut out);
+
+            black_box(&out);
         })
     });
 
     runner.case("sha-256/1KiB", |count| {
+        let mut out = [0; 32];
+
         timed(count, || {
-            black_box(SHA_256.digest(black_box(&data)));
+            SHA_256.digest_into(black_box(&data), &mut out);
+
+            black_box(&out);
         })
     });
 
     runner.case("sha-512/1KiB", |count| {
+        let mut out = [0; 64];
+
         timed(count, || {
-            black_box(SHA_512.digest(black_box(&data)));
+            SHA_512.digest_into(black_box(&data), &mut out);
+
+            black_box(&out);
         })
     });
 
     runner.case("sha3-256/1KiB", |count| {
+        let mut out = [0; 32];
+
         timed(count, || {
-            black_box(SHA3_256.digest(black_box(&data)));
+            SHA3_256.digest_into(black_box(&data), &mut out);
+
+            black_box(&out);
         })
     });
 
     runner.case("shake128/1KiB", |count| {
+        let mut out = [0; 32];
+
         timed(count, || {
-            black_box(SHAKE128.digest(black_box(&data), 32));
+            SHAKE128.digest_into(black_box(&data), &mut out);
+
+            black_box(&out);
         })
     });
 
     runner.case("shake256/1KiB", |count| {
+        let mut out = [0; 64];
+
         timed(count, || {
-            black_box(SHAKE256.digest(black_box(&data), 64));
+            SHAKE256.digest_into(black_box(&data), &mut out);
+
+            black_box(&out);
         })
     });
 }

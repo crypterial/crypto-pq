@@ -377,10 +377,18 @@ impl Keccak {
         }
     }
 
-    // The first size bytes of output for data, read once. Where there is a kernel, the padded
-    // last block is absorbed in the same call as the whole blocks before it, and no state is
-    // kept between calls.
     pub(crate) fn digest(rate: usize, suffix: u8, data: &[u8], size: usize) -> Vec<u8> {
+        let mut out = vec![0; size];
+
+        Self::digest_into(rate, suffix, data, &mut out);
+
+        out
+    }
+
+    // The first out.len() bytes of output for data, read once. Where there is a kernel, the
+    // padded last block is absorbed in the same call as the whole blocks before it, and no state
+    // is kept between calls.
+    pub(crate) fn digest_into(rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) {
         let (blocks, tail) = data.split_at(data.len() - data.len() % rate);
 
         let mut last = [0; 168];
@@ -401,16 +409,7 @@ impl Keccak {
 
         wipe(&mut last);
 
-        engine.finish(size)
-    }
-
-    // The first size bytes of output, for a hash that is read once.
-    pub(crate) fn finish(mut self, size: usize) -> Vec<u8> {
-        let mut out = vec![0; size];
-
-        self.read(&mut out);
-
-        out
+        engine.read(out);
     }
 
     fn extract(&mut self, mut out: &mut [u8]) {

@@ -216,6 +216,87 @@ fn hash_digest_is_repeatable() {
     }
 }
 
+// The _into forms write what the allocating forms return, for messages around every block size,
+// and refuse a buffer of any other size.
+#[test]
+fn digest_into_matches_digest() {
+    let data: Vec<u8> = (0..300).map(|i| (i * 7 + 3) as u8).collect();
+
+    for length in [
+        0, 1, 55, 56, 63, 64, 111, 112, 127, 128, 135, 136, 167, 168, 300,
+    ] {
+        let message = &data[..length];
+
+        for (_, _, algorithm) in HASHES {
+            let mut out = vec![0; algorithm.digest_size()];
+
+            algorithm.digest_into(message, &mut out);
+
+            assert_eq!(out, algorithm.digest(message));
+
+            let mut hasher = algorithm.create();
+
+            hasher.update(message);
+
+            let mut streamed = vec![0; algorithm.digest_size()];
+
+            hasher.digest_into(&mut streamed);
+
+            assert_eq!(streamed, out);
+        }
+
+        for (_, algorithm) in XOFS {
+            let mut out = [0; 200];
+
+            algorithm.digest_into(message, &mut out);
+
+            assert_eq!(out.as_slice(), algorithm.digest(message, 200));
+
+            let mut xof = algorithm.create();
+
+            xof.update(message);
+
+            let mut read = [0; 200];
+
+            xof.read_into(&mut read[..77]);
+
+            xof.read_into(&mut read[77..]);
+
+            assert_eq!(read, out);
+        }
+
+        for (_, _, algorithm) in HMACS {
+            let mut out = vec![0; algorithm.digest_size()];
+
+            algorithm.digest_into(b"key", message, &mut out);
+
+            assert_eq!(out, algorithm.digest(b"key", message));
+
+            let mut hmac = algorithm.create(b"key");
+
+            hmac.update(message);
+
+            let mut streamed = vec![0; algorithm.digest_size()];
+
+            hmac.digest_into(&mut streamed);
+
+            assert_eq!(streamed, out);
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "INVALID_LENGTH")]
+fn digest_into_rejects_another_size() {
+    SHA_256.digest_into(b"abc", &mut [0; 31]);
+}
+
+#[test]
+#[should_panic(expected = "INVALID_LENGTH")]
+fn hmac_digest_into_rejects_another_size() {
+    HMAC_SHA_512.digest_into(b"key", b"abc", &mut [0; 65]);
+}
+
 #[test]
 fn hash_properties() {
     for (_, name, algorithm) in HASHES {
