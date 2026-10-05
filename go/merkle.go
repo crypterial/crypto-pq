@@ -1,5 +1,7 @@
 package cryptopq
 
+import "bytes"
+
 const merkleCachedHeight = 15
 
 // A Merkle tree that keeps its nodes from height low = max(0, h - 15) upwards, plus every level of
@@ -8,22 +10,28 @@ const merkleCachedHeight = 15
 // leaf, which is rebuilt only when the leaf leaves the kept one: consecutive signatures rebuild it
 // once per 2^low leaves instead of once each. Memory stays below 2^16 + 2^(low+1) nodes, while
 // trees of height 15 or less never recompute a leaf. Nodes are n bytes; combine(z, j, ...) joins
-// two nodes of height z into node j of height z + 1.
+// two nodes of height z into node j of height z + 1. leaves counts the leaves the tree computed,
+// which tests read to see that a tree from a tree cache computes none.
 type merkleTree struct {
 	height, low, n int
 	levels         [][]byte
 	bottom         []byte
 	chunk          uint64
+	leaves         uint64
 	leaf           func(index uint64, out []byte)
 	combine        func(z int, j uint64, left, right, out []byte)
 }
 
-func newMerkleTree(height, n int, leaf func(uint64, []byte), combine func(int, uint64, []byte, []byte, []byte)) *merkleTree {
+func emptyMerkleTree(height, n int, leaf func(uint64, []byte), combine func(int, uint64, []byte, []byte, []byte)) *merkleTree {
 	low := max(0, height-merkleCachedHeight)
 
-	t := &merkleTree{height: height, low: low, n: n, bottom: make([]byte, (2<<low-1)*n), leaf: leaf, combine: combine}
+	return &merkleTree{height: height, low: low, n: n, bottom: make([]byte, (2<<low-1)*n), leaf: leaf, combine: combine}
+}
 
-	chunks := 1 << (height - low)
+func newMerkleTree(height, n int, leaf func(uint64, []byte), combine func(int, uint64, []byte, []byte, []byte)) *merkleTree {
+	t := emptyMerkleTree(height, n, leaf, combine)
+
+	chunks := 1 << (height - t.low)
 
 	nodes := make([]byte, chunks*n)
 
@@ -35,7 +43,7 @@ func newMerkleTree(height, n int, leaf func(uint64, []byte), combine func(int, u
 
 	t.levels = [][]byte{nodes}
 
-	for z := low; z < height; z++ {
+	for z := t.low; z < height; z++ {
 		above := make([]byte, len(nodes)/2)
 
 		t.parents(nodes, above, z, 0)
@@ -46,6 +54,61 @@ func newMerkleTree(height, n int, leaf func(uint64, []byte), combine func(int, u
 	}
 
 	return t
+}
+
+// The tree whose cached levels a tree cache holds: nodes are the levels from height low up, each
+// left to right. Every parent is recomputed from its children, so only the nodes at height low
+// are taken as given, and the tree keeps its own copy of them. The result is nil when the nodes
+// do not fill the levels or a parent differs from the one its children give.
+func restoreMerkleTree(height, n int, leaf func(uint64, []byte), combine func(int, uint64, []byte, []byte, []byte), nodes []byte) *merkleTree {
+	t := emptyMerkleTree(height, n, leaf, combine)
+
+	if len(nodes) != t.cachedNodes()*n {
+		return nil
+	}
+
+	// No chunk has this number, so the first path below low builds its subtree.
+	t.chunk = ^uint64(0)
+
+	nodes = bytes.Clone(nodes)
+
+	for z := t.low; z <= height; z++ {
+		size := n << (height - z)
+
+		t.levels = append(t.levels, nodes[:size:size])
+
+		nodes = nodes[size:]
+	}
+
+	parent := make([]byte, n)
+
+	for z := t.low; z < height; z++ {
+		children, above := t.levels[z-t.low], t.levels[z-t.low+1]
+
+		for j := range len(above) / n {
+			combine(z, uint64(j), children[2*j*n:(2*j+1)*n], children[(2*j+1)*n:(2*j+2)*n], parent)
+
+			if !bytes.Equal(parent, above[j*n:(j+1)*n]) {
+				return nil
+			}
+		}
+	}
+
+	return t
+}
+
+// How many nodes the cached levels hold: 2^(height - low + 1) - 1.
+func (t *merkleTree) cachedNodes() int {
+	return 2<<(t.height-t.low) - 1
+}
+
+// The cached levels as a tree cache lists them, from height low up, each left to right.
+func (t *merkleTree) appendNodes(out []byte) []byte {
+	for _, level := range t.levels {
+		out = append(out, level...)
+	}
+
+	return out
 }
 
 func (t *merkleTree) parents(nodes, out []byte, z int, offset uint64) {
@@ -72,6 +135,8 @@ func (t *merkleTree) build(chunk uint64) {
 	for i := range 1 << t.low {
 		t.leaf(base+uint64(i), level[i*n:(i+1)*n])
 	}
+
+	t.leaves += 1 << t.low
 
 	start := 0
 

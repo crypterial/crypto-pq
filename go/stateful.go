@@ -35,8 +35,14 @@ type StatefulKeyGenOptions struct {
 	Reserve    uint64
 }
 
+// TreeCache, the output of ExportTreeCache, replaces the build of the trees it holds; nil loads
+// without one. The state is read and checked first. A cache that is malformed, made for other
+// parameters or another key, or not authentic fails the load with INVALID_ENCODING, or with
+// ALGORITHM_MISMATCH when it belongs to another algorithm. Its trees that the stored index has
+// left are skipped and built again when needed.
 type StatefulLoadOptions struct {
-	Reserve uint64
+	Reserve   uint64
+	TreeCache []byte
 }
 
 type StatefulSignatureAlgorithm uint8
@@ -86,6 +92,7 @@ type statefulSigner interface {
 	sign(index uint64, message []byte) []byte
 	publicKey() []byte
 	capacity() uint64
+	cached() []heldTree
 	wipe()
 }
 
@@ -177,18 +184,47 @@ func (s statefulParameters) capacity() uint64 {
 	return 1 << height
 }
 
+// The parameters as the state blob and the tree cache encode them: the HSS level count and the
+// type codes of every level, or the XMSS OID.
+func (s statefulParameters) appendSection(out []byte) []byte {
+	if p := s.xmss; p != nil {
+		return binary.BigEndian.AppendUint32(out, p.oid)
+	}
+
+	out = append(out, byte(len(s.levels)))
+
+	for _, level := range s.levels {
+		out = binary.BigEndian.AppendUint32(out, level.lms.code)
+
+		out = binary.BigEndian.AppendUint32(out, level.ots.code)
+	}
+
+	return out
+}
+
 // Seeds are I || SEED of the top LMS tree, or SK_SEED || SK_PRF || PUB_SEED for XMSS. Building the
-// trees works on the seed, so it runs under PSTATE.DIT.
-func (s statefulParameters) signer(seed []byte) statefulSigner {
+// trees works on the seed, so it runs under PSTATE.DIT. cached holds, by level or layer, the trees
+// of an authentic tree cache that the next index signs with; the result is nil when one of them
+// does not hold together. A constructor's nil pointer goes back as a nil interface, which a nil
+// pointer inside the interface would not compare equal to.
+func (s statefulParameters) signer(seed []byte, cached []*cachedTree) statefulSigner {
 	defer ditLeave(ditEnter())
 
 	if p := s.xmss; p != nil {
 		n := p.n
 
-		return newXmssSigner(p, bytes.Clone(seed[:n]), bytes.Clone(seed[n:2*n]), bytes.Clone(seed[2*n:]))
+		if signer := newXmssSigner(p, bytes.Clone(seed[:n]), bytes.Clone(seed[n:2*n]), bytes.Clone(seed[2*n:]), cached); signer != nil {
+			return signer
+		}
+
+		return nil
 	}
 
-	return newHssSigner(s.levels, bytes.Clone(seed[:16]), bytes.Clone(seed[16:]))
+	if signer := newHssSigner(s.levels, bytes.Clone(seed[:16]), bytes.Clone(seed[16:]), cached); signer != nil {
+		return signer
+	}
+
+	return nil
 }
 
 // State blob: version, kind, the parameters, the secret seeds and the next index, closed by the
@@ -207,21 +243,13 @@ func (a StatefulSignatureAlgorithm) encode(parameters statefulParameters, seed [
 
 	body = append(body, stateVersion, a.spec().kind)
 
-	if p := parameters.xmss; p != nil {
-		body = binary.BigEndian.AppendUint32(body, p.oid)
+	body = parameters.appendSection(body)
 
+	if parameters.xmss != nil {
 		body = binary.BigEndian.AppendUint64(body, index)
 
 		body = append(body, seed...)
 	} else {
-		body = append(body, byte(len(parameters.levels)))
-
-		for _, level := range parameters.levels {
-			body = binary.BigEndian.AppendUint32(body, level.lms.code)
-
-			body = binary.BigEndian.AppendUint32(body, level.ots.code)
-		}
-
 		body = append(body, seed...)
 
 		body = binary.BigEndian.AppendUint64(body, index)
@@ -347,7 +375,7 @@ func writeState(store StateStore, previous, next []byte) (bool, error) {
 // The seed becomes part of the key. As in the Python reference, the trees are built before the
 // store is written. The new state holds index itself: the first signature claims the reserve.
 func (a StatefulSignatureAlgorithm) create(parameters statefulParameters, seed []byte, index uint64, store StateStore, reserve uint64) (*StatefulKeyPair, error) {
-	signer := parameters.signer(seed)
+	signer := parameters.signer(seed, nil)
 
 	created, err := writeState(store, nil, a.encode(parameters, seed, index))
 
@@ -369,10 +397,19 @@ func (a StatefulSignatureAlgorithm) create(parameters statefulParameters, seed [
 }
 
 // The key starts at the stored index, so indices that an earlier key reserved but did not use
-// are skipped.
+// are skipped. A tree cache replaces the build of the trees it holds, and the key loads only if
+// the cache passes every check.
 func (a StatefulSignatureAlgorithm) LoadPrivateKey(store StateStore, options *StatefulLoadOptions) (*StatefulPrivateKey, error) {
 	if store == nil {
 		return nil, invalidOption("a StateStore is required")
+	}
+
+	var reserve uint64
+
+	var cache []byte
+
+	if options != nil {
+		reserve, cache = options.Reserve, options.TreeCache
 	}
 
 	state, err := store.Read()
@@ -395,13 +432,43 @@ func (a StatefulSignatureAlgorithm) LoadPrivateKey(store StateStore, options *St
 		return nil, mismatch("the stored index is beyond the key's capacity")
 	}
 
-	var reserve uint64
+	signer, err := a.loadSigner(parameters, seed, index, cache)
 
-	if options != nil {
-		reserve = options.Reserve
+	if err != nil {
+		clear(seed)
+
+		return nil, err
 	}
 
-	return a.newPrivateKey(parameters, seed, parameters.signer(seed), store, index, reserve), nil
+	return a.newPrivateKey(parameters, seed, signer, store, index, reserve), nil
+}
+
+// The signer of a loaded key, built, or with the trees of a tree cache. The cache is copied first,
+// so that its checks and its use read the same bytes whatever the caller does with its slice.
+func (a StatefulSignatureAlgorithm) loadSigner(parameters statefulParameters, seed []byte, index uint64, cache []byte) (statefulSigner, error) {
+	if cache == nil {
+		return parameters.signer(seed, nil), nil
+	}
+
+	publicKey, cached, err := a.openTreeCache(parameters, seed, index, bytes.Clone(cache))
+
+	if err != nil {
+		return nil, err
+	}
+
+	signer := parameters.signer(seed, cached)
+
+	if signer == nil {
+		return nil, invalidEncoding("the tree cache holds a node that its children do not give")
+	}
+
+	if !bytes.Equal(signer.publicKey(), publicKey) {
+		signer.wipe()
+
+		return nil, invalidEncoding("the tree cache belongs to another key")
+	}
+
+	return signer, nil
 }
 
 func (s *statefulSpec) validPublicKey(key []byte) bool {
@@ -470,8 +537,9 @@ func (k *StatefulPublicKey) String() string {
 }
 
 // index is the next index to sign with and reserved the one the store holds, never below it.
-// signing is set while a Sign call runs, which alone reads and writes reserved and the signer's
-// caches; index is atomic so that RemainingSignatures needs no lock.
+// busy is set while a Sign call runs, which alone reads and writes reserved and the signer's
+// caches, or while ExportTreeCache reads those caches; index is atomic so that
+// RemainingSignatures needs no lock.
 type StatefulPrivateKey struct {
 	algorithm  StatefulSignatureAlgorithm
 	parameters statefulParameters
@@ -482,7 +550,7 @@ type StatefulPrivateKey struct {
 	reserve    uint64
 	reserved   uint64
 	index      atomic.Uint64
-	signing    atomic.Bool
+	busy       atomic.Bool
 }
 
 type statefulSecrets struct {
@@ -518,9 +586,9 @@ func (k *StatefulPrivateKey) RemainingSignatures() uint64 {
 	return capacity - min(k.index.Load(), capacity)
 }
 
-// A call made while another Sign on the same key runs, from another goroutine or from inside the
-// store's Update, fails at once with STATE_CONFLICT: waiting would deadlock the second case and
-// stall callers behind the rebuild of a large tree.
+// A call made while another Sign or an ExportTreeCache on the same key runs, from another
+// goroutine or from inside the store's Update, fails at once with STATE_CONFLICT: waiting would
+// deadlock the second case and stall callers behind the rebuild of a large tree.
 //
 // Before an index is used, the store holds a later one, so a crash or a failed write can waste
 // indices but never use one twice. When the claimed indices run out, one write replaces the
@@ -528,11 +596,11 @@ func (k *StatefulPrivateKey) RemainingSignatures() uint64 {
 func (k *StatefulPrivateKey) Sign(message []byte) ([]byte, error) {
 	defer runtime.KeepAlive(k)
 
-	if !k.signing.CompareAndSwap(false, true) {
+	if !k.busy.CompareAndSwap(false, true) {
 		return nil, newError(STATE_CONFLICT, "the key is signing in another call")
 	}
 
-	defer k.signing.Store(false)
+	defer k.busy.Store(false)
 
 	index, capacity := k.index.Load(), k.signer.capacity()
 
@@ -566,6 +634,36 @@ func (k *StatefulPrivateKey) signAt(index uint64, message []byte) []byte {
 	defer ditLeave(ditEnter())
 
 	return k.signer.sign(index, message)
+}
+
+// The trees that the key holds, for StatefulLoadOptions.TreeCache to skip their build. The cache
+// holds public nodes, tagged with a key derived from the seed: it needs no secrecy, and a load
+// refuses it once changed. A call made while a Sign on the same key runs, from another goroutine
+// or from inside the store's Update, fails at once with STATE_CONFLICT, as the trees are changing.
+// The body is copied while no Sign can run and tagged after, so that hashing megabytes does not
+// hold off signatures.
+func (k *StatefulPrivateKey) ExportTreeCache() ([]byte, error) {
+	defer runtime.KeepAlive(k)
+
+	body, err := k.treeCacheBody()
+
+	if err != nil {
+		return nil, err
+	}
+
+	tag := treeCacheTag(k.seed, body)
+
+	return append(body, tag[:]...), nil
+}
+
+func (k *StatefulPrivateKey) treeCacheBody() ([]byte, error) {
+	if !k.busy.CompareAndSwap(false, true) {
+		return nil, newError(STATE_CONFLICT, "the key is signing in another call")
+	}
+
+	defer k.busy.Store(false)
+
+	return k.algorithm.treeCacheBody(k.parameters, k.signer), nil
 }
 
 // Formatting shows only the algorithm, never key material.

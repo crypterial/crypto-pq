@@ -438,6 +438,69 @@ func crossStatefulKeys(t *testing.T, name string) {
 	}
 }
 
+// Each export is made again, and every cache loads, or fails to, as the reference decided; a key
+// that loads signs as the reference did.
+func TestCrossTreeCache(t *testing.T) {
+	t.Parallel()
+
+	for _, r := range records(t, "cross/treecache.txt", "treeCache") {
+		t.Run(r.header["algorithm"]+"/"+r.values["name"], func(t *testing.T) {
+			t.Parallel()
+
+			algorithm, _ := crossStatefulAlgorithm(r.header["algorithm"])
+
+			context := algorithm.Name() + ": " + r.values["name"]
+
+			// An empty cache is a cache that fails, where nil would load without one.
+			state, cache := crossField(t, r.values, "state"), append([]byte{}, crossField(t, r.values, "treeCache")...)
+
+			if r.values["operation"] == "export" {
+				index, err := strconv.ParseUint(r.values["index"], 10, 64)
+
+				check(t, err)
+
+				options := crossOptions(r.values)
+
+				pair, err := cryptopq.Hazmat.GenerateStatefulKeyPair(algorithm, options, crossField(t, r.values, "seed"), index)
+
+				check(t, err)
+
+				if r.values["signed"] == "true" {
+					sign(t, pair.PrivateKey, crossField(t, r.values, "message"))
+				}
+
+				exported, err := pair.PrivateKey.ExportTreeCache()
+
+				check(t, err)
+
+				same(t, exported, cache, context)
+
+				same(t, options.StateStore.(*memoryStore).state, state, context)
+			}
+
+			key, err := algorithm.LoadPrivateKey(&memoryStore{state: state}, &cryptopq.StatefulLoadOptions{TreeCache: cache})
+
+			if outcome := crossFinished(nil, err); outcome.result != r.values["result"] {
+				t.Fatalf("%s: got %s, want %s", context, outcome.result, r.values["result"])
+			}
+
+			if err != nil {
+				return
+			}
+
+			same(t, export(t, key.PublicKey(), cryptopq.RAW), crossField(t, r.values, "publicKey"), context)
+
+			if remaining := strconv.FormatUint(key.RemainingSignatures(), 10); remaining != r.values["remaining"] {
+				t.Fatalf("%s: %s signatures remain, want %s", context, remaining, r.values["remaining"])
+			}
+
+			if r.values["signature"] != "" {
+				same(t, sign(t, key, crossField(t, r.values, "message")), crossField(t, r.values, "signature"), context)
+			}
+		})
+	}
+}
+
 // The result of one error-table record: "ok", "true", "false" or an error code, with the output
 // and the remaining signatures it produced.
 type crossOutcome struct {

@@ -727,6 +727,90 @@ func fuzzLoad(t *testing.T, algorithm StatefulSignatureAlgorithm, state []byte) 
 	}
 }
 
+// A key with a tree on every level, the state it stored and its tree cache; signature is what the
+// key signs next, which a key loaded with any cache that passes must sign too.
+type fuzzCacheFixture struct {
+	algorithm                     StatefulSignatureAlgorithm
+	seed, state, cache, signature []byte
+}
+
+var fuzzCacheMessage = []byte("crypto-pq fuzz")
+
+func newFuzzCacheFixture(algorithm StatefulSignatureAlgorithm, options StatefulKeyGenOptions, seed []byte, index uint64) fuzzCacheFixture {
+	store := &fuzzStore{}
+
+	options.StateStore = store
+
+	pair, err := Hazmat.GenerateStatefulKeyPair(algorithm, &options, seed, index)
+
+	fuzzPanic(err)
+
+	_, err = pair.PrivateKey.Sign(fuzzCacheMessage)
+
+	fuzzPanic(err)
+
+	cache, err := pair.PrivateKey.ExportTreeCache()
+
+	fuzzPanic(err)
+
+	state := bytes.Clone(store.state)
+
+	signature, err := pair.PrivateKey.Sign(fuzzCacheMessage)
+
+	fuzzPanic(err)
+
+	return fuzzCacheFixture{algorithm, seed, state, cache, signature}
+}
+
+func FuzzTreeCache(f *testing.F) {
+	levels := []HssLevel{{"LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W4"}, {"LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W2"}}
+
+	fixtures := []fuzzCacheFixture{
+		newFuzzCacheFixture(HSS_LMS, StatefulKeyGenOptions{Levels: levels}, fuzzPattern(40, 0), 40),
+		newFuzzCacheFixture(XMSS_MT, StatefulKeyGenOptions{Parameters: "XMSSMT-SHAKE256_20/4_192"}, fuzzPattern(72, 0), 0x12345),
+	}
+
+	for i, fixture := range fixtures {
+		f.Add(fixture.cache, uint8(i), uint8(0))
+
+		f.Add(fixture.cache, uint8(i), uint8(1))
+
+		f.Add(fixtures[1-i].cache, uint8(i), uint8(1))
+	}
+
+	// mode 1 tags the input again with the fixture's seed, as only the holder of the seed could,
+	// so that changes reach the checks after the tag.
+	f.Fuzz(func(t *testing.T, data []byte, selector, mode uint8) {
+		fixture := fixtures[int(selector)%len(fixtures)]
+
+		if mode&1 == 1 && len(data) >= treeCacheTagSize {
+			body := data[:len(data)-treeCacheTagSize]
+
+			tag := treeCacheTag(fixture.seed, body)
+
+			data = append(bytes.Clone(body), tag[:]...)
+		}
+
+		fuzzBounded(t, len(data), func() {
+			key, err := fixture.algorithm.LoadPrivateKey(&fuzzStore{state: fixture.state}, &StatefulLoadOptions{TreeCache: data})
+
+			if err != nil {
+				fuzzExpect(t, err, INVALID_ENCODING, ALGORITHM_MISMATCH)
+
+				return
+			}
+
+			signature, err := key.Sign(fuzzCacheMessage)
+
+			fuzzCheck(t, err)
+
+			if !bytes.Equal(signature, fixture.signature) {
+				t.Fatal("a key loaded with an accepted cache signs differently")
+			}
+		})
+	})
+}
+
 func FuzzStatefulVerify(f *testing.F) {
 	store := &fuzzStore{}
 

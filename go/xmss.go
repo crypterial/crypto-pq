@@ -720,7 +720,9 @@ func (x *xmssHasher) leaf(out []byte, layer uint32, tree uint64, index uint32, v
 	x.ltree(out, values, &ltree)
 }
 
-func (x *xmssHasher) subtree(layer uint32, tree uint64) *merkleTree {
+// Tree number tree of a layer, built, or restored from nodes, its cached levels in a tree cache;
+// a restored tree is nil when those do not hold together.
+func (x *xmssHasher) subtree(layer uint32, tree uint64, nodes []byte) *merkleTree {
 	values := make([]byte, x.p.wotsLength()*x.p.n)
 
 	leaf := func(index uint64, out []byte) {
@@ -737,7 +739,11 @@ func (x *xmssHasher) subtree(layer uint32, tree uint64) *merkleTree {
 		x.randHash(out, left, right, &adrs)
 	}
 
-	return newMerkleTree(x.p.treeHeight(), x.p.n, leaf, combine)
+	if nodes == nil {
+		return newMerkleTree(x.p.treeHeight(), x.p.n, leaf, combine)
+	}
+
+	return restoreMerkleTree(x.p.treeHeight(), x.p.n, leaf, combine, nodes)
 }
 
 func (x *xmssHasher) computeRoot(node []byte, index uint32, auth []byte, layer uint32, tree uint64) {
@@ -866,8 +872,27 @@ type xmssSigner struct {
 	layers []*xmssLayer
 }
 
-func newXmssSigner(p *xmssParams, skSeed, skPrf, pubSeed []byte) *xmssSigner {
+// cached holds, by layer, the trees of an authentic tree cache that the next index signs with; they
+// replace the build, each checked against its own nodes, and the result is nil, with the secrets
+// wiped, when one does not hold together.
+func newXmssSigner(p *xmssParams, skSeed, skPrf, pubSeed []byte, cached []*cachedTree) *xmssSigner {
 	s := &xmssSigner{p: p, hasher: newXmssHasher(p, skSeed, pubSeed), skPrf: skPrf, layers: make([]*xmssLayer, p.d)}
+
+	for layer, tree := range cached {
+		if tree == nil {
+			continue
+		}
+
+		restored := s.hasher.subtree(uint32(layer), tree.number, tree.nodes)
+
+		if restored == nil {
+			s.wipe()
+
+			return nil
+		}
+
+		s.layers[layer] = &xmssLayer{index: tree.number, tree: restored}
+	}
 
 	s.root = s.layer(uint32(p.d-1), 0).tree.root()
 
@@ -880,12 +905,25 @@ func (s *xmssSigner) layer(layer uint32, index uint64) *xmssLayer {
 	cached := s.layers[layer]
 
 	if cached == nil || cached.index != index {
-		cached = &xmssLayer{index: index, tree: s.hasher.subtree(layer, index)}
+		cached = &xmssLayer{index: index, tree: s.hasher.subtree(layer, index, nil)}
 
 		s.layers[layer] = cached
 	}
 
 	return cached
+}
+
+// Every tree the signer holds, top layer first.
+func (s *xmssSigner) cached() []heldTree {
+	held := make([]heldTree, 0, len(s.layers))
+
+	for layer := len(s.layers) - 1; layer >= 0; layer-- {
+		if cached := s.layers[layer]; cached != nil {
+			held = append(held, heldTree{layer, cached.index, cached.tree})
+		}
+	}
+
+	return held
 }
 
 func (s *xmssSigner) publicKey() []byte {

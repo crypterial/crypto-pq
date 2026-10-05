@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [FuzzKemImport, FuzzDecapsulate, FuzzSignatureImport, FuzzVerify, FuzzLoadPrivateKey, FuzzStatefulVerify, FuzzStatefulImport, FuzzDer, FuzzPem, FuzzBase64]
+        target: [FuzzKemImport, FuzzDecapsulate, FuzzSignatureImport, FuzzVerify, FuzzLoadPrivateKey, FuzzStatefulVerify, FuzzStatefulImport, FuzzTreeCache, FuzzDer, FuzzPem, FuzzBase64]
     defaults:
       run:
         shell: bash

@@ -31,3 +31,14 @@ func KemCache(public *KemPublicKey, private *KemPrivateKey) (shared, expanded bo
 func SignatureCache(public *SignaturePublicKey, private *SignaturePrivateKey) (shared, expanded bool) {
 	return public.cache == private.cache, private.cache.a != nil
 }
+
+// The leaves that the trees a stateful key holds have computed.
+func LeavesComputed(key *StatefulPrivateKey) uint64 {
+	var total uint64
+
+	for _, held := range key.signer.cached() {
+		total += held.merkle.leaves
+	}
+
+	return total
+}

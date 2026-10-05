@@ -741,7 +741,9 @@ type lmsTree struct {
 	lanes     *lmsLanes
 }
 
-func newLmsTree(lms *lmsType, ots *lmotsType, i, seed []byte) *lmsTree {
+// The Merkle tree is built, or restored from nodes, its cached levels in a tree cache; a restored
+// tree is nil when those do not hold together.
+func newLmsTree(lms *lmsType, ots *lmotsType, i, seed, nodes []byte) *lmsTree {
 	t := &lmsTree{lms: lms, ots: ots, i: i, seed: seed, lanes: newLmsLanes(ots)}
 
 	scratch, ends := make([]byte, 22+ots.p*ots.n), lmotsEnds(ots)
@@ -768,7 +770,11 @@ func newLmsTree(lms *lmsType, ots *lmotsType, i, seed []byte) *lmsTree {
 		lmsDigest(lms.shake, lms.m, out, data[:22+2*lms.m])
 	}
 
-	t.merkle = newMerkleTree(lms.h, lms.m, leaf, combine)
+	if nodes == nil {
+		t.merkle = newMerkleTree(lms.h, lms.m, leaf, combine)
+	} else if t.merkle = restoreMerkleTree(lms.h, lms.m, leaf, combine, nodes); t.merkle == nil {
+		return nil
+	}
 
 	t.lanes.wipe()
 
@@ -795,16 +801,24 @@ func (t *lmsTree) sign(q uint32, message []byte) []byte {
 	return signature
 }
 
+// The I and SEED of the child tree that leaf q signs, from the I and SEED of its parent, a tree of
+// type lms.
+func lmsChildKeys(lms *lmsType, i, seed []byte, q uint32) ([]byte, []byte) {
+	childSeed := make([]byte, lms.m)
+
+	lmsDerive(lms.shake, lms.m, i, q, lmsChildSeed, seed, childSeed)
+
+	childI := make([]byte, lms.m)
+
+	lmsDerive(lms.shake, lms.m, i, q, lmsChildI, seed, childI)
+
+	return childI[:16], childSeed
+}
+
 func (t *lmsTree) child(lms *lmsType, ots *lmotsType, q uint32) *lmsTree {
-	seed := make([]byte, t.lms.m)
+	i, seed := lmsChildKeys(t.lms, t.i, t.seed, q)
 
-	lmsDerive(t.lms.shake, t.lms.m, t.i, q, lmsChildSeed, t.seed, seed)
-
-	i := make([]byte, t.lms.m)
-
-	lmsDerive(t.lms.shake, t.lms.m, t.i, q, lmsChildI, t.seed, i)
-
-	return newLmsTree(lms, ots, i[:16], seed)
+	return newLmsTree(lms, ots, i, seed, nil)
 }
 
 type hssLevel struct {
@@ -812,19 +826,127 @@ type hssLevel struct {
 	ots *lmotsType
 }
 
+// A lower tree of a tree cache and its number on its level.
+type hssRestored struct {
+	prefix uint64
+	tree   *lmsTree
+}
+
 // The signing side of an HSS key: the trees on the path to the next leaf, rebuilt when the
-// index leaves a tree, and each child public key signed by its parent.
+// index leaves a tree, and each child public key signed by its parent. restored holds, by level,
+// the lower trees of a tree cache until the first signature needs them.
 type hssSigner struct {
 	levels   []hssLevel
 	trees    []*lmsTree
 	signed   [][]byte
 	prefixes []uint64
+	restored []hssRestored
 }
 
-func newHssSigner(levels []hssLevel, i, seed []byte) *hssSigner {
-	top := newLmsTree(levels[0].lms, levels[0].ots, i, seed)
+// cached holds, by level, the trees of an authentic tree cache that the next index signs with: the
+// top one replaces the build and the lower ones wait in restored. Each is checked against its own
+// nodes before the top tree is built, and the result is nil, with every seed wiped, when one does
+// not hold together.
+func newHssSigner(levels []hssLevel, i, seed []byte, cached []*cachedTree) *hssSigner {
+	s := &hssSigner{levels: levels, prefixes: []uint64{0}, restored: make([]hssRestored, len(levels))}
 
-	return &hssSigner{levels: levels, trees: []*lmsTree{top}, prefixes: []uint64{0}}
+	var nodes []byte
+
+	for level, tree := range cached {
+		switch {
+		case tree == nil:
+		case level == 0:
+			nodes = tree.nodes
+		default:
+			restored := s.pathTree(level, tree.number, i, seed, tree.nodes)
+
+			if restored == nil {
+				s.wipe()
+
+				clear(seed)
+
+				return nil
+			}
+
+			s.restored[level] = hssRestored{tree.number, restored}
+		}
+	}
+
+	top := newLmsTree(levels[0].lms, levels[0].ots, i, seed, nodes)
+
+	if top == nil {
+		s.wipe()
+
+		clear(seed)
+
+		return nil
+	}
+
+	s.trees = []*lmsTree{top}
+
+	return s
+}
+
+// Tree number prefix of a lower level, restored from nodes: the leaves that sign it on the levels
+// above follow from its number, and with them its I and SEED, derived from the top tree's i and
+// seed. Nil, with the SEED wiped, when the nodes do not hold together.
+func (s *hssSigner) pathTree(level int, prefix uint64, i, seed, nodes []byte) *lmsTree {
+	for upper := range level {
+		below := s.heightFrom(upper+1) - s.heightFrom(level)
+
+		q := uint32((prefix >> below) & (1<<s.levels[upper].lms.h - 1))
+
+		childI, childSeed := lmsChildKeys(s.levels[upper].lms, i, seed, q)
+
+		// The SEED of a tree between the top and this one served only this derivation.
+		if upper > 0 {
+			clear(seed)
+		}
+
+		i, seed = childI, childSeed
+	}
+
+	tree := newLmsTree(s.levels[level].lms, s.levels[level].ots, i, seed, nodes)
+
+	if tree == nil {
+		clear(seed)
+	}
+
+	return tree
+}
+
+// Every tree the signer holds, top first: those on the path of the last signature, then the
+// trees of a tree cache that wait for the first one.
+func (s *hssSigner) cached() []heldTree {
+	held := make([]heldTree, 0, len(s.levels))
+
+	for level, tree := range s.trees {
+		held = append(held, heldTree{level, s.prefixes[level], tree.merkle})
+	}
+
+	for level, waiting := range s.restored {
+		if waiting.tree != nil {
+			held = append(held, heldTree{level, waiting.prefix, waiting.tree.merkle})
+		}
+	}
+
+	return held
+}
+
+// The tree of a tree cache that waits on level, if it is tree prefix there; it waits no longer
+// either way.
+func (s *hssSigner) takeRestored(level int, prefix uint64) *lmsTree {
+	waiting := s.restored[level]
+
+	s.restored[level] = hssRestored{}
+
+	if waiting.tree != nil && waiting.prefix != prefix {
+		clear(waiting.tree.seed)
+
+		return nil
+	}
+
+	return waiting.tree
 }
 
 func (s *hssSigner) publicKey() []byte {
@@ -868,7 +990,11 @@ func (s *hssSigner) sign(index uint64, message []byte) []byte {
 
 		q := s.leafIndex(index, level-1)
 
-		tree := parent.child(s.levels[level].lms, s.levels[level].ots, q)
+		tree := s.takeRestored(level, prefix)
+
+		if tree == nil {
+			tree = parent.child(s.levels[level].lms, s.levels[level].ots, q)
+		}
 
 		s.trees = append(s.trees, tree)
 
@@ -891,5 +1017,11 @@ func (s *hssSigner) sign(index uint64, message []byte) []byte {
 func (s *hssSigner) wipe() {
 	for _, tree := range s.trees {
 		clear(tree.seed)
+	}
+
+	for _, waiting := range s.restored {
+		if waiting.tree != nil {
+			clear(waiting.tree.seed)
+		}
 	}
 }
