@@ -107,15 +107,17 @@ pub fn blocks512(state: *[8]u64, blocks: []const u8) void {
 }
 
 // The rounds on words of type u32, or u64 for SHA-512, or on vectors of them that carry
-// independent computations in their lanes: the SHA-2 instructions where the CPU has them, AVX2
-// for eight SHA-256 lanes otherwise, and the portable code below.
+// independent computations in their lanes: AVX2 for eight SHA-256 lanes on x86-64, the SHA-2
+// instructions otherwise where the CPU has them, and the portable code below. SHA-NI runs lanes
+// two streams at a time in legacy SSE encodings, which measured no faster than the portable code
+// on AMD and up to 289 times slower on Intel cores in builds that use AVX.
 pub fn rounds256(comptime W: type, state: *[8]W, words: *const [16]W) void {
-    if (comptime cpu.possible(.sha256)) {
-        if (cpu.has(.sha256)) return isa.sha256Rounds(W, state, words);
-    }
-
     if (comptime W == @Vector(8, u32) and cpu.possible(.avx2)) {
         if (cpu.has(.avx2)) return isa.sha256x8(state, words);
+    }
+
+    if (comptime cpu.possible(.sha256)) {
+        if (cpu.has(.sha256)) return isa.sha256Rounds(W, state, words);
     }
 
     portable.rounds256(W, state, words);
