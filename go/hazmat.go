@@ -10,6 +10,8 @@ type hazmat struct{}
 var Hazmat hazmat
 
 func (hazmat) GenerateKemKeyPair(algorithm KemAlgorithm, seed []byte) (*KemKeyPair, error) {
+	defer ditLeave(ditEnter())
+
 	spec := algorithm.spec()
 
 	if len(seed) != spec.seedSize {
@@ -22,6 +24,8 @@ func (hazmat) GenerateKemKeyPair(algorithm KemAlgorithm, seed []byte) (*KemKeyPa
 }
 
 func (hazmat) Encapsulate(publicKey *KemPublicKey, randomness []byte) (*Encapsulation, error) {
+	defer ditLeave(ditEnter())
+
 	spec := publicKey.algorithm.spec()
 
 	if len(randomness) != spec.randomnessSize {
@@ -33,6 +37,8 @@ func (hazmat) Encapsulate(publicKey *KemPublicKey, randomness []byte) (*Encapsul
 
 // The seed is xi for ML-DSA and SK.seed || SK.prf || PK.seed for SLH-DSA.
 func (hazmat) GenerateSignatureKeyPair(algorithm SignatureAlgorithm, seed []byte) (*SignatureKeyPair, error) {
+	defer ditLeave(ditEnter())
+
 	spec := algorithm.spec()
 
 	if len(seed) != spec.seedSize {
@@ -47,6 +53,8 @@ func (hazmat) GenerateSignatureKeyPair(algorithm SignatureAlgorithm, seed []byte
 // Signs with the given randomness (rnd for ML-DSA, opt_rand for SLH-DSA); Deterministic is
 // ignored.
 func (hazmat) Sign(privateKey *SignaturePrivateKey, message, randomness []byte, options *SignOptions) ([]byte, error) {
+	defer ditLeave(ditEnter())
+
 	spec := privateKey.algorithm.spec()
 
 	if len(randomness) != spec.randomnessSize {

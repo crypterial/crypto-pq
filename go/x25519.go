@@ -321,8 +321,8 @@ func feSwap(a, b *fieldElement, swap uint64) {
 }
 
 // RFC 7748, section 5: the Montgomery ladder on u-coordinates. The top bit of u is ignored and
-// non-canonical values are reduced, as the RFC requires.
-func x25519(scalar, u []byte) [32]byte {
+// non-canonical values are reduced, as the RFC requires. This is the portable form of x25519.
+func x25519Generic(scalar, u []byte) [32]byte {
 	var k [32]byte
 
 	copy(k[:], scalar)

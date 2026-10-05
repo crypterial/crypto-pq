@@ -3,6 +3,7 @@ package cryptopq
 import (
 	"encoding/binary"
 	"math/bits"
+	"slices"
 )
 
 // SLH-DSA (FIPS 205). Every tree and chain index is public, so the code branches on them freely.
@@ -99,29 +100,47 @@ func (a *slhAddress) retyped(kind int) slhAddress {
 
 // F, H, T and PRF bound to one public seed (FIPS 205, section 11). For SHA2 the block holding
 // PK.seed and its zero padding is compressed once and that state reused for every call; for SHAKE
-// PK.seed is kept as Keccak lanes.
+// PK.seed is kept as Keccak lanes. Where the CPU-specific kernels are fast, independent
+// computations of F go through lanes, batches they compute together: blocks and digests, and
+// whole chains as records, for SHA2, states for SHAKE.
 type slhContext struct {
-	p      *slhParams
-	pkSeed []byte
-	skSeed []byte
-	small  [8]uint32
-	large  [8]uint64
-	lanes  [4]uint64
-	values []byte
-	input  []byte
+	p         *slhParams
+	pkSeed    []byte
+	skSeed    []byte
+	small     [8]uint32
+	large     [8]uint64
+	seedLanes [4]uint64
+	values    []byte
+	input     []byte
+	blocks    []uint32
+	digests   []uint32
+	records   []uint32
+	states    [][25]uint64
+	active    []int
 }
+
+// The most F computations in one batch: the chains of a WOTS+ key, 2n + 3.
+const slhMaxLanes = 67
 
 func newSlhContext(p *slhParams, pkSeed, skSeed []byte) *slhContext {
 	size := max(p.wotsLength(), p.k) * p.n
 
-	c := &slhContext{p: p, pkSeed: pkSeed, skSeed: skSeed, values: make([]byte, size), input: make([]byte, 32+p.n+size)}
+	c := &slhContext{p: p, pkSeed: pkSeed, skSeed: skSeed, values: make([]byte, size), input: make([]byte, 32+p.n+size), active: make([]int, 0, slhMaxLanes)}
 
 	if p.shake {
+		if c.lanesFast() {
+			c.states = make([][25]uint64, slhMaxLanes)
+		}
+
 		for i := range p.n / 8 {
-			c.lanes[i] = binary.LittleEndian.Uint64(pkSeed[8*i:])
+			c.seedLanes[i] = binary.LittleEndian.Uint64(pkSeed[8*i:])
 		}
 
 		return c
+	}
+
+	if c.lanesFast() {
+		c.blocks, c.digests, c.records = make([]uint32, 16*slhMaxLanes), make([]uint32, 8*slhMaxLanes), make([]uint32, chainRecord*slhMaxLanes)
 	}
 
 	var block [128]byte
@@ -139,18 +158,30 @@ func newSlhContext(p *slhParams, pkSeed, skSeed []byte) *slhContext {
 	return c
 }
 
-// F, H and PRF hash ADRS with a message of n or 2n bytes, which always fits in a single block, so
-// these functions assemble that block directly: for SHAKE, PK.seed || ADRS || M fills whole lanes;
-// for SHA2, ADRSc || M (FIPS 205, section 11.2) follows the precomputed PK.seed block, and the
-// 22-byte ADRSc puts M two bytes into a word.
-func (c *slhContext) shakeShort(out []byte, adrs *slhAddress, message []byte) {
-	var s [25]uint64
+// Clears what may hold secret chain values: a signature reveals some of them, but not those below
+// the revealed ones.
+func (c *slhContext) wipe() {
+	clear(c.values)
 
+	clear(c.input)
+
+	clear(c.blocks)
+
+	clear(c.digests)
+
+	clear(c.records)
+
+	clear(c.states)
+}
+
+// F, H and PRF hash ADRS with a message of n or 2n bytes, which always fits in a single block, so
+// these functions assemble that block directly: for SHAKE, PK.seed || ADRS || M fills whole lanes,
+// each written once, padding and zeros included; for SHA2, ADRSc || M (FIPS 205, section 11.2)
+// follows the precomputed PK.seed block, and the 22-byte ADRSc puts M two bytes into a word.
+func (c *slhContext) shakeState(s *[25]uint64, adrs *slhAddress, message []byte) {
 	k := c.p.n / 8
 
-	for i, lane := range c.lanes[:k] {
-		s[i] = lane
-	}
+	copy(s[:k], c.seedLanes[:k])
 
 	for i := range 4 {
 		s[k+i] = uint64(bits.ReverseBytes32(adrs[2*i])) | uint64(bits.ReverseBytes32(adrs[2*i+1]))<<32
@@ -162,9 +193,19 @@ func (c *slhContext) shakeShort(out []byte, adrs *slhAddress, message []byte) {
 		s[k+i] = binary.LittleEndian.Uint64(message[8*i:])
 	}
 
-	s[k+len(message)/8] = 0x1f
+	k += len(message) / 8
+
+	s[k] = 0x1f
+
+	clear(s[k+1:])
 
 	s[16] ^= 0x80 << 56
+}
+
+func (c *slhContext) shakeShort(out []byte, adrs *slhAddress, message []byte) {
+	var s [25]uint64
+
+	c.shakeState(&s, adrs, message)
 
 	permute(&s)
 
@@ -173,10 +214,10 @@ func (c *slhContext) shakeShort(out []byte, adrs *slhAddress, message []byte) {
 	}
 }
 
-func (c *slhContext) sha256Short(out []byte, adrs *slhAddress, message []byte) {
-	a, m := adrs, len(message)
+func sha256Message(w *[16]uint32, a *slhAddress, message []byte) {
+	m := len(message)
 
-	var w [16]uint32
+	*w = [16]uint32{}
 
 	w[0], w[1], w[2] = a[0]<<24|a[2]>>8, a[2]<<24|a[3]>>8, a[3]<<24|a[4]<<16|a[5]>>16
 
@@ -189,8 +230,16 @@ func (c *slhContext) sha256Short(out []byte, adrs *slhAddress, message []byte) {
 	w[5+m/4] = uint32(message[m-2])<<24 | uint32(message[m-1])<<16 | 0x8000
 
 	w[15] = uint32(64+22+m) * 8
+}
 
-	s := sha256Block(c.small, w)
+func (c *slhContext) sha256Short(out []byte, adrs *slhAddress, message []byte) {
+	var w [16]uint32
+
+	sha256Message(&w, adrs, message)
+
+	s := c.small
+
+	sha256Block(&s, &w)
 
 	for i := range c.p.n / 4 {
 		binary.BigEndian.PutUint32(out[4*i:], s[i])
@@ -219,7 +268,9 @@ func (c *slhContext) sha512Short(out []byte, adrs *slhAddress, message []byte) {
 
 	w[15] = uint64(128+22+m) * 8
 
-	s := sha512Block(c.large, w)
+	s := c.large
+
+	sha512Block(&s, &w)
 
 	for i := range c.p.n / 8 {
 		binary.BigEndian.PutUint64(out[8*i:], s[i])
@@ -247,6 +298,37 @@ func (c *slhContext) h(out []byte, adrs *slhAddress, message []byte) {
 
 func (c *slhContext) prf(out []byte, adrs *slhAddress) {
 	c.f(out, adrs, c.skSeed)
+}
+
+// Lane k of the next batch: F of ADRS and an n-byte message.
+func (c *slhContext) setLane(k int, adrs *slhAddress, message []byte) {
+	if c.p.shake {
+		c.shakeState(&c.states[k], adrs, message)
+	} else {
+		sha256Message((*[16]uint32)(c.blocks[16*k:16*k+16]), adrs, message)
+	}
+}
+
+// Computes the first count lanes.
+func (c *slhContext) runLanes(count int) {
+	if c.p.shake {
+		permuteLanes(c.states[:count])
+	} else {
+		sha256Lanes(&c.small, c.blocks[:16*count], 1, c.digests[:8*count])
+	}
+}
+
+// The n-byte result of lane k.
+func (c *slhContext) laneResult(k int, out []byte) {
+	if c.p.shake {
+		for i := range c.p.n / 8 {
+			binary.LittleEndian.PutUint64(out[8*i:], c.states[k][i])
+		}
+	} else {
+		for i := range c.p.n / 4 {
+			binary.BigEndian.PutUint32(out[4*i:], c.digests[8*k+i])
+		}
+	}
 }
 
 // T_l over a message of many blocks, with SHA-512 for SHA2 when n > 16.
@@ -282,11 +364,142 @@ func (c *slhContext) t(out []byte, adrs *slhAddress, message []byte) {
 	}
 }
 
-func (c *slhContext) chain(x []byte, start, steps int, adrs *slhAddress) {
-	for j := start; j < start+steps; j++ {
-		adrs.setHash(uint32(j))
+// Advances chain i of a WOTS+ key from step starts[i] to ends[i] on its value, values[n i:n (i +
+// 1)], with adrs the key's WOTS_HASH address (FIPS 205, Algorithm 5). Where the lane kernels are
+// fast, every SHA2 chain is a lane of sha256Chains, which runs whole chains, and the SHAKE chains go
+// in lockstep, so that those taking a step form one batch of independent permutations; otherwise
+// the chains run one after another. The steps depend on the message digest, which the signature
+// reveals.
+func (c *slhContext) chains(values []byte, starts, ends []uint32, adrs *slhAddress) {
+	n := c.p.n
 
-		c.f(x, adrs, x)
+	if !c.lanesFast() {
+		for i := range starts {
+			adrs.setChain(uint32(i))
+
+			for step := starts[i]; step < ends[i]; step++ {
+				adrs.setHash(step)
+
+				c.f(values[i*n:(i+1)*n], adrs, values[i*n:(i+1)*n])
+			}
+		}
+
+		return
+	}
+
+	if !c.p.shake {
+		c.sha2Chains(values, starts, ends, adrs)
+
+		return
+	}
+
+	for step := slices.Min(starts); step < slices.Max(ends); step++ {
+		active := c.active[:0]
+
+		for i := range starts {
+			if starts[i] <= step && step < ends[i] {
+				adrs.setChain(uint32(i))
+
+				adrs.setHash(step)
+
+				c.setLane(len(active), adrs, values[i*n:(i+1)*n])
+
+				active = append(active, i)
+			}
+		}
+
+		c.runLanes(len(active))
+
+		for k, i := range active {
+			c.laneResult(k, values[i*n:(i+1)*n])
+		}
+	}
+}
+
+// A lane record per chain with steps to take, in the order of decreasing step count, so that the
+// chains the kernel pairs take about as many steps. A record's template is the block of F with the
+// chain's address, hash address 0 and a zero message; the kernel ORs in the step and the value.
+func (c *slhContext) sha2Chains(values []byte, starts, ends []uint32, adrs *slhAddress) {
+	n := c.p.n
+
+	order := c.active[:0]
+
+	for i := range starts {
+		if ends[i] > starts[i] {
+			order = append(order, i)
+		}
+	}
+
+	slices.SortStableFunc(order, func(x, y int) int {
+		return int(ends[y]-starts[y]) - int(ends[x]-starts[x])
+	})
+
+	records := c.records[:chainRecord*len(order)]
+
+	var zero [32]byte
+
+	for r, i := range order {
+		record := records[chainRecord*r : chainRecord*(r+1)]
+
+		adrs.setChain(uint32(i))
+
+		adrs.setHash(0)
+
+		sha256Message((*[16]uint32)(record[:16]), adrs, zero[:n])
+
+		clear(record[16:])
+
+		for k := range n / 4 {
+			record[16+k] = binary.BigEndian.Uint32(values[i*n+4*k:])
+		}
+
+		record[24], record[25] = starts[i], ends[i]-starts[i]
+	}
+
+	sha256Chains(&c.small, records, n/4, 16)
+
+	for r, i := range order {
+		for k := range n / 4 {
+			binary.BigEndian.PutUint32(values[i*n+4*k:], records[chainRecord*r+16+k])
+		}
+	}
+}
+
+// Whether the lane kernels beat computing F one call at a time.
+func (c *slhContext) lanesFast() bool {
+	if c.p.shake {
+		return permuteLanesFast()
+	}
+
+	return sha256LanesFast()
+}
+
+// The secret chain starts of a WOTS+ key, PRF(PK.seed, SK.seed, ADRS) of every chain, in one batch.
+func (c *slhContext) wotsSecrets(values []byte, adrs *slhAddress) {
+	n, length := c.p.n, c.p.wotsLength()
+
+	secret := adrs.retyped(slhWotsPRF)
+
+	if !c.lanesFast() {
+		for i := range length {
+			secret.setChain(uint32(i))
+
+			c.prf(values[i*n:(i+1)*n], &secret)
+		}
+
+		return
+	}
+
+	for i := range length {
+		secret.setChain(uint32(i))
+
+		c.setLane(i, &secret, c.skSeed)
+	}
+
+	c.runLanes(length)
+
+	for i := range length {
+		c.laneResult(i, values[i*n:(i+1)*n])
 	}
 }
 
@@ -334,48 +547,39 @@ func (c *slhContext) wotsPublic(out []byte, adrs *slhAddress, values []byte) {
 	c.t(out, &public, values)
 }
 
+var (
+	wotsNoSteps  [slhMaxLanes]uint32
+	wotsAllSteps = func() (steps [slhMaxLanes]uint32) {
+		for i := range steps {
+			steps[i] = 15
+		}
+
+		return steps
+	}()
+)
+
 func (c *slhContext) wotsPublicKey(out []byte, adrs *slhAddress) {
 	n, length := c.p.n, c.p.wotsLength()
 
-	secret := adrs.retyped(slhWotsPRF)
-
 	values := c.values[:length*n]
 
-	for i := range length {
-		value := values[i*n : (i+1)*n]
+	c.wotsSecrets(values, adrs)
 
-		secret.setChain(uint32(i))
-
-		c.prf(value, &secret)
-
-		adrs.setChain(uint32(i))
-
-		c.chain(value, 0, 15, adrs)
-	}
+	c.chains(values, wotsNoSteps[:length], wotsAllSteps[:length], adrs)
 
 	c.wotsPublic(out, adrs, values)
 }
 
 func (c *slhContext) wotsSign(out, message []byte, adrs *slhAddress) {
-	n := c.p.n
+	length := c.p.wotsLength()
 
 	var digits [67]uint32
 
-	c.wotsDigits(digits[:c.p.wotsLength()], message)
+	c.wotsDigits(digits[:length], message)
 
-	secret := adrs.retyped(slhWotsPRF)
+	c.wotsSecrets(out[:length*c.p.n], adrs)
 
-	for i, digit := range digits[:c.p.wotsLength()] {
-		value := out[i*n : (i+1)*n]
-
-		secret.setChain(uint32(i))
-
-		c.prf(value, &secret)
-
-		adrs.setChain(uint32(i))
-
-		c.chain(value, 0, int(digit), adrs)
-	}
+	c.chains(out[:length*c.p.n], wotsNoSteps[:length], digits[:length], adrs)
 }
 
 func (c *slhContext) wotsPublicKeyFromSignature(out, signature, message []byte, adrs *slhAddress) {
@@ -389,11 +593,7 @@ func (c *slhContext) wotsPublicKeyFromSignature(out, signature, message []byte, 
 
 	copy(values, signature[:length*n])
 
-	for i, digit := range digits[:length] {
-		adrs.setChain(uint32(i))
-
-		c.chain(values[i*n:(i+1)*n], int(digit), 15-int(digit), adrs)
-	}
+	c.chains(values, digits[:length], wotsAllSteps[:length], adrs)
 
 	c.wotsPublic(out, adrs, values)
 }
@@ -647,7 +847,11 @@ func slhRoot(p *slhParams, skSeed, pkSeed []byte) []byte {
 
 	root := make([]byte, p.n)
 
-	newSlhContext(p, pkSeed, skSeed).xmssNode(root, 0, p.hp, &adrs)
+	c := newSlhContext(p, pkSeed, skSeed)
+
+	c.xmssNode(root, 0, p.hp, &adrs)
+
+	c.wipe()
 
 	return root
 }
@@ -792,6 +996,8 @@ func slhSign(p *slhParams, message, sk, optRand []byte) []byte {
 	c.forsPublicKeyFromSignature(forsPublicKey[:n], signature[n:forsEnd], md, &adrs)
 
 	c.htSign(signature[forsEnd:], forsPublicKey[:n], tree, leaf)
+
+	c.wipe()
 
 	return signature
 }

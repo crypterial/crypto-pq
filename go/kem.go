@@ -91,6 +91,8 @@ type Encapsulation struct {
 }
 
 func (a KemAlgorithm) GenerateKeyPair(options *KeyGenOptions) (*KemKeyPair, error) {
+	defer ditLeave(ditEnter())
+
 	seed, err := randomBytes(a.spec().seedSize)
 
 	if err != nil {
@@ -187,6 +189,8 @@ func (a KemAlgorithm) ImportPublicKey(data []byte, format KeyFormat) (*KemPublic
 }
 
 func (a KemAlgorithm) ImportPrivateKey(data []byte, format KeyFormat) (*KemPrivateKey, error) {
+	defer ditLeave(ditEnter())
+
 	spec := a.spec()
 
 	raw, octets, publicKey, err := importPrivate(format, data, spec.oid)
@@ -260,6 +264,8 @@ func (k *KemPublicKey) Algorithm() KemAlgorithm {
 }
 
 func (k *KemPublicKey) Encapsulate() (*Encapsulation, error) {
+	defer ditLeave(ditEnter())
+
 	randomness, err := randomBytes(k.algorithm.spec().randomnessSize)
 
 	if err != nil {
@@ -346,6 +352,8 @@ func (k *KemPrivateKey) PublicKey() *KemPublicKey {
 }
 
 func (k *KemPrivateKey) Decapsulate(ciphertext []byte) ([]byte, error) {
+	defer ditLeave(ditEnter())
+
 	defer runtime.KeepAlive(k)
 
 	spec := k.algorithm.spec()
@@ -362,6 +370,8 @@ func (k *KemPrivateKey) Decapsulate(ciphertext []byte) ([]byte, error) {
 }
 
 func (k *KemPrivateKey) ExportKey(format KeyFormat) ([]byte, error) {
+	defer ditLeave(ditEnter())
+
 	defer runtime.KeepAlive(k)
 
 	return exportSeedChoice(format, k.algorithm.spec().oid, k.seed, k.dk)

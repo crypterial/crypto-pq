@@ -124,8 +124,8 @@ func kemSub(a, b uint16) uint16 {
 // NTT (FIPS 203, Algorithm 9) of canonical coefficients. A butterfly adds less than 2q to its
 // outputs, so after seven layers they stay below 15q < 2^16 and one reduction at the end suffices.
 // The layers go in pairs over groups of four coefficients held in locals, which halves the memory
-// traffic; the last layer also reduces.
-func kemNTT(f *kemPoly) {
+// traffic; the last layer also reduces. This is the portable form of kemNTT.
+func kemNTTGeneric(f *kemPoly) {
 	for length := 128; length >= 8; length /= 4 {
 		half := length / 2
 
@@ -171,9 +171,9 @@ func kemNTT(f *kemPoly) {
 var kemLastZeta = kemReduce(uint32(kemZetas[1]) * 3303)
 
 // Inverse NTT (FIPS 203, Algorithm 10) of canonical coefficients, which every butterfly keeps below
-// 2q. As in kemNTT the layers after the first go in pairs; the last pair also applies the factor
-// 1/128 and reduces.
-func kemInverseNTT(f *kemPoly) {
+// 2q. As in kemNTTGeneric the layers after the first go in pairs; the last pair also applies the
+// factor 1/128 and reduces. This is the portable form of kemInverseNTT.
+func kemInverseNTTGeneric(f *kemPoly) {
 	for k := range 64 {
 		g := (*[4]uint16)(f[4*k : 4*k+4])
 
@@ -372,7 +372,7 @@ func kemSampleCBD(f *kemPoly, data []byte, eta int) {
 	}
 }
 
-// PRF_eta(s, b) followed by SamplePolyCBD_eta.
+// PRF_eta(s, b) followed by SamplePolyCBD_eta, one sponge at a time.
 func kemNoise(f *kemPoly, seed []byte, nonce byte, eta int) {
 	var data [192]byte
 
@@ -383,9 +383,7 @@ func kemNoise(f *kemPoly, seed []byte, nonce byte, eta int) {
 	clear(data[:])
 }
 
-// SampleNTT (FIPS 203, Algorithm 7): rejection sampling over public data. Each candidate is stored
-// and then kept or overwritten by advancing the count or not, which avoids a hard-to-predict branch;
-// the slot after the last one absorbs a candidate beyond the 256th.
+// SampleNTT (FIPS 203, Algorithm 7) of one entry, as kemSampleNTTs does many.
 func kemSampleNTT(f *kemPoly, rho []byte, j, i byte) {
 	sponge := keccak{rate: 168, suffix: 0x1f}
 
@@ -420,6 +418,120 @@ func kemSampleNTT(f *kemPoly, rho []byte, j, i byte) {
 	copy(f[:], accepted[:256])
 }
 
+// PRF_eta(s, b) followed by SamplePolyCBD_eta for the nonces b = first, first + 1, ..., one per
+// polynomial, in one batch of sponges where the lane kernels are fast.
+func kemNoises(polys []*kemPoly, seed []byte, first byte, eta int) {
+	if !permuteLanesFast() {
+		for l, f := range polys {
+			kemNoise(f, seed, first+byte(l), eta)
+		}
+
+		return
+	}
+
+	var nonces [keccakMaxLanes]uint16
+
+	for l := range polys {
+		nonces[l] = uint16(first) + uint16(l)
+	}
+
+	var sponges keccakLanes
+
+	sponges.start(136, seed, nonces[:len(polys)], 1)
+
+	var data [keccakMaxLanes][272]byte
+
+	for offset := 0; offset < 64*eta; offset += 136 {
+		sponges.squeeze()
+
+		for l := range polys {
+			sponges.read(l, data[l][offset:])
+		}
+	}
+
+	for l, f := range polys {
+		kemSampleCBD(f, data[l][:64*eta], eta)
+	}
+
+	clear(data[:])
+
+	sponges.wipe()
+}
+
+// The most matrix entries sampled together: a row of ML-KEM-1024.
+const kemRowLanes = 4
+
+// SampleNTT (FIPS 203, Algorithm 7) of rho || j || i for the entries (j, i) given as j + 256 i, all
+// at once where the lane kernels are fast: rejection sampling over public data. Each candidate is
+// stored and then kept or overwritten by advancing the count or not, which avoids a hard-to-predict
+// branch; the slot after the last one absorbs a candidate beyond the 256th.
+func kemSampleNTTs(polys []*kemPoly, rho []byte, positions []uint16) {
+	if !permuteLanesFast() {
+		for l, f := range polys {
+			kemSampleNTT(f, rho, byte(positions[l]), byte(positions[l]>>8))
+		}
+
+		return
+	}
+
+	var sponges keccakLanes
+
+	sponges.start(168, rho, positions, 2)
+
+	var block [168]byte
+
+	var accepted [kemRowLanes][257]uint16
+
+	var counts [kemRowLanes]int
+
+	for remaining := len(polys); remaining > 0; {
+		sponges.squeeze()
+
+		for l, f := range polys {
+			count := counts[l]
+
+			if count >= 256 {
+				continue
+			}
+
+			sponges.read(l, block[:])
+
+			for rest := block[:]; len(rest) >= 3 && count < 256; rest = rest[3:] {
+				d1 := uint32(rest[0]) | uint32(rest[1]&0x0f)<<8
+
+				d2 := uint32(rest[1]>>4) | uint32(rest[2])<<4
+
+				accepted[l][count] = uint16(d1)
+
+				count += int((d1 - kemQ) >> 31)
+
+				accepted[l][count] = uint16(d2)
+
+				count += int((d2 - kemQ) >> 31)
+			}
+
+			counts[l] = count
+
+			if count >= 256 {
+				copy(f[:], accepted[l][:256])
+
+				remaining--
+			}
+		}
+	}
+}
+
+// Row i of the matrix: A[i][j] = SampleNTT(rho || j || i) for every j.
+func kemSampleRow(row []*kemPoly, rho []byte, i int) {
+	var positions [kemRowLanes]uint16
+
+	for j := range row {
+		positions[j] = uint16(j) | uint16(i)<<8
+	}
+
+	kemSampleNTTs(row, rho, positions[:len(row)])
+}
+
 // K-PKE.KeyGen (FIPS 203, Algorithm 13). Each entry A[i][j] = SampleNTT(rho || j || i) is folded into
 // t as soon as it is sampled, so the matrix is never stored.
 func kpkeKeyGen(p *mlkemParams, d, ek, dkPKE []byte) {
@@ -435,21 +547,25 @@ func kpkeKeyGen(p *mlkemParams, d, ek, dkPKE []byte) {
 
 	var e [4]kemPoly
 
-	for n := range k {
-		kemNoise(&s[n].f, sigma, byte(n), p.eta1)
+	noise := make([]*kemPoly, 2*k, 8)
 
+	for n := range k {
+		noise[n], noise[k+n] = &s[n].f, &e[n]
+	}
+
+	kemNoises(noise, sigma, 0, p.eta1)
+
+	for n := range k {
 		kemNTT(&s[n].f)
 
 		s[n].prepare()
-	}
-
-	for n := range k {
-		kemNoise(&e[n], sigma, byte(k+n), p.eta1)
 
 		kemNTT(&e[n])
 	}
 
-	var a kemPoly
+	var a [4]kemPoly
+
+	row := []*kemPoly{&a[0], &a[1], &a[2], &a[3]}[:k]
 
 	var acc [256]uint32
 
@@ -458,15 +574,15 @@ func kpkeKeyGen(p *mlkemParams, d, ek, dkPKE []byte) {
 			acc[x] = uint32(c)
 		}
 
-		for j := range k {
-			kemSampleNTT(&a, rho, byte(j), byte(i))
+		kemSampleRow(row, rho, i)
 
-			kemMultiplyAdd(&acc, &s[j], &a)
+		for j := range k {
+			kemMultiplyAdd(&acc, &s[j], &a[j])
 		}
 
-		kemReduceAll(&a, &acc)
+		kemReduceAll(&a[0], &acc)
 
-		kemEncode12(ek[384*i:], &a)
+		kemEncode12(ek[384*i:], &a[0])
 	}
 
 	copy(ek[384*k:], rho)
@@ -480,6 +596,8 @@ func kpkeKeyGen(p *mlkemParams, d, ek, dkPKE []byte) {
 	clear(s[:])
 
 	clear(e[:])
+
+	clear(a[:])
 }
 
 // What encapsulation derives from an encapsulation key, kept by the key: H(ek), set when the key is
@@ -510,10 +628,16 @@ func (c *mlkemPublic) expand(p *mlkemParams, ek []byte) *mlkemPublic {
 
 		c.a, c.t = factors[:k*k], factors[k*k:]
 
+		var row [kemRowLanes]*kemPoly
+
 		for i := range k {
 			for j := range k {
-				kemSampleNTT(&c.a[i*k+j].f, ek[384*k:], byte(j), byte(i))
+				row[j] = &c.a[i*k+j].f
+			}
 
+			kemSampleRow(row[:k], ek[384*k:], i)
+
+			for j := range k {
 				c.a[i*k+j].prepare()
 			}
 
@@ -556,13 +680,19 @@ func kpkeEncrypt(p *mlkemParams, key *mlkemPublic, m, r, c []byte) {
 
 	var y [4]kemPoly
 
-	var e, u kemPoly
+	var e [5]kemPoly
+
+	var u kemPoly
 
 	var acc [256]uint32
 
-	for n := range k {
-		kemNoise(&y[n], r, byte(n), p.eta1)
+	noise := []*kemPoly{&y[0], &y[1], &y[2], &y[3], &e[0], &e[1], &e[2], &e[3], &e[4]}
 
+	kemNoises(noise[:k], r, 0, p.eta1)
+
+	kemNoises(noise[4:5+k], r, byte(k), p.eta2)
+
+	for n := range k {
 		kemNTT(&y[n])
 	}
 
@@ -577,10 +707,8 @@ func kpkeEncrypt(p *mlkemParams, key *mlkemPublic, m, r, c []byte) {
 
 		kemInverseNTT(&u)
 
-		kemNoise(&e, r, byte(k+i), p.eta2)
-
 		for x := range u {
-			u[x] = kemCompress(kemAdd(u[x], e[x]), du)
+			u[x] = kemCompress(kemAdd(u[x], e[i][x]), du)
 		}
 
 		packBits(c[32*du*i:], u[:], du)
@@ -596,14 +724,12 @@ func kpkeEncrypt(p *mlkemParams, key *mlkemPublic, m, r, c []byte) {
 
 	kemInverseNTT(&u)
 
-	kemNoise(&e, r, byte(2*k), p.eta2)
-
 	var mu kemPoly
 
 	unpackBits(mu[:], m, 1)
 
 	for x := range u {
-		u[x] = kemCompress(kemAdd(kemAdd(u[x], e[x]), kemDecompress(mu[x], 1)), dv)
+		u[x] = kemCompress(kemAdd(kemAdd(u[x], e[k][x]), kemDecompress(mu[x], 1)), dv)
 	}
 
 	packBits(c[32*du*k:], u[:], dv)

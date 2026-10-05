@@ -177,8 +177,11 @@ func (s statefulParameters) capacity() uint64 {
 	return 1 << height
 }
 
-// Seeds are I || SEED of the top LMS tree, or SK_SEED || SK_PRF || PUB_SEED for XMSS.
+// Seeds are I || SEED of the top LMS tree, or SK_SEED || SK_PRF || PUB_SEED for XMSS. Building the
+// trees works on the seed, so it runs under PSTATE.DIT.
 func (s statefulParameters) signer(seed []byte) statefulSigner {
+	defer ditLeave(ditEnter())
+
 	if p := s.xmss; p != nil {
 		n := p.n
 
@@ -195,7 +198,11 @@ func (s statefulParameters) signer(seed []byte) statefulSigner {
 //
 //	HSS:     01 01 L {u32 lms u32 ots}*L I SEED u64(index) checksum
 //	XMSS:    01 02 u32(oid) u64(index) SK_SEED SK_PRF PUB_SEED checksum (XMSS^MT: kind 03)
+//
+// The checksum covers the seeds, so encoding and decoding run under PSTATE.DIT.
 func (a StatefulSignatureAlgorithm) encode(parameters statefulParameters, seed []byte, index uint64) []byte {
+	defer ditLeave(ditEnter())
+
 	body := make([]byte, 0, 2+1+8*len(parameters.levels)+4+len(seed)+8+16)
 
 	body = append(body, stateVersion, a.spec().kind)
@@ -228,6 +235,8 @@ func (a StatefulSignatureAlgorithm) encode(parameters statefulParameters, seed [
 }
 
 func (a StatefulSignatureAlgorithm) decode(state []byte) (statefulParameters, []byte, uint64, error) {
+	defer ditLeave(ditEnter())
+
 	var none statefulParameters
 
 	if len(state) < 18 {
@@ -549,7 +558,14 @@ func (k *StatefulPrivateKey) Sign(message []byte) ([]byte, error) {
 
 	k.index.Store(index + 1)
 
-	return k.signer.sign(index, message), nil
+	return k.signAt(index, message), nil
+}
+
+// The signature itself runs under PSTATE.DIT, which the calls to the store, user code, stay out of.
+func (k *StatefulPrivateKey) signAt(index uint64, message []byte) []byte {
+	defer ditLeave(ditEnter())
+
+	return k.signer.sign(index, message)
 }
 
 // Formatting shows only the algorithm, never key material.

@@ -18,8 +18,9 @@ var roundConstants = [24]uint64{
 // is a{x + 5y}; rho and pi move it to y + 5((2x + 3y) mod 5), so each output plane of chi comes from
 // five input lanes, which are combined just before the plane is written. The lanes are locals, and
 // the compiler decides which to spill: with them in arrays instead, which needs fewer instructions,
-// the speed came to depend on where the arrays sat in memory, by up to a fifth on arm64.
-func permute(s *[25]uint64) {
+// the speed came to depend on where the arrays sat in memory, by up to a fifth on arm64. This is
+// the portable form of permute.
+func permuteGeneric(s *[25]uint64) {
 	a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24 := s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24]
 
 	var e0, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17, e18, e19, e20, e21, e22, e23, e24 uint64
@@ -75,6 +76,74 @@ func permute(s *[25]uint64) {
 	}
 
 	s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24] = a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24
+}
+
+// The portable form of permuteLanes.
+func permuteLanesGeneric(states [][25]uint64) {
+	for i := range states {
+		permuteGeneric(&states[i])
+	}
+}
+
+// The most sponges keccakLanes runs together: the 2k noise samples of ML-KEM-1024 key generation,
+// a group of ML-DSA secret vectors.
+const keccakMaxLanes = 8
+
+// SHAKE sponges of one rate in lockstep, for independent outputs whose inputs fit in one block, so
+// that every permutation is a batch of the lane kernels. Sponge l absorbs prefix || tail_l, tail_l
+// being tails[l] as tailBytes little-endian bytes; squeeze then permutes every sponge, after which
+// read gives each one's next block. When the outputs are secret the caller calls wipe.
+type keccakLanes struct {
+	states [keccakMaxLanes][25]uint64
+	count  int
+	rate   int
+}
+
+func (k *keccakLanes) start(rate int, prefix []byte, tails []uint16, tailBytes int) {
+	k.count, k.rate = len(tails), rate
+
+	var block [200]byte
+
+	copy(block[:], prefix)
+
+	end := len(prefix) + tailBytes
+
+	block[end] = 0x1f
+
+	block[rate-1] ^= 0x80
+
+	for l, tail := range tails {
+		block[len(prefix)] = byte(tail)
+
+		if tailBytes == 2 {
+			block[len(prefix)+1] = byte(tail >> 8)
+		}
+
+		s := &k.states[l]
+
+		*s = [25]uint64{}
+
+		for i := range rate / 8 {
+			s[i] = binary.LittleEndian.Uint64(block[8*i:])
+		}
+	}
+
+	clear(block[:])
+}
+
+func (k *keccakLanes) squeeze() {
+	permuteLanes(k.states[:k.count])
+}
+
+// The rate bytes that sponge l outputs next, into out.
+func (k *keccakLanes) read(l int, out []byte) {
+	for i, lane := range k.states[l][:k.rate/8] {
+		binary.LittleEndian.PutUint64(out[8*i:], lane)
+	}
+}
+
+func (k *keccakLanes) wipe() {
+	clear(k.states[:])
 }
 
 type keccak struct {

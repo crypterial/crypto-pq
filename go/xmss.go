@@ -2,6 +2,7 @@ package cryptopq
 
 import (
 	"encoding/binary"
+	"slices"
 	"strconv"
 )
 
@@ -140,10 +141,20 @@ type xmssHasher struct {
 	skSeed, pubSeed       []byte
 	prfState, keygenState [8]uint32
 	midstates             bool
+	blocks, digests       []uint32
+	current               [][8]uint32
 }
+
+// The batched midstate form hands its hashes to the lane kernels: up to two PRF outputs for each
+// of the 67 chains of a WOTS+ key, a lane having up to three blocks of 16 words.
+const xmssMaxLanes = 2 * 67
 
 func newXmssHasher(p *xmssParams, skSeed, pubSeed []byte) *xmssHasher {
 	x := &xmssHasher{p: p, skSeed: skSeed, pubSeed: pubSeed, midstates: !p.shake && p.n == 32}
+
+	if x.batched() {
+		x.blocks, x.digests, x.current = make([]uint32, 16*xmssMaxLanes), make([]uint32, 8*xmssMaxLanes), make([][8]uint32, 67)
+	}
 
 	if x.midstates {
 		var block [64]byte
@@ -231,11 +242,16 @@ func (x *xmssHasher) prfWords(adrs *xmssAddress) [8]uint32 {
 
 	w[8], w[15] = 0x80000000, 96*8
 
-	return sha256Block(x.prfState, w)
+	state := x.prfState
+
+	sha256Block(&state, &w)
+
+	return state
 }
 
 // With the midstates, a chain stays in words: F(KEY, M) = SHA-256(toByte(0, 32) || KEY || M) is a
-// block of 32 zero bytes and KEY, then a block of M and the padding.
+// block of 32 zero bytes and KEY, then a block of M and the padding. This is the form for CPUs
+// without fast lanes; chains batches the chains otherwise.
 func (x *xmssHasher) chainWords(value []byte, start, steps int, adrs *xmssAddress) {
 	var current, mask [8]uint32
 
@@ -262,7 +278,11 @@ func (x *xmssHasher) chainWords(value []byte, start, steps int, adrs *xmssAddres
 			messageBlock[i] = current[i] ^ mask[i]
 		}
 
-		current = sha256Block(sha256Block(iv256, keyBlock), messageBlock)
+		current = iv256
+
+		sha256Block(&current, &keyBlock)
+
+		sha256Block(&current, &messageBlock)
 	}
 
 	for i, word := range current {
@@ -276,6 +296,7 @@ func (x *xmssHasher) chainWords(value []byte, start, steps int, adrs *xmssAddres
 	clear(messageBlock[:])
 }
 
+// One chain at a time: F(KEY, M) with KEY and the mask from PRF.
 func (x *xmssHasher) chain(value []byte, start, steps int, adrs *xmssAddress) {
 	if x.midstates {
 		x.chainWords(value, start, steps, adrs)
@@ -341,40 +362,182 @@ func (x *xmssHasher) wotsSecret(out []byte, adrs *xmssAddress, i int) {
 	x.prfKeygen(out, adrs)
 }
 
-func (x *xmssHasher) wotsPublic(values []byte, adrs *xmssAddress) {
+// The secret chain starts of a WOTS+ key, one after another in values; in the batched form one
+// batch of PRF_keygen, whose input PUB_SEED || ADRS fills a block after the SK_SEED midstate.
+func (x *xmssHasher) wotsSecrets(values []byte, adrs *xmssAddress) {
+	n, length := x.p.n, x.p.wotsLength()
+
+	if !x.batched() {
+		for i := range length {
+			x.wotsSecret(values[i*n:(i+1)*n], adrs, i)
+		}
+
+		return
+	}
+
+	blocks := x.blocks[:32*length]
+
+	for i := range length {
+		w := blocks[32*i : 32*i+32]
+
+		for k := range 8 {
+			w[k] = binary.BigEndian.Uint32(x.pubSeed[4*k:])
+		}
+
+		adrs[5], adrs[6], adrs[7] = uint32(i), 0, 0
+
+		copy(w[8:16], adrs[:])
+
+		clear(w[16:])
+
+		w[16], w[31] = 0x80000000, 128*8
+	}
+
+	sha256Lanes(&x.keygenState, blocks, 2, x.digests[:8*length])
+
+	for i := range length {
+		for k := range 8 {
+			binary.BigEndian.PutUint32(values[32*i+4*k:], x.digests[8*i+k])
+		}
+	}
+}
+
+// Advances chain i of a WOTS+ key from step starts[i] to ends[i] on its value at values[n i:], with
+// adrs the key's OTS address. In the batched form the chains go in lockstep and a step is two
+// batches: PRF of the key and the mask of every chain taking it, then F, two blocks from the IV.
+// The steps follow from the message digest, which the signature reveals.
+func (x *xmssHasher) chains(values []byte, starts, ends []int, adrs *xmssAddress) {
 	n := x.p.n
 
-	for i := range x.p.wotsLength() {
-		value := values[i*n : (i+1)*n]
+	if !x.batched() {
+		for i := range starts {
+			adrs[5] = uint32(i)
 
-		x.wotsSecret(value, adrs, i)
+			x.chain(values[i*n:(i+1)*n], starts[i], ends[i]-starts[i], adrs)
+		}
 
-		x.chain(value, 0, 15, adrs)
+		return
 	}
+
+	current := x.current[:len(starts)]
+
+	for i := range current {
+		for k := range 8 {
+			current[i][k] = binary.BigEndian.Uint32(values[32*i+4*k:])
+		}
+	}
+
+	var active [67]int
+
+	for step := slices.Min(starts); step < slices.Max(ends); step++ {
+		m := 0
+
+		for i := range starts {
+			if starts[i] <= step && step < ends[i] {
+				active[m] = i
+
+				m++
+			}
+		}
+
+		blocks := x.blocks[:32*m]
+
+		for a, i := range active[:m] {
+			adrs[5], adrs[6] = uint32(i), uint32(step)
+
+			for b := range 2 {
+				w := blocks[16*(2*a+b) : 16*(2*a+b)+16]
+
+				adrs[7] = uint32(b)
+
+				copy(w[:8], adrs[:])
+
+				clear(w[8:])
+
+				w[8], w[15] = 0x80000000, 96*8
+			}
+		}
+
+		sha256Lanes(&x.prfState, blocks, 1, x.digests[:16*m])
+
+		for a, i := range active[:m] {
+			w := blocks[32*a : 32*a+32]
+
+			clear(w[:8])
+
+			copy(w[8:16], x.digests[16*a:16*a+8])
+
+			for k := range 8 {
+				w[16+k] = current[i][k] ^ x.digests[16*a+8+k]
+			}
+
+			clear(w[24:])
+
+			w[24], w[31] = 0x80000000, 96*8
+		}
+
+		sha256Lanes(&iv256, blocks, 2, x.digests[:8*m])
+
+		for a, i := range active[:m] {
+			current[i] = [8]uint32(x.digests[8*a : 8*a+8])
+		}
+	}
+
+	for i := range current {
+		for k := range 8 {
+			binary.BigEndian.PutUint32(values[32*i+4*k:], current[i][k])
+		}
+	}
+}
+
+// Whether the hashes go through the lane kernels: in the midstate form, on CPUs where those beat
+// hashing one block at a time.
+func (x *xmssHasher) batched() bool {
+	return x.midstates && sha256LanesFast()
+}
+
+// Clears the lane buffers, which hold secret chain values while a key signs or builds a tree.
+func (x *xmssHasher) wipeLanes() {
+	clear(x.blocks)
+
+	clear(x.digests)
+
+	clear(x.current)
+}
+
+var (
+	xmssNoSteps  [67]int
+	xmssAllSteps = func() (steps [67]int) {
+		for i := range steps {
+			steps[i] = 15
+		}
+
+		return steps
+	}()
+)
+
+func (x *xmssHasher) wotsPublic(values []byte, adrs *xmssAddress) {
+	length := x.p.wotsLength()
+
+	x.wotsSecrets(values, adrs)
+
+	x.chains(values, xmssNoSteps[:length], xmssAllSteps[:length], adrs)
 }
 
 func (x *xmssHasher) wotsSign(out, message []byte, adrs *xmssAddress) {
-	n := x.p.n
+	length := x.p.wotsLength()
 
-	for i, digit := range x.wotsDigits(message) {
-		value := out[i*n : (i+1)*n]
+	values := out[:length*x.p.n]
 
-		x.wotsSecret(value, adrs, i)
+	x.wotsSecrets(values, adrs)
 
-		x.chain(value, 0, digit, adrs)
-	}
+	x.chains(values, xmssNoSteps[:length], x.wotsDigits(message), adrs)
 }
 
 func (x *xmssHasher) wotsPublicFromSignature(values, signature, message []byte, adrs *xmssAddress) {
-	n := x.p.n
-
 	copy(values, signature[:len(values)])
 
-	for i, digit := range x.wotsDigits(message) {
-		adrs[5] = uint32(i)
-
-		x.chain(values[i*n:(i+1)*n], digit, 15-digit, adrs)
-	}
+	x.chains(values, x.wotsDigits(message), xmssAllSteps[:x.p.wotsLength()], adrs)
 }
 
 // RAND_HASH (RFC 8391, Algorithm 7). out may alias either input.
@@ -412,8 +575,8 @@ func (x *xmssHasher) randHash(out, left, right []byte, adrs *xmssAddress) {
 	x.digest(out, xmssH, key[:n], masks[:2*n])
 }
 
-// H(KEY, M) = SHA-256(toByte(1, 32) || KEY || M) for the midstate case, as in chainWords: a block
-// of the prefix and KEY, a block of the two masked nodes, and a block of padding.
+// H(KEY, M) = SHA-256(toByte(1, 32) || KEY || M) for the midstate case, as in randHashLevel: a
+// block of the prefix and KEY, a block of the two masked nodes, and a block of padding.
 func (x *xmssHasher) randHashWords(out, left, right []byte, adrs *xmssAddress) {
 	adrs[7] = 0
 
@@ -433,18 +596,78 @@ func (x *xmssHasher) randHashWords(out, left, right []byte, adrs *xmssAddress) {
 
 	copy(w[8:], key[:])
 
-	state := sha256Block(iv256, w)
+	state := iv256
+
+	sha256Block(&state, &w)
 
 	for i := range 8 {
 		w[i], w[8+i] = binary.BigEndian.Uint32(left[4*i:])^leftMask[i], binary.BigEndian.Uint32(right[4*i:])^rightMask[i]
 	}
 
-	state = sha256Block(state, w)
+	sha256Block(&state, &w)
 
-	state = sha256Block(state, [16]uint32{0x80000000, 15: 128 * 8})
+	w = [16]uint32{0x80000000, 15: 128 * 8}
+
+	sha256Block(&state, &w)
 
 	for i, word := range state {
 		binary.BigEndian.PutUint32(out[4*i:], word)
+	}
+}
+
+// The nodes of one L-tree level at once in the batched form: out[i] = RAND_HASH(values[2i],
+// values[2i + 1]) for i < half, with the three PRF outputs of every node in one batch and H, three
+// blocks from the IV, in another. The inputs are read into the batches before any output is
+// written, so out may alias values.
+func (x *xmssHasher) randHashLevel(out, values []byte, half int, adrs *xmssAddress) {
+	blocks := x.blocks[:48*half]
+
+	for i := range half {
+		adrs[6] = uint32(i)
+
+		for b := range 3 {
+			w := blocks[16*(3*i+b) : 16*(3*i+b)+16]
+
+			adrs[7] = uint32(b)
+
+			copy(w[:8], adrs[:])
+
+			clear(w[8:])
+
+			w[8], w[15] = 0x80000000, 96*8
+		}
+	}
+
+	sha256Lanes(&x.prfState, blocks, 1, x.digests[:24*half])
+
+	for i := range half {
+		w := blocks[48*i : 48*i+48]
+
+		key, masks := x.digests[24*i:24*i+8], x.digests[24*i+8:24*i+24]
+
+		clear(w[:7])
+
+		w[7] = xmssH
+
+		copy(w[8:16], key)
+
+		for k := range 8 {
+			w[16+k] = binary.BigEndian.Uint32(values[64*i+4*k:]) ^ masks[k]
+
+			w[24+k] = binary.BigEndian.Uint32(values[64*i+32+4*k:]) ^ masks[8+k]
+		}
+
+		clear(w[32:])
+
+		w[32], w[47] = 0x80000000, 128*8
+	}
+
+	sha256Lanes(&iv256, blocks, 3, x.digests[:8*half])
+
+	for i := range half {
+		for k := range 8 {
+			binary.BigEndian.PutUint32(out[32*i+4*k:], x.digests[8*i+k])
+		}
 	}
 }
 
@@ -459,10 +682,14 @@ func (x *xmssHasher) ltree(out, values []byte, adrs *xmssAddress) {
 	for count > 1 {
 		half := count / 2
 
-		for i := range half {
-			adrs[6] = uint32(i)
+		if x.batched() {
+			x.randHashLevel(values, values, half, adrs)
+		} else {
+			for i := range half {
+				adrs[6] = uint32(i)
 
-			x.randHash(values[i*n:(i+1)*n], values[2*i*n:(2*i+1)*n], values[(2*i+1)*n:(2*i+2)*n], adrs)
+				x.randHash(values[i*n:(i+1)*n], values[2*i*n:(2*i+1)*n], values[(2*i+1)*n:(2*i+2)*n], adrs)
+			}
 		}
 
 		if count%2 == 1 {
@@ -644,6 +871,8 @@ func newXmssSigner(p *xmssParams, skSeed, skPrf, pubSeed []byte) *xmssSigner {
 
 	s.root = s.layer(uint32(p.d-1), 0).tree.root()
 
+	s.hasher.wipeLanes()
+
 	return s
 }
 
@@ -719,6 +948,8 @@ func (s *xmssSigner) sign(index uint64, message []byte) []byte {
 
 		node = cached.tree.root()
 	}
+
+	s.hasher.wipeLanes()
 
 	return signature
 }

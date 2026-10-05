@@ -227,6 +227,8 @@ func (a HmacAlgorithm) DigestSize() int {
 }
 
 func (a HmacAlgorithm) Digest(key, data []byte) []byte {
+	defer ditLeave(ditEnter())
+
 	hmac := a.Create(key)
 
 	hmac.Update(data)
@@ -235,6 +237,8 @@ func (a HmacAlgorithm) Digest(key, data []byte) []byte {
 }
 
 func (a HmacAlgorithm) Create(key []byte) *Hmac {
+	defer ditLeave(ditEnter())
+
 	hash := a.spec().hash.spec()
 
 	pad := make([]byte, hash.blockSize)
@@ -276,6 +280,8 @@ func (a HmacAlgorithm) Create(key []byte) *Hmac {
 }
 
 func (a HmacAlgorithm) Verify(key, data, tag []byte) bool {
+	defer ditLeave(ditEnter())
+
 	hmac := a.Create(key)
 
 	hmac.Update(data)
@@ -293,10 +299,14 @@ type Hmac struct {
 }
 
 func (h *Hmac) Update(data []byte) {
+	defer ditLeave(ditEnter())
+
 	h.inner.update(data)
 }
 
 func (h *Hmac) Digest() []byte {
+	defer ditLeave(ditEnter())
+
 	outer := h.outer.clone()
 
 	outer.update(h.inner.digest())
@@ -305,5 +315,7 @@ func (h *Hmac) Digest() []byte {
 }
 
 func (h *Hmac) Verify(tag []byte) bool {
+	defer ditLeave(ditEnter())
+
 	return equal(h.Digest(), tag)
 }

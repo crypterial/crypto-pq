@@ -126,8 +126,8 @@ func dsaAtLeast(x uint32, bound uint32) uint32 {
 // NTT (FIPS 204, Algorithm 41) of canonical coefficients. A butterfly adds less than 2q to its
 // outputs, so after eight layers they stay below 17q and one reduction at the end suffices. The
 // layers go in pairs over groups of four coefficients held in locals, which halves the memory
-// traffic; the last pair also reduces.
-func dsaNTT(w *dsaPoly) {
+// traffic; the last pair also reduces. This is the portable form of dsaNTT.
+func dsaNTTGeneric(w *dsaPoly) {
 	for length := 128; length >= 8; length /= 4 {
 		half := length / 2
 
@@ -179,9 +179,9 @@ var dsaLastZeta = dsaMul(dsaZetas[1], 8347681)
 // Inverse NTT (FIPS 204, Algorithm 42) of canonical coefficients, with zeta (w[j + len] - w[j]) in
 // place of -zeta (w[j] - w[j + len]). The sums at most double per layer and stay below 256q < 2^32
 // without reduction, while the differences, offset by a multiple of q to stay positive, are
-// multiplied back below 2q. As in dsaNTT the layers go in pairs; the last pair also applies the
-// factor 1/256 and reduces.
-func dsaInverseNTT(w *dsaPoly) {
+// multiplied back below 2q. As in dsaNTTGeneric the layers go in pairs; the last pair also applies
+// the factor 1/256 and reduces. This is the portable form of dsaInverseNTT.
+func dsaInverseNTTGeneric(w *dsaPoly) {
 	for k := range 64 {
 		f := (*[4]uint32)(w[4*k : 4*k+4])
 
@@ -290,7 +290,10 @@ func dsaUnpack(w *dsaPoly, in []byte, b uint32, width int) {
 	}
 }
 
-// RejNTTPoly (FIPS 204, Algorithm 30) over public data.
+// The most entries sampled together: a row of the ML-DSA-87 matrix, and a group of secret vectors.
+const dsaRowLanes, dsaBoundedLanes = 8, 4
+
+// RejNTTPoly (FIPS 204, Algorithm 30) of one entry, as dsaSampleUniforms does many.
 func dsaSampleUniform(f *dsaPoly, rho []byte, s, r byte) {
 	sponge := keccak{rate: 168, suffix: 0x1f}
 
@@ -317,10 +320,7 @@ func dsaSampleUniform(f *dsaPoly, rho []byte, s, r byte) {
 	}
 }
 
-// RejBoundedPoly (FIPS 204, Algorithm 31). Each candidate is stored and then kept or overwritten by
-// advancing the count or not, so that no branch depends on a secret nibble; the kept value is
-// computed without division (half mod 5 by a multiply-shift). The slot after the last one absorbs a
-// candidate beyond the 256th.
+// RejBoundedPoly (FIPS 204, Algorithm 31) of one seed, as dsaSampleBoundeds does many.
 func dsaSampleBounded(f *dsaPoly, seed []byte, eta int) {
 	sponge := keccak{rate: 136, suffix: 0x1f}
 
@@ -371,45 +371,238 @@ func dsaSampleBounded(f *dsaPoly, seed []byte, eta int) {
 	clear(sponge.state[:])
 }
 
-// Entry r * l + s is A[r][s] = RejNTTPoly(rho || s || r).
-func dsaExpandA(a []dsaPoly, rho []byte, p *mldsaParams) {
-	for r := range p.k {
-		for s := range p.l {
-			dsaSampleUniform(&a[r*p.l+s], rho, byte(s), byte(r))
+// RejNTTPoly (FIPS 204, Algorithm 30) of rho || s || r for the entries (s, r) given as s + 256 r, all
+// at once where the lane kernels are fast, over public data.
+func dsaSampleUniforms(polys []*dsaPoly, rho []byte, positions []uint16) {
+	if !permuteLanesFast() {
+		for l, f := range polys {
+			dsaSampleUniform(f, rho, byte(positions[l]), byte(positions[l]>>8))
+		}
+
+		return
+	}
+
+	var sponges keccakLanes
+
+	sponges.start(168, rho, positions, 2)
+
+	var block [168]byte
+
+	var counts [dsaRowLanes]int
+
+	for remaining := len(polys); remaining > 0; {
+		sponges.squeeze()
+
+		for l, f := range polys {
+			count := counts[l]
+
+			if count >= 256 {
+				continue
+			}
+
+			sponges.read(l, block[:])
+
+			for rest := block[:]; len(rest) >= 3 && count < 256; rest = rest[3:] {
+				z := uint32(rest[0]) | uint32(rest[1])<<8 | uint32(rest[2]&0x7f)<<16
+
+				if z < dsaQ {
+					f[count] = z
+
+					count++
+				}
+			}
+
+			counts[l] = count
+
+			if count >= 256 {
+				remaining--
+			}
 		}
 	}
 }
 
-func dsaExpandS(s []dsaPoly, rhoPrime []byte, p *mldsaParams) {
-	var seed [66]byte
+// Row r of the matrix: A[r][s] = RejNTTPoly(rho || s || r) for every s.
+func dsaSampleRow(row []*dsaPoly, rho []byte, r int) {
+	var positions [dsaRowLanes]uint16
 
-	copy(seed[:], rhoPrime)
-
-	for r := range s {
-		binary.LittleEndian.PutUint16(seed[64:], uint16(r))
-
-		dsaSampleBounded(&s[r], seed[:], p.eta)
+	for s := range row {
+		positions[s] = uint16(s) | uint16(r)<<8
 	}
 
-	clear(seed[:])
+	dsaSampleUniforms(row, rho, positions[:len(row)])
 }
 
+// RejBoundedPoly (FIPS 204, Algorithm 31) of rho' || r for r = first, first + 1, ..., one per
+// polynomial, all at once where the lane kernels are fast. Each candidate is stored and then kept
+// or overwritten by advancing the count or not, so that no branch depends on a secret nibble; the
+// kept value is computed without division (half mod 5 by a multiply-shift). The slot after the last
+// one absorbs a candidate beyond the 256th.
+func dsaSampleBoundeds(polys []*dsaPoly, rhoPrime []byte, first, eta int) {
+	if !permuteLanesFast() {
+		var seed [66]byte
+
+		copy(seed[:], rhoPrime)
+
+		for l, f := range polys {
+			binary.LittleEndian.PutUint16(seed[64:], uint16(first+l))
+
+			dsaSampleBounded(f, seed[:], eta)
+		}
+
+		clear(seed[:])
+
+		return
+	}
+
+	var nonces [dsaBoundedLanes]uint16
+
+	for l := range polys {
+		nonces[l] = uint16(first + l)
+	}
+
+	var sponges keccakLanes
+
+	sponges.start(136, rhoPrime, nonces[:len(polys)], 2)
+
+	var block [136]byte
+
+	var accepted [dsaBoundedLanes][257]uint32
+
+	var counts [dsaBoundedLanes]int
+
+	for remaining := len(polys); remaining > 0; {
+		sponges.squeeze()
+
+		for l, f := range polys {
+			count := counts[l]
+
+			if count >= 256 {
+				continue
+			}
+
+			sponges.read(l, block[:])
+
+			for _, b := range block {
+				if count >= 256 {
+					break
+				}
+
+				low, high := uint32(b)&15, uint32(b)>>4
+
+				if eta == 2 {
+					accepted[l][count] = dsaFromSigned(2 - int32(low-5*((low*205)>>10)))
+
+					count += int((low - 15) >> 31)
+
+					accepted[l][count] = dsaFromSigned(2 - int32(high-5*((high*205)>>10)))
+
+					count += int((high - 15) >> 31)
+				} else {
+					accepted[l][count] = dsaFromSigned(4 - int32(low))
+
+					count += int((low - 9) >> 31)
+
+					accepted[l][count] = dsaFromSigned(4 - int32(high))
+
+					count += int((high - 9) >> 31)
+				}
+			}
+
+			counts[l] = count
+
+			if count >= 256 {
+				copy(f[:], accepted[l][:256])
+
+				remaining--
+			}
+		}
+	}
+
+	clear(block[:])
+
+	clear(accepted[:])
+
+	sponges.wipe()
+}
+
+// Entry r * l + s is A[r][s] = RejNTTPoly(rho || s || r).
+func dsaExpandA(a []dsaPoly, rho []byte, p *mldsaParams) {
+	var row [dsaRowLanes]*dsaPoly
+
+	for r := range p.k {
+		for s := range p.l {
+			row[s] = &a[r*p.l+s]
+		}
+
+		dsaSampleRow(row[:p.l], rho, r)
+	}
+}
+
+// Groups of four keep the sampling buffers of dsaSampleBoundeds small.
+func dsaExpandS(s []dsaPoly, rhoPrime []byte, p *mldsaParams) {
+	var group [dsaBoundedLanes]*dsaPoly
+
+	for first := 0; first < len(s); first += dsaBoundedLanes {
+		count := min(dsaBoundedLanes, len(s)-first)
+
+		for l := range count {
+			group[l] = &s[first+l]
+		}
+
+		dsaSampleBoundeds(group[:count], rhoPrime, first, p.eta)
+	}
+}
+
+// ExpandMask (FIPS 204, Algorithm 34): y[r] from SHAKE256(rho' || kappa + r), all at once where the
+// lane kernels are fast.
 func dsaExpandMask(y []dsaPoly, rhoPrime []byte, kappa int, p *mldsaParams) {
 	width := p.gamma1Bits()
 
-	var stream [640]byte
+	if !permuteLanesFast() {
+		var stream [640]byte
 
-	var nonce [2]byte
+		var nonce [2]byte
 
-	for r := range y {
-		binary.LittleEndian.PutUint16(nonce[:], uint16(kappa+r))
+		for r := range y {
+			binary.LittleEndian.PutUint16(nonce[:], uint16(kappa+r))
 
-		shake256Sum(stream[:32*width], rhoPrime, nonce[:])
+			shake256Sum(stream[:32*width], rhoPrime, nonce[:])
 
-		dsaUnpack(&y[r], stream[:], p.gamma1, width)
+			dsaUnpack(&y[r], stream[:], p.gamma1, width)
+		}
+
+		clear(stream[:])
+
+		return
 	}
 
-	clear(stream[:])
+	var nonces [dsaRowLanes]uint16
+
+	for r := range y {
+		nonces[r] = uint16(kappa + r)
+	}
+
+	var sponges keccakLanes
+
+	sponges.start(136, rhoPrime, nonces[:len(y)], 2)
+
+	var streams [dsaMaxL][680]byte
+
+	for offset := 0; offset < 32*width; offset += 136 {
+		sponges.squeeze()
+
+		for r := range y {
+			sponges.read(r, streams[r][offset:])
+		}
+	}
+
+	for r := range y {
+		dsaUnpack(&y[r], streams[r][:], p.gamma1, width)
+	}
+
+	clear(streams[:])
+
+	sponges.wipe()
 }
 
 // SampleInBall (FIPS 204, Algorithm 29) from the commitment hash, which the signature reveals.
@@ -504,19 +697,25 @@ func dsaUseHint(h, r, gamma2 uint32, m int32) uint32 {
 	}
 }
 
-// t = NTT^-1(A * NTT(s1)) + s2, with each entry of A sampled just before its product is added.
+// t = NTT^-1(A * NTT(s1)) + s2, with each row of A sampled just before its products are added.
 func dsaPublicT(t []dsaPoly, rho []byte, s1Hat, s2 []dsaPoly, p *mldsaParams) {
-	var a dsaPoly
+	var a [dsaMaxL]dsaPoly
+
+	var row [dsaMaxL]*dsaPoly
+
+	for j := range s1Hat {
+		row[j] = &a[j]
+	}
 
 	var acc [256]uint64
 
 	for i := range t {
 		clear(acc[:])
 
-		for j := range s1Hat {
-			dsaSampleUniform(&a, rho, byte(j), byte(i))
+		dsaSampleRow(row[:len(s1Hat)], rho, i)
 
-			dsaMultiplyAdd(&acc, &a, &s1Hat[j])
+		for j := range s1Hat {
+			dsaMultiplyAdd(&acc, &a[j], &s1Hat[j])
 		}
 
 		for x, sum := range acc {

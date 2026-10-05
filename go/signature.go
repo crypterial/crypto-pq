@@ -216,6 +216,8 @@ type VerifyOptions struct {
 }
 
 func (a SignatureAlgorithm) GenerateKeyPair(options *KeyGenOptions) (*SignatureKeyPair, error) {
+	defer ditLeave(ditEnter())
+
 	seed, err := randomBytes(a.spec().seedSize)
 
 	if err != nil {
@@ -308,6 +310,8 @@ func (a SignatureAlgorithm) ImportPublicKey(data []byte, format KeyFormat) (*Sig
 }
 
 func (a SignatureAlgorithm) ImportPrivateKey(data []byte, format KeyFormat) (*SignaturePrivateKey, error) {
+	defer ditLeave(ditEnter())
+
 	spec := a.spec()
 
 	raw, octets, publicKey, err := importPrivate(format, data, spec.oid)
@@ -482,6 +486,8 @@ func (k *SignaturePrivateKey) PublicKey() *SignaturePublicKey {
 
 // deterministic: ML-DSA signs with rnd = 32 zero bytes and SLH-DSA with opt_rand = PK.seed.
 func (k *SignaturePrivateKey) Sign(message []byte, options *SignOptions) ([]byte, error) {
+	defer ditLeave(ditEnter())
+
 	defer runtime.KeepAlive(k)
 
 	var opts SignOptions
@@ -543,6 +549,8 @@ func (k *SignaturePrivateKey) sign(message, randomness, context []byte, preHash 
 }
 
 func (k *SignaturePrivateKey) ExportKey(format KeyFormat) ([]byte, error) {
+	defer ditLeave(ditEnter())
+
 	defer runtime.KeepAlive(k)
 
 	spec := k.algorithm.spec()

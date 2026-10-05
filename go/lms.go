@@ -3,6 +3,7 @@ package cryptopq
 import (
 	"encoding/binary"
 	"math/bits"
+	"slices"
 	"strconv"
 )
 
@@ -179,7 +180,9 @@ func lmsSha256Short(i []byte, q uint32, index uint16, j byte, x, out []byte) {
 
 	w[15] = uint32(23+n) * 8
 
-	s := sha256Block(iv256, w)
+	s := iv256
+
+	sha256Block(&s, &w)
 
 	for k := range n / 4 {
 		binary.BigEndian.PutUint32(out[4*k:], s[k])
@@ -209,11 +212,251 @@ func lmsDerive(shake bool, n int, i []byte, q uint32, index uint16, seed, out []
 	clear(data[:])
 }
 
-// Iterates x = H(I || u32(q) || u16(j) || u8(k) || x) for k from start to end - 1.
-func lmotsChain(t *lmotsType, i []byte, q uint32, j uint16, start, end int, x []byte) {
-	if !t.shake {
+// The most LM-OTS hashes in one batch; a key has up to 265 chains, which go in groups.
+const lmsMaxLanes = 64
+
+// One-block hashes H(I || u32(q) || u16(index) || u8(j) || x) of n-byte x, the chain steps and
+// derivations of LM-OTS, batched for the lane kernels: SHA-256 blocks from the IV assembled as words,
+// or SHAKE256 states. Their values derive from a tree's SEED, so wipe clears them after use.
+type lmsLanes struct {
+	shake   bool
+	n       int
+	blocks  []uint32
+	digests []uint32
+	records []uint32
+	order   []int
+	states  [][25]uint64
+}
+
+// The buffers exist only where the lane kernels are fast; for SHA-256, records holds one
+// sha256Chains lane per chain of a key of type t.
+func newLmsLanes(t *lmotsType) *lmsLanes {
+	l := &lmsLanes{shake: t.shake, n: t.n}
+
+	switch {
+	case !l.fast():
+	case t.shake:
+		l.states = make([][25]uint64, lmsMaxLanes)
+	default:
+		l.blocks, l.digests = make([]uint32, 16*lmsMaxLanes), make([]uint32, 8*lmsMaxLanes)
+
+		l.records, l.order = make([]uint32, chainRecord*t.p), make([]int, 0, t.p)
+	}
+
+	return l
+}
+
+// The 23 + n bytes fit in one block, with the padding of SHA-256 or of SHAKE256 after them.
+func (l *lmsLanes) set(k int, i []byte, q uint32, index uint16, j byte, x []byte) {
+	n := l.n
+
+	if l.shake {
+		var data [136]byte
+
+		lmsPrefix(data[:], i, q, index)
+
+		data[22] = j
+
+		copy(data[23:], x[:n])
+
+		data[23+n] = 0x1f
+
+		data[135] ^= 0x80
+
+		s := &l.states[k]
+
+		*s = [25]uint64{}
+
+		for m := range 17 {
+			s[m] = binary.LittleEndian.Uint64(data[8*m:])
+		}
+
+		clear(data[:])
+
+		return
+	}
+
+	w := (*[16]uint32)(l.blocks[16*k : 16*k+16])
+
+	*w = [16]uint32{}
+
+	w[0], w[1], w[2], w[3] = binary.BigEndian.Uint32(i), binary.BigEndian.Uint32(i[4:]), binary.BigEndian.Uint32(i[8:]), binary.BigEndian.Uint32(i[12:])
+
+	w[4], w[5] = q, uint32(index)<<16|uint32(j)<<8|uint32(x[0])
+
+	for m := 1; m < n/4; m++ {
+		w[5+m] = binary.BigEndian.Uint32(x[4*m-3:])
+	}
+
+	w[5+n/4] = uint32(x[n-3])<<24 | uint32(x[n-2])<<16 | uint32(x[n-1])<<8 | 0x80
+
+	w[15] = uint32(23+n) * 8
+}
+
+func (l *lmsLanes) run(count int) {
+	if l.shake {
+		permuteLanes(l.states[:count])
+	} else {
+		sha256Lanes(&iv256, l.blocks[:16*count], 1, l.digests[:8*count])
+	}
+}
+
+// The n-byte result of lane k.
+func (l *lmsLanes) result(k int, out []byte) {
+	if l.shake {
+		for m := range l.n / 8 {
+			binary.LittleEndian.PutUint64(out[8*m:], l.states[k][m])
+		}
+
+		return
+	}
+
+	for m := range l.n / 4 {
+		binary.BigEndian.PutUint32(out[4*m:], l.digests[8*k+m])
+	}
+}
+
+// Whether the lane kernels beat hashing one call at a time.
+func (l *lmsLanes) fast() bool {
+	if l.shake {
+		return permuteLanesFast()
+	}
+
+	return sha256LanesFast()
+}
+
+func (l *lmsLanes) wipe() {
+	clear(l.blocks)
+
+	clear(l.digests)
+
+	clear(l.records)
+
+	clear(l.states)
+}
+
+// The chain starts y[j] = H(I || u32(q) || u16(j) || 0xFF || SEED) of every chain j, values holding
+// them one after another.
+func (l *lmsLanes) derive(i []byte, q uint32, seed, values []byte) {
+	n := l.n
+
+	chains := len(values) / n
+
+	if !l.fast() {
+		for j := range chains {
+			lmsDerive(l.shake, n, i, q, uint16(j), seed, values[j*n:(j+1)*n])
+		}
+
+		return
+	}
+
+	for first := 0; first < chains; first += lmsMaxLanes {
+		count := min(lmsMaxLanes, chains-first)
+
+		for k := range count {
+			l.set(k, i, q, uint16(first+k), 0xff, seed)
+		}
+
+		l.run(count)
+
+		for k := range count {
+			l.result(k, values[(first+k)*n:])
+		}
+	}
+}
+
+// Iterates x = H(I || u32(q) || u16(j) || u8(k) || x) on the value of chain j, at values[n j:], for k
+// from starts[j] to ends[j] - 1. Where the lane kernels are fast, every SHA-256 chain is a lane of
+// sha256Chains, in the order of decreasing step count, and the SHAKE256 chains go in lockstep,
+// group by group, so that those taking a step form one batch; otherwise the chains run one after
+// another. The steps follow from the message digest, which the signature reveals.
+func (l *lmsLanes) chains(i []byte, q uint32, values []byte, starts, ends []int) {
+	n := l.n
+
+	if !l.fast() {
+		for j := range starts {
+			lmotsChain(l.shake, n, i, q, uint16(j), starts[j], ends[j], values[j*n:(j+1)*n])
+		}
+
+		return
+	}
+
+	if !l.shake {
+		order := l.order[:0]
+
+		for j := range starts {
+			if ends[j] > starts[j] {
+				order = append(order, j)
+			}
+		}
+
+		slices.SortStableFunc(order, func(x, y int) int { return ends[y] - starts[y] - (ends[x] - starts[x]) })
+
+		var zero [32]byte
+
+		for r, j := range order {
+			record := l.records[chainRecord*r : chainRecord*(r+1)]
+
+			l.set(0, i, q, uint16(j), 0, zero[:n])
+
+			copy(record, l.blocks[:16])
+
+			clear(record[16:])
+
+			for k := range n / 4 {
+				record[16+k] = binary.BigEndian.Uint32(values[j*n+4*k:])
+			}
+
+			record[24], record[25] = uint32(starts[j]), uint32(ends[j]-starts[j])
+		}
+
+		records := l.records[:chainRecord*len(order)]
+
+		sha256Chains(&iv256, records, n/4, 24)
+
+		for r, j := range order {
+			for k := range n / 4 {
+				binary.BigEndian.PutUint32(values[j*n+4*k:], records[chainRecord*r+16+k])
+			}
+		}
+
+		return
+	}
+
+	var active [lmsMaxLanes]int
+
+	for first := 0; first < len(starts); first += lmsMaxLanes {
+		last := min(first+lmsMaxLanes, len(starts))
+
+		low, high := slices.Min(starts[first:last]), slices.Max(ends[first:last])
+
+		for step := low; step < high; step++ {
+			count := 0
+
+			for j := first; j < last; j++ {
+				if starts[j] <= step && step < ends[j] {
+					l.set(count, i, q, uint16(j), byte(step), values[j*n:(j+1)*n])
+
+					active[count] = j
+
+					count++
+				}
+			}
+
+			l.run(count)
+
+			for k, j := range active[:count] {
+				l.result(k, values[j*n:])
+			}
+		}
+	}
+}
+
+// Iterates x = H(I || u32(q) || u16(j) || u8(k) || x) for k from start to end - 1, one hash at a time.
+func lmotsChain(shake bool, n int, i []byte, q uint32, j uint16, start, end int, x []byte) {
+	if !shake {
 		for k := start; k < end; k++ {
-			lmsSha256Short(i, q, j, byte(k), x[:t.n], x)
+			lmsSha256Short(i, q, j, byte(k), x[:n], x)
 		}
 
 		return
@@ -226,12 +469,25 @@ func lmotsChain(t *lmotsType, i []byte, q uint32, j uint16, start, end int, x []
 	for k := start; k < end; k++ {
 		data[22] = byte(k)
 
-		copy(data[23:], x[:t.n])
+		copy(data[23:], x[:n])
 
-		lmsDigest(t.shake, t.n, x, data[:23+t.n])
+		lmsDigest(shake, n, x, data[:23+n])
 	}
 
 	clear(data[:])
+}
+
+// The step counts of chains that start at 0 or end at 2^w - 1, for up to 265 chains.
+var lmotsZeros [265]int
+
+func lmotsEnds(t *lmotsType) []int {
+	ends := make([]int, t.p)
+
+	for j := range ends {
+		ends[j] = 1<<t.w - 1
+	}
+
+	return ends
 }
 
 func lmotsCoefficients(t *lmotsType, data []byte, out []int) {
@@ -266,19 +522,17 @@ func lmotsDigits(t *lmotsType, qHash []byte) []int {
 }
 
 // The LM-OTS public key K = H(I || u32(q) || D_PBLC || y[0] || ... || y[p-1]); scratch holds
-// 22 + p * n bytes.
-func lmotsPublicKey(t *lmotsType, i []byte, q uint32, seed, out, scratch []byte) {
+// 22 + p * n bytes, and ends the step counts of lmotsEnds.
+func lmotsPublicKey(t *lmotsType, i []byte, q uint32, seed, out, scratch []byte, lanes *lmsLanes, ends []int) {
 	n := t.n
 
 	lmsPrefix(scratch, i, q, lmsPublicDomain)
 
-	for j := range t.p {
-		y := scratch[22+j*n : 22+(j+1)*n]
+	values := scratch[22 : 22+t.p*n]
 
-		lmsDerive(t.shake, n, i, q, uint16(j), seed, y)
+	lanes.derive(i, q, seed, values)
 
-		lmotsChain(t, i, q, uint16(j), 0, 1<<t.w-1, y)
-	}
+	lanes.chains(i, q, values, lmotsZeros[:t.p], ends)
 
 	lmsDigest(t.shake, n, out, scratch[:22+t.p*n])
 }
@@ -295,7 +549,7 @@ func lmotsMessageHash(t *lmotsType, i []byte, q uint32, c, message []byte) []byt
 	return qHash
 }
 
-func lmotsSign(t *lmotsType, i []byte, q uint32, seed, message []byte) []byte {
+func lmotsSign(t *lmotsType, i []byte, q uint32, seed, message []byte, lanes *lmsLanes) []byte {
 	n := t.n
 
 	signature := make([]byte, t.signatureSize())
@@ -306,13 +560,13 @@ func lmotsSign(t *lmotsType, i []byte, q uint32, seed, message []byte) []byte {
 
 	lmsDerive(t.shake, n, i, q, lmsRandomizer, seed, c)
 
-	for j, digit := range lmotsDigits(t, lmotsMessageHash(t, i, q, c, message)) {
-		y := signature[4+n*(j+1) : 4+n*(j+2)]
+	digits := lmotsDigits(t, lmotsMessageHash(t, i, q, c, message))
 
-		lmsDerive(t.shake, n, i, q, uint16(j), seed, y)
+	values := signature[4+n : 4+n*(t.p+1)]
 
-		lmotsChain(t, i, q, uint16(j), 0, digit, y)
-	}
+	lanes.derive(i, q, seed, values)
+
+	lanes.chains(i, q, values, lmotsZeros[:t.p], digits)
 
 	return signature
 }
@@ -325,13 +579,13 @@ func lmotsCandidate(t *lmotsType, i []byte, q uint32, signature, message []byte)
 
 	lmsPrefix(scratch, i, q, lmsPublicDomain)
 
-	for j, digit := range lmotsDigits(t, lmotsMessageHash(t, i, q, signature[4:4+n], message)) {
-		z := scratch[22+j*n : 22+(j+1)*n]
+	digits := lmotsDigits(t, lmotsMessageHash(t, i, q, signature[4:4+n], message))
 
-		copy(z, signature[4+n*(j+1):4+n*(j+2)])
+	values := scratch[22:]
 
-		lmotsChain(t, i, q, uint16(j), digit, 1<<t.w-1, z)
-	}
+	copy(values, signature[4+n:4+n*(t.p+1)])
+
+	newLmsLanes(t).chains(i, q, values, digits, lmotsEnds(t))
 
 	candidate := make([]byte, n)
 
@@ -475,7 +729,8 @@ func hssVerify(publicKey, message, signature []byte) bool {
 	return lmsVerify(key, message, signature[offset:])
 }
 
-// One LMS tree of an HSS key: its I, SEED and the Merkle tree over its OTS public keys.
+// One LMS tree of an HSS key: its I, SEED and the Merkle tree over its OTS public keys, with the
+// lanes its one-time keys hash in.
 type lmsTree struct {
 	lms       *lmsType
 	ots       *lmotsType
@@ -483,19 +738,20 @@ type lmsTree struct {
 	seed      []byte
 	merkle    *merkleTree
 	publicKey []byte
+	lanes     *lmsLanes
 }
 
 func newLmsTree(lms *lmsType, ots *lmotsType, i, seed []byte) *lmsTree {
-	t := &lmsTree{lms: lms, ots: ots, i: i, seed: seed}
+	t := &lmsTree{lms: lms, ots: ots, i: i, seed: seed, lanes: newLmsLanes(ots)}
 
-	scratch := make([]byte, 22+ots.p*ots.n)
+	scratch, ends := make([]byte, 22+ots.p*ots.n), lmotsEnds(ots)
 
 	leaf := func(q uint64, out []byte) {
 		var data [54]byte
 
 		lmsPrefix(data[:], i, uint32(1<<lms.h+q), lmsLeafDomain)
 
-		lmotsPublicKey(ots, i, uint32(q), seed, data[22:], scratch)
+		lmotsPublicKey(ots, i, uint32(q), seed, data[22:], scratch, t.lanes, ends)
 
 		lmsDigest(lms.shake, lms.m, out, data[:22+ots.n])
 	}
@@ -514,6 +770,8 @@ func newLmsTree(lms *lmsType, ots *lmotsType, i, seed []byte) *lmsTree {
 
 	t.merkle = newMerkleTree(lms.h, lms.m, leaf, combine)
 
+	t.lanes.wipe()
+
 	t.publicKey = binary.BigEndian.AppendUint32(nil, lms.code)
 
 	t.publicKey = binary.BigEndian.AppendUint32(t.publicKey, ots.code)
@@ -526,11 +784,15 @@ func newLmsTree(lms *lmsType, ots *lmotsType, i, seed []byte) *lmsTree {
 func (t *lmsTree) sign(q uint32, message []byte) []byte {
 	signature := binary.BigEndian.AppendUint32(nil, q)
 
-	signature = append(signature, lmotsSign(t.ots, t.i, q, t.seed, message)...)
+	signature = append(signature, lmotsSign(t.ots, t.i, q, t.seed, message, t.lanes)...)
 
 	signature = binary.BigEndian.AppendUint32(signature, t.lms.code)
 
-	return append(signature, t.merkle.authPath(uint64(q))...)
+	signature = append(signature, t.merkle.authPath(uint64(q))...)
+
+	t.lanes.wipe()
+
+	return signature
 }
 
 func (t *lmsTree) child(lms *lmsType, ots *lmotsType, q uint32) *lmsTree {

@@ -47,9 +47,11 @@ func sha256Schedule(w2, w7, w15, w16 uint32) uint32 {
 	return (bits.RotateLeft32(w2, -17) ^ bits.RotateLeft32(w2, -19) ^ w2>>10) + w7 + (bits.RotateLeft32(w15, -7) ^ bits.RotateLeft32(w15, -18) ^ w15>>3) + w16
 }
 
-// One block of big-endian words, unrolled: the round constants are immediates and the message
-// schedule lives in sixteen locals, so the rounds touch no memory.
-func sha256Block(state [8]uint32, w [16]uint32) [8]uint32 {
+// One block of big-endian words compressed into state, unrolled: the round constants are
+// immediates and the message schedule lives in sixteen locals, so the rounds touch no memory. This
+// is the portable form of sha256Block, which uses the CPU's SHA-256 instructions where it has them;
+// the pointers spare both a copy of their arrays.
+func sha256BlockGeneric(state *[8]uint32, w *[16]uint32) {
 	a, b, c, d, e, f, g, h := state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7]
 
 	w0, w1, w2, w3, w4, w5, w6, w7 := w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]
@@ -282,13 +284,13 @@ func sha256Block(state [8]uint32, w [16]uint32) [8]uint32 {
 
 	e, a, bc = sha256Round(b, c, bc, e, f, g, h, a, w15, 0xc67178f2)
 
-	return [8]uint32{state[0] + a, state[1] + b, state[2] + c, state[3] + d, state[4] + e, state[5] + f, state[6] + g, state[7] + h}
+	*state = [8]uint32{state[0] + a, state[1] + b, state[2] + c, state[3] + d, state[4] + e, state[5] + f, state[6] + g, state[7] + h}
 }
 
 // Every whole 64-byte block of p is compressed into state. Each block is copied to the stack
 // and indexed there directly, so that the race detector checks one range per block rather
-// than every byte.
-func compress256(state *[8]uint32, p []byte) {
+// than every byte. This is the portable form of compress256.
+func compress256Generic(state *[8]uint32, p []byte) {
 	s := *state
 
 	var block [64]byte
@@ -302,10 +304,133 @@ func compress256(state *[8]uint32, p []byte) {
 			w[i] = uint32(block[4*i])<<24 | uint32(block[4*i+1])<<16 | uint32(block[4*i+2])<<8 | uint32(block[4*i+3])
 		}
 
-		s = sha256Block(s, w)
+		sha256BlockGeneric(&s, &w)
 	}
 
 	*state = s
+}
+
+// Lane kernels take out / outWords lanes of blockWords words each. Other sizes are a bug in the
+// caller, stopped here before assembly could read past a slice.
+func checkLanes(blocks, blockWords, out, outWords int) {
+	if blockWords <= 0 || out%outWords != 0 || blocks != out/outWords*blockWords {
+		panic("cryptopq: internal error: lane buffers of mismatched sizes")
+	}
+}
+
+// A lane record of sha256Chains: the block template in words 0-15, the chain value in 16-23 (its
+// length in words, then zeros), the first step in 24 and the number of steps in 25.
+const chainRecord = 32
+
+// The masks that keep the value words of a chain value of 4, 6 or 8 words.
+var chainMasks = [3][8]uint32{
+	{^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0)},
+	{^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0)},
+	{^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0)},
+}
+
+func checkChains(lanes []uint32, words int, shift uint) {
+	if len(lanes)%chainRecord != 0 || words != 4 && words != 6 && words != 8 || shift != 16 && shift != 24 {
+		panic("cryptopq: internal error: malformed chain lanes")
+	}
+}
+
+// The block of a chain step: the template, with the step counter in the bits of word 5 above the
+// value and the value's words shifted right by shift bits from word 5 on. SLH-DSA (shift 16) and
+// LM-OTS (shift 24) place the value two and three bytes into word 5.
+func chainBlock(w *[16]uint32, record []uint32, step uint32, shift uint) {
+	copy(w[:], record[:16])
+
+	v := record[16:24]
+
+	c := 32 - shift
+
+	w[5] |= step<<c | v[0]>>shift
+
+	for m := 1; m < 8; m++ {
+		w[5+m] |= v[m-1]<<c | v[m]>>shift
+	}
+
+	w[13] |= v[7] << c
+}
+
+// The portable form of sha256Chains: every lane runs its steps in turn, one sha256Block each.
+func sha256ChainsSerial(init *[8]uint32, lanes []uint32, words int, shift uint) {
+	var w [16]uint32
+
+	for r := 0; r < len(lanes); r += chainRecord {
+		record := lanes[r : r+chainRecord]
+
+		start, count := record[24], record[25]
+
+		for step := start; step < start+count; step++ {
+			chainBlock(&w, record, step, shift)
+
+			state := *init
+
+			sha256Block(&state, &w)
+
+			copy(record[16:16+words], state[:words])
+		}
+	}
+
+	clear(w[:])
+}
+
+// sha256Chains through sha256Lanes: groups of up to 32 lanes go in lockstep, the lanes that take a
+// step forming one batch, whose independent blocks a CPU can overlap.
+func sha256ChainsLockstep(init *[8]uint32, lanes []uint32, words int, shift uint) {
+	var blocks [32 * 16]uint32
+
+	var out [32 * 8]uint32
+
+	var active [32]int
+
+	for first := 0; first < len(lanes); first += 32 * chainRecord {
+		group := lanes[first:min(first+32*chainRecord, len(lanes))]
+
+		for step := uint32(0); ; step++ {
+			count := 0
+
+			for r := 0; r < len(group); r += chainRecord {
+				if record := group[r : r+chainRecord]; step < record[25] {
+					chainBlock((*[16]uint32)(blocks[16*count:]), record, record[24]+step, shift)
+
+					active[count] = r
+
+					count++
+				}
+			}
+
+			if count == 0 {
+				break
+			}
+
+			sha256Lanes(init, blocks[:16*count], 1, out[:8*count])
+
+			for k, r := range active[:count] {
+				copy(group[r+16:r+16+words], out[8*k:8*k+words])
+			}
+		}
+	}
+
+	clear(blocks[:])
+
+	clear(out[:])
+}
+
+// The portable form of sha256Lanes: lane i starts from init, compresses the nb blocks of words at
+// blocks[16 nb i:] and leaves its state in out[8i:8i + 8].
+func sha256LanesGeneric(init *[8]uint32, blocks []uint32, nb int, out []uint32) {
+	for lane := range len(out) / 8 {
+		state := *init
+
+		for b := range nb {
+			sha256BlockGeneric(&state, (*[16]uint32)(blocks[16*(nb*lane+b):]))
+		}
+
+		copy(out[8*lane:8*lane+8], state[:])
+	}
 }
 
 // The SHA-512 counterpart of sha256Round.
@@ -321,8 +446,9 @@ func sha512Schedule(w2, w7, w15, w16 uint64) uint64 {
 	return (bits.RotateLeft64(w2, -19) ^ bits.RotateLeft64(w2, -61) ^ w2>>6) + w7 + (bits.RotateLeft64(w15, -1) ^ bits.RotateLeft64(w15, -8) ^ w15>>7) + w16
 }
 
-// The 80 rounds of SHA-512 on one block, unrolled like sha256Block.
-func sha512Block(state [8]uint64, w [16]uint64) [8]uint64 {
+// The 80 rounds of SHA-512 on one block, unrolled like sha256BlockGeneric; the portable form of
+// sha512Block.
+func sha512BlockGeneric(state *[8]uint64, w *[16]uint64) {
 	a, b, c, d, e, f, g, h := state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7]
 
 	w0, w1, w2, w3, w4, w5, w6, w7 := w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]
@@ -619,12 +745,12 @@ func sha512Block(state [8]uint64, w [16]uint64) [8]uint64 {
 
 	e, a, bc = sha512Round(b, c, bc, e, f, g, h, a, w15, 0x6c44198c4a475817)
 
-	return [8]uint64{state[0] + a, state[1] + b, state[2] + c, state[3] + d, state[4] + e, state[5] + f, state[6] + g, state[7] + h}
+	*state = [8]uint64{state[0] + a, state[1] + b, state[2] + c, state[3] + d, state[4] + e, state[5] + f, state[6] + g, state[7] + h}
 }
 
 // Every whole 128-byte block of p is compressed into state, read from a stack copy as in
-// compress256.
-func compress512(state *[8]uint64, p []byte) {
+// compress256Generic; the portable form of compress512.
+func compress512Generic(state *[8]uint64, p []byte) {
 	s := *state
 
 	var block [128]byte
@@ -639,7 +765,7 @@ func compress512(state *[8]uint64, p []byte) {
 				uint64(block[8*i+4])<<24 | uint64(block[8*i+5])<<16 | uint64(block[8*i+6])<<8 | uint64(block[8*i+7])
 		}
 
-		s = sha512Block(s, w)
+		sha512BlockGeneric(&s, &w)
 	}
 
 	*state = s
