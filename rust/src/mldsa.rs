@@ -1,5 +1,6 @@
 use alloc::vec;
 use alloc::vec::Vec;
+use core::hint::black_box;
 use core::ops::{Deref, DerefMut};
 
 use crate::cpu::{self, Field, Prepare};
@@ -353,7 +354,9 @@ fn pointwise_portable(f: &Poly, g: &Poly) -> Poly {
     core::array::from_fn(|i| montgomery_mul(f[i], g[i]))
 }
 
-// Branch-free FIPS 204 Algorithm 36 for r in [0, q): (r1, r0) with r0 centered.
+// Branch-free FIPS 204 Algorithm 36 for r in [0, q): (r1, r0) with r0 centered. The sign masks
+// pass through black_box: an optimizer that sees x ^ (mask & x) or x - (mask & q) makes it a
+// select, which some compilers lower to a conditional move on the secret coefficient.
 const fn decompose(r: i32, gamma2: i32) -> (i32, i32) {
     let mut r1 = (r + 127) >> 7;
 
@@ -362,12 +365,12 @@ const fn decompose(r: i32, gamma2: i32) -> (i32, i32) {
     } else {
         r1 = (r1 * 11275 + (1 << 23)) >> 24;
 
-        r1 ^= ((43 - r1) >> 31) & r1;
+        r1 ^= black_box((43 - r1) >> 31) & r1;
     }
 
     let r0 = r - r1 * 2 * gamma2;
 
-    (r1, r0 - ((((Q - 1) / 2 - r0) >> 31) & Q))
+    (r1, r0 - (black_box(((Q - 1) / 2 - r0) >> 31) & Q))
 }
 
 const fn high_bits(r: i32, gamma2: i32) -> i32 {
