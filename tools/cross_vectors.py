@@ -1,6 +1,12 @@
+import os
 import pathlib
 from concurrent.futures import ProcessPoolExecutor
 
+# The cross vectors are what every port, crypto-pq's native core included, is checked against, so
+# they come from the pure Python implementation alone, in this process and in its workers.
+os.environ["CRYPTO_PQ_BACKEND"] = "pure"
+
+import crypto_pq
 from crypto_pq import (
     HMAC_SHA_256,
     HSS_LMS,
@@ -45,6 +51,9 @@ from crypto_pq import (
 from crypto_pq._encoding import pem_encode
 from crypto_pq._signature import PRE_HASHES as STRENGTHS
 from crypto_pq._stateful import seal
+
+if crypto_pq.BACKEND != "pure":
+    raise SystemExit("the cross vectors must come from the pure backend")
 
 # The official vectors check the algorithms; these check what no standard fixes byte for byte:
 # key encodings and the PKCS#8 forms, hazmat signing with every pre-hash, implicit rejection, the

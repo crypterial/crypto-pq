@@ -3,7 +3,7 @@ import unittest
 
 import crypto_pq
 from crypto_pq import CryptoPQError, ErrorCode, hazmat
-from vectors import der, records, unhex
+from vectors import der, expanded_key, records, unhex
 
 ALGORITHMS = {
     "ML-DSA-44": crypto_pq.ML_DSA_44,
@@ -183,7 +183,7 @@ class SignatureApiTest(unittest.TestCase):
             with self.subTest(algorithm=algorithm.name):
                 pair = hazmat.generate_key_pair(algorithm, bytes(range(32)))
 
-                public, private = pair.public_key.export_key("raw"), pair.private_key._private
+                public, private = pair.public_key.export_key("raw"), expanded_key(pair.private_key)
 
                 messages = [bytes([i]) * 10 for i in range(3)]
 
@@ -224,7 +224,8 @@ class SignatureApiTest(unittest.TestCase):
 
     # The matrix and the secret forms are derived at first use, not when a key is made or
     # imported, and a key pair holds one public cache: its public key shares the one inside its
-    # private key.
+    # private key. test_native.py checks the native backend's caches.
+    @unittest.skipUnless(crypto_pq.BACKEND == "pure", "the pure backend's key states")
     def test_lazy_shared_cache(self):
         for algorithm in ALGORITHMS.values():
             with self.subTest(algorithm=algorithm.name):

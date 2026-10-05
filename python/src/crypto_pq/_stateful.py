@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import operator
 import threading
 from collections.abc import Sequence
 from typing import NamedTuple, Protocol
 
-from . import _lms, _xmss
+from . import _lms, _native, _xmss
 from ._encoding import KeyFormat, invalid, object_identifier
 from ._errors import CryptoPQError, ErrorCode
-from ._hash import HMAC_SHA_256
+from ._hash import HMAC_SHA_256, SHA_256
 from ._keys import export_public, import_public, mismatch, require_bytes
 from ._merkle import CACHED_HEIGHT
-from ._primitives import sha256
 from ._rng import random_bytes
 
 _Bytes = bytes | bytearray | memoryview
@@ -56,18 +56,25 @@ def require_reserve(reserve):
 # State blob: version, kind, the parameters, the secret seeds and the next index, closed by the
 # first 16 bytes of its SHA-256 so that a damaged state is refused rather than reused.
 def seal(body):
-    return body + sha256(body)[:16]
+    return body + SHA_256.digest(body)[:16]
+
+
+def require_state(state):
+    if not isinstance(state, (bytes, bytearray)):
+        raise mismatch("the state store holds no valid key")
+
+    return bytes(state)
 
 
 def unseal(state, kind):
-    if not isinstance(state, (bytes, bytearray)) or len(state) < 18:
-        raise mismatch("the state store holds no valid key")
+    state = require_state(state)
 
-    state = bytes(state)
+    if len(state) < 18:
+        raise mismatch("the state store holds no valid key")
 
     body, checksum = state[:-16], state[-16:]
 
-    if sha256(body)[:16] != checksum or body[0] != VERSION:
+    if SHA_256.digest(body)[:16] != checksum or body[0] != VERSION:
         raise mismatch("the stored key state is damaged or unsupported")
 
     if body[1] != kind:
@@ -241,7 +248,92 @@ def split_levels(nodes, low, height, n):
     return levels
 
 
-class _Hss:
+class _Signer:
+    """The pure-Python signer of a stateful key: its trees, with the parameters and the seed that
+    the next state blobs and its tree cache take."""
+
+    __slots__ = ("_backend", "_parameters", "_seed", "_trees", "public_key", "capacity")
+
+    def __init__(self, backend, parameters, seed, trees):
+        self._backend = backend
+
+        self._parameters = parameters
+
+        self._seed = seed
+
+        self._trees = trees
+
+        self.public_key = trees.public_key
+
+        self.capacity = trees.capacity
+
+    def sign(self, index, message):
+        return self._trees.sign(index, message)
+
+    # The sealed state blob that claims the indices below `index`.
+    def next_state(self, state, index):
+        return self._backend.encode(self._parameters, self._seed, index)
+
+    # The body of the tree cache, under the key's lock; the tag follows outside it.
+    def tree_cache(self):
+        backend = self._backend
+
+        return tree_cache_body(backend.kind, backend.parameter_section(self._parameters), self._trees)
+
+    def seal_tree_cache(self, body):
+        return seal_tree_cache(body, self._seed)
+
+    def free(self):
+        pass
+
+
+class _Stateful:
+    """A stateful algorithm: its parameter sets, its state blob and its signers, which _Hss and
+    _Xmss give for their kinds."""
+
+    kind: int
+
+    def parameter_section(self, parameters):
+        raise NotImplementedError
+
+    def capacity(self, parameters):
+        raise NotImplementedError
+
+    def encode(self, parameters, seed, index):
+        raise NotImplementedError
+
+    def decode(self, state):
+        raise NotImplementedError
+
+    def signer(self, parameters, seed, cached=None):
+        raise NotImplementedError
+
+    # The signer of a new key at `index`, and the state blob of that index.
+    def create(self, parameters, seed, index):
+        return _Signer(self, parameters, seed, self.signer(parameters, seed)), self.encode(parameters, seed, index)
+
+    # The signer of a stored state and its index. A tree cache replaces the build of the trees it
+    # holds: the state is checked first, and the key loads only if the cache passes.
+    def load(self, state, tree_cache):
+        parameters, seed, index = self.decode(state)
+
+        if index > self.capacity(parameters):
+            raise mismatch("the stored index is beyond the key's capacity")
+
+        if tree_cache is None:
+            return _Signer(self, parameters, seed, self.signer(parameters, seed)), index
+
+        public_key, cached = open_tree_cache(self, parameters, seed, index, tree_cache)
+
+        trees = self.signer(parameters, seed, cached)
+
+        if trees.public_key != public_key:
+            raise invalid("the tree cache belongs to another key")
+
+        return _Signer(self, parameters, seed, trees), index
+
+
+class _Hss(_Stateful):
     kind = HSS_KIND
 
     oid = object_identifier("1.2.840.113549.1.9.16.3.17")
@@ -341,7 +433,7 @@ class _Hss:
         return _lms.hss_verify(key, message, signature)
 
 
-class _Xmss:
+class _Xmss(_Stateful):
     def __init__(self, multi):
         self.multi = multi
 
@@ -408,6 +500,30 @@ class _Xmss:
         return _xmss.verify(p, key, message, signature)
 
 
+# The native library's signer, state blobs and verification, with the parameter handling of the
+# pure backend: the library builds and checks the state blob and the tree cache itself.
+class _Native(_Stateful):
+    def create(self, parameters, seed, index):
+        return _native.signer_create(self.kind, self.parameter_section(parameters), seed, index)
+
+    def load(self, state, tree_cache):
+        return _native.signer_load(self.kind, require_state(state), tree_cache)
+
+    def check_public_key(self, key):
+        return _native.stateful_check_public_key(self.kind, key)
+
+    def verify(self, key, message, signature):
+        return _native.stateful_verify(self.kind, key, message, signature)
+
+
+class _NativeHss(_Native, _Hss):
+    pass
+
+
+class _NativeXmss(_Native, _Xmss):
+    pass
+
+
 class StatefulPublicKey:
     __slots__ = ("_algorithm", "_key")
 
@@ -441,14 +557,10 @@ class StatefulPublicKey:
 
 
 class StatefulPrivateKey:
-    __slots__ = ("_algorithm", "_parameters", "_seed", "_signer", "_store", "_state", "_index", "_reserved", "_reserve", "_capacity", "_busy")
+    __slots__ = ("_algorithm", "_signer", "_store", "_state", "_index", "_reserved", "_reserve", "_capacity", "_busy")
 
-    def __init__(self, algorithm, parameters, seed, signer, store, state, index, reserve):
+    def __init__(self, algorithm, signer, store, state, index, reserve):
         self._algorithm = algorithm
-
-        self._parameters = parameters
-
-        self._seed = seed
 
         self._signer = signer
 
@@ -505,7 +617,7 @@ class StatefulPrivateKey:
         if index == self._reserved:
             reserved = min(index + self._reserve, self._capacity)
 
-            state = self._algorithm._backend.encode(self._parameters, self._seed, reserved)
+            state = self._signer.next_state(self._state, reserved)
 
             try:
                 updated = self._store.update(self._state, state)
@@ -525,20 +637,19 @@ class StatefulPrivateKey:
 
     # The trees that the key holds, for load_private_key(tree_cache=...) to skip their build. A
     # call made while the key signs, from another thread or from inside the store, fails at once,
-    # as the trees are changing. The body is copied under the lock and tagged after it, so that
-    # hashing megabytes in Python does not hold off signatures.
+    # as the trees are changing. The pure signer copies the body under the lock and tags it after,
+    # so that hashing megabytes in Python does not hold off signatures; the native one exports the
+    # whole cache under the lock.
     def export_tree_cache(self) -> bytes:
-        backend = self._algorithm._backend
-
         if not self._busy.acquire(blocking=False):
             raise CryptoPQError(ErrorCode.STATE_CONFLICT, "the key is signing in another call")
 
         try:
-            body = tree_cache_body(backend.kind, backend.parameter_section(self._parameters), self._signer)
+            cache = self._signer.tree_cache()
         finally:
             self._busy.release()
 
-        return seal_tree_cache(body, self._seed)
+        return self._signer.seal_tree_cache(cache)
 
     def __repr__(self) -> str:
         return f"<StatefulPrivateKey {self._algorithm.name}>"
@@ -571,25 +682,30 @@ class StatefulSignatureAlgorithm:
 
         return self._create(parameters, random_bytes(self._backend.seed_size(parameters)), 0, state_store, reserve)
 
+    # A signer that the store refuses is freed at once rather than left to the exception's frames.
     def _create(self, parameters, seed, index, store, reserve):
         require_store(store)
 
-        signer = self._backend.signer(parameters, seed)
+        index = operator.index(index)
 
-        if not 0 <= index <= signer.capacity:
+        if not 0 <= index <= self._backend.capacity(parameters):
             raise option("the index must lie between 0 and the key's capacity")
 
-        state = self._backend.encode(parameters, seed, index)
+        signer, state = self._backend.create(parameters, seed, index)
 
         try:
             created = store.update(None, state)
         except Exception as error:
+            signer.free()
+
             raise CryptoPQError(ErrorCode.STATE_PERSIST_FAILED, "the state store failed to save the new key") from error
 
         if created is not True:
+            signer.free()
+
             raise CryptoPQError(ErrorCode.STATE_CONFLICT, "the state store already holds a key")
 
-        private_key = StatefulPrivateKey(self, parameters, seed, signer, store, state, index, reserve)
+        private_key = StatefulPrivateKey(self, signer, store, state, index, reserve)
 
         return StatefulKeyPair(private_key.public_key, private_key)
 
@@ -612,24 +728,9 @@ class StatefulSignatureAlgorithm:
         if state is None:
             raise mismatch("the state store holds no key")
 
-        backend = self._backend
+        signer, index = self._backend.load(state, tree_cache)
 
-        parameters, seed, index = backend.decode(state)
-
-        if index > backend.capacity(parameters):
-            raise mismatch("the stored index is beyond the key's capacity")
-
-        if tree_cache is None:
-            signer = backend.signer(parameters, seed)
-        else:
-            public_key, cached = open_tree_cache(backend, parameters, seed, index, tree_cache)
-
-            signer = backend.signer(parameters, seed, cached)
-
-            if signer.public_key != public_key:
-                raise invalid("the tree cache belongs to another key")
-
-        return StatefulPrivateKey(self, parameters, seed, signer, state_store, bytes(state), index, reserve)
+        return StatefulPrivateKey(self, signer, state_store, bytes(state), index, reserve)
 
     def import_public_key(self, data: _Bytes | str, format: KeyFormat | str) -> StatefulPublicKey:
         key = import_public(format, data, self._backend.oid)
@@ -643,8 +744,10 @@ class StatefulSignatureAlgorithm:
         return f"<StatefulSignatureAlgorithm {self._name}>"
 
 
-HSS_LMS = StatefulSignatureAlgorithm("HSS/LMS", _Hss())
+_NATIVE = _native.BACKEND == "native"
 
-XMSS = StatefulSignatureAlgorithm("XMSS", _Xmss(False))
+HSS_LMS = StatefulSignatureAlgorithm("HSS/LMS", _NativeHss() if _NATIVE else _Hss())
 
-XMSS_MT = StatefulSignatureAlgorithm("XMSS^MT", _Xmss(True))
+XMSS = StatefulSignatureAlgorithm("XMSS", _NativeXmss(False) if _NATIVE else _Xmss(False))
+
+XMSS_MT = StatefulSignatureAlgorithm("XMSS^MT", _NativeXmss(True) if _NATIVE else _Xmss(True))

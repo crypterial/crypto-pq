@@ -1,12 +1,14 @@
 [build-system]
-requires = ["flit_core>=3.12,<4"]
-build-backend = "flit_core.buildapi"
+requires = []
+build-backend = "cpq_build"
+backend-path = ["build_backend"]
 
 [project]
 name = "crypto-pq"
 version = "0.2.0.dev0"
-description = "Post-quantum cryptography in pure Python, with no dependencies."
+description = "Post-quantum cryptography with no dependencies: crypto-pq's own native core in the platform wheels, pure Python everywhere else."
 license = "Apache-2.0 OR MIT"
+license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
 requires-python = ">=3.11"
 authors = [{ name = "Wilson Tran" }]
 classifiers = [

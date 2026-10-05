@@ -234,7 +234,8 @@ class KemApiTest(unittest.TestCase):
 
     # The matrix and the secret forms are derived at first use, not when a key is made or
     # imported, and a key pair holds one public cache: its public key shares the one inside its
-    # private key.
+    # private key. test_native.py checks the native backend's caches.
+    @unittest.skipUnless(crypto_pq.BACKEND == "pure", "the pure backend's key states")
     def test_lazy_shared_cache(self):
         def caches(public_key, private_key):
             public, private = public_key._state, private_key._state

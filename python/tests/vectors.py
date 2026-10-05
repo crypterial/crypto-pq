@@ -42,6 +42,11 @@ def unhex(text):
     return bytes.fromhex(text)
 
 
+# The expanded private key of an ML-KEM or ML-DSA key from a seed, which export_key does not give.
+def expanded_key(private_key):
+    return private_key.algorithm._backend.expanded(private_key._private)
+
+
 # A minimal DER writer, so that tests can build encodings the library itself never produces.
 def der(tag, content):
     length = len(content)

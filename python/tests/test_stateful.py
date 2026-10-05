@@ -437,6 +437,7 @@ class XmssTest(unittest.TestCase):
 
     # From index 31 to 33 the signatures cross the edge of a lowest tree: the layer-1 part is
     # signed again at 32 only, and the parts above it are signed once.
+    @unittest.skipUnless(crypto_pq.BACKEND == "pure", "counts the pure backend's WOTS+ signatures")
     def test_layer_cache(self):
         pair = hazmat.generate_key_pair(XMSS_MT, bytes(range(72)), parameters="XMSSMT-SHA2_20/4_192", state_store=MemoryStore(), index=31)
 
@@ -906,6 +907,7 @@ class TreeCacheTest(unittest.TestCase):
                 self.assertCode(ErrorCode.INVALID_ENCODING, self.load, HSS_LMS, state, flip(cache, position, mask))
 
     # A load with the cache computes no leaf; the trees that the next index has left are built.
+    @unittest.skipUnless(crypto_pq.BACKEND == "pure", "counts the pure backend's leaves")
     def test_cache_skips_the_build(self):
         for algorithm, module, parameters, size, index, later, trees in ((HSS_LMS, _lms, TWO, 40, 40, 64, 2), (XMSS_MT, _xmss, MT, 72, 0x12345, 0x12360, 4)):
             with self.subTest(algorithm=algorithm.name):

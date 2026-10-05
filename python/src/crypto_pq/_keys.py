@@ -1,3 +1,4 @@
+from ._bytes import immutable
 from ._encoding import (
     CONTEXT_0,
     OCTET_STRING,
@@ -22,9 +23,9 @@ PUBLIC = b"PUBLIC KEY"
 PRIVATE = b"PRIVATE KEY"
 
 
-def require_bytes(value, name):
+def require_bytes(value, name) -> bytes:
     if isinstance(value, (bytes, bytearray, memoryview)):
-        return bytes(memoryview(value).cast("B"))
+        return immutable(value)
 
     raise TypeError(f"{name} must be bytes-like")
 

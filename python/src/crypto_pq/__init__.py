@@ -1,5 +1,6 @@
 from . import hazmat
 from ._encoding import KeyFormat
+from ._native import BACKEND, LOAD_ERROR
 from ._errors import CryptoPQError, ErrorCode
 from ._hash import (
     HMAC_SHA_224,
@@ -69,6 +70,7 @@ from ._stateful import (
 )
 
 __all__ = [
+    "BACKEND",
     "CryptoPQError",
     "Encapsulation",
     "ErrorCode",
@@ -86,6 +88,7 @@ __all__ = [
     "KemPrivateKey",
     "KemPublicKey",
     "KeyFormat",
+    "LOAD_ERROR",
     "ML_DSA_44",
     "ML_DSA_65",
     "ML_DSA_87",

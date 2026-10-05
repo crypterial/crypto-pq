@@ -8,6 +8,7 @@ import crypto_pq
 from crypto_pq import CryptoPQError, ErrorCode, hazmat
 from crypto_pq import _encoding as encoding
 from crypto_pq import _keys as keys
+from vectors import expanded_key
 
 # Untrusted input gets only the defined errors: random and mutated encodings, signatures,
 # ciphertexts and state blobs through every parsing path. A deterministic generator keeps each run
@@ -473,7 +474,7 @@ class ImportRobustnessTest(RobustnessCase):
         for algorithm, pair, _ in kem_fixtures():
             der = algorithm._backend.oid is not None
 
-            expanded = algorithm.import_private_key(pair.private_key._private, "raw") if der else None
+            expanded = algorithm.import_private_key(expanded_key(pair.private_key), "raw") if der else None
 
             for private in (False, True):
                 key = pair.private_key if private else pair.public_key
@@ -494,7 +495,7 @@ class ImportRobustnessTest(RobustnessCase):
     # vector was changed is accepted and decapsulates to the implicit rejection, SHAKE256(z || c).
     def test_inconsistent_expanded_kem_key(self):
         for algorithm in KEMS[:3]:
-            dk = bytearray(hazmat.generate_key_pair(algorithm, pattern(64)).private_key._private)
+            dk = bytearray(expanded_key(hazmat.generate_key_pair(algorithm, pattern(64)).private_key))
 
             dk[0] ^= 1
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-from . import _mlkem, _xwing
+from . import _mlkem, _native, _xwing
 from ._bytes import equal
 from ._encoding import KeyFormat, object_identifier
 from ._errors import CryptoPQError, ErrorCode
@@ -24,6 +24,14 @@ from ._rng import random_bytes
 _Bytes = bytes | bytearray | memoryview
 
 
+# The pairwise test of key generation: an encapsulation to the new public key must decapsulate to
+# the same shared secret.
+def pairwise(backend, state):
+    shared_secret, ciphertext = backend.encapsulate(backend.public_state_of(state), random_bytes(backend.randomness_size))
+
+    return equal(backend.decapsulate(state, ciphertext), shared_secret)
+
+
 class _MlKem:
     def __init__(self, params, arc):
         self.params = params
@@ -40,25 +48,26 @@ class _MlKem:
 
         self.ciphertext_size = params.ciphertext_size
 
+    # The public key, the private key and the seed that the key keeps.
     def from_seed(self, seed):
         ek, dk = _mlkem.keygen_internal(seed[:32], seed[32:], self.params)
 
-        return ek, dk
+        return ek, dk, seed
 
     def from_expanded(self, dk):
         if not _mlkem.check_decapsulation_key(dk, self.params):
-            raise mismatch("the decapsulation key fails the FIPS 203 checks")
+            return None
 
         return _mlkem.public_key_of(dk, self.params), dk
+
+    def seed(self, private):
+        return None
 
     def expanded(self, private):
         return private
 
-    def check_public_key(self, ek):
-        return _mlkem.check_encapsulation_key(ek, self.params)
-
-    def public_state(self, ek):
-        return _mlkem.public_state(ek, self.params)
+    def import_public(self, ek):
+        return _mlkem.public_state(ek, self.params) if _mlkem.check_encapsulation_key(ek, self.params) else None
 
     def private_state(self, dk):
         return _mlkem.private_state(dk, self.params)
@@ -71,6 +80,9 @@ class _MlKem:
 
     def decapsulate(self, state, ciphertext):
         return _mlkem.decaps_internal(state, ciphertext, self.params)
+
+    def self_test(self, state):
+        return pairwise(self, state)
 
 
 class _XWing:
@@ -87,13 +99,15 @@ class _XWing:
     ciphertext_size = _xwing.CIPHERTEXT_SIZE
 
     def from_seed(self, seed):
-        return _xwing.expand(seed)
+        public, private = _xwing.expand(seed)
 
-    def check_public_key(self, pk):
-        return _xwing.check_public_key(pk)
+        return public, private, seed
 
-    def public_state(self, pk):
-        return _xwing.public_state(pk)
+    def seed(self, private):
+        return None
+
+    def import_public(self, pk):
+        return _xwing.public_state(pk) if _xwing.check_public_key(pk) else None
 
     def private_state(self, private):
         return _xwing.private_state(private)
@@ -107,6 +121,76 @@ class _XWing:
     def decapsulate(self, state, ciphertext):
         return _xwing.decapsulate(state, ciphertext)
 
+    def self_test(self, state):
+        return pairwise(self, state)
+
+
+# A KEM of the native library, with the sizes of its pure twin. A private key is a private slot,
+# which holds its seed or expanded key and its public part; the public key of a private key gets
+# a public slot of its own on first use, so that the private slot lives no longer than the
+# private key.
+class _NativeKem:
+    def __init__(self, pure, number):
+        self.oid = pure.oid
+
+        self.seed_size = pure.seed_size
+
+        self.randomness_size = pure.randomness_size
+
+        self.expanded_size = pure.expanded_size
+
+        self.public_key_size = pure.public_key_size
+
+        self.ciphertext_size = pure.ciphertext_size
+
+        self.number = number
+
+    def from_seed(self, seed):
+        private = _native.kem_generate(self.number, seed)
+
+        return _native.kem_export_public(private, self.public_key_size), private, None
+
+    def from_expanded(self, dk):
+        private = _native.kem_import_private(self.number, dk)
+
+        if private is None:
+            return None
+
+        return _native.kem_export_public(private, self.public_key_size), private
+
+    def seed(self, private):
+        return _native.kem_export_private(private, _native.EXPORT_SEED, self.seed_size)
+
+    def expanded(self, private):
+        return _native.kem_export_private(private, _native.EXPORT_PRIVATE, self.expanded_size)
+
+    def import_public(self, key):
+        return _native.kem_import_public(self.number, key)
+
+    def private_state(self, private):
+        return _native.PrivateState(private)
+
+    def public_state_of(self, state):
+        public = state.public
+
+        if public is None:
+            public = state.public = _native.kem_public(self.number, state.private)
+
+        return public
+
+    def encapsulate(self, state, randomness):
+        return _native.kem_encapsulate(state, randomness, self.ciphertext_size)
+
+    def decapsulate(self, state, ciphertext):
+        return _native.kem_decapsulate(state.private, ciphertext)
+
+    def self_test(self, state):
+        return _native.kem_self_test(state.private, random_bytes(self.randomness_size))
+
+
+def _backend(pure, number):
+    return _NativeKem(pure, number) if _native.BACKEND == "native" else pure
+
 
 class Encapsulation(NamedTuple):
     shared_secret: bytes
@@ -119,12 +203,12 @@ class Encapsulation(NamedTuple):
 class KemPublicKey:
     __slots__ = ("_algorithm", "_key", "_state")
 
-    def __init__(self, algorithm: KemAlgorithm, key: bytes, state: object = None) -> None:
+    def __init__(self, algorithm: KemAlgorithm, key: bytes, state: object) -> None:
         self._algorithm = algorithm
 
         self._key = key
 
-        self._state = algorithm._backend.public_state(key) if state is None else state
+        self._state = state
 
     @property
     def algorithm(self) -> KemAlgorithm:
@@ -184,11 +268,14 @@ class KemPrivateKey:
 
         return backend.decapsulate(self._state, ciphertext)
 
+    # The seed if the key has one, kept here or in its private part; the expanded key otherwise.
     def export_key(self, format: KeyFormat | str) -> bytes:
         backend = self._algorithm._backend
 
-        if self._seed is not None:
-            return export_private(format, backend.oid, encode_seed_choice(self._seed, None), self._seed)
+        seed = self._seed if self._seed is not None else backend.seed(self._private)
+
+        if seed is not None:
+            return export_private(format, backend.oid, encode_seed_choice(seed, None), seed)
 
         expanded = backend.expanded(self._private)
 
@@ -235,28 +322,37 @@ class KemAlgorithm:
 
         public_key = private_key.public_key
 
-        if self_test:
-            encapsulation = public_key.encapsulate()
-
-            if not equal(private_key.decapsulate(encapsulation.ciphertext), encapsulation.shared_secret):
-                raise CryptoPQError(ErrorCode.SELF_TEST_FAILED, "the new key pair failed its consistency test")
+        if self_test and not self._backend.self_test(private_key._state):
+            raise CryptoPQError(ErrorCode.SELF_TEST_FAILED, "the new key pair failed its consistency test")
 
         return KemKeyPair(public_key, private_key)
 
     def _from_seed(self, seed: bytes) -> KemPrivateKey:
-        public, private = self._backend.from_seed(seed)
+        public, private, kept = self._backend.from_seed(seed)
 
-        return KemPrivateKey(self, seed, private, public)
+        return KemPrivateKey(self, kept, private, public)
+
+    def _from_expanded(self, expanded: bytes) -> KemPrivateKey:
+        key = self._backend.from_expanded(expanded)
+
+        if key is None:
+            raise mismatch("the decapsulation key fails the FIPS 203 checks")
+
+        public, private = key
+
+        return KemPrivateKey(self, None, private, public)
 
     def import_public_key(self, data: _Bytes | str, format: KeyFormat | str) -> KemPublicKey:
         key = import_public(format, data, self._backend.oid)
 
         require_key_length(key, self._backend.public_key_size, format, "public key")
 
-        if not self._backend.check_public_key(key):
+        state = self._backend.import_public(key)
+
+        if state is None:
             raise CryptoPQError(ErrorCode.INVALID_PUBLIC_KEY, "the public key fails the encoding checks")
 
-        return KemPublicKey(self, key)
+        return KemPublicKey(self, key, state)
 
     def import_private_key(self, data: _Bytes | str, format: KeyFormat | str) -> KemPrivateKey:
         backend = self._backend
@@ -268,9 +364,7 @@ class KemAlgorithm:
                 return self._from_seed(raw)
 
             if backend.expanded_size is not None and len(raw) == backend.expanded_size:
-                public, private = backend.from_expanded(raw)
-
-                return KemPrivateKey(self, None, private, public)
+                return self._from_expanded(raw)
 
             raise CryptoPQError(ErrorCode.INVALID_LENGTH, "the private key has the wrong length")
 
@@ -282,9 +376,7 @@ class KemAlgorithm:
             if expanded is not None and expanded != backend.expanded(key._private):
                 raise mismatch("the seed and the expanded key do not match")
         else:
-            public, private = backend.from_expanded(expanded)
-
-            key = KemPrivateKey(self, None, private, public)
+            key = self._from_expanded(expanded)
 
         if public_key is not None and public_key != key._public:
             raise mismatch("the embedded public key does not match the private key")
@@ -295,10 +387,10 @@ class KemAlgorithm:
         return f"<KemAlgorithm {self._name}>"
 
 
-ML_KEM_512 = KemAlgorithm("ML-KEM-512", _MlKem(_mlkem.ML_KEM_512, 1))
+ML_KEM_512 = KemAlgorithm("ML-KEM-512", _backend(_MlKem(_mlkem.ML_KEM_512, 1), 0))
 
-ML_KEM_768 = KemAlgorithm("ML-KEM-768", _MlKem(_mlkem.ML_KEM_768, 2))
+ML_KEM_768 = KemAlgorithm("ML-KEM-768", _backend(_MlKem(_mlkem.ML_KEM_768, 2), 1))
 
-ML_KEM_1024 = KemAlgorithm("ML-KEM-1024", _MlKem(_mlkem.ML_KEM_1024, 3))
+ML_KEM_1024 = KemAlgorithm("ML-KEM-1024", _backend(_MlKem(_mlkem.ML_KEM_1024, 3), 2))
 
-X_WING = KemAlgorithm("X-Wing", _XWing())
+X_WING = KemAlgorithm("X-Wing", _backend(_XWing(), 3))
