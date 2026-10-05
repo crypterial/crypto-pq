@@ -59,7 +59,7 @@ use x86_64 as arch;
 mod arch {
     // Nothing is accelerated: the portable build, and every other architecture.
     #[inline(always)]
-    pub(crate) fn compress256(_: &mut [u32; 8], _: &[[u8; 64]]) -> bool {
+    pub(crate) fn compress256(_: &mut [u32; 8], _: &[[u8; 64]], _: &[[u8; 64]]) -> bool {
         false
     }
 
@@ -79,6 +79,21 @@ mod arch {
     #[inline(always)]
     pub(crate) fn permute_many(_: &mut [&mut [u64; 25]]) -> usize {
         0
+    }
+
+    #[inline(always)]
+    pub(crate) fn absorb(_: &mut [u64; 25], _: usize, _: &[u8]) -> usize {
+        0
+    }
+
+    #[inline(always)]
+    pub(crate) fn absorb_last(_: &mut [u64; 25], _: usize, _: &[u8], _: &[u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) const fn keccak_group() -> usize {
+        4
     }
 
     #[inline(always)]
@@ -104,8 +119,8 @@ mod arch {
     #[inline(always)]
     pub(crate) fn multiply_add(
         _: &mut [i32; 256],
-        _: &[i32; 256],
-        _: &[i32; 256],
+        _: &[[i32; 256]],
+        _: &[[i32; 256]],
         _: &super::Field,
     ) -> bool {
         false
@@ -116,8 +131,7 @@ mod arch {
         _: &mut [i32; 256],
         _: &[u16; 256],
         _: &[u16; 256],
-        _: &[i32; 128],
-        _: &super::Field,
+        _: &[u16; 128],
     ) -> bool {
         false
     }
@@ -133,14 +147,89 @@ mod arch {
     }
 
     #[inline(always)]
-    pub(crate) fn binomial(_: usize, _: &[u8], _: u16, _: &mut [u16; 256]) -> bool {
+    pub(crate) fn binomial(_: usize, _: &[u64], _: u16, _: &mut [u16; 256]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn mldsa_add(_: &mut [i32; 256], _: &[i32; 256], _: &[i32; 256], _: i32) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn mldsa_sub(_: &mut [i32; 256], _: &[i32; 256], _: &[i32; 256], _: i32) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn mldsa_norm(_: &[i32; 256], _: i32, _: Option<i32>, _: i32) -> Option<i32> {
+        None
+    }
+
+    #[inline(always)]
+    pub(crate) fn mldsa_hints(
+        _: &mut [i32; 256],
+        _: &[i32; 256],
+        _: &[i32; 256],
+        _: i32,
+        _: i32,
+    ) -> Option<i32> {
+        None
+    }
+
+    #[inline(always)]
+    pub(crate) fn mldsa_w1(_: &mut [u8], _: &[i32; 256], _: i32, _: i32) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn mldsa_mask(_: &mut [i32; 256], _: &[u8], _: u32, _: i32, _: i32) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn mlkem_matrix_vector(
+        _: &mut [[u16; 256]],
+        _: &[[u16; 256]],
+        _: &[[u16; 256]],
+        _: &[[u16; 128]],
+        _: &[[u16; 256]],
+        _: u16,
+    ) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn reduce(_: &[i32; 256], _: i32, _: &super::Field, _: &mut [u16; 256]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn encode12(_: &[u16; 256], _: &mut [u8; 384]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn uniform12(_: &[u64; 21], _: u16, _: &mut [u16; 256], _: &mut usize) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn uniform23(_: &[u64; 21], _: i32, _: &mut [i32; 256], _: &mut usize) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn bounded(_: &[u64; 17], _: i32, _: &mut [i32; 256], _: &mut usize) -> bool {
         false
     }
 }
 
 pub(crate) use arch::{
-    base_multiply_add, binomial, compress256, compress256_lanes, compress512, inverse_ntt,
-    inverse_ntt16, multiply, multiply_add, ntt, ntt16, permute_many,
+    absorb, absorb_last, base_multiply_add, binomial, bounded, compress256, compress256_lanes,
+    compress512, encode12, inverse_ntt, inverse_ntt16, keccak_group, mldsa_add, mldsa_hints,
+    mldsa_mask, mldsa_norm, mldsa_sub, mldsa_w1, mlkem_matrix_vector, multiply, multiply_add, ntt,
+    ntt16, permute_many, reduce, uniform12, uniform23,
 };
 
 // What the transform kernels need of the field of ML-KEM or ML-DSA, so that they compute exactly

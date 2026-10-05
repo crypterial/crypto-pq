@@ -16,6 +16,7 @@
 
 use core::arch::aarch64::*;
 
+use super::memory::{load_i16, load_i32, load_u16, store_i32, store_u16};
 use crate::cpu::{Field, Field16, Prepare};
 
 #[allow(unsafe_code)]
@@ -42,7 +43,7 @@ pub(crate) fn multiply(
     field: &Field,
 ) -> bool {
     // SAFETY: as in ntt.
-    unsafe { products::<false>(out, f, g, field) };
+    unsafe { products(out, f, g, field) };
 
     true
 }
@@ -50,12 +51,12 @@ pub(crate) fn multiply(
 #[allow(unsafe_code)]
 pub(crate) fn multiply_add(
     acc: &mut [i32; 256],
-    f: &[i32; 256],
-    g: &[i32; 256],
+    f: &[[i32; 256]],
+    g: &[[i32; 256]],
     field: &Field,
 ) -> bool {
     // SAFETY: as in ntt.
-    unsafe { products::<true>(acc, f, g, field) };
+    unsafe { products_add(acc, f, g, field) };
 
     true
 }
@@ -63,13 +64,33 @@ pub(crate) fn multiply_add(
 #[allow(unsafe_code)]
 pub(crate) fn base_multiply_add(
     acc: &mut [i32; 256],
-    f: &[u16; 256],
-    g: &[u16; 256],
-    gammas: &[i32; 128],
-    field: &Field,
+    a: &[u16; 256],
+    b: &[u16; 256],
+    cache: &[u16; 128],
 ) -> bool {
     // SAFETY: as in ntt.
-    unsafe { base_products(acc, f, g, gammas, field) };
+    unsafe { base_products(acc, a, b, cache) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn mlkem_matrix_vector(
+    t: &mut [[u16; 256]],
+    a: &[[u16; 256]],
+    s: &[[u16; 256]],
+    caches: &[[u16; 128]],
+    e: &[[u16; 256]],
+    q: u16,
+) -> bool {
+    let k = s.len();
+
+    if k > 4 || a.len() != t.len() * k || caches.len() != k || e.len() != t.len() {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { matrix_vector(t, a, s, caches, e, q) };
 
     true
 }
@@ -104,26 +125,13 @@ const fn pack(low: i32, high: i32) -> u64 {
 #[target_feature(enable = "neon")]
 #[inline]
 fn load(values: &[i32; 4]) -> int32x4_t {
-    let low = vcreate_u64(pack(values[0], values[1]));
-
-    let high = vcreate_u64(pack(values[2], values[3]));
-
-    vreinterpretq_s32_u64(vcombine_u64(low, high))
+    load_i32(values)
 }
 
 #[target_feature(enable = "neon")]
 #[inline]
 fn store(vector: int32x4_t, out: &mut [i32; 4]) {
-    let halves = vreinterpretq_u64_s32(vector);
-
-    let (low, high) = (vgetq_lane_u64::<0>(halves), vgetq_lane_u64::<1>(halves));
-
-    *out = [
-        low as i32,
-        (low >> 32) as i32,
-        high as i32,
-        (high >> 32) as i32,
-    ];
+    store_i32(vector, out);
 }
 
 #[target_feature(enable = "neon")]
@@ -432,9 +440,9 @@ fn inverse(w: &mut [i32; 256], field: &Field) {
     }
 }
 
-// out = f * g, or out += f * g, coefficient by coefficient (ML-DSA).
+// out = f * g coefficient by coefficient (ML-DSA).
 #[target_feature(enable = "neon")]
-fn products<const ADD: bool>(out: &mut [i32; 256], f: &[i32; 256], g: &[i32; 256], field: &Field) {
+fn products(out: &mut [i32; 256], f: &[i32; 256], g: &[i32; 256], field: &Field) {
     let (q, qinv) = (vdupq_n_s32(field.q), vdupq_n_s32(field.qinv));
 
     let factors = f.as_chunks::<4>().0.iter().zip(g.as_chunks::<4>().0);
@@ -447,78 +455,177 @@ fn products<const ADD: bool>(out: &mut [i32; 256], f: &[i32; 256], g: &[i32; 256
             qinv: vmulq_s32(b, qinv),
         };
 
-        let product = montgomery(load(f), t, q);
-
-        store(
-            if ADD {
-                vaddq_s32(load(out), product)
-            } else {
-                product
-            },
-            out,
-        );
+        store(montgomery(load(f), t, q), out);
     }
 }
 
-// The even and the odd coefficients of eight, as 32-bit lanes.
+// acc += f[j] * g[j] summed over j, coefficient by coefficient (ML-DSA): sixteen coefficients of
+// acc stay in registers while every product is added, in the order of the portable code.
 #[target_feature(enable = "neon")]
-#[inline]
-fn split(values: &[u16; 8]) -> (int32x4_t, int32x4_t) {
-    let pack16 = |v: &[u16]| {
-        u64::from(v[0])
-            | (u64::from(v[1]) << 16)
-            | (u64::from(v[2]) << 32)
-            | (u64::from(v[3]) << 48)
-    };
-
-    let pairs = vcombine_u64(
-        vcreate_u64(pack16(&values[..4])),
-        vcreate_u64(pack16(&values[4..])),
-    );
-
-    let pairs = vreinterpretq_u32_u64(pairs);
-
-    (
-        vreinterpretq_s32_u32(vandq_u32(pairs, vdupq_n_u32(0xFFFF))),
-        vreinterpretq_s32_u32(vshrq_n_u32::<16>(pairs)),
-    )
-}
-
-// acc += f * g in ML-KEM's NTT domain, four pairs at a time: (a0 b0 + (a1 b1) gamma, a0 b1 + a1 b0)
-// with a1 b1 a Montgomery product.
-#[target_feature(enable = "neon")]
-fn base_products(
-    acc: &mut [i32; 256],
-    f: &[u16; 256],
-    g: &[u16; 256],
-    gammas: &[i32; 128],
-    field: &Field,
-) {
+fn products_add(acc: &mut [i32; 256], f: &[[i32; 256]], g: &[[i32; 256]], field: &Field) {
     let (q, qinv) = (vdupq_n_s32(field.q), vdupq_n_s32(field.qinv));
 
-    let factors = f.as_chunks::<8>().0.iter().zip(g.as_chunks::<8>().0);
+    for (chunk, acc) in acc.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+        let mut sums = [vdupq_n_s32(0); 4];
 
-    let groups = factors.zip(gammas.as_chunks::<4>().0);
+        for (sum, acc) in sums.iter_mut().zip(acc.as_chunks::<4>().0) {
+            *sum = load(acc);
+        }
 
-    for (acc, ((f, g), gamma)) in acc.as_chunks_mut::<8>().0.iter_mut().zip(groups) {
-        let ((a0, a1), (b0, b1)) = (split(f), split(g));
+        for (f, g) in f.iter().zip(g) {
+            let factors = f.as_chunks::<16>().0[chunk].as_chunks::<4>().0;
 
-        let t = Twiddle {
-            zeta: b1,
-            qinv: vmulq_s32(b1, qinv),
-        };
+            let others = g.as_chunks::<16>().0[chunk].as_chunks::<4>().0;
 
-        let even = vmlaq_s32(vmulq_s32(a0, b0), montgomery(a1, t, q), load(gamma));
+            for ((sum, f), g) in sums.iter_mut().zip(factors).zip(others) {
+                let b = load(g);
 
-        let odd = vmlaq_s32(vmulq_s32(a0, b1), a1, b0);
+                let t = Twiddle {
+                    zeta: b,
+                    qinv: vmulq_s32(b, qinv),
+                };
 
-        let [low, high] = acc.as_chunks_mut::<4>().0 else {
-            unreachable!("eight values are two groups of four")
-        };
+                *sum = vaddq_s32(*sum, montgomery(load(f), t, q));
+            }
+        }
 
-        store(vaddq_s32(load(low), vzip1q_s32(even, odd)), low);
+        for (sum, acc) in sums.iter().zip(acc.as_chunks_mut::<4>().0) {
+            store(*sum, acc);
+        }
+    }
+}
 
-        store(vaddq_s32(load(high), vzip2q_s32(even, odd)), high);
+// The first and second halves of the eight pairs of sixteen ML-KEM coefficients.
+#[target_feature(enable = "neon")]
+#[inline]
+fn pair_halves(values: &[u16; 16]) -> (uint16x8_t, uint16x8_t) {
+    let [low, high] = values.as_chunks::<8>().0 else {
+        unreachable!("sixteen values are two groups of eight")
+    };
+
+    let (low, high) = (load_u16(low), load_u16(high));
+
+    (vuzp1q_u16(low, high), vuzp2q_u16(low, high))
+}
+
+// sums += a * b in ML-KEM's NTT domain for sixteen coefficients, with b's cache of the products
+// b1 gamma: the even sums a0 b0 + a1 c in sums[0] and sums[1], the odd ones a0 b1 + a1 b0 in
+// sums[2] and sums[3], by widening multiplications of the 16-bit halves of the pairs. Every
+// product of canonical values, and the sum of two, fits in 31 bits.
+#[target_feature(enable = "neon")]
+#[inline]
+fn pair_products(sums: &mut [uint32x4_t; 4], a: &[u16; 16], b: &[u16; 16], c: &[u16; 8]) {
+    let ((a0, a1), (b0, b1), c) = (pair_halves(a), pair_halves(b), load_u16(c));
+
+    sums[0] = vmlal_u16(
+        vmlal_u16(sums[0], vget_low_u16(a0), vget_low_u16(b0)),
+        vget_low_u16(a1),
+        vget_low_u16(c),
+    );
+
+    sums[1] = vmlal_high_u16(vmlal_high_u16(sums[1], a0, b0), a1, c);
+
+    sums[2] = vmlal_u16(
+        vmlal_u16(sums[2], vget_low_u16(a0), vget_low_u16(b1)),
+        vget_low_u16(a1),
+        vget_low_u16(b0),
+    );
+
+    sums[3] = vmlal_high_u16(vmlal_high_u16(sums[3], a0, b1), a1, b0);
+}
+
+// acc += a * b in ML-KEM's NTT domain, sixteen coefficients at a time, in coefficient order.
+#[target_feature(enable = "neon")]
+fn base_products(acc: &mut [i32; 256], a: &[u16; 256], b: &[u16; 256], cache: &[u16; 128]) {
+    let factors = a.as_chunks::<16>().0.iter().zip(b.as_chunks::<16>().0);
+
+    let groups = factors.zip(cache.as_chunks::<8>().0);
+
+    for (acc, ((a, b), c)) in acc.as_chunks_mut::<16>().0.iter_mut().zip(groups) {
+        let mut sums = [vdupq_n_u32(0); 4];
+
+        pair_products(&mut sums, a, b, c);
+
+        let products = [
+            vzip1q_u32(sums[0], sums[2]),
+            vzip2q_u32(sums[0], sums[2]),
+            vzip1q_u32(sums[1], sums[3]),
+            vzip2q_u32(sums[1], sums[3]),
+        ];
+
+        for (sums, product) in acc.as_chunks_mut::<4>().0.iter_mut().zip(products) {
+            store(vaddq_s32(load(sums), vreinterpretq_s32_u32(product)), sums);
+        }
+    }
+}
+
+// Rows of t = A * s + e of ML-KEM's key generation, each from a row of A with one entry per
+// polynomial of s, all canonical. A row keeps its sums in registers, sixteen coefficients at a
+// time, until they are reduced. The sums of products of canonical values stay below 2^27, where a
+// Barrett estimate of the quotient by q is too low by at most one, so one conditional subtraction
+// gives the canonical value; it is the same value that the Montgomery reduction of the portable
+// code gives.
+#[target_feature(enable = "neon")]
+fn matrix_vector(
+    t: &mut [[u16; 256]],
+    a: &[[u16; 256]],
+    s: &[[u16; 256]],
+    caches: &[[u16; 128]],
+    e: &[[u16; 256]],
+    q: u16,
+) {
+    let (q16, q32) = (vdupq_n_u16(q), vdupq_n_s32(i32::from(q)));
+
+    let estimate = vdupq_n_s32(((1u64 << 31) / u64::from(q)) as i32);
+
+    for ((t, row), e) in t.iter_mut().zip(a.chunks_exact(s.len())).zip(e) {
+        let outputs = t.as_chunks_mut::<16>().0.iter_mut();
+
+        for (chunk, (out, e)) in outputs.zip(e.as_chunks::<16>().0).enumerate() {
+            let mut sums = [vdupq_n_u32(0); 4];
+
+            for ((a, b), c) in row.iter().zip(s).zip(caches) {
+                pair_products(
+                    &mut sums,
+                    &a.as_chunks::<16>().0[chunk],
+                    &b.as_chunks::<16>().0[chunk],
+                    &c.as_chunks::<8>().0[chunk],
+                );
+            }
+
+            // Below 2q after one Barrett step, then narrowed: even and odd halves of the pairs.
+            let reduced = sums.map(|sum| {
+                let sum = vreinterpretq_s32_u32(sum);
+
+                vreinterpretq_u32_s32(vmlsq_s32(sum, vqdmulhq_s32(sum, estimate), q32))
+            });
+
+            let even = vcombine_u16(vmovn_u32(reduced[0]), vmovn_u32(reduced[1]));
+
+            let odd = vcombine_u16(vmovn_u32(reduced[2]), vmovn_u32(reduced[3]));
+
+            let [e_low, e_high] = e.as_chunks::<8>().0 else {
+                unreachable!("sixteen values are two groups of eight")
+            };
+
+            let [out_low, out_high] = out.as_chunks_mut::<8>().0 else {
+                unreachable!("sixteen values are two groups of eight")
+            };
+
+            let pairs = [vzip1q_u16(even, odd), vzip2q_u16(even, odd)];
+
+            for ((out, e), x) in [out_low, out_high]
+                .into_iter()
+                .zip([e_low, e_high])
+                .zip(pairs)
+            {
+                let x = vminq_u16(x, vsubq_u16(x, q16));
+
+                let sum = vaddq_u16(x, load_u16(e));
+
+                store_u16(vminq_u16(sum, vsubq_u16(sum, q16)), out);
+            }
+        }
     }
 }
 
@@ -532,32 +639,16 @@ struct Twiddle16 {
     qinv: int16x8_t,
 }
 
-const fn pack16(values: &[u16]) -> u64 {
-    (values[0] as u64)
-        | ((values[1] as u64) << 16)
-        | ((values[2] as u64) << 32)
-        | ((values[3] as u64) << 48)
-}
-
 #[target_feature(enable = "neon")]
 #[inline]
 fn load16(values: &[u16; 8]) -> int16x8_t {
-    let (low, high) = values.split_at(4);
-
-    vreinterpretq_s16_u64(vcombine_u64(
-        vcreate_u64(pack16(low)),
-        vcreate_u64(pack16(high)),
-    ))
+    vreinterpretq_s16_u16(load_u16(values))
 }
 
 #[target_feature(enable = "neon")]
 #[inline]
 fn store16(vector: int16x8_t, out: &mut [u16; 8]) {
-    let halves = vreinterpretq_u64_s16(vector);
-
-    let words = [vgetq_lane_u64::<0>(halves), vgetq_lane_u64::<1>(halves)];
-
-    *out = core::array::from_fn(|i| (words[i / 4] >> (16 * (i % 4))) as u16);
+    store_u16(vreinterpretq_u16_s16(vector), out);
 }
 
 #[target_feature(enable = "neon")]
@@ -582,11 +673,9 @@ fn broadcast16(zetas: &[i16; 128], products: &[i16; 128], m: usize) -> Twiddle16
 #[target_feature(enable = "neon")]
 #[inline]
 fn lanes16(tables: &[[[i16; 8]; 16]; 4], k: usize, p: usize) -> Twiddle16 {
-    let load = |values: &[i16; 8]| load16(&values.map(|x| x as u16));
-
     Twiddle16 {
-        zeta: load(&tables[k][p]),
-        qinv: load(&tables[k + 1][p]),
+        zeta: load_i16(&tables[k][p]),
+        qinv: load_i16(&tables[k + 1][p]),
     }
 }
 

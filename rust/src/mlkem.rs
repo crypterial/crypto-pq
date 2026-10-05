@@ -3,11 +3,13 @@ use alloc::vec::Vec;
 
 use crate::cpu::{self, Field, Field16, Prepare};
 use crate::ct::{self, declassify};
-use crate::keccak::Sponges;
+use crate::keccak::{self, Keccak, MAX_SPONGES, Sponges};
 use crate::primitives::{sha3_256, sha3_512, shake256_into};
 use crate::wipe::{SecretBytes, wipe};
 
 const Q: u32 = 3329;
+
+const SHA3: u8 = 0x06;
 
 const SHAKE: u8 = 0x1F;
 
@@ -183,6 +185,16 @@ const fn freeze(y: i32) -> u16 {
 
 // |w| < 2^31 to the canonical coefficients w mod q.
 fn canonical(w: &Wide) -> Poly {
+    let mut f = [0; 256];
+
+    if !cpu::reduce(w, i32::from(R_MOD_Q), &FIELD, &mut f) {
+        f = canonical_portable(w);
+    }
+
+    f
+}
+
+fn canonical_portable(w: &Wide) -> Poly {
     let (r, r_qinv) = (i32::from(R_MOD_Q), i32::from(R_MOD_Q).wrapping_mul(QINV));
 
     w.map(|x| freeze(montgomery(x, r, r_qinv)))
@@ -349,29 +361,57 @@ fn inverse_ntt_portable(w: &mut Wide) -> Poly {
     w.map(|x| freeze(montgomery(x, INVERSE_SCALE, scale_qinv)))
 }
 
-// acc += f * g in the NTT domain (FIPS 203, Algorithms 11 and 12) for canonical f and g. The
-// products are not reduced: k of them stay far below 2^31.
-fn multiply_accumulate(acc: &mut Wide, f: &Poly, g: &Poly) {
-    if !cpu::base_multiply_add(acc, f, g, &GAMMAS, &FIELD) {
-        multiply_accumulate_portable(acc, f, g);
+// The products a1 b1 gamma of FIPS 203, Algorithm 12, take gamma from b's half alone, so a vector
+// that meets several others (s in key generation and decryption, y in encryption) has them
+// computed once: cache[i] = b[2i + 1] * gamma_i mod q.
+type Cache = [u16; 128];
+
+fn multiply_cache(b: &Poly) -> Cache {
+    core::array::from_fn(|i| {
+        let gamma = GAMMAS[i];
+
+        freeze(montgomery(
+            i32::from(b[2 * i + 1]),
+            gamma,
+            gamma.wrapping_mul(QINV),
+        ))
+    })
+}
+
+fn multiply_caches(vector: &[Poly]) -> Vec<Cache> {
+    vector.iter().map(multiply_cache).collect()
+}
+
+// acc += a * b in the NTT domain (FIPS 203, Algorithms 11 and 12) for canonical a and b, with b's
+// cache. The products are plain products of canonical values, not reduced: the at most four
+// terms of a sum stay below 2^27.
+fn multiply_accumulate(acc: &mut Wide, a: &Poly, b: &Poly, cache: &Cache) {
+    if !cpu::base_multiply_add(acc, a, b, cache) {
+        multiply_accumulate_portable(acc, a, b, cache);
     }
 }
 
-fn multiply_accumulate_portable(acc: &mut Wide, f: &Poly, g: &Poly) {
+fn multiply_accumulate_portable(acc: &mut Wide, a: &Poly, b: &Poly, cache: &Cache) {
     let pairs = acc.as_chunks_mut::<2>().0.iter_mut();
 
-    let factors = f.as_chunks::<2>().0.iter().zip(g.as_chunks::<2>().0);
+    let factors = a.as_chunks::<2>().0.iter().zip(b.as_chunks::<2>().0);
 
-    for ((acc, (a, b)), &gamma) in pairs.zip(factors).zip(&GAMMAS) {
+    for ((acc, (a, b)), &c) in pairs.zip(factors).zip(cache) {
         let ([a0, a1], [b0, b1]) = (a.map(i32::from), b.map(i32::from));
 
-        acc[0] += a0 * b0 + montgomery(a1, b1, b1.wrapping_mul(QINV)) * gamma;
+        acc[0] += a0 * b0 + a1 * i32::from(c);
 
         acc[1] += a0 * b1 + a1 * b0;
     }
 }
 
 fn byte_encode(f: &Poly, d: u32, out: &mut [u8]) {
+    if let (12, Ok(out)) = (d, <&mut [u8; 384]>::try_from(&mut *out))
+        && cpu::encode12(f, out)
+    {
+        return;
+    }
+
     match d {
         1 => encode_bits::<1>(f, out),
         4 => encode_bits::<4>(f, out),
@@ -449,11 +489,23 @@ const fn decompress(y: u16, d: u32) -> u16 {
     ((y as u32 * Q + (1 << (d - 1))) >> d) as u16
 }
 
-// One block of an XOF stream into the coefficients accepted so far. Every candidate is written
-// and only an accepted one advances the count, so that no branch depends on a candidate, which a
-// random matrix makes unpredictable.
-fn sample_uniform(block: &[u8; 168], a: &mut Poly, count: &mut usize) {
-    for chunk in block.as_chunks::<3>().0 {
+// One block of an XOF stream, as the lanes of the sponge, into the coefficients accepted so far.
+fn sample_uniform(block: &[u64; 21], a: &mut Poly, count: &mut usize) {
+    if !cpu::uniform12(block, Q as u16, a, count) {
+        sample_uniform_portable(block, a, count);
+    }
+}
+
+// Every candidate is written and only an accepted one advances the count, so that no branch
+// depends on a candidate, which a random matrix makes unpredictable.
+fn sample_uniform_portable(block: &[u64; 21], a: &mut Poly, count: &mut usize) {
+    let mut bytes = [0; 168];
+
+    for (out, lane) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(block) {
+        *out = lane.to_le_bytes();
+    }
+
+    for chunk in bytes.as_chunks::<3>().0 {
         let d1 = u16::from(chunk[0]) | (u16::from(chunk[1] & 0x0F) << 8);
 
         let d2 = u16::from(chunk[1] >> 4) | (u16::from(chunk[2]) << 4);
@@ -471,74 +523,96 @@ fn sample_uniform(block: &[u8; 168], a: &mut Poly, count: &mut usize) {
 }
 
 // Entries first, first + 1, ... of Â (FIPS 203, Algorithm 7, from XOF(rho, j, i) for row i and
-// column j), whose XOF streams are squeezed in lockstep.
-fn sample_ntt(rho: &[u8], k: usize, first: usize, out: &mut [Poly]) {
-    let indices: [[u8; 2]; 4] =
+// column j), whose XOF streams are squeezed in lockstep by squeeze, which may run other
+// permutations beside them.
+fn sample_ntt(
+    sponges: &mut Sponges,
+    rho: &[u8],
+    k: usize,
+    first: usize,
+    out: &mut [Poly],
+    mut squeeze: impl FnMut(&mut Sponges, [bool; MAX_SPONGES]),
+) {
+    let indices: [[u8; 2]; MAX_SPONGES] =
         core::array::from_fn(|e| [((first + e) % k) as u8, ((first + e) / k) as u8]);
 
     let parts = indices.each_ref().map(|index| [rho, &index[..]]);
 
     let messages = parts.each_ref().map(|parts| &parts[..]);
 
-    let mut sponges = Sponges::new(168, SHAKE, &messages[..out.len()]);
+    sponges.start(168, SHAKE, &messages[..out.len()]);
 
-    let mut counts = [0; 4];
-
-    let mut block = [0u8; 168];
+    let mut counts = [0; MAX_SPONGES];
 
     while counts[..out.len()].iter().any(|&count| count < 256) {
-        sponges.squeeze(counts.map(|count| count < 256));
+        squeeze(sponges, counts.map(|count| count < 256));
 
         for (i, (a, count)) in out.iter_mut().zip(&mut counts).enumerate() {
             if *count < 256 {
-                sponges.read(i, &mut block);
-
-                sample_uniform(&block, a, count);
+                sample_uniform(sponges.lanes(i), a, count);
             }
         }
     }
 }
 
 // FIPS 203, Algorithm 8, applied to PRF_eta(seed, nonce) = SHAKE256(seed || nonce) for the
-// nonces first, first + 1, ..., whose sponges run side by side four at a time.
-fn sample_noise(eta: usize, seed: &[u8], first: usize, out: &mut [Poly]) {
-    for (start, group) in (first..).step_by(4).zip(out.chunks_mut(4)) {
-        let nonces: [[u8; 1]; 4] = core::array::from_fn(|i| [(start + i) as u8]);
+// nonces first, first + 1, ..., whose sponges run side by side in groups.
+fn sample_noise(sponges: &mut Sponges, eta: usize, seed: &[u8], first: usize, out: &mut [Poly]) {
+    for (start, group) in (first..)
+        .step_by(MAX_SPONGES)
+        .zip(out.chunks_mut(MAX_SPONGES))
+    {
+        let nonces: [[u8; 1]; MAX_SPONGES] = core::array::from_fn(|i| [(start + i) as u8]);
 
         let parts = nonces.each_ref().map(|nonce| [seed, &nonce[..]]);
 
         let messages = parts.each_ref().map(|parts| &parts[..]);
 
-        let mut sponges = Sponges::new(136, SHAKE, &messages[..group.len()]);
+        sponges.start(136, SHAKE, &messages[..group.len()]);
 
-        let mut buffers = [[0u8; 192]; 4];
+        sponges.squeeze([true; MAX_SPONGES]);
 
-        for offset in (0..64 * eta).step_by(136) {
-            sponges.squeeze([true; 4]);
-
-            let end = (offset + 136).min(64 * eta);
-
-            for (i, buffer) in buffers[..group.len()].iter_mut().enumerate() {
-                sponges.read(i, &mut buffer[offset..end]);
+        if eta == 2 {
+            // 128 bytes, inside the first block.
+            for (i, f) in group.iter_mut().enumerate() {
+                binomial(eta, sponges.lanes::<16>(i), f);
             }
+
+            continue;
         }
 
-        for (f, buffer) in group.iter_mut().zip(&buffers) {
-            *f = binomial(eta, &buffer[..64 * eta]);
+        // 192 bytes: the 17 lanes of the first block and 7 of the second.
+        let mut lanes = [[0u64; 24]; MAX_SPONGES];
+
+        for (i, lanes) in lanes[..group.len()].iter_mut().enumerate() {
+            lanes[..17].copy_from_slice(sponges.lanes::<17>(i));
         }
 
-        wipe(buffers.as_flattened_mut());
+        sponges.squeeze([true; MAX_SPONGES]);
+
+        for (i, (f, lanes)) in group.iter_mut().zip(&mut lanes).enumerate() {
+            lanes[17..].copy_from_slice(sponges.lanes::<7>(i));
+
+            binomial(eta, lanes, f);
+        }
+
+        wipe(lanes[..group.len()].as_flattened_mut());
     }
 }
 
-fn binomial(eta: usize, data: &[u8]) -> Poly {
-    let mut f = [0; 256];
+// The PRF output as the sponges' 64-bit lanes in stream order, 64 eta bytes.
+fn binomial(eta: usize, lanes: &[u64], f: &mut Poly) {
+    if !cpu::binomial(eta, lanes, Q as u16, f) {
+        let mut bytes = [0; 192];
 
-    if !cpu::binomial(eta, data, Q as u16, &mut f) {
-        f = binomial_portable(eta, data);
+        for (bytes, lane) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(lanes) {
+            *bytes = lane.to_le_bytes();
+        }
+
+        *f = binomial_portable(eta, &bytes[..64 * eta]);
+
+        wipe(&mut bytes);
     }
-
-    f
 }
 
 // The bits of each half are summed with masks over a whole word, never one secret bit at a time.
@@ -576,12 +650,18 @@ fn binomial_portable(eta: usize, data: &[u8]) -> Poly {
     f
 }
 
-// Â, with row i and column j at i * k + j, four entries at a time.
+// Â, with row i and column j at i * k + j, a group of entries at a time.
 fn sample_matrix(rho: &[u8], k: usize) -> Vec<Poly> {
     let mut matrix = vec![[0; 256]; k * k];
 
-    for (first, group) in (0..).step_by(4).zip(matrix.chunks_mut(4)) {
-        sample_ntt(rho, k, first, group);
+    let mut sponges = Sponges::empty();
+
+    let size = keccak::group();
+
+    for (first, group) in (0..).step_by(size).zip(matrix.chunks_mut(size)) {
+        sample_ntt(&mut sponges, rho, k, first, group, |sponges, active| {
+            sponges.squeeze(active);
+        });
     }
 
     matrix
@@ -619,23 +699,67 @@ impl EncapsulationKey {
     }
 }
 
-// The decoded NTT-form secret ŝ of a decapsulation key, wiped when dropped.
-pub(crate) struct DecapsulationKey(Vec<Poly>);
+// The decoded NTT-form secret ŝ of a decapsulation key and its products cache, wiped when
+// dropped.
+pub(crate) struct DecapsulationKey {
+    s: Vec<Poly>,
+    caches: Vec<Cache>,
+}
 
 impl DecapsulationKey {
     // For a dk from key generation or one that passed check_decapsulation_key.
     pub(crate) fn new(dk: &[u8], p: &Parameters) -> Self {
-        Self(decode_vector(&dk[..384 * p.k]))
+        let s = decode_vector(&dk[..384 * p.k]);
+
+        let caches = multiply_caches(&s);
+
+        Self { s, caches }
     }
 }
 
 impl Drop for DecapsulationKey {
     fn drop(&mut self) {
-        wipe(self.0.as_flattened_mut());
+        wipe(self.s.as_flattened_mut());
+
+        wipe(self.caches.as_flattened_mut());
     }
 }
 
-fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) {
+// t = A * s + e of key generation, canonical, with s's products caches.
+fn matrix_vector(t: &mut [Poly], matrix: &[Poly], s: &[Poly], caches: &[Cache], e: &[Poly]) {
+    if !cpu::mlkem_matrix_vector(t, matrix, s, caches, e, Q as u16) {
+        matrix_vector_portable(t, matrix, s, caches, e);
+    }
+}
+
+fn matrix_vector_portable(
+    t: &mut [Poly],
+    matrix: &[Poly],
+    s: &[Poly],
+    caches: &[Cache],
+    e: &[Poly],
+) {
+    let mut acc = [0; 256];
+
+    for ((t, row), e) in t.iter_mut().zip(matrix.chunks_exact(s.len())).zip(e) {
+        acc = [0; 256];
+
+        for ((a, b), cache) in row.iter().zip(s).zip(caches) {
+            multiply_accumulate_portable(&mut acc, a, b, cache);
+        }
+
+        *t = canonical_portable(&acc);
+
+        add_assign(t, e);
+    }
+
+    wipe(&mut acc);
+}
+
+// K-PKE.KeyGen, which also returns H(ek). The rows of the matrix are sampled one at a time, and
+// the blocks of ek that the rows before have completed are hashed beside the squeezes of the
+// next row, where a permutation costs less than alone.
+fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) -> [u8; 32] {
     let k = p.k;
 
     let mut g = sha3_512(&[d, &[k as u8]]);
@@ -645,10 +769,14 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) {
     // rho is part of the public key.
     declassify(rho);
 
+    ek[384 * k..].copy_from_slice(rho);
+
+    let mut sponges = Sponges::empty();
+
     // s from the nonces 0 to k - 1 and e from k to 2k - 1.
     let mut noise = [[0; 256]; 8];
 
-    sample_noise(p.eta1, sigma, 0, &mut noise[..2 * k]);
+    sample_noise(&mut sponges, p.eta1, sigma, 0, &mut noise[..2 * k]);
 
     for f in &mut noise[..2 * k] {
         ntt(f);
@@ -656,50 +784,85 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) {
 
     let (s, e) = noise.split_at(k);
 
-    let matrix = sample_matrix(rho, k);
+    let mut caches = [[0; 128]; 4];
+
+    for (cache, s_j) in caches.iter_mut().zip(s) {
+        *cache = multiply_cache(s_j);
+    }
+
+    let mut hash = Keccak::new(136, SHA3);
+
+    let mut hashed = 0;
+
+    let (mut row, mut t) = ([[0; 256]; 4], [[0; 256]; 1]);
 
     for i in 0..k {
-        let mut acc = [0; 256];
+        let mut blocks = ek[hashed..384 * i].as_chunks::<136>().0.iter();
 
-        for (a_ij, s_j) in matrix[i * k..(i + 1) * k].iter().zip(s) {
-            multiply_accumulate(&mut acc, a_ij, s_j);
-        }
+        sample_ntt(
+            &mut sponges,
+            rho,
+            k,
+            k * i,
+            &mut row[..k],
+            |sponges, active| match blocks.next() {
+                Some(block) => {
+                    hash.update_block_with(block, |state| sponges.squeeze_beside(active, state));
 
-        let mut t = canonical(&acc);
+                    hashed += 136;
+                }
+                None => sponges.squeeze(active),
+            },
+        );
 
-        wipe(&mut acc);
+        matrix_vector(&mut t, &row[..k], s, &caches[..k], &e[i..=i]);
 
-        add_assign(&mut t, &e[i]);
+        byte_encode(&t[0], 12, &mut ek[384 * i..384 * (i + 1)]);
 
-        byte_encode(&t, 12, &mut ek[384 * i..384 * (i + 1)]);
+        // t is part of the public key.
+        declassify(&ek[384 * i..384 * (i + 1)]);
 
         byte_encode(&s[i], 12, &mut dk[384 * i..384 * (i + 1)]);
     }
 
-    declassify(&ek[..384 * k]);
+    hash.update(&ek[hashed..]);
 
-    ek[384 * k..].copy_from_slice(rho);
+    let mut h = [0; 32];
+
+    hash.read(&mut h);
 
     wipe(noise[..2 * k].as_flattened_mut());
 
+    wipe(caches[..k].as_flattened_mut());
+
     wipe(&mut g);
+
+    h
 }
 
 fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &mut [u8]) {
     let k = p.k;
 
+    let mut sponges = Sponges::empty();
+
     let mut y = [[0; 256]; 4];
 
-    sample_noise(p.eta1, r, 0, &mut y[..k]);
+    sample_noise(&mut sponges, p.eta1, r, 0, &mut y[..k]);
 
     for y_n in &mut y[..k] {
         ntt(y_n);
     }
 
+    let mut caches = [[0; 128]; 4];
+
+    for (cache, y_n) in caches.iter_mut().zip(&y[..k]) {
+        *cache = multiply_cache(y_n);
+    }
+
     // e1 from the nonces k to 2k - 1 and e2 from 2k.
     let mut noise = [[0; 256]; 5];
 
-    sample_noise(p.eta2, r, k, &mut noise[..k + 1]);
+    sample_noise(&mut sponges, p.eta2, r, k, &mut noise[..k + 1]);
 
     let (c1, c2) = c.split_at_mut(32 * p.du as usize * k);
 
@@ -708,8 +871,8 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
     for (i, chunk) in c1.chunks_exact_mut(32 * p.du as usize).enumerate() {
         let mut acc = [0; 256];
 
-        for (j, y_j) in y[..k].iter().enumerate() {
-            multiply_accumulate(&mut acc, &key.matrix[j * k + i], y_j);
+        for (j, (y_j, cache)) in y[..k].iter().zip(&caches).enumerate() {
+            multiply_accumulate(&mut acc, &key.matrix[j * k + i], y_j, cache);
         }
 
         u = inverse_ntt(&acc);
@@ -723,8 +886,8 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
 
     let mut acc = [0; 256];
 
-    for (t_i, y_i) in key.t.iter().zip(&y[..k]) {
-        multiply_accumulate(&mut acc, t_i, y_i);
+    for ((t_i, y_i), cache) in key.t.iter().zip(&y[..k]).zip(&caches) {
+        multiply_accumulate(&mut acc, t_i, y_i, cache);
     }
 
     let mut v = inverse_ntt(&acc);
@@ -739,6 +902,8 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
 
     wipe(y.as_flattened_mut());
 
+    wipe(caches.as_flattened_mut());
+
     wipe(&mut acc);
 
     wipe(&mut u);
@@ -750,19 +915,21 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
     wipe(&mut mu);
 }
 
-fn pke_decrypt(s: &[Poly], c: &[u8], p: &Parameters) -> [u8; 32] {
+fn pke_decrypt(secret: &DecapsulationKey, c: &[u8], p: &Parameters) -> [u8; 32] {
     let k = p.k;
 
     let (c1, c2) = c.split_at(32 * p.du as usize * k);
 
     let mut acc = [0; 256];
 
-    for (chunk, s_i) in c1.chunks_exact(32 * p.du as usize).zip(s) {
+    let chunks = c1.chunks_exact(32 * p.du as usize);
+
+    for (chunk, (s_i, cache)) in chunks.zip(secret.s.iter().zip(&secret.caches)) {
         let mut u = byte_decode(chunk, p.du).map(|x| decompress(x, p.du));
 
         ntt(&mut u);
 
-        multiply_accumulate(&mut acc, s_i, &u);
+        multiply_accumulate(&mut acc, &u, s_i, cache);
     }
 
     let mut w = inverse_ntt(&acc);
@@ -791,11 +958,11 @@ pub(crate) fn keygen_internal(d: &[u8], z: &[u8], p: &Parameters) -> (Vec<u8>, S
 
     let mut dk = SecretBytes::zeroed(p.decapsulation_key_size());
 
-    pke_keygen(d, p, &mut ek, &mut dk[..384 * k]);
+    let h = pke_keygen(d, p, &mut ek, &mut dk[..384 * k]);
 
     dk[384 * k..768 * k + 32].copy_from_slice(&ek);
 
-    dk[768 * k + 32..768 * k + 64].copy_from_slice(&sha3_256(&[&ek]));
+    dk[768 * k + 32..768 * k + 64].copy_from_slice(&h);
 
     dk[768 * k + 64..].copy_from_slice(z);
 
@@ -836,7 +1003,7 @@ pub(crate) fn decaps_internal(
 ) -> [u8; 32] {
     let z = &dk[768 * p.k + 64..];
 
-    let mut m = pke_decrypt(&secret.0, c, p);
+    let mut m = pke_decrypt(secret, c, p);
 
     let mut g = sha3_512(&[&m, &public.h]);
 
@@ -926,7 +1093,7 @@ mod tests {
 
     // The transform and product kernels against the portable code: canonical coefficients into
     // the forward transform and the products, any 32-bit sums into the inverse, and sums below
-    // 2^28 under the products.
+    // 3 * 2^26 under the products.
     #[test]
     fn transform_kernels_match_portable() {
         let mut inputs = Inputs::new(3329);
@@ -978,18 +1145,172 @@ mod tests {
 
             let g = values(&mut inputs, n + 1, 0, q, |x| x as u16);
 
-            let acc = values(&mut inputs, n, -(1 << 28), 1 << 28, |x| x as i32);
+            let cache = multiply_cache(&g);
+
+            assert!(cache.iter().all(|&c| u32::from(c) < Q), "cache, case {n}");
+
+            let acc = values(&mut inputs, n, 0, 3 << 26, |x| x as i32);
 
             let (mut expected, mut actual) = (acc, acc);
 
-            multiply_accumulate_portable(&mut expected, &f, &g);
+            multiply_accumulate_portable(&mut expected, &f, &g, &cache);
 
-            if cpu::base_multiply_add(&mut actual, &f, &g, &GAMMAS, &FIELD) {
+            if cpu::base_multiply_add(&mut actual, &f, &g, &cache) {
                 assert_eq!(actual, expected, "base multiplication, case {n}");
             }
         }
 
         std::eprintln!("ML-KEM: {accelerated} of 20000 cases through the CPU kernels");
+    }
+
+    // The rejection kernel against the portable code from every count near the end and from
+    // random ones, on random blocks and on blocks of candidates at the bound: the same count and
+    // the same accepted values. Slots past the count may differ.
+    #[test]
+    fn uniform_kernel_matches_portable() {
+        let mut inputs = Inputs::new(168);
+
+        let mut accelerated = 0;
+
+        for n in 0..20_000 {
+            let bytes: [u8; 168] = match n % 5 {
+                0 => {
+                    let candidates: [u32; 112] =
+                        core::array::from_fn(|i| Q - 2 + ((inputs.next() as u32 + i as u32) % 4));
+
+                    let mut block = [0; 168];
+
+                    for (bytes, pair) in block
+                        .as_chunks_mut::<3>()
+                        .0
+                        .iter_mut()
+                        .zip(candidates.as_chunks::<2>().0)
+                    {
+                        let word = pair[0] | (pair[1] << 12);
+
+                        *bytes = [word as u8, (word >> 8) as u8, (word >> 16) as u8];
+                    }
+
+                    block
+                }
+                1 => [[0x00, 0xFF, 0x55][n / 5 % 3]; 168],
+                _ => inputs.bytes(),
+            };
+
+            let block: [u64; 21] =
+                core::array::from_fn(|i| u64::from_le_bytes(bytes.as_chunks::<8>().0[i]));
+
+            let start = match n % 3 {
+                0 => 256 - n / 3 % 64,
+                _ => (inputs.next() % 257) as usize,
+            };
+
+            let prefix: Poly = core::array::from_fn(|_| inputs.next() as u16 % 3329);
+
+            let (mut expected, mut expected_count) = (prefix, start);
+
+            sample_uniform_portable(&block, &mut expected, &mut expected_count);
+
+            let (mut actual, mut actual_count) = (prefix, start);
+
+            if cpu::uniform12(&block, Q as u16, &mut actual, &mut actual_count) {
+                assert_eq!(actual_count, expected_count, "case {n}");
+
+                assert_eq!(actual[..actual_count], expected[..actual_count], "case {n}");
+
+                accelerated += 1;
+            }
+        }
+
+        std::eprintln!("ML-KEM sampling: {accelerated} of 20000 cases through a CPU kernel");
+    }
+
+    // The product kernel of key generation against the portable code, for k = 2 to 4, one to k
+    // rows and canonical polynomials at their bounds first.
+    #[test]
+    fn matrix_vector_kernel_matches_portable() {
+        let mut inputs = Inputs::new(2048);
+
+        let mut accelerated = 0;
+
+        for n in 0..20_000 {
+            let k = 2 + n % 3;
+
+            let mut canonical =
+                |case: usize| values(&mut inputs, case, 0, i64::from(Q), |x| x as u16);
+
+            let matrix: [Poly; 16] = core::array::from_fn(|i| canonical(n + i));
+
+            let s: [Poly; 4] = core::array::from_fn(|i| canonical(n + i + 1));
+
+            let e: [Poly; 4] = core::array::from_fn(|i| canonical(n + i + 2));
+
+            let caches = s.each_ref().map(multiply_cache);
+
+            let rows = 1 + n / 3 % k;
+
+            let (mut expected, mut actual) = ([[0; 256]; 4], [[0; 256]; 4]);
+
+            matrix_vector_portable(
+                &mut expected[..rows],
+                &matrix[..rows * k],
+                &s[..k],
+                &caches[..k],
+                &e[..rows],
+            );
+
+            if cpu::mlkem_matrix_vector(
+                &mut actual[..rows],
+                &matrix[..rows * k],
+                &s[..k],
+                &caches[..k],
+                &e[..rows],
+                Q as u16,
+            ) {
+                assert_eq!(actual[..rows], expected[..rows], "k = {k}, case {n}");
+
+                accelerated += 1;
+            }
+        }
+
+        std::eprintln!("ML-KEM products: {accelerated} of 20000 cases through a CPU kernel");
+    }
+
+    // The reduction and encoding kernels against the portable code: any 32-bit sums and the
+    // canonical coefficients, at their bounds first.
+    #[test]
+    fn reduction_kernels_match_portable() {
+        let mut inputs = Inputs::new(384);
+
+        let mut accelerated = 0;
+
+        for n in 0..20_000 {
+            let w = values(&mut inputs, n, i64::from(i32::MIN), 1 << 31, |x| x as i32);
+
+            let mut actual = [0; 256];
+
+            if cpu::reduce(&w, i32::from(R_MOD_Q), &FIELD, &mut actual) {
+                assert_eq!(actual, canonical_portable(&w), "reduction, case {n}");
+
+                accelerated += 1;
+            }
+
+            let f = values(&mut inputs, n, 0, i64::from(Q), |x| x as u16);
+
+            let mut expected = [0; 384];
+
+            encode_bits::<12>(&f, &mut expected);
+
+            let mut actual = [0; 384];
+
+            if cpu::encode12(&f, &mut actual) {
+                assert_eq!(actual, expected, "encoding, case {n}");
+
+                accelerated += 1;
+            }
+        }
+
+        std::eprintln!("ML-KEM reduction: {accelerated} of 40000 cases through a CPU kernel");
     }
 
     // The noise kernel against the portable code, both values of eta, on random bytes and on
@@ -1006,10 +1327,13 @@ mod tests {
                 None => inputs.bytes(),
             };
 
+            let lanes: [u64; 24] =
+                core::array::from_fn(|i| u64::from_le_bytes(data.as_chunks::<8>().0[i]));
+
             for eta in [2, 3] {
                 let mut actual = [0; 256];
 
-                if cpu::binomial(eta, &data[..64 * eta], Q as u16, &mut actual) {
+                if cpu::binomial(eta, &lanes[..8 * eta], Q as u16, &mut actual) {
                     let expected = binomial_portable(eta, &data[..64 * eta]);
 
                     assert_eq!(actual, expected, "eta {eta}, case {n}");

@@ -107,13 +107,13 @@ fn probe() -> u32 {
 }
 
 #[allow(unsafe_code)]
-pub(crate) fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]]) -> bool {
+pub(crate) fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) -> bool {
     if !has(SHA) {
         return false;
     }
 
     // SAFETY: the CPU has the SHA extensions, SSSE3 and SSE4.1, all that the kernel needs.
-    unsafe { compress256_sha(state, blocks) };
+    unsafe { compress256_sha(state, blocks, more) };
 
     true
 }
@@ -194,16 +194,18 @@ pub(crate) fn multiply(
 #[allow(unsafe_code)]
 pub(crate) fn multiply_add(
     acc: &mut [i32; 256],
-    f: &[i32; 256],
-    g: &[i32; 256],
+    f: &[[i32; 256]],
+    g: &[[i32; 256]],
     field: &Field,
 ) -> bool {
     if !has(AVX2) {
         return false;
     }
 
-    // SAFETY: as in ntt.
-    unsafe { products_avx2::<true>(acc, f, g, field) };
+    for (f, g) in f.iter().zip(g) {
+        // SAFETY: as in ntt.
+        unsafe { products_avx2::<true>(acc, f, g, field) };
+    }
 
     true
 }
@@ -211,23 +213,95 @@ pub(crate) fn multiply_add(
 #[allow(unsafe_code)]
 pub(crate) fn base_multiply_add(
     acc: &mut [i32; 256],
-    f: &[u16; 256],
-    g: &[u16; 256],
-    gammas: &[i32; 128],
-    field: &Field,
+    a: &[u16; 256],
+    b: &[u16; 256],
+    cache: &[u16; 128],
 ) -> bool {
     if !has(AVX2) {
         return false;
     }
 
     // SAFETY: as in ntt.
-    unsafe { base_products_avx2(acc, f, g, gammas, field) };
+    unsafe { base_products_avx2(acc, a, b, cache) };
 
     true
 }
 
 #[inline(always)]
-pub(crate) fn binomial(_: usize, _: &[u8], _: u16, _: &mut [u16; 256]) -> bool {
+pub(crate) fn binomial(_: usize, _: &[u64], _: u16, _: &mut [u16; 256]) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn mldsa_add(_: &mut [i32; 256], _: &[i32; 256], _: &[i32; 256], _: i32) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn mldsa_sub(_: &mut [i32; 256], _: &[i32; 256], _: &[i32; 256], _: i32) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn mldsa_norm(_: &[i32; 256], _: i32, _: Option<i32>, _: i32) -> Option<i32> {
+    None
+}
+
+#[inline(always)]
+pub(crate) fn mldsa_hints(
+    _: &mut [i32; 256],
+    _: &[i32; 256],
+    _: &[i32; 256],
+    _: i32,
+    _: i32,
+) -> Option<i32> {
+    None
+}
+
+#[inline(always)]
+pub(crate) fn mldsa_w1(_: &mut [u8], _: &[i32; 256], _: i32, _: i32) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn mldsa_mask(_: &mut [i32; 256], _: &[u8], _: u32, _: i32, _: i32) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn mlkem_matrix_vector(
+    _: &mut [[u16; 256]],
+    _: &[[u16; 256]],
+    _: &[[u16; 256]],
+    _: &[[u16; 128]],
+    _: &[[u16; 256]],
+    _: u16,
+) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn reduce(_: &[i32; 256], _: i32, _: &Field, _: &mut [u16; 256]) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn encode12(_: &[u16; 256], _: &mut [u8; 384]) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn uniform12(_: &[u64; 21], _: u16, _: &mut [u16; 256], _: &mut usize) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn uniform23(_: &[u64; 21], _: i32, _: &mut [i32; 256], _: &mut usize) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn bounded(_: &[u64; 17], _: i32, _: &mut [i32; 256], _: &mut usize) -> bool {
     false
 }
 
@@ -352,26 +426,34 @@ fn products_avx2<const ADD: bool>(
 }
 
 #[target_feature(enable = "avx2")]
-fn base_products_avx2(
-    acc: &mut [i32; 256],
-    f: &[u16; 256],
-    g: &[u16; 256],
-    gammas: &[i32; 128],
-    field: &Field,
-) {
+fn base_products_avx2(acc: &mut [i32; 256], a: &[u16; 256], b: &[u16; 256], cache: &[u16; 128]) {
     let pairs = acc.as_chunks_mut::<2>().0.iter_mut();
 
-    let factors = f.as_chunks::<2>().0.iter().zip(g.as_chunks::<2>().0);
+    let factors = a.as_chunks::<2>().0.iter().zip(b.as_chunks::<2>().0);
 
-    for ((acc, (a, b)), &gamma) in pairs.zip(factors).zip(gammas) {
+    for ((acc, (a, b)), &c) in pairs.zip(factors).zip(cache) {
         let ([a0, a1], [b0, b1]) = (a.map(i32::from), b.map(i32::from));
 
-        let product = montgomery(a1, b1, b1.wrapping_mul(field.qinv), field.q);
-
-        acc[0] += a0 * b0 + product * gamma;
+        acc[0] += a0 * b0 + a1 * i32::from(c);
 
         acc[1] += a0 * b1 + a1 * b0;
     }
+}
+
+// Groups of four fill the AVX2 kernel.
+pub(crate) const fn keccak_group() -> usize {
+    4
+}
+
+// The AVX2 kernel permutes several states at once, so a single sponge keeps the scalar code.
+#[inline(always)]
+pub(crate) fn absorb(_: &mut [u64; 25], _: usize, _: &[u8]) -> usize {
+    0
+}
+
+#[inline(always)]
+pub(crate) fn absorb_last(_: &mut [u64; 25], _: usize, _: &[u8], _: &[u8]) -> bool {
+    false
 }
 
 // Four states per AVX2 call, and three with one lane idle; one or two stay with the scalar
@@ -497,7 +579,7 @@ fn rounds256<const N: usize>(streams: &mut [Stream; N]) {
 
 // The streaming hash: the state stays in registers from one block to the next.
 #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
-fn compress256_sha(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+fn compress256_sha(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
     let [a, b, c, d, e, f, g, h] = *state;
 
     let mut streams = [Stream {
@@ -509,7 +591,7 @@ fn compress256_sha(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
     // Reverses the bytes of each 32-bit word: the words of a block are big-endian.
     let swap = _mm_set_epi64x(0x0C0D_0E0F_0809_0A0B, 0x0405_0607_0001_0203);
 
-    for block in blocks {
+    for block in blocks.iter().chain(more) {
         for (m, bytes) in streams[0].m.iter_mut().zip(block.as_chunks::<16>().0) {
             let [low, high] = bytes.as_chunks::<8>().0 else {
                 unreachable!("sixteen bytes are two groups of eight")

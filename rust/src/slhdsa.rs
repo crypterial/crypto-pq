@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 
 use crate::ct::declassify;
 use crate::hash::{HMAC_SHA_256, HMAC_SHA_512};
-use crate::keccak::Sponges;
+use crate::keccak::{self, MAX_SPONGES, Sponges};
 use crate::primitives::{sha256, sha512, shake256};
 use crate::sha2::{IV_256, IV_512, Sha256, Sha512};
 use crate::wipe::{SecretBytes, wipe};
@@ -301,8 +301,10 @@ impl<'a> Hashes<'a> {
         self.truncate(&engine.digest())
     }
 
-    // F with SHAKE256 for the lanes that have an input, four sponges side by side: PK.seed,
-    // ADRS and the input fill less than one block.
+    // F with SHAKE256 for the lanes that have an input, a group of sponges side by side: PK.seed,
+    // ADRS and the input fill less than one block. Kept out of f_lanes: inlined there, its sponges
+    // made the SHA-2 path of f_lanes about 1% slower.
+    #[inline(never)]
     fn shake_lanes(&self, adrs: &[Adrs; LANES], inputs: [Option<&[u8]>; LANES]) -> [Node; LANES] {
         let n = self.n;
 
@@ -320,8 +322,10 @@ impl<'a> Hashes<'a> {
             }
         }
 
-        for group in active[..count].chunks(4) {
-            let parts: [[&[u8]; 3]; 4] = core::array::from_fn(|i| {
+        let mut sponges = Sponges::empty();
+
+        for group in active[..count].chunks(keccak::group()) {
+            let parts: [[&[u8]; 3]; MAX_SPONGES] = core::array::from_fn(|i| {
                 let lane = group.get(i).copied().unwrap_or_default();
 
                 [self.pk_seed, &adrs[lane], inputs[lane].unwrap_or_default()]
@@ -329,9 +333,9 @@ impl<'a> Hashes<'a> {
 
             let messages = parts.each_ref().map(|parts| &parts[..]);
 
-            let mut sponges = Sponges::new(136, 0x1F, &messages[..group.len()]);
+            sponges.start(136, 0x1F, &messages[..group.len()]);
 
-            sponges.squeeze([true; 4]);
+            sponges.squeeze([true; MAX_SPONGES]);
 
             for (i, &lane) in group.iter().enumerate() {
                 sponges.read(i, &mut nodes[lane][..n]);

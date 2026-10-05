@@ -38,13 +38,7 @@ impl Engine {
         match self {
             Self::Sha256(engine) => engine.digest()[..size].to_vec(),
             Self::Sha512(engine) => engine.digest()[..size].to_vec(),
-            Self::Keccak(engine) => {
-                let mut out = vec![0; size];
-
-                engine.clone().read(&mut out);
-
-                out
-            }
+            Self::Keccak(engine) => engine.clone().finish(size),
         }
     }
 }
@@ -73,11 +67,17 @@ impl HashAlgorithm {
     }
 
     pub fn digest(&self, data: &[u8]) -> Vec<u8> {
-        let mut hasher = self.create();
+        match self.kind {
+            Kind::Sha256(iv) => Sha256::digest_message(iv, data)[..self.digest_size].to_vec(),
+            Kind::Sha3 => Keccak::digest(self.block_size(), SHA3_SUFFIX, data, self.digest_size),
+            Kind::Sha512(_) => {
+                let mut hasher = self.create();
 
-        hasher.update(data);
+                hasher.update(data);
 
-        hasher.digest()
+                hasher.digest()
+            }
+        }
     }
 
     pub fn create(&self) -> Hasher {
@@ -134,11 +134,7 @@ impl XofAlgorithm {
     }
 
     pub fn digest(&self, data: &[u8], length: usize) -> Vec<u8> {
-        let mut xof = self.create();
-
-        xof.update(data);
-
-        xof.read(length)
+        Keccak::digest(self.rate, SHAKE_SUFFIX, data, length)
     }
 
     pub fn create(&self) -> Xof {

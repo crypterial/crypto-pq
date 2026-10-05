@@ -1,25 +1,47 @@
 // SHA-256 with the ARMv8 SHA2 instructions, SHA-512 with the ARMv8.2 SHA512 instructions and
 // Keccak-f[1600] with the ARMv8.2 SHA3 instructions; the NEON transforms of ML-KEM and ML-DSA and
-// ML-KEM's noise sampling are in the submodules. All of them are on Arm's list of instructions
-// whose timing does not depend on their data (FEAT_DIT), and the code around them has no branch
-// or address that depends on the data. The kernels are safe code inside #[target_feature]
-// functions; what is unsafe is calling one once its feature is known to be there, asking the
-// operating system for the features, and setting the DIT bit.
+// their noise and rejection sampling are in the submodules. All of them are on Arm's list of
+// instructions whose timing does not depend on their data (FEAT_DIT), and the code around them
+// has no branch or address that depends on secret data (sample.rs explains the one pattern it
+// declassifies). The kernels are safe code inside #[target_feature] functions, apart from the
+// loads and stores of memory.rs and the rounds of SHA-256 and Keccak that are written in
+// assembly; what is otherwise unsafe is calling one once its feature is known to be there,
+// asking the operating system for the features, and setting the DIT bit.
 
 use core::arch::aarch64::*;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::keccak::ROUND_CONSTANTS;
+use crate::keccak::{self, ROUND_CONSTANTS};
 use crate::sha2::{K256, K512};
 
 mod binomial;
 
+mod dsa;
+
+mod memory;
+
 mod ntt;
+
+mod pack;
+
+mod sample;
+
+use memory::{load_u8, load_u32, load_u64, store_u32, store_u64};
 
 pub(crate) use binomial::binomial;
 
+pub(crate) use dsa::{
+    add as mldsa_add, encode_w1 as mldsa_w1, hints as mldsa_hints, norm as mldsa_norm,
+    sub as mldsa_sub, unpack_mask as mldsa_mask,
+};
+
+pub(crate) use pack::{encode12, reduce};
+
+pub(crate) use sample::{bounded, uniform12, uniform23};
+
 pub(crate) use ntt::{
-    base_multiply_add, inverse_ntt, inverse_ntt16, multiply, multiply_add, ntt, ntt16,
+    base_multiply_add, inverse_ntt, inverse_ntt16, mlkem_matrix_vector, multiply, multiply_add,
+    ntt, ntt16,
 };
 
 const SHA2: u32 = 1;
@@ -247,14 +269,16 @@ fn clear_dit() {
     }
 }
 
+// The blocks and then the more blocks, as one stream: a one-shot hash passes its input and its
+// padding without copying the input.
 #[allow(unsafe_code)]
-pub(crate) fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]]) -> bool {
+pub(crate) fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) -> bool {
     if !has(SHA2) {
         return false;
     }
 
     // SAFETY: the CPU has the SHA2 instructions, the only feature the kernel needs.
-    unsafe { compress256_sha2(state, blocks) };
+    unsafe { compress256_sha2(state, blocks, more) };
 
     true
 }
@@ -286,22 +310,87 @@ pub(crate) fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]]) -> bool {
     true
 }
 
-// Permutes the states two at a time and returns how many it permuted; an odd last state is left
-// to the scalar permutation, which costs half of a pair.
+// Two states fill the vector pipes, and the scalar pipes permute a third beside them in little
+// more time, so sponges run in groups of six.
+pub(crate) fn keccak_group() -> usize {
+    if has(KECCAK) { 6 } else { 4 }
+}
+
+// Permutes every state, three at a time where that leaves no single state over, then two, then
+// one in vector registers, which is still faster than the scalar permutation; returns how many.
 #[allow(unsafe_code)]
 pub(crate) fn permute_many(states: &mut [&mut [u64; 25]]) -> usize {
     if !has(KECCAK) {
         return 0;
     }
 
-    let (pairs, _) = states.as_chunks_mut::<2>();
+    let count = states.len();
 
-    for [first, second] in pairs.iter_mut() {
-        // SAFETY: KECCAK is only ever found together with SHA3.
-        unsafe { permute2_sha3(first, second) };
+    let mut rest = states;
+
+    while !rest.is_empty() {
+        let size = match rest.len() {
+            1 => 1,
+            2 | 4 => 2,
+            _ => 3,
+        };
+
+        let (group, tail) = core::mem::take(&mut rest).split_at_mut(size);
+
+        // SAFETY: KECCAK is only ever found together with SHA3, all that the kernels need.
+        unsafe {
+            match group {
+                [only] => permute1_sha3(only),
+                [first, second] => permute2_sha3(first, second),
+                [first, second, third] => permute3_sha3(first, second, third),
+                _ => unreachable!("groups have one to three states"),
+            }
+        }
+
+        rest = tail;
     }
 
-    2 * pairs.len()
+    count
+}
+
+// Absorbs the whole blocks of data, rate bytes each, into one state, and returns how many bytes
+// that was. The state stays in vector registers from one block to the next.
+pub(crate) fn absorb(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
+    let length = data.len() - data.len() % rate;
+
+    if length == 0 || !absorb_blocks(state, rate, &data[..length], &[]) {
+        return 0;
+    }
+
+    length
+}
+
+// absorb of whole blocks followed by a last block of rate bytes, already padded, in one call.
+pub(crate) fn absorb_last(state: &mut [u64; 25], rate: usize, data: &[u8], last: &[u8]) -> bool {
+    data.len().is_multiple_of(rate) && last.len() == rate && absorb_blocks(state, rate, data, last)
+}
+
+// A kernel per rate: whole blocks of a constant size keep the state in registers, which a rate
+// known only at run time did not quite do.
+#[allow(unsafe_code)]
+fn absorb_blocks(state: &mut [u64; 25], rate: usize, data: &[u8], last: &[u8]) -> bool {
+    if !has(KECCAK) {
+        return false;
+    }
+
+    // SAFETY: KECCAK is only ever found together with SHA3.
+    unsafe {
+        match rate {
+            72 => absorb_sha3::<72>(state, data.as_chunks().0, last.as_chunks().0),
+            104 => absorb_sha3::<104>(state, data.as_chunks().0, last.as_chunks().0),
+            136 => absorb_sha3::<136>(state, data.as_chunks().0, last.as_chunks().0),
+            144 => absorb_sha3::<144>(state, data.as_chunks().0, last.as_chunks().0),
+            168 => absorb_sha3::<168>(state, data.as_chunks().0, last.as_chunks().0),
+            _ => return false,
+        }
+    }
+
+    true
 }
 
 #[target_feature(enable = "neon")]
@@ -375,6 +464,111 @@ fn quarter<const N: usize, const J: usize>(
     }
 }
 
+// Four rounds of a lone SHA-256 computation, which the latency of SHA256H and SHA256H2 bounds:
+// each overwrites one half of the state and reads the other half's old value, so one half is
+// copied first. The chain is shortest with the copy of abcd, which only SHA256H2 reads, through
+// an input that takes a cycle longer to reach its result than its own efgh. Compilers do not
+// always choose that copy, nor keep the message schedule from adding moves of its own, so the
+// instructions are written out: one block took 98 cycles of an Apple M3 as compiled, 82 here.
+#[target_feature(enable = "sha2")]
+#[inline]
+#[allow(unsafe_code)]
+fn lone_quarter<const J: usize>(
+    abcd: &mut uint32x4_t,
+    efgh: &mut uint32x4_t,
+    m: &mut [uint32x4_t; 4],
+    k: uint32x4_t,
+    schedule: bool,
+) {
+    let (next, after, last) = (m[(J + 1) % 4], m[(J + 2) % 4], m[(J + 3) % 4]);
+
+    let word = &mut m[J];
+
+    if schedule {
+        // SAFETY: instructions on registers only, which the sha2 feature of this function
+        // provides; they read and write no memory, stack or flags.
+        unsafe {
+            core::arch::asm!(
+                "add {wk:v}.4s, {word:v}.4s, {k:v}.4s",
+                "sha256su0 {word:v}.4s, {next:v}.4s",
+                "mov {copy:v}.16b, {abcd:v}.16b",
+                "sha256h {abcd:q}, {efgh:q}, {wk:v}.4s",
+                "sha256h2 {efgh:q}, {copy:q}, {wk:v}.4s",
+                "sha256su1 {word:v}.4s, {after:v}.4s, {last:v}.4s",
+                abcd = inout(vreg) *abcd,
+                efgh = inout(vreg) *efgh,
+                word = inout(vreg) *word,
+                next = in(vreg) next,
+                after = in(vreg) after,
+                last = in(vreg) last,
+                k = in(vreg) k,
+                wk = out(vreg) _,
+                copy = out(vreg) _,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+    } else {
+        // SAFETY: as above.
+        unsafe {
+            core::arch::asm!(
+                "add {wk:v}.4s, {word:v}.4s, {k:v}.4s",
+                "mov {copy:v}.16b, {abcd:v}.16b",
+                "sha256h {abcd:q}, {efgh:q}, {wk:v}.4s",
+                "sha256h2 {efgh:q}, {copy:q}, {wk:v}.4s",
+                abcd = inout(vreg) *abcd,
+                efgh = inout(vreg) *efgh,
+                word = in(vreg) *word,
+                k = in(vreg) k,
+                wk = out(vreg) _,
+                copy = out(vreg) _,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+    }
+}
+
+// lone_quarter::<0> with scheduling, which also copies the state for the addition at the end of
+// the block. Made apart, the copies became moves of the working state, onto the chain of every
+// block.
+#[target_feature(enable = "sha2")]
+#[inline]
+#[allow(unsafe_code)]
+fn first_quarter(
+    abcd: &mut uint32x4_t,
+    efgh: &mut uint32x4_t,
+    m: &mut [uint32x4_t; 4],
+    k: uint32x4_t,
+    start: &mut (uint32x4_t, uint32x4_t),
+) {
+    let [word, next, after, last] = m;
+
+    // SAFETY: as in lone_quarter.
+    unsafe {
+        core::arch::asm!(
+            "mov {start_abcd:v}.16b, {abcd:v}.16b",
+            "mov {start_efgh:v}.16b, {efgh:v}.16b",
+            "add {wk:v}.4s, {word:v}.4s, {k:v}.4s",
+            "sha256su0 {word:v}.4s, {next:v}.4s",
+            "mov {copy:v}.16b, {abcd:v}.16b",
+            "sha256h {abcd:q}, {efgh:q}, {wk:v}.4s",
+            "sha256h2 {efgh:q}, {copy:q}, {wk:v}.4s",
+            "sha256su1 {word:v}.4s, {after:v}.4s, {last:v}.4s",
+            abcd = inout(vreg) *abcd,
+            efgh = inout(vreg) *efgh,
+            word = inout(vreg) *word,
+            next = in(vreg) *next,
+            after = in(vreg) *after,
+            last = in(vreg) *last,
+            k = in(vreg) k,
+            start_abcd = out(vreg) start.0,
+            start_efgh = out(vreg) start.1,
+            wk = out(vreg) _,
+            copy = out(vreg) _,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+}
+
 #[target_feature(enable = "sha2")]
 #[inline]
 fn rounds256<const N: usize>(streams: &mut [Stream; N]) {
@@ -385,13 +579,13 @@ fn rounds256<const N: usize>(streams: &mut [Stream; N]) {
 
         let schedule = sixteen < 3;
 
-        quarter::<N, 0>(streams, vector32(&k[0]), schedule);
+        quarter::<N, 0>(streams, load_u32(&k[0]), schedule);
 
-        quarter::<N, 1>(streams, vector32(&k[1]), schedule);
+        quarter::<N, 1>(streams, load_u32(&k[1]), schedule);
 
-        quarter::<N, 2>(streams, vector32(&k[2]), schedule);
+        quarter::<N, 2>(streams, load_u32(&k[2]), schedule);
 
-        quarter::<N, 3>(streams, vector32(&k[3]), schedule);
+        quarter::<N, 3>(streams, load_u32(&k[3]), schedule);
     }
 
     for (stream, start) in streams.iter_mut().zip(&start) {
@@ -403,39 +597,56 @@ fn rounds256<const N: usize>(streams: &mut [Stream; N]) {
 
 // The streaming hash: the state stays in registers from one block to the next.
 #[target_feature(enable = "sha2")]
-fn compress256_sha2(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+fn compress256_sha2(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
     let [abcd, efgh] = state.as_chunks::<4>().0 else {
         unreachable!("eight words are two groups of four")
     };
 
-    let mut streams = [Stream {
-        abcd: vector32(abcd),
-        efgh: vector32(efgh),
-        m: [vdupq_n_u32(0); 4],
-    }];
+    let (mut abcd, mut efgh) = (load_u32(abcd), load_u32(efgh));
 
-    for block in blocks {
-        for (m, bytes) in streams[0].m.iter_mut().zip(block.as_chunks::<16>().0) {
-            let [low, high] = bytes.as_chunks::<8>().0 else {
-                unreachable!("sixteen bytes are two groups of eight")
-            };
+    let mut k = [vdupq_n_u32(0); 16];
 
-            let swapped = vrev32q_u8(vreinterpretq_u8_u64(vector64(
-                u64::from_le_bytes(*low),
-                u64::from_le_bytes(*high),
-            )));
-
-            *m = vreinterpretq_u32_u8(swapped);
-        }
-
-        rounds256(&mut streams);
+    for (k, words) in k.iter_mut().zip(K256.as_chunks::<4>().0) {
+        *k = load_u32(words);
     }
 
-    let (abcd, efgh) = state.split_at_mut(4);
+    for block in blocks.iter().chain(more) {
+        let mut m = [vdupq_n_u32(0); 4];
 
-    abcd.copy_from_slice(&words32(streams[0].abcd));
+        for (m, bytes) in m.iter_mut().zip(block.as_chunks::<16>().0) {
+            *m = vreinterpretq_u32_u8(vrev32q_u8(load_u8(bytes)));
+        }
 
-    efgh.copy_from_slice(&words32(streams[0].efgh));
+        let mut start = (abcd, efgh);
+
+        for (sixteen, k) in k.as_chunks::<4>().0.iter().enumerate() {
+            let schedule = sixteen < 3;
+
+            if sixteen == 0 {
+                first_quarter(&mut abcd, &mut efgh, &mut m, k[0], &mut start);
+            } else {
+                lone_quarter::<0>(&mut abcd, &mut efgh, &mut m, k[0], schedule);
+            }
+
+            lone_quarter::<1>(&mut abcd, &mut efgh, &mut m, k[1], schedule);
+
+            lone_quarter::<2>(&mut abcd, &mut efgh, &mut m, k[2], schedule);
+
+            lone_quarter::<3>(&mut abcd, &mut efgh, &mut m, k[3], schedule);
+        }
+
+        abcd = vaddq_u32(abcd, start.0);
+
+        efgh = vaddq_u32(efgh, start.1);
+    }
+
+    let [abcd_out, efgh_out] = state.as_chunks_mut::<4>().0 else {
+        unreachable!("eight words are two groups of four")
+    };
+
+    store_u32(abcd, abcd_out);
+
+    store_u32(efgh, efgh_out);
 }
 
 // Lane `lane` of the word-major states and schedule of compress256_lanes.
@@ -545,18 +756,14 @@ fn compress512_sha3(state: &mut [u64; 8], blocks: &[[u8; 128]]) {
     let mut s = [vdupq_n_u64(0); 4];
 
     for (pair, words) in s.iter_mut().zip(state.as_chunks::<2>().0) {
-        *pair = vector64(words[0], words[1]);
+        *pair = load_u64(words);
     }
 
     for block in blocks {
         let mut m = [vdupq_n_u64(0); 8];
 
         for (pair, bytes) in m.iter_mut().zip(block.as_chunks::<16>().0) {
-            let [low, high] = bytes.as_chunks::<8>().0 else {
-                unreachable!("sixteen bytes are two groups of eight")
-            };
-
-            *pair = vector64(u64::from_be_bytes(*low), u64::from_be_bytes(*high));
+            *pair = vreinterpretq_u64_u8(vrev64q_u8(load_u8(bytes)));
         }
 
         let start = s;
@@ -566,21 +773,21 @@ fn compress512_sha3(state: &mut [u64; 8], blocks: &[[u8; 128]]) {
 
             let schedule = sixteen < 4;
 
-            double_round::<0>(&mut s, &mut m, vector64(k[0][0], k[0][1]), schedule);
+            double_round::<0>(&mut s, &mut m, load_u64(&k[0]), schedule);
 
-            double_round::<1>(&mut s, &mut m, vector64(k[1][0], k[1][1]), schedule);
+            double_round::<1>(&mut s, &mut m, load_u64(&k[1]), schedule);
 
-            double_round::<2>(&mut s, &mut m, vector64(k[2][0], k[2][1]), schedule);
+            double_round::<2>(&mut s, &mut m, load_u64(&k[2]), schedule);
 
-            double_round::<3>(&mut s, &mut m, vector64(k[3][0], k[3][1]), schedule);
+            double_round::<3>(&mut s, &mut m, load_u64(&k[3]), schedule);
 
-            double_round::<4>(&mut s, &mut m, vector64(k[4][0], k[4][1]), schedule);
+            double_round::<4>(&mut s, &mut m, load_u64(&k[4]), schedule);
 
-            double_round::<5>(&mut s, &mut m, vector64(k[5][0], k[5][1]), schedule);
+            double_round::<5>(&mut s, &mut m, load_u64(&k[5]), schedule);
 
-            double_round::<6>(&mut s, &mut m, vector64(k[6][0], k[6][1]), schedule);
+            double_round::<6>(&mut s, &mut m, load_u64(&k[6]), schedule);
 
-            double_round::<7>(&mut s, &mut m, vector64(k[7][0], k[7][1]), schedule);
+            double_round::<7>(&mut s, &mut m, load_u64(&k[7]), schedule);
         }
 
         for (pair, start) in s.iter_mut().zip(start) {
@@ -589,7 +796,7 @@ fn compress512_sha3(state: &mut [u64; 8], blocks: &[[u8; 128]]) {
     }
 
     for (words, pair) in state.as_chunks_mut::<2>().0.iter_mut().zip(s) {
-        *words = [vgetq_lane_u64::<0>(pair), vgetq_lane_u64::<1>(pair)];
+        store_u64(pair, words);
     }
 }
 
@@ -656,6 +863,139 @@ fn round(a: &mut [uint64x2_t; 25], constant: u64) {
     a[0] = veorq_u64(a[0], vdupq_n_u64(constant));
 }
 
+// The 24 rounds of Keccak-f[1600] on the vectors of a, with the instructions of round in
+// assembly: the state in v0 to v24, theta's parities and D values in v25 to v31, which chi then
+// reuses. Compiled from round, the absorption of 168-byte blocks kept a lane in memory from one
+// round to the next, a store and a load on the chain of every round: 164 ns a block on an Apple
+// M3 instead of 131.
+#[target_feature(enable = "sha3")]
+#[inline]
+#[allow(unsafe_code)]
+fn rounds(a: &mut [uint64x2_t; 25]) {
+    // SAFETY: the assembly reads the 24 round constants and no other memory, writes no memory,
+    // and changes only the registers it names and the flags.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "eor3 v25.16b, v0.16b, v5.16b, v10.16b",
+            "eor3 v26.16b, v1.16b, v6.16b, v11.16b",
+            "eor3 v27.16b, v2.16b, v7.16b, v12.16b",
+            "eor3 v28.16b, v3.16b, v8.16b, v13.16b",
+            "eor3 v29.16b, v4.16b, v9.16b, v14.16b",
+            "eor3 v25.16b, v25.16b, v15.16b, v20.16b",
+            "eor3 v26.16b, v26.16b, v16.16b, v21.16b",
+            "eor3 v27.16b, v27.16b, v17.16b, v22.16b",
+            "eor3 v28.16b, v28.16b, v18.16b, v23.16b",
+            "eor3 v29.16b, v29.16b, v19.16b, v24.16b",
+            "rax1 v30.2d, v29.2d, v26.2d",
+            "rax1 v31.2d, v25.2d, v27.2d",
+            "rax1 v26.2d, v26.2d, v28.2d",
+            "rax1 v27.2d, v27.2d, v29.2d",
+            "rax1 v28.2d, v28.2d, v25.2d",
+            "mov v25.16b, v1.16b",
+            "xar v1.2d, v6.2d, v31.2d, #20",
+            "xar v6.2d, v9.2d, v28.2d, #44",
+            "xar v9.2d, v22.2d, v26.2d, #3",
+            "xar v22.2d, v14.2d, v28.2d, #25",
+            "xar v14.2d, v20.2d, v30.2d, #46",
+            "xar v20.2d, v2.2d, v26.2d, #2",
+            "xar v2.2d, v12.2d, v26.2d, #21",
+            "xar v12.2d, v13.2d, v27.2d, #39",
+            "xar v13.2d, v19.2d, v28.2d, #56",
+            "xar v19.2d, v23.2d, v27.2d, #8",
+            "xar v23.2d, v15.2d, v30.2d, #23",
+            "xar v15.2d, v4.2d, v28.2d, #37",
+            "xar v4.2d, v24.2d, v28.2d, #50",
+            "xar v24.2d, v21.2d, v31.2d, #62",
+            "xar v21.2d, v8.2d, v27.2d, #9",
+            "xar v8.2d, v16.2d, v31.2d, #19",
+            "xar v16.2d, v5.2d, v30.2d, #28",
+            "xar v5.2d, v3.2d, v27.2d, #36",
+            "xar v3.2d, v18.2d, v27.2d, #43",
+            "xar v18.2d, v17.2d, v26.2d, #49",
+            "xar v17.2d, v11.2d, v31.2d, #54",
+            "xar v11.2d, v7.2d, v26.2d, #58",
+            "xar v7.2d, v10.2d, v30.2d, #61",
+            "xar v10.2d, v25.2d, v31.2d, #63",
+            "eor v0.16b, v0.16b, v30.16b",
+            "bcax v25.16b, v0.16b, v2.16b, v1.16b",
+            "bcax v29.16b, v1.16b, v3.16b, v2.16b",
+            "bcax v2.16b, v2.16b, v4.16b, v3.16b",
+            "bcax v3.16b, v3.16b, v0.16b, v4.16b",
+            "bcax v4.16b, v4.16b, v1.16b, v0.16b",
+            "mov v0.16b, v25.16b",
+            "mov v1.16b, v29.16b",
+            "bcax v25.16b, v5.16b, v7.16b, v6.16b",
+            "bcax v29.16b, v6.16b, v8.16b, v7.16b",
+            "bcax v7.16b, v7.16b, v9.16b, v8.16b",
+            "bcax v8.16b, v8.16b, v5.16b, v9.16b",
+            "bcax v9.16b, v9.16b, v6.16b, v5.16b",
+            "mov v5.16b, v25.16b",
+            "mov v6.16b, v29.16b",
+            "bcax v25.16b, v10.16b, v12.16b, v11.16b",
+            "bcax v29.16b, v11.16b, v13.16b, v12.16b",
+            "bcax v12.16b, v12.16b, v14.16b, v13.16b",
+            "bcax v13.16b, v13.16b, v10.16b, v14.16b",
+            "bcax v14.16b, v14.16b, v11.16b, v10.16b",
+            "mov v10.16b, v25.16b",
+            "mov v11.16b, v29.16b",
+            "bcax v25.16b, v15.16b, v17.16b, v16.16b",
+            "bcax v29.16b, v16.16b, v18.16b, v17.16b",
+            "bcax v17.16b, v17.16b, v19.16b, v18.16b",
+            "bcax v18.16b, v18.16b, v15.16b, v19.16b",
+            "bcax v19.16b, v19.16b, v16.16b, v15.16b",
+            "mov v15.16b, v25.16b",
+            "mov v16.16b, v29.16b",
+            "bcax v25.16b, v20.16b, v22.16b, v21.16b",
+            "bcax v29.16b, v21.16b, v23.16b, v22.16b",
+            "bcax v22.16b, v22.16b, v24.16b, v23.16b",
+            "bcax v23.16b, v23.16b, v20.16b, v24.16b",
+            "bcax v24.16b, v24.16b, v21.16b, v20.16b",
+            "mov v20.16b, v25.16b",
+            "mov v21.16b, v29.16b",
+            "ld1r {{v25.2d}}, [{constants}], #8",
+            "eor v0.16b, v0.16b, v25.16b",
+            "subs {rounds}, {rounds}, #1",
+            "b.ne 2b",
+            constants = inout(reg) ROUND_CONSTANTS.as_ptr() => _,
+            rounds = inout(reg) 24u64 => _,
+            inout("v0") a[0],
+            inout("v1") a[1],
+            inout("v2") a[2],
+            inout("v3") a[3],
+            inout("v4") a[4],
+            inout("v5") a[5],
+            inout("v6") a[6],
+            inout("v7") a[7],
+            inout("v8") a[8],
+            inout("v9") a[9],
+            inout("v10") a[10],
+            inout("v11") a[11],
+            inout("v12") a[12],
+            inout("v13") a[13],
+            inout("v14") a[14],
+            inout("v15") a[15],
+            inout("v16") a[16],
+            inout("v17") a[17],
+            inout("v18") a[18],
+            inout("v19") a[19],
+            inout("v20") a[20],
+            inout("v21") a[21],
+            inout("v22") a[22],
+            inout("v23") a[23],
+            inout("v24") a[24],
+            out("v25") _,
+            out("v26") _,
+            out("v27") _,
+            out("v28") _,
+            out("v29") _,
+            out("v30") _,
+            out("v31") _,
+            options(nostack, readonly),
+        );
+    }
+}
+
 #[target_feature(enable = "sha3")]
 fn permute2_sha3(first: &mut [u64; 25], second: &mut [u64; 25]) {
     let mut a = [vdupq_n_u64(0); 25];
@@ -664,14 +1004,83 @@ fn permute2_sha3(first: &mut [u64; 25], second: &mut [u64; 25]) {
         *lane = vector64(*x, *y);
     }
 
-    for &constant in &ROUND_CONSTANTS {
-        round(&mut a, constant);
+    rounds(&mut a);
+
+    for (lane, (x, y)) in a.iter().zip(first.iter_mut().zip(second.iter_mut())) {
+        *x = vgetq_lane_u64::<0>(*lane);
+
+        *y = vgetq_lane_u64::<1>(*lane);
+    }
+}
+
+// One state in both halves of the vectors: the instructions of a pair, for a state alone.
+#[target_feature(enable = "sha3")]
+fn permute1_sha3(state: &mut [u64; 25]) {
+    let mut a = [vdupq_n_u64(0); 25];
+
+    for (lane, x) in a.iter_mut().zip(state.iter()) {
+        *lane = vdupq_n_u64(*x);
+    }
+
+    rounds(&mut a);
+
+    for (x, lane) in state.iter_mut().zip(&a) {
+        *x = vgetq_lane_u64::<0>(*lane);
+    }
+}
+
+// A pair in the vector pipes and the third state in the scalar ones, their rounds alternating.
+#[target_feature(enable = "sha3")]
+fn permute3_sha3(first: &mut [u64; 25], second: &mut [u64; 25], third: &mut [u64; 25]) {
+    let mut a = [vdupq_n_u64(0); 25];
+
+    for (lane, (x, y)) in a.iter_mut().zip(first.iter().zip(second.iter())) {
+        *lane = vector64(*x, *y);
+    }
+
+    let mut parities = keccak::parities(third);
+
+    let mut e = [0; 25];
+
+    for constants in ROUND_CONSTANTS.as_chunks::<2>().0 {
+        round(&mut a, constants[0]);
+
+        keccak::round(third, &mut e, &mut parities, constants[0]);
+
+        round(&mut a, constants[1]);
+
+        keccak::round(&e, third, &mut parities, constants[1]);
     }
 
     for (lane, (x, y)) in a.iter().zip(first.iter_mut().zip(second.iter_mut())) {
         *x = vgetq_lane_u64::<0>(*lane);
 
         *y = vgetq_lane_u64::<1>(*lane);
+    }
+}
+
+#[target_feature(enable = "sha3")]
+fn absorb_sha3<const RATE: usize>(
+    state: &mut [u64; 25],
+    blocks: &[[u8; RATE]],
+    last: &[[u8; RATE]],
+) {
+    let mut a = [vdupq_n_u64(0); 25];
+
+    for (lane, x) in a.iter_mut().zip(state.iter()) {
+        *lane = vdupq_n_u64(*x);
+    }
+
+    for block in blocks.iter().chain(last) {
+        for (lane, bytes) in a.iter_mut().zip(block.as_chunks::<8>().0) {
+            *lane = veorq_u64(*lane, vdupq_n_u64(u64::from_le_bytes(*bytes)));
+        }
+
+        rounds(&mut a);
+    }
+
+    for (x, lane) in state.iter_mut().zip(&a) {
+        *x = vgetq_lane_u64::<0>(*lane);
     }
 }
 

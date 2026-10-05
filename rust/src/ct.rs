@@ -1,28 +1,50 @@
 use core::hint::black_box;
 
+// The OR of the XORs of two equally long inputs, eight bytes at a time. The sum passes through
+// black_box after every 64 bytes and at the end, so the compiler can neither stop the loop early
+// nor see the result before every byte has been read; a barrier after every byte cost
+// microseconds per kilobyte.
+fn difference(a: &[u8], b: &[u8]) -> u64 {
+    let mut difference = 0;
+
+    let (a_blocks, a_rest) = a.as_chunks::<64>();
+
+    let (b_blocks, b_rest) = b.as_chunks::<64>();
+
+    for (x, y) in a_blocks.iter().zip(b_blocks) {
+        for (x, y) in x.as_chunks::<8>().0.iter().zip(y.as_chunks::<8>().0) {
+            difference |= u64::from_ne_bytes(*x) ^ u64::from_ne_bytes(*y);
+        }
+
+        difference = black_box(difference);
+    }
+
+    let (a_words, a_rest) = a_rest.as_chunks::<8>();
+
+    let (b_words, b_rest) = b_rest.as_chunks::<8>();
+
+    for (x, y) in a_words.iter().zip(b_words) {
+        difference |= u64::from_ne_bytes(*x) ^ u64::from_ne_bytes(*y);
+    }
+
+    for (x, y) in a_rest.iter().zip(b_rest) {
+        difference |= u64::from(x ^ y);
+    }
+
+    black_box(difference)
+}
+
 pub(crate) fn equal(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let mut difference = 0u8;
-
-    for (x, y) in a.iter().zip(b) {
-        difference = black_box(difference | (x ^ y));
-    }
-
-    difference == 0
+    a.len() == b.len() && difference(a, b) == 0
 }
 
 // 0xFF when the equally long inputs match, 0 otherwise, without a branch on their contents.
 pub(crate) fn equal_mask(a: &[u8], b: &[u8]) -> u8 {
-    let mut difference = 0u8;
+    let difference = difference(a, b);
 
-    for (x, y) in a.iter().zip(b) {
-        difference = black_box(difference | (x ^ y));
-    }
+    let nonzero = (difference | difference.wrapping_neg()) >> 63;
 
-    (u16::from(difference).wrapping_sub(1) >> 8) as u8
+    (nonzero as u8).wrapping_sub(1)
 }
 
 // out = a where mask is 0xFF, b where it is 0.
@@ -135,4 +157,36 @@ mod valgrind {
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     compile_error!("the constant-time check runs on x86_64 and aarch64");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Every length up to three blocks of 64 bytes, equal and with one bit flipped at each
+    // position in turn, against a byte-by-byte comparison.
+    #[test]
+    fn comparisons_find_every_difference() {
+        let a: [u8; 200] = core::array::from_fn(|i| (i * 37 + 11) as u8);
+
+        for length in 0..a.len() {
+            let a = &a[..length];
+
+            assert!(equal(a, a));
+
+            assert_eq!(equal_mask(a, a), 0xFF);
+
+            for position in 0..length {
+                let mut b = a.to_vec();
+
+                b[position] ^= 1 << (position % 8);
+
+                assert!(!equal(a, &b), "length {length}, position {position}");
+
+                assert_eq!(equal_mask(a, &b), 0, "length {length}, position {position}");
+            }
+        }
+
+        assert!(!equal(&a[..3], &a[..4]));
+    }
 }

@@ -236,12 +236,12 @@ fn round256(a: u32, b: u32, c: u32, d: &mut u32, e: u32, f: u32, g: u32, h: &mut
     *h = s0.wrapping_add((a & b) | (c & (a | b))).wrapping_add(t1);
 }
 
-fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
-    if cpu::compress256(state, blocks) {
+fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
+    if cpu::compress256(state, blocks, more) {
         return;
     }
 
-    for block in blocks {
+    for block in blocks.iter().chain(more) {
         compress256_block(state, block);
     }
 }
@@ -522,7 +522,7 @@ impl Sha256 {
         let state = &mut self.state;
 
         self.blocks
-            .update(data, |blocks| compress256(state, blocks));
+            .update(data, |blocks| compress256(state, blocks, &[]));
     }
 
     pub(crate) fn digest(&self) -> [u8; 32] {
@@ -531,13 +531,49 @@ impl Sha256 {
         let bits = self.length.wrapping_mul(8).to_be_bytes();
 
         self.blocks
-            .finish(&bits, |blocks| compress256(&mut state, blocks));
+            .finish(&bits, |blocks| compress256(&mut state, blocks, &[]));
 
         let mut out = [0; 32];
 
         for (bytes, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
             *bytes = word.to_be_bytes();
         }
+
+        wipe(&mut state);
+
+        out
+    }
+
+    // The digest of data alone, for a hash computed in one call: the whole blocks of data and the
+    // padding blocks go to the compression in one pass, without the block buffer.
+    pub(crate) fn digest_message(iv: &[u32; 8], data: &[u8]) -> [u8; 32] {
+        let (blocks, tail) = data.as_chunks::<64>();
+
+        let mut last = [[0; 64]; 2];
+
+        let used = if tail.len() + 9 > 64 { 2 } else { 1 };
+
+        let padding = last.as_flattened_mut();
+
+        padding[..tail.len()].copy_from_slice(tail);
+
+        padding[tail.len()] = 0x80;
+
+        let bits = (data.len() as u64).wrapping_mul(8).to_be_bytes();
+
+        padding[64 * used - 8..64 * used].copy_from_slice(&bits);
+
+        let mut state = *iv;
+
+        compress256(&mut state, blocks, &last[..used]);
+
+        let mut out = [0; 32];
+
+        for (bytes, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+            *bytes = word.to_be_bytes();
+        }
+
+        wipe(last.as_flattened_mut());
 
         wipe(&mut state);
 
@@ -764,7 +800,10 @@ mod tests {
 
             let mut actual = state;
 
-            if cpu::compress256(&mut actual, blocks) {
+            // The blocks as one stream from two slices, split at every point in turn.
+            let (first, more) = blocks.split_at(n / 3 % (blocks.len() + 1));
+
+            if cpu::compress256(&mut actual, first, more) {
                 assert_eq!(actual, expected, "case {n}");
 
                 accelerated += 1;
