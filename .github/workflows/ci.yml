@@ -379,6 +379,7 @@ jobs:
   zig-cross:
     name: zig ${{ matrix.target }}
     runs-on: ubuntu-latest
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -408,7 +409,7 @@ jobs:
       - if: matrix.target == 'riscv64-linux'
         run: |
           zig build test-binaries -Doptimize=ReleaseSafe -Dtarget=riscv64-linux
-          docker run --rm -v "$GITHUB_WORKSPACE:/w" -w /w/zig debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a sh -c 'apt-get update -q > /dev/null && apt-get install -yq --no-install-recommends qemu-user > /dev/null && for binary in zig-out/bin/*; do echo "== $binary"; qemu-riscv64 "$binary" || exit 1; done'
+          docker run --rm -v "$GITHUB_WORKSPACE:/w" -w /w/zig debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a sh -c 'apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update -q > /dev/null && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -yq --no-install-recommends qemu-user > /dev/null && for binary in zig-out/bin/*; do echo "== $binary"; qemu-riscv64 "$binary" || exit 1; done'
 
   # The packages that would be published build from their declared contents alone.
   package:
