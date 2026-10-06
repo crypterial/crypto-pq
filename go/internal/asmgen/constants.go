@@ -119,3 +119,43 @@ func keccakConstants() []uint64 {
 
 	return out
 }
+
+// The first width bits of the fractional part of the square root of p (FIPS 180-4, 5.3.3 and
+// 5.3.5), which are also the BLAKE2 IVs.
+func squareRootFraction(p int64, width int) uint64 {
+	const precision = 256
+
+	root := new(big.Float).SetPrec(precision).SetInt64(p)
+
+	root.Sqrt(root)
+
+	whole, _ := root.Int(nil)
+
+	fraction := new(big.Float).SetPrec(precision).Sub(root, new(big.Float).SetPrec(precision).SetInt(whole))
+
+	fraction.SetMantExp(fraction, width)
+
+	bits, _ := fraction.Int(nil)
+
+	return bits.Uint64()
+}
+
+func sha256InitialValues() []uint64 {
+	var out []uint64
+
+	for _, p := range primes(8) {
+		out = append(out, squareRootFraction(p, 32))
+	}
+
+	return out
+}
+
+func sha512InitialValues() []uint64 {
+	var out []uint64
+
+	for _, p := range primes(8) {
+		out = append(out, squareRootFraction(p, 64))
+	}
+
+	return out
+}

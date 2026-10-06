@@ -39,7 +39,7 @@ var xofs = []struct {
 // HMAC.rsp labels each group by digest length in bytes; L=20 is SHA-1, which is out of scope.
 var hmacs = map[string]struct {
 	name      string
-	algorithm cryptopq.HmacAlgorithm
+	algorithm cryptopq.MacAlgorithm
 }{
 	"28": {"HMAC-SHA-224", cryptopq.HMAC_SHA_224},
 	"32": {"HMAC-SHA-256", cryptopq.HMAC_SHA_256},
@@ -294,11 +294,15 @@ func TestXofProperties(t *testing.T) {
 }
 
 func TestInvalidAlgorithm(t *testing.T) {
-	panics(t, "invalid HashAlgorithm", func() { cryptopq.HashAlgorithm(0).Create() })
+	panics(t, "invalid HashAlgorithm", func() { cryptopq.HashAlgorithm{}.Create() })
 
-	panics(t, "invalid XofAlgorithm", func() { cryptopq.XofAlgorithm(9).Create() })
+	panics(t, "invalid XofAlgorithm", func() { cryptopq.XofAlgorithm{}.Create() })
 
-	panics(t, "invalid HmacAlgorithm", func() { cryptopq.HmacAlgorithm(0).Create(nil) })
+	panics(t, "invalid MacAlgorithm", func() { cryptopq.MacAlgorithm{}.Create(nil) })
+
+	panics(t, "invalid KdfAlgorithm", func() { cryptopq.KdfAlgorithm(0).Extract(nil, nil) })
+
+	panics(t, "invalid KdfAlgorithm", func() { cryptopq.KdfAlgorithm(4).Name() })
 }
 
 func TestHmacVectors(t *testing.T) {
@@ -466,7 +470,7 @@ func TestDigestIntoMatchesDigest(t *testing.T) {
 			hmac.DigestInto(streamed)
 
 			if !bytes.Equal(streamed, out) {
-				t.Fatalf("%s, %d bytes: Hmac.DigestInto differs from Digest", h.name, length)
+				t.Fatalf("%s, %d bytes: Mac.DigestInto differs from Digest", h.name, length)
 			}
 		}
 	}
@@ -522,7 +526,7 @@ func TestHmacDigestIntoAllocatesNothing(t *testing.T) {
 
 	var out [64]byte
 
-	for _, algorithm := range []cryptopq.HmacAlgorithm{cryptopq.HMAC_SHA_224, cryptopq.HMAC_SHA_256, cryptopq.HMAC_SHA_384, cryptopq.HMAC_SHA_512} {
+	for _, algorithm := range []cryptopq.MacAlgorithm{cryptopq.HMAC_SHA_224, cryptopq.HMAC_SHA_256, cryptopq.HMAC_SHA_384, cryptopq.HMAC_SHA_512} {
 		for _, keySize := range []int{0, 32, 64, 128, 200} {
 			key := data[:keySize]
 

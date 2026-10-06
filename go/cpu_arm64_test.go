@@ -83,3 +83,60 @@ func TestDIT(t *testing.T) {
 
 	ditClear()
 }
+
+// Every keyed operation of the MACs and KDFs leaves DIT as its caller had it, clear or set.
+func TestDITKeyedSymmetric(t *testing.T) {
+	if !useDIT {
+		t.Skip("the CPU has no DIT")
+	}
+
+	runtime.LockOSThread()
+
+	defer runtime.UnlockOSThread()
+
+	key, data, out := make([]byte, 32), make([]byte, 100), make([]byte, 64)
+
+	var operations []func()
+
+	for _, algorithm := range []MacAlgorithm{HMAC_SHA_256, HMAC_SHA_512, KMAC128, KMAC256, BLAKE2B_MAC, BLAKE2S_MAC} {
+		size := algorithm.DigestSize()
+
+		operations = append(operations,
+			func() { algorithm.DigestInto(key, data, out[:size]) },
+			func() { algorithm.Verify(key, data, out[:size]) },
+			func() {
+				mac := algorithm.Create(key)
+
+				mac.Update(data)
+
+				mac.DigestInto(out[:size])
+
+				mac.Verify(out[:size])
+			})
+	}
+
+	for _, algorithm := range []KdfAlgorithm{HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512} {
+		operations = append(operations,
+			func() { _ = algorithm.DeriveInto(key, out, nil) },
+			func() { algorithm.ExtractInto(key, make([]byte, len(algorithm.Extract(nil, nil))), nil) },
+			func() { _ = algorithm.ExpandInto(make([]byte, 64), out, nil) })
+	}
+
+	for i, operation := range operations {
+		operation()
+
+		if ditIsSet() {
+			t.Fatalf("operation %d left DIT set", i)
+		}
+
+		ditSet()
+
+		operation()
+
+		if !ditIsSet() {
+			t.Fatalf("operation %d cleared a DIT bit set by its caller", i)
+		}
+
+		ditClear()
+	}
+}

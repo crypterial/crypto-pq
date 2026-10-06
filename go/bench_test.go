@@ -64,21 +64,74 @@ func BenchmarkPQ(b *testing.B) {
 	}
 }
 
+type hashCase struct {
+	name   string
+	digest func()
+}
+
 func benchmarkHashes(b *testing.B) {
-	data := sequence(1024)
+	data, key := sequence(1024), sequence(32)
 
-	var out [64]byte
+	var out [128]byte
 
-	cases := []struct {
-		name   string
-		digest func()
-	}{
+	cases := []hashCase{
 		{"sha-256/64B", func() { cryptopq.SHA_256.DigestInto(data[:64], out[:32]) }},
 		{"sha-256/1KiB", func() { cryptopq.SHA_256.DigestInto(data, out[:32]) }},
-		{"sha-512/1KiB", func() { cryptopq.SHA_512.DigestInto(data, out[:]) }},
+		{"sha-512/1KiB", func() { cryptopq.SHA_512.DigestInto(data, out[:64]) }},
 		{"sha3-256/1KiB", func() { cryptopq.SHA3_256.DigestInto(data, out[:32]) }},
 		{"shake128/1KiB", func() { cryptopq.SHAKE128.DigestInto(data, out[:32]) }},
-		{"shake256/1KiB", func() { cryptopq.SHAKE256.DigestInto(data, out[:]) }},
+		{"shake256/1KiB", func() { cryptopq.SHAKE256.DigestInto(data, out[:64]) }},
+	}
+
+	customization := []byte("crypto-pq benchmark")
+
+	cshake128 := must(cryptopq.CSHAKE128.Configure(&cryptopq.XofOptions{Customization: customization}))
+
+	cshake256 := must(cryptopq.CSHAKE256.Configure(&cryptopq.XofOptions{Customization: customization}))
+
+	cxof := must(cryptopq.ASCON_CXOF128.Configure(&cryptopq.XofOptions{Customization: customization}))
+
+	kmac128 := must(cryptopq.KMAC128.Configure(&cryptopq.MacOptions{Customization: customization}))
+
+	kmac256 := must(cryptopq.KMAC256.Configure(&cryptopq.MacOptions{Customization: customization}))
+
+	for _, size := range []struct {
+		length int
+		suffix string
+	}{{64, "64B"}, {1024, "1KiB"}} {
+		d := data[:size.length]
+
+		cases = append(cases, []hashCase{
+			{"blake2b-512/" + size.suffix, func() { cryptopq.BLAKE2B_512.DigestInto(d, out[:64]) }},
+			{"blake2b-256/" + size.suffix, func() { cryptopq.BLAKE2B_256.DigestInto(d, out[:32]) }},
+			{"blake2b-384/" + size.suffix, func() { cryptopq.BLAKE2B_384.DigestInto(d, out[:48]) }},
+			{"blake2b-160/" + size.suffix, func() { cryptopq.BLAKE2B_160.DigestInto(d, out[:20]) }},
+			{"blake2s-256/" + size.suffix, func() { cryptopq.BLAKE2S_256.DigestInto(d, out[:32]) }},
+			{"blake2s-224/" + size.suffix, func() { cryptopq.BLAKE2S_224.DigestInto(d, out[:28]) }},
+			{"blake2s-160/" + size.suffix, func() { cryptopq.BLAKE2S_160.DigestInto(d, out[:20]) }},
+			{"blake2s-128/" + size.suffix, func() { cryptopq.BLAKE2S_128.DigestInto(d, out[:16]) }},
+			{"blake2b-mac/" + size.suffix, func() { cryptopq.BLAKE2B_MAC.DigestInto(key, d, out[:64]) }},
+			{"blake2s-mac/" + size.suffix, func() { cryptopq.BLAKE2S_MAC.DigestInto(key, d, out[:32]) }},
+			{"ascon-hash256/" + size.suffix, func() { cryptopq.ASCON_HASH256.DigestInto(d, out[:32]) }},
+			{"ascon-xof128/" + size.suffix, func() { cryptopq.ASCON_XOF128.DigestInto(d, out[:32]) }},
+			{"ascon-cxof128/" + size.suffix, func() { cxof.DigestInto(d, out[:32]) }},
+			{"cshake128/" + size.suffix, func() { cshake128.DigestInto(d, out[:32]) }},
+			{"cshake256/" + size.suffix, func() { cshake256.DigestInto(d, out[:64]) }},
+			{"kmac128/" + size.suffix, func() { kmac128.DigestInto(key, d, out[:32]) }},
+			{"kmac256/" + size.suffix, func() { kmac256.DigestInto(key, d, out[:64]) }},
+		}...)
+	}
+
+	options := &cryptopq.KdfOptions{Salt: sequence(32), Info: []byte("crypto-pq benchmark info")}
+
+	for _, length := range []int{32, 64, 128} {
+		suffix := strconv.Itoa(length) + "B"
+
+		cases = append(cases, []hashCase{
+			{"hkdf-sha-256/" + suffix, func() { _ = cryptopq.HKDF_SHA_256.DeriveInto(key, out[:length], options) }},
+			{"hkdf-sha-384/" + suffix, func() { _ = cryptopq.HKDF_SHA_384.DeriveInto(key, out[:length], options) }},
+			{"hkdf-sha-512/" + suffix, func() { _ = cryptopq.HKDF_SHA_512.DeriveInto(key, out[:length], options) }},
+		}...)
 	}
 
 	for _, c := range cases {

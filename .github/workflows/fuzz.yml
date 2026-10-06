@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [FuzzKemImport, FuzzDecapsulate, FuzzSignatureImport, FuzzVerify, FuzzLoadPrivateKey, FuzzStatefulVerify, FuzzStatefulImport, FuzzTreeCache, FuzzDer, FuzzPem, FuzzBase64]
+        target: [FuzzKemImport, FuzzDecapsulate, FuzzSignatureImport, FuzzVerify, FuzzLoadPrivateKey, FuzzStatefulVerify, FuzzStatefulImport, FuzzTreeCache, FuzzDer, FuzzPem, FuzzBase64, FuzzSymmetric]
     defaults:
       run:
         shell: bash
@@ -46,7 +46,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
-        target: [FuzzSHA256Kernels, FuzzSHA256Chains, FuzzSHA512Kernels, FuzzKeccakKernels, FuzzX25519Kernels, FuzzNTTKernels]
+        target: [FuzzSHA256Kernels, FuzzSHA256Chains, FuzzSHA512Kernels, FuzzKeccakKernels, FuzzX25519Kernels, FuzzNTTKernels, FuzzBlake2Kernels, FuzzAsconKernels]
     defaults:
       run:
         shell: bash

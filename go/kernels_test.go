@@ -734,3 +734,223 @@ func FuzzKeccakKernels(f *testing.F) {
 		}
 	})
 }
+
+// BLAKE2 compression of one to four blocks, the last with or without the final flag, from counters
+// about to carry into the high word.
+func TestBlake2Kernels(t *testing.T) {
+	r := rand.New(rand.NewPCG(2, 2))
+
+	var data [4 * 128]byte
+
+	for i := range kernelCases / 4 {
+		blocks := 1 + i%4
+
+		fillBytes(r, data[:])
+
+		if i < len(kernelEdges) {
+			edgeBytes(i, data[:])
+		}
+
+		var h64 [8]uint64
+
+		fillWords64(r, h64[:])
+
+		counter64 := [2]uint64{r.Uint64(), r.Uint64()}
+
+		if i%3 == 0 {
+			counter64[0] = ^uint64(0) - uint64(r.IntN(300))
+		}
+
+		flag64 := uint64(0)
+
+		if i%2 == 0 {
+			flag64 = ^uint64(0)
+		}
+
+		wantH, gotH, wantC, gotC := h64, h64, counter64, counter64
+
+		blake2bBlocksGeneric(&wantH, &wantC, flag64, data[:128*blocks])
+
+		blake2bBlocks(&gotH, &gotC, flag64, data[:128*blocks])
+
+		if gotH != wantH || gotC != wantC {
+			t.Fatalf("case %d: blake2bBlocks of %d blocks differs from the portable code", i, blocks)
+		}
+
+		var h32 [8]uint32
+
+		fillWords32(r, h32[:])
+
+		counter32 := [2]uint32{r.Uint32(), r.Uint32()}
+
+		if i%3 == 0 {
+			counter32[0] = ^uint32(0) - uint32(r.IntN(200))
+		}
+
+		flag32 := uint32(flag64)
+
+		want32, got32, wantC32, gotC32 := h32, h32, counter32, counter32
+
+		blake2sBlocksGeneric(&want32, &wantC32, flag32, data[:64*blocks])
+
+		blake2sBlocks(&got32, &gotC32, flag32, data[:64*blocks])
+
+		if got32 != want32 || gotC32 != wantC32 {
+			t.Fatalf("case %d: blake2sBlocks of %d blocks differs from the portable code", i, blocks)
+		}
+	}
+}
+
+// Ascon-p[12] and the absorption of one to five words, against the portable code.
+func TestAsconKernels(t *testing.T) {
+	r := rand.New(rand.NewPCG(3, 3))
+
+	var data [40]byte
+
+	for i := range kernelCases {
+		var s [5]uint64
+
+		fillWords64(r, s[:])
+
+		fillBytes(r, data[:])
+
+		if i < len(kernelEdges) {
+			for j := range s {
+				s[j] = kernelEdges[i]
+			}
+
+			edgeBytes(i, data[:])
+		}
+
+		want, got := s, s
+
+		asconPermuteGeneric(&want)
+
+		asconPermute(&got)
+
+		if got != want {
+			t.Fatalf("case %d: asconPermute differs from the portable code", i)
+		}
+
+		words := 1 + i%5
+
+		want, got = s, s
+
+		asconAbsorbWordsGeneric(&want, data[:8*words])
+
+		asconAbsorbWords(&got, data[:8*words])
+
+		if got != want {
+			t.Fatalf("case %d: asconAbsorbWords of %d words differs from the portable code", i, words)
+		}
+	}
+}
+
+// The precomputed initial states are Ascon-p[12] of the IVs (SP 800-232, Appendix A.3), as both
+// forms of the permutation compute them.
+func TestAsconInitialStates(t *testing.T) {
+	for iv, want := range map[uint64][5]uint64{0x0000080100cc0002: asconHashIV, 0x0000080000cc0003: asconXofIV, 0x0000080000cc0004: asconCxofIV} {
+		generic, fast := [5]uint64{iv}, [5]uint64{iv}
+
+		asconPermuteGeneric(&generic)
+
+		asconPermute(&fast)
+
+		if generic != want || fast != want {
+			t.Fatalf("IV %#x: got %x and %x", iv, generic, fast)
+		}
+	}
+}
+
+// The first 80 bytes give the chaining value and the counter, the rest whole blocks; the final flag
+// follows the low bit of the first byte.
+func FuzzBlake2Kernels(f *testing.F) {
+	f.Add(make([]byte, 80+128))
+
+	f.Add(make([]byte, 80+3*128+5))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) < 80 {
+			return
+		}
+
+		var h64 [8]uint64
+
+		for i := range h64 {
+			h64[i] = binary.LittleEndian.Uint64(data[8*i:])
+		}
+
+		counter64 := [2]uint64{binary.LittleEndian.Uint64(data[64:]), binary.LittleEndian.Uint64(data[72:])}
+
+		flag64 := -uint64(data[0] & 1)
+
+		message := data[80:]
+
+		wantH, gotH, wantC, gotC := h64, h64, counter64, counter64
+
+		blake2bBlocksGeneric(&wantH, &wantC, flag64, message)
+
+		blake2bBlocks(&gotH, &gotC, flag64, message)
+
+		if gotH != wantH || gotC != wantC {
+			t.Fatalf("blake2bBlocks differs from the portable code")
+		}
+
+		var h32 [8]uint32
+
+		for i := range h32 {
+			h32[i] = uint32(h64[i] >> (i % 32))
+		}
+
+		counter32 := [2]uint32{uint32(counter64[0]), uint32(counter64[1])}
+
+		want32, got32, wantC32, gotC32 := h32, h32, counter32, counter32
+
+		blake2sBlocksGeneric(&want32, &wantC32, uint32(flag64), message)
+
+		blake2sBlocks(&got32, &gotC32, uint32(flag64), message)
+
+		if got32 != want32 || gotC32 != wantC32 {
+			t.Fatalf("blake2sBlocks differs from the portable code")
+		}
+	})
+}
+
+// The first 40 bytes give the state, the rest the words absorbed.
+func FuzzAsconKernels(f *testing.F) {
+	f.Add(make([]byte, 40))
+
+	f.Add(make([]byte, 40+24+3))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) < 40 {
+			return
+		}
+
+		var s [5]uint64
+
+		for i := range s {
+			s[i] = binary.LittleEndian.Uint64(data[8*i:])
+		}
+
+		want, got := s, s
+
+		asconPermuteGeneric(&want)
+
+		asconPermute(&got)
+
+		if got != want {
+			t.Fatalf("asconPermute differs from the portable code")
+		}
+
+		want, got = s, s
+
+		asconAbsorbWordsGeneric(&want, data[40:])
+
+		asconAbsorbWords(&got, data[40:])
+
+		if got != want {
+			t.Fatalf("asconAbsorbWords differs from the portable code")
+		}
+	})
+}

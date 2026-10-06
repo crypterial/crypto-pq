@@ -811,7 +811,8 @@ func (e *sha256Engine) update(data []byte) {
 	e.used = copy(e.buffer[:], data)
 }
 
-// FIPS 180-4, 5.1: the 0x80 marker, zeros, then the message length in bits, big-endian.
+// FIPS 180-4, 5.1: the 0x80 marker, zeros, then the message length in bits, big-endian. The engines
+// also serve HMAC and HKDF, so their stack copies of the state and the last block are cleared.
 func (e *sha256Engine) digest() []byte {
 	out := make([]byte, e.size)
 
@@ -846,6 +847,12 @@ func (e *sha256Engine) digestInto(out []byte) {
 	}
 
 	copy(out, full[:e.size])
+
+	clear(tail[:])
+
+	clear(state[:])
+
+	clear(full[:])
 }
 
 func (e *sha256Engine) clone() engine {
@@ -931,6 +938,12 @@ func (e *sha512Engine) digestInto(out []byte) {
 	}
 
 	copy(out, full[:e.size])
+
+	clear(tail[:])
+
+	clear(state[:])
+
+	clear(full[:])
 }
 
 func (e *sha512Engine) clone() engine {
@@ -977,6 +990,48 @@ func sha256Finish(state [8]uint32, absorbed int, data, out []byte) {
 	}
 }
 
+// sha256Finish for a keyed state or secret data, as HMAC and HKDF have: the stack copies of the
+// state and the last block are cleared. A flag in sha256Finish instead cost the plain hashes a
+// spilled argument, and with it up to two fifths of the time of a one-block SHA-512 in some
+// binaries.
+func sha256FinishSecret(state [8]uint32, absorbed int, data, out []byte) {
+	whole := len(data) &^ 63
+
+	if whole > 0 {
+		compress256(&state, data[:whole])
+	}
+
+	var tail [128]byte
+
+	used := copy(tail[:], data[whole:])
+
+	tail[used] = 0x80
+
+	end := 64
+
+	if used+1+8 > 64 {
+		end = 128
+	}
+
+	binary.BigEndian.PutUint64(tail[end-8:end], uint64(absorbed+len(data))*8)
+
+	compress256(&state, tail[:end])
+
+	words := len(out) / 4
+
+	for i := range words {
+		binary.BigEndian.PutUint32(out[4*i:], state[i])
+	}
+
+	for j := range len(out) % 4 {
+		out[4*words+j] = byte(state[words] >> (24 - 8*j))
+	}
+
+	clear(tail[:end])
+
+	clear(state[:])
+}
+
 // The SHA-512 counterpart of sha256Finish, with 128-byte blocks; absorbed stays below 2^61. out
 // may end inside a word, as the 28 bytes of SHA-512/224 do.
 func sha512Finish(state [8]uint64, absorbed int, data, out []byte) {
@@ -1011,4 +1066,43 @@ func sha512Finish(state [8]uint64, absorbed int, data, out []byte) {
 	for j := range len(out) % 8 {
 		out[8*words+j] = byte(state[words] >> (56 - 8*j))
 	}
+}
+
+// The SHA-512 counterpart of sha256FinishSecret.
+func sha512FinishSecret(state [8]uint64, absorbed int, data, out []byte) {
+	whole := len(data) &^ 127
+
+	if whole > 0 {
+		compress512(&state, data[:whole])
+	}
+
+	var tail [256]byte
+
+	used := copy(tail[:], data[whole:])
+
+	tail[used] = 0x80
+
+	end := 128
+
+	if used+1+16 > 128 {
+		end = 256
+	}
+
+	binary.BigEndian.PutUint64(tail[end-8:end], uint64(absorbed+len(data))*8)
+
+	compress512(&state, tail[:end])
+
+	words := len(out) / 8
+
+	for i := range words {
+		binary.BigEndian.PutUint64(out[8*i:], state[i])
+	}
+
+	for j := range len(out) % 8 {
+		out[8*words+j] = byte(state[words] >> (56 - 8*j))
+	}
+
+	clear(tail[:end])
+
+	clear(state[:])
 }

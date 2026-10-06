@@ -326,12 +326,18 @@ func TestSignatureRoundTrip(t *testing.T) {
 
 		expectCode(t, err, cryptopq.INVALID_OPTION)
 
-		_, err = pair.PrivateKey.Sign(message, &cryptopq.SignOptions{PreHash: cryptopq.HashAlgorithm(0)})
+		for _, preHash := range []cryptopq.PreHash{cryptopq.HashAlgorithm{}, cryptopq.XofAlgorithm{}, cryptopq.BLAKE2B_512, cryptopq.ASCON_HASH256, cryptopq.CSHAKE256, cryptopq.ASCON_XOF128} {
+			_, err = pair.PrivateKey.Sign(message, &cryptopq.SignOptions{PreHash: preHash})
 
-		expectCode(t, err, cryptopq.INVALID_OPTION)
+			expectCode(t, err, cryptopq.INVALID_OPTION)
 
-		if pair.PublicKey.Verify(hashed, message, &cryptopq.VerifyOptions{PreHash: cryptopq.XofAlgorithm(3)}) {
-			t.Fatalf("%s: invalid pre-hash", algorithm)
+			_, err = cryptopq.Hazmat.Sign(pair.PrivateKey, message, make([]byte, 32), &cryptopq.SignOptions{PreHash: preHash})
+
+			expectCode(t, err, cryptopq.INVALID_OPTION)
+
+			if pair.PublicKey.Verify(hashed, message, &cryptopq.VerifyOptions{PreHash: preHash}) {
+				t.Fatalf("%s: invalid pre-hash %v", algorithm, preHash)
+			}
 		}
 	}
 }

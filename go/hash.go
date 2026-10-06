@@ -1,6 +1,9 @@
 package cryptopq
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"strconv"
+)
 
 type engine interface {
 	update(data []byte)
@@ -50,59 +53,149 @@ func (e *sha3Engine) clone() engine {
 	return &copied
 }
 
-type HashAlgorithm uint8
+// HashAlgorithm names a hash function. A BLAKE2 hash also carries the salt and personalization
+// that Configure gave it, as the parameter-block words they fill (zero by default), so that a
+// configured value needs no heap and keeps no reference to the caller's buffers.
+type HashAlgorithm struct {
+	id     uint8
+	params [4]uint64
+}
 
 const (
-	SHA_224 HashAlgorithm = iota + 1
-	SHA_256
-	SHA_384
-	SHA_512
-	SHA_512_224
-	SHA_512_256
-	SHA3_224
-	SHA3_256
-	SHA3_384
-	SHA3_512
+	hashSHA224 = iota + 1
+	hashSHA256
+	hashSHA384
+	hashSHA512
+	hashSHA512_224
+	hashSHA512_256
+	hashSHA3_224
+	hashSHA3_256
+	hashSHA3_384
+	hashSHA3_512
+	hashBLAKE2b160
+	hashBLAKE2b256
+	hashBLAKE2b384
+	hashBLAKE2b512
+	hashBLAKE2s128
+	hashBLAKE2s160
+	hashBLAKE2s224
+	hashBLAKE2s256
+	hashAsconHash256
 )
 
+var (
+	SHA_224       = HashAlgorithm{id: hashSHA224}
+	SHA_256       = HashAlgorithm{id: hashSHA256}
+	SHA_384       = HashAlgorithm{id: hashSHA384}
+	SHA_512       = HashAlgorithm{id: hashSHA512}
+	SHA_512_224   = HashAlgorithm{id: hashSHA512_224}
+	SHA_512_256   = HashAlgorithm{id: hashSHA512_256}
+	SHA3_224      = HashAlgorithm{id: hashSHA3_224}
+	SHA3_256      = HashAlgorithm{id: hashSHA3_256}
+	SHA3_384      = HashAlgorithm{id: hashSHA3_384}
+	SHA3_512      = HashAlgorithm{id: hashSHA3_512}
+	BLAKE2B_160   = HashAlgorithm{id: hashBLAKE2b160}
+	BLAKE2B_256   = HashAlgorithm{id: hashBLAKE2b256}
+	BLAKE2B_384   = HashAlgorithm{id: hashBLAKE2b384}
+	BLAKE2B_512   = HashAlgorithm{id: hashBLAKE2b512}
+	BLAKE2S_128   = HashAlgorithm{id: hashBLAKE2s128}
+	BLAKE2S_160   = HashAlgorithm{id: hashBLAKE2s160}
+	BLAKE2S_224   = HashAlgorithm{id: hashBLAKE2s224}
+	BLAKE2S_256   = HashAlgorithm{id: hashBLAKE2s256}
+	ASCON_HASH256 = HashAlgorithm{id: hashAsconHash256}
+)
+
+// HashOptions configures a BLAKE2 hash: a salt and a personalization of at most 16 bytes for
+// BLAKE2b and 8 for BLAKE2s, shorter ones zero-padded as the BLAKE2 specification says. The other
+// hashes take no options.
+type HashOptions struct {
+	Salt            []byte
+	Personalization []byte
+}
+
+// field is the size of a BLAKE2 salt or personalization, 0 for the hashes without them.
 type hashSpec struct {
 	name       string
 	digestSize int
 	blockSize  int
-	create     func() engine
+	field      int
+	create     func(params [4]uint64, size int) engine
+}
+
+func newBlake2bHash(params [4]uint64, size int) engine {
+	return newBlake2b(&params, size, nil)
+}
+
+func newBlake2sHash(params [4]uint64, size int) engine {
+	return newBlake2s(&params, size, nil)
 }
 
 var hashSpecs = [...]hashSpec{
-	SHA_224:     {"SHA-224", 28, 64, func() engine { return newSha256(&iv224, 28) }},
-	SHA_256:     {"SHA-256", 32, 64, func() engine { return newSha256(&iv256, 32) }},
-	SHA_384:     {"SHA-384", 48, 128, func() engine { return newSha512(&iv384, 48) }},
-	SHA_512:     {"SHA-512", 64, 128, func() engine { return newSha512(&iv512, 64) }},
-	SHA_512_224: {"SHA-512/224", 28, 128, func() engine { return newSha512(&iv512224, 28) }},
-	SHA_512_256: {"SHA-512/256", 32, 128, func() engine { return newSha512(&iv512256, 32) }},
-	SHA3_224:    {"SHA3-224", 28, 144, func() engine { return newSha3(28) }},
-	SHA3_256:    {"SHA3-256", 32, 136, func() engine { return newSha3(32) }},
-	SHA3_384:    {"SHA3-384", 48, 104, func() engine { return newSha3(48) }},
-	SHA3_512:    {"SHA3-512", 64, 72, func() engine { return newSha3(64) }},
+	hashSHA224:       {"SHA-224", 28, 64, 0, func([4]uint64, int) engine { return newSha256(&iv224, 28) }},
+	hashSHA256:       {"SHA-256", 32, 64, 0, func([4]uint64, int) engine { return newSha256(&iv256, 32) }},
+	hashSHA384:       {"SHA-384", 48, 128, 0, func([4]uint64, int) engine { return newSha512(&iv384, 48) }},
+	hashSHA512:       {"SHA-512", 64, 128, 0, func([4]uint64, int) engine { return newSha512(&iv512, 64) }},
+	hashSHA512_224:   {"SHA-512/224", 28, 128, 0, func([4]uint64, int) engine { return newSha512(&iv512224, 28) }},
+	hashSHA512_256:   {"SHA-512/256", 32, 128, 0, func([4]uint64, int) engine { return newSha512(&iv512256, 32) }},
+	hashSHA3_224:     {"SHA3-224", 28, 144, 0, func([4]uint64, int) engine { return newSha3(28) }},
+	hashSHA3_256:     {"SHA3-256", 32, 136, 0, func([4]uint64, int) engine { return newSha3(32) }},
+	hashSHA3_384:     {"SHA3-384", 48, 104, 0, func([4]uint64, int) engine { return newSha3(48) }},
+	hashSHA3_512:     {"SHA3-512", 64, 72, 0, func([4]uint64, int) engine { return newSha3(64) }},
+	hashBLAKE2b160:   {"BLAKE2b-160", 20, 128, 16, newBlake2bHash},
+	hashBLAKE2b256:   {"BLAKE2b-256", 32, 128, 16, newBlake2bHash},
+	hashBLAKE2b384:   {"BLAKE2b-384", 48, 128, 16, newBlake2bHash},
+	hashBLAKE2b512:   {"BLAKE2b-512", 64, 128, 16, newBlake2bHash},
+	hashBLAKE2s128:   {"BLAKE2s-128", 16, 64, 8, newBlake2sHash},
+	hashBLAKE2s160:   {"BLAKE2s-160", 20, 64, 8, newBlake2sHash},
+	hashBLAKE2s224:   {"BLAKE2s-224", 28, 64, 8, newBlake2sHash},
+	hashBLAKE2s256:   {"BLAKE2s-256", 32, 64, 8, newBlake2sHash},
+	hashAsconHash256: {"Ascon-Hash256", 32, 8, 0, func([4]uint64, int) engine { return &asconHashEngine{sponge: asconSponge{state: asconHashIV}} }},
 }
 
-func (a HashAlgorithm) spec() *hashSpec {
-	if a == 0 || int(a) >= len(hashSpecs) {
+func hashSpecOf(id uint8) *hashSpec {
+	if id == 0 || int(id) >= len(hashSpecs) {
 		panic("cryptopq: invalid HashAlgorithm")
 	}
 
-	return &hashSpecs[a]
+	return &hashSpecs[id]
 }
 
 func (a HashAlgorithm) Name() string {
-	return a.spec().name
+	return hashSpecOf(a.id).name
 }
 
 func (a HashAlgorithm) DigestSize() int {
-	return a.spec().digestSize
+	return hashSpecOf(a.id).digestSize
+}
+
+// Configure returns the algorithm with the options applied, or INVALID_OPTION; nil options leave
+// it as it is.
+func (a HashAlgorithm) Configure(options *HashOptions) (HashAlgorithm, error) {
+	spec := hashSpecOf(a.id)
+
+	if options == nil {
+		return a, nil
+	}
+
+	if len(options.Salt) > spec.field || len(options.Personalization) > spec.field {
+		if spec.field == 0 {
+			return HashAlgorithm{}, invalidOption(spec.name + " takes no salt or personalization")
+		}
+
+		return HashAlgorithm{}, invalidOption(spec.name + " takes a salt and a personalization of at most " + strconv.Itoa(spec.field) + " bytes")
+	}
+
+	configured := HashAlgorithm{id: a.id}
+
+	if spec.field > 0 {
+		configured.params = blake2Params(options.Salt, options.Personalization, spec.field)
+	}
+
+	return configured, nil
 }
 
 func (a HashAlgorithm) Digest(data []byte) []byte {
-	out := make([]byte, a.spec().digestSize)
+	out := make([]byte, hashSpecOf(a.id).digestSize)
 
 	a.DigestInto(data, out)
 
@@ -113,30 +206,36 @@ func (a HashAlgorithm) Digest(data []byte) []byte {
 // Each hash is called directly rather than through a function value, so that its buffers stay on
 // the stack together with out.
 func (a HashAlgorithm) DigestInto(data, out []byte) {
-	checkDigestLength(len(out), a.spec().digestSize)
+	checkDigestLength(len(out), hashSpecOf(a.id).digestSize)
 
-	switch a {
-	case SHA_224:
+	switch a.id {
+	case hashSHA224:
 		sha256Finish(iv224, 0, data, out)
-	case SHA_256:
+	case hashSHA256:
 		sha256Finish(iv256, 0, data, out)
-	case SHA_384:
+	case hashSHA384:
 		sha512Finish(iv384, 0, data, out)
-	case SHA_512:
+	case hashSHA512:
 		sha512Finish(iv512, 0, data, out)
-	case SHA_512_224:
+	case hashSHA512_224:
 		sha512Finish(iv512224, 0, data, out)
-	case SHA_512_256:
+	case hashSHA512_256:
 		sha512Finish(iv512256, 0, data, out)
+	case hashBLAKE2b160, hashBLAKE2b256, hashBLAKE2b384, hashBLAKE2b512:
+		blake2bSum(&a.params, nil, data, out)
+	case hashBLAKE2s128, hashBLAKE2s160, hashBLAKE2s224, hashBLAKE2s256:
+		blake2sSum(&a.params, nil, data, out)
+	case hashAsconHash256:
+		asconSum(asconHashIV, data, out)
 	default:
 		sha3DigestInto(data, out)
 	}
 }
 
 func (a HashAlgorithm) Create() *Hasher {
-	spec := a.spec()
+	spec := hashSpecOf(a.id)
 
-	return &Hasher{engine: spec.create(), size: spec.digestSize}
+	return &Hasher{engine: spec.create(a.params, spec.digestSize), size: spec.digestSize}
 }
 
 // An output buffer of another length is a programming error, as an index out of range is.
@@ -169,54 +268,140 @@ func (h *Hasher) DigestInto(out []byte) {
 	h.engine.digestInto(out)
 }
 
-type XofAlgorithm uint8
+// XofAlgorithm names an extendable-output function. A configured cSHAKE carries the Keccak state
+// after its customization block, and Ascon-XOF128 and Ascon-CXOF128 their state after the IV (and
+// the customization) in the first five words, so that this part is absorbed once, not per call.
+type XofAlgorithm struct {
+	id         uint8
+	customized bool
+	state      [25]uint64
+}
 
 const (
-	SHAKE128 XofAlgorithm = iota + 1
-	SHAKE256
+	xofSHAKE128 = iota + 1
+	xofSHAKE256
+	xofCSHAKE128
+	xofCSHAKE256
+	xofAsconXOF128
+	xofAsconCXOF128
 )
 
+var (
+	SHAKE128      = XofAlgorithm{id: xofSHAKE128}
+	SHAKE256      = XofAlgorithm{id: xofSHAKE256}
+	CSHAKE128     = XofAlgorithm{id: xofCSHAKE128}
+	CSHAKE256     = XofAlgorithm{id: xofCSHAKE256}
+	ASCON_XOF128  = XofAlgorithm{id: xofAsconXOF128, state: asconStateWords(asconXofIV)}
+	ASCON_CXOF128 = asconCustomized(nil)
+)
+
+// XofOptions configures cSHAKE and Ascon-CXOF128 with a customization string, which is at most 256
+// bytes for Ascon-CXOF128. SHAKE and Ascon-XOF128 take none.
+type XofOptions struct {
+	Customization []byte
+}
+
+// rate is the Keccak rate in bytes, 0 for Ascon.
 type xofSpec struct {
 	name string
 	rate int
 }
 
 var xofSpecs = [...]xofSpec{
-	SHAKE128: {"SHAKE128", 168},
-	SHAKE256: {"SHAKE256", 136},
+	xofSHAKE128:     {"SHAKE128", 168},
+	xofSHAKE256:     {"SHAKE256", 136},
+	xofCSHAKE128:    {"cSHAKE128", 168},
+	xofCSHAKE256:    {"cSHAKE256", 136},
+	xofAsconXOF128:  {"Ascon-XOF128", 0},
+	xofAsconCXOF128: {"Ascon-CXOF128", 0},
 }
 
-func (a XofAlgorithm) spec() *xofSpec {
-	if a == 0 || int(a) >= len(xofSpecs) {
+func xofSpecOf(id uint8) *xofSpec {
+	if id == 0 || int(id) >= len(xofSpecs) {
 		panic("cryptopq: invalid XofAlgorithm")
 	}
 
-	return &xofSpecs[a]
+	return &xofSpecs[id]
 }
 
 func (a XofAlgorithm) Name() string {
-	return a.spec().name
+	return xofSpecOf(a.id).name
+}
+
+// Configure returns the algorithm with the options applied, or INVALID_OPTION; nil options leave
+// it as it is. cSHAKE without a customization is SHAKE, as SP 800-185 defines it.
+func (a XofAlgorithm) Configure(options *XofOptions) (XofAlgorithm, error) {
+	spec := xofSpecOf(a.id)
+
+	if options == nil {
+		return a, nil
+	}
+
+	switch a.id {
+	case xofCSHAKE128, xofCSHAKE256:
+		return cshakeAlgorithm(a.id, nil, options.Customization), nil
+	case xofAsconCXOF128:
+		if len(options.Customization) > asconCustomizationLimit {
+			return XofAlgorithm{}, invalidOption("the Ascon-CXOF128 customization is at most 256 bytes")
+		}
+
+		return asconCustomized(options.Customization), nil
+	}
+
+	if len(options.Customization) > 0 {
+		return XofAlgorithm{}, invalidOption(spec.name + " takes no customization")
+	}
+
+	return a, nil
+}
+
+// The domain bits of the padding: SHAKE's 1111, or cSHAKE's 00 after a customization.
+func (a *XofAlgorithm) suffix() byte {
+	if a.customized {
+		return 0x04
+	}
+
+	return 0x1f
 }
 
 func (a XofAlgorithm) Digest(data []byte, length int) []byte {
-	sponge := keccak{rate: a.spec().rate, suffix: 0x1f}
+	if length < 0 {
+		panic("cryptopq: INVALID_LENGTH: length must not be negative")
+	}
 
-	sponge.update(data)
+	out := make([]byte, length)
 
-	return squeeze(&sponge, length)
+	a.digestInto(data, out)
+
+	return out
 }
 
 // DigestInto fills out with output, without allocating.
 func (a XofAlgorithm) DigestInto(data, out []byte) {
-	sponge := keccak{rate: a.spec().rate, suffix: 0x1f}
+	a.digestInto(data, out)
+}
 
-	sponge.update(data)
+// The receiver is a copy, so the configured state becomes the working state in place.
+func (a *XofAlgorithm) digestInto(data, out []byte) {
+	spec := xofSpecOf(a.id)
 
-	sponge.read(out)
+	if spec.rate == 0 {
+		asconXof((*[5]uint64)(a.state[:5]), data, out)
+
+		return
+	}
+
+	keccakXof(&a.state, spec.rate, a.suffix(), data, out)
 }
 
 func (a XofAlgorithm) Create() *Xof {
-	return &Xof{sponge: keccak{rate: a.spec().rate, suffix: 0x1f}}
+	spec := xofSpecOf(a.id)
+
+	if spec.rate == 0 {
+		return &Xof{ascon: true, asconSponge: asconSponge{state: [5]uint64(a.state[:5])}}
+	}
+
+	return &Xof{sponge: keccak{state: a.state, rate: spec.rate, suffix: a.suffix()}}
 }
 
 func (a XofAlgorithm) String() string {
@@ -224,309 +409,57 @@ func (a XofAlgorithm) String() string {
 }
 
 type Xof struct {
-	sponge keccak
+	sponge      keccak
+	asconSponge asconSponge
+	ascon       bool
 }
 
 func (x *Xof) Update(data []byte) {
+	if x.ascon {
+		x.asconSponge.update(data)
+
+		return
+	}
+
 	x.sponge.update(data)
 }
 
 func (x *Xof) Read(length int) []byte {
-	return squeeze(&x.sponge, length)
-}
-
-func (x *Xof) ReadInto(out []byte) {
-	x.sponge.read(out)
-}
-
-func squeeze(sponge *keccak, length int) []byte {
 	if length < 0 {
 		panic("cryptopq: INVALID_LENGTH: length must not be negative")
 	}
 
 	out := make([]byte, length)
 
-	sponge.read(out)
+	x.ReadInto(out)
 
 	return out
 }
 
-type HmacAlgorithm uint8
+func (x *Xof) ReadInto(out []byte) {
+	if x.ascon {
+		x.asconSponge.read(out)
 
-const (
-	HMAC_SHA_224 HmacAlgorithm = iota + 1
-	HMAC_SHA_256
-	HMAC_SHA_384
-	HMAC_SHA_512
-)
-
-type hmacSpec struct {
-	name string
-	hash HashAlgorithm
-}
-
-var hmacSpecs = [...]hmacSpec{
-	HMAC_SHA_224: {"HMAC-SHA-224", SHA_224},
-	HMAC_SHA_256: {"HMAC-SHA-256", SHA_256},
-	HMAC_SHA_384: {"HMAC-SHA-384", SHA_384},
-	HMAC_SHA_512: {"HMAC-SHA-512", SHA_512},
-}
-
-func (a HmacAlgorithm) spec() *hmacSpec {
-	if a == 0 || int(a) >= len(hmacSpecs) {
-		panic("cryptopq: invalid HmacAlgorithm")
+		return
 	}
 
-	return &hmacSpecs[a]
+	x.sponge.read(out)
 }
 
-func (a HmacAlgorithm) Name() string {
-	return a.spec().name
-}
+// The salt and personalization, each zero-padded to field bytes, as the little-endian words they
+// fill in the parameter block: words 4-7 of BLAKE2b, or words 4-7 of BLAKE2s packed two by two.
+func blake2Params(salt, personalization []byte, field int) [4]uint64 {
+	var block [32]byte
 
-func (a HmacAlgorithm) DigestSize() int {
-	return a.spec().hash.DigestSize()
-}
+	copy(block[:field], salt)
 
-func (a HmacAlgorithm) Digest(key, data []byte) []byte {
-	out := make([]byte, a.DigestSize())
+	copy(block[field:2*field], personalization)
 
-	a.DigestInto(key, data, out)
+	var params [4]uint64
 
-	return out
-}
-
-// DigestInto writes the tag into out, which must be DigestSize bytes long, without allocating.
-func (a HmacAlgorithm) DigestInto(key, data, out []byte) {
-	hash := a.spec().hash
-
-	checkDigestLength(len(out), hash.DigestSize())
-
-	defer ditLeave(ditEnter())
-
-	hmacInto(hash, key, data, out)
-}
-
-func (a HmacAlgorithm) Create(key []byte) *Hmac {
-	defer ditLeave(ditEnter())
-
-	hash := a.spec().hash
-
-	spec := hash.spec()
-
-	var block [128]byte
-
-	hmacKey(hash, key, &block)
-
-	h := &Hmac{size: spec.digestSize}
-
-	if spec.blockSize == 64 {
-		keyed := hmacKeys256(hashIV256(hash), &block)
-
-		h.inner = &sha256Engine{state: [8]uint32(keyed[:8]), length: 64, size: spec.digestSize}
-
-		h.outer = &sha256Engine{state: [8]uint32(keyed[8:]), length: 64, size: spec.digestSize}
-
-		clear(keyed[:])
-	} else {
-		keyed := hmacKeys512(hashIV512(hash), &block)
-
-		h.inner = &sha512Engine{state: keyed[0], length: 128, size: spec.digestSize}
-
-		h.outer = &sha512Engine{state: keyed[1], length: 128, size: spec.digestSize}
-
-		clear(keyed[0][:])
-
-		clear(keyed[1][:])
+	for i := range 2 * field / 8 {
+		params[i] = binary.LittleEndian.Uint64(block[8*i:])
 	}
 
-	clear(block[:])
-
-	return h
-}
-
-func (a HmacAlgorithm) Verify(key, data, tag []byte) bool {
-	defer ditLeave(ditEnter())
-
-	var expected [64]byte
-
-	size := a.DigestSize()
-
-	hmacInto(a.spec().hash, key, data, expected[:size])
-
-	ok := equal(expected[:size], tag)
-
-	clear(expected[:])
-
-	return ok
-}
-
-func (a HmacAlgorithm) String() string {
-	return a.Name()
-}
-
-// HMAC (RFC 2104) with every buffer on the stack, where it is cleared, so that a call allocates
-// nothing; the callers hold DIT. The inner and outer key blocks are compressed side by side where
-// the CPU can, and the inner and outer hashes are finished without engines.
-func hmacInto(hash HashAlgorithm, key, data, out []byte) {
-	var block [128]byte
-
-	hmacKey(hash, key, &block)
-
-	if hash.spec().blockSize == 64 {
-		keyed := hmacKeys256(hashIV256(hash), &block)
-
-		var inner [32]byte
-
-		sha256Finish([8]uint32(keyed[:8]), 64, data, inner[:len(out)])
-
-		sha256Finish([8]uint32(keyed[8:]), 64, inner[:len(out)], out)
-
-		clear(keyed[:])
-
-		clear(inner[:])
-	} else {
-		keyed := hmacKeys512(hashIV512(hash), &block)
-
-		var inner [64]byte
-
-		sha512Finish(keyed[0], 128, data, inner[:len(out)])
-
-		sha512Finish(keyed[1], 128, inner[:len(out)], out)
-
-		clear(keyed[0][:])
-
-		clear(keyed[1][:])
-
-		clear(inner[:])
-	}
-
-	clear(block[:])
-}
-
-// The key padded with zeros to a block, or its hash if it is longer than a block.
-func hmacKey(hash HashAlgorithm, key []byte, block *[128]byte) {
-	spec := hash.spec()
-
-	if len(key) > spec.blockSize {
-		hash.DigestInto(key, block[:spec.digestSize])
-	} else {
-		copy(block[:], key)
-	}
-}
-
-// The states after the inner and the outer key block, inner then outer, which sha256Lanes
-// compresses side by side.
-func hmacKeys256(iv *[8]uint32, block *[128]byte) [16]uint32 {
-	var words [32]uint32
-
-	for i := range 16 {
-		w := binary.BigEndian.Uint32(block[4*i:])
-
-		words[i], words[16+i] = w^0x36363636, w^0x5c5c5c5c
-	}
-
-	var keyed [16]uint32
-
-	sha256Lanes(iv, words[:], 1, keyed[:])
-
-	clear(words[:])
-
-	return keyed
-}
-
-func hmacKeys512(iv *[8]uint64, block *[128]byte) [2][8]uint64 {
-	var pads [2][128]byte
-
-	for i := range block {
-		pads[0][i], pads[1][i] = block[i]^0x36, block[i]^0x5c
-	}
-
-	keyed := [2][8]uint64{*iv, *iv}
-
-	compress512(&keyed[0], pads[0][:])
-
-	compress512(&keyed[1], pads[1][:])
-
-	clear(pads[0][:])
-
-	clear(pads[1][:])
-
-	return keyed
-}
-
-func hashIV256(hash HashAlgorithm) *[8]uint32 {
-	if hash == SHA_224 {
-		return &iv224
-	}
-
-	return &iv256
-}
-
-func hashIV512(hash HashAlgorithm) *[8]uint64 {
-	if hash == SHA_384 {
-		return &iv384
-	}
-
-	return &iv512
-}
-
-// Hmac holds the inner engine, which has absorbed the inner key block and the data so far, and the
-// outer one, which has absorbed the outer key block only.
-type Hmac struct {
-	inner engine
-	outer engine
-	size  int
-}
-
-func (h *Hmac) Update(data []byte) {
-	defer ditLeave(ditEnter())
-
-	h.inner.update(data)
-}
-
-func (h *Hmac) Digest() []byte {
-	out := make([]byte, h.size)
-
-	h.DigestInto(out)
-
-	return out
-}
-
-func (h *Hmac) DigestInto(out []byte) {
-	checkDigestLength(len(out), h.size)
-
-	defer ditLeave(ditEnter())
-
-	h.finish(out)
-}
-
-func (h *Hmac) Verify(tag []byte) bool {
-	defer ditLeave(ditEnter())
-
-	var expected [64]byte
-
-	h.finish(expected[:h.size])
-
-	ok := equal(expected[:h.size], tag)
-
-	clear(expected[:])
-
-	return ok
-}
-
-// The inner hash and the outer key give the output, which may be a key itself.
-func (h *Hmac) finish(out []byte) {
-	var inner [64]byte
-
-	h.inner.digestInto(inner[:h.size])
-
-	switch outer := h.outer.(type) {
-	case *sha256Engine:
-		sha256Finish(outer.state, 64, inner[:h.size], out)
-	case *sha512Engine:
-		sha512Finish(outer.state, 128, inner[:h.size], out)
-	}
-
-	clear(inner[:])
+	return params
 }

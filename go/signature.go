@@ -36,21 +36,21 @@ func hashPreHash(algorithm HashAlgorithm, arc uint64, strength int) preHashSpec 
 // Collision strength in bits of each approved pre-hash; SHAKE128 and SHAKE256 produce 256 and
 // 512 bits as FIPS 204 and FIPS 205 require.
 var hashPreHashes = [...]preHashSpec{
-	SHA_224:     hashPreHash(SHA_224, 4, 112),
-	SHA_256:     hashPreHash(SHA_256, 1, 128),
-	SHA_384:     hashPreHash(SHA_384, 2, 192),
-	SHA_512:     hashPreHash(SHA_512, 3, 256),
-	SHA_512_224: hashPreHash(SHA_512_224, 5, 112),
-	SHA_512_256: hashPreHash(SHA_512_256, 6, 128),
-	SHA3_224:    hashPreHash(SHA3_224, 7, 112),
-	SHA3_256:    hashPreHash(SHA3_256, 8, 128),
-	SHA3_384:    hashPreHash(SHA3_384, 9, 192),
-	SHA3_512:    hashPreHash(SHA3_512, 10, 256),
+	hashSHA224:     hashPreHash(SHA_224, 4, 112),
+	hashSHA256:     hashPreHash(SHA_256, 1, 128),
+	hashSHA384:     hashPreHash(SHA_384, 2, 192),
+	hashSHA512:     hashPreHash(SHA_512, 3, 256),
+	hashSHA512_224: hashPreHash(SHA_512_224, 5, 112),
+	hashSHA512_256: hashPreHash(SHA_512_256, 6, 128),
+	hashSHA3_224:   hashPreHash(SHA3_224, 7, 112),
+	hashSHA3_256:   hashPreHash(SHA3_256, 8, 128),
+	hashSHA3_384:   hashPreHash(SHA3_384, 9, 192),
+	hashSHA3_512:   hashPreHash(SHA3_512, 10, 256),
 }
 
 var xofPreHashes = [...]preHashSpec{
-	SHAKE128: newPreHash("SHAKE128", 11, 128, func(message []byte) []byte { return SHAKE128.Digest(message, 32) }),
-	SHAKE256: newPreHash("SHAKE256", 12, 256, func(message []byte) []byte { return SHAKE256.Digest(message, 64) }),
+	xofSHAKE128: newPreHash("SHAKE128", 11, 128, func(message []byte) []byte { return SHAKE128.Digest(message, 32) }),
+	xofSHAKE256: newPreHash("SHAKE256", 12, 256, func(message []byte) []byte { return SHAKE256.Digest(message, 64) }),
 }
 
 func preHashOf(preHash PreHash) (*preHashSpec, error) {
@@ -58,16 +58,16 @@ func preHashOf(preHash PreHash) (*preHashSpec, error) {
 	case nil:
 		return nil, nil
 	case HashAlgorithm:
-		if algorithm > 0 && int(algorithm) < len(hashPreHashes) {
-			return &hashPreHashes[algorithm], nil
+		if algorithm.id > 0 && int(algorithm.id) < len(hashPreHashes) {
+			return &hashPreHashes[algorithm.id], nil
 		}
 	case XofAlgorithm:
-		if algorithm > 0 && int(algorithm) < len(xofPreHashes) {
-			return &xofPreHashes[algorithm], nil
+		if algorithm.id > 0 && int(algorithm.id) < len(xofPreHashes) {
+			return &xofPreHashes[algorithm.id], nil
 		}
 	}
 
-	return nil, invalidOption("PreHash must be one of the cryptopq hash functions")
+	return nil, invalidOption("PreHash must be a SHA-2, SHA-3 or SHAKE function that FIPS 204 and FIPS 205 list")
 }
 
 // FIPS 204 and FIPS 205: M' = 0 || |ctx| || ctx || M, or 1 || |ctx| || ctx || OID || PH(M).

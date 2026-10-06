@@ -527,17 +527,20 @@ func fuzzSignaturePrivate(t *testing.T, algorithm SignatureAlgorithm, data []byt
 	}
 }
 
-// The pre-hash choices of a fuzz input: none, every hash and XOF, and an invalid value.
+// The pre-hash choices of a fuzz input: none, every hash and XOF (those FIPS 204 and FIPS 205 do
+// not list must be refused), and an invalid value.
 func fuzzPreHash(selector uint8) PreHash {
-	switch value := int(selector) % 14; {
+	hashes, xofs := len(hashSpecs)-1, len(xofSpecs)-1
+
+	switch value := int(selector) % (hashes + xofs + 2); {
 	case value == 0:
 		return nil
-	case value <= 10:
-		return HashAlgorithm(value)
-	case value <= 12:
-		return XofAlgorithm(value - 10)
+	case value <= hashes:
+		return HashAlgorithm{id: uint8(value)}
+	case value <= hashes+xofs:
+		return XofAlgorithm{id: uint8(value - hashes)}
 	default:
-		return HashAlgorithm(200)
+		return HashAlgorithm{id: 200}
 	}
 }
 
@@ -547,7 +550,7 @@ func FuzzVerify(f *testing.F) {
 
 		f.Add(fixture.signature, fixture.message, fixture.context, uint8(i), uint8(3), uint8(2))
 
-		f.Add(fixture.signature[:len(fixture.signature)/2], fixture.message, []byte{}, uint8(i), uint8(11), uint8(1))
+		f.Add(fixture.signature[:len(fixture.signature)/2], fixture.message, []byte{}, uint8(i), uint8(20), uint8(1))
 	}
 
 	f.Fuzz(func(t *testing.T, signature, message, context []byte, selector, preHash, mode uint8) {
@@ -1229,5 +1232,175 @@ func FuzzBase64(f *testing.F) {
 				t.Fatal("base64Encode disagrees with the standard library")
 			}
 		})
+	})
+}
+
+// A hash, XOF, MAC or KDF with options and inputs from the fuzzer: Configure refuses exactly the
+// options outside the documented limits, and the forms of a configured algorithm agree.
+func FuzzSymmetric(f *testing.F) {
+	f.Add(uint8(0), uint16(0), []byte("salt"), []byte("personal"), []byte("message"))
+
+	f.Add(uint8(13), uint16(20), []byte{}, make([]byte, 17), make([]byte, 300))
+
+	f.Add(uint8(40), uint16(3), []byte("customization"), []byte{}, []byte("key and message"))
+
+	f.Fuzz(func(t *testing.T, selector uint8, length uint16, first, second, data []byte) {
+		split := len(data) / 3
+
+		switch family := int(selector) % 4; family {
+		case 0:
+			hashes := []HashAlgorithm{SHA_224, SHA_256, SHA_384, SHA_512, SHA_512_224, SHA_512_256, SHA3_224, SHA3_256, SHA3_384, SHA3_512, BLAKE2B_160, BLAKE2B_256, BLAKE2B_384, BLAKE2B_512, BLAKE2S_128, BLAKE2S_160, BLAKE2S_224, BLAKE2S_256, ASCON_HASH256}
+
+			algorithm := hashes[int(selector/4)%len(hashes)]
+
+			field := hashSpecOf(algorithm.id).field
+
+			configured, err := algorithm.Configure(&HashOptions{Salt: first, Personalization: second})
+
+			if (err != nil) != (len(first) > field || len(second) > field) {
+				t.Fatalf("%s: Configure returned %v", algorithm, err)
+			}
+
+			if err != nil {
+				return
+			}
+
+			out := make([]byte, configured.DigestSize())
+
+			configured.DigestInto(data, out)
+
+			hasher := configured.Create()
+
+			hasher.Update(data[:split])
+
+			hasher.Update(data[split:])
+
+			if !bytes.Equal(out, configured.Digest(data)) || !bytes.Equal(out, hasher.Digest()) {
+				t.Fatalf("%s: the forms differ", algorithm)
+			}
+		case 1:
+			xofs := []XofAlgorithm{SHAKE128, SHAKE256, CSHAKE128, CSHAKE256, ASCON_XOF128, ASCON_CXOF128}
+
+			algorithm := xofs[int(selector/4)%len(xofs)]
+
+			limit := map[uint8]int{xofCSHAKE128: 1 << 30, xofCSHAKE256: 1 << 30, xofAsconCXOF128: 256}[algorithm.id]
+
+			configured, err := algorithm.Configure(&XofOptions{Customization: first})
+
+			if (err != nil) != (len(first) > limit) {
+				t.Fatalf("%s: Configure returned %v", algorithm, err)
+			}
+
+			if err != nil {
+				return
+			}
+
+			size := int(length % 600)
+
+			out := make([]byte, size)
+
+			configured.DigestInto(data, out)
+
+			xof := configured.Create()
+
+			xof.Update(data[:split])
+
+			xof.Update(data[split:])
+
+			streamed := append(xof.Read(size/2), xof.Read(size-size/2)...)
+
+			if !bytes.Equal(out, configured.Digest(data, size)) || !bytes.Equal(out, streamed) {
+				t.Fatalf("%s: the forms differ", algorithm)
+			}
+		case 2:
+			macs := []MacAlgorithm{HMAC_SHA_224, HMAC_SHA_256, HMAC_SHA_384, HMAC_SHA_512, KMAC128, KMAC256, BLAKE2B_MAC, BLAKE2S_MAC}
+
+			algorithm := macs[int(selector/4)%len(macs)]
+
+			spec := macSpecOf(algorithm.id)
+
+			size := int(length % 600)
+
+			options := &MacOptions{Length: size}
+
+			valid := true
+
+			switch spec.kind {
+			case macKindHMAC:
+				options = &MacOptions{}
+			case macKindKMAC:
+				options.Customization, options.Xof = first, length&1024 != 0
+
+				valid = size == 0 || size >= 4
+			default:
+				options.Salt, options.Personalization = first, second
+
+				valid = size <= spec.maximum && len(first) <= spec.field && len(second) <= spec.field
+			}
+
+			configured, err := algorithm.Configure(options)
+
+			if (err != nil) == valid {
+				t.Fatalf("%s: Configure returned %v", algorithm, err)
+			}
+
+			if err != nil {
+				return
+			}
+
+			key := data[:split]
+
+			if spec.kind == macKindBLAKE2 {
+				key = append([]byte{1}, key[:min(len(key), spec.maximum-1)]...)
+			}
+
+			message := data[split:]
+
+			tag := configured.Digest(key, message)
+
+			out := make([]byte, configured.DigestSize())
+
+			configured.DigestInto(key, message, out)
+
+			mac := configured.Create(key)
+
+			mac.Update(message[:len(message)/2])
+
+			mac.Update(message[len(message)/2:])
+
+			if !bytes.Equal(out, tag) || !bytes.Equal(mac.Digest(), tag) || !configured.Verify(key, message, tag) || !mac.Verify(tag) {
+				t.Fatalf("%s: the forms differ", algorithm)
+			}
+
+			tag[0] ^= 1
+
+			if configured.Verify(key, message, tag) || mac.Verify(tag) {
+				t.Fatalf("%s: a wrong tag verifies", algorithm)
+			}
+		default:
+			algorithm := KdfAlgorithm(1 + int(selector/4)%(len(kdfSpecs)-1))
+
+			size := int(length % 20000)
+
+			options := &KdfOptions{Salt: first, Info: second}
+
+			okm, err := algorithm.Derive(data, size, options)
+
+			if (err != nil) != (size == 0 || size > 255*algorithm.spec().hash.DigestSize()) {
+				t.Fatalf("%s: Derive of %d bytes returned %v", algorithm, size, err)
+			}
+
+			if err != nil {
+				return
+			}
+
+			expanded, err := algorithm.Expand(algorithm.Extract(data, options), size, options)
+
+			fuzzCheck(t, err)
+
+			if !bytes.Equal(okm, expanded) {
+				t.Fatalf("%s: Derive differs from Extract and Expand", algorithm)
+			}
+		}
 	})
 }

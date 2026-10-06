@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // Large and edge inputs, and stateful keys used from many goroutines at once.
@@ -1167,5 +1168,157 @@ func TestEdgeStructures(t *testing.T) {
 		if key.Verify(edited, message) {
 			t.Fatalf("%s index %x verified", c.algorithm, c.index)
 		}
+	}
+}
+
+// A Mac's keyed state is cleared once the Mac becomes unreachable, for every kind of MAC.
+func TestMacWipedWhenUnreachable(t *testing.T) {
+	key := fuzzPattern(32, 1)
+
+	for _, algorithm := range []MacAlgorithm{HMAC_SHA_256, HMAC_SHA_512, KMAC128, BLAKE2B_MAC, BLAKE2S_MAC} {
+		mac := algorithm.Create(key)
+
+		mac.Update([]byte("data"))
+
+		e := mac.engine
+
+		keyed := func() bool {
+			switch e := e.(type) {
+			case *hmacEngine:
+				return hmacKeyed(e)
+			case *kmacEngine:
+				return e.sponge.state != [25]uint64{}
+			case *blake2bMac:
+				return e.h != [8]uint64{}
+			case *blake2sMac:
+				return e.h != [8]uint32{}
+			}
+
+			return false
+		}
+
+		if !keyed() {
+			t.Fatalf("%s: no keyed state before", algorithm)
+		}
+
+		mac = nil
+
+		for i := 0; keyed(); i++ {
+			if i == 1000 {
+				t.Fatalf("%s: the keyed state was not cleared", algorithm)
+			}
+
+			runtime.GC()
+
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func hmacKeyed(e *hmacEngine) bool {
+	switch inner := e.inner.(type) {
+	case *sha256Engine:
+		return inner.state != [8]uint32{} || e.outer.(*sha256Engine).state != [8]uint32{}
+	case *sha512Engine:
+		return inner.state != [8]uint64{} || e.outer.(*sha512Engine).state != [8]uint64{}
+	}
+
+	return false
+}
+
+// The large message through the hashes, XOFs, MACs and the KDF of SP 800-185, RFC 7693,
+// SP 800-232 and RFC 5869, one-shot and streamed, against x/crypto's BLAKE2, go-ascon, the
+// standard library's cSHAKE and HKDF, and KMAC composed from its cSHAKE.
+func TestLargeSymmetric(t *testing.T) {
+	message := largeMessage()
+
+	key, customization := fuzzPattern(32, 0), []byte("crypto-pq")
+
+	stream := func(update func([]byte)) {
+		for offset := 0; offset < len(message); offset += 1_000_003 {
+			update(message[offset:min(offset+1_000_003, len(message))])
+		}
+	}
+
+	hashes := map[HashAlgorithm]string{
+		BLAKE2B_512:   "323ffab3e5047f023a27147f587ce931dd9189e6dc57a514a840ecfb6d3fee67c175179de718bf426e4208a3e292c55c27544ee44b6d8e4d0cca3f5947ed3055",
+		BLAKE2B_256:   "68e2548fced4d43b257ff08bf6b834fc613598737df1474679d67bfb73e38ee7",
+		BLAKE2S_256:   "54710fa9de5fbb96a6f2c6f17bd7bd638ddd90c953ee99da5400b92f10cde9c0",
+		ASCON_HASH256: "3d6d33c850384c263bc5e649ed33de4ffa92f3b2866233c212f8411073de6dc9",
+	}
+
+	for algorithm, expected := range hashes {
+		hasher := algorithm.Create()
+
+		stream(hasher.Update)
+
+		if got, streamed := hex.EncodeToString(algorithm.Digest(message)), hex.EncodeToString(hasher.Digest()); got != expected || streamed != expected {
+			t.Fatalf("%s: %s, streamed %s", algorithm, got, streamed)
+		}
+	}
+
+	cxof, err := ASCON_CXOF128.Configure(&XofOptions{Customization: customization})
+
+	fuzzCheck(t, err)
+
+	cshake128, err := CSHAKE128.Configure(&XofOptions{Customization: customization})
+
+	fuzzCheck(t, err)
+
+	cshake256, err := CSHAKE256.Configure(&XofOptions{Customization: customization})
+
+	fuzzCheck(t, err)
+
+	xofs := []struct {
+		algorithm XofAlgorithm
+		expected  string
+	}{
+		{ASCON_XOF128, "abaaee06cf36ebc8aad10f3dbba56246634eab6c066bdc1db14b519e133321d9"},
+		{cxof, "70f8ba9d6524ed84afef6ceb1e5d591809677b731cebe010286a43135e8435a4"},
+		{cshake128, "0ddb71194b475a4e2a08851f68040db156b949f3026a470b51d105b9309ab644"},
+		{cshake256, "b2add54b54d81f476609eee17726c6a6ee245dd7f856ae90d6ed939d72227c228deddfa1002208b67732711cbdaaef9c3d27ce53f886e3e3ec325d9c815278b2"},
+	}
+
+	for _, x := range xofs {
+		xof := x.algorithm.Create()
+
+		stream(xof.Update)
+
+		size := len(x.expected) / 2
+
+		if got, streamed := hex.EncodeToString(x.algorithm.Digest(message, size)), hex.EncodeToString(xof.Read(size)); got != x.expected || streamed != x.expected {
+			t.Fatalf("%s: %s, streamed %s", x.algorithm, got, streamed)
+		}
+	}
+
+	kmac, err := KMAC128.Configure(&MacOptions{Customization: customization})
+
+	fuzzCheck(t, err)
+
+	macs := []struct {
+		algorithm MacAlgorithm
+		expected  string
+	}{
+		{BLAKE2B_MAC, "6db708cf7f01bb0552ff9565b738efed37cb6fd26a31308e36789718a88984ea7b03ed8147ab8f0edb9a7692cf624a1ae86bc602962d4ec6f23cf79d39f9510f"},
+		{BLAKE2S_MAC, "45f1fe1189cb7a34ed75d0452a0542bc22f1655dc2661ce4c325aed905cd2eb9"},
+		{kmac, "3fa1d5df6637e6a1d4f7d1632bfe83dcc332e29af5d227c5fe9b407e2cd2f3cf"},
+	}
+
+	for _, m := range macs {
+		mac := m.algorithm.Create(key)
+
+		stream(mac.Update)
+
+		if got, streamed := hex.EncodeToString(m.algorithm.Digest(key, message)), hex.EncodeToString(mac.Digest()); got != m.expected || streamed != m.expected {
+			t.Fatalf("%s: %s, streamed %s", m.algorithm, got, streamed)
+		}
+	}
+
+	okm, err := HKDF_SHA_256.Derive(message, 100, &KdfOptions{Salt: key, Info: customization})
+
+	fuzzCheck(t, err)
+
+	if got := hex.EncodeToString(okm); got != "eebc5e69418644fcbe92159e2735a75fd1f82cf9ea5cd0675e1d3c4cf0ee815f31be4641387482148600a18497895b2cb8c025b4c71c7df672e5e15bfb251c76c18f79f4830290765e9e8de64bda2517247f3f89eed2c1d4b88bbceee0271a99294fa067" {
+		t.Fatalf("HKDF-SHA-256: %s", got)
 	}
 }

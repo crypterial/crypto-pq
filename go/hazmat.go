@@ -103,3 +103,14 @@ func (hazmat) Verify(publicKey *SignaturePublicKey, signature, message []byte, o
 
 	return publicKey.verify(signature, message, opts.Context, opts.PreHash, false)
 }
+
+// ConfigureCshake sets cSHAKE's function name N as well as its customization S. SP 800-185
+// reserves N for functions NIST defines, so the public Configure takes S only; this one exists for
+// test vectors. Both empty give SHAKE.
+func (hazmat) ConfigureCshake(algorithm XofAlgorithm, functionName, customization []byte) (XofAlgorithm, error) {
+	if algorithm.id != xofCSHAKE128 && algorithm.id != xofCSHAKE256 {
+		return XofAlgorithm{}, invalidOption("ConfigureCshake takes CSHAKE128 or CSHAKE256")
+	}
+
+	return cshakeAlgorithm(algorithm.id, functionName, customization), nil
+}
