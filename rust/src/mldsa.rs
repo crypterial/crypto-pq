@@ -5,7 +5,7 @@ use core::ops::{Deref, DerefMut};
 
 use crate::cpu::{self, Field, Prepare};
 use crate::ct::{self, declassify, declassify_value};
-use crate::keccak::{self, MAX_SPONGES, Sponges};
+use crate::keccak::{self, Keccak, MAX_SPONGES, Sponges};
 use crate::primitives::{shake256, shake256_into};
 use crate::wipe::{SecretBytes, wipe};
 
@@ -539,16 +539,18 @@ fn pack_bits<const BITS: usize>(out: &mut [u8], values: &Poly, f: impl Fn(i32) -
 fn unpack_bits<const BITS: usize>(data: &[u8]) -> Poly {
     let size = group_size(BITS);
 
+    let length = BITS * size / 8;
+
     let mut values = [0; 256];
 
-    for (group, bytes) in values
-        .chunks_exact_mut(size)
-        .zip(data.chunks_exact(BITS * size / 8))
-    {
-        let word = bytes
-            .iter()
-            .rev()
-            .fold(0u128, |word, &byte| (word << 8) | u128::from(byte));
+    for (group, bytes) in values.chunks_exact_mut(size).zip(data.chunks_exact(length)) {
+        // A copy of constant size, which stays in registers: folded in byte by byte, the word
+        // took half as long again for 18 and 20 bits.
+        let mut window = [0; 16];
+
+        window[..length].copy_from_slice(bytes);
+
+        let word = u128::from_le_bytes(window);
 
         for (i, value) in group.iter_mut().enumerate() {
             *value = (word >> (BITS * i)) as i32 & ((1 << BITS) - 1);
@@ -586,8 +588,16 @@ fn sample_uniform_portable(block: &[u64; 21], a: &mut Poly, count: &mut usize) {
     }
 }
 
-// Entries first, first + 1, ... of Â, whose XOF streams are squeezed in lockstep.
-fn rej_ntt_poly(sponges: &mut Sponges, rho: &[u8], l: usize, first: usize, out: &mut [Poly]) {
+// Entries first, first + 1, ... of Â, whose XOF streams are squeezed in lockstep by `squeeze`,
+// which may permute another state beside them.
+fn rej_ntt_poly(
+    sponges: &mut Sponges,
+    rho: &[u8],
+    l: usize,
+    first: usize,
+    out: &mut [Poly],
+    mut squeeze: impl FnMut(&mut Sponges, [bool; MAX_SPONGES]),
+) {
     let indices: [[u8; 2]; MAX_SPONGES] =
         core::array::from_fn(|e| [((first + e) % l) as u8, ((first + e) / l) as u8]);
 
@@ -600,7 +610,7 @@ fn rej_ntt_poly(sponges: &mut Sponges, rho: &[u8], l: usize, first: usize, out: 
     let mut counts = [0; MAX_SPONGES];
 
     while counts[..out.len()].iter().any(|&count| count < 256) {
-        sponges.squeeze(counts.map(|count| count < 256));
+        squeeze(sponges, counts.map(|count| count < 256));
 
         for (i, (a, count)) in out.iter_mut().zip(&mut counts).enumerate() {
             if *count < 256 {
@@ -679,10 +689,69 @@ fn expand_a(rho: &[u8], p: &Parameters) -> Vec<Poly> {
     let size = keccak::group();
 
     for (first, group) in (0..).step_by(size).zip(a.chunks_mut(size)) {
-        rej_ntt_poly(&mut sponges, rho, p.l, first, group);
+        rej_ntt_poly(&mut sponges, rho, p.l, first, group, Sponges::squeeze);
     }
 
     a
+}
+
+// expand_a for a public key, and tr = H(pk, 64) beside it: while blocks of pk remain, each group
+// of sponges leaves a slot free, and every squeeze also permutes the sponge that absorbs pk, in
+// that slot, where a permutation costs little next to the group's. A key verified once, the most
+// common use, otherwise paid for the ten to twenty permutations of tr alone.
+fn expand_a_and_tr(pk: &[u8], p: &Parameters) -> (Vec<Poly>, [u8; 64]) {
+    let mut a = vec![[0; 256]; p.k * p.l];
+
+    let mut sponges = Sponges::empty();
+
+    let mut hash = Keccak::new(136, SHAKE);
+
+    let (mut blocks, mut finished) = (pk.as_chunks::<136>().0.iter(), false);
+
+    let mut first = 0;
+
+    while first < a.len() {
+        let size = keccak::group() - usize::from(!finished);
+
+        let group = &mut a[first..(first + size).min(p.k * p.l)];
+
+        rej_ntt_poly(
+            &mut sponges,
+            &pk[..32],
+            p.l,
+            first,
+            group,
+            |sponges, active| match blocks.next() {
+                Some(block) => {
+                    hash.update_block_with(block, |state| sponges.squeeze_beside(active, state));
+                }
+                None if !finished => {
+                    hash.update(&pk[pk.len() - pk.len() % 136..]);
+
+                    hash.finish_with(|state| sponges.squeeze_beside(active, state));
+
+                    finished = true;
+                }
+                None => sponges.squeeze(active),
+            },
+        );
+
+        first += group.len();
+    }
+
+    if !finished {
+        for block in blocks {
+            hash.update(block);
+        }
+
+        hash.update(&pk[pk.len() - pk.len() % 136..]);
+    }
+
+    let mut tr = [0; 64];
+
+    hash.read(&mut tr);
+
+    (a, tr)
 }
 
 // Signed coefficients of s1 and s2 (FIPS 204 Algorithm 33).
@@ -754,11 +823,15 @@ fn unpack_mask_portable(bytes: &[u8], bits: u32, gamma1: i32) -> Poly {
 fn sample_in_ball(seed: &[u8], tau: usize) -> Poly {
     let mut stream = shake256(&[seed]);
 
-    let mut signs = [0u8; 8];
+    // The stream a block at a time: read a byte at a time, as the algorithm takes it, the reads
+    // cost more than the permutation. The first eight bytes are the signs.
+    let mut block = [0u8; 136];
 
-    stream.read(&mut signs);
+    stream.read(&mut block);
 
-    let mut signs = u64::from_le_bytes(signs);
+    let mut signs = u64::from_le_bytes(*block.first_chunk().expect("a block has eight bytes"));
+
+    let mut next = 8;
 
     let mut c = [0; 256];
 
@@ -767,19 +840,21 @@ fn sample_in_ball(seed: &[u8], tau: usize) -> Poly {
     // positions say nothing about the key, because whether an attempt is rejected does not depend
     // on c * s1 or c * s2.
     for i in 256 - tau..256 {
-        let mut j = [0u8];
+        let j = loop {
+            if next == block.len() {
+                stream.read(&mut block);
 
-        loop {
-            stream.read(&mut j);
-
-            declassify(&j);
-
-            if usize::from(j[0]) <= i {
-                break;
+                next = 0;
             }
-        }
 
-        let j = usize::from(j[0]);
+            let j = declassify_value(block[next]);
+
+            next += 1;
+
+            if usize::from(j) <= i {
+                break usize::from(j);
+            }
+        };
 
         c[i] = c[j];
 
@@ -787,6 +862,8 @@ fn sample_in_ball(seed: &[u8], tau: usize) -> Poly {
 
         signs >>= 1;
     }
+
+    wipe(&mut block);
 
     c.map(canonical)
 }
@@ -909,24 +986,34 @@ pub(crate) struct VerifyingKey {
 
 impl VerifyingKey {
     pub(crate) fn new(pk: &[u8]) -> Self {
-        let t1 = pk[32..]
-            .as_chunks::<320>()
-            .0
-            .iter()
-            .map(|chunk| {
-                let mut t1 = unpack(chunk, 10).map(|x| x << D);
-
-                ntt(&mut t1);
-
-                t1
-            })
-            .collect();
-
         Self {
-            t1,
+            t1: t1_hat(pk),
             tr: hash_public_key(pk),
         }
     }
+}
+
+fn t1_hat(pk: &[u8]) -> Vec<Poly> {
+    pk[32..]
+        .as_chunks::<320>()
+        .0
+        .iter()
+        .map(|chunk| {
+            let mut t1 = unpack(chunk, 10).map(|x| x << D);
+
+            ntt(&mut t1);
+
+            t1
+        })
+        .collect()
+}
+
+// Â and what verification derives from a public key, computed together for the first
+// verification with a key, which is often its only one (see expand_a_and_tr).
+pub(crate) fn public_derived(pk: &[u8], p: &Parameters) -> (Matrix, VerifyingKey) {
+    let (a, tr) = expand_a_and_tr(pk, p);
+
+    (Matrix(a), VerifyingKey { t1: t1_hat(pk), tr })
 }
 
 // The NTT forms of s1, s2 and t0 that signing uses, wiped when dropped. K and tr are read from the
@@ -1045,23 +1132,21 @@ fn hint_bit_pack(h: &Polys, p: &Parameters, out: &mut [u8]) {
 
 // FIPS 204, Algorithm 21: the encoding must be canonical (strictly increasing indices, zero
 // padding), otherwise the signature is rejected.
-fn hint_bit_unpack(data: &[u8], p: &Parameters) -> Option<Vec<[bool; 256]>> {
-    let mut h = vec![[false; 256]; p.k];
-
+fn hint_bit_unpack(data: &[u8], p: &Parameters, h: &mut [[bool; 256]]) -> bool {
     let mut index = 0;
 
     for (i, poly) in h.iter_mut().enumerate() {
         let end = usize::from(data[p.omega + i]);
 
         if end < index || end > p.omega {
-            return None;
+            return false;
         }
 
         let first = index;
 
         while index < end {
             if index > first && data[index - 1] >= data[index] {
-                return None;
+                return false;
             }
 
             poly[usize::from(data[index])] = true;
@@ -1070,10 +1155,7 @@ fn hint_bit_unpack(data: &[u8], p: &Parameters) -> Option<Vec<[bool; 256]>> {
         }
     }
 
-    data[index..p.omega]
-        .iter()
-        .all(|&byte| byte == 0)
-        .then_some(h)
+    data[index..p.omega].iter().all(|&byte| byte == 0)
 }
 
 fn encode_w1(w: &Polys, p: &Parameters, out: &mut [u8]) {
@@ -1278,15 +1360,20 @@ pub(crate) fn verify_internal(
 
     let (z_bytes, hint_bytes) = rest.split_at(32 * p.l * bits as usize);
 
-    let Some(h) = hint_bit_unpack(hint_bytes, p) else {
+    let mut hints = [[false; 256]; 8];
+
+    let h = &mut hints[..p.k];
+
+    if !hint_bit_unpack(hint_bytes, p, h) {
         return false;
-    };
-
-    let mut z = Polys::new(p.l);
-
-    for (poly, chunk) in z.iter_mut().zip(z_bytes.chunks_exact(32 * bits as usize)) {
-        *poly = unpack(chunk, bits).map(|x| p.gamma1 - x);
     }
+
+    // z and w are public, as the signature and the key are, so they are neither zeroed first nor
+    // wiped.
+    let mut z: Vec<Poly> = z_bytes
+        .chunks_exact(32 * bits as usize)
+        .map(|chunk| unpack(chunk, bits).map(|x| p.gamma1 - x))
+        .collect();
 
     if reaches(z.iter().flatten().copied(), p.gamma1 - p.beta()) != 0 {
         return false;
@@ -1302,22 +1389,29 @@ pub(crate) fn verify_internal(
         *poly = ntt_of(poly);
     }
 
-    let mut w = Polys::new(p.k);
+    let w: Vec<Poly> = key
+        .t1
+        .iter()
+        .zip(matrix.0.chunks_exact(p.l))
+        .map(|(t1, row)| {
+            let mut w_i = pointwise(&c_hat, t1).map(|x| -x);
 
-    for ((w_i, t1), row) in w.iter_mut().zip(&key.t1).zip(matrix.0.chunks_exact(p.l)) {
-        *w_i = pointwise(&c_hat, t1).map(|x| -x);
+            multiply_add(&mut w_i, row, &z);
 
-        multiply_add(w_i, row, &z);
+            inverse_ntt(&mut w_i);
 
-        inverse_ntt(w_i);
-    }
+            w_i
+        })
+        .collect();
 
-    let mut w1 = vec![0; 32 * p.k * p.w1_bits() as usize];
+    let mut w1 = [0; 32 * 8 * 4];
+
+    let w1 = &mut w1[..32 * p.k * p.w1_bits() as usize];
 
     for ((chunk, w_i), h_i) in w1
         .chunks_exact_mut(32 * p.w1_bits() as usize)
         .zip(w.iter())
-        .zip(&h)
+        .zip(h.iter())
     {
         let hinted = w_i
             .iter()
@@ -1327,7 +1421,7 @@ pub(crate) fn verify_internal(
         pack(chunk, p.w1_bits(), hinted);
     }
 
-    challenge(&mu, &w1, p)[..p.challenge_size()] == *c_tilde
+    challenge(&mu, w1, p)[..p.challenge_size()] == *c_tilde
 }
 
 #[cfg(test)]
@@ -1678,5 +1772,27 @@ mod tests {
         assert_eq!(R2, 2365951);
 
         assert_eq!(ZETAS[1], mul(4808194, 4193792));
+    }
+
+    // The matrix and tr computed together equal the matrix and the hash computed apart, for every
+    // parameter set and keys of random bytes, including key lengths that are and are not a
+    // multiple of the hash's rate.
+    #[test]
+    fn matrix_and_tr_together_match_apart() {
+        let mut inputs = Inputs::new(204);
+
+        for p in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
+            for extra in [0, 1, 136 - p.public_key_size() % 136] {
+                let pk: [u8; 2592 + 136] = inputs.bytes();
+
+                let pk = &pk[..p.public_key_size() + extra];
+
+                let (a, tr) = expand_a_and_tr(pk, &p);
+
+                assert!(a == expand_a(&pk[..32], &p), "{p:?}, {extra}");
+
+                assert_eq!(tr, hash_public_key(pk), "{p:?}, {extra}");
+            }
+        }
     }
 }

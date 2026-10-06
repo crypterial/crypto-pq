@@ -484,6 +484,25 @@ impl Derived {
     fn verifying(&self, key: &[u8]) -> &mldsa::VerifyingKey {
         self.verifying.get_or_init(|| mldsa::VerifyingKey::new(key))
     }
+
+    // Both, for a verification. A key whose first use this is fills them together, which hashes
+    // the key beside the sampling of the matrix.
+    fn for_verify(
+        &self,
+        key: &[u8],
+        p: &mldsa::Parameters,
+    ) -> (&mldsa::Matrix, &mldsa::VerifyingKey) {
+        if self.matrix.get().is_none() && self.verifying.get().is_none() {
+            let (matrix, verifying) = mldsa::public_derived(key, p);
+
+            return (
+                self.matrix.get_or_init(|| matrix),
+                self.verifying.get_or_init(|| verifying),
+            );
+        }
+
+        (self.matrix(key, p), self.verifying(key))
+    }
 }
 
 // A public key and what ML-DSA derives from it; SLH-DSA derives nothing. A private key and every
@@ -562,9 +581,9 @@ impl SignaturePublicKey {
 
         match (algorithm.scheme, &self.public.derived) {
             (Scheme::MlDsa(p), Some(derived)) => {
-                let matrix = derived.matrix(key, &p);
+                let (matrix, verifying) = derived.for_verify(key, &p);
 
-                mldsa::verify_internal(matrix, derived.verifying(key), &parts, signature, &p)
+                mldsa::verify_internal(matrix, verifying, &parts, signature, &p)
             }
             (Scheme::SlhDsa(p), _) => slhdsa::verify_internal(&parts, signature, key, &p),
             // Every ML-DSA key is made with its caches.

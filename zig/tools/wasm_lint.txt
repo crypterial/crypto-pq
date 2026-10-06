@@ -42,9 +42,9 @@ crypto_pq_ml_dsa mldsa.keyGen 0 1 0 0 loop counts, sponge lengths and the public
 crypto_pq_ml_dsa mldsa.sampleInBall 3 48 0 0 challenge positions, public as in BoringSSL, declassified by the core
 crypto_pq_ml_dsa mldsa.sampleMatrix 0 15 0 0 rejection sampling of the public matrix from rho
 crypto_pq_ml_dsa mldsa.sign 2 68 0 0 an attempt's rejection outcome (declassified, FIPS 204), loop counts and sponge lengths
-crypto_pq_ml_dsa sha2.blocks256 0 1 0 0 block counts from the length
-crypto_pq_ml_dsa sha2.blocks512 0 1 0 0 block counts from the length
-crypto_pq_ml_dsa signature.Representative.init 8 12 0 3 the pre-hash kind and the lengths of the message representative
+crypto_pq_ml_dsa sha2.blocks256 0 2 0 0 block counts from the length
+crypto_pq_ml_dsa sha2.blocks512 0 2 0 0 block counts from the length
+crypto_pq_ml_dsa signature.Representative.init 7 27 0 3 the pre-hash kind and the lengths of the message representative
 crypto_pq_ml_kem capi.common.Lazy(mlkem.EncapsulationKey(2)).get 2 3 0 0 the cache state word: empty, or the address the cache was filled or is being filled at
 crypto_pq_ml_kem capi.common.Slot.close 1 18 0 0 the slot's users word: the last call out of a slot that a wipe marked zeroes it, by its length
 crypto_pq_ml_kem capi.common.apart 0 34 0 0 the addresses and lengths of the call's buffers
@@ -105,8 +105,8 @@ crypto_pq_slh_dsa capi.signature.signAs 0 180 0 0 slot header and users word, le
 crypto_pq_slh_dsa capi.wipeRange 4 37 0 0 slot headers in the range (magic, size, users word), the signer registry entries, lengths
 crypto_pq_slh_dsa hash.Engine.digest 5 4 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_slh_dsa hash.Engine.update 2 10 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
-crypto_pq_slh_dsa hash.HashAlgorithm.digest 0 1 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
-crypto_pq_slh_dsa hash.HmacAlgorithm.create 0 1 0 3 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
+crypto_pq_slh_dsa hash.HashAlgorithm.digest 0 2 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
+crypto_pq_slh_dsa hash.HmacAlgorithm.create 0 5 0 0 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_slh_dsa keccak.Keccak.read 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_slh_dsa keccak.Keccak.update 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_slh_dsa keccak.Sponge4.absorb 1 28 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
@@ -116,33 +116,35 @@ crypto_pq_slh_dsa keccak.webassembly.permute3 0 1 0 0 the code shape for the eng
 crypto_pq_slh_dsa keccak.webassembly.permute4 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
 crypto_pq_slh_dsa mem.eql 2 7 0 0 comparisons of public bytes: pre-hash names, parameter sections, public keys
 crypto_pq_slh_dsa primitives.shake256Short 0 20 0 0 lengths of the parts hashed
-crypto_pq_slh_dsa sha2.blocks256 0 1 0 0 block counts from the length
-crypto_pq_slh_dsa sha2.blocks512 0 1 0 0 block counts from the length
+crypto_pq_slh_dsa sha2.blocks256 0 2 0 0 block counts from the length
+crypto_pq_slh_dsa sha2.blocks512 0 2 0 0 block counts from the length
+crypto_pq_slh_dsa sha2.finish256 0 8 0 0 block counts, tail and output lengths from the lengths; the data hashed decides nothing
+crypto_pq_slh_dsa sha2.finish512 0 12 0 0 block counts, tail and output lengths from the lengths; the data hashed decides nothing
 crypto_pq_slh_dsa signature.Representative.init 2 2 0 0 the pre-hash kind and the lengths of the message representative
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=16,.h=63,.d=7,.hp=9,.a=12,.k=14,.m=30}).Hashes.t 3 9 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=16,.h=63,.d=7,.hp=9,.a=12,.k=14,.m=30}).merkle 0 16 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=16,.h=63,.d=7,.hp=9,.a=12,.k=14,.m=30}).messageDigest 0 3 0 1 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
-crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=16,.h=63,.d=7,.hp=9,.a=12,.k=14,.m=30}).sign 0 6 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
+crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=16,.h=63,.d=7,.hp=9,.a=12,.k=14,.m=30}).sign 0 7 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=16,.h=66,.d=22,.hp=3,.a=6,.k=33,.m=34}).Hashes.t 3 9 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=16,.h=66,.d=22,.hp=3,.a=6,.k=33,.m=34}).merkle 0 15 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=16,.h=66,.d=22,.hp=3,.a=6,.k=33,.m=34}).messageDigest 0 3 0 1 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
-crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=16,.h=66,.d=22,.hp=3,.a=6,.k=33,.m=34}).sign 0 6 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
+crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=16,.h=66,.d=22,.hp=3,.a=6,.k=33,.m=34}).sign 0 7 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=24,.h=63,.d=7,.hp=9,.a=14,.k=17,.m=39}).Hashes.t 4 9 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=24,.h=63,.d=7,.hp=9,.a=14,.k=17,.m=39}).merkle 0 13 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=24,.h=63,.d=7,.hp=9,.a=14,.k=17,.m=39}).messageDigest 0 3 0 1 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
-crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=24,.h=63,.d=7,.hp=9,.a=14,.k=17,.m=39}).sign 0 6 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
+crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=24,.h=63,.d=7,.hp=9,.a=14,.k=17,.m=39}).sign 0 7 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=24,.h=66,.d=22,.hp=3,.a=8,.k=33,.m=42}).Hashes.t 4 9 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=24,.h=66,.d=22,.hp=3,.a=8,.k=33,.m=42}).merkle 0 12 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=24,.h=66,.d=22,.hp=3,.a=8,.k=33,.m=42}).messageDigest 0 3 0 1 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
-crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=24,.h=66,.d=22,.hp=3,.a=8,.k=33,.m=42}).sign 0 6 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
+crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=24,.h=66,.d=22,.hp=3,.a=8,.k=33,.m=42}).sign 0 7 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=64,.d=8,.hp=8,.a=14,.k=22,.m=47}).Hashes.t 4 9 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=64,.d=8,.hp=8,.a=14,.k=22,.m=47}).merkle 0 13 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=64,.d=8,.hp=8,.a=14,.k=22,.m=47}).messageDigest 0 3 0 1 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
-crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=64,.d=8,.hp=8,.a=14,.k=22,.m=47}).sign 0 6 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
+crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=64,.d=8,.hp=8,.a=14,.k=22,.m=47}).sign 0 7 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=68,.d=17,.hp=4,.a=9,.k=35,.m=49}).Hashes.t 4 9 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=68,.d=17,.hp=4,.a=9,.k=35,.m=49}).merkle 0 13 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=68,.d=17,.hp=4,.a=9,.k=35,.m=49}).messageDigest 0 3 0 1 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
-crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=68,.d=17,.hp=4,.a=9,.k=35,.m=49}).sign 0 6 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
+crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=68,.d=17,.hp=4,.a=9,.k=35,.m=49}).sign 0 7 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=16,.h=63,.d=7,.hp=9,.a=12,.k=14,.m=30}).merkle 0 5 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=16,.h=63,.d=7,.hp=9,.a=12,.k=14,.m=30}).messageDigest 0 2 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=16,.h=63,.d=7,.hp=9,.a=12,.k=14,.m=30}).sign 0 5 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
@@ -187,7 +189,8 @@ crypto_pq_stateful capi.stateful.written 0 17 0 0 signer slot fields (registry i
 crypto_pq_stateful capi.wipeRange 4 47 0 0 slot headers in the range (magic, size, users word), the signer registry entries, lengths
 crypto_pq_stateful hash.Engine.digest 5 2 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_stateful hash.Engine.update 2 10 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
-crypto_pq_stateful hash.HmacAlgorithm.create 0 0 0 2 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
+crypto_pq_stateful hash.Hmac.digest 0 2 0 0 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
+crypto_pq_stateful hash.HmacAlgorithm.create 0 1 0 0 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_stateful heap.BrkAllocator.alloc 3 6 0 0 allocation sizes
 crypto_pq_stateful heap.BrkAllocator.free 1 1 0 0 allocation sizes
 crypto_pq_stateful keccak.Keccak.read 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
@@ -209,8 +212,8 @@ crypto_pq_stateful merkle.MerkleTree(xmss.TreeContext).leaves 1 29 0 0 tree indi
 crypto_pq_stateful merkle.MerkleTree(xmss.TreeContext).rebuild 0 3 0 0 tree indices, heights and lane counts
 crypto_pq_stateful primitives.digest 0 1 0 1 lengths of the parts hashed
 crypto_pq_stateful primitives.shake256Short 0 45 0 0 lengths of the parts hashed
-crypto_pq_stateful sha2.blocks256 0 1 0 0 block counts from the length
-crypto_pq_stateful sha2.blocks512 0 1 0 0 block counts from the length
+crypto_pq_stateful sha2.blocks256 0 2 0 0 block counts from the length
+crypto_pq_stateful sha2.blocks512 0 2 0 0 block counts from the length
 crypto_pq_stateful sort.pdq.breakPatterns 1 3 0 0 sorting the chains by their public lengths
 crypto_pq_stateful sort.pdq.partialInsertionSort 0 32 0 0 sorting the chains by their public lengths
 crypto_pq_stateful stateful.Signer.build 8 106 0 0 state blob fields and parameter codes; the checksum and tree-cache tag comparisons are declassified: loading fails on them
@@ -218,8 +221,6 @@ crypto_pq_stateful stateful.Signer.cachedTrees 0 8 0 0 state blob fields and par
 crypto_pq_stateful stateful.Signer.destroy 0 18 0 0 state blob fields and parameter codes; the checksum and tree-cache tag comparisons are declassified: loading fails on them
 crypto_pq_stateful stateful.Signer.signatureSize 1 3 0 0 state blob fields and parameter codes; the checksum and tree-cache tag comparisons are declassified: loading fails on them
 crypto_pq_stateful stateful.decode 3 35 0 0 state blob fields and parameter codes; the checksum and tree-cache tag comparisons are declassified: loading fails on them
-crypto_pq_stateful stateful.treeCacheKey 0 1 0 0 state blob fields and parameter codes; the checksum and tree-cache tag comparisons are declassified: loading fails on them
-crypto_pq_stateful stateful.treeCacheTag 0 1 0 0 state blob fields and parameter codes; the checksum and tree-cache tag comparisons are declassified: loading fails on them
 crypto_pq_stateful vector.ChainLanes(8,6).advance 0 2 0 0 chain lengths from the base-w digits of the public message digest, lane counts
 crypto_pq_stateful vector.ChainLanes(8,6).init 4 61 0 0 chain lengths from the base-w digits of the public message digest, lane counts
 crypto_pq_stateful vector.ChainLanes(8,6).take 0 4 0 0 chain lengths from the base-w digits of the public message digest, lane counts

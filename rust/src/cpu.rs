@@ -72,7 +72,37 @@ mod arch {
     }
 
     #[inline(always)]
-    pub(crate) fn compress512(_: &mut [u64; 8], _: &[[u8; 128]]) -> bool {
+    pub(crate) fn compress256_pair(_: &mut [[u32; 8]; 2], _: &[[u8; 64]; 2]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn compress512(_: &mut [u64; 8], _: &[[u8; 128]], _: &[[u8; 128]]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn finish256(_: &mut [u32; 8], _: &[u8], _: u64) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn finish512(_: &mut [u64; 8], _: &[u8], _: u128) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn hmac256(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn hmac512(_: &[u64; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn compress512_pair(_: &mut [[u64; 8]; 2], _: &[[u8; 128]; 2]) -> bool {
         false
     }
 
@@ -87,7 +117,7 @@ mod arch {
     }
 
     #[inline(always)]
-    pub(crate) fn absorb_last(_: &mut [u64; 25], _: usize, _: &[u8], _: &[u8]) -> bool {
+    pub(crate) fn digest(_: usize, _: u8, _: &[u8], _: &mut [u8]) -> bool {
         false
     }
 
@@ -226,10 +256,11 @@ mod arch {
 }
 
 pub(crate) use arch::{
-    absorb, absorb_last, base_multiply_add, binomial, bounded, compress256, compress256_lanes,
-    compress512, encode12, inverse_ntt, inverse_ntt16, keccak_group, mldsa_add, mldsa_hints,
-    mldsa_mask, mldsa_norm, mldsa_sub, mldsa_w1, mlkem_matrix_vector, multiply, multiply_add, ntt,
-    ntt16, permute_many, reduce, uniform12, uniform23,
+    absorb, base_multiply_add, binomial, bounded, compress256, compress256_lanes, compress256_pair,
+    compress512, compress512_pair, digest, encode12, finish256, finish512, hmac256, hmac512,
+    inverse_ntt, inverse_ntt16, keccak_group, mldsa_add, mldsa_hints, mldsa_mask, mldsa_norm,
+    mldsa_sub, mldsa_w1, mlkem_matrix_vector, multiply, multiply_add, ntt, ntt16, permute_many,
+    reduce, uniform12, uniform23,
 };
 
 // What the transform kernels need of the field of ML-KEM or ML-DSA, so that they compute exactly

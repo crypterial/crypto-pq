@@ -432,3 +432,233 @@ fn Sha2(comptime Word: type, comptime block_size: usize, comptime blocks: fn (*[
 pub const Sha256 = Sha2(u32, 64, blocks256);
 
 pub const Sha512 = Sha2(u64, 128, blocks512);
+
+// The last `count` bytes of data, fewer than sixteen, as the low bytes of a little-endian value,
+// read without a store: from the sixteen bytes that end data where it has them.
+pub fn lastBytes(data: []const u8, count: usize) u128 {
+    if (count == 0) return 0;
+
+    if (data.len >= 16) return std.mem.readInt(u128, data[data.len - 16 ..][0..16], .little) >> @intCast(8 * (16 - count));
+
+    var value: u128 = 0;
+
+    for (data[data.len - count ..], 0..) |byte, i| value |= @as(u128, byte) << @intCast(8 * i);
+
+    return value;
+}
+
+// The padded last block or two (FIPS 180-4, 5.1) of a message that ends with data, into the zeroed
+// `last`: the bytes of data after its whole blocks, the 0x80 marker, and the length field of
+// `field` bytes, the message length in bits, at the end. Returns how many blocks are used. Each
+// 16-byte chunk gets a single store, which the compression's load of it can forward.
+fn pad(comptime block: usize, data: []const u8, bits: u128, comptime field: usize, last: *[2 * block]u8) usize {
+    const tail = data[data.len - data.len % block ..];
+
+    const used: usize = if (tail.len + 1 + field > block) 2 else 1;
+
+    const whole = tail.len / 16;
+
+    @memcpy(last[0 .. 16 * whole], tail[0 .. 16 * whole]);
+
+    var marker = lastBytes(data, tail.len % 16) | @as(u128, 0x80) << @intCast(8 * (tail.len % 16));
+
+    // The field's bytes are the last ones of the chunk, big-endian.
+    const length = @byteSwap(bits) & (~@as(u128, 0) << (8 * (16 - field)));
+
+    const end = used * block / 16 - 1;
+
+    if (whole == end) {
+        marker |= length;
+    } else {
+        std.mem.writeInt(u128, last[16 * end ..][0..16], length, .little);
+    }
+
+    std.mem.writeInt(u128, last[16 * whole ..][0..16], marker, .little);
+
+    return used;
+}
+
+fn store(comptime Word: type, state: *const [8]Word, out: []u8) void {
+    const size = @sizeOf(Word);
+
+    for (0..out.len / size) |i| std.mem.writeInt(Word, out[size * i ..][0..size], state[i], .big);
+
+    const rest = out.len % size;
+
+    if (rest > 0) {
+        const word = state[out.len / size];
+
+        for (out[out.len - rest ..], 0..) |*byte, j| byte.* = @truncate(word >> @intCast(8 * (size - 1 - j)));
+    }
+}
+
+// The digest of `absorbed` bytes, whole blocks already compressed into state, followed by data, in
+// one call: the whole blocks of data go to the compression straight from data, and the padding
+// after them. out receives the leading bytes of the digest.
+pub fn finish256(state: [8]u32, absorbed: u64, data: []const u8, out: []u8) void {
+    var s = state;
+
+    defer ct.wipe(std.mem.asBytes(&s));
+
+    const bits = (absorbed +% data.len) *% 8;
+
+    if (comptime cpu.possible(.sha256) and @hasDecl(isa, "sha256Finish")) {
+        if (cpu.has(.sha256)) {
+            isa.sha256Finish(&s, data, bits);
+
+            return store(u32, &s, out);
+        }
+    }
+
+    var last: [128]u8 = @splat(0);
+
+    defer ct.wipe(&last);
+
+    const used = pad(64, data, bits, 8, &last);
+
+    blocks256(&s, data[0 .. data.len / 64 * 64]);
+
+    blocks256(&s, last[0 .. 64 * used]);
+
+    store(u32, &s, out);
+}
+
+pub fn finish512(state: [8]u64, absorbed: u128, data: []const u8, out: []u8) void {
+    var s = state;
+
+    defer ct.wipe(std.mem.asBytes(&s));
+
+    const bits = (absorbed +% data.len) *% 8;
+
+    if (comptime cpu.possible(.sha512) and @hasDecl(isa, "sha512Finish")) {
+        if (cpu.has(.sha512)) {
+            isa.sha512Finish(&s, data, bits);
+
+            return store(u64, &s, out);
+        }
+    }
+
+    var last: [256]u8 = @splat(0);
+
+    defer ct.wipe(&last);
+
+    const used = pad(128, data, bits, 16, &last);
+
+    blocks512(&s, data[0 .. data.len / 128 * 128]);
+
+    blocks512(&s, last[0 .. 128 * used]);
+
+    store(u64, &s, out);
+}
+
+// The states after HMAC's (RFC 2104) inner and outer key blocks, the key, at most a block, padded
+// with zeros and XORed with 0x36 and 0x5c, compressed side by side as two lanes.
+pub fn keyed256(iv: *const [8]u32, key: []const u8) [2][8]u32 {
+    var block: [64]u8 = @splat(0);
+
+    defer ct.wipe(&block);
+
+    @memcpy(block[0..key.len], key);
+
+    var states: [8]@Vector(2, u32) = undefined;
+
+    defer ct.wipe(std.mem.asBytes(&states));
+
+    for (&states, iv) |*lanes, word| lanes.* = @splat(word);
+
+    var words: [16]@Vector(2, u32) = undefined;
+
+    defer ct.wipe(std.mem.asBytes(&words));
+
+    for (&words, 0..) |*lanes, t| {
+        const word = std.mem.readInt(u32, block[4 * t ..][0..4], .big);
+
+        lanes.* = .{ word ^ 0x36363636, word ^ 0x5c5c5c5c };
+    }
+
+    rounds256(@Vector(2, u32), &states, &words);
+
+    var keyed: [2][8]u32 = undefined;
+
+    for (states, 0..) |lanes, i| {
+        keyed[0][i] = lanes[0];
+
+        keyed[1][i] = lanes[1];
+    }
+
+    return keyed;
+}
+
+pub fn keyed512(iv: *const [8]u64, key: []const u8) [2][8]u64 {
+    var block: [128]u8 = @splat(0);
+
+    defer ct.wipe(&block);
+
+    @memcpy(block[0..key.len], key);
+
+    var states: [8]@Vector(2, u64) = undefined;
+
+    defer ct.wipe(std.mem.asBytes(&states));
+
+    for (&states, iv) |*lanes, word| lanes.* = @splat(word);
+
+    var words: [16]@Vector(2, u64) = undefined;
+
+    defer ct.wipe(std.mem.asBytes(&words));
+
+    for (&words, 0..) |*lanes, t| {
+        const word = std.mem.readInt(u64, block[8 * t ..][0..8], .big);
+
+        lanes.* = .{ word ^ 0x3636363636363636, word ^ 0x5c5c5c5c5c5c5c5c };
+    }
+
+    rounds512(@Vector(2, u64), &states, &words);
+
+    var keyed: [2][8]u64 = undefined;
+
+    for (states, 0..) |lanes, i| {
+        keyed[0][i] = lanes[0];
+
+        keyed[1][i] = lanes[1];
+    }
+
+    return keyed;
+}
+
+// HMAC-SHA-256, or HMAC-SHA-224 for a 28-byte tag, under a key of at most a block.
+pub fn hmac256(iv: *const [8]u32, key: []const u8, data: []const u8, tag: []u8) void {
+    if (comptime cpu.possible(.sha256) and @hasDecl(isa, "hmac256")) {
+        if (cpu.has(.sha256)) return isa.hmac256(iv, key, data, tag);
+    }
+
+    var keyed = keyed256(iv, key);
+
+    defer ct.wipe(std.mem.asBytes(&keyed));
+
+    var inner: [32]u8 = undefined;
+
+    defer ct.wipe(&inner);
+
+    finish256(keyed[0], 64, data, inner[0..tag.len]);
+
+    finish256(keyed[1], 64, inner[0..tag.len], tag);
+}
+
+// HMAC-SHA-512, or HMAC-SHA-384 for a 48-byte tag, under a key of at most a block.
+pub fn hmac512(iv: *const [8]u64, key: []const u8, data: []const u8, tag: []u8) void {
+    if (comptime cpu.possible(.sha512) and @hasDecl(isa, "hmac512")) {
+        if (cpu.has(.sha512)) return isa.hmac512(iv, key, data, tag);
+    }
+
+    var keyed = keyed512(iv, key);
+
+    defer ct.wipe(std.mem.asBytes(&keyed));
+
+    var inner: [64]u8 = undefined;
+
+    defer ct.wipe(&inner);
+
+    finish512(keyed[0], 128, data, inner[0..tag.len]);
+
+    finish512(keyed[1], 128, inner[0..tag.len], tag);
+}

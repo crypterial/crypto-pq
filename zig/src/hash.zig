@@ -51,12 +51,22 @@ pub const HashAlgorithm = struct {
     digest_size: usize,
     kind: Kind,
 
+    // SHA-2 in one call, without an engine: the whole blocks of data go to the compression straight
+    // from data, and the padding after them.
     pub fn digest(self: HashAlgorithm, data: []const u8, out: []u8) void {
-        var hasher = self.create();
+        checkLength(out.len, self.digest_size);
 
-        hasher.update(data);
+        switch (self.kind) {
+            .sha256 => |iv| sha2.finish256(iv.*, 0, data, out),
+            .sha512 => |iv| sha2.finish512(iv.*, 0, data, out),
+            .sha3 => {
+                var hasher = self.create();
 
-        hasher.digest(out);
+                hasher.update(data);
+
+                hasher.digest(out);
+            },
+        }
     }
 
     pub fn create(self: HashAlgorithm) Hasher {
@@ -122,25 +132,22 @@ pub const Xof = struct {
     }
 };
 
+// HMAC runs under DIT because its key is secret; plain hashes do not know whether their input is.
+// Each public function takes the guard once, around everything it does with the key, and the
+// functions it calls take none of their own.
 pub const HmacAlgorithm = struct {
     name: []const u8,
     digest_size: usize,
     hash: HashAlgorithm,
 
     pub fn digest(self: HmacAlgorithm, key: []const u8, data: []const u8, out: []u8) void {
+        checkLength(out.len, self.digest_size);
+
         const dit = cpu.Dit.enter();
 
         defer dit.leave();
 
-        var hmac: Hmac = undefined;
-
-        defer ct.wipe(std.mem.asBytes(&hmac));
-
-        self.init(&hmac, key);
-
-        hmac.update(data);
-
-        hmac.digest(out);
+        self.mac(key, data, out);
     }
 
     pub fn create(self: HmacAlgorithm, key: []const u8) Hmac {
@@ -159,54 +166,79 @@ pub const HmacAlgorithm = struct {
 
         defer dit.leave();
 
-        const block = self.hash.blockSize();
+        var hashed: [64]u8 = undefined;
 
-        var pad: [128]u8 = @splat(0);
+        defer ct.wipe(&hashed);
 
-        defer ct.wipe(&pad);
-
-        if (key.len > block) {
-            self.hash.digest(key, pad[0..self.digest_size]);
-        } else {
-            @memcpy(pad[0..key.len], key);
-        }
-
-        for (&pad) |*b| {
-            b.* ^= 0x36;
-        }
+        const k = self.blockKey(key, &hashed);
 
         hmac.size = self.digest_size;
 
-        hmac.inner = self.hash.create().engine;
+        switch (self.hash.kind) {
+            .sha256 => |iv| {
+                var keyed = sha2.keyed256(iv, k);
 
-        hmac.inner.update(pad[0..block]);
+                defer ct.wipe(std.mem.asBytes(&keyed));
 
-        for (&pad) |*b| {
-            b.* ^= 0x36 ^ 0x5c;
+                hmac.inner = .{ .sha256 = .{ .state = keyed[0], .length = 64 } };
+
+                hmac.outer = .{ .sha256 = .{ .state = keyed[1], .length = 64 } };
+            },
+            .sha512 => |iv| {
+                var keyed = sha2.keyed512(iv, k);
+
+                defer ct.wipe(std.mem.asBytes(&keyed));
+
+                hmac.inner = .{ .sha512 = .{ .state = keyed[0], .length = 128 } };
+
+                hmac.outer = .{ .sha512 = .{ .state = keyed[1], .length = 128 } };
+            },
+            .sha3 => unreachable,
         }
-
-        hmac.outer = self.hash.create().engine;
-
-        hmac.outer.update(pad[0..block]);
     }
 
     pub fn verify(self: HmacAlgorithm, key: []const u8, data: []const u8, tag: []const u8) bool {
+        if (tag.len != self.digest_size) return false;
+
         const dit = cpu.Dit.enter();
 
         defer dit.leave();
 
-        var hmac: Hmac = undefined;
+        var expected: [64]u8 = undefined;
 
-        defer ct.wipe(std.mem.asBytes(&hmac));
+        defer ct.wipe(&expected);
 
-        self.init(&hmac, key);
+        self.mac(key, data, expected[0..self.digest_size]);
 
-        hmac.update(data);
+        return ct.equal(expected[0..self.digest_size], tag);
+    }
 
-        return hmac.verify(tag);
+    fn mac(self: HmacAlgorithm, key: []const u8, data: []const u8, out: []u8) void {
+        var hashed: [64]u8 = undefined;
+
+        defer ct.wipe(&hashed);
+
+        const k = self.blockKey(key, &hashed);
+
+        switch (self.hash.kind) {
+            .sha256 => |iv| sha2.hmac256(iv, k, data, out),
+            .sha512 => |iv| sha2.hmac512(iv, k, data, out),
+            .sha3 => unreachable,
+        }
+    }
+
+    // RFC 2104: a key longer than a block is replaced by its hash, which `hashed` then holds.
+    fn blockKey(self: HmacAlgorithm, key: []const u8, hashed: *[64]u8) []const u8 {
+        if (key.len <= self.hash.blockSize()) return key;
+
+        self.hash.digest(key, hashed[0..self.digest_size]);
+
+        return hashed[0..self.digest_size];
     }
 };
 
+// The inner engine has absorbed the inner key block and the data so far; the outer one only the
+// outer key block.
 pub const Hmac = struct {
     inner: Engine,
     outer: Engine,
@@ -221,42 +253,44 @@ pub const Hmac = struct {
     }
 
     pub fn digest(self: *const Hmac, out: []u8) void {
+        checkLength(out.len, self.size);
+
         const dit = cpu.Dit.enter();
 
         defer dit.leave();
 
-        checkLength(out.len, self.size);
+        self.finish(out);
+    }
 
-        // The inner hash and the outer key give the output, which may be a key itself.
+    pub fn verify(self: *const Hmac, tag: []const u8) bool {
+        if (tag.len != self.size) return false;
+
+        const dit = cpu.Dit.enter();
+
+        defer dit.leave();
+
+        var expected: [64]u8 = undefined;
+
+        defer ct.wipe(&expected);
+
+        self.finish(expected[0..self.size]);
+
+        return ct.equal(expected[0..self.size], tag);
+    }
+
+    // The inner hash and the outer key give the output, which may be a key itself.
+    fn finish(self: *const Hmac, out: []u8) void {
         var inner: [64]u8 = undefined;
 
         defer ct.wipe(&inner);
 
         self.inner.digest(inner[0..self.size]);
 
-        var outer = self.outer;
-
-        defer ct.wipe(std.mem.asBytes(&outer));
-
-        outer.update(inner[0..self.size]);
-
-        outer.digest(out);
-    }
-
-    pub fn verify(self: *const Hmac, tag: []const u8) bool {
-        const dit = cpu.Dit.enter();
-
-        defer dit.leave();
-
-        if (tag.len != self.size) return false;
-
-        var expected: [64]u8 = undefined;
-
-        defer ct.wipe(&expected);
-
-        self.digest(expected[0..self.size]);
-
-        return ct.equal(expected[0..self.size], tag);
+        switch (self.outer) {
+            .sha256 => |*outer| sha2.finish256(outer.state, outer.length, inner[0..self.size], out),
+            .sha512 => |*outer| sha2.finish512(outer.state, outer.length, inner[0..self.size], out),
+            .keccak => unreachable,
+        }
     }
 };
 

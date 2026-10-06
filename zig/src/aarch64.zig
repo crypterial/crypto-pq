@@ -359,6 +359,221 @@ pub fn sha512Rounds(comptime W: type, state: *[8]W, words: *const [16]W) void {
     ct.wipe(std.mem.asBytes(&s));
 }
 
+// ---- One-shot SHA-2 and HMAC ----
+//
+// The padded last block or two of a message is built in registers, not in memory: a chunk written
+// by smaller stores and loaded right away is not forwarded, and waiting for the stores cost the
+// first rounds of the block tens of cycles. No copy of the message's tail is stored either. HMAC
+// runs from the key to the tag in registers, so that only the tag reaches memory.
+
+const Chunk = @Vector(16, u8);
+
+// Chunk i of the bytes of a message after its whole blocks (tail), the marker chunk at the end of
+// its whole chunks, zeros after it.
+inline fn lastChunk(tail: []const u8, comptime i: usize, marker: Chunk) Chunk {
+    if (i < tail.len / 16) return tail[16 * i ..][0..16].*;
+
+    if (i == tail.len / 16) return marker;
+
+    return @splat(0);
+}
+
+// The rest of data after its whole chunks, then the byte 0x80.
+inline fn markerChunk(data: []const u8) Chunk {
+    const rest = data.len % 16;
+
+    return @bitCast(sha2.lastBytes(data, rest) | @as(u128, 0x80) << @intCast(8 * rest));
+}
+
+inline fn sha256Chunks(abcd: *[1]Words, efgh: *[1]Words, chunks: [4]Chunk) void {
+    var m: [1][4]Words = undefined;
+
+    inline for (0..4) |j| m[0][j] = @byteSwap(@as(Words, @bitCast(chunks[j])));
+
+    sha256Streams(1, abcd, efgh, &m);
+}
+
+// The whole blocks of data and then its padding, for a message of `bits` bits that ends with data.
+inline fn sha256Tail(abcd: *[1]Words, efgh: *[1]Words, data: []const u8, bits: u64) void {
+    const whole = data.len / 64 * 64;
+
+    var offset: usize = 0;
+
+    while (offset < whole) : (offset += 64) sha256Chunks(abcd, efgh, @bitCast(data[offset..][0..64].*));
+
+    const tail = data[whole..];
+
+    const marker = markerChunk(data);
+
+    var last: [4]Chunk = undefined;
+
+    inline for (0..4) |i| last[i] = lastChunk(tail, i, marker);
+
+    const length: Chunk = @bitCast(@as(u128, @byteSwap(bits)) << 64);
+
+    if (tail.len + 9 > 64) {
+        sha256Chunks(abcd, efgh, last);
+
+        last = .{ @splat(0), @splat(0), @splat(0), length };
+    } else {
+        last[3] |= length;
+    }
+
+    sha256Chunks(abcd, efgh, last);
+}
+
+pub fn sha256Finish(state: *[8]u32, data: []const u8, bits: u64) void {
+    var abcd = [1]Words{state[0..4].*};
+
+    var efgh = [1]Words{state[4..8].*};
+
+    sha256Tail(&abcd, &efgh, data, bits);
+
+    state[0..4].* = abcd[0];
+
+    state[4..8].* = efgh[0];
+}
+
+// The key of HMAC, at most a block of `n` chunks, zero-padded and XORed with pad in every byte.
+inline fn keyBlock(comptime n: usize, key: []const u8, pad: u8) [n]Chunk {
+    const partial: Chunk = @bitCast(sha2.lastBytes(key, key.len % 16));
+
+    var block: [n]Chunk = undefined;
+
+    inline for (0..n) |i| block[i] = lastChunk(key, i, partial) ^ @as(Chunk, @splat(pad));
+
+    return block;
+}
+
+// The bytes of the tag from the big-endian words of a final state.
+inline fn storeTag(comptime n: usize, words: [n]Chunk, tag: []u8) void {
+    inline for (0..n) |i| {
+        if (16 * (i + 1) <= tag.len) {
+            tag[16 * i ..][0..16].* = words[i];
+        } else if (16 * i < tag.len) {
+            const halves: Pair = @bitCast(words[i]);
+
+            std.mem.writeInt(u64, tag[16 * i ..][0..8], halves[0], .little);
+
+            std.mem.writeInt(u32, tag[16 * i + 8 ..][0..4], @truncate(halves[1]), .little);
+        }
+    }
+}
+
+// HMAC-SHA-256, or HMAC-SHA-224 for a 28-byte tag, under a key of at most a block. The two key
+// blocks are independent, and the core overlaps them.
+pub fn hmac256(iv: *const [8]u32, key: []const u8, data: []const u8, tag: []u8) void {
+    var inner_abcd = [1]Words{iv[0..4].*};
+
+    var inner_efgh = [1]Words{iv[4..8].*};
+
+    var outer_abcd = inner_abcd;
+
+    var outer_efgh = inner_efgh;
+
+    sha256Chunks(&inner_abcd, &inner_efgh, keyBlock(4, key, 0x36));
+
+    sha256Chunks(&outer_abcd, &outer_efgh, keyBlock(4, key, 0x5c));
+
+    sha256Tail(&inner_abcd, &inner_efgh, data, (data.len +% 64) *% 8);
+
+    // The outer block is the inner digest's words, the marker word and the length.
+    var m = [1][4]Words{.{ inner_abcd[0], inner_efgh[0], @splat(0), .{ 0, 0, 0, @intCast((64 + tag.len) * 8) } }};
+
+    if (tag.len == 32) {
+        m[0][2][0] = 0x8000_0000;
+    } else {
+        m[0][1][3] = 0x8000_0000;
+    }
+
+    sha256Streams(1, &outer_abcd, &outer_efgh, &m);
+
+    storeTag(2, .{ @bitCast(@byteSwap(outer_abcd[0])), @bitCast(@byteSwap(outer_efgh[0])) }, tag);
+}
+
+inline fn sha512Chunks(states: *[1]State512, chunks: [8]Chunk) void {
+    var m: [1][8]Pair = undefined;
+
+    inline for (0..8) |j| m[0][j] = @byteSwap(@as(Pair, @bitCast(chunks[j])));
+
+    sha512Streams(1, states, &m);
+}
+
+// sha256Tail for SHA-512, whose length field takes 16 bytes.
+inline fn sha512Tail(states: *[1]State512, data: []const u8, bits: u128) void {
+    const whole = data.len / 128 * 128;
+
+    var offset: usize = 0;
+
+    while (offset < whole) : (offset += 128) sha512Chunks(states, @bitCast(data[offset..][0..128].*));
+
+    const tail = data[whole..];
+
+    const marker = markerChunk(data);
+
+    var last: [8]Chunk = undefined;
+
+    inline for (0..8) |i| last[i] = lastChunk(tail, i, marker);
+
+    if (tail.len + 17 > 128) {
+        sha512Chunks(states, last);
+
+        last = @splat(@splat(0));
+    }
+
+    last[7] = @bitCast(@byteSwap(bits));
+
+    sha512Chunks(states, last);
+}
+
+pub fn sha512Finish(state: *[8]u64, data: []const u8, bits: u128) void {
+    var s = [1]State512{.{ state[0..2].*, state[2..4].*, state[4..6].*, state[6..8].* }};
+
+    sha512Tail(&s, data, bits);
+
+    inline for (0..4) |j| state[2 * j ..][0..2].* = s[0][j];
+}
+
+// hmac256 for HMAC-SHA-512, or HMAC-SHA-384 for a 48-byte tag; the key blocks run as a pair.
+pub fn hmac512(iv: *const [8]u64, key: []const u8, data: []const u8, tag: []u8) void {
+    const start: State512 = .{ iv[0..2].*, iv[2..4].*, iv[4..6].*, iv[6..8].* };
+
+    var keyed = [2]State512{ start, start };
+
+    var m: [2][8]Pair = undefined;
+
+    inline for (.{ 0x36, 0x5c }, 0..) |pad, i| {
+        const block = keyBlock(8, key, pad);
+
+        inline for (0..8) |j| m[i][j] = @byteSwap(@as(Pair, @bitCast(block[j])));
+    }
+
+    sha512Streams(2, &keyed, &m);
+
+    var inner = [1]State512{keyed[0]};
+
+    var outer = [1]State512{keyed[1]};
+
+    sha512Tail(&inner, data, (@as(u128, data.len) +% 128) *% 8);
+
+    // The outer block is the inner digest's words, the marker word and the length.
+    const ab, const cd, const ef, const gh = inner[0];
+
+    const marker: Pair = .{ 0x8000_0000_0000_0000, 0 };
+
+    const length: Pair = .{ 0, (128 + tag.len) * 8 };
+
+    var block = [1][8]Pair{if (tag.len == 64) .{ ab, cd, ef, gh, marker, @splat(0), @splat(0), length } else .{ ab, cd, ef, marker, @splat(0), @splat(0), @splat(0), length }};
+
+    sha512Streams(1, &outer, &block);
+
+    var words: [4]Chunk = undefined;
+
+    inline for (0..4) |j| words[j] = @bitCast(@byteSwap(outer[0][j]));
+
+    storeTag(4, words, tag);
+}
+
 // ---- Modular arithmetic for ML-KEM and ML-DSA ----
 //
 // AArch64 has no vector multiply-high for 16-bit or 32-bit lanes, so LLVM widens the products.

@@ -514,3 +514,35 @@ func TestDigestIntoAllocatesNothing(t *testing.T) {
 		t.Errorf("SHAKE256: %v allocations", allocations)
 	}
 }
+
+// HMAC's one-shot forms allocate nothing either, for keys up to a block and longer ones, which are
+// hashed first.
+func TestHmacDigestIntoAllocatesNothing(t *testing.T) {
+	data := sequence(1000)
+
+	var out [64]byte
+
+	for _, algorithm := range []cryptopq.HmacAlgorithm{cryptopq.HMAC_SHA_224, cryptopq.HMAC_SHA_256, cryptopq.HMAC_SHA_384, cryptopq.HMAC_SHA_512} {
+		for _, keySize := range []int{0, 32, 64, 128, 200} {
+			key := data[:keySize]
+
+			tag := out[:algorithm.DigestSize()]
+
+			allocations := testing.AllocsPerRun(20, func() {
+				algorithm.DigestInto(key, data, tag)
+			})
+
+			if allocations != 0 {
+				t.Errorf("%s, %d-byte key: %v allocations", algorithm, keySize, allocations)
+			}
+
+			allocations = testing.AllocsPerRun(20, func() {
+				algorithm.Verify(key, data, tag)
+			})
+
+			if allocations != 0 {
+				t.Errorf("%s verify, %d-byte key: %v allocations", algorithm, keySize, allocations)
+			}
+		}
+	}
+}

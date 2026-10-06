@@ -4,7 +4,10 @@ use alloc::vec::Vec;
 use crate::cpu::Dit;
 use crate::ct;
 use crate::keccak::Keccak;
-use crate::sha2::{IV_224, IV_256, IV_384, IV_512, IV_512_224, IV_512_256, Sha256, Sha512};
+use crate::sha2::{
+    self, IV_224, IV_256, IV_384, IV_512, IV_512_224, IV_512_256, Sha256, Sha512, finish256,
+    finish512,
+};
 use crate::wipe::wipe;
 
 const SHA3_SUFFIX: u8 = 0x06;
@@ -36,8 +39,8 @@ impl Engine {
 
     fn digest_into(&self, out: &mut [u8]) {
         match self {
-            Self::Sha256(engine) => out.copy_from_slice(&engine.digest()[..out.len()]),
-            Self::Sha512(engine) => out.copy_from_slice(&engine.digest()[..out.len()]),
+            Self::Sha256(engine) => engine.digest_into(out),
+            Self::Sha512(engine) => engine.digest_into(out),
             Self::Keccak(engine) => engine.clone().read(out),
         }
     }
@@ -87,17 +90,9 @@ impl HashAlgorithm {
         check_length(out.len(), self.digest_size);
 
         match self.kind {
-            Kind::Sha256(iv) => {
-                out.copy_from_slice(&Sha256::digest_message(iv, data)[..self.digest_size])
-            }
+            Kind::Sha256(iv) => finish256(iv, 0, data, out),
+            Kind::Sha512(iv) => finish512(iv, 0, data, out),
             Kind::Sha3 => Keccak::digest_into(self.block_size(), SHA3_SUFFIX, data, out),
-            Kind::Sha512(_) => {
-                let mut hasher = self.create();
-
-                hasher.update(data);
-
-                hasher.engine.digest_into(out);
-            }
         }
     }
 
@@ -208,6 +203,9 @@ pub struct HmacAlgorithm {
     hash: HashAlgorithm,
 }
 
+// HMAC runs under DIT because its key is secret; plain hashes do not know whether their input is.
+// Each public method takes the guard once, around everything it does with the key, and the
+// functions it calls take none of their own.
 impl HmacAlgorithm {
     pub const fn name(&self) -> &'static str {
         self.name
@@ -218,76 +216,117 @@ impl HmacAlgorithm {
     }
 
     pub fn digest(&self, key: &[u8], data: &[u8]) -> Vec<u8> {
-        let _dit = Dit::new();
+        let mut out = vec![0; self.hash.digest_size];
 
-        let mut hmac = self.create(key);
+        self.digest_into(key, data, &mut out);
 
-        hmac.update(data);
-
-        hmac.digest()
+        out
     }
 
     pub fn digest_into(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
+        check_length(out.len(), self.hash.digest_size);
+
         let _dit = Dit::new();
 
-        let mut hmac = self.create(key);
-
-        hmac.update(data);
-
-        hmac.digest_into(out);
+        self.mac(key, data, out);
     }
 
     pub fn create(&self, key: &[u8]) -> Hmac {
         let _dit = Dit::new();
 
-        let block = self.hash.block_size();
+        let mut hashed = [0; 64];
 
-        let mut pad = [0u8; 128];
+        let key = self.block_key(key, &mut hashed);
 
-        if key.len() > block {
-            let mut digest = self.hash.digest(key);
+        let (inner, outer) = match self.hash.kind {
+            Kind::Sha256(iv) => {
+                let mut keyed = sha2::keyed256(iv, key);
 
-            pad[..digest.len()].copy_from_slice(&digest);
+                let engines = (
+                    Engine::Sha256(Sha256::resume(keyed[0], 64)),
+                    Engine::Sha256(Sha256::resume(keyed[1], 64)),
+                );
 
-            wipe(&mut digest);
-        } else {
-            pad[..key.len()].copy_from_slice(key);
+                wipe(keyed.as_flattened_mut());
+
+                engines
+            }
+            Kind::Sha512(iv) => {
+                let mut keyed = sha2::keyed512(iv, key);
+
+                let engines = (
+                    Engine::Sha512(Sha512::resume(keyed[0], 128)),
+                    Engine::Sha512(Sha512::resume(keyed[1], 128)),
+                );
+
+                wipe(keyed.as_flattened_mut());
+
+                engines
+            }
+            Kind::Sha3 => unreachable!("HMAC is defined here over SHA-2 only"),
+        };
+
+        wipe(&mut hashed);
+
+        Hmac {
+            inner,
+            outer,
+            size: self.hash.digest_size,
         }
-
-        pad.iter_mut().for_each(|b| *b ^= 0x36);
-
-        let mut inner = self.hash.create();
-
-        inner.update(&pad[..block]);
-
-        pad.iter_mut().for_each(|b| *b ^= 0x36 ^ 0x5C);
-
-        let mut outer = self.hash.create();
-
-        outer.update(&pad[..block]);
-
-        wipe(&mut pad);
-
-        Hmac { inner, outer }
     }
 
     pub fn verify(&self, key: &[u8], data: &[u8], tag: &[u8]) -> bool {
         let _dit = Dit::new();
 
-        let mut hmac = self.create(key);
+        let mut expected = [0; 64];
 
-        hmac.update(data);
+        let size = self.hash.digest_size;
 
-        hmac.verify(tag)
+        self.mac(key, data, &mut expected[..size]);
+
+        let equal = ct::equal(&expected[..size], tag);
+
+        wipe(&mut expected);
+
+        equal
+    }
+
+    fn mac(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
+        let mut hashed = [0; 64];
+
+        let key = self.block_key(key, &mut hashed);
+
+        match self.hash.kind {
+            Kind::Sha256(iv) => sha2::hmac256(iv, key, data, out),
+            Kind::Sha512(iv) => sha2::hmac512(iv, key, data, out),
+            Kind::Sha3 => unreachable!("HMAC is defined here over SHA-2 only"),
+        }
+
+        wipe(&mut hashed);
+    }
+
+    // RFC 2104: a key longer than a block is replaced by its hash, which `hashed` then holds.
+    fn block_key<'a>(&self, key: &'a [u8], hashed: &'a mut [u8; 64]) -> &'a [u8] {
+        if key.len() <= self.hash.block_size() {
+            return key;
+        }
+
+        let hashed = &mut hashed[..self.hash.digest_size];
+
+        self.hash.digest_into(key, hashed);
+
+        hashed
     }
 }
 
+// The inner engine has absorbed the inner key block and the data so far; the outer one only the
+// outer key block.
 pub struct Hmac {
-    inner: Hasher,
-    outer: Hasher,
+    inner: Engine,
+    outer: Engine,
+    size: usize,
 }
 
-// HMAC runs under DIT because its key is secret; plain hashes do not know whether their input is.
 impl Hmac {
     pub fn update(&mut self, data: &[u8]) {
         let _dit = Dit::new();
@@ -296,7 +335,7 @@ impl Hmac {
     }
 
     pub fn digest(&self) -> Vec<u8> {
-        let mut out = vec![0; self.outer.size];
+        let mut out = vec![0; self.size];
 
         self.digest_into(&mut out);
 
@@ -304,28 +343,42 @@ impl Hmac {
     }
 
     pub fn digest_into(&self, out: &mut [u8]) {
+        check_length(out.len(), self.size);
+
         let _dit = Dit::new();
 
-        check_length(out.len(), self.outer.size);
-
-        let mut outer = self.outer.engine.clone();
-
-        // The inner hash and the outer key give the output, which may be a key itself.
-        let mut inner = [0; 64];
-
-        self.inner.engine.digest_into(&mut inner[..self.inner.size]);
-
-        outer.update(&inner[..self.inner.size]);
-
-        wipe(&mut inner);
-
-        outer.digest_into(out);
+        self.finish(out);
     }
 
     pub fn verify(&self, tag: &[u8]) -> bool {
         let _dit = Dit::new();
 
-        ct::equal(&self.digest(), tag)
+        let mut expected = [0; 64];
+
+        self.finish(&mut expected[..self.size]);
+
+        let equal = ct::equal(&expected[..self.size], tag);
+
+        wipe(&mut expected);
+
+        equal
+    }
+
+    // The inner digest is wiped: with the outer key it gives the output, which may be a key itself.
+    fn finish(&self, out: &mut [u8]) {
+        let mut inner = [0; 64];
+
+        let inner_digest = &mut inner[..self.size];
+
+        self.inner.digest_into(inner_digest);
+
+        match &self.outer {
+            Engine::Sha256(outer) => outer.digest_after(inner_digest, out),
+            Engine::Sha512(outer) => outer.digest_after(inner_digest, out),
+            Engine::Keccak(_) => unreachable!("HMAC is defined here over SHA-2 only"),
+        }
+
+        wipe(&mut inner);
     }
 }
 

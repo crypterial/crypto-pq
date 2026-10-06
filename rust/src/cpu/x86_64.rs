@@ -142,8 +142,40 @@ pub(crate) fn compress256_lanes<const LANES: usize>(
     false
 }
 
+// The one-shot hashes build their padding in memory, as the portable code does.
 #[inline(always)]
-pub(crate) fn compress512(_: &mut [u64; 8], _: &[[u8; 128]]) -> bool {
+pub(crate) fn finish256(_: &mut [u32; 8], _: &[u8], _: u64) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn finish512(_: &mut [u64; 8], _: &[u8], _: u128) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn hmac256(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn hmac512(_: &[u64; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
+    false
+}
+
+// The pair goes through compress256_lanes, which has the SHA-NI and AVX2 kernels.
+#[inline(always)]
+pub(crate) fn compress256_pair(_: &mut [[u32; 8]; 2], _: &[[u8; 64]; 2]) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn compress512(_: &mut [u64; 8], _: &[[u8; 128]], _: &[[u8; 128]]) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn compress512_pair(_: &mut [[u64; 8]; 2], _: &[[u8; 128]; 2]) -> bool {
     false
 }
 
@@ -452,7 +484,7 @@ pub(crate) fn absorb(_: &mut [u64; 25], _: usize, _: &[u8]) -> usize {
 }
 
 #[inline(always)]
-pub(crate) fn absorb_last(_: &mut [u64; 25], _: usize, _: &[u8], _: &[u8]) -> bool {
+pub(crate) fn digest(_: usize, _: u8, _: &[u8], _: &mut [u8]) -> bool {
     false
 }
 

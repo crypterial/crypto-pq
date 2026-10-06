@@ -345,19 +345,27 @@ impl Keccak {
         self.position = 0;
     }
 
+    // The padding of the input so far and the first permutation of the output, which permute
+    // applies as in update_block_with.
+    pub(crate) fn finish_with(&mut self, permute: impl FnOnce(&mut [u64; 25])) {
+        assert!(!self.squeezing, "UNSUPPORTED: cannot finish twice");
+
+        let last = self.rate - 1;
+
+        self.state[self.position / 8] ^= u64::from(self.suffix) << (8 * (self.position % 8));
+
+        self.state[last / 8] ^= 0x80 << (8 * (last % 8));
+
+        permute(&mut self.state);
+
+        self.position = 0;
+
+        self.squeezing = true;
+    }
+
     pub(crate) fn read(&mut self, mut out: &mut [u8]) {
         if !self.squeezing {
-            let last = self.rate - 1;
-
-            self.state[self.position / 8] ^= u64::from(self.suffix) << (8 * (self.position % 8));
-
-            self.state[last / 8] ^= 0x80 << (8 * (last % 8));
-
-            permute_one(&mut self.state);
-
-            self.position = 0;
-
-            self.squeezing = true;
+            self.finish_with(permute_one);
         }
 
         while !out.is_empty() {
@@ -385,29 +393,16 @@ impl Keccak {
         out
     }
 
-    // The first out.len() bytes of output for data, read once. Where there is a kernel, the
-    // padded last block is absorbed in the same call as the whole blocks before it, and no state
-    // is kept between calls.
+    // The first out.len() bytes of output for data, read once. A kernel absorbs and squeezes in
+    // one call with the state in its registers.
     pub(crate) fn digest_into(rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) {
-        let (blocks, tail) = data.split_at(data.len() - data.len() % rate);
-
-        let mut last = [0; 168];
-
-        last[..tail.len()].copy_from_slice(tail);
-
-        last[tail.len()] ^= suffix;
-
-        last[rate - 1] ^= 0x80;
+        if cpu::digest(rate, suffix, data, out) {
+            return;
+        }
 
         let mut engine = Self::new(rate, suffix);
 
-        if cpu::absorb_last(&mut engine.state, rate, blocks, &last[..rate]) {
-            engine.squeezing = true;
-        } else {
-            engine.update(data);
-        }
-
-        wipe(&mut last);
+        engine.update(data);
 
         engine.read(out);
     }

@@ -246,6 +246,242 @@ fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
     }
 }
 
+// One block into each of two states, side by side: a lone stream waits on the latency of its
+// rounds, which the other stream fills. HMAC's inner and outer key blocks are such a pair.
+pub(crate) fn compress256_pair(states: &mut [[u32; 8]; 2], blocks: &[[u8; 64]; 2]) {
+    if cpu::compress256_pair(states, blocks) {
+        return;
+    }
+
+    let mut lanes: [[u32; 2]; 8] = core::array::from_fn(|i| [states[0][i], states[1][i]]);
+
+    let words = blocks.each_ref().map(|block| block.as_chunks::<4>().0);
+
+    let mut w: [[u32; 2]; 16] = core::array::from_fn(|t| {
+        [
+            u32::from_be_bytes(words[0][t]),
+            u32::from_be_bytes(words[1][t]),
+        ]
+    });
+
+    compress256_lanes(&mut lanes, &mut w);
+
+    for (i, lane) in lanes.iter().enumerate() {
+        states[0][i] = lane[0];
+
+        states[1][i] = lane[1];
+    }
+
+    wipe(lanes.as_flattened_mut());
+
+    wipe(w.as_flattened_mut());
+}
+
+// The words of a state as big-endian bytes, as many as out holds: a digest, or its truncation.
+fn store256(state: &[u32; 8], out: &mut [u8]) {
+    let (words, rest) = out.as_chunks_mut::<4>();
+
+    for (bytes, word) in words.iter_mut().zip(state) {
+        *bytes = word.to_be_bytes();
+    }
+
+    if let Some(word) = state.get(words.len()) {
+        rest.copy_from_slice(&word.to_be_bytes()[..rest.len()]);
+    }
+}
+
+fn store512(state: &[u64; 8], out: &mut [u8]) {
+    let (words, rest) = out.as_chunks_mut::<8>();
+
+    for (bytes, word) in words.iter_mut().zip(state) {
+        *bytes = word.to_be_bytes();
+    }
+
+    if let Some(word) = state.get(words.len()) {
+        rest.copy_from_slice(&word.to_be_bytes()[..rest.len()]);
+    }
+}
+
+// The last `count` bytes of data, fewer than sixteen, as the low bytes of a little-endian value,
+// read without a store: from the sixteen bytes that end data where it has them.
+pub(crate) fn last_bytes(data: &[u8], count: usize) -> u128 {
+    if count == 0 {
+        return 0;
+    }
+
+    if let Some(window) = data.last_chunk::<16>() {
+        return u128::from_le_bytes(*window) >> (8 * (16 - count));
+    }
+
+    data[data.len() - count..]
+        .iter()
+        .rev()
+        .fold(0, |value, &byte| value << 8 | u128::from(byte))
+}
+
+// The padded last block or two (FIPS 180-4, 5.1) of a message that ends with data: the bytes of
+// data after its whole blocks, the 0x80 marker, zeros, and the length field of `field` bytes, the
+// message length in bits, at the end. Returns how many of the two blocks are used. Each 16-byte
+// chunk gets a single store, which the compression's 16-byte load of it can forward: a chunk
+// made of byte stores and read right away cost an Apple M3 tens of cycles.
+fn pad<const BLOCK: usize>(
+    data: &[u8],
+    bits: u128,
+    field: usize,
+    last: &mut [[u8; BLOCK]; 2],
+) -> usize {
+    let tail = &data[data.len() - data.len() % BLOCK..];
+
+    let used = if tail.len() + 1 + field > BLOCK { 2 } else { 1 };
+
+    let chunks = last.as_flattened_mut().as_chunks_mut::<16>().0;
+
+    let (whole, rest) = tail.as_chunks::<16>();
+
+    for (chunk, bytes) in chunks.iter_mut().zip(whole) {
+        *chunk = *bytes;
+    }
+
+    let mut marker = last_bytes(data, rest.len()) | 0x80 << (8 * rest.len());
+
+    // The field's bytes are the last ones of the chunk, big-endian.
+    let length = bits.swap_bytes() & (u128::MAX << (8 * (16 - field)));
+
+    let end = used * BLOCK / 16 - 1;
+
+    if whole.len() == end {
+        marker |= length;
+    } else {
+        chunks[end] = length.to_le_bytes();
+    }
+
+    chunks[whole.len()] = marker.to_le_bytes();
+
+    used
+}
+
+// The digest of `absorbed` bytes, whole blocks already compressed into state, followed by data,
+// computed in one call: the whole blocks of data and the padding blocks go to the compression in
+// one pass, without copying data into a block buffer. out receives the leading bytes of the
+// digest.
+pub(crate) fn finish256(state: &[u32; 8], absorbed: u64, data: &[u8], out: &mut [u8]) {
+    let bits = absorbed.wrapping_add(data.len() as u64).wrapping_mul(8);
+
+    let mut state = *state;
+
+    if !cpu::finish256(&mut state, data, bits) {
+        let mut last = [[0; 64]; 2];
+
+        let used = pad(data, u128::from(bits), 8, &mut last);
+
+        compress256(&mut state, data.as_chunks::<64>().0, &last[..used]);
+
+        wipe(last.as_flattened_mut());
+    }
+
+    store256(&state, out);
+
+    wipe(&mut state);
+}
+
+// finish256 for SHA-512, whose length field takes 16 bytes.
+pub(crate) fn finish512(state: &[u64; 8], absorbed: u128, data: &[u8], out: &mut [u8]) {
+    let bits = absorbed.wrapping_add(data.len() as u128).wrapping_mul(8);
+
+    let mut state = *state;
+
+    if !cpu::finish512(&mut state, data, bits) {
+        let mut last = [[0; 128]; 2];
+
+        let used = pad(data, bits, 16, &mut last);
+
+        compress512(&mut state, data.as_chunks::<128>().0, &last[..used]);
+
+        wipe(last.as_flattened_mut());
+    }
+
+    store512(&state, out);
+
+    wipe(&mut state);
+}
+
+// HMAC (RFC 2104) keys: the key, at most a block, padded with zeros to a block and XORed with
+// 0x36 for the inner hash and with 0x5C for the outer one.
+fn pads<const BLOCK: usize>(key: &[u8]) -> [[u8; BLOCK]; 2] {
+    let mut pads = [[0x36; BLOCK], [0x5C; BLOCK]];
+
+    for pad in &mut pads {
+        for (byte, key) in pad.iter_mut().zip(key) {
+            *byte ^= key;
+        }
+    }
+
+    pads
+}
+
+// The states after HMAC's inner and outer key blocks, compressed side by side.
+pub(crate) fn keyed256(iv: &[u32; 8], key: &[u8]) -> [[u32; 8]; 2] {
+    let mut pads = pads::<64>(key);
+
+    let mut states = [*iv; 2];
+
+    compress256_pair(&mut states, &pads);
+
+    wipe(pads.as_flattened_mut());
+
+    states
+}
+
+pub(crate) fn keyed512(iv: &[u64; 8], key: &[u8]) -> [[u64; 8]; 2] {
+    let mut pads = pads::<128>(key);
+
+    let mut states = [*iv; 2];
+
+    compress512_pair(&mut states, &pads);
+
+    wipe(pads.as_flattened_mut());
+
+    states
+}
+
+// HMAC-SHA-256, or HMAC-SHA-224 for a 28-byte tag, under a key of at most a block.
+pub(crate) fn hmac256(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
+    if cpu::hmac256(iv, key, data, tag) {
+        return;
+    }
+
+    let mut keyed = keyed256(iv, key);
+
+    let mut inner = [0; 32];
+
+    finish256(&keyed[0], 64, data, &mut inner[..tag.len()]);
+
+    finish256(&keyed[1], 64, &inner[..tag.len()], tag);
+
+    wipe(&mut inner);
+
+    wipe(keyed.as_flattened_mut());
+}
+
+// HMAC-SHA-512, or HMAC-SHA-384 for a 48-byte tag, under a key of at most a block.
+pub(crate) fn hmac512(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
+    if cpu::hmac512(iv, key, data, tag) {
+        return;
+    }
+
+    let mut keyed = keyed512(iv, key);
+
+    let mut inner = [0; 64];
+
+    finish512(&keyed[0], 128, data, &mut inner[..tag.len()]);
+
+    finish512(&keyed[1], 128, &inner[..tag.len()], tag);
+
+    wipe(&mut inner);
+
+    wipe(keyed.as_flattened_mut());
+}
+
 fn compress256_block(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 16];
 
@@ -436,16 +672,30 @@ fn round512(a: u64, b: u64, c: u64, d: &mut u64, e: u64, f: u64, g: u64, h: &mut
     *h = s0.wrapping_add((a & b) | (c & (a | b))).wrapping_add(t1);
 }
 
-fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]]) {
-    if cpu::compress512(state, blocks) {
+fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
+    if cpu::compress512(state, blocks, more) {
         return;
     }
 
-    for block in blocks {
+    for block in blocks.iter().chain(more) {
         compress512_block(state, block);
     }
 }
 
+// compress256_pair for SHA-512.
+pub(crate) fn compress512_pair(states: &mut [[u64; 8]; 2], blocks: &[[u8; 128]; 2]) {
+    if cpu::compress512_pair(states, blocks) {
+        return;
+    }
+
+    for (state, block) in states.iter_mut().zip(blocks) {
+        compress512(state, core::slice::from_ref(block), &[]);
+    }
+}
+
+// Never inlined: inlined into compress512, its frame and register saves came with every call, the
+// kernel's included, and cost a one-block SHA-512 about 30 ns on an Apple M3.
+#[inline(never)]
 fn compress512_block(state: &mut [u64; 8], block: &[u8; 128]) {
     let mut w = [0u64; 16];
 
@@ -509,10 +759,15 @@ pub(crate) struct Sha256 {
 
 impl Sha256 {
     pub(crate) const fn new(iv: &[u32; 8]) -> Self {
+        Self::resume(*iv, 0)
+    }
+
+    // An engine whose first `absorbed` bytes, whole blocks, are already compressed into state.
+    pub(crate) const fn resume(state: [u32; 8], absorbed: u64) -> Self {
         Self {
-            state: *iv,
+            state,
             blocks: Blocks::new(),
-            length: 0,
+            length: absorbed,
         }
     }
 
@@ -526,6 +781,15 @@ impl Sha256 {
     }
 
     pub(crate) fn digest(&self) -> [u8; 32] {
+        let mut out = [0; 32];
+
+        self.digest_into(&mut out);
+
+        out
+    }
+
+    // The leading out.len() bytes of the digest.
+    pub(crate) fn digest_into(&self, out: &mut [u8]) {
         let mut state = self.state;
 
         let bits = self.length.wrapping_mul(8).to_be_bytes();
@@ -533,51 +797,20 @@ impl Sha256 {
         self.blocks
             .finish(&bits, |blocks| compress256(&mut state, blocks, &[]));
 
-        let mut out = [0; 32];
-
-        for (bytes, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
-            *bytes = word.to_be_bytes();
-        }
+        store256(&state, out);
 
         wipe(&mut state);
-
-        out
     }
 
-    // The digest of data alone, for a hash computed in one call: the whole blocks of data and the
-    // padding blocks go to the compression in one pass, without the block buffer.
-    pub(crate) fn digest_message(iv: &[u32; 8], data: &[u8]) -> [u8; 32] {
-        let (blocks, tail) = data.as_chunks::<64>();
+    // digest_into after data, without the block buffer, for an engine whose input so far fills
+    // whole blocks: the outer hash of HMAC.
+    pub(crate) fn digest_after(&self, data: &[u8], out: &mut [u8]) {
+        assert_eq!(
+            self.blocks.len, 0,
+            "the input so far must fill whole blocks"
+        );
 
-        let mut last = [[0; 64]; 2];
-
-        let used = if tail.len() + 9 > 64 { 2 } else { 1 };
-
-        let padding = last.as_flattened_mut();
-
-        padding[..tail.len()].copy_from_slice(tail);
-
-        padding[tail.len()] = 0x80;
-
-        let bits = (data.len() as u64).wrapping_mul(8).to_be_bytes();
-
-        padding[64 * used - 8..64 * used].copy_from_slice(&bits);
-
-        let mut state = *iv;
-
-        compress256(&mut state, blocks, &last[..used]);
-
-        let mut out = [0; 32];
-
-        for (bytes, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
-            *bytes = word.to_be_bytes();
-        }
-
-        wipe(last.as_flattened_mut());
-
-        wipe(&mut state);
-
-        out
+        finish256(&self.state, self.length, data, out);
     }
 
     // finish_lanes for messages whose padded last block the caller has already built as words,
@@ -667,10 +900,15 @@ pub(crate) struct Sha512 {
 
 impl Sha512 {
     pub(crate) const fn new(iv: &[u64; 8]) -> Self {
+        Self::resume(*iv, 0)
+    }
+
+    // Sha256::resume.
+    pub(crate) const fn resume(state: [u64; 8], absorbed: u128) -> Self {
         Self {
-            state: *iv,
+            state,
             blocks: Blocks::new(),
-            length: 0,
+            length: absorbed,
         }
     }
 
@@ -680,26 +918,37 @@ impl Sha512 {
         let state = &mut self.state;
 
         self.blocks
-            .update(data, |blocks| compress512(state, blocks));
+            .update(data, |blocks| compress512(state, blocks, &[]));
     }
 
     pub(crate) fn digest(&self) -> [u8; 64] {
+        let mut out = [0; 64];
+
+        self.digest_into(&mut out);
+
+        out
+    }
+
+    pub(crate) fn digest_into(&self, out: &mut [u8]) {
         let mut state = self.state;
 
         let bits = self.length.wrapping_mul(8).to_be_bytes();
 
         self.blocks
-            .finish(&bits, |blocks| compress512(&mut state, blocks));
+            .finish(&bits, |blocks| compress512(&mut state, blocks, &[]));
 
-        let mut out = [0; 64];
-
-        for (bytes, word) in out.as_chunks_mut::<8>().0.iter_mut().zip(state) {
-            *bytes = word.to_be_bytes();
-        }
+        store512(&state, out);
 
         wipe(&mut state);
+    }
 
-        out
+    pub(crate) fn digest_after(&self, data: &[u8], out: &mut [u8]) {
+        assert_eq!(
+            self.blocks.len, 0,
+            "the input so far must fill whole blocks"
+        );
+
+        finish512(&self.state, self.length, data, out);
     }
 
     // Sha256::finish_lanes for one message.
@@ -725,13 +974,11 @@ impl Sha512 {
 
         let mut state = self.state;
 
-        compress512(&mut state, message[..end].as_chunks::<128>().0);
+        compress512(&mut state, message[..end].as_chunks::<128>().0, &[]);
 
         let mut out = [0; 64];
 
-        for (bytes, word) in out.as_chunks_mut::<8>().0.iter_mut().zip(state) {
-            *bytes = word.to_be_bytes();
-        }
+        store512(&state, &mut out);
 
         wipe(message);
 
@@ -887,7 +1134,9 @@ mod tests {
 
             let mut actual = state;
 
-            if cpu::compress512(&mut actual, blocks) {
+            let (first, more) = blocks.split_at(n / 3 % (blocks.len() + 1));
+
+            if cpu::compress512(&mut actual, first, more) {
                 assert_eq!(actual, expected, "case {n}");
 
                 accelerated += 1;
@@ -895,5 +1144,172 @@ mod tests {
         }
 
         std::eprintln!("SHA-512: {accelerated} of {CASES} cases through a CPU kernel");
+    }
+
+    // The pairs against two lone compressions, through a kernel or through the fallback.
+    #[test]
+    fn pairs_match_lone_compressions() {
+        let mut inputs = Inputs::new(2);
+
+        for n in 0..4_000 {
+            let (first, blocks) = case::<8, u32, 64>(&mut inputs, n, |x| x as u32);
+
+            let mut states = [first, inputs.words::<8>().map(|x| x as u32)];
+
+            let pair = [blocks[0], blocks[1]];
+
+            let mut expected = states;
+
+            for (state, block) in expected.iter_mut().zip(&pair) {
+                compress256_block(state, block);
+            }
+
+            compress256_pair(&mut states, &pair);
+
+            assert_eq!(states, expected, "SHA-256 case {n}");
+
+            let (first, blocks) = case::<8, u64, 128>(&mut inputs, n, |x| x);
+
+            let mut states = [first, inputs.words::<8>()];
+
+            let pair = [blocks[0], blocks[2]];
+
+            let mut expected = states;
+
+            for (state, block) in expected.iter_mut().zip(&pair) {
+                compress512_block(state, block);
+            }
+
+            compress512_pair(&mut states, &pair);
+
+            assert_eq!(states, expected, "SHA-512 case {n}");
+        }
+    }
+
+    // The one-shot finish against the incremental engine, for every tail length around the
+    // padding boundaries, from a state that has absorbed a block or none.
+    #[test]
+    fn finish_matches_engine() {
+        let data: [u8; 3 * 128 + 1] = Inputs::new(3).bytes();
+
+        for length in 0..data.len() {
+            let message = &data[..length];
+
+            let mut engine = Sha256::new(&IV_256);
+
+            engine.update(&data[..64]);
+
+            let resumed = Sha256::resume(engine.state, 64);
+
+            engine.update(message);
+
+            let mut out = [0; 32];
+
+            resumed.digest_after(message, &mut out);
+
+            assert_eq!(
+                out,
+                engine.digest(),
+                "SHA-256 after a block, length {length}"
+            );
+
+            let mut truncated = [0; 28];
+
+            finish256(&IV_224, 0, message, &mut truncated);
+
+            let mut whole = Sha256::new(&IV_224);
+
+            whole.update(message);
+
+            assert_eq!(truncated, whole.digest()[..28], "SHA-224, length {length}");
+
+            let mut engine = Sha512::new(&IV_512);
+
+            engine.update(&data[..128]);
+
+            let resumed = Sha512::resume(engine.state, 128);
+
+            engine.update(message);
+
+            let mut out = [0; 64];
+
+            resumed.digest_after(message, &mut out);
+
+            assert_eq!(
+                out,
+                engine.digest(),
+                "SHA-512 after a block, length {length}"
+            );
+
+            let mut truncated = [0; 28];
+
+            finish512(&IV_512_224, 0, message, &mut truncated);
+
+            let mut whole = Sha512::new(&IV_512_224);
+
+            whole.update(message);
+
+            assert_eq!(
+                truncated,
+                whole.digest()[..28],
+                "SHA-512/224, length {length}"
+            );
+        }
+    }
+
+    // The one-call HMAC kernels against the key states and the finish of the generic path, for
+    // every key length up to a block, data lengths around the padding boundaries and every tag
+    // size. Where there is no kernel, the cpu functions return false.
+    #[test]
+    fn hmac_kernels_match_generic() {
+        let bytes: [u8; 400] = Inputs::new(5).bytes();
+
+        let mut accelerated = 0;
+
+        for (n, key_length) in (0..=128).enumerate() {
+            let data = &bytes[128..128 + [0, 1, 55, 56, 64, 111, 112, 128, 200, 260][n % 10]];
+
+            for (iv, size) in [(&IV_256, 32), (&IV_224, 28)] {
+                let key = &bytes[..key_length.min(64)];
+
+                let keyed = keyed256(iv, key);
+
+                let (mut inner, mut expected) = ([0; 32], [0; 32]);
+
+                finish256(&keyed[0], 64, data, &mut inner[..size]);
+
+                finish256(&keyed[1], 64, &inner[..size], &mut expected[..size]);
+
+                let mut tag = [0; 32];
+
+                if cpu::hmac256(iv, key, data, &mut tag[..size]) {
+                    assert_eq!(tag, expected, "key {key_length}, size {size}");
+
+                    accelerated += 1;
+                }
+            }
+
+            for (iv, size) in [(&IV_512, 64), (&IV_384, 48)] {
+                let key = &bytes[..key_length];
+
+                let keyed = keyed512(iv, key);
+
+                let (mut inner, mut expected) = ([0; 64], [0; 64]);
+
+                finish512(&keyed[0], 128, data, &mut inner[..size]);
+
+                finish512(&keyed[1], 128, &inner[..size], &mut expected[..size]);
+
+                let mut tag = [0; 64];
+
+                if cpu::hmac512(iv, key, data, &mut tag[..size]) {
+                    assert_eq!(tag, expected, "key {key_length}, size {size}");
+
+                    accelerated += 1;
+                }
+            }
+        }
+
+        std::eprintln!("HMAC: {accelerated} of 516 cases through a CPU kernel");
     }
 }

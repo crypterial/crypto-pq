@@ -3,9 +3,62 @@ use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{Ordering, compiler_fence};
 
-// Volatile writes survive dead-store elimination, so secrets are gone even when the memory is
-// never read again. Groups of sixteen, then eight values are written at once, which turns them
-// into a few wide stores instead of one narrow store per value.
+// Secrets are overwritten with zeros that the compiler must keep, even when the memory is never
+// read again. The zeros are written with ordinary stores, as wide as the target has, and then the
+// buffer's address goes into an empty assembly block, which for all the compiler knows reads the
+// buffer, so no store can be dropped as dead. (Volatile stores of whole arrays were each built in
+// a temporary first and copied, a store-to-load dependency per sixteen bytes.) Up to eight values
+// of at most a word get a volatile store each instead: an address given to the assembly pins a
+// variable to memory for its whole life, and the X25519 ladder's, kept there, made X-Wing 2.5%
+// slower.
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "loongarch64",
+))]
+#[allow(unsafe_code)]
+pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
+    if size_of::<T>() <= 8 && values.len() <= 8 {
+        for value in values {
+            // SAFETY: `value` comes from a mutable slice, so it is valid, aligned and exclusive.
+            unsafe { core::ptr::write_volatile(value, T::default()) };
+        }
+
+        compiler_fence(Ordering::SeqCst);
+
+        return;
+    }
+
+    values.fill(T::default());
+
+    // SAFETY: the assembly is empty: it reads no register but the address, writes nothing and
+    // leaves the stack and the flags alone.
+    unsafe {
+        core::arch::asm!(
+            "/* {0} */",
+            in(reg) values.as_ptr(),
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+
+    compiler_fence(Ordering::SeqCst);
+}
+
+// Targets without stable inline assembly in Rust: volatile writes, which survive dead-store
+// elimination, in groups of sixteen and then eight values.
+#[cfg(not(any(
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "loongarch64",
+)))]
 #[allow(unsafe_code)]
 pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
     let (wide, rest) = values.as_chunks_mut::<16>();

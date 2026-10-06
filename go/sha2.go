@@ -783,15 +783,6 @@ func newSha256(iv *[8]uint32, size int) *sha256Engine {
 	return &sha256Engine{state: *iv, size: size}
 }
 
-// The digest of data into out, on an engine that stays on the stack.
-func sha256DigestInto(iv *[8]uint32, data, out []byte) {
-	e := sha256Engine{state: *iv, size: len(out)}
-
-	e.update(data)
-
-	e.digestInto(out)
-}
-
 func (e *sha256Engine) update(data []byte) {
 	e.length += uint64(len(data))
 
@@ -875,15 +866,6 @@ func newSha512(iv *[8]uint64, size int) *sha512Engine {
 	return &sha512Engine{state: *iv, size: size}
 }
 
-// The digest of data into out, on an engine that stays on the stack.
-func sha512DigestInto(iv *[8]uint64, data, out []byte) {
-	e := sha512Engine{state: *iv, size: len(out)}
-
-	e.update(data)
-
-	e.digestInto(out)
-}
-
 func (e *sha512Engine) update(data []byte) {
 	e.length += uint64(len(data))
 
@@ -959,11 +941,14 @@ func (e *sha512Engine) clone() engine {
 
 // Completes a SHA-256 hash whose first absorbed bytes, a multiple of 64, are already compressed
 // into state, and writes the first len(out) bytes of the digest. Nothing is allocated, and the
-// stack buffers are indexed directly for the race detector's sake, as in compress256.
+// stack buffer is indexed directly for the race detector's sake, as in compress256. The one-shot
+// digests come here too: an engine on the stack cost them a tenth more on a block of data.
 func sha256Finish(state [8]uint32, absorbed int, data, out []byte) {
 	whole := len(data) &^ 63
 
-	compress256(&state, data[:whole])
+	if whole > 0 {
+		compress256(&state, data[:whole])
+	}
 
 	var tail [128]byte
 
@@ -977,28 +962,29 @@ func sha256Finish(state [8]uint32, absorbed int, data, out []byte) {
 		end = 128
 	}
 
-	length := uint64(absorbed+len(data)) * 8
-
-	for i := range 8 {
-		tail[end-1-i] = byte(length >> (8 * i))
-	}
+	binary.BigEndian.PutUint64(tail[end-8:end], uint64(absorbed+len(data))*8)
 
 	compress256(&state, tail[:end])
 
-	var digest [32]byte
+	words := len(out) / 4
 
-	for i, word := range state {
-		digest[4*i], digest[4*i+1], digest[4*i+2], digest[4*i+3] = byte(word>>24), byte(word>>16), byte(word>>8), byte(word)
+	for i := range words {
+		binary.BigEndian.PutUint32(out[4*i:], state[i])
 	}
 
-	copy(out, digest[:])
+	for j := range len(out) % 4 {
+		out[4*words+j] = byte(state[words] >> (24 - 8*j))
+	}
 }
 
-// The SHA-512 counterpart of sha256Finish, with 128-byte blocks; absorbed stays below 2^61.
+// The SHA-512 counterpart of sha256Finish, with 128-byte blocks; absorbed stays below 2^61. out
+// may end inside a word, as the 28 bytes of SHA-512/224 do.
 func sha512Finish(state [8]uint64, absorbed int, data, out []byte) {
 	whole := len(data) &^ 127
 
-	compress512(&state, data[:whole])
+	if whole > 0 {
+		compress512(&state, data[:whole])
+	}
 
 	var tail [256]byte
 
@@ -1012,21 +998,17 @@ func sha512Finish(state [8]uint64, absorbed int, data, out []byte) {
 		end = 256
 	}
 
-	length := uint64(absorbed+len(data)) * 8
-
-	for i := range 8 {
-		tail[end-1-i] = byte(length >> (8 * i))
-	}
+	binary.BigEndian.PutUint64(tail[end-8:end], uint64(absorbed+len(data))*8)
 
 	compress512(&state, tail[:end])
 
-	var digest [64]byte
+	words := len(out) / 8
 
-	for i, word := range state {
-		for j := range 8 {
-			digest[8*i+j] = byte(word >> (56 - 8*j))
-		}
+	for i := range words {
+		binary.BigEndian.PutUint64(out[8*i:], state[i])
 	}
 
-	copy(out, digest[:])
+	for j := range len(out) % 8 {
+		out[8*words+j] = byte(state[words] >> (56 - 8*j))
+	}
 }

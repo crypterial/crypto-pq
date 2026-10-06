@@ -1,5 +1,7 @@
 package cryptopq
 
+import "encoding/binary"
+
 type engine interface {
 	update(data []byte)
 	digest() []byte
@@ -108,24 +110,24 @@ func (a HashAlgorithm) Digest(data []byte) []byte {
 }
 
 // DigestInto writes the digest into out, which must be DigestSize bytes long, without allocating.
-// Each engine is called directly rather than through a function value, so that it stays on the
-// stack together with out.
+// Each hash is called directly rather than through a function value, so that its buffers stay on
+// the stack together with out.
 func (a HashAlgorithm) DigestInto(data, out []byte) {
 	checkDigestLength(len(out), a.spec().digestSize)
 
 	switch a {
 	case SHA_224:
-		sha256DigestInto(&iv224, data, out)
+		sha256Finish(iv224, 0, data, out)
 	case SHA_256:
-		sha256DigestInto(&iv256, data, out)
+		sha256Finish(iv256, 0, data, out)
 	case SHA_384:
-		sha512DigestInto(&iv384, data, out)
+		sha512Finish(iv384, 0, data, out)
 	case SHA_512:
-		sha512DigestInto(&iv512, data, out)
+		sha512Finish(iv512, 0, data, out)
 	case SHA_512_224:
-		sha512DigestInto(&iv512224, data, out)
+		sha512Finish(iv512224, 0, data, out)
 	case SHA_512_256:
-		sha512DigestInto(&iv512256, data, out)
+		sha512Finish(iv512256, 0, data, out)
 	default:
 		sha3DigestInto(data, out)
 	}
@@ -287,82 +289,190 @@ func (a HmacAlgorithm) DigestSize() int {
 }
 
 func (a HmacAlgorithm) Digest(key, data []byte) []byte {
-	defer ditLeave(ditEnter())
+	out := make([]byte, a.DigestSize())
 
-	hmac := a.Create(key)
+	a.DigestInto(key, data, out)
 
-	hmac.Update(data)
-
-	return hmac.Digest()
+	return out
 }
 
+// DigestInto writes the tag into out, which must be DigestSize bytes long, without allocating.
 func (a HmacAlgorithm) DigestInto(key, data, out []byte) {
+	hash := a.spec().hash
+
+	checkDigestLength(len(out), hash.DigestSize())
+
 	defer ditLeave(ditEnter())
 
-	hmac := a.Create(key)
-
-	hmac.Update(data)
-
-	hmac.DigestInto(out)
+	hmacInto(hash, key, data, out)
 }
 
 func (a HmacAlgorithm) Create(key []byte) *Hmac {
 	defer ditLeave(ditEnter())
 
-	hash := a.spec().hash.spec()
+	hash := a.spec().hash
 
-	pad := make([]byte, hash.blockSize)
+	spec := hash.spec()
 
-	if len(key) > hash.blockSize {
-		hashed := hash.create()
+	var block [128]byte
 
-		hashed.update(key)
+	hmacKey(hash, key, &block)
 
-		digest := hashed.digest()
+	h := &Hmac{size: spec.digestSize}
 
-		copy(pad, digest)
+	if spec.blockSize == 64 {
+		keyed := hmacKeys256(hashIV256(hash), &block)
 
-		clear(digest)
+		h.inner = &sha256Engine{state: [8]uint32(keyed[:8]), length: 64, size: spec.digestSize}
+
+		h.outer = &sha256Engine{state: [8]uint32(keyed[8:]), length: 64, size: spec.digestSize}
+
+		clear(keyed[:])
 	} else {
-		copy(pad, key)
+		keyed := hmacKeys512(hashIV512(hash), &block)
+
+		h.inner = &sha512Engine{state: keyed[0], length: 128, size: spec.digestSize}
+
+		h.outer = &sha512Engine{state: keyed[1], length: 128, size: spec.digestSize}
+
+		clear(keyed[0][:])
+
+		clear(keyed[1][:])
 	}
 
-	for i := range pad {
-		pad[i] ^= 0x36
-	}
+	clear(block[:])
 
-	inner := hash.create()
-
-	inner.update(pad)
-
-	for i := range pad {
-		pad[i] ^= 0x36 ^ 0x5c
-	}
-
-	outer := hash.create()
-
-	outer.update(pad)
-
-	// Best effort: Go cannot promise that no other copy of the key remains.
-	clear(pad)
-
-	return &Hmac{inner: inner, outer: outer, size: hash.digestSize}
+	return h
 }
 
 func (a HmacAlgorithm) Verify(key, data, tag []byte) bool {
 	defer ditLeave(ditEnter())
 
-	hmac := a.Create(key)
+	var expected [64]byte
 
-	hmac.Update(data)
+	size := a.DigestSize()
 
-	return hmac.Verify(tag)
+	hmacInto(a.spec().hash, key, data, expected[:size])
+
+	ok := equal(expected[:size], tag)
+
+	clear(expected[:])
+
+	return ok
 }
 
 func (a HmacAlgorithm) String() string {
 	return a.Name()
 }
 
+// HMAC (RFC 2104) with every buffer on the stack, where it is cleared, so that a call allocates
+// nothing; the callers hold DIT. The inner and outer key blocks are compressed side by side where
+// the CPU can, and the inner and outer hashes are finished without engines.
+func hmacInto(hash HashAlgorithm, key, data, out []byte) {
+	var block [128]byte
+
+	hmacKey(hash, key, &block)
+
+	if hash.spec().blockSize == 64 {
+		keyed := hmacKeys256(hashIV256(hash), &block)
+
+		var inner [32]byte
+
+		sha256Finish([8]uint32(keyed[:8]), 64, data, inner[:len(out)])
+
+		sha256Finish([8]uint32(keyed[8:]), 64, inner[:len(out)], out)
+
+		clear(keyed[:])
+
+		clear(inner[:])
+	} else {
+		keyed := hmacKeys512(hashIV512(hash), &block)
+
+		var inner [64]byte
+
+		sha512Finish(keyed[0], 128, data, inner[:len(out)])
+
+		sha512Finish(keyed[1], 128, inner[:len(out)], out)
+
+		clear(keyed[0][:])
+
+		clear(keyed[1][:])
+
+		clear(inner[:])
+	}
+
+	clear(block[:])
+}
+
+// The key padded with zeros to a block, or its hash if it is longer than a block.
+func hmacKey(hash HashAlgorithm, key []byte, block *[128]byte) {
+	spec := hash.spec()
+
+	if len(key) > spec.blockSize {
+		hash.DigestInto(key, block[:spec.digestSize])
+	} else {
+		copy(block[:], key)
+	}
+}
+
+// The states after the inner and the outer key block, inner then outer, which sha256Lanes
+// compresses side by side.
+func hmacKeys256(iv *[8]uint32, block *[128]byte) [16]uint32 {
+	var words [32]uint32
+
+	for i := range 16 {
+		w := binary.BigEndian.Uint32(block[4*i:])
+
+		words[i], words[16+i] = w^0x36363636, w^0x5c5c5c5c
+	}
+
+	var keyed [16]uint32
+
+	sha256Lanes(iv, words[:], 1, keyed[:])
+
+	clear(words[:])
+
+	return keyed
+}
+
+func hmacKeys512(iv *[8]uint64, block *[128]byte) [2][8]uint64 {
+	var pads [2][128]byte
+
+	for i := range block {
+		pads[0][i], pads[1][i] = block[i]^0x36, block[i]^0x5c
+	}
+
+	keyed := [2][8]uint64{*iv, *iv}
+
+	compress512(&keyed[0], pads[0][:])
+
+	compress512(&keyed[1], pads[1][:])
+
+	clear(pads[0][:])
+
+	clear(pads[1][:])
+
+	return keyed
+}
+
+func hashIV256(hash HashAlgorithm) *[8]uint32 {
+	if hash == SHA_224 {
+		return &iv224
+	}
+
+	return &iv256
+}
+
+func hashIV512(hash HashAlgorithm) *[8]uint64 {
+	if hash == SHA_384 {
+		return &iv384
+	}
+
+	return &iv512
+}
+
+// Hmac holds the inner engine, which has absorbed the inner key block and the data so far, and the
+// outer one, which has absorbed the outer key block only.
 type Hmac struct {
 	inner engine
 	outer engine
@@ -384,24 +494,39 @@ func (h *Hmac) Digest() []byte {
 }
 
 func (h *Hmac) DigestInto(out []byte) {
-	defer ditLeave(ditEnter())
-
 	checkDigestLength(len(out), h.size)
 
-	outer := h.outer.clone()
+	defer ditLeave(ditEnter())
 
-	// The inner hash and the outer key give the output, which may be a key itself.
-	inner := h.inner.digest()
-
-	outer.update(inner)
-
-	clear(inner)
-
-	outer.digestInto(out)
+	h.finish(out)
 }
 
 func (h *Hmac) Verify(tag []byte) bool {
 	defer ditLeave(ditEnter())
 
-	return equal(h.Digest(), tag)
+	var expected [64]byte
+
+	h.finish(expected[:h.size])
+
+	ok := equal(expected[:h.size], tag)
+
+	clear(expected[:])
+
+	return ok
+}
+
+// The inner hash and the outer key give the output, which may be a key itself.
+func (h *Hmac) finish(out []byte) {
+	var inner [64]byte
+
+	h.inner.digestInto(inner[:h.size])
+
+	switch outer := h.outer.(type) {
+	case *sha256Engine:
+		sha256Finish(outer.state, 64, inner[:h.size], out)
+	case *sha512Engine:
+		sha512Finish(outer.state, 128, inner[:h.size], out)
+	}
+
+	clear(inner[:])
 }

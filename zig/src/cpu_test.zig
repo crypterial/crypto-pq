@@ -230,6 +230,126 @@ test "AArch64 SHA-512 instructions match the portable code" {
     try checkLanes512(3, random, runs / 10);
 }
 
+// The digest of `absorbed` bytes already compressed into state followed by data, with the padding
+// built byte by byte and every block through the portable code.
+fn portableFinish(comptime Word: type, state: [8]Word, absorbed: usize, data: []const u8) [8]Word {
+    const block = 16 * @sizeOf(Word);
+
+    const field = 2 * @sizeOf(Word);
+
+    var s = state;
+
+    var buffer: [2 * block + 300]u8 = @splat(0);
+
+    @memcpy(buffer[0..data.len], data);
+
+    buffer[data.len] = 0x80;
+
+    const end = (data.len + 1 + field + block - 1) / block * block;
+
+    std.mem.writeInt(u64, buffer[end - 8 ..][0..8], (absorbed + data.len) * 8, .big);
+
+    var offset: usize = 0;
+
+    while (offset < end) : (offset += block) {
+        if (Word == u32) sha2.portable.compress256(&s, buffer[offset..][0..block]) else sha2.portable.compress512(&s, buffer[offset..][0..block]);
+    }
+
+    return s;
+}
+
+fn portableHmac(comptime Word: type, iv: *const [8]Word, key: []const u8, data: []const u8, size: usize) [64]u8 {
+    const block = 16 * @sizeOf(Word);
+
+    var keyed: [2][8]Word = .{ iv.*, iv.* };
+
+    for (&keyed, [_]u8{ 0x36, 0x5c }) |*state, pad| {
+        var bytes: [block]u8 = @splat(pad);
+
+        for (bytes[0..key.len], key) |*byte, k| byte.* ^= k;
+
+        if (Word == u32) sha2.portable.compress256(state, &bytes) else sha2.portable.compress512(state, &bytes);
+    }
+
+    var inner: [64]u8 = undefined;
+
+    for (portableFinish(Word, keyed[0], block, data), 0..) |word, i| std.mem.writeInt(Word, inner[@sizeOf(Word) * i ..][0..@sizeOf(Word)], word, .big);
+
+    var tag: [64]u8 = undefined;
+
+    for (portableFinish(Word, keyed[1], block, inner[0..size]), 0..) |word, i| std.mem.writeInt(Word, tag[@sizeOf(Word) * i ..][0..@sizeOf(Word)], word, .big);
+
+    return tag;
+}
+
+test "AArch64 one-shot SHA-256 and HMAC-SHA-256 match the portable code" {
+    if (comptime arch != .aarch64 or !cpu.possible(.sha256)) return error.SkipZigTest;
+
+    if (!cpu.has(.sha256)) return error.SkipZigTest;
+
+    var prng: std.Random.DefaultPrng = .init(0x48);
+
+    const random = prng.random();
+
+    var data: [300]u8 = undefined;
+
+    for (0..data.len) |length| {
+        fill(random, &data, length);
+
+        const message = data[0..length];
+
+        var state = sha2.iv_256;
+
+        aarch64.sha256Finish(&state, message, length * 8);
+
+        try testing.expectEqualSlices(u32, &portableFinish(u32, sha2.iv_256, 0, message), &state);
+
+        const key = data[length / 3 ..][0 .. length % 65];
+
+        for ([_]usize{ 32, 28 }, [_]*const [8]u32{ &sha2.iv_256, &sha2.iv_224 }) |size, iv| {
+            var tag: [32]u8 = undefined;
+
+            aarch64.hmac256(iv, key, message, tag[0..size]);
+
+            try testing.expectEqualSlices(u8, portableHmac(u32, iv, key, message, size)[0..size], tag[0..size]);
+        }
+    }
+}
+
+test "AArch64 one-shot SHA-512 and HMAC-SHA-512 match the portable code" {
+    if (comptime arch != .aarch64 or !cpu.possible(.sha512)) return error.SkipZigTest;
+
+    if (!cpu.has(.sha512)) return error.SkipZigTest;
+
+    var prng: std.Random.DefaultPrng = .init(0x96);
+
+    const random = prng.random();
+
+    var data: [300]u8 = undefined;
+
+    for (0..data.len) |length| {
+        fill(random, &data, length);
+
+        const message = data[0..length];
+
+        var state = sha2.iv_512;
+
+        aarch64.sha512Finish(&state, message, length * 8);
+
+        try testing.expectEqualSlices(u64, &portableFinish(u64, sha2.iv_512, 0, message), &state);
+
+        const key = data[length / 3 ..][0 .. length % 129];
+
+        for ([_]usize{ 64, 48 }, [_]*const [8]u64{ &sha2.iv_512, &sha2.iv_384 }) |size, iv| {
+            var tag: [64]u8 = undefined;
+
+            aarch64.hmac512(iv, key, message, tag[0..size]);
+
+            try testing.expectEqualSlices(u8, portableHmac(u64, iv, key, message, size)[0..size], tag[0..size]);
+        }
+    }
+}
+
 test "AArch64 Keccak pairs with the SHA3 instructions match the portable permutation" {
     if (comptime arch != .aarch64 or !cpu.possible(.sha3)) return error.SkipZigTest;
 

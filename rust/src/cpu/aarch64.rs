@@ -12,7 +12,8 @@ use core::arch::aarch64::*;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::keccak::{self, ROUND_CONSTANTS};
-use crate::sha2::{K256, K512};
+use crate::sha2::{K256, K512, last_bytes};
+use crate::wipe::wipe;
 
 mod binomial;
 
@@ -26,7 +27,7 @@ mod pack;
 
 mod sample;
 
-use memory::{load_u8, load_u32, load_u64, store_u32, store_u64};
+use memory::{load_u8, load_u32, load_u64, store_u8, store_u32, store_u64};
 
 pub(crate) use binomial::binomial;
 
@@ -218,7 +219,9 @@ fn probe() -> u32 {
 
 // PSTATE.DIT makes data-processing instructions take a time independent of their operands; on
 // Apple cores it also turns off the data memory-dependent prefetcher. It is set for the life of
-// the guard and cleared afterwards, unless it was already set when the guard was made.
+// the guard and cleared afterwards, unless it was already set when the guard was made. Writing
+// the bit drains the pipeline (on an Apple M3 a set and a clear take about 80 cycles together,
+// and a write that changes nothing about 14), so a guard inside another only reads it.
 pub(crate) struct Dit(bool);
 
 impl Dit {
@@ -251,14 +254,25 @@ fn set_dit() -> bool {
     unsafe {
         core::arch::asm!(
             "mrs {previous}, s3_3_c4_c2_5",
-            "msr s3_3_c4_c2_5, {set}",
             previous = out(reg) previous,
+            options(nostack, preserves_flags),
+        );
+    }
+
+    if previous & DIT_BIT != 0 {
+        return false;
+    }
+
+    // SAFETY: as above.
+    unsafe {
+        core::arch::asm!(
+            "msr s3_3_c4_c2_5, {set}",
             set = in(reg) DIT_BIT,
             options(nostack, preserves_flags),
         );
     }
 
-    previous & DIT_BIT == 0
+    true
 }
 
 #[allow(unsafe_code)]
@@ -299,13 +313,87 @@ pub(crate) fn compress256_lanes<const LANES: usize>(
 }
 
 #[allow(unsafe_code)]
-pub(crate) fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]]) -> bool {
+pub(crate) fn compress256_pair(states: &mut [[u32; 8]; 2], blocks: &[[u8; 64]; 2]) -> bool {
+    if !has(SHA2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { compress256_pair_sha2(states, blocks) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn finish256(state: &mut [u32; 8], data: &[u8], bits: u64) -> bool {
+    if !has(SHA2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { finish256_sha2(state, data, bits) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn finish512(state: &mut [u64; 8], data: &[u8], bits: u128) -> bool {
+    if !has(SHA3) {
+        return false;
+    }
+
+    // SAFETY: as in compress512.
+    unsafe { finish512_sha3(state, data, bits) };
+
+    true
+}
+
+// HMAC of data under a key of at most a block, whose tag size picks the hash: 32 or 28 bytes
+// for SHA-256 or SHA-224 (hmac256), 64 or 48 bytes for SHA-512 or SHA-384 (hmac512).
+#[allow(unsafe_code)]
+pub(crate) fn hmac256(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) -> bool {
+    if !has(SHA2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { hmac256_sha2(iv, key, data, tag) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn hmac512(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) -> bool {
+    if !has(SHA3) {
+        return false;
+    }
+
+    // SAFETY: as in compress512.
+    unsafe { hmac512_sha3(iv, key, data, tag) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) -> bool {
     if !has(SHA3) {
         return false;
     }
 
     // SAFETY: the CPU has the SHA3 and SHA512 instructions, which Rust's sha3 feature names.
-    unsafe { compress512_sha3(state, blocks) };
+    unsafe { compress512_sha3(state, blocks, more) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn compress512_pair(states: &mut [[u64; 8]; 2], blocks: &[[u8; 128]; 2]) -> bool {
+    if !has(SHA3) {
+        return false;
+    }
+
+    // SAFETY: as in compress512.
+    unsafe { compress512_pair_sha3(states, blocks) };
 
     true
 }
@@ -355,37 +443,48 @@ pub(crate) fn permute_many(states: &mut [&mut [u64; 25]]) -> usize {
 
 // Absorbs the whole blocks of data, rate bytes each, into one state, and returns how many bytes
 // that was. The state stays in vector registers from one block to the next.
+#[allow(unsafe_code)]
 pub(crate) fn absorb(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
     let length = data.len() - data.len() % rate;
 
-    if length == 0 || !absorb_blocks(state, rate, &data[..length], &[]) {
+    if length == 0 || !has(KECCAK) {
         return 0;
+    }
+
+    let blocks = &data[..length];
+
+    // SAFETY: KECCAK is only ever found together with SHA3.
+    unsafe {
+        match rate {
+            72 => absorb_sha3::<72>(state, blocks.as_chunks().0),
+            104 => absorb_sha3::<104>(state, blocks.as_chunks().0),
+            136 => absorb_sha3::<136>(state, blocks.as_chunks().0),
+            144 => absorb_sha3::<144>(state, blocks.as_chunks().0),
+            168 => absorb_sha3::<168>(state, blocks.as_chunks().0),
+            _ => return 0,
+        }
     }
 
     length
 }
 
-// absorb of whole blocks followed by a last block of rate bytes, already padded, in one call.
-pub(crate) fn absorb_last(state: &mut [u64; 25], rate: usize, data: &[u8], last: &[u8]) -> bool {
-    data.len().is_multiple_of(rate) && last.len() == rate && absorb_blocks(state, rate, data, last)
-}
-
-// A kernel per rate: whole blocks of a constant size keep the state in registers, which a rate
-// known only at run time did not quite do.
+// The output of a sponge of the given rate and suffix that absorbs data and is read once into
+// out. A kernel per rate: whole blocks of a constant size keep the state in registers, which a
+// rate known only at run time did not quite do.
 #[allow(unsafe_code)]
-fn absorb_blocks(state: &mut [u64; 25], rate: usize, data: &[u8], last: &[u8]) -> bool {
+pub(crate) fn digest(rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) -> bool {
     if !has(KECCAK) {
         return false;
     }
 
-    // SAFETY: KECCAK is only ever found together with SHA3.
+    // SAFETY: as in absorb.
     unsafe {
         match rate {
-            72 => absorb_sha3::<72>(state, data.as_chunks().0, last.as_chunks().0),
-            104 => absorb_sha3::<104>(state, data.as_chunks().0, last.as_chunks().0),
-            136 => absorb_sha3::<136>(state, data.as_chunks().0, last.as_chunks().0),
-            144 => absorb_sha3::<144>(state, data.as_chunks().0, last.as_chunks().0),
-            168 => absorb_sha3::<168>(state, data.as_chunks().0, last.as_chunks().0),
+            72 => digest_sha3::<72>(data, suffix, out),
+            104 => digest_sha3::<104>(data, suffix, out),
+            136 => digest_sha3::<136>(data, suffix, out),
+            144 => digest_sha3::<144>(data, suffix, out),
+            168 => digest_sha3::<168>(data, suffix, out),
             _ => return false,
         }
     }
@@ -595,51 +694,88 @@ fn rounds256<const N: usize>(streams: &mut [Stream; N]) {
     }
 }
 
-// The streaming hash: the state stays in registers from one block to the next.
+// One block of a lone stream, given as its schedule words, with the state in registers.
 #[target_feature(enable = "sha2")]
-fn compress256_sha2(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
-    let [abcd, efgh] = state.as_chunks::<4>().0 else {
-        unreachable!("eight words are two groups of four")
-    };
+#[inline]
+fn block256(
+    abcd: &mut uint32x4_t,
+    efgh: &mut uint32x4_t,
+    mut m: [uint32x4_t; 4],
+    k: &[uint32x4_t; 16],
+) {
+    let mut start = (*abcd, *efgh);
 
-    let (mut abcd, mut efgh) = (load_u32(abcd), load_u32(efgh));
+    for (sixteen, k) in k.as_chunks::<4>().0.iter().enumerate() {
+        let schedule = sixteen < 3;
 
+        if sixteen == 0 {
+            first_quarter(abcd, efgh, &mut m, k[0], &mut start);
+        } else {
+            lone_quarter::<0>(abcd, efgh, &mut m, k[0], schedule);
+        }
+
+        lone_quarter::<1>(abcd, efgh, &mut m, k[1], schedule);
+
+        lone_quarter::<2>(abcd, efgh, &mut m, k[2], schedule);
+
+        lone_quarter::<3>(abcd, efgh, &mut m, k[3], schedule);
+    }
+
+    *abcd = vaddq_u32(*abcd, start.0);
+
+    *efgh = vaddq_u32(*efgh, start.1);
+}
+
+// The big-endian words of a block of bytes.
+#[target_feature(enable = "neon")]
+#[inline]
+fn words256(chunks: [uint8x16_t; 4]) -> [uint32x4_t; 4] {
+    let mut words = [vdupq_n_u32(0); 4];
+
+    for (words, chunk) in words.iter_mut().zip(chunks) {
+        *words = vreinterpretq_u32_u8(vrev32q_u8(chunk));
+    }
+
+    words
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn block_chunks<const N: usize>(block: &[[u8; 16]]) -> [uint8x16_t; N] {
+    let mut chunks = [vdupq_n_u8(0); N];
+
+    for (chunk, bytes) in chunks.iter_mut().zip(block) {
+        *chunk = load_u8(bytes);
+    }
+
+    chunks
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn constants256() -> [uint32x4_t; 16] {
     let mut k = [vdupq_n_u32(0); 16];
 
     for (k, words) in k.iter_mut().zip(K256.as_chunks::<4>().0) {
         *k = load_u32(words);
     }
 
-    for block in blocks.iter().chain(more) {
-        let mut m = [vdupq_n_u32(0); 4];
+    k
+}
 
-        for (m, bytes) in m.iter_mut().zip(block.as_chunks::<16>().0) {
-            *m = vreinterpretq_u32_u8(vrev32q_u8(load_u8(bytes)));
-        }
+#[target_feature(enable = "neon")]
+#[inline]
+fn load256(state: &[u32; 8]) -> (uint32x4_t, uint32x4_t) {
+    let [abcd, efgh] = state.as_chunks::<4>().0 else {
+        unreachable!("eight words are two groups of four")
+    };
 
-        let mut start = (abcd, efgh);
+    (load_u32(abcd), load_u32(efgh))
+}
 
-        for (sixteen, k) in k.as_chunks::<4>().0.iter().enumerate() {
-            let schedule = sixteen < 3;
-
-            if sixteen == 0 {
-                first_quarter(&mut abcd, &mut efgh, &mut m, k[0], &mut start);
-            } else {
-                lone_quarter::<0>(&mut abcd, &mut efgh, &mut m, k[0], schedule);
-            }
-
-            lone_quarter::<1>(&mut abcd, &mut efgh, &mut m, k[1], schedule);
-
-            lone_quarter::<2>(&mut abcd, &mut efgh, &mut m, k[2], schedule);
-
-            lone_quarter::<3>(&mut abcd, &mut efgh, &mut m, k[3], schedule);
-        }
-
-        abcd = vaddq_u32(abcd, start.0);
-
-        efgh = vaddq_u32(efgh, start.1);
-    }
-
+#[target_feature(enable = "neon")]
+#[inline]
+fn store256(abcd: uint32x4_t, efgh: uint32x4_t, state: &mut [u32; 8]) {
     let [abcd_out, efgh_out] = state.as_chunks_mut::<4>().0 else {
         unreachable!("eight words are two groups of four")
     };
@@ -647,6 +783,250 @@ fn compress256_sha2(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]
     store_u32(abcd, abcd_out);
 
     store_u32(efgh, efgh_out);
+}
+
+// The streaming hash: the state stays in registers from one block to the next.
+#[target_feature(enable = "sha2")]
+fn compress256_sha2(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
+    let (mut abcd, mut efgh) = load256(state);
+
+    let k = constants256();
+
+    for block in blocks.iter().chain(more) {
+        let chunks = block_chunks(block.as_chunks::<16>().0);
+
+        block256(&mut abcd, &mut efgh, words256(chunks), &k);
+    }
+
+    store256(abcd, efgh, state);
+}
+
+// Chunk i of the padded last block or two of a message whose bytes after its whole blocks are
+// whole (whole 16-byte chunks) and then the bytes that the marker chunk holds.
+#[target_feature(enable = "neon")]
+#[inline]
+fn last_chunk(whole: &[[u8; 16]], i: usize, marker: uint8x16_t) -> uint8x16_t {
+    match whole.get(i) {
+        Some(bytes) => load_u8(bytes),
+        None if i == whole.len() => marker,
+        None => vdupq_n_u8(0),
+    }
+}
+
+// The bytes of a message tail that fill no whole chunk, then the 0x80 marker, in a vector.
+#[target_feature(enable = "neon")]
+#[inline]
+fn marker_chunk(data: &[u8], rest: usize) -> uint8x16_t {
+    let value = last_bytes(data, rest) | 0x80 << (8 * rest);
+
+    vreinterpretq_u8_u64(vector64(value as u64, (value >> 64) as u64))
+}
+
+// The whole blocks of data and then its padded last block or two, for a message of `bits` bits
+// that ends with data, into a state held in registers. The padding is built in registers, not in
+// memory: a chunk written by smaller stores and loaded right away is not forwarded, and waiting
+// for the stores cost the first rounds tens of cycles. No copy of the message's tail is stored.
+#[target_feature(enable = "sha2")]
+#[inline]
+fn tail256(
+    abcd: &mut uint32x4_t,
+    efgh: &mut uint32x4_t,
+    data: &[u8],
+    bits: u64,
+    k: &[uint32x4_t; 16],
+) {
+    let (blocks, tail) = data.as_chunks::<64>();
+
+    for block in blocks {
+        let chunks = block_chunks(block.as_chunks::<16>().0);
+
+        block256(abcd, efgh, words256(chunks), k);
+    }
+
+    let (whole, rest) = tail.as_chunks::<16>();
+
+    let marker = marker_chunk(data, rest.len());
+
+    let length = vreinterpretq_u8_u64(vector64(0, bits.swap_bytes()));
+
+    let mut last = [
+        last_chunk(whole, 0, marker),
+        last_chunk(whole, 1, marker),
+        last_chunk(whole, 2, marker),
+        last_chunk(whole, 3, marker),
+    ];
+
+    if tail.len() + 9 > 64 {
+        block256(abcd, efgh, words256(last), k);
+
+        last = [vdupq_n_u8(0), vdupq_n_u8(0), vdupq_n_u8(0), length];
+    } else {
+        last[3] = vorrq_u8(last[3], length);
+    }
+
+    block256(abcd, efgh, words256(last), k);
+}
+
+#[target_feature(enable = "sha2")]
+fn finish256_sha2(state: &mut [u32; 8], data: &[u8], bits: u64) {
+    let (mut abcd, mut efgh) = load256(state);
+
+    tail256(&mut abcd, &mut efgh, data, bits, &constants256());
+
+    store256(abcd, efgh, state);
+}
+
+// The key block of HMAC (a key of at most `N` chunks, zero-padded) XORed with pad in every byte.
+#[target_feature(enable = "neon")]
+#[inline]
+fn key_block<const N: usize>(key: &[u8], pad: u8) -> [uint8x16_t; N] {
+    let (whole, rest) = key.as_chunks::<16>();
+
+    let partial = vreinterpretq_u8_u64({
+        let value = last_bytes(key, rest.len());
+
+        vector64(value as u64, (value >> 64) as u64)
+    });
+
+    let mut block = [vdupq_n_u8(0); N];
+
+    for (i, chunk) in block.iter_mut().enumerate() {
+        *chunk = veorq_u8(last_chunk(whole, i, partial), vdupq_n_u8(pad));
+    }
+
+    block
+}
+
+// A tag from the byte vectors of a final state: whole vectors, and for HMAC-SHA-224 twelve bytes
+// of the last one, written without a copy in memory.
+#[target_feature(enable = "neon")]
+#[inline]
+fn store_tag<const N: usize>(vectors: [uint8x16_t; N], tag: &mut [u8]) {
+    let (chunks, rest) = tag.as_chunks_mut::<16>();
+
+    for (chunk, vector) in chunks.iter_mut().zip(vectors) {
+        store_u8(vector, chunk);
+    }
+
+    if let Some(&vector) = vectors.get(chunks.len()) {
+        let halves = vreinterpretq_u64_u8(vector);
+
+        let halves = [vgetq_lane_u64::<0>(halves), vgetq_lane_u64::<1>(halves)];
+
+        for (i, byte) in rest.iter_mut().enumerate() {
+            *byte = (halves[i / 8] >> (8 * (i % 8))) as u8;
+        }
+    }
+}
+
+// HMAC-SHA-256, or HMAC-SHA-224 for a 28-byte tag, of data under a key of at most a block: the two
+// key blocks in registers, which the core overlaps, the inner hash through data and its padding,
+// and the outer hash of the inner digest. The inner hash is a call to finish256_sha2, and the
+// keyed states wait for it in `states`, which is wiped: held in registers across a call, they
+// would have been saved on the stack, where nothing wipes them.
+#[target_feature(enable = "sha2")]
+fn hmac256_sha2(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
+    let k = constants256();
+
+    let (mut inner_abcd, mut inner_efgh) = load256(iv);
+
+    let (mut outer_abcd, mut outer_efgh) = (inner_abcd, inner_efgh);
+
+    block256(
+        &mut inner_abcd,
+        &mut inner_efgh,
+        words256(key_block(key, 0x36)),
+        &k,
+    );
+
+    block256(
+        &mut outer_abcd,
+        &mut outer_efgh,
+        words256(key_block(key, 0x5C)),
+        &k,
+    );
+
+    let mut states = [[0; 8]; 2];
+
+    store256(inner_abcd, inner_efgh, &mut states[0]);
+
+    store256(outer_abcd, outer_efgh, &mut states[1]);
+
+    finish256_sha2(
+        &mut states[0],
+        data,
+        (data.len() as u64).wrapping_add(64).wrapping_mul(8),
+    );
+
+    let (inner_abcd, inner_efgh) = load256(&states[0]);
+
+    let (mut outer_abcd, mut outer_efgh) = load256(&states[1]);
+
+    // The outer block is the inner digest's words, the marker word and the length.
+    let bits = (64 + tag.len() as u32) * 8;
+
+    let mut outer = [inner_abcd, inner_efgh, vdupq_n_u32(0), vdupq_n_u32(0)];
+
+    if tag.len() == 32 {
+        outer[2] = vsetq_lane_u32::<0>(0x8000_0000, outer[2]);
+    } else {
+        outer[1] = vsetq_lane_u32::<3>(0x8000_0000, outer[1]);
+    }
+
+    outer[3] = vsetq_lane_u32::<3>(bits, outer[3]);
+
+    block256(&mut outer_abcd, &mut outer_efgh, outer, &k);
+
+    store_tag(
+        [
+            vrev32q_u8(vreinterpretq_u8_u32(outer_abcd)),
+            vrev32q_u8(vreinterpretq_u8_u32(outer_efgh)),
+        ],
+        tag,
+    );
+
+    wipe(states.as_flattened_mut());
+}
+
+// A state and a block of bytes as a stream.
+#[target_feature(enable = "neon")]
+#[inline]
+fn stream(state: &[u32; 8], block: &[u8; 64]) -> Stream {
+    let [abcd, efgh] = state.as_chunks::<4>().0 else {
+        unreachable!("eight words are two groups of four")
+    };
+
+    let mut m = [vdupq_n_u32(0); 4];
+
+    for (m, bytes) in m.iter_mut().zip(block.as_chunks::<16>().0) {
+        *m = vreinterpretq_u32_u8(vrev32q_u8(load_u8(bytes)));
+    }
+
+    Stream {
+        abcd: load_u32(abcd),
+        efgh: load_u32(efgh),
+        m,
+    }
+}
+
+#[target_feature(enable = "sha2")]
+fn compress256_pair_sha2(states: &mut [[u32; 8]; 2], blocks: &[[u8; 64]; 2]) {
+    let mut streams = [
+        stream(&states[0], &blocks[0]),
+        stream(&states[1], &blocks[1]),
+    ];
+
+    rounds256(&mut streams);
+
+    for (state, stream) in states.iter_mut().zip(&streams) {
+        let [abcd, efgh] = state.as_chunks_mut::<4>().0 else {
+            unreachable!("eight words are two groups of four")
+        };
+
+        store_u32(stream.abcd, abcd);
+
+        store_u32(stream.efgh, efgh);
+    }
 }
 
 // Lane `lane` of the word-major states and schedule of compress256_lanes.
@@ -751,53 +1131,231 @@ fn double_round<const J: usize>(
     }
 }
 
-#[target_feature(enable = "sha3")]
-fn compress512_sha3(state: &mut [u64; 8], blocks: &[[u8; 128]]) {
+// The schedule words of a block, two per vector.
+#[target_feature(enable = "neon")]
+#[inline]
+fn message512(block: &[u8; 128]) -> [uint64x2_t; 8] {
+    let mut m = [vdupq_n_u64(0); 8];
+
+    for (pair, bytes) in m.iter_mut().zip(block.as_chunks::<16>().0) {
+        *pair = vreinterpretq_u64_u8(vrev64q_u8(load_u8(bytes)));
+    }
+
+    m
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn load512(state: &[u64; 8]) -> [uint64x2_t; 4] {
     let mut s = [vdupq_n_u64(0); 4];
 
     for (pair, words) in s.iter_mut().zip(state.as_chunks::<2>().0) {
         *pair = load_u64(words);
     }
 
-    for block in blocks {
-        let mut m = [vdupq_n_u64(0); 8];
+    s
+}
 
-        for (pair, bytes) in m.iter_mut().zip(block.as_chunks::<16>().0) {
-            *pair = vreinterpretq_u64_u8(vrev64q_u8(load_u8(bytes)));
-        }
-
-        let start = s;
-
-        for (sixteen, k) in K512.as_chunks::<16>().0.iter().enumerate() {
-            let k = k.as_chunks::<2>().0;
-
-            let schedule = sixteen < 4;
-
-            double_round::<0>(&mut s, &mut m, load_u64(&k[0]), schedule);
-
-            double_round::<1>(&mut s, &mut m, load_u64(&k[1]), schedule);
-
-            double_round::<2>(&mut s, &mut m, load_u64(&k[2]), schedule);
-
-            double_round::<3>(&mut s, &mut m, load_u64(&k[3]), schedule);
-
-            double_round::<4>(&mut s, &mut m, load_u64(&k[4]), schedule);
-
-            double_round::<5>(&mut s, &mut m, load_u64(&k[5]), schedule);
-
-            double_round::<6>(&mut s, &mut m, load_u64(&k[6]), schedule);
-
-            double_round::<7>(&mut s, &mut m, load_u64(&k[7]), schedule);
-        }
-
-        for (pair, start) in s.iter_mut().zip(start) {
-            *pair = vaddq_u64(*pair, start);
-        }
-    }
-
+#[target_feature(enable = "neon")]
+#[inline]
+fn store512(s: &[uint64x2_t; 4], state: &mut [u64; 8]) {
     for (words, pair) in state.as_chunks_mut::<2>().0.iter_mut().zip(s) {
-        store_u64(pair, words);
+        store_u64(*pair, words);
     }
+}
+
+// Double round J of every stream, which interleave so that each hides the others' latency.
+#[target_feature(enable = "sha3")]
+#[inline]
+fn double_rounds<const N: usize, const J: usize>(
+    s: &mut [[uint64x2_t; 4]; N],
+    m: &mut [[uint64x2_t; 8]; N],
+    k: uint64x2_t,
+    schedule: bool,
+) {
+    for (s, m) in s.iter_mut().zip(m.iter_mut()) {
+        double_round::<J>(s, m, k, schedule);
+    }
+}
+
+// One block of each of N streams.
+#[target_feature(enable = "sha3")]
+#[inline]
+fn rounds512<const N: usize>(s: &mut [[uint64x2_t; 4]; N], m: &mut [[uint64x2_t; 8]; N]) {
+    let start = *s;
+
+    for (sixteen, k) in K512.as_chunks::<16>().0.iter().enumerate() {
+        let k = k.as_chunks::<2>().0;
+
+        let schedule = sixteen < 4;
+
+        double_rounds::<N, 0>(s, m, load_u64(&k[0]), schedule);
+
+        double_rounds::<N, 1>(s, m, load_u64(&k[1]), schedule);
+
+        double_rounds::<N, 2>(s, m, load_u64(&k[2]), schedule);
+
+        double_rounds::<N, 3>(s, m, load_u64(&k[3]), schedule);
+
+        double_rounds::<N, 4>(s, m, load_u64(&k[4]), schedule);
+
+        double_rounds::<N, 5>(s, m, load_u64(&k[5]), schedule);
+
+        double_rounds::<N, 6>(s, m, load_u64(&k[6]), schedule);
+
+        double_rounds::<N, 7>(s, m, load_u64(&k[7]), schedule);
+    }
+
+    for (s, start) in s.iter_mut().zip(&start) {
+        for (pair, start) in s.iter_mut().zip(start) {
+            *pair = vaddq_u64(*pair, *start);
+        }
+    }
+}
+
+// The blocks and then the more blocks, as one stream, as in compress256_sha2.
+#[target_feature(enable = "sha3")]
+fn compress512_sha3(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
+    let mut s = [load512(state)];
+
+    for block in blocks.iter().chain(more) {
+        rounds512(&mut s, &mut [message512(block)]);
+    }
+
+    store512(&s[0], state);
+}
+
+#[target_feature(enable = "sha3")]
+fn compress512_pair_sha3(states: &mut [[u64; 8]; 2], blocks: &[[u8; 128]; 2]) {
+    let mut s = [load512(&states[0]), load512(&states[1])];
+
+    rounds512(
+        &mut s,
+        &mut [message512(&blocks[0]), message512(&blocks[1])],
+    );
+
+    store512(&s[0], &mut states[0]);
+
+    store512(&s[1], &mut states[1]);
+}
+
+// tail256 for SHA-512, with the whole blocks and the padding in one loop around one compression:
+// with three call sites the compression was not inlined, and every block's state and words went
+// through the stack, which cost about 3% a block and left them there.
+#[target_feature(enable = "sha3")]
+#[inline]
+fn tail512(s: &mut [[uint64x2_t; 4]; 1], data: &[u8], bits: u128) {
+    let (blocks, tail) = data.as_chunks::<128>();
+
+    let (whole, rest) = tail.as_chunks::<16>();
+
+    let marker = marker_chunk(data, rest.len());
+
+    let mut first = [vdupq_n_u8(0); 8];
+
+    for (i, chunk) in first.iter_mut().enumerate() {
+        *chunk = last_chunk(whole, i, marker);
+    }
+
+    let length = vreinterpretq_u8_u64(vector64(
+        ((bits >> 64) as u64).swap_bytes(),
+        (bits as u64).swap_bytes(),
+    ));
+
+    // The length field ends the tail's block, or a second block if it does not fit after it.
+    let two = tail.len() + 17 > 128;
+
+    let mut second = [vdupq_n_u8(0); 8];
+
+    if two {
+        second[7] = length;
+    } else {
+        first[7] = length;
+    }
+
+    for i in 0..blocks.len() + 1 + usize::from(two) {
+        let m = match blocks.get(i) {
+            Some(block) => message512(block),
+            None if i == blocks.len() => words512(first),
+            None => words512(second),
+        };
+
+        rounds512(s, &mut [m]);
+    }
+}
+
+#[target_feature(enable = "sha3")]
+fn finish512_sha3(state: &mut [u64; 8], data: &[u8], bits: u128) {
+    let mut s = [load512(state)];
+
+    tail512(&mut s, data, bits);
+
+    store512(&s[0], state);
+}
+
+// hmac256_sha2 for HMAC-SHA-512, or HMAC-SHA-384 for a 48-byte tag.
+#[target_feature(enable = "sha3")]
+fn hmac512_sha3(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
+    let start = load512(iv);
+
+    let mut inner = [start];
+
+    rounds512(&mut inner, &mut [words512(key_block(key, 0x36))]);
+
+    let mut outer = [start];
+
+    rounds512(&mut outer, &mut [words512(key_block(key, 0x5C))]);
+
+    let mut states = [[0; 8]; 2];
+
+    store512(&inner[0], &mut states[0]);
+
+    store512(&outer[0], &mut states[1]);
+
+    finish512_sha3(
+        &mut states[0],
+        data,
+        (data.len() as u128).wrapping_add(128).wrapping_mul(8),
+    );
+
+    let mut outer = [load512(&states[1])];
+
+    // The outer block is the inner digest's words, the marker word and the length.
+    let [ab, cd, ef, gh] = load512(&states[0]);
+
+    let (marker, zero) = (vector64(0x8000_0000_0000_0000, 0), vdupq_n_u64(0));
+
+    let length = vector64(0, (128 + tag.len() as u64) * 8);
+
+    let block = if tag.len() == 64 {
+        [ab, cd, ef, gh, marker, zero, zero, length]
+    } else {
+        [ab, cd, ef, marker, zero, zero, zero, length]
+    };
+
+    rounds512(&mut outer, &mut [block]);
+
+    let mut bytes = [vdupq_n_u8(0); 4];
+
+    for (bytes, pair) in bytes.iter_mut().zip(outer[0]) {
+        *bytes = vrev64q_u8(vreinterpretq_u8_u64(pair));
+    }
+
+    store_tag(bytes, tag);
+
+    wipe(states.as_flattened_mut());
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn words512(chunks: [uint8x16_t; 8]) -> [uint64x2_t; 8] {
+    let mut words = [vdupq_n_u64(0); 8];
+
+    for (words, chunk) in words.iter_mut().zip(chunks) {
+        *words = vreinterpretq_u64_u8(vrev64q_u8(chunk));
+    }
+
+    words
 }
 
 // One Keccak-f[1600] round on two states, lane i of both in vector i. Theta's column parities
@@ -1060,21 +1618,15 @@ fn permute3_sha3(first: &mut [u64; 25], second: &mut [u64; 25], third: &mut [u64
 }
 
 #[target_feature(enable = "sha3")]
-fn absorb_sha3<const RATE: usize>(
-    state: &mut [u64; 25],
-    blocks: &[[u8; RATE]],
-    last: &[[u8; RATE]],
-) {
+fn absorb_sha3<const RATE: usize>(state: &mut [u64; 25], blocks: &[[u8; RATE]]) {
     let mut a = [vdupq_n_u64(0); 25];
 
     for (lane, x) in a.iter_mut().zip(state.iter()) {
         *lane = vdupq_n_u64(*x);
     }
 
-    for block in blocks.iter().chain(last) {
-        for (lane, bytes) in a.iter_mut().zip(block.as_chunks::<8>().0) {
-            *lane = veorq_u64(*lane, vdupq_n_u64(u64::from_le_bytes(*bytes)));
-        }
+    for block in blocks {
+        xor_block(&mut a, block);
 
         rounds(&mut a);
     }
@@ -1082,6 +1634,198 @@ fn absorb_sha3<const RATE: usize>(
     for (x, lane) in state.iter_mut().zip(&a) {
         *x = vgetq_lane_u64::<0>(*lane);
     }
+}
+
+// The lanes of a block XORed into the first lanes of the state, in assembly that keeps the state
+// in v0 to v24 as rounds does: compiled from intrinsics, the loads ran ahead of the XORs and the
+// lanes they displaced went to memory. Only the low half of each vector takes the block, as only
+// the low half is read out; the high half runs the same permutation on a state of its own.
+macro_rules! xor_lanes {
+    ($a:ident, $block:ident, $($lane:literal),+) => {
+        // SAFETY: the assembly reads the block's lanes, each inside the array the pointer comes
+        // from, and changes no memory, stack or flags.
+        unsafe {
+            core::arch::asm!(
+                $(
+                    concat!("ldr d25, [{block}, #", $lane, " * 8]"),
+                    concat!("eor v", $lane, ".16b, v", $lane, ".16b, v25.16b"),
+                )+
+                block = in(reg) $block.as_ptr(),
+                inout("v0") $a[0],
+                inout("v1") $a[1],
+                inout("v2") $a[2],
+                inout("v3") $a[3],
+                inout("v4") $a[4],
+                inout("v5") $a[5],
+                inout("v6") $a[6],
+                inout("v7") $a[7],
+                inout("v8") $a[8],
+                inout("v9") $a[9],
+                inout("v10") $a[10],
+                inout("v11") $a[11],
+                inout("v12") $a[12],
+                inout("v13") $a[13],
+                inout("v14") $a[14],
+                inout("v15") $a[15],
+                inout("v16") $a[16],
+                inout("v17") $a[17],
+                inout("v18") $a[18],
+                inout("v19") $a[19],
+                inout("v20") $a[20],
+                inout("v21") $a[21],
+                inout("v22") $a[22],
+                inout("v23") $a[23],
+                inout("v24") $a[24],
+                out("v25") _,
+                options(nostack, readonly, preserves_flags),
+            );
+        }
+    };
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+#[allow(unsafe_code)]
+fn xor_block<const RATE: usize>(a: &mut [uint64x2_t; 25], block: &[u8; RATE]) {
+    match RATE {
+        72 => xor_lanes!(a, block, 0, 1, 2, 3, 4, 5, 6, 7, 8),
+        104 => xor_lanes!(a, block, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12),
+        136 => xor_lanes!(
+            a, block, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
+        ),
+        144 => xor_lanes!(
+            a, block, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
+        ),
+        168 => xor_lanes!(
+            a, block, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+        ),
+        _ => unreachable!("the rates of SHA-3 and SHAKE"),
+    }
+}
+
+// The lanes of the rate stored from the state, as xor_lanes reads them.
+macro_rules! store_lanes {
+    ($a:ident, $out:ident, $($lane:literal),+) => {
+        // SAFETY: the assembly writes the lanes inside the array the pointer comes from, reads no
+        // other memory and changes no stack or flags.
+        unsafe {
+            core::arch::asm!(
+                $(concat!("str d", $lane, ", [{out}, #", $lane, " * 8]"),)+
+                out = in(reg) $out.as_mut_ptr(),
+                in("v0") $a[0],
+                in("v1") $a[1],
+                in("v2") $a[2],
+                in("v3") $a[3],
+                in("v4") $a[4],
+                in("v5") $a[5],
+                in("v6") $a[6],
+                in("v7") $a[7],
+                in("v8") $a[8],
+                in("v9") $a[9],
+                in("v10") $a[10],
+                in("v11") $a[11],
+                in("v12") $a[12],
+                in("v13") $a[13],
+                in("v14") $a[14],
+                in("v15") $a[15],
+                in("v16") $a[16],
+                in("v17") $a[17],
+                in("v18") $a[18],
+                in("v19") $a[19],
+                in("v20") $a[20],
+                options(nostack, preserves_flags),
+            );
+        }
+    };
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+#[allow(unsafe_code)]
+fn store_rate<const RATE: usize>(a: &[uint64x2_t; 25], out: &mut [u8; RATE]) {
+    match RATE {
+        72 => store_lanes!(a, out, 0, 1, 2, 3, 4, 5, 6, 7, 8),
+        104 => store_lanes!(a, out, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12),
+        136 => store_lanes!(
+            a, out, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
+        ),
+        144 => store_lanes!(
+            a, out, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
+        ),
+        168 => store_lanes!(
+            a, out, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+        ),
+        _ => unreachable!("the rates of SHA-3 and SHAKE"),
+    }
+}
+
+// The whole blocks of data and then its padded last block, and then out.len() bytes squeezed,
+// with the state in registers throughout. The last block is built before the state is live,
+// since a call to memcpy while it is would push it to memory, and it and the squeezed lanes pass
+// through small buffers that are wiped.
+#[target_feature(enable = "sha3")]
+fn digest_sha3<const RATE: usize>(data: &[u8], suffix: u8, out: &mut [u8]) {
+    let (blocks, tail) = data.as_chunks::<RATE>();
+
+    let (lanes, rest) = tail.as_chunks::<8>();
+
+    let mut last = [0u8; RATE];
+
+    let chunks = last.as_chunks_mut::<8>().0;
+
+    for (chunk, bytes) in chunks.iter_mut().zip(lanes) {
+        *chunk = *bytes;
+    }
+
+    // The lane after the whole ones takes the rest of data and the suffix, and the last lane of
+    // the rate the final bit; each lane gets a single store, which its load forwards.
+    let marker = last_bytes(data, rest.len()) as u64 | u64::from(suffix) << (8 * rest.len());
+
+    let end = RATE / 8 - 1;
+
+    if lanes.len() == end {
+        chunks[end] = (marker ^ 0x80 << 56).to_le_bytes();
+    } else {
+        chunks[lanes.len()] = marker.to_le_bytes();
+
+        chunks[end] = (0x80u64 << 56).to_le_bytes();
+    }
+
+    let mut a = [vdupq_n_u64(0); 25];
+
+    for block in blocks {
+        xor_block(&mut a, block);
+
+        rounds(&mut a);
+    }
+
+    xor_block(&mut a, &last);
+
+    rounds(&mut a);
+
+    // Whole blocks of output go straight from the registers to out; the last part, through a
+    // buffer once the state is no longer needed.
+    let (whole, partial) = out.as_chunks_mut::<RATE>();
+
+    for (i, block) in whole.iter_mut().enumerate() {
+        if i > 0 {
+            rounds(&mut a);
+        }
+
+        store_rate(&a, block);
+    }
+
+    if !partial.is_empty() {
+        if !whole.is_empty() {
+            rounds(&mut a);
+        }
+
+        store_rate(&a, &mut last);
+
+        partial.copy_from_slice(&last[..partial.len()]);
+    }
+
+    wipe(&mut last);
 }
 
 #[cfg(test)]

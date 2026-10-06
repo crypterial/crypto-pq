@@ -325,52 +325,15 @@ func (a StatefulSignatureAlgorithm) openTreeCache(parameters statefulParameters,
 	return key, needed, nil
 }
 
-// HMAC-SHA-256 (RFC 2104) with a key of at most one block, computed on the stack, where its own
-// buffers are cleared: the tree cache feeds it the seed and keys it with a value derived from the
-// seed, both of which the engines behind HMAC_SHA_256 would leave on the heap until collected.
-func hmacSha256(key, data []byte, out *[32]byte) {
-	var pad [64]byte
-
-	copy(pad[:], key)
-
-	for i := range pad {
-		pad[i] ^= 0x36
-	}
-
-	state := iv256
-
-	compress256(&state, pad[:])
-
-	var inner [32]byte
-
-	sha256Finish(state, 64, data, inner[:])
-
-	for i := range pad {
-		pad[i] ^= 0x36 ^ 0x5c
-	}
-
-	state = iv256
-
-	compress256(&state, pad[:])
-
-	sha256Finish(state, 64, inner[:], out[:])
-
-	clear(pad[:])
-
-	clear(state[:])
-
-	clear(inner[:])
-}
-
 // The tag of a tree cache body: HMAC-SHA-256 under K, which is cleared once used.
 func treeCacheTag(seed, body []byte) [32]byte {
 	defer ditLeave(ditEnter())
 
 	var key, tag [32]byte
 
-	hmacSha256(treeCacheLabel, seed, &key)
+	hmacInto(SHA_256, treeCacheLabel, seed, key[:])
 
-	hmacSha256(key[:], body, &tag)
+	hmacInto(SHA_256, key[:], body, tag[:])
 
 	clear(key[:])
 
