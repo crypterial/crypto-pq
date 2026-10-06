@@ -35,6 +35,74 @@ const TAIL = new Uint8Array(256);
 
 const WORDS = new Int32Array(32);
 
+// The state of a one-shot digest, cleared after each: a digest runs to its end without calling
+// out, so one serves every call.
+const STATE = new Int32Array(16);
+
+// The digest of a whole message without an engine: its whole blocks are compressed where they
+// are, and only its end goes into the tail with the padding, as in Sha2.digest.
+function oneShot(
+  iv: Int32Array,
+  size: number,
+  block: number,
+  compress: (state: Int32Array, data: Uint8Array, offset: number) => void,
+  data: Uint8Array,
+): Uint8Array {
+  const state = STATE;
+
+  const length = data.length;
+
+  const whole = length - (length % block);
+
+  state.set(iv);
+
+  for (let offset = 0; offset < whole; offset += block) {
+    compress(state, data, offset);
+  }
+
+  const tail = TAIL;
+
+  const buffered = length - whole;
+
+  for (let i = 0; i < buffered; i++) {
+    tail[i] = data[whole + i];
+  }
+
+  tail[buffered] = 0x80;
+
+  const end = buffered + 1 + block / 8 > block ? 2 * block : block;
+
+  tail.fill(0, buffered + 1, end - 8);
+
+  writeUint32(tail, end - 8, Math.floor(length / 0x20000000));
+
+  writeUint32(tail, end - 4, (length % 0x20000000) * 8);
+
+  for (let offset = 0; offset < end; offset += block) {
+    compress(state, tail, offset);
+  }
+
+  tail.fill(0, 0, end);
+
+  const out = new Uint8Array(size);
+
+  for (let i = 0; i < size; i++) {
+    out[i] = state[i >>> 2] >>> (24 - 8 * (i & 3));
+  }
+
+  state.fill(0);
+
+  return out;
+}
+
+export function digest256(iv: Int32Array, size: number, data: Uint8Array): Uint8Array {
+  return oneShot(iv, size, 64, compress256, data);
+}
+
+export function digest512(iv: Int32Array, size: number, data: Uint8Array): Uint8Array {
+  return oneShot(iv, size, 128, compress512, data);
+}
+
 export function compress256(state: Int32Array, data: Uint8Array, offset: number): void {
   for (let t = 0; t < 16; t++) {
     WORDS[t] = readUint32(data, offset + 4 * t);

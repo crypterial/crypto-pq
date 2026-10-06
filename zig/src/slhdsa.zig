@@ -767,31 +767,45 @@ pub fn Scheme(comptime p: Parameters) type {
         const Shake4 = struct {
             const lanes = 4;
 
-            // F, H and PRF take at most 2n bytes, which are gathered with the seed and the address
-            // into one block; T over a WOTS public key, which is far longer, is absorbed in parts
-            // by `leaves`.
-            const max_input = n + 32 + 2 * n;
+            // F, H and PRF take m = n or 2n bytes, which with the seed and the address fill less
+            // than one block, a whole number of lanes: each state is written lane by lane, padding
+            // included, straight from the inputs. T over a WOTS public key, which is far longer,
+            // is absorbed in parts by `leaves`. Verification hashes only public values, and leaves
+            // its states unwiped.
+            fn shake(hashes: *const Hashes, adrs: *const [lanes]Address, comptime m: usize, comptime secret: bool, messages: [lanes][]const u8, out: [lanes]*Node) void {
+                const length = n + 32 + m;
 
-            fn shake(hashes: *const Hashes, adrs: *const [lanes]Address, messages: [lanes][]const u8, out: [lanes]*Node) void {
-                const length = n + 32 + messages[0].len;
+                comptime std.debug.assert(length % 8 == 0 and length < 136);
 
-                var inputs: [lanes][max_input]u8 = undefined;
+                var seed: [n / 8]u64 = undefined;
 
-                defer for (&inputs) |*input| ct.wipe(input[0..length]);
+                for (&seed, 0..) |*word, i| word.* = std.mem.readInt(u64, hashes.pk_seed[8 * i ..][0..8], .little);
 
-                for (&inputs, adrs, messages) |*input, *address, message| {
-                    input[0..n].* = hashes.pk_seed;
+                var states: [lanes][25]u64 = undefined;
 
-                    input[n..][0..32].* = address.*;
+                defer if (secret) ct.wipe(std.mem.asBytes(&states));
 
-                    @memcpy(input[n + 32 ..][0..message.len], message);
+                for (&states, adrs, messages) |*state, *address, message| {
+                    std.debug.assert(message.len == m);
+
+                    state[0 .. n / 8].* = seed;
+
+                    inline for (0..4) |i| state[n / 8 + i] = std.mem.readInt(u64, address[8 * i ..][0..8], .little);
+
+                    inline for (0..m / 8) |i| state[(n + 32) / 8 + i] = std.mem.readInt(u64, message[8 * i ..][0..8], .little);
+
+                    inline for (length / 8..25) |i| state[i] = 0;
+
+                    state[length / 8] ^= 0x1f;
+
+                    state[16] ^= @as(u64, 0x80) << 56;
                 }
 
-                var sponge: keccak.Sponge4 = .init(136, 0x1f, .{ inputs[0][0..length], inputs[1][0..length], inputs[2][0..length], inputs[3][0..length] });
+                keccak.permute4(&states);
 
-                defer sponge.wipe();
-
-                sponge.squeeze(.{ out[0], out[1], out[2], out[3] });
+                for (&states, out) |*state, node| {
+                    inline for (0..n / 8) |i| std.mem.writeInt(u64, node[8 * i ..][0..8], state[i], .little);
+                }
             }
 
             fn addresses(adrs: *const Address, kind: u32, keypair: [lanes]u32) [lanes]Address {
@@ -856,7 +870,7 @@ pub fn Scheme(comptime p: Parameters) type {
                         setChain(chain_address, @intCast(i));
                     }
 
-                    shake(hashes, &prf_adrs, same(&hashes.sk_seed), nodes);
+                    shake(hashes, &prf_adrs, n, true, same(&hashes.sk_seed), nodes);
 
                     for (0..16) |j| {
                         if (lane) |l| {
@@ -867,7 +881,7 @@ pub fn Scheme(comptime p: Parameters) type {
 
                         for (&chain_adrs) |*address| setHash(address, @intCast(j));
 
-                        shake(hashes, &chain_adrs, messages, nodes);
+                        shake(hashes, &chain_adrs, n, true, messages, nodes);
                     }
 
                     public_key.absorb(messages);
@@ -900,7 +914,7 @@ pub fn Scheme(comptime p: Parameters) type {
                     setTreeIndex(leaf_address, index);
                 }
 
-                shake(hashes, &prf_adrs, same(&hashes.sk_seed), .{ &secrets[0], &secrets[1], &secrets[2], &secrets[3] });
+                shake(hashes, &prf_adrs, n, true, same(&hashes.sk_seed), .{ &secrets[0], &secrets[1], &secrets[2], &secrets[3] });
 
                 if (capture) |c| {
                     if (c.index >= first and c.index - first < out.len) c.out.* = secrets[c.index - first];
@@ -912,7 +926,7 @@ pub fn Scheme(comptime p: Parameters) type {
 
                 for (&leaves_out, &spare, 0..) |*leaf, *slot, l| leaf.* = if (l < out.len) &out[l] else slot;
 
-                shake(hashes, &leaf_adrs, .{ &secrets[0], &secrets[1], &secrets[2], &secrets[3] }, leaves_out);
+                shake(hashes, &leaf_adrs, n, true, .{ &secrets[0], &secrets[1], &secrets[2], &secrets[3] }, leaves_out);
             }
 
             // Parents first .. first + out.len - 1 at `height` of the children in pairs.
@@ -937,7 +951,7 @@ pub fn Scheme(comptime p: Parameters) type {
 
                 for (&nodes, &spare, 0..) |*node, *slot, l| node.* = if (l < out.len) &out[l] else slot;
 
-                shake(hashes, &node_adrs, .{ &pairs[0], &pairs[1], &pairs[2], &pairs[3] }, nodes);
+                shake(hashes, &node_adrs, 2 * n, true, .{ &pairs[0], &pairs[1], &pairs[2], &pairs[3] }, nodes);
             }
 
             // The FORS roots implied by a signature, one tree per lane.
@@ -963,7 +977,7 @@ pub fn Scheme(comptime p: Parameters) type {
 
                     const targets: [lanes]*Node = .{ &nodes[0], &nodes[1], &nodes[2], &nodes[3] };
 
-                    shake(hashes, &node_adrs, .{ &nodes[0], &nodes[1], &nodes[2], &nodes[3] }, targets);
+                    shake(hashes, &node_adrs, n, false, .{ &nodes[0], &nodes[1], &nodes[2], &nodes[3] }, targets);
 
                     for (0..a) |z| {
                         var pairs: [lanes][2 * n]u8 = undefined;
@@ -980,7 +994,7 @@ pub fn Scheme(comptime p: Parameters) type {
                             setTreeIndex(address, value.*);
                         }
 
-                        shake(hashes, &node_adrs, .{ &pairs[0], &pairs[1], &pairs[2], &pairs[3] }, targets);
+                        shake(hashes, &node_adrs, 2 * n, false, .{ &pairs[0], &pairs[1], &pairs[2], &pairs[3] }, targets);
                     }
 
                     @memcpy(roots[first..][0..count], nodes[0..count]);
@@ -1006,7 +1020,7 @@ pub fn Scheme(comptime p: Parameters) type {
                         setHash(address, schedule.step[l]);
                     }
 
-                    shake(hashes, &chain_adrs, .{ &nodes[0], &nodes[1], &nodes[2], &nodes[3] }, .{ &nodes[0], &nodes[1], &nodes[2], &nodes[3] });
+                    shake(hashes, &chain_adrs, n, false, .{ &nodes[0], &nodes[1], &nodes[2], &nodes[3] }, .{ &nodes[0], &nodes[1], &nodes[2], &nodes[3] });
 
                     var next: [n / 4]@Vector(lanes, u32) = undefined;
 

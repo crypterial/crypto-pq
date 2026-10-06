@@ -74,6 +74,7 @@ const COMMON = [
   "cpq_free",
   "cpq_stack_low",
   "cpq_stack_high",
+  "cpq_wasm_tune",
 ];
 
 // The smallest module with a SIMD128 instruction: i8x16.popcnt of a splat.
@@ -102,6 +103,33 @@ export function setBackend(backend: Backend): void {
   }
 
   chosen = backend;
+}
+
+// What the core is told of the engine (cpq_wasm_tune), which picks between code shapes of equal
+// results: bit 0 for V8 before version 15, which compiles a rotation of 64-bit vector lanes faster
+// as two added shifts, bit 1 for any V8, which runs a single Keccak state faster with two rounds
+// per iteration, and bit 2 for V8 from version 15 and for Bun's JavaScriptCore, which run two
+// Keccak states faster in the lanes of vectors. Bun reports a V8 version for compatibility; engines
+// that report none get the shapes that the engines measured run best on average.
+export function engineFlags(): number {
+  const g = globalThis as {
+    process?: { versions?: { v8?: unknown; bun?: unknown } };
+    Deno?: { version?: { v8?: unknown } };
+  };
+
+  const versions = g.process?.versions;
+
+  if (versions?.bun !== undefined) {
+    return 4;
+  }
+
+  const v8 = g.Deno?.version?.v8 ?? versions?.v8;
+
+  if (typeof v8 !== "string") {
+    return 0;
+  }
+
+  return (Number.parseInt(v8, 10) < 15 ? 1 : 4) | 2;
 }
 
 function api(): Api {
@@ -398,6 +426,8 @@ export class Core {
     if (this.x.cpq_abi_version() !== 1) {
       throw new Error("the WebAssembly module has another ABI version");
     }
+
+    this.x.cpq_wasm_tune(engineFlags());
 
     this.#stackLow = this.x.cpq_stack_low() >>> 0;
 

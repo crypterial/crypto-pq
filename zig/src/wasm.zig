@@ -48,6 +48,23 @@ inline fn unsignedProductsHigh(a: U32x4, b: U32x4) U64x2 {
     );
 }
 
+// The lanes of x rotated left by k, with the two shifts added by an i64x2.add that LLVM cannot
+// see through: LLVM would join them with an OR, its usual rotation, which V8 before version 15
+// compiles in three instructions on Arm and the addition in two (SHL and USRA).
+pub inline fn rotate(x: U64x2, comptime k: u6) U64x2 {
+    comptime std.debug.assert(k != 0);
+
+    const high = x << @splat(k);
+
+    const low = x >> @splat(@as(u6, @intCast(64 - @as(u7, k))));
+
+    return asm ("local.get %[a]\nlocal.get %[b]\ni64x2.add\nlocal.set %[r]"
+        : [r] "=r" (-> U64x2),
+        : [a] "r" (high),
+          [b] "r" (low),
+    );
+}
+
 // The high 32 bits of the four products a * b.
 inline fn mulHigh(a: I32x4, b: I32x4) I32x4 {
     const low: I32x4 = @bitCast(productsLow(a, b));

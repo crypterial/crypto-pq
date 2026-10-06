@@ -7,6 +7,7 @@ const ct = @import("ct.zig");
 const isa = switch (builtin.cpu.arch) {
     .aarch64 => @import("aarch64.zig"),
     .x86_64 => @import("x86_64.zig"),
+    .wasm32 => @import("wasm.zig"),
     else => struct {},
 };
 
@@ -21,12 +22,14 @@ pub const round_constants = [24]u64{
 
 const rotations = [25]u6{ 0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14 };
 
-// One permutation: with the SHA3 instructions on the cores that run them fast, or the portable
-// code below.
+// One permutation: with the SHA3 instructions on the cores that run them fast, the WebAssembly
+// code below, or the portable code.
 pub fn permute(state: *[25]u64) void {
     if (comptime cpu.possible(.sha3)) {
         if (cpu.has(.sha3)) return isa.keccak1(state);
     }
+
+    if (comptime cpu.wasm_simd) return webassembly.permute(state);
 
     portable.permute(state);
 }
@@ -51,7 +54,7 @@ fn absorbBlocks(state: *[25]u64, rate: usize, data: []const u8) usize {
 }
 
 // Four independent permutations: two pairs with the SHA3 instructions on the cores that run them
-// fast, all four in AVX2 registers, or the portable code below.
+// fast, all four in AVX2 registers, the WebAssembly code below, or the portable code below.
 pub fn permute4(states: *[4][25]u64) void {
     if (comptime cpu.possible(.sha3)) {
         if (cpu.has(.sha3)) {
@@ -64,6 +67,8 @@ pub fn permute4(states: *[4][25]u64) void {
     if (comptime cpu.possible(.avx2)) {
         if (cpu.has(.avx2)) return isa.keccak4(states);
     }
+
+    if (comptime cpu.wasm_simd) return webassembly.permute4(states);
 
     portable.permute4(states);
 }
@@ -87,6 +92,15 @@ pub fn permuteSome(states: *[4][25]u64, count: usize) void {
                 },
             };
         }
+    }
+
+    if (comptime cpu.wasm_simd) {
+        return switch (count) {
+            1 => webassembly.permute(&states[0]),
+            2 => webassembly.permute2(states[0..2]),
+            3 => webassembly.permute3(states),
+            else => webassembly.permute4(states),
+        };
     }
 
     if (count >= 3) return permute4(states);
@@ -151,6 +165,179 @@ fn portablePermute4(states: *[4][25]u64) void {
     states[2] = third;
 
     states[3] = fourth;
+}
+
+// The code for WebAssembly, measured on V8 and JavaScriptCore, whose code generators allocate the
+// registers and order the instructions themselves. Engines differ in which shapes of the code they
+// compile well, and the binding says once which engine runs the module (tune). V8 before version
+// 15 joins the two shifts of a rotation of vector lanes in two instructions on Arm (SHL and USRA)
+// only when they are added, and runs three states fastest together, two in the lanes of 2 x 64-bit
+// vectors and one in integer registers. V8 15 and JavaScriptCore compile the plain rotation well,
+// fusing it on Arm with the XOR before it, and lose that to the addition: they run states in pairs
+// in vector lanes far faster than in integer registers. V8 also runs a single state faster with two
+// rounds per iteration, from one array of lanes into the other and back, which JavaScriptCore runs
+// slower than the portable code. Other engines get the shapes that run best on average on those
+// measured: three states together with plain rotations, the rest one by one.
+pub const webassembly = struct {
+    var adds = false;
+
+    var unrolled = false;
+
+    var pairs = false;
+
+    // Bit 0: the engine adds the halves of a rotation faster than it rotates. Bit 1: it runs a
+    // single state faster with two rounds per iteration. Bit 2: it runs two states faster in the
+    // lanes of vectors than one after the other in integer registers.
+    pub fn tune(flags: u32) void {
+        adds = flags & 1 != 0;
+
+        unrolled = flags & 2 != 0;
+
+        pairs = flags & 4 != 0;
+    }
+
+    // The dispatches are functions of their own, so that the shapes' conditions stay in a few
+    // places for the WebAssembly lint (zig build wasm-lint).
+    noinline fn permute(state: *[25]u64) void {
+        if (unrolled) return twoRounds(state);
+
+        portable.permute(state);
+    }
+
+    noinline fn permute2(states: *[2][25]u64) void {
+        if (pairs) return pair(states);
+
+        for (states) |*state| webassembly.permute(state);
+    }
+
+    // The first three of the four states.
+    noinline fn permute3(states: *[4][25]u64) void {
+        if (adds) return hybrid(true, states);
+
+        hybrid(false, states);
+    }
+
+    noinline fn permute4(states: *[4][25]u64) void {
+        if (pairs) {
+            pair(states[0..2]);
+
+            return pair(states[2..4]);
+        }
+
+        permute3(states);
+
+        webassembly.permute(&states[3]);
+    }
+
+    // Each shape is a function of its own: inlined into one, they ran markedly slower on
+    // JavaScriptCore.
+    noinline fn twoRounds(state: *[25]u64) void {
+        var a = state.*;
+
+        var e: [25]u64 = undefined;
+
+        var i: usize = 0;
+
+        while (i < round_constants.len) : (i += 2) {
+            roundInto(u64, false, &a, &e, round_constants[i]);
+
+            roundInto(u64, false, &e, &a, round_constants[i + 1]);
+        }
+
+        state.* = a;
+    }
+
+    // Two states in the lanes of 2 x 64-bit vectors, with the rounds of the portable code: the
+    // engines that run pairs fast run this shape faster than two rounds per iteration.
+    noinline fn pair(states: *[2][25]u64) void {
+        const W = @Vector(2, u64);
+
+        var lanes: [25]W = undefined;
+
+        for (&lanes, states[0], states[1]) |*lane, x, y| lane.* = .{ x, y };
+
+        for (round_constants) |constant| round(W, &lanes, constant);
+
+        for (lanes, &states[0], &states[1]) |lane, *x, *y| {
+            x.* = lane[0];
+
+            y.* = lane[1];
+        }
+    }
+
+    // The first two states in the lanes of vectors and the third in integer registers.
+    noinline fn hybrid(comptime add: bool, states: *[4][25]u64) void {
+        const W = @Vector(2, u64);
+
+        var lanes: [25]W = undefined;
+
+        for (&lanes, states[0], states[1]) |*lane, x, y| lane.* = .{ x, y };
+
+        var third = states[2];
+
+        var e: [25]W = undefined;
+
+        var t: [25]u64 = undefined;
+
+        var i: usize = 0;
+
+        while (i < round_constants.len) : (i += 2) {
+            roundInto(W, add, &lanes, &e, round_constants[i]);
+
+            roundInto(u64, add, &third, &t, round_constants[i]);
+
+            roundInto(W, add, &e, &lanes, round_constants[i + 1]);
+
+            roundInto(u64, add, &t, &third, round_constants[i + 1]);
+        }
+
+        for (lanes, &states[0], &states[1]) |lane, *x, *y| {
+            x.* = lane[0];
+
+            y.* = lane[1];
+        }
+
+        states[2] = third;
+    }
+};
+
+// Theta of a, then rho, pi and chi into e one output plane at a time, as XKCP's unrolled code
+// does: lane x of output plane y comes from lane x' + 5x of a, with x' = (x + 3y) mod 5. Vector
+// lanes rotate with the added shifts of isa.rotate when add is set.
+inline fn roundInto(comptime W: type, comptime add: bool, a: *const [25]W, e: *[25]W, constant: u64) void {
+    var c: [5]W = undefined;
+
+    inline for (0..5) |x| {
+        c[x] = a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20];
+    }
+
+    var d: [5]W = undefined;
+
+    inline for (0..5) |x| {
+        d[x] = c[(x + 4) % 5] ^ rotate(W, add, c[(x + 1) % 5], 1);
+    }
+
+    inline for (0..5) |y| {
+        var b: [5]W = undefined;
+
+        inline for (0..5) |x| {
+            const column = (x + 3 * y) % 5;
+
+            b[x] = rotate(W, add, a[column + 5 * x] ^ d[column], rotations[column + 5 * x]);
+        }
+
+        inline for (0..5) |x| {
+            e[5 * y + x] = b[x] ^ (~b[(x + 1) % 5] & b[(x + 2) % 5]);
+        }
+    }
+
+    e[0] ^= if (W == u64) constant else @as(W, @splat(constant));
+}
+
+inline fn rotate(comptime W: type, comptime add: bool, x: W, comptime k: u6) W {
+    if (W == u64 or !add or k == 0) return std.math.rotl(W, x, k);
+
+    return isa.rotate(x, k);
 }
 
 inline fn round(comptime W: type, a: *[25]W, constant: u64) void {
@@ -318,36 +505,6 @@ pub const Sponge4 = struct {
     position: usize,
     count: usize = 4,
 
-    // Built in place rather than from start: SLH-DSA builds millions of these per signature, and
-    // copying the state out of start made it 1.45 times slower.
-    pub fn init(rate: usize, suffix: u8, messages: [4][]const u8) Sponge4 {
-        var self: Sponge4 = .{ .states = undefined, .rate = rate, .position = 0 };
-
-        ct.wipe(std.mem.asBytes(&self.states));
-
-        const length = messages[0].len;
-
-        var offset: usize = 0;
-
-        while (length - offset >= rate) : (offset += rate) {
-            for (&self.states, messages) |*state, message| xorBytes(state, 0, message[offset..][0..rate]);
-
-            permute4(&self.states);
-        }
-
-        for (&self.states, messages) |*state, message| {
-            std.debug.assert(message.len == length);
-
-            xorBytes(state, 0, message[offset..length]);
-
-            xorBytes(state, length - offset, &.{suffix});
-
-            xorBytes(state, rate - 1, &.{0x80});
-        }
-
-        return self;
-    }
-
     // One to four sponges, each given a message shorter than a block, to be read block by block
     // with next and block: only the sponges in use are permuted. Filled in place, since the
     // states would otherwise be copied out.
@@ -424,8 +581,10 @@ pub const Sponge4 = struct {
         for (&self.states, out) |*state, bytes| copyBytes(state, 0, bytes);
     }
 
-    // The next block of every sponge in use, read with block.
-    pub fn next(self: *Sponge4) void {
+    // The next block of every sponge in use, read with block. A function of its own, as it was
+    // when the permutations it calls were inlined into it: its conditions on the number of
+    // sponges stay in one place for the WebAssembly lint.
+    pub noinline fn next(self: *Sponge4) void {
         permuteSome(&self.states, self.count);
     }
 

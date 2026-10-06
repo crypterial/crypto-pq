@@ -22,6 +22,7 @@ pub const stateful = @import("capi/stateful.zig");
 
 const cpu = @import("cpu.zig");
 const ct = @import("ct.zig");
+const keccak = @import("keccak.zig");
 
 // A failed safety check traps: the process stops, or the WebAssembly instance, which the host then
 // discards. Nothing returns to the host with memory in an unknown state, and the library carries no
@@ -93,6 +94,16 @@ pub fn cpuFeatures() callconv(.c) u32 {
     if (cpu.neon) bits |= 32;
 
     return bits;
+}
+
+// What the binding knows of the engine that runs a WebAssembly module, given before the module
+// does any work. It picks between code shapes of equal results: bit 0, the engine compiles a
+// rotation of 64-bit vector lanes faster as two added shifts (V8 before version 15); bit 1, it
+// runs a single Keccak state faster with two rounds per iteration (V8); bit 2, it runs two Keccak
+// states faster in the lanes of vectors (V8 from version 15, JavaScriptCore). Other bits are
+// ignored.
+pub fn wasmTune(flags: u32) callconv(.c) void {
+    keccak.webassembly.tune(flags);
 }
 
 fn sizeOf(slot_type: common.SlotType, algorithm: u32) usize {
@@ -233,6 +244,7 @@ comptime {
                 .{ "cpq_free", &memory.free },
                 .{ "cpq_stack_low", &memory.stackLow },
                 .{ "cpq_stack_high", &memory.stackHigh },
+                .{ "cpq_wasm_tune", &wasmTune },
             });
         }
 

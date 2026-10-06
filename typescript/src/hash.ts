@@ -1,9 +1,20 @@
 import { bytes, equal } from "./bytes.ts";
 import { CryptoPQError } from "./errors.ts";
 import { X_WING_HASH } from "./families.ts";
-import { Keccak } from "./keccak.ts";
+import { Keccak, keccakDigest } from "./keccak.ts";
 import { PRE_HASHES } from "./prehash.ts";
-import { IV_224, IV_256, IV_384, IV_512, IV_512_224, IV_512_256, Sha256, Sha512 } from "./sha2.ts";
+import {
+  IV_224,
+  IV_256,
+  IV_384,
+  IV_512,
+  IV_512_224,
+  IV_512_256,
+  Sha256,
+  Sha512,
+  digest256,
+  digest512,
+} from "./sha2.ts";
 import { type Core, HASHING, OK, REJECTED, check } from "./wasm.ts";
 
 const HASHER_SLOT = 5;
@@ -39,6 +50,8 @@ export interface Spec {
   readonly preHash: readonly [number, number] | null;
 
   create(): Engine;
+
+  digest(data: Uint8Array): Uint8Array;
 }
 
 // The states of incremental hashing on the backend that made them.
@@ -362,11 +375,11 @@ export class HashAlgorithm {
   digest(data: Uint8Array): Uint8Array {
     const core = X_WING_HASH.select();
 
-    if (core === null) {
-      return new Hasher(this.#spec.create()).update(data).digest();
-    }
-
     const input = bytes(data, "data");
+
+    if (core === null) {
+      return this.#spec.digest(input);
+    }
 
     const { id, digestSize } = this.#spec;
 
@@ -440,13 +453,13 @@ export class XofAlgorithm {
   digest(data: Uint8Array, length: number): Uint8Array {
     const core = X_WING_HASH.select();
 
-    if (core === null) {
-      return this.create().update(data).read(length);
-    }
-
     const input = bytes(data, "data");
 
     requireReadLength(length);
+
+    if (core === null) {
+      return keccakDigest(this.#rate, 0x1f, input, length);
+    }
 
     const id = this.#id;
 
@@ -611,17 +624,38 @@ export class HmacAlgorithm {
 }
 
 function sha256(id: number, iv: Int32Array, digestSize: number, preHash: Spec["preHash"]): Spec {
-  return { id, digestSize, blockSize: 64, preHash, create: () => new Sha256(iv, digestSize) };
+  return {
+    id,
+    digestSize,
+    blockSize: 64,
+    preHash,
+    create: () => new Sha256(iv, digestSize),
+    digest: (data) => digest256(iv, digestSize, data),
+  };
 }
 
 function sha512(id: number, iv: Int32Array, digestSize: number, preHash: Spec["preHash"]): Spec {
-  return { id, digestSize, blockSize: 128, preHash, create: () => new Sha512(iv, digestSize) };
+  return {
+    id,
+    digestSize,
+    blockSize: 128,
+    preHash,
+    create: () => new Sha512(iv, digestSize),
+    digest: (data) => digest512(iv, digestSize, data),
+  };
 }
 
 function sha3(id: number, digestSize: number, preHash: Spec["preHash"]): Spec {
   const rate = 200 - 2 * digestSize;
 
-  return { id, digestSize, blockSize: rate, preHash, create: () => new Sha3(new Keccak(rate, 0x06), digestSize) };
+  return {
+    id,
+    digestSize,
+    blockSize: rate,
+    preHash,
+    create: () => new Sha3(new Keccak(rate, 0x06), digestSize),
+    digest: (data) => keccakDigest(rate, 0x06, data, digestSize),
+  };
 }
 
 const SHA_224_SPEC = /* @__PURE__ */ sha256(0, IV_224, 28, [4, 112]);

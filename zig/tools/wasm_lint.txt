@@ -29,8 +29,12 @@ crypto_pq_ml_dsa capi.wipeRange 4 37 0 0 slot headers in the range (magic, size,
 crypto_pq_ml_dsa heap.BrkAllocator.alloc 0 4 0 0 allocation sizes
 crypto_pq_ml_dsa keccak.Keccak.read 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_ml_dsa keccak.Keccak.update 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
-crypto_pq_ml_dsa keccak.Sponge4.next 0 2 0 0 the number of sponges in use
+crypto_pq_ml_dsa keccak.Sponge4.next 0 0 0 1 the number of sponges in use
 crypto_pq_ml_dsa keccak.Sponge4.startSome 0 24 0 0 the number of messages and their lengths; the data absorbed decides nothing
+crypto_pq_ml_dsa keccak.webassembly.permute 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
+crypto_pq_ml_dsa keccak.webassembly.permute2 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
+crypto_pq_ml_dsa keccak.webassembly.permute3 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
+crypto_pq_ml_dsa keccak.webassembly.permute4 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
 crypto_pq_ml_dsa mem.eql 2 7 0 0 comparisons of public bytes: pre-hash names, parameter sections, public keys
 crypto_pq_ml_dsa mldsa.checkPrivateKey 0 3 0 0 validity of an expanded key, declassified: import fails on it
 crypto_pq_ml_dsa mldsa.expandSecret 0 1 0 0 which nibbles are accepted, declassified by the core: rejection sampling shows only which discarded values were out of range
@@ -65,8 +69,12 @@ crypto_pq_ml_kem hash.Hasher.digest 5 3 0 1 lengths, positions and algorithm tag
 crypto_pq_ml_kem hash.Hasher.update 2 10 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_ml_kem keccak.Keccak.read 1 10 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_ml_kem keccak.Keccak.update 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
-crypto_pq_ml_kem keccak.Sponge4.next 0 2 0 0 the number of sponges in use
+crypto_pq_ml_kem keccak.Sponge4.next 0 0 0 1 the number of sponges in use
 crypto_pq_ml_kem keccak.Sponge4.startSome 0 24 0 0 the number of messages and their lengths; the data absorbed decides nothing
+crypto_pq_ml_kem keccak.webassembly.permute 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
+crypto_pq_ml_kem keccak.webassembly.permute2 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
+crypto_pq_ml_kem keccak.webassembly.permute3 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
+crypto_pq_ml_kem keccak.webassembly.permute4 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
 crypto_pq_ml_kem mlkem.checkEncapsulationKey 0 22 0 0 range check of the public encapsulation key
 crypto_pq_ml_kem mlkem.sampleMatrix 0 15 0 0 rejection sampling of the public matrix from rho
 crypto_pq_ml_kem primitives.digest 0 2 0 0 lengths of the parts hashed
@@ -102,8 +110,10 @@ crypto_pq_slh_dsa hash.HmacAlgorithm.create 0 1 0 3 lengths, positions and algor
 crypto_pq_slh_dsa keccak.Keccak.read 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_slh_dsa keccak.Keccak.update 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_slh_dsa keccak.Sponge4.absorb 1 28 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
-crypto_pq_slh_dsa keccak.Sponge4.init 0 26 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_slh_dsa keccak.Sponge4.squeeze 0 24 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
+crypto_pq_slh_dsa keccak.webassembly.permute 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
+crypto_pq_slh_dsa keccak.webassembly.permute3 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
+crypto_pq_slh_dsa keccak.webassembly.permute4 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
 crypto_pq_slh_dsa mem.eql 2 7 0 0 comparisons of public bytes: pre-hash names, parameter sections, public keys
 crypto_pq_slh_dsa primitives.shake256Short 0 20 0 0 lengths of the parts hashed
 crypto_pq_slh_dsa sha2.blocks256 0 1 0 0 block counts from the length
@@ -133,21 +143,18 @@ crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=68,.d=17,.hp=4,.a=9,.k=3
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=68,.d=17,.hp=4,.a=9,.k=35,.m=49}).merkle 0 13 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=68,.d=17,.hp=4,.a=9,.k=35,.m=49}).messageDigest 0 3 0 1 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=false,.n=32,.h=68,.d=17,.hp=4,.a=9,.k=35,.m=49}).sign 0 6 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
-crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=16,.h=63,.d=7,.hp=9,.a=12,.k=14,.m=30}).Shake4.shake 0 32 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=16,.h=63,.d=7,.hp=9,.a=12,.k=14,.m=30}).merkle 0 5 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=16,.h=63,.d=7,.hp=9,.a=12,.k=14,.m=30}).messageDigest 0 2 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=16,.h=63,.d=7,.hp=9,.a=12,.k=14,.m=30}).sign 0 5 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=16,.h=66,.d=22,.hp=3,.a=6,.k=33,.m=34}).merkle 0 5 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=16,.h=66,.d=22,.hp=3,.a=6,.k=33,.m=34}).messageDigest 0 2 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=16,.h=66,.d=22,.hp=3,.a=6,.k=33,.m=34}).sign 0 5 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
-crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=24,.h=63,.d=7,.hp=9,.a=14,.k=17,.m=39}).Shake4.shake 0 32 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=24,.h=63,.d=7,.hp=9,.a=14,.k=17,.m=39}).merkle 0 5 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=24,.h=63,.d=7,.hp=9,.a=14,.k=17,.m=39}).messageDigest 0 2 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=24,.h=63,.d=7,.hp=9,.a=14,.k=17,.m=39}).sign 0 5 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=24,.h=66,.d=22,.hp=3,.a=8,.k=33,.m=42}).merkle 0 5 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=24,.h=66,.d=22,.hp=3,.a=8,.k=33,.m=42}).messageDigest 0 2 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=24,.h=66,.d=22,.hp=3,.a=8,.k=33,.m=42}).sign 0 5 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
-crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=32,.h=64,.d=8,.hp=8,.a=14,.k=22,.m=47}).Shake4.shake 0 32 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=32,.h=64,.d=8,.hp=8,.a=14,.k=22,.m=47}).merkle 0 5 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=32,.h=64,.d=8,.hp=8,.a=14,.k=22,.m=47}).messageDigest 0 2 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
 crypto_pq_slh_dsa slhdsa.Scheme(.{.shake=true,.n=32,.h=64,.d=8,.hp=8,.a=14,.k=22,.m=47}).sign 0 5 0 0 tree and leaf indices from the message digest (public: the verifier recomputes them), lane batching and lengths
@@ -185,6 +192,7 @@ crypto_pq_stateful heap.BrkAllocator.alloc 3 6 0 0 allocation sizes
 crypto_pq_stateful heap.BrkAllocator.free 1 1 0 0 allocation sizes
 crypto_pq_stateful keccak.Keccak.read 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_stateful keccak.Keccak.update 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
+crypto_pq_stateful keccak.webassembly.permute 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
 crypto_pq_stateful lms.Hash.digest 0 24 0 1 tree indices, heights, chain lengths from the public digest digits, lane counts, type codes
 crypto_pq_stateful lms.Lanes(8).chains 0 4 0 0 tree indices, heights, chain lengths from the public digest digits, lane counts, type codes
 crypto_pq_stateful lms.Tree.build 0 27 0 0 tree indices, heights, chain lengths from the public digest digits, lane counts, type codes
@@ -264,8 +272,12 @@ crypto_pq_x_wing_hash hash.Hasher.digest 5 3 0 1 lengths, positions and algorith
 crypto_pq_x_wing_hash hash.Hasher.update 2 10 0 1 lengths, positions and algorithm tags of the hash engines; the data hashed decides nothing
 crypto_pq_x_wing_hash keccak.Keccak.read 1 10 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
 crypto_pq_x_wing_hash keccak.Keccak.update 1 11 0 0 sponge positions, rates and lengths; the data absorbed decides nothing
-crypto_pq_x_wing_hash keccak.Sponge4.next 0 2 0 0 the number of sponges in use
+crypto_pq_x_wing_hash keccak.Sponge4.next 0 0 0 1 the number of sponges in use
 crypto_pq_x_wing_hash keccak.Sponge4.startSome 0 24 0 0 the number of messages and their lengths; the data absorbed decides nothing
+crypto_pq_x_wing_hash keccak.webassembly.permute 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
+crypto_pq_x_wing_hash keccak.webassembly.permute2 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
+crypto_pq_x_wing_hash keccak.webassembly.permute3 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
+crypto_pq_x_wing_hash keccak.webassembly.permute4 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
 crypto_pq_x_wing_hash mlkem.sampleMatrix 0 3 0 0 rejection sampling of the public matrix from rho
 crypto_pq_x_wing_hash primitives.digest 0 2 0 0 lengths of the parts hashed
 crypto_pq_x_wing_hash sha2.blocks256 0 1 0 0 block counts from the length

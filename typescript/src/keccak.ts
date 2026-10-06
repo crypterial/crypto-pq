@@ -172,6 +172,22 @@ export function squeezeBytes(s: Uint32Array, rate: number, position: number, suf
   }
 }
 
+// The state of a one-shot digest, cleared after each: a digest runs to its end without calling
+// out, so one serves every call.
+const SPONGE = new Uint32Array(50);
+
+// The first length bytes of the output for a whole message, without a sponge object: the message
+// enters the state straight from data.
+export function keccakDigest(rate: number, suffix: number, data: Uint8Array, length: number): Uint8Array {
+  const out = new Uint8Array(length);
+
+  squeezeBytes(SPONGE, rate, absorbBytes(SPONGE, rate, 0, data, 0, data.length), suffix, out);
+
+  SPONGE.fill(0);
+
+  return out;
+}
+
 // A Keccak sponge over bytes. The buffer collects the input of a partial block while absorbing and
 // holds the current block of output while squeezing.
 export class Keccak extends Blocks {

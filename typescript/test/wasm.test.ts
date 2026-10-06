@@ -11,7 +11,7 @@ import * as hazmat from "../src/hazmat.ts";
 import * as pq from "../src/index.ts";
 import * as mldsa from "../src/mldsa.ts";
 import { sha256 } from "../src/primitives.ts";
-import { type Core, HASHING, SECRET, check, decodeBase64 } from "../src/wasm.ts";
+import { type Core, HASHING, SECRET, check, decodeBase64, engineFlags } from "../src/wasm.ts";
 import { ML_DSA_WASM } from "../src/wasm-ml-dsa.ts";
 import { ML_KEM_WASM } from "../src/wasm-ml-kem.ts";
 import { SLH_DSA_WASM } from "../src/wasm-slh-dsa.ts";
@@ -178,6 +178,67 @@ test("the self-tests' known answers are TypeScript's", () => {
   } finally {
     pq.setBackend(BACKEND);
   }
+});
+
+// Every code shape that cpq_wasm_tune can pick, against TypeScript: Keccak on one, two, three
+// and four states (single hashes, ML-KEM-768's secret vectors, ML-DSA-87's masks, matrices and
+// SLH-DSA-SHAKE's trees) and the stateful module's.
+test("every engine tuning gives TypeScript's results", () => {
+  const outputs = () => {
+    const kem = hazmat.generateKeyPair(pq.ML_KEM_768, range(64, 1));
+
+    const dsa = hazmat.generateKeyPair(pq.ML_DSA_87, range(32, 2));
+
+    const slh = hazmat.generateKeyPair(pq.SLH_DSA_SHAKE_128F, range(48, 3));
+
+    const lms = hazmat.generateStatefulKeyPair(pq.HSS_LMS, range(40, 4), {
+      parameters: [["LMS_SHAKE_M24_H5", "LMOTS_SHAKE_N24_W4"]],
+      stateStore: new MemoryStore(),
+    });
+
+    const message = range(100, 5);
+
+    return [
+      pq.SHA3_256.digest(range(200, 6)),
+      pq.SHAKE128.digest(range(300, 7), 400),
+      pq.SHAKE256.digest(message, 64),
+      kem.publicKey.exportKey("raw"),
+      hazmat.encapsulate(kem.publicKey, range(32, 8)).ciphertext,
+      dsa.publicKey.exportKey("raw"),
+      dsa.privateKey.sign(message, { deterministic: true }),
+      slh.privateKey.sign(message, { deterministic: true }),
+      lms.publicKey.exportKey("raw"),
+      lms.privateKey.sign(message),
+    ].map(toHex);
+  };
+
+  pq.setBackend("js");
+
+  let expected: string[];
+
+  try {
+    expected = outputs();
+  } finally {
+    pq.setBackend(BACKEND);
+  }
+
+  onWasm(() => {
+    const cores = [ML_KEM, ML_DSA, SLH_DSA, STATEFUL_SIGNATURES, X_WING_HASH].map((family) => family.select()!);
+
+    try {
+      for (let flags = 0; flags < 8; flags++) {
+        for (const core of cores) {
+          core.x.cpq_wasm_tune(flags);
+        }
+
+        assert.deepEqual(outputs(), expected, `flags ${flags}`);
+      }
+    } finally {
+      for (const core of cores) {
+        core.x.cpq_wasm_tune(engineFlags());
+      }
+    }
+  });
 });
 
 test("the backend option", () => {

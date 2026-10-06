@@ -400,9 +400,36 @@ function wasmEngine(family: Family, id: number, sizes: SignatureSizes, invalid: 
     };
   };
 
+  const importPublic = (pk: Uint8Array): Verifier => {
+    const core = family.core();
+
+    const publicSize = core.size(PUBLIC_SLOT, id);
+
+    return core.run(PUBLIC, [publicSize, pk.length], ([publicSlot, input]) => {
+      core.write(input, pk);
+
+      check(core.x.cpq_sig_import_public(id, input, pk.length, publicSlot, publicSize));
+
+      return verifierOf(new Slot(core, publicSlot, publicSize, caches));
+    });
+  };
+
+  // A new key's verifier keeps the public key and imports it when it first verifies: its public
+  // slot, which for ML-DSA is the larger part of what key generation copies out of the instance
+  // (allocators that clear memory as they hand it out, such as musl's, make that slow), is copied
+  // only once it serves. A key pair that tested itself keeps the slot it made, caches filled.
+  const deferred = (pk: Uint8Array): Verifier => {
+    let verifier: Verifier | null = null;
+
+    return {
+      verify: (message, context, entry, signature, policy) =>
+        (verifier ??= importPublic(pk)).verify(message, context, entry, signature, policy),
+    };
+  };
+
   // The key made in the private slot at key: its public slot, made at public, and the public key,
   // exported at raw.
-  const created = (core: Core, at: readonly number[], seeded: boolean): NewKey => {
+  const created = (core: Core, at: readonly number[], seeded: boolean, filled: boolean): NewKey => {
     const [key, publicSlot, raw] = at;
 
     const privateSize = core.size(PRIVATE_SLOT, id);
@@ -415,7 +442,7 @@ function wasmEngine(family: Family, id: number, sizes: SignatureSizes, invalid: 
 
     const pk = core.read(raw, sizes.publicKeySize);
 
-    const verifier = verifierOf(new Slot(core, publicSlot, publicSize, caches));
+    const verifier = filled ? verifierOf(new Slot(core, publicSlot, publicSize, caches)) : deferred(pk);
 
     return [pk, verifier, secretOf(new Slot(core, key, privateSize, caches | (caches << 1)), seeded)];
   };
@@ -438,7 +465,7 @@ function wasmEngine(family: Family, id: number, sizes: SignatureSizes, invalid: 
 
           check(core.x.cpq_sig_keygen(id, s, sizes.seedSize, fill ? FILL_CACHE : 0, key, core.size(PRIVATE_SLOT, id)));
 
-          return created(core, at, mlDsaKey);
+          return created(core, at, mlDsaKey, fill);
         });
       } finally {
         seed?.fill(0);
@@ -457,25 +484,13 @@ function wasmEngine(family: Family, id: number, sizes: SignatureSizes, invalid: 
 
           check(status, { INVALID_PRIVATE_KEY: invalid });
 
-          return created(core, at, false);
+          return created(core, at, false, false);
         });
       } finally {
         sk.fill(0);
       }
     },
-    importPublic(pk) {
-      const core = family.core();
-
-      const publicSize = core.size(PUBLIC_SLOT, id);
-
-      return core.run(PUBLIC, [publicSize, pk.length], ([publicSlot, input]) => {
-        core.write(input, pk);
-
-        check(core.x.cpq_sig_import_public(id, input, pk.length, publicSlot, publicSize));
-
-        return verifierOf(new Slot(core, publicSlot, publicSize, caches));
-      });
-    },
+    importPublic,
   };
 }
 
