@@ -1,3 +1,6 @@
+// Each test crate uses the part of these helpers that its vectors need.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};

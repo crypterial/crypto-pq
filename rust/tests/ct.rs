@@ -7,11 +7,14 @@
 
 use crypto_pq::ct_check::{declassify, secret, x25519, x25519_base};
 use crypto_pq::{
-    Error, HSS_LMS, KemAlgorithm, KemPrivateKey, KemPublicKey, KeyFormat, KeyGenOptions, ML_DSA_44,
-    ML_DSA_65, ML_DSA_87, ML_KEM_512, ML_KEM_768, ML_KEM_1024, SLH_DSA_SHA2_192F,
-    SLH_DSA_SHAKE_128F, SignOptions, SignatureAlgorithm, SignaturePrivateKey, SignaturePublicKey,
-    StateStore, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
-    StatefulSignatureAlgorithm, VerifyOptions, X_WING, XMSS_MT, hazmat,
+    ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_256, BLAKE2B_MAC, BLAKE2S_256, BLAKE2S_MAC,
+    CSHAKE128, CSHAKE256, Error, HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512, HMAC_SHA_256,
+    HMAC_SHA_384, HSS_LMS, HashOptions, KMAC128, KMAC256, KdfOptions, KemAlgorithm, KemPrivateKey,
+    KemPublicKey, KeyFormat, KeyGenOptions, ML_DSA_44, ML_DSA_65, ML_DSA_87, ML_KEM_512,
+    ML_KEM_768, ML_KEM_1024, MacAlgorithm, MacOptions, SLH_DSA_SHA2_192F, SLH_DSA_SHAKE_128F,
+    SignOptions, SignatureAlgorithm, SignaturePrivateKey, SignaturePublicKey, StateStore,
+    StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters, StatefulSignatureAlgorithm,
+    VerifyOptions, X_WING, XMSS_MT, XofOptions, hazmat,
 };
 
 const MESSAGE: &[u8] = b"crypto-pq constant-time check";
@@ -452,4 +455,167 @@ fn xmss_mt() {
         StatefulParameters::Name("XMSSMT-SHAKE256_20/4_192"),
         3 * 24,
     );
+}
+
+// Every MAC under a secret key, one-shot and incremental, over a message that spans blocks, and
+// its verification of the right tag and of a changed one: the verdict is public, the tag is not.
+fn mac(algorithm: MacAlgorithm, key_size: usize) {
+    let key = secret_bytes(key_size, 9);
+
+    let message: Vec<u8> = (0..300).map(|i| i as u8).collect();
+
+    let tag = algorithm.digest(&key, &message);
+
+    let mut incremental = algorithm.create(&key);
+
+    incremental.update(&message[..77]);
+
+    incremental.update(&message[77..]);
+
+    assert!(same(&incremental.digest(), &tag));
+
+    assert!(algorithm.verify(&key, &message, &tag));
+
+    assert!(incremental.verify(&tag));
+
+    let mut changed = tag.clone();
+
+    declassify(&changed);
+
+    changed[0] ^= 1;
+
+    assert!(!algorithm.verify(&key, &message, &changed));
+
+    assert!(!incremental.verify(&changed));
+}
+
+#[test]
+fn macs() {
+    for (algorithm, key_size) in [
+        (HMAC_SHA_256, 32),
+        (HMAC_SHA_384, 200),
+        (KMAC128, 32),
+        (KMAC256, 64),
+        (BLAKE2B_MAC, 64),
+        (BLAKE2S_MAC, 32),
+    ] {
+        mac(algorithm, key_size);
+    }
+
+    // KMACXOF with a customization and a tag longer than a comparison chunk, and BLAKE2 with a
+    // short key, salt and personalization.
+    let options = MacOptions {
+        length: Some(100),
+        customization: b"ct",
+        xof: true,
+        ..MacOptions::default()
+    };
+
+    mac(KMAC128.configure(&options).unwrap(), 16);
+
+    let options = MacOptions {
+        length: Some(20),
+        salt: b"salt",
+        personalization: b"person",
+        ..MacOptions::default()
+    };
+
+    mac(BLAKE2B_MAC.configure(&options).unwrap(), 5);
+
+    mac(BLAKE2S_MAC.configure(&options).unwrap(), 1);
+}
+
+// HKDF from a secret IKM, and Expand from the secret PRK, with outputs of one block and of several,
+// and an info too long for the message buffer.
+#[test]
+fn hkdf() {
+    for kdf in [HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512] {
+        let ikm = secret_bytes(32, 3);
+
+        let long_info = vec![7; 300];
+
+        for info in [&b"info"[..], &long_info] {
+            let options = KdfOptions {
+                salt: b"salt",
+                info,
+            };
+
+            let okm = kdf.derive(&ikm, 200, &options).unwrap();
+
+            let short = kdf.derive(&ikm, 16, &options).unwrap();
+
+            assert!(same(&short, &okm[..16]));
+
+            let prk = kdf
+                .extract(
+                    &ikm,
+                    &KdfOptions {
+                        salt: b"salt",
+                        ..KdfOptions::default()
+                    },
+                )
+                .unwrap();
+
+            let expanded = kdf
+                .expand(
+                    &prk,
+                    200,
+                    &KdfOptions {
+                        info,
+                        ..KdfOptions::default()
+                    },
+                )
+                .unwrap();
+
+            assert!(same(&expanded, &okm));
+        }
+    }
+}
+
+// The hash functions on secret input, as a KDF or a MAC built on them would feed it: one-shot and
+// incremental, configured and not.
+#[test]
+fn hashes_of_secrets() {
+    let data = secret_bytes(300, 11);
+
+    let options = HashOptions {
+        salt: b"salt",
+        personalization: b"me",
+    };
+
+    for algorithm in [
+        BLAKE2B_256,
+        BLAKE2S_256,
+        BLAKE2B_256.configure(&options).unwrap(),
+        ASCON_HASH256,
+    ] {
+        let digest = algorithm.digest(&data);
+
+        let mut hasher = algorithm.create();
+
+        hasher.update(&data[..100]);
+
+        hasher.update(&data[100..]);
+
+        assert!(same(&hasher.digest(), &digest));
+    }
+
+    let customized = XofOptions {
+        customization: b"ct",
+    };
+
+    for algorithm in [
+        CSHAKE128.configure(&customized).unwrap(),
+        CSHAKE256,
+        ASCON_XOF128,
+        ASCON_CXOF128.configure(&customized).unwrap(),
+    ] {
+        let output = algorithm.digest(&data, 70);
+
+        let mut xof = algorithm.create();
+
+        xof.update(&data);
+
+        assert!(same(&xof.read(70), &output));
+    }
 }

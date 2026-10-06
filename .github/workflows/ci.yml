@@ -511,8 +511,8 @@ jobs:
       - run: cargo test --locked --release
 
   # Each x86-64 path whatever the runner's CPU: QEMU user mode runs the suite on a CPU with AVX2
-  # and no SHA-NI, one with SHA-NI and no AVX, and one with neither. The runner itself covers the
-  # CPU it has, usually SHA-NI with AVX2.
+  # and no SHA-NI, one with SHA-NI and SSE4.1 (BLAKE2s) but no AVX, and one with none of them. The
+  # runner itself covers the CPU it has, usually SHA-NI with AVX2.
   rust-x86-models:
     name: rust x86-64 -cpu ${{ matrix.cpu }}
     runs-on: ubuntu-latest

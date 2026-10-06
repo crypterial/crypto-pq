@@ -79,6 +79,17 @@ impl PreHash {
         }
     }
 
+    // FIPS 204 and FIPS 205 allow only hash functions with a NIST identifier; the others, such as
+    // BLAKE2, Ascon-Hash256 and cSHAKE, are refused.
+    const fn approved(&self) -> bool {
+        let arc = match self.0 {
+            PreHashKind::Hash(algorithm) => algorithm.oid_arc(),
+            PreHashKind::Xof(algorithm) => algorithm.oid_arc(),
+        };
+
+        arc != 0
+    }
+
     // Collision strength in bits: half the output.
     fn strength(&self) -> usize {
         4 * self.output_size()
@@ -450,6 +461,11 @@ impl SignatureAlgorithm {
 
         policy && pre_hash.is_some_and(|pre_hash| pre_hash.strength() < strength)
     }
+
+    // A pre-hash that is not approved, or too weak where the policy applies (hazmat skips it).
+    fn refuses(&self, pre_hash: Option<PreHash>, policy: bool) -> bool {
+        pre_hash.is_some_and(|pre_hash| !pre_hash.approved()) || self.too_weak(pre_hash, policy)
+    }
 }
 
 impl fmt::Debug for SignatureAlgorithm {
@@ -552,7 +568,8 @@ impl SignaturePublicKey {
         self.algorithm
     }
 
-    // Fails closed: a long context, a wrong signature length or a weak pre-hash is just false.
+    // Fails closed: a long context, a wrong signature length or a weak or unapproved pre-hash is
+    // just false.
     pub fn verify(&self, signature: &[u8], message: &[u8], options: &VerifyOptions) -> bool {
         self.verify_with(signature, message, options, true)
     }
@@ -566,7 +583,7 @@ impl SignaturePublicKey {
     ) -> bool {
         let algorithm = self.algorithm;
 
-        if algorithm.too_weak(options.pre_hash, policy)
+        if algorithm.refuses(options.pre_hash, policy)
             || options.context.len() > MAX_CONTEXT_SIZE
             || signature.len() != algorithm.signature_size()
         {
@@ -641,7 +658,7 @@ impl SignaturePrivateKey {
     }
 
     pub(crate) fn check_options(&self, options: &SignOptions, policy: bool) -> Result<(), Error> {
-        if self.algorithm.too_weak(options.pre_hash, policy) {
+        if self.algorithm.refuses(options.pre_hash, policy) {
             return Err(Error::InvalidOption);
         }
 

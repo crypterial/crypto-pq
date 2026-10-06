@@ -5,6 +5,7 @@
 use alloc::vec::Vec;
 
 use crate::error::Error;
+use crate::hash::XofAlgorithm;
 use crate::kem::{Encapsulation, KemAlgorithm, KemKeyPair, KemPublicKey};
 use crate::signature::{
     SignOptions, SignatureAlgorithm, SignatureKeyPair, SignaturePrivateKey, SignaturePublicKey,
@@ -105,4 +106,15 @@ pub fn generate_stateful_key_pair<S: StateStore>(
         reserve,
         store,
     )
+}
+
+// cSHAKE128 or cSHAKE256 with a function name N as well as a customization S, as the ACVP vectors
+// set it. SP 800-185, 3.4: N should only take values that NIST defines, so the public configure
+// takes S alone.
+pub fn configure_cshake(
+    algorithm: XofAlgorithm,
+    function_name: &[u8],
+    customization: &[u8],
+) -> Result<XofAlgorithm, Error> {
+    algorithm.configure_cshake(function_name, customization)
 }

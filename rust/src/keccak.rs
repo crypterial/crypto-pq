@@ -1,6 +1,3 @@
-use alloc::vec;
-use alloc::vec::Vec;
-
 use crate::cpu;
 use crate::wipe::wipe;
 
@@ -79,6 +76,58 @@ pub(crate) fn parities(state: &[u64; 25]) -> [u64; 5] {
     })
 }
 
+// Keccak-f[1600] as the specification writes it, for states that constants need at compile time.
+pub(crate) const fn permute_const(a: &mut [u64; 25]) {
+    let mut round = 0;
+
+    while round < 24 {
+        let mut c = [0; 5];
+
+        let mut x = 0;
+
+        while x < 5 {
+            c[x] = a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20];
+
+            x += 1;
+        }
+
+        let mut i = 0;
+
+        while i < 25 {
+            a[i] ^= c[(i + 4) % 5] ^ c[(i + 1) % 5].rotate_left(1);
+
+            i += 1;
+        }
+
+        // Rho and pi: lane (x, y) moves to (y, 2x + 3y).
+        let mut b = [0; 25];
+
+        i = 0;
+
+        while i < 25 {
+            let (x, y) = (i % 5, i / 5);
+
+            b[y + 5 * ((2 * x + 3 * y) % 5)] = a[i].rotate_left(ROTATIONS[i]);
+
+            i += 1;
+        }
+
+        i = 0;
+
+        while i < 25 {
+            let row = i - i % 5;
+
+            a[i] = b[i] ^ (!b[row + (i + 1) % 5] & b[row + (i + 2) % 5]);
+
+            i += 1;
+        }
+
+        a[0] ^= ROUND_CONSTANTS[round];
+
+        round += 1;
+    }
+}
+
 pub(crate) fn permute(state: &mut [u64; 25]) {
     let mut parities = parities(state);
 
@@ -92,7 +141,7 @@ pub(crate) fn permute(state: &mut [u64; 25]) {
 }
 
 // One state through a CPU kernel where there is one.
-fn permute_one(state: &mut [u64; 25]) {
+pub(crate) fn permute_one(state: &mut [u64; 25]) {
     if cpu::permute_many(&mut [&mut *state]) == 0 {
         permute(state);
     }
@@ -287,12 +336,32 @@ pub(crate) struct Keccak {
 
 impl Keccak {
     pub(crate) const fn new(rate: usize, suffix: u8) -> Self {
+        Self::resume([0; 25], rate, suffix)
+    }
+
+    // A sponge whose input so far has left `state` at a block boundary.
+    pub(crate) const fn resume(state: [u64; 25], rate: usize, suffix: u8) -> Self {
         Self {
-            state: [0; 25],
+            state,
             rate,
             suffix,
             position: 0,
             squeezing: false,
+        }
+    }
+
+    pub(crate) const fn state(&self) -> [u64; 25] {
+        self.state
+    }
+
+    // Zero bytes up to the end of the block: bytepad's padding of SP 800-185.
+    pub(crate) fn pad_block(&mut self) {
+        assert!(!self.squeezing, "UNSUPPORTED: cannot update after read");
+
+        if self.position > 0 {
+            permute_one(&mut self.state);
+
+            self.position = 0;
         }
     }
 
@@ -385,22 +454,33 @@ impl Keccak {
         }
     }
 
-    pub(crate) fn digest(rate: usize, suffix: u8, data: &[u8], size: usize) -> Vec<u8> {
-        let mut out = vec![0; size];
-
-        Self::digest_into(rate, suffix, data, &mut out);
-
-        out
-    }
-
     // The first out.len() bytes of output for data, read once. A kernel absorbs and squeezes in
     // one call with the state in its registers.
     pub(crate) fn digest_into(rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) {
-        if cpu::digest(rate, suffix, data, out) {
+        if cpu::digest(None, rate, suffix, data, out) {
             return;
         }
 
         let mut engine = Self::new(rate, suffix);
+
+        engine.update(data);
+
+        engine.read(out);
+    }
+
+    // digest_into from a state at a block boundary, such as cSHAKE's after its prefix.
+    pub(crate) fn digest_from(
+        start: &[u64; 25],
+        rate: usize,
+        suffix: u8,
+        data: &[u8],
+        out: &mut [u8],
+    ) {
+        if cpu::digest(Some(start), rate, suffix, data, out) {
+            return;
+        }
+
+        let mut engine = Self::resume(*start, rate, suffix);
 
         engine.update(data);
 
@@ -444,6 +524,8 @@ impl Drop for Keccak {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     use crate::cpu::testing::{EDGES, Inputs};
 
@@ -633,11 +715,49 @@ mod tests {
 
                     engine.read(&mut expected);
 
-                    let actual = Keccak::digest(rate, suffix, &data[..length], size);
+                    let mut actual = vec![0; size];
+
+                    Keccak::digest_into(rate, suffix, &data[..length], &mut actual);
 
                     assert_eq!(actual, expected, "rate {rate}, length {length}");
+
+                    // The same from a state after a block, as cSHAKE's prefix leaves it.
+                    let start = inputs.words();
+
+                    let mut engine = Keccak::resume(start, rate, suffix);
+
+                    engine.update(&data[..length]);
+
+                    engine.read(&mut expected);
+
+                    Keccak::digest_from(&start, rate, suffix, &data[..length], &mut actual);
+
+                    assert_eq!(
+                        actual, expected,
+                        "from a state: rate {rate}, length {length}"
+                    );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn compile_time_permutation_matches() {
+        let mut inputs = Inputs::new(25);
+
+        for n in 0..100 {
+            let mut state: [u64; 25] = match EDGES.get(n) {
+                Some(&edge) => [edge; 25],
+                None => inputs.words(),
+            };
+
+            let mut expected = state;
+
+            permute(&mut expected);
+
+            permute_const(&mut state);
+
+            assert_eq!(state, expected, "case {n}");
         }
     }
 

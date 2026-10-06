@@ -9,8 +9,8 @@
 // The constant-time check (--cfg crypto_pq_ct) runs under valgrind, which cannot execute every
 // instruction: its build leaves out SHA3, SHA512 and DIT on arm64 and the SHA extensions on
 // x86-64, ignores what the build guarantees, and detects the rest at run time, so that it checks
-// the SHA-256 instructions and NEON on arm64 and AVX2 on x86-64. The portable build checks the
-// fallback.
+// the SHA-256 instructions and NEON on arm64 and AVX2 and SSE4.1 on x86-64. The portable build
+// checks the fallback.
 
 #[cfg(all(
     target_arch = "aarch64",
@@ -102,7 +102,27 @@ mod arch {
     }
 
     #[inline(always)]
+    pub(crate) fn hmac256_keyed(_: &[[u32; 8]; 2], _: &[u8], _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn hmac512_keyed(_: &[[u64; 8]; 2], _: &[u8], _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
     pub(crate) fn compress512_pair(_: &mut [[u64; 8]; 2], _: &[[u8; 128]; 2]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn ascon(_: &mut [u64; 5]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn ascon_digest(_: &[u64; 5], _: &[u8], _: &mut [u8]) -> bool {
         false
     }
 
@@ -117,7 +137,29 @@ mod arch {
     }
 
     #[inline(always)]
-    pub(crate) fn digest(_: usize, _: u8, _: &[u8], _: &mut [u8]) -> bool {
+    pub(crate) fn digest(_: Option<&[u64; 25]>, _: usize, _: u8, _: &[u8], _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn blake2b(
+        _: &mut [u64; 8],
+        _: Option<&[u64; 16]>,
+        _: &[[u8; 128]],
+        _: u128,
+        _: Option<(&[u64; 16], u128)>,
+    ) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn blake2s(
+        _: &mut [u32; 8],
+        _: Option<&[u32; 16]>,
+        _: &[[u8; 64]],
+        _: u64,
+        _: Option<(&[u32; 16], u128)>,
+    ) -> bool {
         false
     }
 
@@ -256,11 +298,12 @@ mod arch {
 }
 
 pub(crate) use arch::{
-    absorb, base_multiply_add, binomial, bounded, compress256, compress256_lanes, compress256_pair,
-    compress512, compress512_pair, digest, encode12, finish256, finish512, hmac256, hmac512,
-    inverse_ntt, inverse_ntt16, keccak_group, mldsa_add, mldsa_hints, mldsa_mask, mldsa_norm,
-    mldsa_sub, mldsa_w1, mlkem_matrix_vector, multiply, multiply_add, ntt, ntt16, permute_many,
-    reduce, uniform12, uniform23,
+    absorb, ascon, ascon_digest, base_multiply_add, binomial, blake2b, blake2s, bounded,
+    compress256, compress256_lanes, compress256_pair, compress512, compress512_pair, digest,
+    encode12, finish256, finish512, hmac256, hmac256_keyed, hmac512, hmac512_keyed, inverse_ntt,
+    inverse_ntt16, keccak_group, mldsa_add, mldsa_hints, mldsa_mask, mldsa_norm, mldsa_sub,
+    mldsa_w1, mlkem_matrix_vector, multiply, multiply_add, ntt, ntt16, permute_many, reduce,
+    uniform12, uniform23,
 };
 
 // What the transform kernels need of the field of ML-KEM or ML-DSA, so that they compute exactly

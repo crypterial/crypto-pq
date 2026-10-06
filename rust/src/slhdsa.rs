@@ -2,8 +2,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::ct::declassify;
-use crate::hash::{HMAC_SHA_256, HMAC_SHA_512};
 use crate::keccak::{self, MAX_SPONGES, Sponges};
+use crate::mac::{HMAC_SHA_256, HMAC_SHA_512};
 use crate::primitives::{sha256, sha512, shake256};
 use crate::sha2::{IV_256, IV_512, Sha256, Sha512};
 use crate::wipe::{SecretBytes, wipe};

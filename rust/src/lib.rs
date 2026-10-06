@@ -6,6 +6,10 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod ascon;
+
+mod blake2;
+
 mod cpu;
 
 mod ct;
@@ -18,6 +22,8 @@ mod hash;
 
 pub mod hazmat;
 
+mod kdf;
+
 mod kem;
 
 mod keccak;
@@ -25,6 +31,8 @@ mod keccak;
 mod keys;
 
 mod lms;
+
+mod mac;
 
 mod merkle;
 
@@ -44,6 +52,8 @@ mod signature;
 
 mod slhdsa;
 
+mod sp800_185;
+
 mod stateful;
 
 mod wipe;
@@ -56,15 +66,21 @@ mod xwing;
 
 pub use error::Error;
 pub use hash::{
-    HMAC_SHA_224, HMAC_SHA_256, HMAC_SHA_384, HMAC_SHA_512, HashAlgorithm, Hasher, Hmac,
-    HmacAlgorithm, SHA_224, SHA_256, SHA_384, SHA_512, SHA_512_224, SHA_512_256, SHA3_224,
-    SHA3_256, SHA3_384, SHA3_512, SHAKE128, SHAKE256, Xof, XofAlgorithm,
+    ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_160, BLAKE2B_256, BLAKE2B_384, BLAKE2B_512,
+    BLAKE2S_128, BLAKE2S_160, BLAKE2S_224, BLAKE2S_256, CSHAKE128, CSHAKE256, HashAlgorithm,
+    HashOptions, Hasher, SHA_224, SHA_256, SHA_384, SHA_512, SHA_512_224, SHA_512_256, SHA3_224,
+    SHA3_256, SHA3_384, SHA3_512, SHAKE128, SHAKE256, Xof, XofAlgorithm, XofOptions,
 };
+pub use kdf::{HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512, KdfAlgorithm, KdfOptions};
 pub use kem::{
     Encapsulation, KemAlgorithm, KemKeyPair, KemPrivateKey, KemPublicKey, ML_KEM_512, ML_KEM_768,
     ML_KEM_1024, X_WING,
 };
 pub use keys::{KeyFormat, KeyGenOptions};
+pub use mac::{
+    BLAKE2B_MAC, BLAKE2S_MAC, HMAC_SHA_224, HMAC_SHA_256, HMAC_SHA_384, HMAC_SHA_512, KMAC128,
+    KMAC256, Mac, MacAlgorithm, MacOptions,
+};
 pub use signature::{
     ML_DSA_44, ML_DSA_65, ML_DSA_87, PreHash, SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S,
     SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F,

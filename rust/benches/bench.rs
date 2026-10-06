@@ -2,13 +2,16 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use crypto_pq::{
-    Error, HSS_LMS, KemAlgorithm, ML_DSA_44, ML_DSA_65, ML_DSA_87, ML_KEM_512, ML_KEM_768,
-    ML_KEM_1024, SHA_256, SHA_512, SHA3_256, SHAKE128, SHAKE256, SLH_DSA_SHA2_128F,
-    SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S,
-    SLH_DSA_SHAKE_128F, SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S,
-    SLH_DSA_SHAKE_256F, SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, StateStore,
-    StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters, StatefulPrivateKey,
-    StatefulSignatureAlgorithm, VerifyOptions, X_WING, XMSS, XMSS_MT, hazmat,
+    ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_512, BLAKE2B_MAC, BLAKE2S_256, BLAKE2S_MAC,
+    CSHAKE128, CSHAKE256, Error, HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512, HMAC_SHA_256, HSS_LMS,
+    HashAlgorithm, KMAC128, KMAC256, KdfAlgorithm, KdfOptions, KemAlgorithm, ML_DSA_44, ML_DSA_65,
+    ML_DSA_87, ML_KEM_512, ML_KEM_768, ML_KEM_1024, MacAlgorithm, MacOptions, SHA_256, SHA_512,
+    SHA3_256, SHAKE128, SHAKE256, SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F,
+    SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F,
+    SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F,
+    SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, StateStore, StatefulKeyGenOptions,
+    StatefulLoadOptions, StatefulParameters, StatefulPrivateKey, StatefulSignatureAlgorithm,
+    VerifyOptions, X_WING, XMSS, XMSS_MT, XofAlgorithm, XofOptions, hazmat,
 };
 
 const MIN_TIME: Duration = Duration::from_secs(1);
@@ -174,6 +177,154 @@ fn hashes(runner: &Runner) {
 
         timed(count, || {
             SHAKE256.digest_into(black_box(&data), &mut out);
+
+            black_box(&out);
+        })
+    });
+
+    for (name, algorithm) in [
+        ("blake2b-512", BLAKE2B_512),
+        ("blake2s-256", BLAKE2S_256),
+        ("ascon-hash256", ASCON_HASH256),
+    ] {
+        for (size, suffix) in [(64, "64B"), (1024, "1KiB")] {
+            hash(
+                runner,
+                &format!("{name}/{suffix}"),
+                algorithm,
+                &data[..size],
+            );
+        }
+    }
+
+    let options = XofOptions {
+        customization: b"crypto-pq benchmark",
+    };
+
+    for (name, algorithm, size) in [
+        ("cshake128/1KiB", CSHAKE128.configure(&options).unwrap(), 32),
+        ("cshake256/1KiB", CSHAKE256.configure(&options).unwrap(), 64),
+        ("ascon-xof128/1KiB", ASCON_XOF128, 32),
+        (
+            "ascon-cxof128/1KiB",
+            ASCON_CXOF128.configure(&options).unwrap(),
+            32,
+        ),
+    ] {
+        xof(runner, name, algorithm, &data, size);
+    }
+}
+
+fn hash(runner: &Runner, name: &str, algorithm: HashAlgorithm, data: &[u8]) {
+    runner.case(name, |count| {
+        let mut out = vec![0; algorithm.digest_size()];
+
+        timed(count, || {
+            algorithm.digest_into(black_box(data), &mut out);
+
+            black_box(&out);
+        })
+    });
+}
+
+fn xof(runner: &Runner, name: &str, algorithm: XofAlgorithm, data: &[u8], size: usize) {
+    runner.case(name, |count| {
+        let mut out = vec![0; size];
+
+        timed(count, || {
+            algorithm.digest_into(black_box(data), &mut out);
+
+            black_box(&out);
+        })
+    });
+}
+
+// MACs under a 32-byte key; KMAC with a customization string.
+fn macs(runner: &Runner) {
+    let data = bytes(1024);
+
+    let key = bytes(32);
+
+    let options = MacOptions {
+        customization: b"crypto-pq benchmark",
+        ..MacOptions::default()
+    };
+
+    for (name, algorithm) in [
+        ("hmac-sha-256", HMAC_SHA_256),
+        ("kmac128", KMAC128.configure(&options).unwrap()),
+        ("kmac256", KMAC256.configure(&options).unwrap()),
+        ("blake2b-mac", BLAKE2B_MAC),
+        ("blake2s-mac", BLAKE2S_MAC),
+    ] {
+        for (size, suffix) in [(64, "64B"), (1024, "1KiB")] {
+            mac(
+                runner,
+                &format!("{name}/{suffix}"),
+                algorithm,
+                &key,
+                &data[..size],
+            );
+        }
+    }
+}
+
+fn mac(runner: &Runner, name: &str, algorithm: MacAlgorithm, key: &[u8], data: &[u8]) {
+    runner.case(name, |count| {
+        let mut out = vec![0; algorithm.digest_size()];
+
+        timed(count, || {
+            algorithm.digest_into(black_box(key), black_box(data), &mut out);
+
+            black_box(&out);
+        })
+    });
+}
+
+// HKDF derive with a 32-byte IKM, a 32-byte salt and a 16-byte info.
+fn kdfs(runner: &Runner) {
+    let ikm = bytes(32);
+
+    let salt = bytes(32);
+
+    let options = KdfOptions {
+        salt: &salt,
+        info: b"crypto-pq hkdf 1",
+    };
+
+    for (name, algorithm) in [
+        ("hkdf-sha-256", HKDF_SHA_256),
+        ("hkdf-sha-384", HKDF_SHA_384),
+        ("hkdf-sha-512", HKDF_SHA_512),
+    ] {
+        for size in [32, 64, 128] {
+            kdf(
+                runner,
+                &format!("{name}/{size}B"),
+                algorithm,
+                &ikm,
+                size,
+                &options,
+            );
+        }
+    }
+}
+
+fn kdf(
+    runner: &Runner,
+    name: &str,
+    algorithm: KdfAlgorithm,
+    ikm: &[u8],
+    size: usize,
+    options: &KdfOptions,
+) {
+    runner.case(name, |count| {
+        let mut out = vec![0; size];
+
+        timed(count, || {
+            algorithm
+                .derive_into(black_box(ikm), &mut out, options)
+                .unwrap();
 
             black_box(&out);
         })
@@ -423,6 +574,10 @@ fn main() {
     };
 
     hashes(&runner);
+
+    macs(&runner);
+
+    kdfs(&runner);
 
     for algorithm in [ML_KEM_512, ML_KEM_768, ML_KEM_1024] {
         kem(&runner, algorithm, 64, 32);

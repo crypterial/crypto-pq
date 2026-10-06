@@ -15,6 +15,8 @@ use crate::keccak::{self, ROUND_CONSTANTS};
 use crate::sha2::{K256, K512, last_bytes};
 use crate::wipe::wipe;
 
+mod ascon;
+
 mod binomial;
 
 mod dsa;
@@ -28,6 +30,8 @@ mod pack;
 mod sample;
 
 use memory::{load_u8, load_u32, load_u64, store_u8, store_u32, store_u64};
+
+pub(crate) use ascon::{ascon, ascon_digest};
 
 pub(crate) use binomial::binomial;
 
@@ -375,6 +379,30 @@ pub(crate) fn hmac512(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) ->
 }
 
 #[allow(unsafe_code)]
+pub(crate) fn hmac256_keyed(keyed: &[[u32; 8]; 2], data: &[u8], tag: &mut [u8]) -> bool {
+    if !has(SHA2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { hmac256_keyed_sha2(keyed, data, tag) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn hmac512_keyed(keyed: &[[u64; 8]; 2], data: &[u8], tag: &mut [u8]) -> bool {
+    if !has(SHA3) {
+        return false;
+    }
+
+    // SAFETY: as in compress512.
+    unsafe { hmac512_keyed_sha3(keyed, data, tag) };
+
+    true
+}
+
+#[allow(unsafe_code)]
 pub(crate) fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) -> bool {
     if !has(SHA3) {
         return false;
@@ -472,7 +500,13 @@ pub(crate) fn absorb(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
 // out. A kernel per rate: whole blocks of a constant size keep the state in registers, which a
 // rate known only at run time did not quite do.
 #[allow(unsafe_code)]
-pub(crate) fn digest(rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) -> bool {
+pub(crate) fn digest(
+    initial: Option<&[u64; 25]>,
+    rate: usize,
+    suffix: u8,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
     if !has(KECCAK) {
         return false;
     }
@@ -480,16 +514,41 @@ pub(crate) fn digest(rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) -> bo
     // SAFETY: as in absorb.
     unsafe {
         match rate {
-            72 => digest_sha3::<72>(data, suffix, out),
-            104 => digest_sha3::<104>(data, suffix, out),
-            136 => digest_sha3::<136>(data, suffix, out),
-            144 => digest_sha3::<144>(data, suffix, out),
-            168 => digest_sha3::<168>(data, suffix, out),
+            72 => digest_sha3::<72>(initial, data, suffix, out),
+            104 => digest_sha3::<104>(initial, data, suffix, out),
+            136 => digest_sha3::<136>(initial, data, suffix, out),
+            144 => digest_sha3::<144>(initial, data, suffix, out),
+            168 => digest_sha3::<168>(initial, data, suffix, out),
             _ => return false,
         }
     }
 
     true
+}
+
+// BLAKE2 runs best on the scalar pipes as compiled: four independent G functions per step keep
+// them busy, a hand-ordered assembly version measured the same, and NEON's two-cycle instructions
+// and two-instruction rotations lengthen the chain.
+#[inline(always)]
+pub(crate) fn blake2b(
+    _: &mut [u64; 8],
+    _: Option<&[u64; 16]>,
+    _: &[[u8; 128]],
+    _: u128,
+    _: Option<(&[u64; 16], u128)>,
+) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn blake2s(
+    _: &mut [u32; 8],
+    _: Option<&[u32; 16]>,
+    _: &[[u8; 64]],
+    _: u64,
+    _: Option<(&[u32; 16], u128)>,
+) -> bool {
+    false
 }
 
 #[target_feature(enable = "neon")]
@@ -952,6 +1011,16 @@ fn hmac256_sha2(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
 
     store256(outer_abcd, outer_efgh, &mut states[1]);
 
+    after_keys256(&mut states, data, tag, &k);
+
+    wipe(states.as_flattened_mut());
+}
+
+// HMAC-SHA-256 or HMAC-SHA-224 from the states after the inner and the outer key block, which
+// `states` holds; the inner hash overwrites the first.
+#[target_feature(enable = "sha2")]
+#[inline]
+fn after_keys256(states: &mut [[u32; 8]; 2], data: &[u8], tag: &mut [u8], k: &[uint32x4_t; 16]) {
     finish256_sha2(
         &mut states[0],
         data,
@@ -975,7 +1044,7 @@ fn hmac256_sha2(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
 
     outer[3] = vsetq_lane_u32::<3>(bits, outer[3]);
 
-    block256(&mut outer_abcd, &mut outer_efgh, outer, &k);
+    block256(&mut outer_abcd, &mut outer_efgh, outer, k);
 
     store_tag(
         [
@@ -984,6 +1053,14 @@ fn hmac256_sha2(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
         ],
         tag,
     );
+}
+
+// hmac256_sha2 from the keyed states, for many messages under one key: HKDF's expansion.
+#[target_feature(enable = "sha2")]
+fn hmac256_keyed_sha2(keyed: &[[u32; 8]; 2], data: &[u8], tag: &mut [u8]) {
+    let mut states = *keyed;
+
+    after_keys256(&mut states, data, tag, &constants256());
 
     wipe(states.as_flattened_mut());
 }
@@ -1312,6 +1389,15 @@ fn hmac512_sha3(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
 
     store512(&outer[0], &mut states[1]);
 
+    after_keys512(&mut states, data, tag);
+
+    wipe(states.as_flattened_mut());
+}
+
+// after_keys256 for SHA-512 and SHA-384.
+#[target_feature(enable = "sha3")]
+#[inline]
+fn after_keys512(states: &mut [[u64; 8]; 2], data: &[u8], tag: &mut [u8]) {
     finish512_sha3(
         &mut states[0],
         data,
@@ -1342,6 +1428,13 @@ fn hmac512_sha3(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
     }
 
     store_tag(bytes, tag);
+}
+
+#[target_feature(enable = "sha3")]
+fn hmac512_keyed_sha3(keyed: &[[u64; 8]; 2], data: &[u8], tag: &mut [u8]) {
+    let mut states = *keyed;
+
+    after_keys512(&mut states, data, tag);
 
     wipe(states.as_flattened_mut());
 }
@@ -1760,11 +1853,17 @@ fn store_rate<const RATE: usize>(a: &[uint64x2_t; 25], out: &mut [u8; RATE]) {
 }
 
 // The whole blocks of data and then its padded last block, and then out.len() bytes squeezed,
-// with the state in registers throughout. The last block is built before the state is live,
-// since a call to memcpy while it is would push it to memory, and it and the squeezed lanes pass
-// through small buffers that are wiped.
+// with the state in registers throughout, from the initial state if there is one and from zero
+// otherwise. The last block is built before the state is live, since a call to memcpy while it is
+// would push it to memory, and it and the squeezed lanes pass through small buffers that are
+// wiped.
 #[target_feature(enable = "sha3")]
-fn digest_sha3<const RATE: usize>(data: &[u8], suffix: u8, out: &mut [u8]) {
+fn digest_sha3<const RATE: usize>(
+    initial: Option<&[u64; 25]>,
+    data: &[u8],
+    suffix: u8,
+    out: &mut [u8],
+) {
     let (blocks, tail) = data.as_chunks::<RATE>();
 
     let (lanes, rest) = tail.as_chunks::<8>();
@@ -1792,6 +1891,12 @@ fn digest_sha3<const RATE: usize>(data: &[u8], suffix: u8, out: &mut [u8]) {
     }
 
     let mut a = [vdupq_n_u64(0); 25];
+
+    if let Some(initial) = initial {
+        for (lane, x) in a.iter_mut().zip(initial) {
+            *lane = vdupq_n_u64(*x);
+        }
+    }
 
     for block in blocks {
         xor_block(&mut a, block);
@@ -1874,7 +1979,7 @@ mod tests {
 
         assert!(!dit_is_set());
 
-        crate::hash::HMAC_SHA_256.digest(b"key", b"data");
+        crate::mac::HMAC_SHA_256.digest(b"key", b"data");
 
         assert!(!dit_is_set());
     }

@@ -1,13 +1,15 @@
 // SHA-256 with the SHA extensions (SHA256RNDS2, SHA256MSG1, SHA256MSG2); the SHA-256 lanes,
-// Keccak-f[1600] on four states and the ML-KEM and ML-DSA transforms with AVX2. Every
-// instruction used is on Intel's list of data-operand-independent timing instructions, and the
-// code around them has no branch or address that depends on the data. x86-64 has no common
-// SHA-512 extension, so SHA-512 stays portable. The kernels are safe code inside
-// #[target_feature] functions; what is unsafe is calling one once its feature is known to be
-// there, and CPUID with XGETBV.
+// Keccak-f[1600] on four states, BLAKE2b and the ML-KEM and ML-DSA transforms with AVX2; BLAKE2s,
+// and BLAKE2b without AVX2, with SSE4.1. Every instruction used is on Intel's list of
+// data-operand-independent timing instructions, and the code around them has no branch or
+// address that depends on the data. x86-64 has no common SHA-512 extension, so SHA-512 stays
+// portable. The kernels are safe code inside #[target_feature] functions; what is unsafe is
+// calling one once its feature is known to be there, and CPUID with XGETBV.
 
 use core::arch::x86_64::*;
 use core::sync::atomic::{AtomicU32, Ordering};
+
+mod blake2;
 
 use crate::cpu::{Field, Field16, Prepare};
 use crate::keccak::ROUND_CONSTANTS;
@@ -18,6 +20,9 @@ const SHA: u32 = 1;
 
 // AVX2, with ymm state that the operating system saves.
 const AVX2: u32 = 1 << 1;
+
+// SSSE3 and SSE4.1.
+const SSE41: u32 = 1 << 2;
 
 const READY: u32 = 1 << 31;
 
@@ -34,15 +39,16 @@ const fn guaranteed(feature: u32) -> bool {
             target_feature = "sse4.1"
         )),
         AVX2 => cfg!(target_feature = "avx2"),
+        SSE41 => cfg!(all(target_feature = "ssse3", target_feature = "sse4.1")),
         _ => false,
     }
 }
 
 // The constant-time check runs under valgrind, which cannot execute the SHA extensions, so its
-// build leaves them out and checks the AVX2 paths.
+// build leaves them out and checks the AVX2 and SSE4.1 paths.
 const fn usable(feature: u32) -> bool {
     if cfg!(crypto_pq_ct) {
-        return feature == AVX2;
+        return feature == AVX2 || feature == SSE41;
     }
 
     true
@@ -80,16 +86,20 @@ fn probe() -> u32 {
     // compiles this module out.
     let (max, leaf1) = unsafe { (__cpuid(0).eax, __cpuid(1)) };
 
+    let mut found = 0;
+
+    if leaf1.ecx & (1 << 9) != 0 && leaf1.ecx & (1 << 19) != 0 {
+        found |= SSE41;
+    }
+
     if max < 7 {
-        return 0;
+        return found;
     }
 
     // SAFETY: as above; leaf 7 exists because the highest leaf is at least 7.
     let leaf7 = unsafe { __cpuid_count(7, 0) };
 
-    let mut found = 0;
-
-    if leaf7.ebx & (1 << 29) != 0 && leaf1.ecx & (1 << 9) != 0 && leaf1.ecx & (1 << 19) != 0 {
+    if found & SSE41 != 0 && leaf7.ebx & (1 << 29) != 0 {
         found |= SHA;
     }
 
@@ -160,6 +170,16 @@ pub(crate) fn hmac256(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
 
 #[inline(always)]
 pub(crate) fn hmac512(_: &[u64; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn hmac256_keyed(_: &[[u32; 8]; 2], _: &[u8], _: &mut [u8]) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn hmac512_keyed(_: &[[u64; 8]; 2], _: &[u8], _: &mut [u8]) -> bool {
     false
 }
 
@@ -472,6 +492,17 @@ fn base_products_avx2(acc: &mut [i32; 256], a: &[u16; 256], b: &[u16; 256], cach
     }
 }
 
+// The portable Ascon permutation, unrolled, is all there is.
+#[inline(always)]
+pub(crate) fn ascon(_: &mut [u64; 5]) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn ascon_digest(_: &[u64; 5], _: &[u8], _: &mut [u8]) -> bool {
+    false
+}
+
 // Groups of four fill the AVX2 kernel.
 pub(crate) const fn keccak_group() -> usize {
     4
@@ -484,8 +515,51 @@ pub(crate) fn absorb(_: &mut [u64; 25], _: usize, _: &[u8]) -> usize {
 }
 
 #[inline(always)]
-pub(crate) fn digest(_: usize, _: u8, _: &[u8], _: &mut [u8]) -> bool {
+pub(crate) fn digest(_: Option<&[u64; 25]>, _: usize, _: u8, _: &[u8], _: &mut [u8]) -> bool {
     false
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn blake2b(
+    h: &mut [u64; 8],
+    first: Option<&[u64; 16]>,
+    blocks: &[[u8; 128]],
+    counter: u128,
+    last: Option<(&[u64; 16], u128)>,
+) -> bool {
+    if has(AVX2) {
+        // SAFETY: the CPU has AVX2 and the operating system saves its registers.
+        unsafe { blake2::blake2b_avx2(h, first, blocks, counter, last) };
+
+        return true;
+    }
+
+    if has(SSE41) {
+        // SAFETY: the CPU has SSSE3 and SSE4.1, all that the kernel needs.
+        unsafe { blake2::blake2b_sse41(h, first, blocks, counter, last) };
+
+        return true;
+    }
+
+    false
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn blake2s(
+    h: &mut [u32; 8],
+    first: Option<&[u32; 16]>,
+    blocks: &[[u8; 64]],
+    counter: u64,
+    last: Option<(&[u32; 16], u128)>,
+) -> bool {
+    if !has(SSE41) {
+        return false;
+    }
+
+    // SAFETY: the CPU has SSSE3 and SSE4.1, all that the kernel needs.
+    unsafe { blake2::blake2s_sse41(h, first, blocks, counter, last) };
+
+    true
 }
 
 // Four states per AVX2 call, and three with one lane idle; one or two stay with the scalar

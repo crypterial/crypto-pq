@@ -463,6 +463,36 @@ pub(crate) fn hmac256(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
     wipe(keyed.as_flattened_mut());
 }
 
+// HMAC-SHA-256 or HMAC-SHA-224 from the states after the inner and the outer key block, for
+// many messages under one key.
+pub(crate) fn hmac256_keyed(keyed: &[[u32; 8]; 2], data: &[u8], tag: &mut [u8]) {
+    if cpu::hmac256_keyed(keyed, data, tag) {
+        return;
+    }
+
+    let mut inner = [0; 32];
+
+    finish256(&keyed[0], 64, data, &mut inner[..tag.len()]);
+
+    finish256(&keyed[1], 64, &inner[..tag.len()], tag);
+
+    wipe(&mut inner);
+}
+
+pub(crate) fn hmac512_keyed(keyed: &[[u64; 8]; 2], data: &[u8], tag: &mut [u8]) {
+    if cpu::hmac512_keyed(keyed, data, tag) {
+        return;
+    }
+
+    let mut inner = [0; 64];
+
+    finish512(&keyed[0], 128, data, &mut inner[..tag.len()]);
+
+    finish512(&keyed[1], 128, &inner[..tag.len()], tag);
+
+    wipe(&mut inner);
+}
+
 // HMAC-SHA-512, or HMAC-SHA-384 for a 48-byte tag, under a key of at most a block.
 pub(crate) fn hmac512(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
     if cpu::hmac512(iv, key, data, tag) {
@@ -802,17 +832,6 @@ impl Sha256 {
         wipe(&mut state);
     }
 
-    // digest_into after data, without the block buffer, for an engine whose input so far fills
-    // whole blocks: the outer hash of HMAC.
-    pub(crate) fn digest_after(&self, data: &[u8], out: &mut [u8]) {
-        assert_eq!(
-            self.blocks.len, 0,
-            "the input so far must fill whole blocks"
-        );
-
-        finish256(&self.state, self.length, data, out);
-    }
-
     // finish_lanes for messages whose padded last block the caller has already built as words,
     // word-major (blocks[t][lane]); returns the final states, word-major too. The blocks are
     // overwritten.
@@ -940,15 +959,6 @@ impl Sha512 {
         store512(&state, out);
 
         wipe(&mut state);
-    }
-
-    pub(crate) fn digest_after(&self, data: &[u8], out: &mut [u8]) {
-        assert_eq!(
-            self.blocks.len, 0,
-            "the input so far must fill whole blocks"
-        );
-
-        finish512(&self.state, self.length, data, out);
     }
 
     // Sha256::finish_lanes for one message.
@@ -1199,13 +1209,13 @@ mod tests {
 
             engine.update(&data[..64]);
 
-            let resumed = Sha256::resume(engine.state, 64);
+            let state = engine.state;
 
             engine.update(message);
 
             let mut out = [0; 32];
 
-            resumed.digest_after(message, &mut out);
+            finish256(&state, 64, message, &mut out);
 
             assert_eq!(
                 out,
@@ -1227,13 +1237,13 @@ mod tests {
 
             engine.update(&data[..128]);
 
-            let resumed = Sha512::resume(engine.state, 128);
+            let state = engine.state;
 
             engine.update(message);
 
             let mut out = [0; 64];
 
-            resumed.digest_after(message, &mut out);
+            finish512(&state, 128, message, &mut out);
 
             assert_eq!(
                 out,
@@ -1287,6 +1297,14 @@ mod tests {
 
                     accelerated += 1;
                 }
+
+                let mut tag = [0; 32];
+
+                if cpu::hmac256_keyed(&keyed, data, &mut tag[..size]) {
+                    assert_eq!(tag, expected, "keyed, key {key_length}, size {size}");
+
+                    accelerated += 1;
+                }
             }
 
             for (iv, size) in [(&IV_512, 64), (&IV_384, 48)] {
@@ -1307,9 +1325,17 @@ mod tests {
 
                     accelerated += 1;
                 }
+
+                let mut tag = [0; 64];
+
+                if cpu::hmac512_keyed(&keyed, data, &mut tag[..size]) {
+                    assert_eq!(tag, expected, "keyed, key {key_length}, size {size}");
+
+                    accelerated += 1;
+                }
             }
         }
 
-        std::eprintln!("HMAC: {accelerated} of 516 cases through a CPU kernel");
+        std::eprintln!("HMAC: {accelerated} of 1032 cases through a CPU kernel");
     }
 }

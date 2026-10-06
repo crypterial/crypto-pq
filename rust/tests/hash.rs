@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crypto_pq::{
-    HMAC_SHA_224, HMAC_SHA_256, HMAC_SHA_384, HMAC_SHA_512, HashAlgorithm, HmacAlgorithm, SHA_224,
-    SHA_256, SHA_384, SHA_512, SHA_512_224, SHA_512_256, SHA3_224, SHA3_256, SHA3_384, SHA3_512,
-    SHAKE128, SHAKE256, XofAlgorithm,
+    ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_512, BLAKE2S_256, CSHAKE128, CSHAKE256,
+    Error, HMAC_SHA_224, HMAC_SHA_256, HMAC_SHA_384, HMAC_SHA_512, HashAlgorithm, HashOptions,
+    ML_DSA_65, MacAlgorithm, MacOptions, PreHash, SHA_224, SHA_256, SHA_384, SHA_512, SHA_512_224,
+    SHA_512_256, SHA3_224, SHA3_256, SHA3_384, SHA3_512, SHAKE128, SHAKE256, SLH_DSA_SHAKE_128F,
+    SignOptions, VerifyOptions, XofAlgorithm, XofOptions, hazmat,
 };
 
 type Fields = HashMap<String, String>;
@@ -25,7 +27,7 @@ const HASHES: [(&str, &str, HashAlgorithm); 10] = [
 const XOFS: [(&str, XofAlgorithm); 2] = [("SHAKE128", SHAKE128), ("SHAKE256", SHAKE256)];
 
 // HMAC.rsp labels each group by digest length in bytes; L=20 is SHA-1, which is out of scope.
-const HMACS: [(&str, &str, HmacAlgorithm); 4] = [
+const HMACS: [(&str, &str, MacAlgorithm); 4] = [
     ("28", "HMAC-SHA-224", HMAC_SHA_224),
     ("32", "HMAC-SHA-256", HMAC_SHA_256),
     ("48", "HMAC-SHA-384", HMAC_SHA_384),
@@ -528,5 +530,131 @@ fn hmac_properties() {
         assert_eq!(algorithm.name(), name);
 
         assert_eq!(algorithm.digest(b"k", b"").len(), algorithm.digest_size());
+    }
+}
+
+// HMAC takes no options, and none leave it as it is.
+#[test]
+fn hmac_configure() {
+    for (_, _, algorithm) in HMACS {
+        assert_eq!(algorithm.configure(&MacOptions::default()), Ok(algorithm));
+
+        for options in [
+            MacOptions {
+                length: Some(algorithm.digest_size()),
+                ..MacOptions::default()
+            },
+            MacOptions {
+                customization: b"x",
+                ..MacOptions::default()
+            },
+            MacOptions {
+                xof: true,
+                ..MacOptions::default()
+            },
+            MacOptions {
+                salt: b"x",
+                ..MacOptions::default()
+            },
+        ] {
+            assert_eq!(algorithm.configure(&options), Err(Error::InvalidOption));
+        }
+    }
+
+    for (_, _, algorithm) in HASHES {
+        assert_eq!(algorithm.configure(&HashOptions::default()), Ok(algorithm));
+
+        let options = HashOptions {
+            personalization: b"x",
+            ..HashOptions::default()
+        };
+
+        assert_eq!(algorithm.configure(&options), Err(Error::InvalidOption));
+    }
+}
+
+// FIPS 204 and FIPS 205 pre-hash only with the hash functions that have a NIST identifier, so
+// BLAKE2, Ascon and cSHAKE are refused by sign (hazmat included) and fail verification.
+#[test]
+fn unapproved_pre_hashes_are_refused() {
+    for algorithm in [ML_DSA_65, SLH_DSA_SHAKE_128F] {
+        let seed = vec![7; 3 * algorithm.public_key_size() / 2];
+
+        let seed = &seed[..if algorithm == ML_DSA_65 { 32 } else { 48 }];
+
+        let pair = hazmat::generate_signature_key_pair(algorithm, seed).unwrap();
+
+        let customized = CSHAKE256
+            .configure(&XofOptions {
+                customization: b"x",
+            })
+            .unwrap();
+
+        let refused: [PreHash; 7] = [
+            BLAKE2B_512.into(),
+            BLAKE2S_256.into(),
+            ASCON_HASH256.into(),
+            CSHAKE128.into(),
+            customized.into(),
+            ASCON_XOF128.into(),
+            ASCON_CXOF128.into(),
+        ];
+
+        let randomness = vec![1; if algorithm == ML_DSA_65 { 32 } else { 16 }];
+
+        for pre_hash in refused {
+            let options = SignOptions {
+                pre_hash: Some(pre_hash),
+                ..SignOptions::default()
+            };
+
+            assert_eq!(
+                pair.private_key.sign(b"message", &options),
+                Err(Error::InvalidOption),
+                "{pre_hash:?}"
+            );
+
+            assert_eq!(
+                hazmat::sign(&pair.private_key, b"message", &randomness, &options),
+                Err(Error::InvalidOption),
+                "{pre_hash:?}"
+            );
+
+            // A signature over the pre-hash of an approved function never verifies under it.
+            let signed = pair
+                .private_key
+                .sign(
+                    b"message",
+                    &SignOptions {
+                        pre_hash: Some(SHA_512.into()),
+                        ..SignOptions::default()
+                    },
+                )
+                .unwrap();
+
+            let options = VerifyOptions {
+                pre_hash: Some(pre_hash),
+                ..VerifyOptions::default()
+            };
+
+            assert!(!pair.public_key.verify(&signed, b"message", &options));
+        }
+
+        // An approved function configured with no options is that function.
+        let same = SHA_512.configure(&HashOptions::default()).unwrap();
+
+        let options = SignOptions {
+            pre_hash: Some(same.into()),
+            ..SignOptions::default()
+        };
+
+        let signed = pair.private_key.sign(b"message", &options).unwrap();
+
+        let options = VerifyOptions {
+            pre_hash: Some(same.into()),
+            ..VerifyOptions::default()
+        };
+
+        assert!(pair.public_key.verify(&signed, b"message", &options));
     }
 }
