@@ -959,25 +959,32 @@ class TreeCacheTest(unittest.TestCase):
         self.assertEqual(Cache(key.export_tree_cache()).public_key, pair.public_key.export_key("raw"))
 
     # The load that the cache saves, for one tree of height 15 (10 by default): every leaf against
-    # the parents only.
+    # the parents only. The fastest of three loads each, as shared CI runners pause at random.
     def test_load_time(self):
         height = 15 if SLOW else 10
 
         _, state, cache = self.exported(HSS_LMS, [(f"LMS_SHA256_M24_H{height}", "LMOTS_SHA256_N24_W2")], bytes(40), 0, sign=False)
 
-        start = time.perf_counter()
+        plain_times, cached_times = [], []
 
-        plain = HSS_LMS.load_private_key(MemoryStore(state))
+        for _ in range(3):
+            start = time.perf_counter()
 
-        middle = time.perf_counter()
+            plain = HSS_LMS.load_private_key(MemoryStore(state))
 
-        cached = self.load(HSS_LMS, state, cache)
+            middle = time.perf_counter()
 
-        end = time.perf_counter()
+            cached = self.load(HSS_LMS, state, cache)
 
-        self.assertEqual(cached.public_key, plain.public_key)
+            end = time.perf_counter()
 
-        self.assertLess(4 * (end - middle), middle - start, f"H{height}: {middle - start:.3f} s without the cache, {end - middle:.3f} s with it")
+            self.assertEqual(cached.public_key, plain.public_key)
+
+            plain_times.append(middle - start)
+
+            cached_times.append(end - middle)
+
+        self.assertLess(4 * min(cached_times), min(plain_times), f"H{height}: {min(plain_times):.3f} s without the cache, {min(cached_times):.3f} s with it")
 
 
 if __name__ == "__main__":
