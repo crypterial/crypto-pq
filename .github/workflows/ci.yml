@@ -379,7 +379,7 @@ jobs:
   zig-cross:
     name: zig ${{ matrix.target }}
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
