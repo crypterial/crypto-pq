@@ -95,7 +95,7 @@ class BuildCase(unittest.TestCase):
             for entry in archive.infolist():
                 self.assertEqual((entry.date_time, entry.create_system, entry.compress_type), ((1980, 1, 1, 0, 0, 0), 3, zipfile.ZIP_DEFLATED))
 
-                self.assertEqual(entry.external_attr >> 16, 0o100755 if entry.filename.endswith((".so", ".dylib", ".dll")) else 0o100644)
+                self.assertEqual(entry.external_attr >> 16, 0o100755 if entry.filename.endswith((".so", ".dylib", ".dll", ".pyd")) else 0o100644)
 
             info = next(name.split("/")[0] for name in names if name.endswith("/WHEEL"))
 
@@ -129,7 +129,7 @@ class PureWheelTest(BuildCase):
 
         names, metadata = self.check_wheel(first, ("any",), True)
 
-        self.assertFalse([name for name in names if name.endswith((".so", ".dylib", ".dll", ".record"))])
+        self.assertFalse([name for name in names if name.endswith((".so", ".dylib", ".dll", ".pyd", ".record"))])
 
         lines = metadata.splitlines()
 
@@ -246,61 +246,78 @@ def crypto_pq_version():
 
 class PlatformTest(BuildCase):
     CASES = (
-        ("x86_64-linux", "libcrypto_pq.so", elf(0x3E), ("manylinux_2_17_x86_64", "manylinux2014_x86_64", "musllinux_1_1_x86_64")),
-        ("aarch64-linux", "libcrypto_pq.so", elf(0xB7), ("manylinux_2_17_aarch64", "manylinux2014_aarch64", "musllinux_1_1_aarch64")),
-        ("riscv64-linux", "libcrypto_pq.so", elf(0xF3), ("manylinux_2_17_riscv64", "musllinux_1_1_riscv64")),
-        ("x86_64-macos", "libcrypto_pq.dylib", macho(0x01000007), ("macosx_13_0_x86_64",)),
-        ("aarch64-macos", "libcrypto_pq.dylib", macho(0x0100000C, 11), ("macosx_11_0_arm64",)),
-        ("x86_64-windows", "crypto_pq.dll", pe(0x8664), ("win_amd64",)),
-        ("aarch64-windows", "crypto_pq.dll", pe(0xAA64), ("win_arm64",)),
+        ("x86_64-linux", ("libcrypto_pq.so", "_cpq.abi3.so"), elf(0x3E), ("manylinux_2_17_x86_64", "manylinux2014_x86_64", "musllinux_1_1_x86_64")),
+        ("aarch64-linux", ("libcrypto_pq.so", "_cpq.abi3.so"), elf(0xB7), ("manylinux_2_17_aarch64", "manylinux2014_aarch64", "musllinux_1_1_aarch64")),
+        ("riscv64-linux", ("libcrypto_pq.so", "_cpq.abi3.so"), elf(0xF3), ("manylinux_2_17_riscv64", "musllinux_1_1_riscv64")),
+        ("x86_64-macos", ("libcrypto_pq.dylib", "_cpq.abi3.so"), macho(0x01000007), ("macosx_13_0_x86_64",)),
+        ("aarch64-macos", ("libcrypto_pq.dylib", "_cpq.abi3.so"), macho(0x0100000C, 11), ("macosx_11_0_arm64",)),
+        ("x86_64-windows", ("crypto_pq.dll", "_cpq.pyd"), pe(0x8664), ("win_amd64",)),
+        ("aarch64-windows", ("crypto_pq.dll", "_cpq.pyd"), pe(0xAA64), ("win_arm64",)),
     )
 
-    def library(self, name, data, directory="lib"):
-        path = self.directory / directory / name
+    # A platform directory as `zig build dist` writes it, the extension module made distinct from
+    # the library.
+    def native(self, files, directory="native"):
+        path = self.directory / directory
 
-        path.parent.mkdir(exist_ok=True)
+        path.mkdir()
 
-        path.write_bytes(data)
+        for name, data in files.items():
+            (path / name).write_bytes(data)
 
         return path
 
-    # The headers of the library give its platform and tags; the wheel holds it with its record.
-    def test_platforms(self):
-        for target, name, data, tags in self.CASES:
-            with self.subTest(target=target):
-                self.assertEqual(backend.library_platform(data), (target, name, tags))
+    def pair(self, names, data, directory="native"):
+        return self.native({names[0]: data, names[1]: data + b"extension"}, directory)
 
-                path = self.wheel(str(self.library(name, data)))
+    # The headers of the files give their platform and tags; the wheel holds both with their
+    # record.
+    def test_platforms(self):
+        for target, names, data, tags in self.CASES:
+            with self.subTest(target=target):
+                self.assertEqual(backend.file_platform(data), (target, tags))
+
+                path = self.wheel(str(self.pair(names, data, target)))
 
                 self.check_wheel(path, tags, False)
 
+                library, extension = data, data + b"extension"
+
                 with zipfile.ZipFile(path) as archive:
-                    self.assertEqual(archive.read(f"crypto_pq/{name}"), data)
+                    self.assertEqual((archive.read(f"crypto_pq/{names[0]}"), archive.read(f"crypto_pq/{names[1]}")), (library, extension))
 
                     record = archive.read("crypto_pq/native.record").decode().splitlines()
 
-                self.assertEqual(record, ["crypto-pq native library 1", f"file {name}", f"target {target}", f"size {len(data)}", f"crc32 {binascii.crc32(data):08x}"])
+                self.assertEqual(record, ["crypto-pq native files 1", f"target {target}", f"library {names[0]} {len(library)} {binascii.crc32(library):08x}", f"extension {names[1]} {len(extension)} {binascii.crc32(extension):08x}"])
 
-                self.assertEqual(path.read_bytes(), self.wheel(str(self.library(name, data, "other")), "again").read_bytes())
+                self.assertEqual(path.read_bytes(), self.wheel(str(self.pair(names, data, target + "-again")), "again").read_bytes())
 
     def test_refusals(self):
-        for data, name, message in (
-            (elf(0x3E, needed=True), "libcrypto_pq.so", "needs another library"),
-            (elf(0x3E, width=1), "libcrypto_pq.so", "not 64-bit little-endian"),
-            (elf(0x28), "libcrypto_pq.so", "supported architecture"),
-            (macho(0x01000007, kind=8), "libcrypto_pq.dylib", "not a dynamic library"),
-            (pe(0x8664, characteristics=0x22), "crypto_pq.dll", "not a DLL"),
-            (pe(0x14C), "crypto_pq.dll", "not a DLL of a supported architecture"),
-            (b"\x00" * 64, "libcrypto_pq.so", "not an ELF, Mach-O or PE file"),
-            (elf(0xB7), "crypto_pq.dll", "must be named libcrypto_pq.so"),
-            (macho(0x0100000C), "libcrypto_pq.so", "must be named libcrypto_pq.dylib"),
+        linux = ("libcrypto_pq.so", "_cpq.abi3.so")
+
+        for files, message in (
+            ({linux[0]: elf(0x3E, needed=True), linux[1]: elf(0x3E)}, "needs another library"),
+            ({linux[0]: elf(0x3E), linux[1]: elf(0x3E, needed=True)}, "needs another library"),
+            ({linux[0]: elf(0x3E, width=1), linux[1]: elf(0x3E)}, "not 64-bit little-endian"),
+            ({linux[0]: elf(0x28), linux[1]: elf(0x28)}, "supported architecture"),
+            ({linux[0]: elf(0x3E), linux[1]: elf(0xB7)}, "is not built for x86_64-linux"),
+            ({linux[0]: elf(0x3E), linux[1]: b"\x00" * 64}, "not an ELF, Mach-O or PE file"),
+            ({linux[0]: elf(0x3E)}, "the extension for x86_64-linux must be named _cpq.abi3.so"),
+            ({linux[0]: elf(0x3E), "_cpq.pyd": elf(0x3E)}, "must be named _cpq.abi3.so"),
+            ({"libcrypto_pq.dylib": macho(0x01000007, kind=8), linux[1]: macho(0x01000007)}, "not a dynamic library"),
+            ({"libcrypto_pq.dylib": macho(0x01000007), linux[1]: macho(0x01000007, 12)}, "is not built for x86_64-macos like the library"),
+            ({"crypto_pq.dll": pe(0x8664, characteristics=0x22), "_cpq.pyd": pe(0x8664)}, "not a DLL"),
+            ({"crypto_pq.dll": pe(0x14C), "_cpq.pyd": pe(0x14C)}, "not a DLL of a supported architecture"),
+            ({"crypto_pq.dll": elf(0xB7), linux[1]: elf(0xB7)}, "the library for aarch64-linux must be named libcrypto_pq.so"),
+            ({linux[1]: elf(0xB7)}, "must hold exactly one crypto-pq library"),
+            ({linux[0]: elf(0xB7), "crypto_pq.dll": pe(0x8664), linux[1]: elf(0xB7)}, "must hold exactly one crypto-pq library"),
         ):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(ValueError, message):
-                    self.wheel(str(self.library(name, data)))
+                    self.wheel(str(self.native(files, f"case{len(list(self.directory.iterdir()))}")))
 
     def test_config_setting(self):
-        path = self.library("libcrypto_pq.so", elf(0xB7))
+        path = self.pair(("libcrypto_pq.so", "_cpq.abi3.so"), elf(0xB7))
 
         name = backend.build_wheel(str(self.directory / "hook"), {"native": str(path)})
 
@@ -320,8 +337,8 @@ class PlatformTest(BuildCase):
 
 @unittest.skipUnless(DIST, "CRYPTO_PQ_DIST names no `zig build dist` output")
 class DistTest(BuildCase):
-    # Every shipped library makes its platform's wheel, twice the same, holding the library as
-    # `zig build dist` wrote it.
+    # Every shipped platform makes its wheel, twice the same, holding the library and the extension
+    # module as `zig build dist` wrote them.
     def test_all_wheels(self):
         built = {}
 
@@ -330,8 +347,8 @@ class DistTest(BuildCase):
 
             backend.build(str(out))
 
-            for target, (name, _) in backend.PLATFORMS.items():
-                backend.build(str(out), os.path.join(DIST, target, name))
+            for target in backend.PLATFORMS:
+                backend.build(str(out), os.path.join(DIST, target))
 
             backend.build_sdist_archive(str(out))
 
@@ -342,20 +359,24 @@ class DistTest(BuildCase):
         for first, second in zip(built["one"], built["two"]):
             self.assertEqual(first.read_bytes(), second.read_bytes(), first.name)
 
-        for target, (name, _) in backend.PLATFORMS.items():
+        for target, (library_name, extension_name, _) in backend.PLATFORMS.items():
             with self.subTest(target=target):
-                library = (pathlib.Path(DIST) / target / name).read_bytes()
+                library = (pathlib.Path(DIST) / target / library_name).read_bytes()
 
-                found, _, tags = backend.library_platform(library)
+                extension = (pathlib.Path(DIST) / target / extension_name).read_bytes()
 
-                self.assertEqual(found, target)
+                found, tags = backend.file_platform(library)
+
+                self.assertEqual((found, tags), (target, backend.file_platform(extension)[1]))
 
                 path = next(path for path in built["one"] if path.name.endswith(f"-py3-none-{'.'.join(tags)}.whl"))
 
                 self.check_wheel(path, tags, False)
 
                 with zipfile.ZipFile(path) as archive:
-                    self.assertEqual(archive.read(f"crypto_pq/{name}"), library)
+                    self.assertEqual(archive.read(f"crypto_pq/{library_name}"), library)
+
+                    self.assertEqual(archive.read(f"crypto_pq/{extension_name}"), extension)
 
         self.assertEqual(len(built["one"]), len(backend.PLATFORMS) + 2)
 

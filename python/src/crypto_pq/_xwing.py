@@ -1,5 +1,4 @@
-from . import _mlkem
-from ._primitives import sha3_256, shake256
+from . import _mlkem, _primitives
 from ._x25519 import x25519, x25519_base
 
 LABEL = b"\\.//^\\"
@@ -12,7 +11,7 @@ SEED_SIZE = 32
 
 
 def expand(seed):
-    expanded = shake256(seed, 96)
+    expanded = _primitives.shake_256(seed).digest(96)
 
     ek, dk = _mlkem.keygen_internal(expanded[:32], expanded[32:64], _mlkem.ML_KEM_768)
 
@@ -24,7 +23,7 @@ def expand(seed):
 
 
 def combine(ss_m, ss_x, ct_x, pk_x):
-    return sha3_256(ss_m + ss_x + ct_x + pk_x + LABEL)
+    return _primitives.sha3_256(ss_m + ss_x + ct_x + pk_x + LABEL).digest()
 
 
 def check_public_key(pk):

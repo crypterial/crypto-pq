@@ -2,8 +2,8 @@ from ._encoding import invalid
 
 CACHED_HEIGHT = 15
 
-# Leaves per request when the tree is taller than the cache, so that each request still batches
-# many hashes.
+# Leaves per request when the tree is taller than the cache, which bounds the leaves that one
+# request holds.
 BATCH = 1024
 
 

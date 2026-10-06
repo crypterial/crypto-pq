@@ -1,5 +1,19 @@
+import operator
+
+from ._errors import CryptoPQError, ErrorCode
+
+
 def view(data):
     return memoryview(data).cast("B")
+
+
+def require_output_length(length):
+    length = operator.index(length)
+
+    if length < 0:
+        raise CryptoPQError(ErrorCode.INVALID_LENGTH, "length must not be negative")
+
+    return length
 
 
 # The bytes of `data` in an object that no other thread can change: a bytes object as it is, or

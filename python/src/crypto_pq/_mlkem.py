@@ -1,10 +1,10 @@
 import struct
+from functools import lru_cache
 from typing import NamedTuple
 
-from . import _bits, _lanes
+from . import _bits, _primitives
 from ._bytes import equal
 from ._ntt import Ntt
-from ._primitives import sha3_256, sha3_512
 
 Q = 3329
 
@@ -101,8 +101,16 @@ def decompress(f, d):
     return [(y * Q + half) >> d for y in f]
 
 
-# FIPS 203, Algorithm 7: two 12-bit candidates from every 3 bytes, in stream order. Each group
-# of 3 bytes is spread into a 32-bit field, d1 stays in its low half and d2 moves to the high one.
+# The masks of the 12-bit candidates of `groups` 3-byte groups spread into 32-bit fields: d1 in the
+# low half of each field and d2, moved up by 4 bits, in the high one.
+@lru_cache(maxsize=8)
+def _candidate_masks(groups):
+    one = int.from_bytes(b"\x01\x00\x00\x00" * groups, "little")
+
+    return one * 0xFFF, one * 0x0FFF0000
+
+
+# FIPS 203, Algorithm 7: two 12-bit candidates from every 3 bytes, in stream order.
 def candidates(data):
     groups = len(data) // 3
 
@@ -114,11 +122,11 @@ def candidates(data):
 
     spread[2::4] = data[2::3]
 
-    one = _lanes.ones(groups, 32)
+    low, high = _candidate_masks(groups)
 
     x = int.from_bytes(spread, "little")
 
-    x = (x & (one * 0xFFF)) | ((x << 4) & (one * 0x0FFF0000))
+    x = (x & low) | ((x << 4) & high)
 
     return struct.unpack(f"<{2 * groups}H", x.to_bytes(4 * groups, "little"))
 
@@ -127,24 +135,26 @@ def sample_ntt(data):
     return [c for c in candidates(data) if c < Q][:256]
 
 
-def _matrix_seeds(rho, k):
-    return [rho + bytes([j, i]) for i in range(k) for j in range(k)]
+# SampleNTT of one XOF stream: three blocks nearly always give 256 coefficients (more than 99%
+# of streams); otherwise the stream is read again, one block longer each time.
+def _sample(seed):
+    length = 3 * 168
+
+    poly = sample_ntt(_primitives.shake_128(seed).digest(length))
+
+    while len(poly) < 256:
+        length += 168
+
+        poly = sample_ntt(_primitives.shake_128(seed).digest(length))
+
+    return poly
 
 
-# SampleNTT for the whole matrix from streams that run in lanes, with any further streams of the
-# same batch after the k * k of the matrix: three blocks nearly always give 256 coefficients, and
-# another block follows for every stream whenever one of the matrix falls short.
-def _sample_matrix(stream, k):
-    data = stream.blocks(3)
+# The matrix A-hat of FIPS 203, Algorithm 13: entry (i, j) from rho || j || i.
+def sample_matrix(rho, k):
+    polys = [_sample(rho + bytes([j, i])) for i in range(k) for j in range(k)]
 
-    polys = [sample_ntt(d) for d in data[: k * k]]
-
-    while any(len(a) < 256 for a in polys):
-        data = [d + more for d, more in zip(data, stream.blocks(1))]
-
-        polys = [sample_ntt(d) for d in data[: k * k]]
-
-    return [polys[i * k : (i + 1) * k] for i in range(k)], data[k * k :]
+    return [polys[i * k : (i + 1) * k] for i in range(k)]
 
 
 def _cbd_masks(eta):
@@ -179,28 +189,22 @@ def _noise_etas(params):
     return [params.eta1] * params.k + [params.eta2] * (params.k + 1)
 
 
-# The PRF outputs for nonces 0, 1, ... with the given eta each, as one batch of SHAKE256 streams.
+# The PRF outputs for nonces 0, 1, ... with the given eta each.
 def prfs(seed, etas):
-    data = _lanes.Squeeze([seed + bytes([n]) for n in range(len(etas))], 136).blocks(-(-64 * max(etas) // 136))
-
-    return [d[: 64 * eta] for d, eta in zip(data, etas)]
+    return [_primitives.shake_256(seed + bytes([n])).digest(64 * eta) for n, eta in enumerate(etas)]
 
 
-# K-PKE.KeyGen; the PRF streams of s and e share the lanes of the matrix.
+# K-PKE.KeyGen.
 def pke_keygen(d, params):
     k, eta = params.k, params.eta1
 
-    g = sha3_512(d + bytes([k]))
+    g = _primitives.sha3_512(d + bytes([k])).digest()
 
     rho, sigma = g[:32], g[32:]
 
-    seeds = [sigma + bytes([n]) for n in range(2 * k)]
+    a = sample_matrix(rho, k)
 
-    stream = _lanes.Squeeze(_matrix_seeds(rho, k) + seeds, [168] * (k * k) + [136] * (2 * k))
-
-    a, noise = _sample_matrix(stream, k)
-
-    noise = _NTT.forward([[x - eta for x in sample_cbd(data[: 64 * eta], eta)] for data in noise])
+    noise = _NTT.forward([[x - eta for x in sample_cbd(data, eta)] for data in prfs(sigma, [eta] * (2 * k))])
 
     s, e = [[x % Q for x in poly] for poly in noise[:k]], noise[k:]
 
@@ -370,27 +374,17 @@ class EncapsulationKey:
 
     def hash(self):
         if self._hash is None:
-            self._hash = sha3_256(self.ek)
+            self._hash = _primitives.sha3_256(self.ek).digest()
 
         return self._hash
 
-    # A key that still needs H(ek) hashes it in lane 0 beside the matrix streams.
     def state(self):
         if self._state is None:
             k = self.params.k
 
             ek = self.ek
 
-            seeds = _matrix_seeds(ek[384 * k :], k)
-
-            if self._hash is None:
-                stream = _lanes.Beside([0] * 25, _lanes.padded_blocks(ek, 136, 0x06), [_lanes.padded_block(seed, 168, 0x1F) for seed in seeds], [168] * (k * k))
-
-                a, _ = _sample_matrix(stream, k)
-
-                self._hash = struct.pack("<4Q", *stream.finish()[:4])
-            else:
-                a, _ = _sample_matrix(_lanes.Squeeze(seeds, 168), k)
+            a = sample_matrix(ek[384 * k :], k)
 
             self._state = _encryption_state(a, [byte_decode(ek[384 * i : 384 * (i + 1)], 12) for i in range(k)], self.params)
 
@@ -438,38 +432,26 @@ def private_state(dk, params):
 def keygen_internal(d, z, params):
     ek, dk = pke_keygen(d, params)
 
-    return ek, dk + ek + sha3_256(ek) + z
+    return ek, dk + ek + _primitives.sha3_256(ek).digest() + z
 
 
 def encaps_internal(key, m, params):
     state = key.state()
 
-    g = sha3_512(m + key.hash())
+    g = _primitives.sha3_512(m + key.hash()).digest()
 
     return g[:32], _encrypt(state, m, prfs(g[32:], _noise_etas(params)), params)
 
 
-# Implicit rejection: a ciphertext that does not re-encrypt to itself yields J(z || c). J takes one
-# permutation per block of z || c; G(m || h), and then the PRF streams from r, ride in the lanes of
-# its first permutations.
+# Implicit rejection: a ciphertext that does not re-encrypt to itself yields J(z || c).
 def decaps_internal(key, c, params):
     m = _decrypt(key.secret(), c, params)
 
-    blocks = _lanes.padded_blocks(key.z + c, 136, 0x1F)
+    g = _primitives.sha3_512(m + key.public.hash()).digest()
 
-    stream = _lanes.Beside([0] * 25, blocks, [_lanes.padded_block(m + key.public.hash(), 72, 0x06)], [72])
+    rejected = _primitives.shake_256(key.z + c).digest(32)
 
-    g = stream.blocks(1)[0]
-
-    etas = _noise_etas(params)
-
-    stream = _lanes.Beside(stream.lane, stream.pending, [_lanes.padded_block(g[32:64] + bytes([n]), 136, 0x1F) for n in range(len(etas))], [136] * len(etas))
-
-    noise = [d[: 64 * eta] for d, eta in zip(stream.blocks(-(-64 * max(etas) // 136)), etas)]
-
-    rejected = struct.pack("<4Q", *stream.finish()[:4])
-
-    return g[:32] if equal(c, _encrypt(key.public.state(), m, noise, params)) else rejected
+    return g[:32] if equal(c, _encrypt(key.public.state(), m, prfs(g[32:], _noise_etas(params)), params)) else rejected
 
 
 # FIPS 203, 7.2: every coefficient of the encoded vector must already be reduced modulo q.
@@ -494,7 +476,7 @@ def check_decapsulation_key(dk, params):
 
     ek = dk[384 * k : 768 * k + 32]
 
-    return check_encapsulation_key(ek, params) and sha3_256(ek) == dk[768 * k + 32 : 768 * k + 64]
+    return check_encapsulation_key(ek, params) and _primitives.sha3_256(ek).digest() == dk[768 * k + 32 : 768 * k + 64]
 
 
 def public_key_of(dk, params):

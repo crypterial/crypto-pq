@@ -123,8 +123,9 @@ jobs:
           package-manager-cache: false
       - run: node --import ./test/backend.ts --test test/differential.test.ts
 
-  # The Python native backend against the pure one on many more random inputs, every SLH-DSA set
-  # included, from a wheel built with this source's x86-64 library.
+  # The Python native backend, through the extension module and through ctypes, against the pure
+  # one on many more random inputs, every SLH-DSA set included, from a wheel built with this
+  # source's x86-64 files.
   python-native-differential:
     name: python native against pure
     runs-on: ubuntu-latest
@@ -148,10 +149,12 @@ jobs:
         run: zig build dist
       - working-directory: python
         run: |
-          python build_backend/cpq_build.py wheel "$RUNNER_TEMP/wheel" --native ../zig/zig-out/dist/x86_64-linux/libcrypto_pq.so
+          python build_backend/cpq_build.py wheel "$RUNNER_TEMP/wheel" --native ../zig/zig-out/dist/x86_64-linux
           python -m pip install "$RUNNER_TEMP"/wheel/*.whl
       - working-directory: python/tests
         env:
           CRYPTO_PQ_FUZZ: "1"
           CRYPTO_PQ_BACKEND: native
-        run: python -m unittest -v test_native test_robustness
+        run: |
+          python -m unittest -v test_native test_robustness
+          python -c 'import sys; sys.modules["crypto_pq._cpq"] = None; from crypto_pq import _native; assert _native.BINDING == "ctypes", _native.BINDING; import unittest; unittest.main(module=None, argv=["unittest", "-v", "test_native", "test_robustness"])'

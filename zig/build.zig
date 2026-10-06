@@ -209,10 +209,10 @@ const wasm_modules = [_]struct { []const u8, Families }{
     .{ "crypto_pq_x_wing_hash", .{ .x_wing = true, .hash = true } },
 };
 
-// The shared libraries that ship: Linux without libc, one file for glibc and musl alike (on
-// AArch64 it takes getauxval, for the page size and the CPU features, from the process's libc),
-// macOS 13 or later, and Windows. The CPU is each architecture's baseline; faster instructions are
-// detected at run time.
+// The shared libraries that ship, and the Python extension module for each: Linux without libc, one
+// file for glibc and musl alike (on AArch64 it takes getauxval, for the page size and the CPU
+// features, from the process's libc), macOS 13 or later, and Windows. The CPU is each
+// architecture's baseline; faster instructions are detected at run time.
 const native_targets = [_]struct { []const u8, []const u8, []const u8 }{
     .{ "x86_64-linux-none", "x86_64-linux", "libcrypto_pq.so" },
     .{ "aarch64-linux-none", "aarch64-linux", "libcrypto_pq.so" },
@@ -282,10 +282,10 @@ fn capiWasm(b: *std.Build, name: []const u8, families: Families, build_options: 
     return module;
 }
 
-// The C ABI of src/capi.zig: `lib` builds the shared library for the target, `wasm` the
-// WebAssembly modules, and `dist` every library and module that ships, always in ReleaseFast. The
-// output of `dist` depends on nothing but the sources and the Zig version, so builds on different
-// hosts compare byte for byte.
+// The C ABI of src/capi.zig: `lib` builds the shared library for the target, `pyext` the Python
+// extension module, `wasm` the WebAssembly modules, and `dist` every library and module that ships,
+// always in ReleaseFast. The output of `dist` depends on nothing but the sources and the Zig
+// version, so builds on different hosts compare byte for byte.
 fn capi(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Module, vectors: *std.Build.Module, tests: *std.Build.Step, binaries: *std.Build.Step) void {
     b.step("lib", "Build the C ABI shared library for the target").dependOn(&b.addInstallArtifact(capiLibrary(b, target, optimize, build_options), .{}).step);
 
@@ -325,12 +325,20 @@ fn capi(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.O
         lint.addArtifactArg(capiWasm(b, name, families, build_options, false));
     }
 
+    b.step("pyext", "Build the CPython extension module for the target").dependOn(&b.addInstallArtifact(pyextLibrary(b, target, optimize, build_options), .{}).step);
+
     for (native_targets) |entry| {
         const query, const directory, const file = entry;
 
-        const library = capiLibrary(b, b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = query }) catch unreachable), .ReleaseFast, build_options);
+        const native_target = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = query }) catch unreachable);
+
+        const library = capiLibrary(b, native_target, .ReleaseFast, build_options);
 
         dist.dependOn(&b.addInstallFileWithDir(library.getEmittedBin(), .{ .custom = b.fmt("dist/{s}", .{directory}) }, file).step);
+
+        const extension = pyextLibrary(b, native_target, .ReleaseFast, build_options);
+
+        dist.dependOn(&b.addInstallFileWithDir(extension.getEmittedBin(), .{ .custom = b.fmt("dist/{s}", .{directory}) }, pyextFile(native_target)).step);
     }
 
     const capi_tests = b.addTest(.{
@@ -352,6 +360,69 @@ fn capi(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.O
     run(b, b.step("test-capi", "Run only the C ABI tests"), capi_tests);
 
     binaries.dependOn(&b.addInstallArtifact(capi_tests, .{}).step);
+}
+
+// The CPython extension module of the Python package (src/pyext.zig): the C ABI called in place,
+// for the stable ABI of CPython 3.11 and later. Python's symbols come from the interpreter that
+// loads it; on Windows from python3.dll, through an import library made here from the module's
+// own list of them, so that nothing outside this repository and Zig takes part in the build.
+fn pyextLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Module) *std.Build.Step.Compile {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/pyext.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize != .Debug,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options },
+            .{ .name = "capi_options", .module = capiOptions(b, every_family, false) },
+        },
+    });
+
+    if (target.result.os.tag == .windows) module.addObjectFile(python3ImportLibrary(b, target));
+
+    const library = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "_cpq",
+        .root_module = module,
+    });
+
+    library.linker_allow_shlib_undefined = true;
+
+    library.install_name = "@rpath/_cpq.abi3.so";
+
+    return library;
+}
+
+fn pyextFile(target: std.Build.ResolvedTarget) []const u8 {
+    return if (target.result.os.tag == .windows) "_cpq.pyd" else "_cpq.abi3.so";
+}
+
+fn python3ImportLibrary(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.LazyPath {
+    const python3 = @import("src/pyext/python3.zig");
+
+    var definition: std.ArrayList(u8) = .empty;
+
+    definition.appendSlice(b.allocator, "LIBRARY python3.dll\nEXPORTS\n") catch @panic("OOM");
+
+    for (python3.functions) |name| definition.print(b.allocator, "{s}\n", .{name}) catch @panic("OOM");
+
+    for (python3.data) |name| definition.print(b.allocator, "{s} DATA\n", .{name}) catch @panic("OOM");
+
+    const file = b.addWriteFiles().add("python3.def", definition.items);
+
+    const machine = switch (target.result.cpu.arch) {
+        .x86_64 => "i386:x86-64",
+        .aarch64 => "arm64",
+        else => @panic("the extension module is built for x86-64 and ARM64 Windows only"),
+    };
+
+    const dlltool = b.addSystemCommand(&.{ b.graph.zig_exe, "dlltool", "-m", machine, "-D", "python3.dll", "-d" });
+
+    dlltool.addFileArg(file);
+
+    dlltool.addArg("-l");
+
+    return dlltool.addOutputFileArg("python3.lib");
 }
 
 // The secret-handling entry points of the C ABI, driven as a C caller would with every secret

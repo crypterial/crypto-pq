@@ -1,20 +1,22 @@
 """A PEP 517 build backend for crypto-pq that needs nothing but the Python standard library.
 
 `pip wheel .` and `pip install .` build the pure wheel, py3-none-any, offline and with an empty
-build environment. A platform wheel takes the native library that `zig build dist` writes for one
-platform, given as a config setting or on the command line:
+build environment. A platform wheel takes the native files that `zig build dist` writes for one
+platform, the shared library and the CPython extension module, from the directory given as a config
+setting or on the command line:
 
-    pip wheel . --config-settings native=../zig/zig-out/dist/x86_64-linux/libcrypto_pq.so
-    python build_backend/cpq_build.py wheel OUT_DIR [--native LIBRARY]
+    pip wheel . --config-settings native=../zig/zig-out/dist/x86_64-linux
+    python build_backend/cpq_build.py wheel OUT_DIR [--native DIRECTORY]
     python build_backend/cpq_build.py sdist OUT_DIR
     python build_backend/cpq_build.py all OUT_DIR DIST_DIR
 
-The library's own headers name its platform, so a wheel never carries a library under another
-platform's tags. The wheel holds the library and its build record (file name, platform, size and
-CRC-32), which the loader checks before it maps the library. The metadata is METADATA 2.4 with a
-license expression and license files (PEP 639); RECORD hashes come from crypto-pq's own SHA-256,
-never from hashlib; every archive entry has a fixed time, mode and order, so that the same sources
-and library give the same bytes with the same zlib.
+The files' own headers name their platform, so a wheel never carries a file under another
+platform's tags. The wheel holds both files and their build record (platform, then each file's
+name, size and CRC-32), which the loader checks before it maps either. Its tags stay py3-none: every
+Python 3 runs it, CPython with a GIL through the extension module and the others through ctypes.
+The metadata is METADATA 2.4 with a license expression and license files (PEP 639); RECORD hashes
+come from crypto-pq's own SHA-256, never from hashlib; every archive entry has a fixed time, mode
+and order, so that the same sources and native files give the same bytes with the same zlib.
 """
 
 import base64
@@ -40,20 +42,23 @@ EPOCH = 315532800
 
 RECORD = "native.record"
 
-RECORD_FORMAT = "crypto-pq native library 1"
+RECORD_FORMAT = "crypto-pq native files 1"
 
-# The libraries that `zig build dist` writes, by platform: the file name and the wheel's platform
-# tags. A Linux library needs no libc, so one file serves glibc and musl; a macOS tag takes the
-# minimum version that the library itself records.
+# The files that `zig build dist` writes, by platform: the library, the extension module and the
+# wheel's platform tags. A Linux file needs no libc, so one file serves glibc and musl (the extension
+# takes Python's symbols from the interpreter); a macOS tag takes the minimum version that the
+# files themselves record.
 PLATFORMS = {
-    "x86_64-linux": ("libcrypto_pq.so", ("manylinux_2_17_x86_64", "manylinux2014_x86_64", "musllinux_1_1_x86_64")),
-    "aarch64-linux": ("libcrypto_pq.so", ("manylinux_2_17_aarch64", "manylinux2014_aarch64", "musllinux_1_1_aarch64")),
-    "riscv64-linux": ("libcrypto_pq.so", ("manylinux_2_17_riscv64", "musllinux_1_1_riscv64")),
-    "x86_64-macos": ("libcrypto_pq.dylib", ("macosx_{}_{}_x86_64",)),
-    "aarch64-macos": ("libcrypto_pq.dylib", ("macosx_{}_{}_arm64",)),
-    "x86_64-windows": ("crypto_pq.dll", ("win_amd64",)),
-    "aarch64-windows": ("crypto_pq.dll", ("win_arm64",)),
+    "x86_64-linux": ("libcrypto_pq.so", "_cpq.abi3.so", ("manylinux_2_17_x86_64", "manylinux2014_x86_64", "musllinux_1_1_x86_64")),
+    "aarch64-linux": ("libcrypto_pq.so", "_cpq.abi3.so", ("manylinux_2_17_aarch64", "manylinux2014_aarch64", "musllinux_1_1_aarch64")),
+    "riscv64-linux": ("libcrypto_pq.so", "_cpq.abi3.so", ("manylinux_2_17_riscv64", "musllinux_1_1_riscv64")),
+    "x86_64-macos": ("libcrypto_pq.dylib", "_cpq.abi3.so", ("macosx_{}_{}_x86_64",)),
+    "aarch64-macos": ("libcrypto_pq.dylib", "_cpq.abi3.so", ("macosx_{}_{}_arm64",)),
+    "x86_64-windows": ("crypto_pq.dll", "_cpq.pyd", ("win_amd64",)),
+    "aarch64-windows": ("crypto_pq.dll", "_cpq.pyd", ("win_arm64",)),
 }
+
+NATIVE_SUFFIXES = (".so", ".dylib", ".dll", ".pyd")
 
 PROJECT_KEYS = {"name", "version", "description", "license", "license-files", "requires-python", "authors", "keywords", "classifiers", "urls"}
 
@@ -67,8 +72,9 @@ def read(path):
         return handle.read()
 
 
-# crypto-pq's own SHA-256, from the sources being built unless crypto_pq is already imported: not
-# even the build uses hashlib. The import takes the pure backend, which the sources always have.
+# crypto-pq's own SHA-256 engine, from the sources being built unless crypto_pq is already imported:
+# not even the build hashes with hashlib. The import takes the pure backend, which the sources
+# always have.
 def sha256(data):
     if not _digest:
         previous = os.environ.get("CRYPTO_PQ_BACKEND")
@@ -78,7 +84,7 @@ def sha256(data):
         sys.path.insert(0, os.path.join(ROOT, "src"))
 
         try:
-            from crypto_pq import SHA_256
+            from crypto_pq._sha2 import IV_256, Sha256
         finally:
             sys.path.remove(os.path.join(ROOT, "src"))
 
@@ -87,9 +93,15 @@ def sha256(data):
             else:
                 os.environ["CRYPTO_PQ_BACKEND"] = previous
 
-        _digest.append(SHA_256.digest)
+        _digest.append(lambda message: _engine_digest(Sha256(IV_256, 32), message))
 
     return _digest[0](data)
+
+
+def _engine_digest(engine, message):
+    engine.update(message)
+
+    return engine.digest()
 
 
 def project():
@@ -205,7 +217,7 @@ def elf_target(data):
                 break
 
             if tag == 1:
-                raise ValueError("the Linux library needs another library, so it cannot serve glibc and musl alike")
+                raise ValueError("the Linux file needs another library, so it cannot serve glibc and musl alike")
 
     return f"{architecture}-linux"
 
@@ -231,7 +243,7 @@ def macho_target(data):
 
         offset += size
 
-    raise ValueError("the Mach-O library records no minimum macOS version")
+    raise ValueError("the Mach-O file records no minimum macOS version")
 
 
 def pe_target(data):
@@ -252,8 +264,8 @@ def pe_target(data):
     return f"{architecture}-windows"
 
 
-# The platform and the wheel's platform tags of a library, read from its own headers.
-def library_platform(data):
+# The platform and the wheel's platform tags of a native file, read from its own headers.
+def file_platform(data):
     if data[:4] == b"\x7fELF":
         target, version = elf_target(data), None
     elif data[:4] == b"\xcf\xfa\xed\xfe":
@@ -261,24 +273,41 @@ def library_platform(data):
     elif data[:2] == b"MZ":
         target, version = pe_target(data), None
     else:
-        raise ValueError("the library is not an ELF, Mach-O or PE file")
+        raise ValueError("the file is not an ELF, Mach-O or PE file")
 
-    name, tags = PLATFORMS[target]
+    tags = PLATFORMS[target][2]
 
-    return target, name, tuple(tag.format(*version) if version else tag for tag in tags)
+    return target, tuple(tag.format(*version) if version else tag for tag in tags)
 
 
-def native_files(path):
-    data = read(path)
+# The library and the extension module of one platform from `directory`, both built for it, and
+# their build record.
+def native_files(directory):
+    found = sorted({library for library, _, _ in PLATFORMS.values()} & set(os.listdir(directory)))
 
-    target, name, tags = library_platform(data)
+    if len(found) != 1:
+        raise ValueError(f"{directory} must hold exactly one crypto-pq library")
 
-    if os.path.basename(path) != name:
-        raise ValueError(f"a library for {target} must be named {name}")
+    target, tags = file_platform(read(os.path.join(directory, found[0])))
 
-    record = f"{RECORD_FORMAT}\nfile {name}\ntarget {target}\nsize {len(data)}\ncrc32 {binascii.crc32(data):08x}\n"
+    files, record = [], [RECORD_FORMAT, f"target {target}"]
 
-    return [(f"{PACKAGE}/{name}", data), (f"{PACKAGE}/{RECORD}", record.encode("ascii"))], tags
+    for role, name in zip(("library", "extension"), PLATFORMS[target][:2]):
+        path = os.path.join(directory, name)
+
+        if not os.path.exists(path):
+            raise ValueError(f"the {role} for {target} must be named {name}")
+
+        data = read(path)
+
+        if file_platform(data) != (target, tags):
+            raise ValueError(f"{name} is not built for {target} like the library")
+
+        files.append((f"{PACKAGE}/{name}", data))
+
+        record.append(f"{role} {name} {len(data)} {binascii.crc32(data):08x}")
+
+    return files + [(f"{PACKAGE}/{RECORD}", ("\n".join(record) + "\n").encode("ascii"))], tags
 
 
 def wheel_metadata(table, tags, purelib):
@@ -321,7 +350,7 @@ def write_wheel(directory, entries, table, tags, purelib):
 
             entry.compress_type = zipfile.ZIP_DEFLATED
 
-            entry.external_attr = (0o100755 if path.endswith((".so", ".dylib", ".dll")) else 0o100644) << 16
+            entry.external_attr = (0o100755 if path.endswith(NATIVE_SUFFIXES) else 0o100644) << 16
 
             archive.writestr(entry, data, compresslevel=9)
 
@@ -462,12 +491,12 @@ def main(arguments):
     elif command == "all":
         print(build(directory))
 
-        for target, (name, _) in PLATFORMS.items():
-            print(build(directory, os.path.join(rest[0], target, name)))
+        for target in PLATFORMS:
+            print(build(directory, os.path.join(rest[0], target)))
 
         print(build_sdist_archive(directory))
     else:
-        raise SystemExit("usage: cpq_build.py wheel OUT_DIR [--native LIBRARY] | sdist OUT_DIR | all OUT_DIR DIST_DIR")
+        raise SystemExit("usage: cpq_build.py wheel OUT_DIR [--native DIRECTORY] | sdist OUT_DIR | all OUT_DIR DIST_DIR")
 
 
 if __name__ == "__main__":

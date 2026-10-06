@@ -1,23 +1,14 @@
 import struct
-from functools import lru_cache
-from itertools import starmap
 from typing import NamedTuple
 
-from . import _lanes
+from . import _primitives
 from ._hash import HMAC_SHA_256, HMAC_SHA_512
-from ._lanes import M64
-from ._primitives import sha256, sha512, shake256
-from ._sha2 import IV_256, IV_512, Sha256, Sha512
 
 WOTS_HASH, WOTS_PK, TREE, FORS_TREE, FORS_ROOTS, WOTS_PRF, FORS_PRF = range(7)
 
 W = 16
 
 LG_W = 4
-
-# Lanes per batch: enough to make the interpreter's share of each big-integer operation small,
-# few enough for the operands to stay in the processor cache.
-CHUNK = 8192
 
 
 class Parameters(NamedTuple):
@@ -73,34 +64,12 @@ SHA2 = _sets("SHA2", False)
 
 SHAKE = _sets("SHAKE", True)
 
-# An address: layer, tree, type and the three words after it (key pair, chain or tree height,
-# hash or tree index). The tree address of SLH-DSA fits in its low 8 bytes.
-_ADDRESS = struct.Struct(">I4xQIIII")
+_WORD = struct.Struct(">I").pack
 
-_COMPRESSED = struct.Struct(">BQBIII")
+# The 32-bit words below 1024: chain and hash addresses, key pairs and the nodes of an XMSS tree.
+_WORDS = [_WORD(i) for i in range(1024)]
 
-
-def address(layer, tree, kind, word5=0, word6=0, word7=0):
-    return _ADDRESS.pack(layer, tree, kind, word5, word6, word7)
-
-
-def _records(record, count, fields):
-    columns = [field if isinstance(field, list) else [field] * count for field in fields]
-
-    return b"".join(starmap(record.pack, zip(*columns)))
-
-
-# The words of one address per lane, from fields that are either one value for every lane or a
-# list with one value per lane.
-def _address_words(record, layout, widths, count, fields):
-    if not any(isinstance(field, list) for field in fields):
-        words = struct.unpack(layout, record.pack(*fields))
-
-        return [_lanes.replicate(word, count, width) for word, width in zip(words, widths)]
-
-    columns = zip(*struct.iter_unpack(layout, _records(record, count, fields)))
-
-    return [_lanes.pack(column, width) for column, width in zip(columns, widths)]
+_ZERO = bytes(4)
 
 
 def mgf1(seed, length, hash_function):
@@ -109,7 +78,7 @@ def mgf1(seed, length, hash_function):
     counter = 0
 
     while len(out) < length:
-        out += hash_function(seed + counter.to_bytes(4, "big"))
+        out += hash_function(seed + counter.to_bytes(4, "big")).digest()
 
         counter += 1
 
@@ -118,16 +87,16 @@ def mgf1(seed, length, hash_function):
 
 def h_msg(p, r, pk_seed, pk_root, message):
     if p.shake:
-        return shake256(r + pk_seed + pk_root + message, p.m)
+        return _primitives.shake_256(r + pk_seed + pk_root + message).digest(p.m)
 
-    hash_function = sha256 if p.n == 16 else sha512
+    hash_function = _primitives.sha256 if p.n == 16 else _primitives.sha512
 
-    return mgf1(r + pk_seed + hash_function(r + pk_seed + pk_root + message), p.m, hash_function)
+    return mgf1(r + pk_seed + hash_function(r + pk_seed + pk_root + message).digest(), p.m, hash_function)
 
 
 def prf_msg(p, sk_prf, opt_rand, message):
     if p.shake:
-        return shake256(sk_prf + opt_rand + message, p.n)
+        return _primitives.shake_256(sk_prf + opt_rand + message).digest(p.n)
 
     hmac = HMAC_SHA_256 if p.n == 16 else HMAC_SHA_512
 
@@ -184,272 +153,247 @@ def split_digest(p, digest):
     return digest[:md_size], tree, leaf
 
 
-class _Sha2Lanes:
-    """F, H, T and PRF of the SHA-2 sets on many inputs at once (see _lanes).
+class _Sha2Hashes:
+    """F, H, T and PRF of the SHA-2 sets for one key (FIPS 205, 11.2): each hash continues the state
+    after the block of PK.seed and zeros. F and PRF use SHA-256; H and T use SHA-512 when n > 16.
 
-    The messages follow the block of PK.seed and zeros, whose compression is done once, and start
-    with the 22-byte compressed address, so the values after it start 2 bytes into a word. A value
-    from F or PRF is a list of 32-bit SHA-256 words in 64-bit fields; with n > 16, H and T use
-    SHA-512 and their values are 64-bit words in 128-bit fields.
+    An address is its head (one byte of the layer, the low eight bytes of the tree and one byte of
+    the type: the compressed form ADRSc) and three 32-bit words.
     """
 
-    def __init__(self, p, pk_seed, sk_seed):
-        n = p.n
-
-        self.n = n
-
-        self.wide = n > 16
-
-        self.width = 128 if self.wide else 64
-
-        small = Sha256(IV_256, 32)
-
-        small.update(pk_seed + bytes(64 - n))
-
-        self.small = list(small._state)
-
-        if self.wide:
-            large = Sha512(IV_512, 64)
-
-            large.update(pk_seed + bytes(128 - n))
-
-            self.large = list(large._state)
-
-        self.sk_seed = list(struct.unpack(f">{n // 4}I", sk_seed)) if sk_seed is not None else None
-
-    # The compressed address keeps byte 3 of the layer, the low 8 bytes of the tree and byte 3 of
-    # the type: 22 bytes, five 32-bit words and the top half of a sixth. The SHA-512 form is two
-    # 64-bit words and the top six bytes of a third.
-    def address(self, count, layer, tree, kind, word5=0, word6=0, word7=0, wide=False):
-        fields = (layer, tree, kind, word5, word6, word7)
-
-        if wide and self.wide:
-            v0, v1, v2, v3 = _address_words(_COMPRESSED, ">QQIH", (128,) * 4, count, fields)
-
-            return [v0, v1, (v2 << 32) | (v3 << 16)]
-
-        words = _address_words(_COMPRESSED, ">IIIIIH", (64,) * 6, count, fields)
-
-        words[5] <<= 16
-
-        return words
-
-    def to_bytes(self, value, count, wide=False):
-        if wide and self.wide:
-            return _lanes.chunks(value, count, 8, 128)
-
-        return _lanes.chunks(value, count, 4, 64)
-
-    def from_bytes(self, values, wide=False):
-        if wide and self.wide:
-            return _lanes.words(values, 8, 128)
-
-        return _lanes.words(values, 4, 64)
-
-    # An F output becomes an input of H: SHA-512 takes the 32-bit words two at a time.
-    def widen(self, value, count):
-        if not self.wide:
-            return value
-
-        return [_lanes.widen((value[i] << 32) | value[i + 1], count) for i in range(0, len(value), 2)]
-
-    def _small(self, count, words, length):
-        return _lanes.sha256(self.small, words, count, 8 * (64 + length))[: self.n // 4]
-
-    def _large(self, count, words, length):
-        return _lanes.sha512(self.large, words, count, 8 * (128 + length))[: self.n // 8]
-
-    def f(self, adrs, value, count):
-        return self._small(count, adrs[:5] + _lanes.shifted(adrs[5], value, 4, 2, count), 22 + self.n)
-
-    def prf(self, adrs, count):
-        return self.f(adrs, [_lanes.replicate(word, count, 64) for word in self.sk_seed], count)
-
-    # F with hash address j, for an address made with hash address 0: the low half of the hash
-    # word is the top half of message word 5.
-    def step(self, adrs, value, count, j):
-        return self.f(adrs[:5] + [_lanes.replicate(j << 16, count, 64)], value, count)
-
-    def h(self, adrs, left, right, count):
-        if self.wide:
-            return self._large(count, adrs[:2] + _lanes.shifted(adrs[2], left + right, 8, 6, count), 22 + 2 * self.n)
-
-        return self._small(count, adrs[:5] + _lanes.shifted(adrs[5], left + right, 4, 2, count), 22 + 2 * self.n)
-
-    def t(self, adrs, values, count):
-        length = 22 + len(values) * self.n
-
-        if self.wide:
-            words = [word for value in values for word in self.widen(value, count)]
-
-            return self._large(count, adrs[:2] + _lanes.shifted(adrs[2], words, 8, 6, count), length)
-
-        words = [word for value in values for word in value]
-
-        return self._small(count, adrs[:5] + _lanes.shifted(adrs[5], words, 4, 2, count), length)
-
-
-class _ShakeLanes:
-    """F, H, T and PRF of the SHAKE sets on many inputs at once (see _lanes). n is a multiple of
-    8, so PK.seed, the address and every value fill whole 64-bit Keccak lanes."""
+    __slots__ = ("n", "sk_seed", "small", "large")
 
     def __init__(self, p, pk_seed, sk_seed):
         n = p.n
 
         self.n = n
 
-        self.width = 64
+        self.sk_seed = sk_seed
 
-        self.pk_seed = list(struct.unpack(f"<{n // 8}Q", pk_seed))
+        self.small = _primitives.sha256(pk_seed + bytes(64 - n)).copy
 
-        self.sk_seed = list(struct.unpack(f"<{n // 8}Q", sk_seed)) if sk_seed is not None else None
+        self.large = _primitives.sha512(pk_seed + bytes(128 - n)).copy if n > 16 else self.small
 
-    def address(self, count, layer, tree, kind, word5=0, word6=0, word7=0, wide=False):
-        return _address_words(_ADDRESS, "<QQQQ", (64,) * 4, count, (layer, tree, kind, word5, word6, word7))
+    @staticmethod
+    def head(layer, tree, kind):
+        return bytes([layer]) + tree.to_bytes(8, "big") + bytes([kind])
 
-    def to_bytes(self, value, count, wide=False):
-        return _lanes.chunks64(value, count)
+    def f(self, adrs, value):
+        h = self.small()
 
-    def from_bytes(self, values, wide=False):
-        return _lanes.lanes64(values)
+        h.update(adrs + value)
 
-    def widen(self, value, count):
+        return h.digest()[: self.n]
+
+    def prf(self, adrs):
+        h = self.small()
+
+        h.update(adrs + self.sk_seed)
+
+        return h.digest()[: self.n]
+
+    def h(self, adrs, value):
+        h = self.large()
+
+        h.update(adrs + value)
+
+        return h.digest()[: self.n]
+
+    t = h
+
+    # F with hash addresses first .. last - 1 in turn, after `prefix`: the head, the key pair and
+    # the chain address.
+    def chain(self, prefix, value, first, last):
+        copy, n, words = self.small, self.n, _WORDS
+
+        for j in range(first, last):
+            h = copy()
+
+            h.update(prefix + words[j] + value)
+
+            value = h.digest()[:n]
+
         return value
 
-    def _shake(self, count, message):
-        seed = [_lanes.replicate(word, count, 64) for word in self.pk_seed]
+    # The parents of `nodes`, numbered from `first`, after `prefix`: the head, the first word and
+    # their height.
+    def parents(self, prefix, first, nodes):
+        copy, n = self.large, self.n
 
-        return _lanes.shake256(seed + message + [_lanes.replicate(0x1F, count, 64)], count, self.n // 8)
+        out = []
 
-    def f(self, adrs, value, count):
-        return self._shake(count, adrs + value)
+        for i in range(0, len(nodes), 2):
+            h = copy()
 
-    def prf(self, adrs, count):
-        return self._shake(count, adrs + [_lanes.replicate(word, count, 64) for word in self.sk_seed])
+            h.update(prefix + _WORD(first + (i >> 1)) + nodes[i] + nodes[i + 1])
 
-    # F with hash address j, for an address made with hash address 0: the hash word is the high
-    # half of the last address lane, in big-endian byte order.
-    def step(self, adrs, value, count, j):
-        return self._shake(count, adrs[:3] + [adrs[3] | _lanes.replicate(int.from_bytes(j.to_bytes(4, "big"), "little") << 32, count, 64)] + value)
+            out.append(h.digest()[:n])
 
-    def h(self, adrs, left, right, count):
-        return self._shake(count, adrs + left + right)
+        return out
 
-    def t(self, adrs, values, count):
-        return self._shake(count, adrs + [word for value in values for word in value])
+
+class _Sha2WholeHashes(_Sha2Hashes):
+    """The same hashes, each from a new state of its whole input, where states copy and update
+    slowly (see _primitives.copies_cheaply)."""
+
+    __slots__ = ("small_block", "large_block", "sha256", "large_hash")
+
+    def __init__(self, p, pk_seed, sk_seed):
+        n = p.n
+
+        self.n = n
+
+        self.sk_seed = sk_seed
+
+        self.sha256 = _primitives.sha256
+
+        self.large_hash = _primitives.sha512 if n > 16 else self.sha256
+
+        self.small_block = pk_seed + bytes(64 - n)
+
+        self.large_block = pk_seed + bytes(128 - n) if n > 16 else self.small_block
+
+    def f(self, adrs, value):
+        return self.sha256(self.small_block + adrs + value).digest()[: self.n]
+
+    def prf(self, adrs):
+        return self.sha256(self.small_block + adrs + self.sk_seed).digest()[: self.n]
+
+    def h(self, adrs, value):
+        return self.large_hash(self.large_block + adrs + value).digest()[: self.n]
+
+    t = h
+
+    def chain(self, prefix, value, first, last):
+        sha256, n, words = self.sha256, self.n, _WORDS
+
+        prefix = self.small_block + prefix
+
+        for j in range(first, last):
+            value = sha256(prefix + words[j] + value).digest()[:n]
+
+        return value
+
+    def parents(self, prefix, first, nodes):
+        large_hash, n = self.large_hash, self.n
+
+        prefix = self.large_block + prefix
+
+        return [large_hash(prefix + _WORD(first + (i >> 1)) + nodes[i] + nodes[i + 1]).digest()[:n] for i in range(0, len(nodes), 2)]
+
+
+class _ShakeHashes:
+    """F, H, T and PRF of the SHAKE sets for one key (FIPS 205, 11.1), with the same interface; an
+    address head is the layer, the 12-byte tree and the type."""
+
+    __slots__ = ("n", "pk_seed", "sk_seed", "shake")
+
+    def __init__(self, p, pk_seed, sk_seed):
+        self.n = p.n
+
+        self.pk_seed = pk_seed
+
+        self.sk_seed = sk_seed
+
+        self.shake = _primitives.shake_256
+
+    @staticmethod
+    def head(layer, tree, kind):
+        return layer.to_bytes(4, "big") + tree.to_bytes(12, "big") + kind.to_bytes(4, "big")
+
+    def f(self, adrs, value):
+        return self.shake(self.pk_seed + adrs + value).digest(self.n)
+
+    h = t = f
+
+    def prf(self, adrs):
+        return self.shake(self.pk_seed + adrs + self.sk_seed).digest(self.n)
+
+    def chain(self, prefix, value, first, last):
+        shake_256, n, words = self.shake, self.n, _WORDS
+
+        prefix = self.pk_seed + prefix
+
+        for j in range(first, last):
+            value = shake_256(prefix + words[j] + value).digest(n)
+
+        return value
+
+    def parents(self, prefix, first, nodes):
+        shake_256, n = self.shake, self.n
+
+        prefix = self.pk_seed + prefix
+
+        return [shake_256(prefix + _WORD(first + (i >> 1)) + nodes[i] + nodes[i + 1]).digest(n) for i in range(0, len(nodes), 2)]
 
 
 def _hashes(p, pk_seed, sk_seed):
-    return (_ShakeLanes if p.shake else _Sha2Lanes)(p, pk_seed, sk_seed)
+    if p.shake:
+        return _ShakeHashes(p, pk_seed, sk_seed)
+
+    return (_Sha2Hashes if _primitives.copies_cheaply(_primitives.sha256) else _Sha2WholeHashes)(p, pk_seed, sk_seed)
 
 
-@lru_cache(maxsize=32)
-def _reverse(bits):
-    return [int(f"{k:0{bits}b}"[::-1], 2) if bits else 0 for k in range(1 << bits)]
+# FIPS 205, Algorithm 6: the WOTS+ public key of `keypair` under the heads of its PRF, chain and
+# public key addresses. With `digits`, also the WOTS+ signature (Algorithm 7) of the message they
+# encode, whose values the chains pass through on their way.
+def wots_pk(hashes, p, heads, keypair, digits=None):
+    prf_head, hash_head, pk_head = heads
+
+    word = _WORDS[keypair]
+
+    prf_prefix, hash_prefix = prf_head + word, hash_head + word
+
+    ends, signature = [], []
+
+    for i in range(p.length):
+        chain = _WORDS[i]
+
+        value = hashes.prf(prf_prefix + chain + _ZERO)
+
+        prefix = hash_prefix + chain
+
+        if digits is not None:
+            value = hashes.chain(prefix, value, 0, digits[i])
+
+            signature.append(value)
+
+            ends.append(hashes.chain(prefix, value, digits[i], W - 1))
+        else:
+            ends.append(hashes.chain(prefix, value, 0, W - 1))
+
+    return hashes.t(pk_head + word + bytes(8), b"".join(ends)), b"".join(signature)
 
 
-def _select(value, start, count, width):
-    return [_lanes.select(word, start, count, width) for word in value]
+# Every level of the XMSS tree `tree` of `layer`, from its leaves to its root, and the WOTS+
+# signature of `message` with leaf `leaf` when a message is given (FIPS 205, Algorithms 9 and 10).
+def xmss_levels(hashes, p, layer, tree, message=None, leaf=0):
+    heads = hashes.head(layer, tree, WOTS_PRF), hashes.head(layer, tree, WOTS_HASH), hashes.head(layer, tree, WOTS_PK)
 
+    digits = wots_digits(p, message) if message is not None else None
 
-def _join(parts, counts, width):
-    return [_lanes.concatenate(words, counts, width) for words in zip(*parts)]
+    leaves, signature = [], b""
 
+    for keypair in range(1 << p.hp):
+        if keypair == leaf and digits is not None:
+            node, signature = wots_pk(hashes, p, heads, keypair, digits)
+        else:
+            node = wots_pk(hashes, p, heads, keypair)[0]
 
-# The WOTS public keys, compressed by T, of every leaf of the given XMSS trees. Leaf q of tree t
-# is lane reverse(q) * len(trees) + t: with the leaf index bit-reversed, the left children of
-# every level fill the lower half of the lanes and their right siblings the upper half, in the
-# same order, so each Merkle level is one split and one batch of H. The chains of one batch are
-# grouped by chain index, which keeps the slice of one chain contiguous.
-def wots_leaves(hashes, p, trees):
-    count_t = len(trees)
+        leaves.append(node)
 
-    positions = count_t << p.hp
-
-    reverse = _reverse(p.hp)
-
-    layers = [layer for _ in range(1 << p.hp) for layer, _ in trees]
-
-    tree_addresses = [tree for _ in range(1 << p.hp) for _, tree in trees]
-
-    key_pairs = [reverse[r] for r in range(1 << p.hp) for _ in trees]
-
-    per_batch = max(1, CHUNK // positions)
-
-    values = []
-
-    for first in range(0, p.length, per_batch):
-        chains = range(first, min(p.length, first + per_batch))
-
-        count = len(chains) * positions
-
-        layer, tree, key_pair = layers * len(chains), tree_addresses * len(chains), key_pairs * len(chains)
-
-        chain = [i for i in chains for _ in range(positions)]
-
-        value = hashes.prf(hashes.address(count, layer, tree, WOTS_PRF, key_pair, chain), count)
-
-        adrs = hashes.address(count, layer, tree, WOTS_HASH, key_pair, chain)
-
-        for j in range(W - 1):
-            value = hashes.step(adrs, value, count, j)
-
-        for c in range(len(chains)):
-            values.append(_select(value, c * positions, positions, 64))
-
-    return hashes.t(hashes.address(positions, layers, tree_addresses, WOTS_PK, key_pairs, wide=True), values, positions)
-
-
-# Every level of trees whose leaves are in the lane order of wots_leaves, from the leaves to the
-# roots. adrs(height, indices, trees) gives the addresses of the nodes at that height.
-def merkle_levels(hashes, height, count_t, leaves, adrs):
     levels = [leaves]
 
-    for z in range(height):
-        half = count_t << (height - z - 1)
+    head = hashes.head(layer, tree, TREE) + _ZERO
 
-        level = levels[-1]
+    for z in range(1, p.hp + 1):
+        levels.append(hashes.parents(head + _WORDS[z], 0, levels[-1]))
 
-        reverse = _reverse(height - z - 1)
-
-        indices = [reverse[r] for r in range(1 << (height - z - 1)) for _ in range(count_t)]
-
-        trees = list(range(count_t)) * (1 << (height - z - 1))
-
-        left, right = _select(level, 0, half, hashes.width), _select(level, half, half, hashes.width)
-
-        levels.append(hashes.h(adrs(z + 1, indices, trees), left, right, half))
-
-    return levels
-
-
-def _node(hashes, levels, height, count_t, z, index, t):
-    lane = _reverse(height - z)[index] * count_t + t
-
-    return hashes.to_bytes([_lanes.lane(word, lane, hashes.width, M64) for word in levels[z]], 1, wide=True)[0]
-
-
-def xmss_trees(hashes, p, trees):
-    leaves = wots_leaves(hashes, p, trees)
-
-    layers = [layer for layer, _ in trees]
-
-    tree_addresses = [tree for _, tree in trees]
-
-    def adrs(height, indices, which):
-        count = len(indices)
-
-        return hashes.address(count, [layers[t] for t in which], [tree_addresses[t] for t in which], TREE, 0, height, indices, wide=True)
-
-    return merkle_levels(hashes, p.hp, len(trees), leaves, adrs)
+    return levels, signature
 
 
 def root(p, sk_seed, pk_seed):
-    hashes = _hashes(p, pk_seed, sk_seed)
-
-    levels = xmss_trees(hashes, p, [(p.d - 1, 0)])
-
-    return _node(hashes, levels, p.hp, 1, p.hp, 0, 0)
+    return xmss_levels(_hashes(p, pk_seed, sk_seed), p, p.d - 1, 0)[0][-1][0]
 
 
 def keygen_internal(sk_seed, sk_prf, pk_seed, p):
@@ -458,117 +402,61 @@ def keygen_internal(sk_seed, sk_prf, pk_seed, p):
     return sk_seed + sk_prf + pk_seed + pk_root, pk_seed + pk_root
 
 
-# The WOTS signatures of several layers at once: lane i * len + j is chain j of layer i.
-def wots_sign(hashes, p, messages, trees, leaves):
-    count = len(messages) * p.length
-
-    digits = [digit for message in messages for digit in wots_digits(p, message)]
-
-    layer = [layer for layer, _ in trees for _ in range(p.length)]
-
-    tree = [tree for _, tree in trees for _ in range(p.length)]
-
-    key_pair = [leaf for leaf in leaves for _ in range(p.length)]
-
-    chain = list(range(p.length)) * len(messages)
-
-    secret = hashes.prf(hashes.address(count, layer, tree, WOTS_PRF, key_pair, chain), count)
-
-    adrs = hashes.address(count, layer, tree, WOTS_HASH, key_pair, chain)
-
-    signature = _lanes.run_to(lambda value, j: hashes.step(adrs, value, count, j), secret, digits)
-
-    values = hashes.to_bytes(signature, count)
-
-    return [b"".join(values[i * p.length : (i + 1) * p.length]) for i in range(len(messages))]
-
-
-# The hypertree signature builds the XMSS tree of every layer at once: their auth paths and roots
-# come from the same levels, and the root of a layer is the message of the layer above.
+# FIPS 205, Algorithm 12: each layer signs the root of the one below with the leaf that the tree
+# address gives, and its tree's levels give the authentication path and its own root.
 def ht_sign(hashes, p, message, tree, leaf):
-    trees, leaves = [], []
-
-    for _ in range(p.d):
-        trees.append((len(trees), tree))
-
-        leaves.append(leaf)
-
-        leaf = tree % (1 << p.hp)
-
-        tree >>= p.hp
-
-    levels = xmss_trees(hashes, p, trees)
-
-    messages = [message] + [_node(hashes, levels, p.hp, p.d, p.hp, 0, layer) for layer in range(p.d - 1)]
-
-    signatures = wots_sign(hashes, p, messages, trees, leaves)
-
     out = []
 
-    for layer, leaf in enumerate(leaves):
-        out.append(signatures[layer])
+    for layer in range(p.d):
+        levels, signature = xmss_levels(hashes, p, layer, tree, message, leaf)
 
-        out += [_node(hashes, levels, p.hp, p.d, z, (leaf >> z) ^ 1, layer) for z in range(p.hp)]
+        out.append(signature)
+
+        out += [levels[z][(leaf >> z) ^ 1] for z in range(p.hp)]
+
+        message = levels[-1][0]
+
+        leaf = tree & ((1 << p.hp) - 1)
+
+        tree >>= p.hp
 
     return b"".join(out)
 
 
-# FORS trees go in groups that fill a batch; lane reverse(j) * group + c is leaf j of tree
-# first + c. A tree larger than a batch computes its leaves in several batches.
-def fors_sign(hashes, p, digest, idx_tree, idx_leaf):
-    indices = base_2b(digest, p.a, p.k)
+# FIPS 205, Algorithms 14 to 16: every FORS tree in turn, with the secret value of its leaf, the
+# authentication path and its root; returns the signature and the FORS public key.
+def fors_sign(hashes, p, md, tree, leaf):
+    indices = base_2b(md, p.a, p.k)
 
-    group = max(1, CHUNK >> p.a)
+    word = _WORDS[leaf]
 
-    reverse = _reverse(p.a)
+    prf_head = hashes.head(0, tree, FORS_PRF) + word + _ZERO
+
+    tree_head = hashes.head(0, tree, FORS_TREE) + word
+
+    leaf_head = tree_head + _ZERO
+
+    prf, f = hashes.prf, hashes.f
 
     out, roots = [], []
 
-    for first in range(0, p.k, group):
-        trees = range(first, min(p.k, first + group))
+    for i in range(p.k):
+        first = i << p.a
 
-        positions = len(trees) << p.a
+        level = [f(leaf_head + address, prf(prf_head + address)) for address in map(_WORD, range(first, first + (1 << p.a)))]
 
-        index = [(i << p.a) | reverse[r] for r in range(1 << p.a) for i in trees]
+        index = indices[i]
 
-        secrets, leaves, counts = [], [], []
+        out.append(prf(prf_head + _WORD(first + index)))
 
-        for start in range(0, positions, CHUNK):
-            count = min(CHUNK, positions - start)
+        for z in range(p.a):
+            out.append(level[(index >> z) ^ 1])
 
-            part = index[start : start + count]
+            level = hashes.parents(tree_head + _WORDS[z + 1], first >> (z + 1), level)
 
-            secret = hashes.prf(hashes.address(count, 0, idx_tree, FORS_PRF, idx_leaf, 0, part), count)
+        roots.append(level[0])
 
-            leaves.append(hashes.widen(hashes.f(hashes.address(count, 0, idx_tree, FORS_TREE, idx_leaf, 0, part), secret, count), count))
-
-            secrets.append(secret)
-
-            counts.append(count)
-
-        def adrs(height, nodes, which, first=first):
-            count = len(nodes)
-
-            return hashes.address(count, 0, idx_tree, FORS_TREE, idx_leaf, height, [((first + t) << (p.a - height)) | node for node, t in zip(nodes, which)], wide=True)
-
-        levels = merkle_levels(hashes, p.a, len(trees), _join(leaves, counts, hashes.width), adrs)
-
-        for c, i in enumerate(trees):
-            lane = reverse[indices[i]] * len(trees) + c
-
-            chunk, offset = divmod(lane, CHUNK)
-
-            out.append(hashes.to_bytes([_lanes.lane(word, offset, 64, M64) for word in secrets[chunk]], 1)[0])
-
-            out += [_node(hashes, levels, p.a, len(trees), z, (indices[i] >> z) ^ 1, c) for z in range(p.a)]
-
-            roots.append(_node(hashes, levels, p.a, len(trees), p.a, 0, c))
-
-    return b"".join(out), roots
-
-
-def _fors_public(single, idx_tree, idx_leaf, roots):
-    return single.t(address(0, idx_tree, FORS_ROOTS, idx_leaf), b"".join(roots))
+    return b"".join(out), hashes.t(hashes.head(0, tree, FORS_ROOTS) + word + bytes(8), b"".join(roots))
 
 
 def sign_internal(message, sk, addrnd, p):
@@ -582,82 +470,80 @@ def sign_internal(message, sk, addrnd, p):
 
     md, tree, leaf = split_digest(p, h_msg(p, r, pk_seed, pk_root, message))
 
-    fors, roots = fors_sign(hashes, p, md, tree, leaf)
-
-    pk_fors = _fors_public(Hashes(p, pk_seed), tree, leaf, roots)
+    fors, pk_fors = fors_sign(hashes, p, md, tree, leaf)
 
     return r + fors + ht_sign(hashes, p, pk_fors, tree, leaf)
 
 
-# Verification follows one path per tree: the k FORS trees climb together in k lanes, and the
-# chains of one WOTS signature run in len lanes.
-def fors_pk_from_sig(hashes, single, p, signature, digest, idx_tree, idx_leaf):
-    n, k = p.n, p.k
-
-    indices = base_2b(digest, p.a, k)
-
-    size = (p.a + 1) * n
-
-    index = [(i << p.a) + indices[i] for i in range(k)]
-
-    secrets = hashes.from_bytes([signature[i * size : i * size + n] for i in range(k)])
-
-    node = hashes.widen(hashes.f(hashes.address(k, 0, idx_tree, FORS_TREE, idx_leaf, 0, index), secrets, k), k)
-
-    for z in range(p.a):
-        sibling = hashes.from_bytes([signature[i * size + (z + 1) * n : i * size + (z + 2) * n] for i in range(k)], wide=True)
-
-        first = _lanes.mask([(x >> z) & 1 == 0 for x in indices], hashes.width)
-
-        left = [s ^ ((x ^ s) & first) for x, s in zip(node, sibling)]
-
-        right = [x ^ s ^ y for x, s, y in zip(node, sibling, left)]
-
-        index = [x >> 1 for x in index]
-
-        node = hashes.h(hashes.address(k, 0, idx_tree, FORS_TREE, idx_leaf, z + 1, index, wide=True), left, right, k)
-
-    return _fors_public(single, idx_tree, idx_leaf, hashes.to_bytes(node, k, wide=True))
-
-
-def xmss_pk_from_sig(hashes, single, p, leaf, signature, message, layer, tree):
+# Climbs from `node`, at `index` on the lowest level, along the authentication path `auth`, under
+# `prefix`: an address head and its first word.
+def climb(hashes, p, node, index, auth, prefix, height):
     n = p.n
 
-    count = p.length
-
-    values = hashes.from_bytes([signature[i * n : (i + 1) * n] for i in range(count)])
-
-    adrs = hashes.address(count, layer, tree, WOTS_HASH, leaf, list(range(count)))
-
-    values = _lanes.run_from(lambda value, j: hashes.step(adrs, value, count, j), values, wots_digits(p, message), W - 1)
-
-    node = single.t(address(layer, tree, WOTS_PK, leaf), b"".join(hashes.to_bytes(values, count)))
-
-    auth = signature[count * n :]
-
-    index = leaf
-
-    for z in range(p.hp):
+    for z in range(height):
         sibling = auth[z * n : (z + 1) * n]
 
         pair = sibling + node if index & 1 else node + sibling
 
         index >>= 1
 
-        node = single.h(address(layer, tree, TREE, 0, z + 1, index), pair)
+        node = hashes.h(prefix + _WORDS[z + 1] + _WORD(index), pair)
 
     return node
 
 
-def ht_verify(hashes, single, p, message, signature, tree, leaf, pk_root):
+# FIPS 205, Algorithm 17.
+def fors_pk_from_sig(hashes, p, signature, md, tree, leaf):
+    n = p.n
+
+    indices = base_2b(md, p.a, p.k)
+
+    word = _WORDS[leaf]
+
+    tree_head = hashes.head(0, tree, FORS_TREE) + word
+
+    size = (p.a + 1) * n
+
+    roots = []
+
+    for i in range(p.k):
+        part = signature[i * size : (i + 1) * size]
+
+        index = (i << p.a) + indices[i]
+
+        node = hashes.f(tree_head + _ZERO + _WORD(index), part[:n])
+
+        roots.append(climb(hashes, p, node, index, part[n:], tree_head, p.a))
+
+    return hashes.t(hashes.head(0, tree, FORS_ROOTS) + word + bytes(8), b"".join(roots))
+
+
+# FIPS 205, Algorithms 8 and 11.
+def xmss_pk_from_sig(hashes, p, leaf, signature, message, layer, tree):
+    n = p.n
+
+    digits = wots_digits(p, message)
+
+    word = _WORDS[leaf]
+
+    hash_prefix = hashes.head(layer, tree, WOTS_HASH) + word
+
+    ends = [hashes.chain(hash_prefix + _WORDS[i], signature[i * n : (i + 1) * n], digits[i], W - 1) for i in range(p.length)]
+
+    node = hashes.t(hashes.head(layer, tree, WOTS_PK) + word + bytes(8), b"".join(ends))
+
+    return climb(hashes, p, node, leaf, signature[p.length * n :], hashes.head(layer, tree, TREE) + _ZERO, p.hp)
+
+
+def ht_verify(hashes, p, message, signature, tree, leaf, pk_root):
     size = (p.length + p.hp) * p.n
 
     node = message
 
     for layer in range(p.d):
-        node = xmss_pk_from_sig(hashes, single, p, leaf, signature[layer * size : (layer + 1) * size], node, layer, tree)
+        node = xmss_pk_from_sig(hashes, p, leaf, signature[layer * size : (layer + 1) * size], node, layer, tree)
 
-        leaf = tree % (1 << p.hp)
+        leaf = tree & ((1 << p.hp) - 1)
 
         tree >>= p.hp
 
@@ -674,42 +560,12 @@ def verify_internal(message, signature, pk, p):
 
     hashes = _hashes(p, pk_seed, None)
 
-    single = Hashes(p, pk_seed)
-
     r = signature[:n]
 
     fors_end = (1 + p.k * (1 + p.a)) * n
 
     md, tree, leaf = split_digest(p, h_msg(p, r, pk_seed, pk_root, message))
 
-    pk_fors = fors_pk_from_sig(hashes, single, p, signature[n:fors_end], md, tree, leaf)
+    pk_fors = fors_pk_from_sig(hashes, p, signature[n:fors_end], md, tree, leaf)
 
-    return ht_verify(hashes, single, p, pk_fors, signature[fors_end:], tree, leaf, pk_root)
-
-
-# FIPS 205, section 11, for single inputs: H and T of the SHA-2 sets reuse the state after the
-# block of PK.seed and zeros.
-class Hashes:
-    def __init__(self, p, pk_seed):
-        self.n = p.n
-
-        self.pk_seed = pk_seed
-
-        self.shake = p.shake
-
-        if not p.shake:
-            self.base = Sha256(IV_256, 32) if p.n == 16 else Sha512(IV_512, 64)
-
-            self.base.update(pk_seed + bytes(self.base._block - p.n))
-
-    def h(self, adrs, message):
-        if self.shake:
-            return shake256(self.pk_seed + adrs + message, self.n)
-
-        engine = self.base.copy()
-
-        engine.update(adrs[3:4] + adrs[8:16] + adrs[19:20] + adrs[20:32] + message)
-
-        return engine.digest()[: self.n]
-
-    t = h
+    return ht_verify(hashes, p, pk_fors, signature[fors_end:], tree, leaf, pk_root)

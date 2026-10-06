@@ -1,9 +1,9 @@
 import struct
+from functools import lru_cache
 from typing import NamedTuple
 
-from . import _bits, _lanes
+from . import _bits, _primitives
 from ._ntt import Ntt
-from ._primitives import shake256
 
 Q = 8380417
 
@@ -61,6 +61,12 @@ ML_DSA_87 = Parameters("ML-DSA-87", 8, 7, 2, 60, 256, 1 << 19, (Q - 1) // 32, 75
 
 
 _NTT = Ntt(Q, ZETAS, 1, 8347681)
+
+
+# An integer with a one at the bottom of each of `count` fields of `bits` bits.
+@lru_cache(maxsize=16)
+def ones(count, bits):
+    return int.from_bytes((b"\x01" + bytes(bits // 8 - 1)) * count, "little")
 
 
 # The sum of the products of matching coefficients, three products per pass, unreduced: the
@@ -258,7 +264,7 @@ def rej_ntt_poly(data):
 
     spread[2::4] = data[2::3]
 
-    x = int.from_bytes(spread, "little") & (_lanes.ones(groups, 32) * 0x7FFFFF)
+    x = int.from_bytes(spread, "little") & (ones(groups, 32) * 0x7FFFFF)
 
     return [z for z in struct.unpack(f"<{groups}I", x.to_bytes(4 * groups, "little")) if z < Q][:256]
 
@@ -267,7 +273,7 @@ def rej_ntt_poly(data):
 def rej_bounded_poly(data, eta):
     x = int.from_bytes(data, "little")
 
-    low = _lanes.ones(len(data), 8) * 0x0F
+    low = ones(len(data), 8) * 0x0F
 
     halves = bytearray(2 * len(data))
 
@@ -281,63 +287,43 @@ def rej_bounded_poly(data, eta):
     return [4 - half for half in halves if half < 9][:256]
 
 
-# The samplers of a key run their streams in lanes: a first number of blocks that nearly always
-# suffices, then another block for every stream whenever one of them falls short.
-def _sample(seeds, rates, blocks, parsers):
-    stream = _lanes.Squeeze(seeds, rates)
+# A rejection sampler on one XOF stream: `blocks` blocks of `rate` bytes nearly always suffice;
+# otherwise the stream is read again, one block longer each time.
+def _sample(xof, rate, blocks, parse, seed):
+    length = blocks * rate
 
-    data = stream.blocks(blocks)
+    poly = parse(xof(seed).digest(length))
 
-    polys = [parse(d) for parse, d in zip(parsers, data)]
+    while len(poly) < 256:
+        length += rate
 
-    while any(len(poly) < 256 for poly in polys):
-        data = [d + more for d, more in zip(data, stream.blocks(1))]
+        poly = parse(xof(seed).digest(length))
 
-        polys = [parse(d) for parse, d in zip(parsers, data)]
-
-    return polys
+    return poly
 
 
-def _matrix_seeds(rho, p):
-    return [rho + bytes([s, r]) for r in range(p.k) for s in range(p.l)]
-
-
+# FIPS 204, Algorithm 32: five blocks give 280 candidates, each accepted with probability
+# q / 2^23 > 0.999.
 def expand_a(rho, p):
-    polys = _sample(_matrix_seeds(rho, p), 168, 5, [rej_ntt_poly] * (p.k * p.l))
-
-    return [polys[r * p.l : (r + 1) * p.l] for r in range(p.k)]
+    return [[_sample(_primitives.shake_128, 168, 5, rej_ntt_poly, rho + bytes([s, r])) for s in range(p.l)] for r in range(p.k)]
 
 
-# ExpandA and ExpandS. The SHAKE256 streams of s1 and s2, whose first two blocks nearly always
-# suffice, ride in the five blocks of the matrix streams while that batch has at most 32 lanes;
-# beyond, each extra lane costs more than a batch of their own (measured), as for ML-DSA-87.
-def expand_a_and_s(rho, rho_prime, p):
-    count, extra = p.k * p.l, p.l + p.k
-
-    seeds = [rho_prime + r.to_bytes(2, "little") for r in range(extra)]
-
+# FIPS 204, Algorithm 33: two blocks give 544 candidates, each accepted with probability 15/16
+# for eta = 2 and 9/16 for eta = 4.
+def expand_s(rho_prime, p):
     def bounded(data):
-        poly = rej_bounded_poly(data[:272], p.eta)
+        return rej_bounded_poly(data, p.eta)
 
-        return poly if len(poly) == 256 else rej_bounded_poly(data, p.eta)
+    polys = [_sample(_primitives.shake_256, 136, 2, bounded, rho_prime + r.to_bytes(2, "little")) for r in range(p.l + p.k)]
 
-    if count <= 32:
-        polys = _sample(_matrix_seeds(rho, p) + seeds, [168] * count + [136] * extra, 5, [rej_ntt_poly] * count + [bounded] * extra)
-
-        a, s = [polys[r * p.l : (r + 1) * p.l] for r in range(p.k)], polys[count:]
-    else:
-        a, s = expand_a(rho, p), _sample(seeds, 136, 2, [bounded] * extra)
-
-    return a, s[: p.l], s[p.l :]
+    return polys[: p.l], polys[p.l :]
 
 
-# ExpandMask for `count` signing attempts from kappa on, in one batch of SHAKE256 streams.
+# ExpandMask (FIPS 204, Algorithm 34) for `count` signing attempts from kappa on.
 def expand_masks(rho, kappa, count, p):
     size = 32 * gamma1_bits(p)
 
-    seeds = [rho + (kappa + r).to_bytes(2, "little") for r in range(count * p.l)]
-
-    return [bit_unpack(d[:size], p.gamma1 - 1, p.gamma1) for d in _lanes.Squeeze(seeds, 136).blocks(-(-size // 136))]
+    return [bit_unpack(_primitives.shake_256(rho + (kappa + r).to_bytes(2, "little")).digest(size), p.gamma1 - 1, p.gamma1) for r in range(count * p.l)]
 
 
 # FIPS 204, Algorithm 29, on the first bytes of a SHAKE256 stream; None if they run out.
@@ -369,21 +355,22 @@ def sample_in_ball(data, tau):
     return c
 
 
-# SampleInBall in every lane of a stream, which squeezes more blocks while any lane runs out.
-def _challenges(stream, tau):
-    data = stream.blocks(1)
+# SampleInBall from c-tilde: one block nearly always suffices; otherwise the stream is read again,
+# one block longer each time.
+def challenge(c_tilde, tau):
+    length = 136
 
-    c = [sample_in_ball(d, tau) for d in data]
+    c = sample_in_ball(_primitives.shake_256(c_tilde).digest(length), tau)
 
-    while None in c:
-        data = [d + more for d, more in zip(data, stream.blocks(1))]
+    while c is None:
+        length += 136
 
-        c = [sample_in_ball(d, tau) for d in data]
+        c = sample_in_ball(_primitives.shake_256(c_tilde).digest(length), tau)
 
     return c
 
 
-_BIAS = {bits: (1 << (bits - 1)) * _lanes.ones(512, bits) for bits in (16, 32)}
+_BIAS = {bits: (1 << (bits - 1)) * ones(512, bits) for bits in (16, 32)}
 
 _OPERAND_BIAS = {bits: _BIAS[bits] & ((1 << (256 * bits)) - 1) for bits in (16, 32)}
 
@@ -451,7 +438,7 @@ class VerificationKey:
 
     def tr(self):
         if self._tr is None:
-            self._tr = shake256(self.pk, 64)
+            self._tr = _primitives.shake_256(self.pk).digest(64)
 
         return self._tr
 
@@ -502,7 +489,7 @@ def private_state(sk, pk, params):
     return SigningKey(sk, params, VerificationKey(pk, params, sk[64:128]))
 
 
-_ONES32 = _lanes.ones(256, 32)
+_ONES32 = ones(256, 32)
 
 _LOW13 = 0x1FFF * _ONES32
 
@@ -537,17 +524,19 @@ def public_t(a, s1, s2, p):
 
 
 def keygen_internal(xi, p):
-    expanded = shake256(xi + bytes([p.k, p.l]), 128)
+    expanded = _primitives.shake_256(xi + bytes([p.k, p.l])).digest(128)
 
     rho, rho_prime, key = expanded[:32], expanded[32:96], expanded[96:]
 
-    a, s1, s2 = expand_a_and_s(rho, rho_prime, p)
+    a = expand_a(rho, p)
+
+    s1, s2 = expand_s(rho_prime, p)
 
     t1, t0 = public_t(a, s1, s2, p)
 
     pk = rho + t1
 
-    return pk, rho + key + shake256(pk, 64) + b"".join(bit_pack(s, p.eta, p.eta) for s in s1 + s2) + t0
+    return pk, rho + key + _primitives.shake_256(pk).digest(64) + b"".join(bit_pack(s, p.eta, p.eta) for s in s1 + s2) + t0
 
 
 # An expanded private key carries everything needed to rebuild the public key, so a key whose
@@ -565,17 +554,13 @@ def check_private_key(sk, p):
 
     pk = rho + t1
 
-    return pk if shake256(pk, 64) == tr else None
+    return pk if _primitives.shake_256(pk).digest(64) == tr else None
 
 
-# Signing attempts run in groups: their ExpandMask streams, transforms, c-tilde hashes and
-# SampleInBall streams share lanes, and the attempts are then checked in the order of kappa, so the
-# first one accepted is the one of FIPS 204.
+# Signing attempts run in groups whose transforms share their passes; the attempts are then taken
+# in the order of kappa, each finished only when it is checked, so the first one accepted is the
+# one of FIPS 204.
 GROUP = 3
-
-
-def _padded8(data):
-    return data + bytes(-len(data) % 8)
 
 
 def _attempts(a, rho_prime, kappa, mu, p):
@@ -587,17 +572,12 @@ def _attempts(a, rho_prime, kappa, mu, p):
 
     w = _NTT.inverse([dot(a[i], y_hat[n * l : (n + 1) * l]) for n in range(GROUP) for i in range(k)])
 
-    w = [w[n * k : (n + 1) * k] for n in range(GROUP)]
+    for n in range(GROUP):
+        attempt = w[n * k : (n + 1) * k]
 
-    w1 = [w1_encode([high_bits(poly, p.gamma2) for poly in attempt], p) for attempt in w]
+        c_tilde = _primitives.shake_256(mu + w1_encode([high_bits(poly, p.gamma2) for poly in attempt], p)).digest(p.lam // 4)
 
-    messages = _lanes.lanes64([_padded8(mu + data + b"\x1f") for data in w1])
-
-    c_tilde = _lanes.chunks64(_lanes.shake256(messages, GROUP, p.lam // 32), GROUP)
-
-    c = _challenges(_lanes.Squeeze(c_tilde, 136), p.tau)
-
-    return [(y[n * l : (n + 1) * l], w[n], c_tilde[n], Challenge(c[n])) for n in range(GROUP)]
+        yield y[n * l : (n + 1) * l], attempt, c_tilde, Challenge(challenge(c_tilde, p.tau))
 
 
 def sign_internal(key, message, rnd, p):
@@ -605,9 +585,9 @@ def sign_internal(key, message, rnd, p):
 
     secret, s1, s2, t0 = key.secrets()
 
-    mu = shake256(key.public.tr() + message, 64)
+    mu = _primitives.shake_256(key.public.tr() + message).digest(64)
 
-    rho_prime = shake256(secret + rnd + mu, 64)
+    rho_prime = _primitives.shake_256(secret + rnd + mu).digest(64)
 
     kappa = 0
 
@@ -634,8 +614,6 @@ def sign_internal(key, message, rnd, p):
         kappa += GROUP * p.l
 
 
-# mu needs tr || M', usually one block; SampleInBall of c-tilde rides in the lanes of its first
-# permutation.
 def verify_internal(key, message, sig, p):
     if len(sig) != p.signature_size:
         return False
@@ -650,11 +628,9 @@ def verify_internal(key, message, sig, p):
     if infinity_norm(z) >= p.gamma1 - p.beta:
         return False
 
-    stream = _lanes.Beside([0] * 25, _lanes.padded_blocks(key.tr() + message, 136, 0x1F), [_lanes.padded_block(c_tilde, 136, 0x1F)], [136])
+    c = Challenge(challenge(c_tilde, p.tau))
 
-    c = Challenge(_challenges(stream, p.tau)[0])
-
-    mu = struct.pack("<8Q", *stream.finish()[:8])
+    mu = _primitives.shake_256(key.tr() + message).digest(64)
 
     a = key.matrix()
 
@@ -666,4 +642,4 @@ def verify_internal(key, message, sig, p):
 
     w1 = [use_hint(h[i], w[i], p.gamma2) for i in range(p.k)]
 
-    return shake256(mu + w1_encode(w1, p), p.lam // 4) == c_tilde
+    return _primitives.shake_256(mu + w1_encode(w1, p)).digest(p.lam // 4) == c_tilde

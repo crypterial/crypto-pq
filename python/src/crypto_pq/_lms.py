@@ -1,10 +1,7 @@
-import struct
 from typing import NamedTuple
 
-from . import _lanes
+from . import _primitives
 from ._merkle import MerkleTree
-from ._primitives import sha256, shake256
-from ._sha2 import IV_256
 
 D_PBLC = b"\x80\x80"
 
@@ -22,9 +19,6 @@ RANDOMIZER = 0xFFFD
 CHILD_SEED = 0xFFFE
 
 CHILD_I = 0xFFFF
-
-# Lanes per batch (see _slhdsa).
-CHUNK = 8192
 
 
 class OtsType(NamedTuple):
@@ -106,7 +100,7 @@ def u16(value):
 
 
 def digest(shake, n, data):
-    return shake256(data, n) if shake else sha256(data)[:n]
+    return _primitives.shake_256(data).digest(n) if shake else _primitives.sha256(data).digest()[:n]
 
 
 def derive(shake, n, i_value, q, index, seed):
@@ -133,177 +127,85 @@ def digits(t, q_hash):
     return coefficients(t, q_hash + u16(checksum), t.p)
 
 
-def _swap32(values):
-    return list(struct.unpack(f"<{len(values)}I", struct.pack(f">{len(values)}I", *values)))
+_STEPS = [bytes([j]) for j in range(256)]
 
 
-class Lanes:
-    """The hashes of one LMS tree on many inputs at once (see _lanes).
+# The steps first .. last - 1 of a chain: H(I || q || i || j || value) with `prefix` I || q || i.
+# SHA-256 with n = 32 keeps the whole digest.
+def chain(shake, n, prefix, value, first, last):
+    if shake:
+        shake_256 = _primitives.shake_256
 
-    Every message is I, a 32-bit number q or r, two or three bytes (a tag, or a chain index and a
-    step) and n-byte values, which therefore start 2 or 3 bytes into a SHA-256 word, or 6 or 7
-    bytes into a Keccak lane. A value is n/4 SHA-256 words in 64-bit fields, or n/8 Keccak lanes.
-    """
+        for step in _STEPS[first:last]:
+            value = shake_256(prefix + step + value).digest(n)
+    elif n == 32:
+        sha256 = _primitives.sha256
 
-    def __init__(self, shake, n, i_value, count):
-        self.shake = shake
+        for step in _STEPS[first:last]:
+            value = sha256(prefix + step + value).digest()
+    else:
+        sha256 = _primitives.sha256
 
-        self.n = n
+        for step in _STEPS[first:last]:
+            value = sha256(prefix + step + value).digest()[:n]
 
-        self.count = count
-
-        words = struct.unpack("<2Q", i_value) if shake else struct.unpack(">4I", i_value)
-
-        self.i_value = [_lanes.replicate(word, count, 64) for word in words]
-
-    # The words in front of the values for one number per lane, and the bits of the number that
-    # share the word or lane of the first value.
-    def head(self, numbers):
-        numbers = numbers if isinstance(numbers, list) else [numbers] * self.count
-
-        if self.shake:
-            return list(self.i_value), _lanes.pack(_swap32(numbers), 64)
-
-        return self.i_value + [_lanes.pack(numbers, 64)], 0
-
-    # The two or three bytes after the number (a tag, or a chain index and a step), given as one
-    # big-endian value for every lane or a list of them, placed in the word or lane of the first
-    # value.
-    def after(self, values, size):
-        if isinstance(values, list):
-            return _lanes.pack([self._place(value, size) for value in values], 64)
-
-        return _lanes.replicate(self._place(values, size), self.count, 64)
-
-    def _place(self, value, size):
-        if self.shake:
-            return int.from_bytes(value.to_bytes(size, "big"), "little") << 32
-
-        return value << (32 - 8 * size)
-
-    def hash(self, head, top, values, offset):
-        length = 20 + offset + len(values) * (8 if self.shake else 4)
-
-        if self.shake:
-            return _lanes.shake256(head + _lanes.shifted_le(top, values, offset + 4, self.count), self.count, self.n // 8)
-
-        return _lanes.sha256(IV_256, head + _lanes.shifted(top, values, 4, offset, self.count), self.count, 8 * length)[: self.n // 4]
-
-    def tagged(self, numbers, tag, values):
-        head, top = self.head(numbers)
-
-        return self.hash(head, top | self.after(int.from_bytes(tag, "big"), 2), values, 2)
-
-    def from_bytes(self, values):
-        return _lanes.lanes64(values) if self.shake else _lanes.words(values, 4, 64)
-
-    def to_bytes(self, value):
-        return _lanes.chunks64(value, self.count) if self.shake else _lanes.chunks(value, self.count, 4, 64)
-
-    def constant(self, data):
-        words = struct.unpack(f"<{len(data) // 8}Q", data) if self.shake else struct.unpack(f">{len(data) // 4}I", data)
-
-        return [_lanes.replicate(word, self.count, 64) for word in words]
-
-    # step(value, k) hashes I || q || j || k || value in every lane, for the (q, j) of each lane.
-    def chain_step(self, numbers, chains):
-        head, top = self.head(numbers)
-
-        top |= self.after([j << 8 for j in chains], 3)
-
-        unit = (1 << 48) if self.shake else (1 << 8)
-
-        def step(value, k):
-            return self.hash(head, top | _lanes.replicate(k * unit, self.count, 64), value, 3)
-
-        return step
-
-    # The chain starts x_j = H(I || q || j || 0xFF || SEED) of RFC 8554, Appendix A.
-    def chain_start(self, step, seed):
-        return step(self.constant(seed), 0xFF)
+    return value
 
 
-# Leaves q of one tree: the chains of a batch of leaves run in lane j * count + i (chain j of
-# leaf first + i), so that the n-byte results of one chain are a contiguous slice for K.
+# The chain starts x_i of RFC 8554, Appendix A.
+def chain_starts(t, i_value, q, seed):
+    return [derive(t.shake, t.n, i_value, q, i, seed) for i in range(t.p)]
+
+
 def leaves(lms, ots, i_value, seed, first, count):
-    p = ots.p
-
-    per_batch = max(1, CHUNK // p)
+    shake, n, last = ots.shake, ots.n, (1 << ots.w) - 1
 
     out = []
 
-    for start in range(first, first + count, per_batch):
-        size = min(per_batch, first + count - start)
+    for q in range(first, first + count):
+        prefix = i_value + u32(q)
 
-        numbers = list(range(start, start + size))
+        y = [chain(shake, n, prefix + u16(i), x, 0, last) for i, x in enumerate(chain_starts(ots, i_value, q, seed))]
 
-        lanes = Lanes(ots.shake, ots.n, i_value, size * p)
+        k_value = digest(shake, n, prefix + D_PBLC + b"".join(y))
 
-        step = lanes.chain_step(numbers * p, [j for j in range(p) for _ in range(size)])
-
-        value = lanes.chain_start(step, seed)
-
-        for k in range((1 << ots.w) - 1):
-            value = step(value, k)
-
-        lanes = Lanes(ots.shake, ots.n, i_value, size)
-
-        y = [_lanes.select(word, j * size, size, 64) for j in range(p) for word in value]
-
-        k_value = lanes.tagged(numbers, D_PBLC, y)
-
-        out += lanes.to_bytes(lanes.tagged([(1 << lms.h) + q for q in numbers], D_LEAF, k_value))
+        out.append(digest(shake, n, i_value + u32((1 << lms.h) + q) + D_LEAF + k_value))
 
     return out
 
 
 def combine(lms, i_value, z, first, lefts, rights):
-    out = []
+    base = (1 << (lms.h - z - 1)) + first
 
-    for start in range(0, len(lefts), CHUNK):
-        size = min(CHUNK, len(lefts) - start)
-
-        lanes = Lanes(lms.shake, lms.m, i_value, size)
-
-        values = lanes.from_bytes(lefts[start : start + size]) + lanes.from_bytes(rights[start : start + size])
-
-        numbers = [(1 << (lms.h - z - 1)) + first + start + i for i in range(size)]
-
-        out += lanes.to_bytes(lanes.tagged(numbers, D_INTR, values))
-
-    return out
+    return [digest(lms.shake, lms.m, i_value + u32(base + i) + D_INTR + left + right) for i, (left, right) in enumerate(zip(lefts, rights))]
 
 
 def ots_sign(t, i_value, q, seed, message):
     c = derive(t.shake, t.n, i_value, q, RANDOMIZER, seed)
 
-    q_hash = digest(t.shake, t.n, i_value + u32(q) + D_MESG + c + message)
+    prefix = i_value + u32(q)
 
-    lanes = Lanes(t.shake, t.n, i_value, t.p)
+    q_hash = digest(t.shake, t.n, prefix + D_MESG + c + message)
 
-    step = lanes.chain_step(q, list(range(t.p)))
+    starts = chain_starts(t, i_value, q, seed)
 
-    y = _lanes.run_to(step, lanes.chain_start(step, seed), digits(t, q_hash))
+    y = [chain(t.shake, t.n, prefix + u16(i), x, 0, a) for i, (x, a) in enumerate(zip(starts, digits(t, q_hash)))]
 
-    return u32(t.code) + c + b"".join(lanes.to_bytes(y))
+    return u32(t.code) + c + b"".join(y)
 
 
 def ots_candidate(t, i_value, q, signature, message):
-    n = t.n
+    n, last = t.n, (1 << t.w) - 1
 
     c = signature[4 : 4 + n]
 
-    q_hash = digest(t.shake, n, i_value + u32(q) + D_MESG + c + message)
+    prefix = i_value + u32(q)
 
-    lanes = Lanes(t.shake, n, i_value, t.p)
+    q_hash = digest(t.shake, n, prefix + D_MESG + c + message)
 
-    step = lanes.chain_step(q, list(range(t.p)))
+    z = [chain(t.shake, n, prefix + u16(i), signature[4 + n * (i + 1) : 4 + n * (i + 2)], a, last) for i, a in enumerate(digits(t, q_hash))]
 
-    y = lanes.from_bytes([signature[4 + n * (j + 1) : 4 + n * (j + 2)] for j in range(t.p)])
-
-    z = _lanes.run_from(step, y, digits(t, q_hash), (1 << t.w) - 1)
-
-    return digest(t.shake, n, i_value + u32(q) + D_PBLC + b"".join(lanes.to_bytes(z)))
+    return digest(t.shake, n, prefix + D_PBLC + b"".join(z))
 
 
 def lms_signature_size(lms, ots):

@@ -1,12 +1,9 @@
-import operator
 import threading
 from functools import partial
 
-from . import _native
-from ._bytes import equal, view
-from ._errors import CryptoPQError, ErrorCode
+from . import _native, _primitives
+from ._bytes import equal, immutable, require_output_length, view
 from ._keccak import Keccak
-from ._sha2 import IV_224, IV_256, IV_384, IV_512, IV_512_224, IV_512_256, Sha256, Sha512
 
 _Bytes = bytes | bytearray | memoryview
 
@@ -32,6 +29,7 @@ class Hasher:
             return self._engine.digest()
 
 
+# `digest` is the shortest path the backend has: with the extension module, one of its functions.
 class HashAlgorithm:
     __slots__ = ("_name", "_digest_size", "_engine", "_digest")
 
@@ -60,15 +58,6 @@ class HashAlgorithm:
 
     def __repr__(self) -> str:
         return f"<HashAlgorithm {self._name}>"
-
-
-def require_output_length(length):
-    length = operator.index(length)
-
-    if length < 0:
-        raise CryptoPQError(ErrorCode.INVALID_LENGTH, "length must not be negative")
-
-    return length
 
 
 class Xof:
@@ -107,9 +96,7 @@ class XofAlgorithm:
         return self._name
 
     def digest(self, data: _Bytes, length: int) -> bytes:
-        data = view(data)
-
-        return self._digest(data, require_output_length(length))
+        return self._digest(data, length)
 
     def create(self) -> Xof:
         return Xof(self._engine())
@@ -178,6 +165,7 @@ class HmacAlgorithm:
         return f"<HmacAlgorithm {self._name}>"
 
 
+# HMAC on crypto-pq's own hash engines.
 class _PureHmac:
     __slots__ = ("_inner", "_outer")
 
@@ -228,6 +216,25 @@ class _PureHmac:
         return equal(self.digest(), tag)
 
 
+# HMAC from the standard library's hmac module, for a hash that hashlib provides.
+class _HashlibHmac:
+    __slots__ = ("_hmac", "_compare")
+
+    def __init__(self, module, name, key):
+        self._hmac = module.new(immutable(key), digestmod=name)
+
+        self._compare = module.compare_digest
+
+    def update(self, data):
+        self._hmac.update(data)
+
+    def digest(self):
+        return self._hmac.digest()
+
+    def verify(self, tag):
+        return self._compare(self._hmac.digest(), tag)
+
+
 def _pure_digest(engine, data):
     hasher = engine()
 
@@ -239,9 +246,13 @@ def _pure_digest(engine, data):
 def _pure_xof(engine, data, length):
     xof = engine()
 
-    xof.update(data)
+    xof.update(view(data))
 
-    return xof.read(length)
+    return xof.read(require_output_length(length))
+
+
+def _shake_digest(constructor, data, length):
+    return constructor(view(data)).digest(require_output_length(length))
 
 
 def _pure_hmac(engine, key, data):
@@ -260,65 +271,76 @@ def _pure_hmac_verify(engine, key, data, tag):
     return hmac.verify(view(tag))
 
 
-# Each function is the native library's when the native backend is in use, with the pure engine
-# as its fallback; `number` is the library's id of the function.
-def _hash(name, digest_size, number, engine):
+def _hashlib_hmac(module, name, key, data):
+    return module.digest(immutable(key), view(data), name)
+
+
+def _hashlib_hmac_verify(module, name, key, data, tag):
+    return module.compare_digest(module.digest(immutable(key), view(data), name), view(tag))
+
+
+# Each algorithm is the native library's when the native backend is in use, by the library's id
+# `number`; otherwise the pure backend's: hashlib's where it has the algorithm (see _primitives),
+# crypto-pq's own code where it does not, and crypto-pq's own sponge for the streaming XOF reads
+# that hashlib cannot make.
+def _hash(name, digest_size, number, hash_name):
     if _native.BACKEND == "native":
-        return HashAlgorithm(name, digest_size, partial(_native.HashState, number, digest_size), partial(_native.hash_digest, number, digest_size))
+        return HashAlgorithm(name, digest_size, partial(_native.HashState, number, digest_size), _native.hash_function(number, digest_size))
 
-    return HashAlgorithm(name, digest_size, engine, partial(_pure_digest, engine))
+    constructor = getattr(_primitives, hash_name)
+
+    return HashAlgorithm(name, digest_size, constructor, partial(_pure_digest, constructor))
 
 
-def _xof(name, number, engine):
+def _xof(name, number, rate, hash_name):
     if _native.BACKEND == "native":
-        return XofAlgorithm(name, partial(_native.XofState, number), partial(_native.xof_digest, number))
+        return XofAlgorithm(name, partial(_native.XofState, number), _native.xof_function(number))
 
-    return XofAlgorithm(name, engine, partial(_pure_xof, engine))
+    return XofAlgorithm(name, partial(Keccak, rate, 0x1F, 0), partial(_shake_digest, getattr(_primitives, hash_name)))
 
 
-def _hmac(name, digest_size, number, engine):
+def _hmac(name, digest_size, number, hash_name):
     if _native.BACKEND == "native":
-        return HmacAlgorithm(name, digest_size, partial(_native.HmacState, number, digest_size), partial(_native.hmac_digest, number, digest_size), partial(_native.hmac_verify, number))
+        return HmacAlgorithm(name, digest_size, partial(_native.HmacState, number, digest_size), _native.hmac_function(number, digest_size), _native.hmac_verify_function(number))
+
+    engine = getattr(_primitives, hash_name)
+
+    if _primitives.hashlib is not None and engine is getattr(_primitives.hashlib, hash_name, None):
+        import hmac
+
+        return HmacAlgorithm(name, digest_size, partial(_HashlibHmac, hmac, hash_name), partial(_hashlib_hmac, hmac, hash_name), partial(_hashlib_hmac_verify, hmac, hash_name))
 
     return HmacAlgorithm(name, digest_size, partial(_PureHmac, engine), partial(_pure_hmac, engine), partial(_pure_hmac_verify, engine))
 
 
-_SHA_224 = partial(Sha256, IV_224, 28)
+SHA_224 = _hash("SHA-224", 28, 0, "sha224")
 
-_SHA_256 = partial(Sha256, IV_256, 32)
+SHA_256 = _hash("SHA-256", 32, 1, "sha256")
 
-_SHA_384 = partial(Sha512, IV_384, 48)
+SHA_384 = _hash("SHA-384", 48, 2, "sha384")
 
-_SHA_512 = partial(Sha512, IV_512, 64)
+SHA_512 = _hash("SHA-512", 64, 3, "sha512")
 
-SHA_224 = _hash("SHA-224", 28, 0, _SHA_224)
+SHA_512_224 = _hash("SHA-512/224", 28, 4, "sha512_224")
 
-SHA_256 = _hash("SHA-256", 32, 1, _SHA_256)
+SHA_512_256 = _hash("SHA-512/256", 32, 5, "sha512_256")
 
-SHA_384 = _hash("SHA-384", 48, 2, _SHA_384)
+SHA3_224 = _hash("SHA3-224", 28, 6, "sha3_224")
 
-SHA_512 = _hash("SHA-512", 64, 3, _SHA_512)
+SHA3_256 = _hash("SHA3-256", 32, 7, "sha3_256")
 
-SHA_512_224 = _hash("SHA-512/224", 28, 4, partial(Sha512, IV_512_224, 28))
+SHA3_384 = _hash("SHA3-384", 48, 8, "sha3_384")
 
-SHA_512_256 = _hash("SHA-512/256", 32, 5, partial(Sha512, IV_512_256, 32))
+SHA3_512 = _hash("SHA3-512", 64, 9, "sha3_512")
 
-SHA3_224 = _hash("SHA3-224", 28, 6, partial(Keccak, 144, 0x06, 28))
+SHAKE128 = _xof("SHAKE128", 0, 168, "shake_128")
 
-SHA3_256 = _hash("SHA3-256", 32, 7, partial(Keccak, 136, 0x06, 32))
+SHAKE256 = _xof("SHAKE256", 1, 136, "shake_256")
 
-SHA3_384 = _hash("SHA3-384", 48, 8, partial(Keccak, 104, 0x06, 48))
+HMAC_SHA_224 = _hmac("HMAC-SHA-224", 28, 0, "sha224")
 
-SHA3_512 = _hash("SHA3-512", 64, 9, partial(Keccak, 72, 0x06, 64))
+HMAC_SHA_256 = _hmac("HMAC-SHA-256", 32, 1, "sha256")
 
-SHAKE128 = _xof("SHAKE128", 0, partial(Keccak, 168, 0x1F, 0))
+HMAC_SHA_384 = _hmac("HMAC-SHA-384", 48, 2, "sha384")
 
-SHAKE256 = _xof("SHAKE256", 1, partial(Keccak, 136, 0x1F, 0))
-
-HMAC_SHA_224 = _hmac("HMAC-SHA-224", 28, 0, _SHA_224)
-
-HMAC_SHA_256 = _hmac("HMAC-SHA-256", 32, 1, _SHA_256)
-
-HMAC_SHA_384 = _hmac("HMAC-SHA-384", 48, 2, _SHA_384)
-
-HMAC_SHA_512 = _hmac("HMAC-SHA-512", 64, 3, _SHA_512)
+HMAC_SHA_512 = _hmac("HMAC-SHA-512", 64, 3, "sha512")

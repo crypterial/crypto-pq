@@ -758,10 +758,11 @@ jobs:
       - run: go test -run '^$' -bench 'BenchmarkPQ' -benchtime 300ms -count 3 . | tee kernels.txt
       - run: go test -tags purego -run '^$' -bench 'BenchmarkPQ' -benchtime 300ms -count 3 . | tee portable.txt
 
-  # The C ABI's shipped artifacts (seven native libraries and five WebAssembly modules), built on
-  # an x86-64 and an Arm host: the two sets must be byte-identical, which proves they come from
-  # this source and this pinned Zig alone. The WebAssembly lint lists select and br_if in the
-  # secret-handling functions against the reviewed allowlist.
+  # The C ABI's shipped artifacts (seven native libraries, the Python extension module for the
+  # same seven platforms and five WebAssembly modules), built on an x86-64 and an Arm host: the two
+  # sets must be byte-identical, which proves they come from this source and this pinned Zig alone.
+  # The WebAssembly lint lists select and br_if in the secret-handling functions against the
+  # reviewed allowlist. The extension module also builds with its safety checks for every target.
   zig-abi-dist:
     name: zig C ABI dist (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -789,6 +790,11 @@ jobs:
           echo ~/zig >> "$GITHUB_PATH"
       - run: zig build dist
       - run: zig build wasm-lint
+      - run: |
+          for target in x86_64-linux-none aarch64-linux-none riscv64-linux-none x86_64-macos.13.0 aarch64-macos.13.0 x86_64-windows-gnu aarch64-windows-gnu; do
+            zig build pyext -Dtarget="$target" -Doptimize=ReleaseSafe -p "zig-out/safe/$target"
+          done
+          ls -l zig-out/safe/*/*
       - run: (cd zig-out/dist && find . -type f | LC_ALL=C sort | xargs sha256sum) | tee dist.sha256
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -934,9 +940,9 @@ jobs:
           DENO_NO_UPDATE_CHECK: "1"
       - run: ~/bun/bun-linux-x64/bun test/engines.ts
 
-  # The Python package's platform wheels, built by the stdlib backend from the zig-abi-dist
-  # libraries (twice, byte-identical), installed on every matching runner, and run there with the
-  # native and the pure backend; musl and RISC-V run in containers.
+  # The Python package's platform wheels, built by the stdlib backend from the zig-abi-dist files
+  # (twice, byte-identical), installed on every matching runner, and run there with each binding of
+  # the native backend and with the pure backend; musl and RISC-V run in containers.
   python-wheels:
     name: python wheels
     needs: zig-abi-dist
@@ -967,8 +973,11 @@ jobs:
           path: ${{ runner.temp }}/one
 
   # Each platform wheel on the runner that runs it: pip must choose it over the pure wheel, the
-  # backend must be native, and the whole suite runs under both backends with the installed
-  # package (the fallback, thread, wipe, differential and isolation tests included). 3.14t is the
+  # backend must be native through the binding that the interpreter takes (the extension module on
+  # CPython with the GIL, ctypes on free-threaded 3.14t and PyPy), and the whole suite runs with
+  # the installed package (the fallback, thread, wipe, differential and isolation tests included)
+  # under that binding, under ctypes where the extension serves (a None in sys.modules blocks the
+  # extension module, as it blocks an import), and under the pure backend. 3.14t is the
   # free-threaded build, where the thread tests run truly in parallel.
   python-native:
     name: python ${{ matrix.python }} wheel (${{ matrix.os }})
@@ -981,8 +990,9 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
         python: ["3.11", "3.x"]
         include:
-          - { os: ubuntu-latest, python: "3.14t" }
-          - { os: ubuntu-24.04-arm, python: "3.14t" }
+          - { os: ubuntu-latest, python: "3.14t", binding: ctypes }
+          - { os: ubuntu-24.04-arm, python: "3.14t", binding: ctypes }
+          - { os: ubuntu-latest, python: "pypy3.11", binding: ctypes }
     defaults:
       run:
         shell: bash
@@ -997,8 +1007,12 @@ jobs:
           name: python-wheels
           path: wheels
       - run: python -m pip install --no-index --find-links ../../wheels crypto-pq
-      - run: python -c 'import crypto_pq, sys; print(crypto_pq.BACKEND, crypto_pq.LOAD_ERROR, crypto_pq.__file__); sys.exit(crypto_pq.BACKEND != "native")'
+      - run: python -c 'import crypto_pq, sys; from crypto_pq import _native as n; print(crypto_pq.BACKEND, n.BINDING, crypto_pq.LOAD_ERROR, n.EXTENSION_ERROR, crypto_pq.__file__); sys.exit((crypto_pq.BACKEND, n.BINDING) != ("native", sys.argv[1]))' ${{ matrix.binding || 'extension' }}
       - run: python -m unittest discover -s . -v
+        env:
+          CRYPTO_PQ_BACKEND: native
+      - if: (matrix.binding || 'extension') == 'extension'
+        run: python -c 'import sys; sys.modules["crypto_pq._cpq"] = None; from crypto_pq import _native; assert _native.BINDING == "ctypes", _native.BINDING; import unittest; unittest.main(module=None, argv=["unittest", "discover", "-s", "."])'
         env:
           CRYPTO_PQ_BACKEND: native
       - run: python -m unittest discover -s .
@@ -1024,14 +1038,16 @@ jobs:
       - run: |
           docker run --rm -v "$PWD:/w" -w /w/python/tests python:3.14-alpine sh -ec '
             pip install -q --root-user-action=ignore --no-index --find-links /w/wheels crypto-pq
-            python -c "import crypto_pq, sys; print(crypto_pq.BACKEND, crypto_pq.LOAD_ERROR); sys.exit(crypto_pq.BACKEND != \"native\")"
+            python -c "import crypto_pq, sys; from crypto_pq import _native as n; print(crypto_pq.BACKEND, n.BINDING, crypto_pq.LOAD_ERROR, n.EXTENSION_ERROR); sys.exit((crypto_pq.BACKEND, n.BINDING) != (\"native\", \"extension\"))"
             CRYPTO_PQ_BACKEND=native python -m unittest discover -s .
+            CRYPTO_PQ_BACKEND=native python -c "import sys; sys.modules[\"crypto_pq._cpq\"] = None; from crypto_pq import _native; assert _native.BINDING == \"ctypes\", _native.BINDING; import unittest; unittest.main(module=None, argv=[\"unittest\", \"discover\", \"-s\", \".\"])"
             CRYPTO_PQ_BACKEND=pure python -m unittest discover -s .
           '
 
   # riscv64, the one shipped platform that no runner has, under qemu user mode (the distribution's
-  # qemu-user-static registers the binfmt handler that docker uses). The native suite only: the
-  # pure one adds nothing that the other runners do not check, at twenty times the cost.
+  # qemu-user-static registers the binfmt handler that docker uses). The native suite through the
+  # extension module, and the native tests through ctypes: the pure suite adds nothing that the
+  # other runners do not check, at twenty times the cost.
   python-riscv64:
     name: python wheel riscv64 (qemu)
     needs: python-wheels
@@ -1047,8 +1063,9 @@ jobs:
       - run: |
           docker run --rm --platform linux/riscv64 -v "$PWD:/w" -w /w/python/tests python:3.14-slim sh -ec '
             pip install -q --root-user-action=ignore --no-index --find-links /w/wheels crypto-pq
-            python -c "import crypto_pq, sys; print(crypto_pq.BACKEND, crypto_pq.LOAD_ERROR); sys.exit(crypto_pq.BACKEND != \"native\")"
+            python -c "import crypto_pq, sys; from crypto_pq import _native as n; print(crypto_pq.BACKEND, n.BINDING, crypto_pq.LOAD_ERROR, n.EXTENSION_ERROR); sys.exit((crypto_pq.BACKEND, n.BINDING) != (\"native\", \"extension\"))"
             CRYPTO_PQ_BACKEND=native python -m unittest discover -s .
+            CRYPTO_PQ_BACKEND=native python -c "import sys; sys.modules[\"crypto_pq._cpq\"] = None; from crypto_pq import _native; assert _native.BINDING == \"ctypes\", _native.BINDING; import unittest; unittest.main(module=None, argv=[\"unittest\", \"test_native\"])"
           '
 
   # The package's own type check (mypy is a test-only tool here: nothing ships or builds with it).

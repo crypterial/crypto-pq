@@ -1,6 +1,8 @@
+import ast
 import binascii
 import copy
 import gc
+import importlib
 import inspect
 import os
 import pickle
@@ -15,11 +17,14 @@ from unittest import mock
 
 import crypto_pq
 from crypto_pq import CryptoPQError, ErrorCode, hazmat
-from crypto_pq import _bits, _blocks, _hash, _keccak, _kem, _lanes, _lms, _merkle, _mldsa, _mlkem, _native, _ntt, _primitives, _sha2, _signature, _slhdsa, _stateful, _x25519, _xmss, _xwing
+from crypto_pq import _hash, _keccak, _kem, _lms, _mldsa, _mlkem, _native, _sha2, _signature, _slhdsa, _stateful
+from test_primitives import on_hashlib
 from test_robustness import MemoryStore, Random, mutate, mutate_state, pattern
 from vectors import expanded_key
 
 NATIVE = crypto_pq.BACKEND == "native"
+
+EXTENSION = _native.BINDING == "extension"
 
 # CRYPTO_PQ_FUZZ=1 runs many more differential rounds, and every SLH-DSA set.
 FUZZ = bool(os.environ.get("CRYPTO_PQ_FUZZ"))
@@ -106,6 +111,12 @@ def pure_twins():
     return twins
 
 
+def sysconfig_gil_disabled():
+    import sysconfig
+
+    return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+
+
 def outcome(function, *args, **kwargs):
     try:
         return "ok", function(*args, **kwargs)
@@ -155,12 +166,43 @@ class KnownAnswerTest(unittest.TestCase):
 
         self.assertEqual(crypto_pq.LOAD_ERROR is None, NATIVE or os.environ.get("CRYPTO_PQ_BACKEND") == "pure")
 
+        self.assertEqual(_native.BINDING, ("extension" if _native.EXTENSION_ERROR is None else "ctypes") if NATIVE else None)
+
+    # The extension module serves CPython with the GIL, and ctypes every other interpreter.
+    def test_binding(self):
+        refusal = _native.extension_refusal()
+
+        if sys.implementation.name != "cpython":
+            self.assertIn("needs CPython", refusal)
+        elif sysconfig_gil_disabled():
+            self.assertIn("free-threaded", refusal)
+        else:
+            self.assertIsNone(refusal)
+
+        if NATIVE and refusal is not None:
+            self.assertEqual((_native.BINDING, _native.EXTENSION_ERROR), ("ctypes", refusal))
+
+    # A build whose objects lie otherwise than in the stable ABI is refused by its configuration,
+    # before anything is loaded.
+    @unittest.skipUnless(sys.implementation.name == "cpython", "CPython's build configuration")
+    def test_refused_builds(self):
+        import sysconfig
+
+        for name, reason in (("Py_GIL_DISABLED", "free-threaded"), ("Py_TRACE_REFS", "Py_TRACE_REFS")):
+            with self.subTest(name=name), mock.patch.object(sysconfig, "get_config_var", lambda key, name=name: 1 if key == name else 0):
+                self.assertIn(reason, _native.extension_refusal())
+
 
 @unittest.skipUnless(NATIVE, "compares the native backend with the pure one")
 class DifferentialTest(unittest.TestCase):
+    # The pure algorithms hash through hashlib here, a test-only oracle apart from both of
+    # crypto-pq's engines: on crypto-pq's own pure engines, which test_primitives checks against
+    # hashlib, every SLH-DSA signature would take seconds.
     @classmethod
     def setUpClass(cls):
         cls.twins = pure_twins()
+
+        cls.enterClassContext(on_hashlib())
 
     def test_hashes(self):
         rng = Random(301)
@@ -409,9 +451,20 @@ class DifferentialTest(unittest.TestCase):
         return outcome(load)
 
 
+# The modules of the public API, the shared helpers and the bindings; every other module of the
+# package holds pure algorithm code.
+NOT_PURE = {"__init__", "_bytes", "_encoding", "_errors", "_hash", "_keys", "_kem", "_native", "_native_ctypes", "_native_extension", "_rng", "_signature", "_stateful", "hazmat"}
+
+
+def pure_modules():
+    names = sorted(name[:-3] for name in os.listdir(os.path.dirname(crypto_pq.__file__)) if name.endswith(".py") and name[:-3] not in NOT_PURE)
+
+    return tuple(importlib.import_module(f"crypto_pq.{name}") for name in names)
+
+
 @unittest.skipUnless(NATIVE, "the native backend")
 class IsolationTest(unittest.TestCase):
-    PURE_MODULES = (_bits, _blocks, _keccak, _lanes, _lms, _merkle, _mldsa, _mlkem, _ntt, _primitives, _sha2, _slhdsa, _x25519, _xmss, _xwing)
+    PURE_MODULES = pure_modules()
 
     # Byte packing that the stateful parameter sections share with the pure LMS code.
     ALLOWED = {(_lms, "u32")}
@@ -534,13 +587,12 @@ class IsolationTest(unittest.TestCase):
 
 @unittest.skipUnless(NATIVE, "the native backend's slots")
 class WipeTest(unittest.TestCase):
-    # The slot memory of an object, which outlives the slot while the test holds it.
+    # The memory that holds a slot (a ctypes buffer or the extension's bytearray), which outlives
+    # the slot while the test holds it.
     def memory_of(self, slot):
         memory = slot._memory
 
-        start = slot.address - _native._c.addressof(memory)
-
-        return memory, memory.raw[start : start + slot.size]
+        return memory, bytes(memory)[slot.offset : slot.offset + slot.size]
 
     def assertWiped(self, make, slot_of):
         holder = [make()]
@@ -557,7 +609,7 @@ class WipeTest(unittest.TestCase):
 
         gc.collect()
 
-        self.assertEqual(memory.raw, bytes(len(memory)))
+        self.assertEqual(bytes(memory), bytes(len(memory)))
 
     def test_slots(self):
         self.assertWiped(lambda: crypto_pq.ML_KEM_768.generate_key_pair().private_key, lambda key: key._private)
@@ -602,21 +654,44 @@ class WipeTest(unittest.TestCase):
 
         self.assertEqual(pair.private_key.decapsulate(sealed.ciphertext), sealed.shared_secret)
 
-    # A wipe that the library refuses, as it does for a slot that a call holds, leaves the memory
-    # allocated instead of freeing it under that call.
+    # A wipe that the library refuses, as it does for a slot that a call is inside, keeps the
+    # memory allocated rather than free it under that call: the ctypes binding keeps the buffer in
+    # Slot.kept, and the extension module keeps its bytearray exported for good. The test counts a
+    # call in the users field of the slot's header (after the magic, the algorithm, the size and
+    # the flags), which no call leaves.
     def test_refused_wipe(self):
-        slot = _native.Slot(_native.HASHER, 1)
+        hasher = crypto_pq.SHA3_256.create()
 
-        memory = slot._memory
+        hasher.update(b"a state to keep")
 
-        with mock.patch.object(_native.Slot, "wipe", staticmethod(lambda address, size: 104)):
-            del slot
+        slot = hasher._engine._slot
 
-            gc.collect()
+        memory, users = slot._memory, slot.offset + 20
 
-        self.assertEqual(len(_native.Slot.kept), 1)
+        memory[users] = 1 if isinstance(memory, bytearray) else b"\x01"
 
-        self.assertIs(_native.Slot.kept.pop(), memory)
+        before = bytes(memory)
+
+        kept = [] if EXTENSION else _native.Slot.kept
+
+        count = len(kept)
+
+        del slot, hasher
+
+        gc.collect()
+
+        if EXTENSION:
+            with self.assertRaises(BufferError):
+                memory.append(0)
+        else:
+            self.assertTrue(any(item is memory for item in kept[count:]))
+
+            del kept[count:]
+
+        after = bytes(memory)
+
+        # The wipe marked the call's count and stopped there.
+        self.assertEqual(after[:users] + after[users + 4 :], before[:users] + before[users + 4 :])
 
     # A wiped slot is refused, never read as a key.
     def test_wiped_slot_is_refused(self):
@@ -624,9 +699,7 @@ class WipeTest(unittest.TestCase):
 
         sealed = private_key.public_key.encapsulate()
 
-        slot = private_key._private
-
-        _native.Slot.wipe(slot.address, slot.size)
+        self.assertEqual(_native.wipe(private_key._private), 0)
 
         with self.assertRaises(RuntimeError):
             private_key.decapsulate(sealed.ciphertext)
@@ -635,7 +708,7 @@ class WipeTest(unittest.TestCase):
             private_key.export_key("raw")
 
     def recorded(self, function):
-        buffers, original = [], _native.output
+        buffers, original = [], _native.binding.output
 
         def record(size):
             buffer = original(size)
@@ -644,12 +717,14 @@ class WipeTest(unittest.TestCase):
 
             return buffer
 
-        with mock.patch.object(_native, "output", record):
+        with mock.patch.object(_native.binding, "output", record):
             result = function()
 
         return result, buffers
 
-    # The buffers that held secrets are zeroed once the secret is copied out.
+    # The buffers that held secrets are zeroed once the secret is copied out. The extension module
+    # writes each output straight into the bytes object that it returns.
+    @unittest.skipIf(EXTENSION, "the extension module has no output buffers to zero")
     def test_secret_outputs(self):
         pair = crypto_pq.ML_KEM_768.generate_key_pair()
 
@@ -912,17 +987,21 @@ class ThreadTest(unittest.TestCase):
 
 
 # Each case runs in a fresh interpreter on a copy of the installed package, changed as the case
-# needs: the backend is chosen once, at import.
+# needs: the backend and its binding are chosen once, at import.
 PROBE = """
 import sys
 {prelude}
 try:
     import crypto_pq
+    from crypto_pq import _native
 except ImportError as error:
-    print("ImportError", error)
+    print(repr(("ImportError", str(error))))
     raise SystemExit(0)
-print(crypto_pq.BACKEND, "ctypes" in sys.modules, repr(crypto_pq.LOAD_ERROR))
+print(repr((crypto_pq.BACKEND, _native.BINDING, sys.modules.get("ctypes") is not None, crypto_pq.LOAD_ERROR, _native.EXTENSION_ERROR)))
 """
+
+# Whether this interpreter can load the extension module, and why not.
+REFUSAL = _native.extension_refusal()
 
 
 class ProbeCase(unittest.TestCase):
@@ -939,6 +1018,8 @@ class ProbeCase(unittest.TestCase):
 
         shutil.copytree(self.PACKAGE, self.package, ignore=shutil.ignore_patterns("__pycache__"))
 
+    # (backend, binding, whether ctypes was imported, LOAD_ERROR, EXTENSION_ERROR), or
+    # ("ImportError", message).
     def probe(self, backend=None, prelude=""):
         env = {key: value for key, value in os.environ.items() if key not in ("CRYPTO_PQ_BACKEND", "PYTHONPATH")}
 
@@ -951,30 +1032,35 @@ class ProbeCase(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
-        return result.stdout.strip()
+        return ast.literal_eval(result.stdout.strip())
 
-    def record(self):
+    def record_lines(self):
         with open(os.path.join(self.package, _native.RECORD)) as handle:
-            return dict(line.partition(" ")[::2] for line in handle.read().splitlines()[1:])
+            return handle.read().splitlines()
 
-    def library(self):
-        return os.path.join(self.package, self.record()["file"])
+    def write_record(self, lines):
+        with open(os.path.join(self.package, _native.RECORD), "w") as handle:
+            handle.write("".join(line + "\n" for line in lines))
 
-    def write_library(self, data, target=None, recorded=True):
-        fields = self.record()
+    def entry(self, role):
+        return next(line.split(" ")[1:] for line in self.record_lines() if line.startswith(role + " "))
 
-        with open(os.path.join(self.package, fields["file"]), "wb") as handle:
+    def path(self, role):
+        return os.path.join(self.package, self.entry(role)[0])
+
+    def read(self, role):
+        with open(self.path(role), "rb") as handle:
+            return handle.read()
+
+    # Replaces a native file, and its line in the record unless `recorded` is false.
+    def write(self, role, data, recorded=True):
+        name = self.entry(role)[0]
+
+        with open(self.path(role), "wb") as handle:
             handle.write(data)
 
         if recorded:
-            fields.update(size=str(len(data)), crc32=f"{binascii.crc32(data):08x}", target=target or fields["target"])
-
-            with open(os.path.join(self.package, _native.RECORD), "w") as handle:
-                handle.write(_native.RECORD_FORMAT + "\n" + "".join(f"{key} {value}\n" for key, value in fields.items()))
-
-    def read_library(self):
-        with open(self.library(), "rb") as handle:
-            return handle.read()
+            self.write_record([f"{role} {name} {len(data)} {binascii.crc32(data):08x}" if line.startswith(role + " ") else line for line in self.record_lines()])
 
     def patch_module(self, old, new):
         path = os.path.join(self.package, "_native.py")
@@ -987,35 +1073,42 @@ class ProbeCase(unittest.TestCase):
         with open(path, "w") as handle:
             handle.write(source.replace(old, new))
 
-    def assertPure(self, output, reason):
-        backend, ctypes_loaded, error = output.split(" ", 2)
+    def assertPure(self, found, reason):
+        self.assertEqual(found[:2], ("pure", None), found)
 
-        self.assertEqual(backend, "pure", output)
+        self.assertIn(reason, found[3])
 
-        self.assertIn(reason, error)
+    def assertRefused(self, reason, prelude=""):
+        found = self.probe("native", prelude)
+
+        self.assertEqual(found[0], "ImportError", found)
+
+        self.assertTrue(found[1].startswith("CRYPTO_PQ_BACKEND is native, but the native library cannot be used"), found)
+
+        self.assertIn(reason, found[1])
 
 
 class SelectionTest(ProbeCase):
     def test_choices(self):
-        for value in ("typo", "", "NATIVE", "Pure"):
+        for value in ("typo", "", "NATIVE", "Pure", "ctypes"):
             with self.subTest(value=value):
-                self.assertTrue(self.probe(value).startswith("ImportError CRYPTO_PQ_BACKEND must be auto, native or pure"))
+                self.assertEqual(self.probe(value), ("ImportError", f"CRYPTO_PQ_BACKEND must be auto, native or pure, not {value!r}"))
 
-        # The pure backend never maps the library, nor even imports ctypes.
-        self.assertEqual(self.probe("pure"), "pure False None")
+        # The pure backend never maps a native file, nor even imports ctypes.
+        self.assertEqual(self.probe("pure"), ("pure", None, False, None, None))
 
         if not self.HAS_LIBRARY:
             self.assertPure(self.probe(), "the package holds no native library")
 
-            self.assertIn("the package holds no native library", self.probe("native"))
+            self.assertRefused("the package holds no native library")
 
             return
 
-        self.assertEqual(self.probe(), "native True None")
+        # The extension module needs no ctypes.
+        expected = ("native", "extension", False, None, None) if REFUSAL is None else ("native", "ctypes", True, None, REFUSAL)
 
-        self.assertEqual(self.probe("auto"), "native True None")
-
-        self.assertEqual(self.probe("native"), "native True None")
+        for backend in (None, "auto", "native"):
+            self.assertEqual(self.probe(backend), expected)
 
     def test_no_library(self):
         if self.HAS_LIBRARY:
@@ -1023,97 +1116,270 @@ class SelectionTest(ProbeCase):
 
         self.assertPure(self.probe(), "the package holds no native library")
 
-        self.assertTrue(self.probe("native").startswith("ImportError CRYPTO_PQ_BACKEND is native, but the native library cannot be used: the package holds no native library"))
+        self.assertRefused("the native library cannot be used: the package holds no native library")
 
 
 @unittest.skipUnless(ProbeCase.HAS_LIBRARY, "the package holds no native library")
 class FallbackTest(ProbeCase):
-    def check(self, reason, prelude=""):
+    # The extension module is unusable for `reason`: ctypes serves instead.
+    def without_extension(self, reason, prelude=""):
+        found = self.probe(prelude=prelude)
+
+        self.assertEqual(found[:4], ("native", "ctypes", True, None), found)
+
+        self.assertIn(reason if REFUSAL is None else REFUSAL, found[4])
+
+    # The library is unusable for `reason`: the extension module serves where it can, and the pure
+    # backend elsewhere, as it does where the extension module is blocked.
+    def without_library(self, reason, prelude=""):
+        if REFUSAL is None:
+            self.assertEqual(self.probe(prelude=prelude), ("native", "extension", False, None, None))
+
+            prelude += "\nsys.modules['crypto_pq._cpq'] = None"
+
         self.assertPure(self.probe(prelude=prelude), reason)
 
-        self.assertTrue(self.probe("native", prelude).startswith("ImportError CRYPTO_PQ_BACKEND is native, but the native library cannot be used"), reason)
+        self.assertRefused(reason, prelude)
+
+    # Neither file is usable: the pure backend, with both reasons.
+    def without_either(self, library_reason, extension_reason, prelude=""):
+        found = self.probe(prelude=prelude)
+
+        self.assertPure(found, library_reason)
+
+        self.assertIn(extension_reason if REFUSAL is None else REFUSAL, found[4])
+
+        self.assertRefused(library_reason, prelude)
 
     def test_missing(self):
-        os.remove(self.library())
+        extension, library = self.path("extension"), self.path("library")
 
-        self.check("No such file")
+        os.rename(extension, extension + ".gone")
+
+        self.without_extension("No such file")
+
+        os.rename(extension + ".gone", extension)
+
+        os.remove(library)
+
+        self.without_library("No such file")
+
+        os.remove(extension)
+
+        self.without_either("No such file", "No such file")
 
     def test_truncated(self):
-        data = self.read_library()
+        extension, library = self.read("extension"), self.read("library")
 
-        self.write_library(data[: len(data) // 3], recorded=False)
+        for size in (len(extension) // 3, 4096):
+            self.write("extension", extension[:size], recorded=False)
 
-        self.check("the native library is damaged")
+            self.without_extension("the extension module is damaged")
 
-        self.write_library(data[:4096], recorded=False)
+        self.write("extension", extension, recorded=False)
 
-        self.check("the native library is damaged")
+        self.write("library", library[: len(library) // 3], recorded=False)
+
+        self.without_library("the native library is damaged")
 
     def test_bit_flipped(self):
-        data = bytearray(self.read_library())
+        for role, reason in (("extension", "the extension module is damaged"), ("library", "the native library is damaged")):
+            data = self.read(role)
 
-        data[len(data) // 2] ^= 0x10
+            flipped = bytearray(data)
 
-        self.write_library(bytes(data), recorded=False)
+            flipped[len(data) // 2] ^= 0x10
 
-        self.check("the native library is damaged")
+            self.write(role, bytes(flipped), recorded=False)
+
+            (self.without_extension if role == "extension" else self.without_library)(reason)
+
+            self.write(role, data, recorded=False)
 
     def test_record(self):
-        record = os.path.join(self.package, _native.RECORD)
-
-        with open(record) as handle:
-            text = handle.read()
+        lines = self.record_lines()
 
         for changed, reason in (
-            (text.replace(_native.RECORD_FORMAT, "crypto-pq native library 2"), "unknown format"),
-            ("".join(line + "\n" for line in text.splitlines() if not line.startswith("crc32")), "malformed"),
-            (text.replace("file ", "file ../"), "names no crypto-pq library"),
+            ([lines[0].replace("files 1", "files 2")] + lines[1:], "unknown format"),
+            ([line.rsplit(" ", 1)[0] if line.startswith("library ") else line for line in lines], "malformed"),
+            ([line for line in lines if not line.startswith("target ")], "malformed"),
+            (lines + [lines[-1]], "malformed"),
         ):
-            with open(record, "w") as handle:
-                handle.write(changed)
+            with self.subTest(reason=reason, record=changed):
+                self.write_record(changed)
 
-            self.check(reason)
+                found = self.probe()
 
-    # A library built for another platform is refused before it is mapped; one that claims this
-    # platform is refused by the dynamic loader.
+                self.assertPure(found, reason)
+
+                self.assertIsNone(found[4])
+
+                self.assertRefused(reason)
+
+        self.write_record([line.replace("library ", "library ../") for line in lines])
+
+        self.without_library("names no crypto-pq native library")
+
+        self.write_record([line.replace("extension ", "extension ../") for line in lines])
+
+        self.without_extension("names no crypto-pq extension module")
+
+        self.write_record([line for line in lines if not line.startswith("extension ")])
+
+        self.without_extension("the package holds no extension module")
+
+    # Files built for another platform are refused before they are mapped; files that claim this
+    # platform are refused by the dynamic loader. CRYPTO_PQ_FOREIGN_DIST names the `zig build dist`
+    # directory of another platform, for the second check.
     def test_foreign_platform(self):
         running = _native.platform_target()
 
         other = "aarch64-linux" if running != "aarch64-linux" else "x86_64-linux"
 
-        data = self.read_library()
+        lines = self.record_lines()
 
-        self.write_library(data, target=other)
+        self.write_record([f"target {other}" if line.startswith("target ") else line for line in lines])
 
-        self.check(f"built for {other}")
+        self.assertPure(self.probe(), f"built for {other}")
 
-        foreign = os.environ.get("CRYPTO_PQ_FOREIGN_LIBRARY")
+        self.assertRefused(f"built for {other}")
 
-        if foreign:
-            with open(foreign, "rb") as handle:
-                self.write_library(handle.read(), target=running)
+        foreign = os.environ.get("CRYPTO_PQ_FOREIGN_DIST")
 
-            self.check("OSError")
+        if not foreign:
+            return
+
+        self.write_record(lines)
+
+        names = {entry.name for entry in os.scandir(foreign)}
+
+        for role, names_of_role, error in (("extension", _native.EXTENSIONS, "ImportError"), ("library", _native.LIBRARIES, "OSError")):
+            original = self.read(role)
+
+            with open(os.path.join(foreign, next(name for name in names_of_role if name in names)), "rb") as handle:
+                self.write(role, handle.read())
+
+            (self.without_extension if role == "extension" else self.without_library)(error)
+
+            self.write(role, original)
 
     def test_garbage(self):
-        data = self.read_library()
+        for role, error in (("extension", "ImportError"), ("library", "OSError")):
+            data = self.read(role)
 
-        self.write_library(data[:4] + Random(9).bytes(len(data) - 4))
+            self.write(role, data[:4] + Random(9).bytes(len(data) - 4))
 
-        self.check("OSError")
+            (self.without_extension if role == "extension" else self.without_library)(error)
+
+            self.write(role, data)
 
     def test_abi_version(self):
         self.patch_module("ABI_VERSION = 1", "ABI_VERSION = 2")
 
-        self.check("ABI version 1, and this package needs 2")
+        self.without_either("the native library has ABI version 1, and this package needs 2", "the extension module has ABI version 1, and this package needs 2")
 
     def test_self_test(self):
         self.patch_module(_native.SELF_TEST_DIGEST, "00" * 32)
 
-        self.check("the known-answer test failed")
+        self.without_either("the known-answer test failed", "the known-answer test failed")
 
     def test_no_ctypes(self):
-        self.check("import of ctypes halted", prelude="sys.modules['ctypes'] = None")
+        self.without_library("import of ctypes halted", prelude="sys.modules['ctypes'] = None")
+
+    # A None in sys.modules blocks the extension module, as it blocks an import: the test suite's
+    # way to run with ctypes where the extension would serve.
+    def test_blocked_extension(self):
+        self.without_extension("import of crypto_pq._cpq halted", prelude="sys.modules['crypto_pq._cpq'] = None")
+
+
+@unittest.skipUnless(EXTENSION, "the extension module")
+class ExtensionTest(unittest.TestCase):
+    def setUp(self):
+        self.module = importlib.import_module("crypto_pq._cpq")
+
+    # The module that passed the known-answer test is the one that an import finds.
+    def test_registered(self):
+        self.assertIs(self.module.Slot, _native.Slot)
+
+        self.assertIs(getattr(crypto_pq, "_cpq"), self.module)
+
+        with self.assertRaises(TypeError):
+            self.module.Slot()
+
+    # A one-shot hash, XOF or HMAC is one call of the module.
+    def test_shortest_path(self):
+        for algorithm, number in zip(HASHES, range(10)):
+            self.assertIs(algorithm._digest, getattr(self.module, f"hash{number}"))
+
+        for algorithm, number in zip(XOFS, range(2)):
+            self.assertIs(algorithm._digest, getattr(self.module, f"xof{number}"))
+
+        for algorithm, number in zip(HMACS, range(4)):
+            self.assertIs(algorithm._digest, getattr(self.module, f"hmac{number}"))
+
+            self.assertIs(algorithm._verify, getattr(self.module, f"hmac_verify{number}"))
+
+    def test_arguments(self):
+        data = b"crypto-pq"
+
+        self.assertEqual(crypto_pq.SHA_256.digest(memoryview(b"x" + data)[1:]), crypto_pq.SHA_256.digest(bytearray(data)))
+
+        for wrong in ("text", 3, None, memoryview(data)[::2]):
+            with self.subTest(wrong=wrong), self.assertRaises(TypeError):
+                crypto_pq.SHA_256.digest(wrong)
+
+        with self.assertRaises(TypeError):
+            crypto_pq.SHAKE128.digest(data, 1.5)
+
+        with self.assertRaises(CryptoPQError) as caught:
+            crypto_pq.SHAKE128.digest(data, -1)
+
+        self.assertEqual(caught.exception.code, ErrorCode.INVALID_LENGTH)
+
+        self.assertEqual(crypto_pq.SHAKE128.digest(data, True), crypto_pq.SHAKE128.digest(data, 1))
+
+        for call in (lambda: self.module.hash1(), lambda: self.module.hash1(data, data), lambda: self.module.kem_decapsulate(data, data), lambda: self.module.kem_generate(-1, bytes(64))):
+            with self.assertRaises((TypeError, OverflowError)):
+                call()
+
+        with self.assertRaises(OverflowError):
+            self.module.kem_generate(1 << 32, bytes(64))
+
+        with self.assertRaisesRegex(RuntimeError, "status 101"):
+            self.module.kem_generate(4, bytes(64))
+
+    # A long hash leaves the GIL to other threads and keeps its input exported meanwhile: another
+    # thread can run during the call, and finds that it cannot resize the bytearray being hashed.
+    def test_gil(self):
+        data, seen, done = bytearray(8 << 20), [], threading.Event()
+
+        def resize():
+            while not done.is_set():
+                try:
+                    data.append(0)
+
+                    del data[-1]
+                except BufferError:
+                    seen.append(True)
+
+                    return
+
+        thread = threading.Thread(target=resize)
+
+        thread.start()
+
+        try:
+            for _ in range(200):
+                if seen:
+                    break
+
+                crypto_pq.SHA3_512.digest(data)
+        finally:
+            done.set()
+
+            thread.join()
+
+        self.assertTrue(seen)
 
 
 if __name__ == "__main__":

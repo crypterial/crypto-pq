@@ -236,6 +236,19 @@ class Keccak(Blocks):
 
         self._position = -1
 
+    def copy(self):
+        other = Keccak(self._block, self._suffix, self._size)
+
+        other._state = list(self._state)
+
+        other._buffer[:] = self._buffer
+
+        other._output = self._output
+
+        other._position = self._position
+
+        return other
+
     def update(self, data):
         if self._position >= 0:
             raise CryptoPQError(ErrorCode.UNSUPPORTED, "cannot update after read")

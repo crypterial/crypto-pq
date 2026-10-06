@@ -1,7 +1,6 @@
 import os
 import threading
 import time
-import tracemalloc
 import unittest
 
 import crypto_pq
@@ -1077,7 +1076,8 @@ class LargeInputTest(RobustnessCase):
 
     # A length field that claims gigabytes must be refused before anything that large is
     # allocated; one with a needless leading zero byte, and a PKCS#8 version above 1, are refused
-    # too.
+    # too. The allocations are measured where the interpreter traces them: PyPy has no
+    # tracemalloc.
     def test_claimed_der_lengths(self):
         pair = hazmat.generate_key_pair(crypto_pq.ML_DSA_65, pattern(32))
 
@@ -1099,20 +1099,29 @@ class LargeInputTest(RobustnessCase):
             private[:4] + b"\x02" + private[5:],
         ]
 
-        tracemalloc.start()
+        try:
+            import tracemalloc
+        except ImportError:
+            tracemalloc = None
+
+        if tracemalloc is not None:
+            tracemalloc.start()
 
         try:
             for data in cases:
                 with self.subTest(data=data[:24].hex()):
-                    tracemalloc.reset_peak()
+                    if tracemalloc is not None:
+                        tracemalloc.reset_peak()
 
                     self.assertCode(ErrorCode.INVALID_ENCODING, crypto_pq.ML_DSA_65.import_public_key, data, "der")
 
                     self.assertCode(ErrorCode.INVALID_ENCODING, crypto_pq.ML_DSA_65.import_private_key, data, "der")
 
-                    self.assertLess(tracemalloc.get_traced_memory()[1], 1 << 20)
+                    if tracemalloc is not None:
+                        self.assertLess(tracemalloc.get_traced_memory()[1], 1 << 20)
         finally:
-            tracemalloc.stop()
+            if tracemalloc is not None:
+                tracemalloc.stop()
 
 
 class ConcurrencyTest(RobustnessCase):
