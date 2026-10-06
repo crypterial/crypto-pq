@@ -7,6 +7,7 @@ import shutil
 import sys
 import urllib.request
 import zipfile
+import zlib
 
 VECTORS = pathlib.Path(__file__).resolve().parents[1] / "vectors"
 
@@ -19,6 +20,14 @@ WYCHEPROOF = "https://raw.githubusercontent.com/C2SP/wycheproof/3fa63dd0344abb61
 XWING = "https://raw.githubusercontent.com/dconnolly/draft-connolly-cfrg-xwing-kem/984c2f7a93b8f8d8f8073ebb53f9f4ce50b5babd/spec"
 
 RFC = "https://www.rfc-editor.org/rfc"
+
+EXAMPLES = "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Standards-and-Guidelines/documents/examples"
+
+BLAKE2 = "https://raw.githubusercontent.com/BLAKE2/BLAKE2/ed1974ea83433eba7b2d95c5dcd9ac33cb847913/testvectors"
+
+ASCON = "https://raw.githubusercontent.com/ascon/ascon-c/446347f21b209f3921c65ece70027c366cbe1693"
+
+FRODOKEM = "https://raw.githubusercontent.com/microsoft/PQCrypto-LWEKE/e1edeb3af1fae0d5727683bd2f5465280ec2437a"
 
 SHA2 = ("SHA224", "SHA256", "SHA384", "SHA512", "SHA512_224", "SHA512_256")
 
@@ -83,9 +92,41 @@ SOURCES = {
     "rfc7748": (f"{RFC}/rfc7748.txt", "279ca0ecc5e92e2962e27b846986aeb74729d9dd34bd4a04a362f80dcb596ad3"),
     "rfc8554": (f"{RFC}/rfc8554.txt", "d5bfdbd457dfe7bc5f67cc1f62482999c2f55bf8033f2af56da323f2ffc2c055"),
     "rfc9858": (f"{RFC}/rfc9858.txt", "87562eee1657467b218c448c608e4605aa1149583e4f2fbf6f3fedfbd000360d"),
+    "rfc5869": (f"{RFC}/rfc5869.txt", "7a40eb3835b35fc947eb12a2ed614db079d43b26e50dbc537c31fba16397089c"),
+    "hkdf_sha256_test": (f"{WYCHEPROOF}/hkdf_sha256_test.json", "bb2b462a38b251cb52a2aede706d6d4b62b26864f4e80c95497507ddb07c5f1e"),
+    "hkdf_sha384_test": (f"{WYCHEPROOF}/hkdf_sha384_test.json", "69ff6ea3657bb9c1b8cdffbbb4e7832353d08fd15c0d9997b03f7a6b180e3678"),
+    "hkdf_sha512_test": (f"{WYCHEPROOF}/hkdf_sha512_test.json", "bb9a21f4e86041caf5d7792b030349f8ff289087f195b2fbc0fc0afc39deca6f"),
+    "KDA-HKDF-Sp800-56Cr1": (f"{ACVP}/KDA-HKDF-Sp800-56Cr1/internalProjection.json", "8c26944649f8bee126f4ab3b33d33f5a801eb3d0156ee29f949e5e4905677926"),
+    "KDA-HKDF-Sp800-56Cr2": (f"{ACVP}/KDA-HKDF-Sp800-56Cr2/internalProjection.json", "8a31c66049aa816d93f7e200898a4bb484c0814ce5bc2bc9e7249c86e79ded50"),
+    "cSHAKE_samples": (f"{EXAMPLES}/cSHAKE_samples.pdf", "49fbf71bed8b6dd8069720250b43ce029706695b6586c201270d76889b41873e"),
+    "KMAC_samples": (f"{EXAMPLES}/KMAC_samples.pdf", "445ee87689670da2bee611e88b765f22a43b4155295fd7f1cddea0ac671b24e1"),
+    "KMACXOF_samples": (f"{EXAMPLES}/KMACXOF_samples.pdf", "ba8432a008c998f6d27013bc7dbeabc793c114048da36861a285776200fc2959"),
+    "cSHAKE-128": (f"{ACVP}/cSHAKE-128-1.0/internalProjection.json", "a5fc118dce746aa678a44db39e47609af8f95e087e8c9b49f2cfe6fe2c3120ad"),
+    "cSHAKE-256": (f"{ACVP}/cSHAKE-256-1.0/internalProjection.json", "a9c56eb3d40221b5515a42acc04d8c2adac6cf03846ad5b3a8bb7ec37790d24d"),
+    "KMAC-128": (f"{ACVP}/KMAC-128-1.0/internalProjection.json", "43ee39f587abbf5c4ada9236ba0d55fd9f6ea4f03b6e73598846c5920515f476"),
+    "KMAC-256": (f"{ACVP}/KMAC-256-1.0/internalProjection.json", "3c64e79297096cca5e69162be42af8d54e51681001335ee4ecfd10c6f05cf922"),
+    "KDF-KMAC": (f"{ACVP}/KDF-KMAC-Sp800-108r1/internalProjection.json", "45468ada2624b8d047ded175db496e8cb4d2e86982083f6ebc22a0dc0ab79384"),
+    "kmac128_no_customization_test": (f"{WYCHEPROOF}/kmac128_no_customization_test.json", "9482c88537dd71fe94048bffc479ce37398bc53299617d54a3d90dda07d293fa"),
+    "kmac256_no_customization_test": (f"{WYCHEPROOF}/kmac256_no_customization_test.json", "950b9e8f64bd4e614aa3d825f0cd0570ec33c6cdfc81cbd043c429265149a671"),
+    "rfc7693": (f"{RFC}/rfc7693.txt", "c943754888364fe29bbd0bb3c71c6658ef392371497eaa4a9d9dde015b0721e5"),
+    "blake2-kat": (f"{BLAKE2}/blake2-kat.json", "5031ac14800798ae15cee79c04d65e326a575f2c968c7e2846a79bd07a1c0e61"),
+    "LWC_HASH_KAT_128_256": (f"{ASCON}/crypto_hash/asconhash256/LWC_HASH_KAT_128_256.txt", "b7d6fbc51362f0d62bc7e57b21f3e83242983434a7c92320a4956d915749df17"),
+    "LWC_XOF_KAT_128_512": (f"{ASCON}/crypto_hash/asconxof128/LWC_XOF_KAT_128_512.txt", "d7f5a23f37fc969896e48246700bc859fa324f2d309164043361376068e30852"),
+    "LWC_CXOF_KAT_128_512": (f"{ASCON}/crypto_cxof/asconcxof128/LWC_CXOF_KAT_128_512.txt", "abcbb0cc851a7f9cfc5ea2bcaf3eba5b2056e37fcb8ce541ceda1d1b960fc9dc"),
+    "Ascon-Hash256": (f"{ACVP}/Ascon-Hash256-SP800-232/internalProjection.json", "643274a80f256c517c2fbb34fca4eda13b6526d48f6f9387ad22ae6a515d0136"),
+    "Ascon-XOF128": (f"{ACVP}/Ascon-XOF128-SP800-232/internalProjection.json", "66efeb34ae67c8ea01ef2fade03d9c61c3fc46a4a5c0a75cb5bb11627e66a983"),
+    "Ascon-CXOF128": (f"{ACVP}/Ascon-CXOF128-SP800-232/internalProjection.json", "a387c6d9254a312a32c7bd23a23db68ec14fd1d8fe1d2854d07977642bd13db6"),
+    "FrodoKEM-976-AES": (f"{FRODOKEM}/FrodoKEM/KAT/PQCkemKAT_31296.rsp", "d1bc19050269a99bfa84038ad466688428ebc98417ba35b48a06f3c05aefc9bd"),
+    "FrodoKEM-976-SHAKE": (f"{FRODOKEM}/FrodoKEM/KAT/PQCkemKAT_31296_shake.rsp", "e29858b32dbd88f926e2a45d3d464812642e1df7cd45fcf9c3db4b4c683f45f0"),
+    "FrodoKEM-1344-AES": (f"{FRODOKEM}/FrodoKEM/KAT/PQCkemKAT_43088.rsp", "1c866df7985ef3e3ca1402d046778d49c643ec584b8bf25b30baf7a34bcdde34"),
+    "FrodoKEM-1344-SHAKE": (f"{FRODOKEM}/FrodoKEM/KAT/PQCkemKAT_43088_shake.rsp", "05cdb3dad681f448da3b86eaa8404e6555593199b4311b6738fcfabf79f288dd"),
+    "eFrodoKEM-976-AES": (f"{FRODOKEM}/eFrodoKEM/KAT/PQCkemKAT_31296.rsp", "32ed6b1622c845b487c3170ce6878df7baae07e90bd2819a19e5960ce04a55f7"),
+    "eFrodoKEM-976-SHAKE": (f"{FRODOKEM}/eFrodoKEM/KAT/PQCkemKAT_31296_shake.rsp", "32b0ad60047273fb52696f0516acac7ed083e31f5478b416d579ae5e8d8e734c"),
+    "eFrodoKEM-1344-AES": (f"{FRODOKEM}/eFrodoKEM/KAT/PQCkemKAT_43088.rsp", "9756f7c8cc88d7048ff6e81fa66425bb1392e35c1d30016c190dba17de15221a"),
+    "eFrodoKEM-1344-SHAKE": (f"{FRODOKEM}/eFrodoKEM/KAT/PQCkemKAT_43088_shake.rsp", "591adc09a718afbc0ac36e1f57a191e557fe4eec7899e078104b9706b75e2f96"),
 }
 
-GENERATED = ("acvp", "wycheproof", "xwing", "rfc")
+GENERATED = ("acvp", "wycheproof", "xwing", "rfc", "nist-examples", "blake2", "ascon", "frodokem")
 
 
 def fetch(url, expected):
@@ -111,6 +152,14 @@ def write(relative, data):
     path.parent.mkdir(parents=True, exist_ok=True)
 
     path.write_bytes(data)
+
+
+def checksums():
+    files = sorted(p for p in VECTORS.rglob("*") if p.is_file() and p.name != "SHA256SUMS")
+
+    lines = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(VECTORS).as_posix()}" for p in files]
+
+    (VECTORS / "SHA256SUMS").write_text("\n".join(lines) + "\n")
 
 
 def text(value):
@@ -143,6 +192,33 @@ def render(groups):
             lines.append("")
 
     return ("\n".join(lines) + "\n").encode()
+
+
+# Records with equal headers share one group, in the order the headers first appear.
+def grouped(pairs):
+    groups = {}
+
+    for header, test in pairs:
+        groups.setdefault(tuple(header.items()), []).append(test)
+
+    return [(dict(header), tests) for header, tests in groups.items()]
+
+
+def aligned(*bits):
+    return all(b % 8 == 0 for b in bits)
+
+
+# An ACVP value that a byte API takes as is: its bit length is whole bytes and its hexadecimal
+# has exactly that many.
+def whole(value, bits):
+    if bits % 8 or len(value) != bits // 4:
+        sys.exit(f"{value[:16]}: {len(value) // 2} bytes for {bits} bits")
+
+    return value
+
+
+def customization(group, test):
+    return test["customizationHex"] if group["hexCustomization"] else test["customization"].encode("ascii").hex()
 
 
 def acvp(name, keep=lambda group: True, select=lambda group, tests: tests, drop=()):
@@ -412,6 +488,601 @@ def rfc9858():
     return tests
 
 
+# rfc/hkdf.txt: RFC 5869 A.1-A.3, the SHA-256 cases (A.4-A.7 use SHA-1, which crypto-pq lacks).
+# Header parameterSet; fields name, ikm, salt and info (empty for zero octets), length (L, in
+# bytes), prk (the Extract output) and okm.
+def rfc5869():
+    lines = rfc_text("rfc5869")
+
+    starts = [i for i, line in enumerate(lines) if re.fullmatch(r"A\.\d\.  Test Case \d", line)]
+
+    tests = []
+
+    for start, end in zip(starts, starts[1:] + [len(lines)]):
+        fields = {}
+
+        key = None
+
+        for line in lines[start + 1 : end]:
+            match = re.fullmatch(r"   (\w+) +=(.*)", line)
+
+            if match:
+                key = match.group(1)
+
+                fields[key] = match.group(2)
+            elif key and re.fullmatch(r" {10}[0-9a-f]+(?: \(\d+ octets\))?", line):
+                fields[key] += line
+            else:
+                key = None
+
+        value = {k: re.sub(r"\(\d+ octets\)|0x|\s", "", v) for k, v in fields.items()}
+
+        if value["Hash"] != "SHA-256":
+            continue
+
+        if len(value["PRK"]) != 64 or len(value["OKM"]) != 2 * int(value["L"]):
+            sys.exit(f"RFC 5869 {lines[start]}: unexpected lengths")
+
+        name = f"RFC 5869 {lines[start].split()[0].rstrip('.')}"
+
+        tests.append({"name": name, "ikm": value["IKM"], "salt": value["salt"], "info": value["info"], "length": int(value["L"]), "prk": value["PRK"], "okm": value["OKM"]})
+
+    return [({"parameterSet": "HKDF-SHA-256"}, tests)]
+
+
+HKDF_HASHES = {"SHA2-256": "HKDF-SHA-256", "SHA2-384": "HKDF-SHA-384", "SHA2-512": "HKDF-SHA-512"}
+
+
+def fixed_info(test):
+    parameters = test["kdfParameter"]
+
+    if (parameters["fixedInfoPattern"], parameters["fixedInputEncoding"]) != ("uPartyInfo||vPartyInfo||l", "concatenation"):
+        sys.exit(f"KDA-HKDF test {test['tcId']}: fixed info {parameters['fixedInfoPattern']}")
+
+    parties = (test["fixedInfoPartyU"], test["fixedInfoPartyV"])
+
+    return "".join(party["partyId"] + party.get("ephemeralData", "") for party in parties) + f"{parameters['l']:08x}"
+
+
+# acvp/KDA-HKDF.txt: the ACVP HKDF tests of SP 800-56C r1 and r2 for SHA2-256/384/512 as plain
+# HKDF (RFC 5869): ikm = z || t (t is the r2 hybrid secret), salt as given (a "default" salt is
+# zero bytes), length = l / 8 bytes. A one-step test's info is its fixed info uPartyInfo ||
+# vPartyInfo || l: partyId || ephemeralData of party U, the same of party V, then l as a 32-bit
+# big-endian number. A multi-expansion test extracts once and expands once per iteration, so its
+# info and okm hold one comma-separated value per expansion, all of the given length. Header
+# parameterSet and revision; fields tcId, ikm, salt, info, length, okm. Kept: the 450 AFT tests
+# (150 of r1, 300 of r2). Dropped: their 450 VAL tests (known answers again, or a dkm altered to
+# test a comparison; they would double the file) and the 2,100 tests with SHA2-224,
+# SHA2-512/224, SHA2-512/256 or SHA3, which crypto-pq's HKDF does not take.
+def kda_hkdf():
+    pairs = []
+
+    for revision in ("Sp800-56Cr1", "Sp800-56Cr2"):
+        for group in json.loads(source(f"KDA-HKDF-{revision}"))["testGroups"]:
+            for test in group["tests"]:
+                parameters = test.get("kdfParameter") or test["kdfMultiExpansionParameter"]
+
+                if group["testType"] != "AFT" or parameters["hmacAlg"] not in HKDF_HASHES:
+                    continue
+
+                if "kdfParameter" in test:
+                    expansions = [(fixed_info(test), parameters["l"])]
+
+                    okm = [test["dkm"]]
+                else:
+                    expansions = [(step["fixedInfo"], step["l"]) for step in parameters["iterationParameters"]]
+
+                    okm = test["dkms"]
+
+                lengths = {bits for _, bits in expansions}
+
+                if len(lengths) != 1 or not aligned(*lengths):
+                    sys.exit(f"KDA-HKDF {revision} test {test['tcId']}: output lengths {lengths}")
+
+                record = {
+                    "tcId": test["tcId"],
+                    "ikm": parameters["z"] + parameters.get("t", ""),
+                    "salt": parameters["salt"],
+                    "info": ",".join(info for info, _ in expansions).lower(),
+                    "length": lengths.pop() // 8,
+                    "okm": ",".join(okm).lower(),
+                }
+
+                pairs.append(({"parameterSet": HKDF_HASHES[parameters["hmacAlg"]], "revision": revision}, record))
+
+    return grouped(pairs)
+
+
+# The NIST examples are PDFs that show their text as literal strings in the page content streams,
+# one marked-content sequence per line: the strings of each sequence, page after page in the
+# order of the page tree, give the text line by line.
+def pdf_lines(data):
+    objects = {}
+
+    position = 0
+
+    while match := re.compile(rb"(\d+) 0 obj\b").search(data, position):
+        body = re.compile(rb"stream\r?\n|endobj").search(data, match.end())
+
+        if body.group() == b"endobj":
+            objects[int(match.group(1))] = (data[match.end() : body.start()], None)
+
+            position = body.end()
+
+            continue
+
+        dictionary = data[match.end() : body.start()]
+
+        length = int(re.search(rb"/Length (\d+)\b(?! \d+ R)", dictionary).group(1))
+
+        stream = data[body.end() : body.end() + length]
+
+        position = body.end() + length
+
+        if b"/FlateDecode" in dictionary:
+            stream = zlib.decompress(stream)
+
+        objects[int(match.group(1))] = (dictionary, stream)
+
+        if b"/ObjStm" in dictionary:
+            first = int(re.search(rb"/First (\d+)", dictionary).group(1))
+
+            index = [int(n) for n in stream[:first].split()]
+
+            offsets = index[1::2] + [len(stream) - first]
+
+            for number, start, end in zip(index[0::2], offsets, offsets[1:]):
+                objects[number] = (stream[first + start : first + end], None)
+
+    catalog = next(body for body, _ in objects.values() if re.search(rb"/Type\s*/Catalog\b", body))
+
+    nodes = [int(re.search(rb"/Pages (\d+) 0 R", catalog).group(1))]
+
+    lines = []
+
+    while nodes:
+        node = objects[nodes.pop(0)][0]
+
+        kids = re.search(rb"/Kids\s*\[([^\]]*)\]", node)
+
+        if kids:
+            nodes[:0] = [int(n) for n in re.findall(rb"(\d+) 0 R", kids.group(1))]
+
+            continue
+
+        contents = re.search(rb"/Contents\s*(\[[^\]]*\]|\d+ 0 R)", node).group(1)
+
+        content = b"\n".join(objects[int(n)][1] for n in re.findall(rb"(\d+) 0 R", contents))
+
+        line = b""
+
+        for token in re.finditer(rb"\((?:\\.|[^\\)])*\)|\bE(?:MC|T)\b", content, re.S):
+            if token.group().startswith(b"("):
+                line += re.sub(rb"\\(.)", rb"\1", token.group()[1:-1], flags=re.S)
+
+                continue
+
+            if line.strip():
+                lines.append(line.decode("latin-1").strip())
+
+            line = b""
+
+    return lines
+
+
+def samples(name):
+    lines = pdf_lines(source(f"{name}_samples"))
+
+    starts = [i for i, line in enumerate(lines) if re.fullmatch(r"Sample #\d+", line)]
+
+    return [lines[start:end] for start, end in zip(starts, starts[1:] + [len(lines)])]
+
+
+def example_level(sample):
+    return int(re.search(r"\nSecurity Strength: (\d+)-bits\n", "\n".join(sample)).group(1))
+
+
+# A hexadecimal value of an example, checked against the bit length that the text gives for it.
+def example_hex(sample, label, length):
+    index = sample.index(label) + 1
+
+    value = ""
+
+    while index < len(sample) and re.fullmatch(r"[0-9A-F]{2}(?: [0-9A-F]{2})*", sample[index]):
+        value += sample[index].replace(" ", "")
+
+        index += 1
+
+    if f"{length} {4 * len(value)}-bits" not in sample:
+        sys.exit(f"{sample[0]}: {label} has {len(value) // 2} bytes, which the text does not give")
+
+    return value.lower()
+
+
+def example_string(sample, label):
+    value = sample[sample.index(label) + 1]
+
+    return "" if value in ("(empty string)", '"(null)"') else value.strip('"').encode("ascii").hex()
+
+
+# nist-examples/cSHAKE.txt: the SP 800-185 cSHAKE example values. Header parameterSet; fields name,
+# msg, functionName (N) and customization (S) in hexadecimal, md (its length is the output length).
+def cshake_examples():
+    pairs = []
+
+    for sample in samples("cSHAKE"):
+        record = {
+            "name": f"cSHAKE {sample[0]}",
+            "msg": example_hex(sample, "Data is", "Length of data is"),
+            "functionName": example_string(sample, "N is"),
+            "customization": example_string(sample, "S (as a character string) is"),
+            "md": example_hex(sample, "Outval is", "Requested output length is"),
+        }
+
+        pairs.append(({"parameterSet": f"cSHAKE{example_level(sample)}"}, record))
+
+    return grouped(pairs)
+
+
+# nist-examples/KMAC.txt: the SP 800-185 KMAC and KMACXOF example values. Header parameterSet and
+# xof (true for KMACXOF); fields name, key, msg, customization (S, hexadecimal), mac (its length is
+# the output length).
+def kmac_examples():
+    pairs = []
+
+    for name in ("KMAC", "KMACXOF"):
+        for sample in samples(name):
+            record = {
+                "name": f"{name} {sample[0]}",
+                "key": example_hex(sample, "Key is", "Length of Key is"),
+                "msg": example_hex(sample, "Data is", "Length of data is"),
+                "customization": example_string(sample, "S (as a character string) is"),
+                "mac": example_hex(sample, "Outval is", "Requested output length is"),
+            }
+
+            pairs.append(({"parameterSet": f"KMAC{example_level(sample)}", "xof": name == "KMACXOF"}, record))
+
+    return grouped(pairs)
+
+
+# acvp/cSHAKE.txt: the ACVP cSHAKE AFT tests whose message and output lengths are whole bytes: 2
+# of cSHAKE-128's 100 and 3 of cSHAKE-256's 100 (dropped: 98 and 97 with bit lengths, and each
+# MCT test, which chains bit-length outputs). All five set a function name, so they need the
+# hazmat API. Header parameterSet; fields tcId, msg, functionName and customization in
+# hexadecimal, md (its length is the output length).
+def acvp_cshake():
+    pairs = []
+
+    for level in (128, 256):
+        for group in json.loads(source(f"cSHAKE-{level}"))["testGroups"]:
+            for test in group["tests"]:
+                if group["testType"] != "AFT" or not aligned(test["len"], test["outLen"]):
+                    continue
+
+                record = {
+                    "tcId": test["tcId"],
+                    "msg": whole(test["msg"], test["len"]),
+                    "functionName": test["functionName"].encode("ascii").hex(),
+                    "customization": customization(group, test),
+                    "md": whole(test["md"], test["outLen"]),
+                }
+
+                pairs.append(({"parameterSet": f"cSHAKE{level}"}, record))
+
+    return grouped(pairs)
+
+
+# acvp/KMAC.txt: the ACVP KMAC tests whose key, message and MAC lengths are whole bytes, 2 of
+# KMAC-128's 800 and 1 of KMAC-256's 800, all three MVT (dropped: 798 and 799 with bit lengths),
+# then the 100 KDF-KMAC tests of SP 800-108r1, which are KMAC(K = keyDerivationKey, X = context,
+# L = derivedKeyLength, S = label). Header parameterSet, xof and source (the ACVP test set); fields
+# tcId, key, msg, customization (hexadecimal), mac (its length is the output length) and
+# testPassed (false: mac was altered and must not verify).
+def acvp_kmac():
+    pairs = []
+
+    for level in (128, 256):
+        for group in json.loads(source(f"KMAC-{level}"))["testGroups"]:
+            for test in group["tests"]:
+                if not aligned(test["keyLen"], test["msgLen"], test["macLen"]):
+                    continue
+
+                record = {
+                    "tcId": test["tcId"],
+                    "key": whole(test["key"], test["keyLen"]),
+                    "msg": whole(test["msg"], test["msgLen"]),
+                    "customization": customization(group, test),
+                    "mac": whole(test["mac"], test["macLen"]),
+                    "testPassed": test.get("testPassed", True),
+                }
+
+                pairs.append(({"parameterSet": f"KMAC{level}", "xof": group["xof"], "source": f"KMAC-{level}-1.0"}, record))
+
+    for group in json.loads(source("KDF-KMAC"))["testGroups"]:
+        for test in group["tests"]:
+            record = {
+                "tcId": test["tcId"],
+                "key": test["keyDerivationKey"],
+                "msg": test["context"],
+                "customization": test["label"],
+                "mac": whole(test["derivedKey"], test["derivedKeyLength"]),
+                "testPassed": True,
+            }
+
+            header = {"parameterSet": group["macMode"].replace("-", ""), "xof": False, "source": "KDF-KMAC-Sp800-108r1"}
+
+            pairs.append((header, record))
+
+    return grouped(pairs)
+
+
+# The numbers of a C array initializer in the RFC 7693 self-test code.
+def c_array(lines, name):
+    start = next(i for i, line in enumerate(lines) if f" {name}[" in line and "{" in line)
+
+    end = next(i for i in range(start, len(lines)) if "}" in lines[i])
+
+    body = " ".join(lines[start : end + 1]).split("{")[1].split("}")[0]
+
+    return [int(value, 0) for value in body.replace(",", " ").split()]
+
+
+# rfc/blake2.txt: RFC 7693. kind = example: BLAKE2b-512 and BLAKE2s-256 of "abc" (Appendices A
+# and B); fields name, hash, in, out. kind = selftest: the Appendix E self-test; fields name, hash,
+# digestLengths, inputLengths, out. For each digest length outlen and input length inlen it hashes
+# selftest_seq(inlen, inlen) to outlen bytes unkeyed, then keyed with selftest_seq(outlen, outlen),
+# feeds every result to one BLAKE2b-256 (BLAKE2s-256) hash and expects out from it.
+# selftest_seq(len, seed): a = 0xDEAD4BAD * seed and b = 1 as 32-bit words, then for each byte
+# t = a + b, a = b, b = t, byte = t >> 24.
+def rfc7693():
+    lines = rfc_text("rfc7693")
+
+    examples = []
+
+    for name, appendix in (("BLAKE2b-512", "A"), ("BLAKE2s-256", "B")):
+        index = next(i for i, line in enumerate(lines) if line.startswith(f'   {name}("abc") = '))
+
+        out = lines[index].split("=")[1]
+
+        while re.fullmatch(r" +(?:[0-9A-F]{2} ?)+", lines[index + 1]):
+            index += 1
+
+            out += lines[index]
+
+        out = "".join(out.split()).lower()
+
+        if len(out) != int(name[-3:]) // 4:
+            sys.exit(f"RFC 7693 {name}: {len(out) // 2} bytes")
+
+        examples.append({"name": f"RFC 7693 Appendix {appendix}", "hash": name, "in": b"abc".hex(), "out": out})
+
+    selftests = []
+
+    for name, prefix in (("BLAKE2b", "b2b"), ("BLAKE2s", "b2s")):
+        out = bytes(c_array(lines, f"{name.lower()}_res"))
+
+        if len(out) != 32:
+            sys.exit(f"RFC 7693 {name} self-test: {len(out)} bytes")
+
+        record = {
+            "name": f"RFC 7693 Appendix E {name}",
+            "hash": name,
+            "digestLengths": ",".join(map(str, c_array(lines, f"{prefix}_md_len"))),
+            "inputLengths": ",".join(map(str, c_array(lines, f"{prefix}_in_len"))),
+            "out": out.hex(),
+        }
+
+        selftests.append(record)
+
+    return [({"kind": "example"}, examples), ({"kind": "selftest"}, selftests)]
+
+
+# blake2/blake2b.txt and blake2s.txt: the BLAKE2 reference KATs, the hashes of 0..255 bytes (00 01
+# 02 ...) unkeyed and keyed with the longest key (00 01 02 ...), at the full output length (the
+# BLAKE2bp/sp/Xb/Xs entries are not used). Fields in, key (empty: unkeyed), out.
+def blake2_kat(entries, name):
+    return [({}, [{k: entry[k] for k in ("in", "key", "out")} for entry in entries if entry["hash"] == name])]
+
+
+# acvp/Ascon.txt: the ACVP SP 800-232 tests whose lengths are whole bytes: 12 of Ascon-Hash256's
+# 60, 3 of Ascon-XOF128's 60 and 1 of Ascon-CXOF128's 60 (dropped: the others, with bit lengths).
+# Header parameterSet; fields tcId, msg, cs (the CXOF128 customization) and md, whose length is the
+# output length.
+def acvp_ascon():
+    pairs = []
+
+    for name in ("Ascon-Hash256", "Ascon-XOF128", "Ascon-CXOF128"):
+        for group in json.loads(source(name))["testGroups"]:
+            for test in group["tests"]:
+                if not aligned(test["len"], test.get("outLen", 256), test.get("csLen", 0)):
+                    continue
+
+                record = {"tcId": test["tcId"], "msg": whole(test["msg"], test["len"])}
+
+                if "cs" in test:
+                    record["cs"] = whole(test["cs"], test["csLen"])
+
+                record["md"] = whole(test["md"], test.get("outLen", 256))
+
+                pairs.append(({"parameterSet": name}, record))
+
+    return grouped(pairs)
+
+
+def gf_multiply(a, b):
+    product = 0
+
+    while b:
+        if b & 1:
+            product ^= a
+
+        a = (a << 1) ^ (0x11B if a & 0x80 else 0)
+
+        b >>= 1
+
+    return product
+
+
+# The AES S-box from its definition: the inverse in GF(2^8) (x^254), then the affine map.
+def aes_sbox():
+    box = []
+
+    for x in range(256):
+        inverse = 1
+
+        for _ in range(254):
+            inverse = gf_multiply(inverse, x)
+
+        rotations = [((inverse << r) | (inverse >> (8 - r))) & 0xFF for r in range(1, 5)]
+
+        box.append(inverse ^ rotations[0] ^ rotations[1] ^ rotations[2] ^ rotations[3] ^ 0x63)
+
+    return box
+
+
+SBOX = aes_sbox()
+
+
+def aes256_round_keys(key):
+    words = [list(key[i : i + 4]) for i in range(0, 32, 4)]
+
+    rcon = 1
+
+    while len(words) < 60:
+        word = list(words[-1])
+
+        if len(words) % 8 == 0:
+            word = [SBOX[b] for b in word[1:] + word[:1]]
+
+            word[0] ^= rcon
+
+            rcon = gf_multiply(rcon, 2)
+        elif len(words) % 8 == 4:
+            word = [SBOX[b] for b in word]
+
+        words.append([a ^ b for a, b in zip(words[-8], word)])
+
+    return [sum(words[i : i + 4], []) for i in range(0, 60, 4)]
+
+
+# The state is column-major (byte i is row i % 4, column i // 4), and ShiftRows moves the byte in
+# row r, column c to column c - r.
+def aes_encrypt(round_keys, block):
+    state = [b ^ k for b, k in zip(block, round_keys[0])]
+
+    for index, round_key in enumerate(round_keys[1:], 1):
+        state = [SBOX[state[(i + 4 * (i % 4)) % 16]] for i in range(16)]
+
+        if index < len(round_keys) - 1:
+            mixed = []
+
+            for c in range(0, 16, 4):
+                a = state[c : c + 4]
+
+                total = a[0] ^ a[1] ^ a[2] ^ a[3]
+
+                mixed += [a[i] ^ total ^ gf_multiply(a[i] ^ a[(i + 1) % 4], 2) for i in range(4)]
+
+            state = mixed
+
+        state = [b ^ k for b, k in zip(state, round_key)]
+
+    return bytes(state)
+
+
+# The AES-256 CTR DRBG of the NIST PQC KAT generator (rng.c: no derivation function, Key = 0 and
+# V = 0 updated with the 48-byte seed; each request encrypts V + 1, V + 2, ... and then updates
+# with zeros).
+class Drbg:
+    def __init__(self, seed):
+        self.key = bytes(32)
+
+        self.counter = 0
+
+        self.update(seed)
+
+    def blocks(self, count):
+        round_keys = aes256_round_keys(self.key)
+
+        out = b""
+
+        for _ in range(count):
+            self.counter = (self.counter + 1) % (1 << 128)
+
+            out += aes_encrypt(round_keys, self.counter.to_bytes(16, "big"))
+
+        return out
+
+    def update(self, provided):
+        state = bytes(a ^ b for a, b in zip(self.blocks(3), provided))
+
+        self.key = state[:32]
+
+        self.counter = int.from_bytes(state[32:], "big")
+
+    def random(self, length):
+        out = self.blocks((length + 15) // 16)[:length]
+
+        self.update(bytes(48))
+
+        return out
+
+
+# frodokem/kat.txt: the KATs of the FrodoKEM reference implementation for the ISO/IEC 18033-2
+# sets, FrodoKEM-976/1344 and eFrodoKEM-976/1344 with AES and SHAKE (FrodoKEM-640 is not in the
+# standard and is not fetched). A KAT draws each key pair and encapsulation from the NIST PQC
+# DRBG seeded with the entry's seed; here those draws are listed, so tests need no DRBG, and pk, sk
+# and ct are replaced by their SHA-256 (the eight .rsp files hold 119 MB). The DRBG is checked by
+# deriving every KAT seed from the generator's master seed 00 01 ... 2f. Header parameterSet;
+# fields count and seed (the KAT entry), s, seedSE and z (the key generation draw, in this order),
+# u and salt (the encapsulation draw; eFrodoKEM has no salt), pkSha256, skSha256, ctSha256 and ss.
+def frodokem():
+    master = Drbg(bytes(range(48)))
+
+    seeds = [master.random(48).hex() for _ in range(100)]
+
+    groups = []
+
+    for name in (f"{e}FrodoKEM-{n}-{generator}" for e in ("", "e") for n in (976, 1344) for generator in ("AES", "SHAKE")):
+        size = 24 if "-976-" in name else 32
+
+        salted = not name.startswith("e")
+
+        blocks = [dict(re.findall(r"^(\w+) = ([0-9A-Fa-f]*)$", block, re.M)) for block in source(name).decode().split("\n\n")]
+
+        entries = [block for block in blocks if "count" in block]
+
+        tests = []
+
+        for index, entry in enumerate(entries):
+            if entry["count"] != str(index) or entry["seed"].lower() != seeds[index] or len(entry["ss"]) != 2 * size:
+                sys.exit(f"{name}: entry {index} is not the KAT entry the generator writes")
+
+            drbg = Drbg(bytes.fromhex(entry["seed"]))
+
+            keygen = drbg.random(size + (2 if salted else 1) * size + 16)
+
+            encaps = drbg.random(size + (2 * size if salted else 0))
+
+            test = {"count": index, "seed": entry["seed"], "s": keygen[:size].hex(), "seedSE": keygen[size:-16].hex(), "z": keygen[-16:].hex(), "u": encaps[:size].hex()}
+
+            if salted:
+                test["salt"] = encaps[size:].hex()
+
+            test.update({f"{k}Sha256": hashlib.sha256(bytes.fromhex(entry[k])).hexdigest() for k in ("pk", "sk", "ct")})
+
+            test["ss"] = entry["ss"]
+
+            tests.append(test)
+
+        if len(tests) != 100:
+            sys.exit(f"{name}: {len(tests)} entries")
+
+        groups.append(({"parameterSet": name}, tests))
+
+    return groups
+
+
 def main():
     for url, expected, members in ARCHIVES:
         archive = zipfile.ZipFile(io.BytesIO(fetch(url, expected)))
@@ -464,11 +1135,45 @@ def main():
 
     write("rfc/hss.txt", render([({}, rfc8554() + rfc9858())]))
 
-    files = sorted(p for p in VECTORS.rglob("*") if p.is_file() and p.name != "SHA256SUMS")
+    write("rfc/hkdf.txt", render(rfc5869()))
 
-    lines = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(VECTORS).as_posix()}" for p in files]
+    # Header parameterSet (HKDF-SHA-256/384/512); fields tcId, ikm, salt, info, size (L, in bytes),
+    # okm, result (invalid only for L > 255 * HashLen, which HKDF must refuse) and flags.
+    write("wycheproof/hkdf.txt", render(wycheproof([f"hkdf_sha{n}_test" for n in (256, 384, 512)], ("ikm", "salt", "info", "size", "okm"))))
 
-    (VECTORS / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+    write("acvp/KDA-HKDF.txt", render(kda_hkdf()))
+
+    write("nist-examples/cSHAKE.txt", render(cshake_examples()))
+
+    write("nist-examples/KMAC.txt", render(kmac_examples()))
+
+    write("acvp/cSHAKE.txt", render(acvp_cshake()))
+
+    write("acvp/KMAC.txt", render(acvp_kmac()))
+
+    # KMAC without customization. Header parameterSet (KMAC128/256), keySize and tagSize (bits);
+    # fields tcId, key, msg, tag, result (valid: the tag verifies) and flags. Every tag is 16, 32 or
+    # 64 bytes, so none is below KMAC's 4-byte minimum.
+    write("wycheproof/kmac.txt", render(wycheproof([f"kmac{n}_no_customization_test" for n in (128, 256)], ("key", "msg", "tag"), ("keySize", "tagSize"))))
+
+    write("rfc/blake2.txt", render(rfc7693()))
+
+    kat = json.loads(source("blake2-kat"))
+
+    write("blake2/blake2b.txt", render(blake2_kat(kat, "blake2b")))
+
+    write("blake2/blake2s.txt", render(blake2_kat(kat, "blake2s")))
+
+    # The designers' Ascon KATs are already in this format, so they are kept as published: fields
+    # Count, Msg, Z (the CXOF128 customization) and MD, whose length is the output length.
+    for name in ("LWC_HASH_KAT_128_256", "LWC_XOF_KAT_128_512", "LWC_CXOF_KAT_128_512"):
+        write(f"ascon/{name}.txt", source(name))
+
+    write("acvp/Ascon.txt", render(acvp_ascon()))
+
+    write("frodokem/kat.txt", render(frodokem()))
+
+    checksums()
 
 
 if __name__ == "__main__":
