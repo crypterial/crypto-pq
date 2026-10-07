@@ -692,23 +692,19 @@ fn bigEndian(comptime T: type, value: T) [@sizeOf(T)]u8 {
 //
 // The tag key is HKDF-Extract (RFC 5869) of the seed section of the state, with the label as salt.
 fn treeCacheKey(seed: []const u8, key: *[32]u8) void {
-    var mac = hash.hmac_sha_256.create(tree_cache_label);
+    const dit = cpu.Dit.enter();
 
-    defer ct.wipe(std.mem.asBytes(&mac));
+    defer dit.leave();
 
-    mac.update(seed);
-
-    mac.digest(key);
+    primitives.hmac(u32, tree_cache_label, seed, &.{}, key);
 }
 
 pub fn treeCacheTag(key: *const [32]u8, body: []const u8, tag: *[tag_size]u8) void {
-    var mac = hash.hmac_sha_256.create(key);
+    const dit = cpu.Dit.enter();
 
-    defer ct.wipe(std.mem.asBytes(&mac));
+    defer dit.leave();
 
-    mac.update(body);
-
-    mac.digest(tag);
+    primitives.hmac(u32, key, body, &.{}, tag);
 }
 
 // Reads the big-endian fields of a tree cache from the front.

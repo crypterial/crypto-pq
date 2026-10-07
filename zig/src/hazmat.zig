@@ -6,6 +6,7 @@ const std = @import("std");
 
 const cpu = @import("cpu.zig");
 const Error = @import("errors.zig").Error;
+const hash = @import("hash.zig");
 const kem = @import("kem.zig");
 const keys = @import("keys.zig");
 const signatures = @import("signature.zig");
@@ -73,4 +74,10 @@ pub fn sign(private_key: *const signatures.SignaturePrivateKey, allocator: Alloc
 
 pub fn verify(public_key: *const signatures.SignaturePublicKey, signature: []const u8, message: []const u8, options: signatures.VerifyOptions) bool {
     return signatures.verifyWith(public_key, signature, message, options, false);
+}
+
+// cSHAKE128 or cSHAKE256 with a function name, which SP 800-185 reserves for functions NIST
+// defines (the ACVP vectors use them), and a customization string.
+pub fn configureCshake(algorithm: hash.XofAlgorithm, function_name: []const u8, customization: []const u8) Error!hash.XofAlgorithm {
+    return hash.configureCshake(algorithm, function_name, customization);
 }

@@ -4,10 +4,11 @@
 //!
 //! The functions keep the C ABI's rules and the ctypes binding's: inputs come through the buffer
 //! protocol and stay exported until the call returns; outputs are new bytes objects of the exact
-//! size, written in place by the library and zeroed if the call fails; keys, hash states and
-//! stateful signers live in slots, memory that the module allocates and wipes when the slot object
-//! goes. A call that computes releases the GIL, as hashlib does for large inputs (releasing it
-//! costs about 20 ns, against microseconds of work): a hash, XOF or HMAC of 2048 bytes or more,
+//! size, written in place by the library and zeroed if the call fails; keys, hash states,
+//! configured algorithms and stateful signers live in slots, memory that the module allocates and
+//! wipes when the slot object goes. A call that computes releases the GIL, as hashlib does for
+//! large inputs (releasing it costs about 20 ns, against microseconds of work): a hash, XOF or MAC
+//! of 2048 bytes or more,
 //! and key generation, private and ML-DSA public key import, encapsulation, decapsulation,
 //! signing and verification when every input is a bytes object, which no other thread can change
 //! meanwhile. Copies, exports and checks keep it. Statuses become the exceptions of the package's
@@ -680,14 +681,13 @@ const signature = struct {
     }
 };
 
-// One-shot hashes, XOFs and HMACs, one function per algorithm: hash0 to hash9, xof0 and xof1,
-// hmac0 to hmac3 and hmac_verify0 to hmac_verify3, by the C ABI's ids.
+// One-shot hashes, XOFs and MACs with their default options, one function per algorithm: hash0
+// to hash18, xof0 to xof5, mac0 to mac7 and mac_verify0 to mac_verify7, by the C ABI's ids, and
+// hmac0 to hmac3 and hmac_verify0 to hmac_verify3, the names of ABI version 1 for the first four.
 fn OneShot(comptime id: u32) type {
     return struct {
-        const digest_size = capi.hash.algorithms[id].digest_size;
-
         fn hash(module: *Object, data: Input) ?*Object {
-            const out = Output.init(digest_size) orelse return null;
+            const out = Output.init(capi.hash.algorithms[id].digest_size) orelse return null;
 
             const gil = Gil.release(data.bytes.len >= unlocked_size);
 
@@ -710,8 +710,8 @@ fn OneShot(comptime id: u32) type {
             return finish(module, status, refused, out);
         }
 
-        fn hmac(module: *Object, key: Input, data: Input) ?*Object {
-            const out = Output.init(digest_size) orelse return null;
+        fn mac(module: *Object, key: Input, data: Input) ?*Object {
+            const out = Output.init(capi.hash.macs[id].digest_size) orelse return null;
 
             const gil = Gil.release(data.bytes.len >= unlocked_size);
 
@@ -722,7 +722,7 @@ fn OneShot(comptime id: u32) type {
             return finish(module, status, refused, out);
         }
 
-        fn hmacVerify(module: *Object, key: Input, data: Input, tag: Input) ?*Object {
+        fn macVerify(module: *Object, key: Input, data: Input, tag: Input) ?*Object {
             const gil = Gil.release(data.bytes.len >= unlocked_size);
 
             const status = capi.hash.hmacVerify(id, key.bytes.ptr, key.bytes.len, data.bytes.ptr, data.bytes.len, tag.bytes.ptr, tag.bytes.len);
@@ -733,6 +733,123 @@ fn OneShot(comptime id: u32) type {
         }
     };
 }
+
+// Configured algorithms (hash.configure, xof.configure, mac.configure in Python) live in slots of
+// their own, which the calls below only read.
+const configured = struct {
+    fn hash(module: *Object, algorithm: u32, salt: Input, personalization: Input) ?*Object {
+        const slot = newSlot(module, .configured_hash, algorithm) orelse return null;
+
+        return created(module, slot, capi.hash.configureHash(algorithm, salt.bytes.ptr, salt.bytes.len, personalization.bytes.ptr, personalization.bytes.len, slot.memory, slot.size), refused);
+    }
+
+    fn hashWith(module: *Object, spec: *Slot, data: Input) ?*Object {
+        const out = Output.init(states.digestSize(spec.algorithm)) orelse return null;
+
+        const gil = Gil.release(data.bytes.len >= unlocked_size);
+
+        const status = capi.hash.digestWith(spec.memory, spec.size, data.bytes.ptr, data.bytes.len, out.bytes.ptr, out.bytes.len);
+
+        gil.restore();
+
+        return finish(module, status, refused, out);
+    }
+
+    fn hashInitWith(module: *Object, spec: *Slot) ?*Object {
+        const slot = newSlot(module, .hasher, spec.algorithm) orelse return null;
+
+        return created(module, slot, capi.hash.initWith(spec.memory, spec.size, slot.memory, slot.size), refused);
+    }
+
+    // The function name is for hazmat's cSHAKE only.
+    fn xof(module: *Object, algorithm: u32, function_name: Input, customization: Input) ?*Object {
+        const slot = newSlot(module, .configured_xof, algorithm) orelse return null;
+
+        return created(module, slot, capi.hash.configureXof(algorithm, function_name.bytes.ptr, function_name.bytes.len, customization.bytes.ptr, customization.bytes.len, slot.memory, slot.size), refused);
+    }
+
+    fn xofWith(module: *Object, spec: *Slot, data: Input, size: Length) ?*Object {
+        const out = Output.init(size.value) orelse return null;
+
+        const gil = Gil.release(data.bytes.len + size.value >= unlocked_size);
+
+        const status = capi.hash.xofWith(spec.memory, spec.size, data.bytes.ptr, data.bytes.len, out.bytes.ptr, out.bytes.len);
+
+        gil.restore();
+
+        return finish(module, status, refused, out);
+    }
+
+    fn xofInitWith(module: *Object, spec: *Slot) ?*Object {
+        const slot = newSlot(module, .xof, spec.algorithm) orelse return null;
+
+        return created(module, slot, capi.hash.xofInitWith(spec.memory, spec.size, slot.memory, slot.size), refused);
+    }
+
+    // flags: 1 KMACXOF, 2 `size` is the length (else the default, size 0); first is KMAC's
+    // customization or BLAKE2's salt, second BLAKE2's personalization.
+    fn mac(module: *Object, algorithm: u32, size: usize, flags: u32, first: Input, second: Input) ?*Object {
+        const slot = newSlot(module, .configured_mac, algorithm) orelse return null;
+
+        return created(module, slot, capi.hash.configureMac(algorithm, size, flags, first.bytes.ptr, first.bytes.len, second.bytes.ptr, second.bytes.len, slot.memory, slot.size), refused);
+    }
+
+    // `size` is the configured length, which Python keeps.
+    fn macWith(module: *Object, spec: *Slot, key: Input, data: Input, size: usize) ?*Object {
+        const out = Output.init(size) orelse return null;
+
+        const gil = Gil.release(data.bytes.len >= unlocked_size);
+
+        const status = capi.hash.macWith(spec.memory, spec.size, key.bytes.ptr, key.bytes.len, data.bytes.ptr, data.bytes.len, out.bytes.ptr, out.bytes.len);
+
+        gil.restore();
+
+        return finish(module, status, refused, out);
+    }
+
+    fn macVerifyWith(module: *Object, spec: *Slot, key: Input, data: Input, tag: Input) ?*Object {
+        const gil = Gil.release(data.bytes.len >= unlocked_size);
+
+        const status = capi.hash.macVerifyWith(spec.memory, spec.size, key.bytes.ptr, key.bytes.len, data.bytes.ptr, data.bytes.len, tag.bytes.ptr, tag.bytes.len);
+
+        gil.restore();
+
+        return answer(module, status, common.rejected);
+    }
+
+    fn macInitWith(module: *Object, spec: *Slot, key: Input) ?*Object {
+        const slot = newSlot(module, .hmac, spec.algorithm) orelse return null;
+
+        return created(module, slot, capi.hash.macInitWith(spec.memory, spec.size, key.bytes.ptr, key.bytes.len, slot.memory, slot.size), refused);
+    }
+};
+
+// HKDF by the C ABI's KDF ids; a length is crypto-pq's INVALID_LENGTH when negative, as elsewhere.
+const kdf = struct {
+    fn derive(module: *Object, algorithm: u32, ikm: Input, salt: Input, info: Input, size: Length) ?*Object {
+        const out = Output.init(size.value) orelse return null;
+
+        const status = capi.hash.kdfDerive(algorithm, ikm.bytes.ptr, ikm.bytes.len, salt.bytes.ptr, salt.bytes.len, info.bytes.ptr, info.bytes.len, out.bytes.ptr, out.bytes.len);
+
+        return finish(module, status, refused, out);
+    }
+
+    fn extract(module: *Object, algorithm: u32, ikm: Input, salt: Input) ?*Object {
+        const out = Output.init(if (algorithm < capi.hash.kdf_count) capi.hash.kdfs[algorithm].hashSize() else 0) orelse return null;
+
+        const status = capi.hash.kdfExtract(algorithm, ikm.bytes.ptr, ikm.bytes.len, salt.bytes.ptr, salt.bytes.len, out.bytes.ptr, out.bytes.len);
+
+        return finish(module, status, refused, out);
+    }
+
+    fn expand(module: *Object, algorithm: u32, prk: Input, info: Input, size: Length) ?*Object {
+        const out = Output.init(size.value) orelse return null;
+
+        const status = capi.hash.kdfExpand(algorithm, prk.bytes.ptr, prk.bytes.len, info.bytes.ptr, info.bytes.len, out.bytes.ptr, out.bytes.len);
+
+        return finish(module, status, refused, out);
+    }
+};
 
 // Incremental states. Their Python objects take one call at a time, with a lock of their own.
 const states = struct {
@@ -816,6 +933,13 @@ const states = struct {
 
     fn hmacFinalVerify(module: *Object, slot: *Slot, tag: Input) ?*Object {
         return answer(module, capi.hash.hmacFinalVerify(slot.memory, slot.size, tag.bytes.ptr, tag.bytes.len), common.rejected);
+    }
+
+    // The tag of a MAC state of any kind; `size` is its length, which Python keeps.
+    fn macFinal(module: *Object, slot: *Slot, size: usize) ?*Object {
+        const out = Output.init(size) orelse return null;
+
+        return finish(module, capi.hash.hmacFinal(slot.memory, slot.size, out.bytes.ptr, out.bytes.len), refused, out);
     }
 
     // HMAC ids name the hashes of the same ids.
@@ -984,7 +1108,7 @@ const stateful = struct {
     }
 };
 
-const one_shot_count = capi.hash.hash_count + capi.hash.xof_count + 2 * capi.hash.hmac_count;
+const one_shot_count = capi.hash.hash_count + capi.hash.xof_count + 2 * capi.hash.hmac_count + 2 * capi.hash.mac_count;
 
 fn oneShotMethods() [one_shot_count]py.MethodDef {
     var out: [one_shot_count]py.MethodDef = undefined;
@@ -1004,9 +1128,17 @@ fn oneShotMethods() [one_shot_count]py.MethodDef {
     }
 
     for (0..capi.hash.hmac_count) |id| {
-        out[next] = method(std.fmt.comptimePrint("hmac{d}", .{id}), OneShot(id).hmac);
+        out[next] = method(std.fmt.comptimePrint("hmac{d}", .{id}), OneShot(id).mac);
 
-        out[next + 1] = method(std.fmt.comptimePrint("hmac_verify{d}", .{id}), OneShot(id).hmacVerify);
+        out[next + 1] = method(std.fmt.comptimePrint("hmac_verify{d}", .{id}), OneShot(id).macVerify);
+
+        next += 2;
+    }
+
+    for (0..capi.hash.mac_count) |id| {
+        out[next] = method(std.fmt.comptimePrint("mac{d}", .{id}), OneShot(id).mac);
+
+        out[next + 1] = method(std.fmt.comptimePrint("mac_verify{d}", .{id}), OneShot(id).macVerify);
 
         next += 2;
     }
@@ -1046,6 +1178,23 @@ const methods = [_]py.MethodDef{
     method("hmac_update", states.hmacUpdate),
     method("hmac_final", states.hmacFinal),
     method("hmac_final_verify", states.hmacFinalVerify),
+    method("mac_init", states.hmacInit),
+    method("mac_update", states.hmacUpdate),
+    method("mac_final", states.macFinal),
+    method("mac_final_verify", states.hmacFinalVerify),
+    method("hash_configure", configured.hash),
+    method("hash_with", configured.hashWith),
+    method("hash_init_with", configured.hashInitWith),
+    method("xof_configure", configured.xof),
+    method("xof_with", configured.xofWith),
+    method("xof_init_with", configured.xofInitWith),
+    method("mac_configure", configured.mac),
+    method("mac_with", configured.macWith),
+    method("mac_verify_with", configured.macVerifyWith),
+    method("mac_init_with", configured.macInitWith),
+    method("kdf_derive", kdf.derive),
+    method("kdf_extract", kdf.extract),
+    method("kdf_expand", kdf.expand),
     method("stateful_info", stateful.info),
     method("stateful_verify", stateful.verify),
     method("stateful_check_public_key", stateful.checkPublicKey),

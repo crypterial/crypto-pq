@@ -1,5 +1,6 @@
 const errors = @import("errors.zig");
 const hash = @import("hash.zig");
+const kdf = @import("kdf.zig");
 const kem = @import("kem.zig");
 const keys = @import("keys.zig");
 const signature = @import("signature.zig");
@@ -13,15 +14,25 @@ pub const KeyGenOptions = keys.KeyGenOptions;
 
 pub const HashAlgorithm = hash.HashAlgorithm;
 
+pub const HashOptions = hash.HashOptions;
+
 pub const Hasher = hash.Hasher;
 
 pub const XofAlgorithm = hash.XofAlgorithm;
 
+pub const XofOptions = hash.XofOptions;
+
 pub const Xof = hash.Xof;
 
-pub const HmacAlgorithm = hash.HmacAlgorithm;
+pub const MacAlgorithm = hash.MacAlgorithm;
 
-pub const Hmac = hash.Hmac;
+pub const MacOptions = hash.MacOptions;
+
+pub const Mac = hash.Mac;
+
+pub const KdfAlgorithm = kdf.KdfAlgorithm;
+
+pub const KdfOptions = kdf.KdfOptions;
 
 pub const sha_224 = hash.sha_224;
 
@@ -43,9 +54,35 @@ pub const sha3_384 = hash.sha3_384;
 
 pub const sha3_512 = hash.sha3_512;
 
+pub const blake2b_160 = hash.blake2b_160;
+
+pub const blake2b_256 = hash.blake2b_256;
+
+pub const blake2b_384 = hash.blake2b_384;
+
+pub const blake2b_512 = hash.blake2b_512;
+
+pub const blake2s_128 = hash.blake2s_128;
+
+pub const blake2s_160 = hash.blake2s_160;
+
+pub const blake2s_224 = hash.blake2s_224;
+
+pub const blake2s_256 = hash.blake2s_256;
+
+pub const ascon_hash256 = hash.ascon_hash256;
+
 pub const shake128 = hash.shake128;
 
 pub const shake256 = hash.shake256;
+
+pub const cshake128 = hash.cshake128;
+
+pub const cshake256 = hash.cshake256;
+
+pub const ascon_xof128 = hash.ascon_xof128;
+
+pub const ascon_cxof128 = hash.ascon_cxof128;
 
 pub const hmac_sha_224 = hash.hmac_sha_224;
 
@@ -54,6 +91,20 @@ pub const hmac_sha_256 = hash.hmac_sha_256;
 pub const hmac_sha_384 = hash.hmac_sha_384;
 
 pub const hmac_sha_512 = hash.hmac_sha_512;
+
+pub const kmac128 = hash.kmac128;
+
+pub const kmac256 = hash.kmac256;
+
+pub const blake2b_mac = hash.blake2b_mac;
+
+pub const blake2s_mac = hash.blake2s_mac;
+
+pub const hkdf_sha_256 = kdf.hkdf_sha_256;
+
+pub const hkdf_sha_384 = kdf.hkdf_sha_384;
+
+pub const hkdf_sha_512 = kdf.hkdf_sha_512;
 
 pub const KemAlgorithm = kem.KemAlgorithm;
 

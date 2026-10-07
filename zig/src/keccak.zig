@@ -464,6 +464,16 @@ pub const Keccak = struct {
         }
     }
 
+    // Ends the block with zeros, as SP 800-185's bytepad does: a block that holds data is
+    // permuted.
+    pub fn fillBlock(self: *Keccak) void {
+        if (self.position == 0) return;
+
+        permute(&self.state);
+
+        self.position = 0;
+    }
+
     pub fn read(self: *Keccak, out: []u8) void {
         if (!self.squeezing) {
             xorBytes(&self.state, self.position, &.{self.suffix});

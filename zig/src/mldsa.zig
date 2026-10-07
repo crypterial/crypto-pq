@@ -3,7 +3,6 @@ const std = @import("std");
 const aarch64 = @import("aarch64.zig");
 const cpu = @import("cpu.zig");
 const ct = @import("ct.zig");
-const hash = @import("hash.zig");
 const keccak = @import("keccak.zig");
 const primitives = @import("primitives.zig");
 const vec = @import("vector.zig");
@@ -726,7 +725,7 @@ fn expandMask(comptime p: Parameters, rho: *const [64]u8, kappa: u16, y: *[p.l]P
 }
 
 fn sampleInBall(comptime p: Parameters, seed: []const u8, c: *Poly) void {
-    var xof = hash.shake256.create();
+    var xof = primitives.shake256Sponge();
 
     xof.update(seed);
 
@@ -763,7 +762,7 @@ fn sampleInBall(comptime p: Parameters, seed: []const u8, c: *Poly) void {
 
 // w1Encode of one row of w1, absorbed into the challenge hash: the rows are hashed as they are
 // produced instead of being kept.
-fn absorbHigh(comptime p: Parameters, challenge: *hash.Xof, w1: *const Poly) void {
+fn absorbHigh(comptime p: Parameters, challenge: *keccak.Keccak, w1: *const Poly) void {
     var values: [256]u32 = undefined;
 
     var encoded: [32 * @as(usize, p.w1Bits())]u8 = undefined;
@@ -1054,7 +1053,7 @@ pub noinline fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, 
         ct.wipe(std.mem.asBytes(work));
     }
 
-    var mu_hasher = hash.shake256.create();
+    var mu_hasher = primitives.shake256Sponge();
 
     mu_hasher.update(sk[64..128]);
 
@@ -1075,7 +1074,7 @@ pub noinline fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, 
 
         for (y_hat) |*f| ntt(f);
 
-        var challenge = hash.shake256.create();
+        var challenge = primitives.shake256Sponge();
 
         defer ct.wipe(std.mem.asBytes(&challenge));
 
@@ -1270,7 +1269,7 @@ pub noinline fn verify(comptime p: Parameters, pk: *const [p.publicKeySize()]u8,
 
     var mu: [64]u8 = undefined;
 
-    var mu_hasher = hash.shake256.create();
+    var mu_hasher = primitives.shake256Sponge();
 
     mu_hasher.update(tr);
 
@@ -1296,7 +1295,7 @@ pub noinline fn verify(comptime p: Parameters, pk: *const [p.publicKeySize()]u8,
         multiplyMatrix(p, pk[0..32], &z, &w, null);
     }
 
-    var challenge = hash.shake256.create();
+    var challenge = primitives.shake256Sponge();
 
     challenge.update(&mu);
 

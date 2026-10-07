@@ -324,6 +324,27 @@ test "signature round trip" {
         try testing.expectError(error.InvalidOption, pair.private_key.sign(allocator, "message", .{ .pre_hash = .{ .hash = forged } }));
 
         try testing.expect(!public_key.verify(hashed, "message", .{ .pre_hash = .{ .hash = forged } }));
+
+        // BLAKE2, Ascon and cSHAKE are no pre-hashes of FIPS 204, for hazmat either.
+        const others = [_]pq.PreHash{
+            .{ .hash = pq.blake2b_512 },
+            .{ .hash = pq.blake2s_256 },
+            .{ .hash = pq.ascon_hash256 },
+            .{ .xof = pq.cshake256 },
+            .{ .xof = try pq.cshake128.configure(.{ .customization = "x" }) },
+            .{ .xof = pq.ascon_xof128 },
+            .{ .xof = pq.ascon_cxof128 },
+        };
+
+        const randomness: [32]u8 = @splat(1);
+
+        for (others) |other| {
+            try testing.expectError(error.InvalidOption, pair.private_key.sign(allocator, "message", .{ .pre_hash = other }));
+
+            try testing.expectError(error.InvalidOption, hazmat.sign(&pair.private_key, allocator, "message", &randomness, .{ .pre_hash = other }));
+
+            try testing.expect(!public_key.verify(hashed, "message", .{ .pre_hash = other }));
+        }
     }
 }
 

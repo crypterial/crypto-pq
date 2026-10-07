@@ -554,6 +554,10 @@ pub fn finish512(state: [8]u64, absorbed: u128, data: []const u8, out: []u8) voi
 // The states after HMAC's (RFC 2104) inner and outer key blocks, the key, at most a block, padded
 // with zeros and XORed with 0x36 and 0x5c, compressed side by side as two lanes.
 pub fn keyed256(iv: *const [8]u32, key: []const u8) [2][8]u32 {
+    if (comptime cpu.possible(.sha256) and @hasDecl(isa, "keyed256")) {
+        if (cpu.has(.sha256)) return isa.keyed256(iv, key);
+    }
+
     var block: [64]u8 = @splat(0);
 
     defer ct.wipe(&block);
@@ -590,6 +594,10 @@ pub fn keyed256(iv: *const [8]u32, key: []const u8) [2][8]u32 {
 }
 
 pub fn keyed512(iv: *const [8]u64, key: []const u8) [2][8]u64 {
+    if (comptime cpu.possible(.sha512) and @hasDecl(isa, "keyed512")) {
+        if (cpu.has(.sha512)) return isa.keyed512(iv, key);
+    }
+
     var block: [128]u8 = @splat(0);
 
     defer ct.wipe(&block);
@@ -642,6 +650,36 @@ pub fn hmac256(iv: *const [8]u32, key: []const u8, data: []const u8, tag: []u8) 
     finish256(keyed[0], 64, data, inner[0..tag.len]);
 
     finish256(keyed[1], 64, inner[0..tag.len], tag);
+}
+
+// HMAC-SHA-256 (or -224) from the states that keyed256 gave, for a key used for several tags.
+pub fn hmacKeyed256(states: *const [2][8]u32, data: []const u8, tag: []u8) void {
+    if (comptime cpu.possible(.sha256) and @hasDecl(isa, "hmacKeyed256")) {
+        if (cpu.has(.sha256)) return isa.hmacKeyed256(states, data, tag);
+    }
+
+    var inner: [32]u8 = undefined;
+
+    defer ct.wipe(&inner);
+
+    finish256(states[0], 64, data, inner[0..tag.len]);
+
+    finish256(states[1], 64, inner[0..tag.len], tag);
+}
+
+// HMAC-SHA-512 (or -384) from the states that keyed512 gave.
+pub fn hmacKeyed512(states: *const [2][8]u64, data: []const u8, tag: []u8) void {
+    if (comptime cpu.possible(.sha512) and @hasDecl(isa, "hmacKeyed512")) {
+        if (cpu.has(.sha512)) return isa.hmacKeyed512(states, data, tag);
+    }
+
+    var inner: [64]u8 = undefined;
+
+    defer ct.wipe(&inner);
+
+    finish512(states[0], 128, data, inner[0..tag.len]);
+
+    finish512(states[1], 128, inner[0..tag.len], tag);
 }
 
 // HMAC-SHA-512, or HMAC-SHA-384 for a 48-byte tag, under a key of at most a block.

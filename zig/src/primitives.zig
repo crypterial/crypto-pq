@@ -5,22 +5,49 @@ const hash = @import("hash.zig");
 const keccak = @import("keccak.zig");
 const sha2 = @import("sha2.zig");
 
-// One-shot hashing of concatenated parts. The engine state is wiped afterwards: a sponge state
-// can be run backwards to its input, and the inputs here are often secret.
+const Keccak = keccak.Keccak;
+
+// The library's own hashing uses the engines themselves rather than the public Hasher, Xof and
+// Mac, whose unions would bring every other algorithm's code into each module.
+
+// One-shot hashing of concatenated parts with SHA-2 or SHA-3. The engine state is wiped
+// afterwards: a sponge state can be run backwards to its input, and the inputs here are often
+// secret.
 pub fn digest(comptime algorithm: hash.HashAlgorithm, parts: []const []const u8, out: []u8) void {
-    var hasher = algorithm.create();
+    switch (algorithm.kind) {
+        .sha3 => {
+            var sponge = Keccak.init(200 - 2 * algorithm.digest_size, 0x06);
 
-    for (parts) |part| {
-        hasher.update(part);
+            defer ct.wipe(std.mem.asBytes(&sponge));
+
+            for (parts) |part| sponge.update(part);
+
+            sponge.read(out);
+        },
+        inline .sha256, .sha512 => |iv| {
+            var engine = (if (algorithm.kind == .sha256) sha2.Sha256 else sha2.Sha512).init(iv);
+
+            defer ct.wipe(std.mem.asBytes(&engine));
+
+            for (parts) |part| engine.update(part);
+
+            var full = engine.digest();
+
+            defer ct.wipe(&full);
+
+            @memcpy(out, full[0..out.len]);
+        },
+        else => @compileError("not a SHA-2 or SHA-3 hash"),
     }
+}
 
-    hasher.digest(out);
-
-    ct.wipe(std.mem.asBytes(&hasher));
+// SHAKE256's sponge.
+pub fn shake256Sponge() Keccak {
+    return .init(136, 0x1f);
 }
 
 pub fn shake256(parts: []const []const u8, out: []u8) void {
-    var xof = hash.shake256.create();
+    var xof = shake256Sponge();
 
     for (parts) |part| {
         xof.update(part);
@@ -29,6 +56,34 @@ pub fn shake256(parts: []const []const u8, out: []u8) void {
     xof.read(out);
 
     ct.wipe(std.mem.asBytes(&xof));
+}
+
+// HMAC-SHA-256 (Word u32) or HMAC-SHA-512 (Word u64) of `first` and then `rest` under a key of
+// at most a block, its output truncated to out.len bytes. The caller holds DIT.
+pub fn hmac(comptime Word: type, key: []const u8, first: []const u8, rest: []const []const u8, out: []u8) void {
+    const block = 16 * @sizeOf(Word);
+
+    std.debug.assert(key.len <= block);
+
+    var keyed = if (Word == u32) sha2.keyed256(&sha2.iv_256, key) else sha2.keyed512(&sha2.iv_512, key);
+
+    defer ct.wipe(std.mem.asBytes(&keyed));
+
+    var inner: (if (Word == u32) sha2.Sha256 else sha2.Sha512) = .{ .state = keyed[0], .length = block };
+
+    defer ct.wipe(std.mem.asBytes(&inner));
+
+    inner.update(first);
+
+    for (rest) |part| inner.update(part);
+
+    var inner_digest = inner.digest();
+
+    defer ct.wipe(&inner_digest);
+
+    if (Word == u32) return sha2.finish256(keyed[1], block, &inner_digest, out);
+
+    sha2.finish512(keyed[1], block, &inner_digest, out);
 }
 
 fn gather(buffer: []u8, parts: []const []const u8) usize {

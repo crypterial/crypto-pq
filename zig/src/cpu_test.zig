@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const aarch64 = @import("aarch64.zig");
+const blake2 = @import("blake2.zig");
 const cpu = @import("cpu.zig");
 const keccak = @import("keccak.zig");
 const mldsa = @import("mldsa.zig");
@@ -258,7 +259,7 @@ fn portableFinish(comptime Word: type, state: [8]Word, absorbed: usize, data: []
     return s;
 }
 
-fn portableHmac(comptime Word: type, iv: *const [8]Word, key: []const u8, data: []const u8, size: usize) [64]u8 {
+fn portableKeyed(comptime Word: type, iv: *const [8]Word, key: []const u8) [2][8]Word {
     const block = 16 * @sizeOf(Word);
 
     var keyed: [2][8]Word = .{ iv.*, iv.* };
@@ -270,6 +271,14 @@ fn portableHmac(comptime Word: type, iv: *const [8]Word, key: []const u8, data: 
 
         if (Word == u32) sha2.portable.compress256(state, &bytes) else sha2.portable.compress512(state, &bytes);
     }
+
+    return keyed;
+}
+
+fn portableHmac(comptime Word: type, iv: *const [8]Word, key: []const u8, data: []const u8, size: usize) [64]u8 {
+    const block = 16 * @sizeOf(Word);
+
+    const keyed = portableKeyed(Word, iv, key);
 
     var inner: [64]u8 = undefined;
 
@@ -309,9 +318,22 @@ test "AArch64 one-shot SHA-256 and HMAC-SHA-256 match the portable code" {
         for ([_]usize{ 32, 28 }, [_]*const [8]u32{ &sha2.iv_256, &sha2.iv_224 }) |size, iv| {
             var tag: [32]u8 = undefined;
 
+            const expected = portableHmac(u32, iv, key, message, size);
+
             aarch64.hmac256(iv, key, message, tag[0..size]);
 
-            try testing.expectEqualSlices(u8, portableHmac(u32, iv, key, message, size)[0..size], tag[0..size]);
+            try testing.expectEqualSlices(u8, expected[0..size], tag[0..size]);
+
+            // The keyed states once, then tags from them.
+            const keyed = aarch64.keyed256(iv, key);
+
+            try testing.expectEqual(portableKeyed(u32, iv, key), keyed);
+
+            @memset(&tag, 0);
+
+            aarch64.hmacKeyed256(&keyed, message, tag[0..size]);
+
+            try testing.expectEqualSlices(u8, expected[0..size], tag[0..size]);
         }
     }
 }
@@ -343,9 +365,21 @@ test "AArch64 one-shot SHA-512 and HMAC-SHA-512 match the portable code" {
         for ([_]usize{ 64, 48 }, [_]*const [8]u64{ &sha2.iv_512, &sha2.iv_384 }) |size, iv| {
             var tag: [64]u8 = undefined;
 
+            const expected = portableHmac(u64, iv, key, message, size);
+
             aarch64.hmac512(iv, key, message, tag[0..size]);
 
-            try testing.expectEqualSlices(u8, portableHmac(u64, iv, key, message, size)[0..size], tag[0..size]);
+            try testing.expectEqualSlices(u8, expected[0..size], tag[0..size]);
+
+            const keyed = aarch64.keyed512(iv, key);
+
+            try testing.expectEqual(portableKeyed(u64, iv, key), keyed);
+
+            @memset(&tag, 0);
+
+            aarch64.hmacKeyed512(&keyed, message, tag[0..size]);
+
+            try testing.expectEqualSlices(u8, expected[0..size], tag[0..size]);
         }
     }
 }
@@ -742,4 +776,76 @@ test "x86-64 AVX2 Keccak in four lanes matches the portable permutation" {
     var prng: std.Random.DefaultPrng = .init(0x4);
 
     try checkKeccak(4, x86_64.keccak4, prng.random());
+}
+
+fn blake2Words(comptime W: type, bytes: []const u8) [16]W {
+    var m: [16]W = undefined;
+
+    for (&m, 0..) |*x, i| x.* = std.mem.readInt(W, bytes[@sizeOf(W) * i ..][0..@sizeOf(W)], .little);
+
+    return m;
+}
+
+// One to three blocks, and a last block with the final flag, against the portable compression;
+// some counters sit just below the carry out of their low word.
+fn checkBlake2(comptime B: type, random: std.Random) !void {
+    const W = @typeInfo(@FieldType(B.Engine, "h")).array.child;
+
+    for (0..runs) |case| {
+        var h: [8]W = undefined;
+
+        var data: [3 * B.block]u8 = undefined;
+
+        fill(random, std.mem.asBytes(&h), case);
+
+        fill(random, &data, case);
+
+        const count = 1 + case % 3;
+
+        var t = random.int(B.Counter);
+
+        if (case % 4 == 1) t = @as(B.Counter, random.int(W)) << @bitSizeOf(W) | (std.math.maxInt(W) - random.uintLessThan(W, 3 * B.block));
+
+        var expected = h;
+
+        for (0..count) |b| B.portable(&expected, &blake2Words(W, data[B.block * b ..][0..B.block]), t +% B.block * (b + 1), false);
+
+        var got = h;
+
+        B.blocks(&got, data[0 .. B.block * count], t);
+
+        try testing.expectEqual(expected, got);
+
+        expected = h;
+
+        B.portable(&expected, &blake2Words(W, data[0..B.block]), t, true);
+
+        got = h;
+
+        B.compress(&got, data[0..B.block], t, true);
+
+        try testing.expectEqual(expected, got);
+    }
+}
+
+test "AArch64 BLAKE2b and BLAKE2s match the portable code" {
+    if (comptime !cpu.aarch64_base) return error.SkipZigTest;
+
+    var prng: std.Random.DefaultPrng = .init(0xb2a);
+
+    try checkBlake2(blake2.Blake2b, prng.random());
+
+    try checkBlake2(blake2.Blake2s, prng.random());
+}
+
+test "x86-64 AVX2 BLAKE2b and BLAKE2s match the portable code" {
+    if (comptime arch != .x86_64 or !cpu.possible(.avx2)) return error.SkipZigTest;
+
+    if (!cpu.has(.avx2)) return error.SkipZigTest;
+
+    var prng: std.Random.DefaultPrng = .init(0xb2);
+
+    try checkBlake2(blake2.Blake2b, prng.random());
+
+    try checkBlake2(blake2.Blake2s, prng.random());
 }

@@ -245,7 +245,7 @@ test "slot sizes and alignment" {
         }
     }
 
-    for ([_]struct { common.SlotType, u32 }{ .{ .hasher, 10 }, .{ .xof, 2 }, .{ .hmac, 4 } }) |entry| {
+    for ([_]struct { common.SlotType, u32 }{ .{ .hasher, 19 }, .{ .xof, 6 }, .{ .hmac, 8 }, .{ .configured_hash, 19 }, .{ .configured_xof, 6 }, .{ .configured_mac, 8 } }) |entry| {
         for (0..entry[1]) |id| try testing.expect(capi.slotSize(@intFromEnum(entry[0]), @intCast(id)) > 0);
 
         try testing.expectEqual(0, capi.slotSize(@intFromEnum(entry[0]), entry[1]));
@@ -873,11 +873,21 @@ test "signature rejections" {
     try expectStatus(common.bad_slot, Sig.verify(private, &signature, message, "", 0, 0));
 }
 
-const hash_ids = [_]pq.HashAlgorithm{ pq.sha_224, pq.sha_256, pq.sha_384, pq.sha_512, pq.sha_512_224, pq.sha_512_256, pq.sha3_224, pq.sha3_256, pq.sha3_384, pq.sha3_512 };
+const hash_ids = capi.hash.algorithms;
 
-const hmac_ids = [_]pq.HmacAlgorithm{ pq.hmac_sha_224, pq.hmac_sha_256, pq.hmac_sha_384, pq.hmac_sha_512 };
+const mac_ids = capi.hash.macs;
 
-test "hashes, XOFs and HMACs through the ABI equal the core" {
+// Keys of every kind of length that a MAC takes: none, short, longer than a block for HMAC and
+// KMAC; one byte, short and the longest for BLAKE2.
+fn keyLengths(algorithm: pq.MacAlgorithm) [3]usize {
+    return switch (algorithm.kind) {
+        .blake2b => .{ 1, 20, 64 },
+        .blake2s => .{ 1, 20, 32 },
+        else => .{ 0, 20, 200 },
+    };
+}
+
+test "hashes, XOFs and MACs through the ABI equal the core" {
     const allocator = testing.allocator;
 
     const data = pattern(1000, 3);
@@ -931,9 +941,9 @@ test "hashes, XOFs and HMACs through the ABI equal the core" {
         try testing.expectEqual([3]u32{ 5, @intCast(id), 0 }, try state.info());
     }
 
-    try expectStatus(common.bad_argument, capi.hash.digest(10, &data, data.len, null, 0));
+    try expectStatus(common.bad_argument, capi.hash.digest(hash_ids.len, &data, data.len, null, 0));
 
-    inline for (.{ pq.shake128, pq.shake256 }, 0..) |algorithm, id| {
+    inline for (capi.hash.xofs, 0..) |algorithm, id| {
         var expected: [300]u8 = undefined;
 
         algorithm.digest(&data, &expected);
@@ -966,12 +976,12 @@ test "hashes, XOFs and HMACs through the ABI equal the core" {
         try expectStatus(ok, capi.hash.xofRead(state.ptr(), state.len(), null, 0));
     }
 
-    try expectStatus(common.bad_argument, capi.hash.xof(2, &data, data.len, null, 0));
+    try expectStatus(common.bad_argument, capi.hash.xof(capi.hash.xofs.len, &data, data.len, null, 0));
 
     const key = pattern(200, 5);
 
-    for (hmac_ids, 0..) |algorithm, id| {
-        for ([_]usize{ 0, 20, 200 }) |key_length| {
+    for (mac_ids, 0..) |algorithm, id| {
+        for (keyLengths(algorithm)) |key_length| {
             var expected: [64]u8 = undefined;
 
             algorithm.digest(key[0..key_length], &data, expected[0..algorithm.digest_size]);
@@ -1018,7 +1028,391 @@ test "hashes, XOFs and HMACs through the ABI equal the core" {
         }
     }
 
-    try expectStatus(common.bad_argument, capi.hash.hmac(4, &key, 1, &data, 1, null, 0));
+    try expectStatus(common.bad_argument, capi.hash.hmac(mac_ids.len, &key, 1, &data, 1, null, 0));
+}
+
+// A BLAKE2 key outside 1 to 64 (BLAKE2b) or 32 (BLAKE2s) bytes is INVALID_LENGTH, and a
+// verification with one says no.
+test "BLAKE2 MAC keys through the ABI" {
+    const key = pattern(65, 1);
+
+    const data = "data";
+
+    var out: [64]u8 = undefined;
+
+    for ([_]u32{ 6, 7 }, [_]usize{ 64, 32 }) |id, max| {
+        const size = mac_ids[id].digest_size;
+
+        const state = try Memory.init(testing.allocator, .hmac, id);
+
+        defer state.deinit();
+
+        const spec = try Memory.init(testing.allocator, .configured_mac, id);
+
+        defer spec.deinit();
+
+        try expectStatus(ok, capi.hash.configureMac(id, 0, 0, null, 0, null, 0, spec.ptr(), spec.len()));
+
+        for ([_]usize{ 0, max + 1 }) |length| {
+            try expectStatus(common.code(error.InvalidLength), capi.hash.hmac(id, &key, length, data, data.len, &out, size));
+
+            try expectStatus(common.rejected, capi.hash.hmacVerify(id, &key, length, data, data.len, &out, size));
+
+            try expectStatus(common.code(error.InvalidLength), capi.hash.hmacInit(id, &key, length, state.ptr(), state.len()));
+
+            try expectStatus(common.code(error.InvalidLength), capi.hash.macWith(spec.ptr(), spec.len(), &key, length, data, data.len, &out, size));
+
+            try expectStatus(common.rejected, capi.hash.macVerifyWith(spec.ptr(), spec.len(), &key, length, data, data.len, &out, size));
+
+            try expectStatus(common.code(error.InvalidLength), capi.hash.macInitWith(spec.ptr(), spec.len(), &key, length, state.ptr(), state.len()));
+        }
+
+        try expectStatus(ok, capi.hash.hmac(id, &key, max, data, data.len, &out, size));
+    }
+}
+
+test "configured hashes, XOFs and MACs through the ABI equal the core" {
+    const allocator = testing.allocator;
+
+    const data = pattern(700, 9);
+
+    const salt = pattern(16, 1);
+
+    const personalization = pattern(16, 2);
+
+    for (hash_ids, 0..) |algorithm, id| {
+        const spec = try Memory.init(allocator, .configured_hash, @intCast(id));
+
+        defer spec.deinit();
+
+        const options = algorithm.kind == .blake2b or algorithm.kind == .blake2s;
+
+        const width: usize = if (algorithm.kind == .blake2b) 16 else 8;
+
+        // Options are BLAKE2's only.
+        if (!options) {
+            try expectStatus(common.code(error.InvalidOption), capi.hash.configureHash(@intCast(id), &salt, 1, null, 0, spec.ptr(), spec.len()));
+
+            try expectStatus(common.code(error.InvalidOption), capi.hash.configureHash(@intCast(id), null, 0, &personalization, 1, spec.ptr(), spec.len()));
+        } else {
+            try expectStatus(common.code(error.InvalidOption), capi.hash.configureHash(@intCast(id), &salt, width + 1, null, 0, spec.ptr(), spec.len()));
+        }
+
+        const salt_length: usize = if (options) width else 0;
+
+        const configured = try algorithm.configure(.{ .salt = salt[0..salt_length], .personalization = personalization[0..salt_length] });
+
+        try expectStatus(ok, capi.hash.configureHash(@intCast(id), &salt, salt_length, &personalization, salt_length, spec.ptr(), spec.len()));
+
+        try testing.expectEqual([3]u32{ 9, @intCast(id), 0 }, try spec.info());
+
+        var expected: [64]u8 = undefined;
+
+        configured.digest(&data, expected[0..algorithm.digest_size]);
+
+        var out: [64]u8 = undefined;
+
+        try expectStatus(ok, capi.hash.digestWith(spec.ptr(), spec.len(), &data, data.len, &out, algorithm.digest_size));
+
+        try testing.expectEqualSlices(u8, expected[0..algorithm.digest_size], out[0..algorithm.digest_size]);
+
+        try expectStatus(common.bad_argument, capi.hash.digestWith(spec.ptr(), spec.len(), &data, data.len, &out, algorithm.digest_size - 1));
+
+        const state = try Memory.init(allocator, .hasher, @intCast(id));
+
+        defer state.deinit();
+
+        try expectStatus(ok, capi.hash.initWith(spec.ptr(), spec.len(), state.ptr(), state.len()));
+
+        try expectStatus(ok, capi.hash.update(state.ptr(), state.len(), &data, 300));
+
+        try expectStatus(ok, capi.hash.update(state.ptr(), state.len(), data[300..].ptr, 400));
+
+        try expectStatus(ok, capi.hash.final(state.ptr(), state.len(), &out, algorithm.digest_size));
+
+        try testing.expectEqualSlices(u8, expected[0..algorithm.digest_size], out[0..algorithm.digest_size]);
+
+        // A configured slot is no state, and a state no configured slot.
+        try expectStatus(common.bad_slot, capi.hash.update(spec.ptr(), spec.len(), &data, 1));
+
+        try expectStatus(common.bad_slot, capi.hash.digestWith(state.ptr(), state.len(), &data, data.len, &out, algorithm.digest_size));
+    }
+
+    const customization = pattern(300, 4);
+
+    inline for (capi.hash.xofs, 0..) |algorithm, id| {
+        const spec = try Memory.init(allocator, .configured_xof, id);
+
+        defer spec.deinit();
+
+        const takes = algorithm.kind == .cshake or algorithm.kind == .ascon_cxof;
+
+        const length: usize = if (takes) 256 else 0;
+
+        if (!takes) try expectStatus(common.code(error.InvalidOption), capi.hash.configureXof(id, null, 0, &customization, 1, spec.ptr(), spec.len()));
+
+        if (algorithm.kind == .ascon_cxof) try expectStatus(common.code(error.InvalidOption), capi.hash.configureXof(id, null, 0, &customization, 257, spec.ptr(), spec.len()));
+
+        // A function name is for cSHAKE only.
+        if (algorithm.kind != .cshake) try expectStatus(common.code(error.InvalidOption), capi.hash.configureXof(id, "N", 1, null, 0, spec.ptr(), spec.len()));
+
+        const configured = if (algorithm.kind == .cshake) try pq.hazmat.configureCshake(algorithm, "N", customization[0..length]) else try algorithm.configure(.{ .customization = customization[0..length] });
+
+        const name_length: usize = if (algorithm.kind == .cshake) 1 else 0;
+
+        try expectStatus(ok, capi.hash.configureXof(id, "N", name_length, &customization, length, spec.ptr(), spec.len()));
+
+        var expected: [300]u8 = undefined;
+
+        configured.digest(&data, &expected);
+
+        var out: [300]u8 = undefined;
+
+        try expectStatus(ok, capi.hash.xofWith(spec.ptr(), spec.len(), &data, data.len, &out, out.len));
+
+        try testing.expectEqualSlices(u8, &expected, &out);
+
+        const state = try Memory.init(allocator, .xof, id);
+
+        defer state.deinit();
+
+        try expectStatus(ok, capi.hash.xofInitWith(spec.ptr(), spec.len(), state.ptr(), state.len()));
+
+        try expectStatus(ok, capi.hash.xofUpdate(state.ptr(), state.len(), &data, 699));
+
+        try expectStatus(ok, capi.hash.xofUpdate(state.ptr(), state.len(), data[699..].ptr, 1));
+
+        try expectStatus(ok, capi.hash.xofRead(state.ptr(), state.len(), &out, 13));
+
+        try expectStatus(ok, capi.hash.xofRead(state.ptr(), state.len(), out[13..].ptr, 287));
+
+        try testing.expectEqualSlices(u8, &expected, &out);
+    }
+
+    const key = pattern(64, 7);
+
+    for (mac_ids, 0..) |algorithm, id| {
+        const spec = try Memory.init(allocator, .configured_mac, @intCast(id));
+
+        defer spec.deinit();
+
+        // Each kind's options, and a length that is not the default.
+        const configured: pq.MacAlgorithm, const size: usize, const flags: u32, const first: []const u8, const second: []const u8 = switch (algorithm.kind) {
+            .hmac => .{ algorithm, 0, 0, "", "" },
+            .kmac => .{ try algorithm.configure(.{ .length = 100, .customization = customization[0..40], .xof = id == 5 }), 100, capi.hash.mac_length | @as(u32, if (id == 5) capi.hash.mac_xof else 0), customization[0..40], "" },
+            .blake2b => .{ try algorithm.configure(.{ .length = 33, .salt = salt[0..16], .personalization = personalization[0..5] }), 33, capi.hash.mac_length, salt[0..16], personalization[0..5] },
+            .blake2s => .{ try algorithm.configure(.{ .length = 17, .salt = salt[0..8], .personalization = personalization[0..8] }), 17, capi.hash.mac_length, salt[0..8], personalization[0..8] },
+        };
+
+        try expectStatus(ok, capi.hash.configureMac(@intCast(id), size, flags, first.ptr, first.len, second.ptr, second.len, spec.ptr(), spec.len()));
+
+        const key_length: usize = if (algorithm.kind == .blake2s) 32 else 64;
+
+        var expected: [100]u8 = undefined;
+
+        configured.digest(key[0..key_length], &data, expected[0..configured.digest_size]);
+
+        var out: [100]u8 = undefined;
+
+        const tag = out[0..configured.digest_size];
+
+        try expectStatus(ok, capi.hash.macWith(spec.ptr(), spec.len(), &key, key_length, &data, data.len, tag.ptr, tag.len));
+
+        try testing.expectEqualSlices(u8, expected[0..configured.digest_size], tag);
+
+        try expectStatus(ok, capi.hash.macVerifyWith(spec.ptr(), spec.len(), &key, key_length, &data, data.len, tag.ptr, tag.len));
+
+        try expectStatus(common.rejected, capi.hash.macVerifyWith(spec.ptr(), spec.len(), &key, key_length, &data, data.len - 1, tag.ptr, tag.len));
+
+        try expectStatus(common.bad_argument, capi.hash.macWith(spec.ptr(), spec.len(), &key, key_length, &data, data.len, tag.ptr, tag.len + 1));
+
+        const state = try Memory.init(allocator, .hmac, @intCast(id));
+
+        defer state.deinit();
+
+        try expectStatus(ok, capi.hash.macInitWith(spec.ptr(), spec.len(), &key, key_length, state.ptr(), state.len()));
+
+        try expectStatus(ok, capi.hash.hmacUpdate(state.ptr(), state.len(), &data, 500));
+
+        try expectStatus(ok, capi.hash.hmacUpdate(state.ptr(), state.len(), data[500..].ptr, 200));
+
+        @memset(tag, 0);
+
+        try expectStatus(ok, capi.hash.hmacFinal(state.ptr(), state.len(), tag.ptr, tag.len));
+
+        try testing.expectEqualSlices(u8, expected[0..configured.digest_size], tag);
+
+        try expectStatus(ok, capi.hash.hmacFinalVerify(state.ptr(), state.len(), tag.ptr, tag.len));
+
+        try expectStatus(common.rejected, capi.hash.hmacFinalVerify(state.ptr(), state.len(), tag.ptr, tag.len - 1));
+
+        try expectStatus(common.bad_argument, capi.hash.hmacFinal(state.ptr(), state.len(), tag.ptr, tag.len + 1));
+    }
+}
+
+test "configure through the ABI refuses what the core refuses" {
+    const allocator = testing.allocator;
+
+    const long = pattern(17, 1);
+
+    for (mac_ids, 0..) |algorithm, id| {
+        const spec = try Memory.init(allocator, .configured_mac, @intCast(id));
+
+        defer spec.deinit();
+
+        const invalid_option = common.code(error.InvalidOption);
+
+        // Unknown flags, and a size without mac_length, are the binding's mistakes.
+        try expectStatus(common.bad_argument, capi.hash.configureMac(@intCast(id), 0, 4, null, 0, null, 0, spec.ptr(), spec.len()));
+
+        try expectStatus(common.bad_argument, capi.hash.configureMac(@intCast(id), 32, 0, null, 0, null, 0, spec.ptr(), spec.len()));
+
+        switch (algorithm.kind) {
+            .hmac => {
+                try expectStatus(invalid_option, capi.hash.configureMac(@intCast(id), algorithm.digest_size, capi.hash.mac_length, null, 0, null, 0, spec.ptr(), spec.len()));
+
+                try expectStatus(invalid_option, capi.hash.configureMac(@intCast(id), 0, capi.hash.mac_xof, null, 0, null, 0, spec.ptr(), spec.len()));
+
+                try expectStatus(invalid_option, capi.hash.configureMac(@intCast(id), 0, 0, &long, 1, null, 0, spec.ptr(), spec.len()));
+            },
+            .kmac => {
+                try expectStatus(invalid_option, capi.hash.configureMac(@intCast(id), 3, capi.hash.mac_length, null, 0, null, 0, spec.ptr(), spec.len()));
+
+                try expectStatus(invalid_option, capi.hash.configureMac(@intCast(id), 0, 0, null, 0, &long, 1, spec.ptr(), spec.len()));
+            },
+            .blake2b, .blake2s => {
+                const max: usize = if (algorithm.kind == .blake2b) 64 else 32;
+
+                try expectStatus(invalid_option, capi.hash.configureMac(@intCast(id), 0, capi.hash.mac_length, null, 0, null, 0, spec.ptr(), spec.len()));
+
+                try expectStatus(invalid_option, capi.hash.configureMac(@intCast(id), max + 1, capi.hash.mac_length, null, 0, null, 0, spec.ptr(), spec.len()));
+
+                try expectStatus(invalid_option, capi.hash.configureMac(@intCast(id), 0, capi.hash.mac_xof, null, 0, null, 0, spec.ptr(), spec.len()));
+
+                try expectStatus(invalid_option, capi.hash.configureMac(@intCast(id), 0, 0, &long, max / 4 + 1, null, 0, spec.ptr(), spec.len()));
+            },
+        }
+
+        // The defaults.
+        try expectStatus(ok, capi.hash.configureMac(@intCast(id), 0, 0, null, 0, null, 0, spec.ptr(), spec.len()));
+
+        try testing.expectEqual([3]u32{ 11, @intCast(id), 0 }, try spec.info());
+
+        // A live slot is not overwritten.
+        try expectStatus(common.bad_slot, capi.hash.configureMac(@intCast(id), 0, 0, null, 0, null, 0, spec.ptr(), spec.len()));
+    }
+
+    try expectStatus(common.bad_argument, capi.hash.configureHash(hash_ids.len, null, 0, null, 0, null, 0));
+
+    try expectStatus(common.bad_argument, capi.hash.configureXof(capi.hash.xofs.len, null, 0, null, 0, null, 0));
+
+    try expectStatus(common.bad_argument, capi.hash.configureMac(mac_ids.len, 0, 0, null, 0, null, 0, null, 0));
+}
+
+// A configured slot that the binding damaged is refused, never used.
+test "a damaged configured slot is refused" {
+    const allocator = testing.allocator;
+
+    var out: [64]u8 = undefined;
+
+    const cshake = try Memory.init(allocator, .configured_xof, 2);
+
+    defer cshake.deinit();
+
+    try expectStatus(ok, capi.hash.configureXof(2, null, 0, "S", 1, cshake.ptr(), cshake.len()));
+
+    const Spec = capi.hash.Xof(2).Spec;
+
+    cshake.bytes[common.bodyOffset(Spec) + @offsetOf(Spec, "prefixed")] = 2;
+
+    try expectStatus(common.bad_slot, capi.hash.xofWith(cshake.ptr(), cshake.len(), "data", 4, &out, out.len));
+
+    const xof = try Memory.init(allocator, .xof, 2);
+
+    defer xof.deinit();
+
+    try expectStatus(common.bad_slot, capi.hash.xofInitWith(cshake.ptr(), cshake.len(), xof.ptr(), xof.len()));
+
+    // A KMAC length below 4 and a BLAKE2 length of 0.
+    inline for (.{ 4, 6 }) |id| {
+        const spec = try Memory.init(allocator, .configured_mac, id);
+
+        defer spec.deinit();
+
+        try expectStatus(ok, capi.hash.configureMac(id, 0, 0, null, 0, null, 0, spec.ptr(), spec.len()));
+
+        const MacSpec = capi.hash.Mac(id).Spec;
+
+        @memset(spec.bytes[common.bodyOffset(MacSpec) + @offsetOf(MacSpec, "length") ..][0..@sizeOf(usize)], 0);
+
+        try expectStatus(common.bad_slot, capi.hash.macWith(spec.ptr(), spec.len(), "key", 3, "data", 4, &out, 32));
+
+        try expectStatus(common.bad_slot, capi.hash.macVerifyWith(spec.ptr(), spec.len(), "key", 3, "data", 4, &out, 32));
+
+        const state = try Memory.init(allocator, .hmac, id);
+
+        defer state.deinit();
+
+        try expectStatus(common.bad_slot, capi.hash.macInitWith(spec.ptr(), spec.len(), "key", 3, state.ptr(), state.len()));
+
+        // Nothing was made in the state's memory.
+        try expectStatus(common.bad_slot, capi.hash.hmacUpdate(state.ptr(), state.len(), "x", 1));
+    }
+}
+
+test "HKDF through the ABI equals the core" {
+    const ikm = pattern(40, 1);
+
+    const salt = pattern(20, 2);
+
+    const info = pattern(30, 3);
+
+    for (capi.hash.kdfs, 0..) |algorithm, id| {
+        const n = algorithm.hashSize();
+
+        var expected: [600]u8 = undefined;
+
+        try algorithm.derive(&ikm, &expected, .{ .salt = &salt, .info = &info });
+
+        var out: [600]u8 = undefined;
+
+        try expectStatus(ok, capi.hash.kdfDerive(@intCast(id), &ikm, ikm.len, &salt, salt.len, &info, info.len, &out, out.len));
+
+        try testing.expectEqualSlices(u8, &expected, &out);
+
+        var prk: [64]u8 = undefined;
+
+        try expectStatus(ok, capi.hash.kdfExtract(@intCast(id), &ikm, ikm.len, &salt, salt.len, &prk, n));
+
+        try expectStatus(common.bad_argument, capi.hash.kdfExtract(@intCast(id), &ikm, ikm.len, &salt, salt.len, &prk, n - 1));
+
+        @memset(&out, 0);
+
+        try expectStatus(ok, capi.hash.kdfExpand(@intCast(id), &prk, n, &info, info.len, &out, out.len));
+
+        try testing.expectEqualSlices(u8, &expected, &out);
+
+        const invalid_length = common.code(error.InvalidLength);
+
+        try expectStatus(invalid_length, capi.hash.kdfDerive(@intCast(id), &ikm, ikm.len, null, 0, null, 0, null, 0));
+
+        try expectStatus(invalid_length, capi.hash.kdfExpand(@intCast(id), &prk, n - 1, null, 0, &out, 32));
+
+        try expectStatus(invalid_length, capi.hash.kdfExpand(@intCast(id), &prk, n, null, 0, null, 0));
+
+        const too_long = try testing.allocator.alloc(u8, 255 * n + 1);
+
+        defer testing.allocator.free(too_long);
+
+        try expectStatus(invalid_length, capi.hash.kdfDerive(@intCast(id), &ikm, ikm.len, null, 0, null, 0, too_long.ptr, too_long.len));
+
+        try expectStatus(ok, capi.hash.kdfDerive(@intCast(id), &ikm, ikm.len, null, 0, null, 0, too_long.ptr, too_long.len - 1));
+
+        // The output is apart from the inputs.
+        try expectStatus(common.bad_argument, capi.hash.kdfDerive(@intCast(id), &out, 40, null, 0, null, 0, out[20..].ptr, 32));
+    }
+
+    try expectStatus(common.bad_argument, capi.hash.kdfDerive(capi.hash.kdfs.len, &ikm, ikm.len, null, 0, null, 0, null, 0));
 }
 
 test "a state in use by another call is busy" {
@@ -1770,6 +2164,12 @@ const Fixture = struct {
     hasher: Memory,
     xof: Memory,
     hmac: Memory,
+    configured_hash: Memory,
+    configured_xof: Memory,
+    configured_mac: Memory,
+    blake2_hasher: Memory,
+    kmac: Memory,
+    blake2_mac: Memory,
     scratch: Memory,
     ciphertext: [1568]u8 = undefined,
     signature: []u8,
@@ -1797,6 +2197,18 @@ const Fixture = struct {
 
         fixture.hmac = try Memory.init(allocator, .hmac, 3);
 
+        fixture.configured_hash = try Memory.init(allocator, .configured_hash, 13);
+
+        fixture.configured_xof = try Memory.init(allocator, .configured_xof, 3);
+
+        fixture.configured_mac = try Memory.init(allocator, .configured_mac, 5);
+
+        fixture.blake2_hasher = try Memory.init(allocator, .hasher, 13);
+
+        fixture.kmac = try Memory.init(allocator, .hmac, 5);
+
+        fixture.blake2_mac = try Memory.init(allocator, .hmac, 6);
+
         fixture.scratch = try Memory.init(allocator, .signature_private, 2);
 
         fixture.signature = try allocator.alloc(u8, 49856);
@@ -1809,7 +2221,7 @@ const Fixture = struct {
     fn deinit(self: *Fixture, allocator: Allocator) void {
         for (self.kem_private ++ self.kem_public ++ self.signature_private ++ self.signature_public) |memory| memory.deinit();
 
-        for ([_]Memory{ self.hasher, self.xof, self.hmac, self.scratch }) |memory| memory.deinit();
+        for ([_]Memory{ self.hasher, self.xof, self.hmac, self.configured_hash, self.configured_xof, self.configured_mac, self.blake2_hasher, self.kmac, self.blake2_mac, self.scratch }) |memory| memory.deinit();
 
         allocator.free(self.signature);
     }
@@ -2049,18 +2461,94 @@ fn statefulProbes(comptime number: usize) [1]Probe {
 }
 
 const hash_probes = [_]Probe{
-    .{ .name = "hash, xof, hmac", .run = struct {
+    .{ .name = "hash, xof, mac", .run = struct {
         fn run(f: *Fixture) !void {
             var out: [200]u8 = undefined;
 
-            for (0..10) |id| try expectStatus(ok, capi.hash.digest(@intCast(id), &f.data, f.data.len, &out, hash_ids[id].digest_size));
+            for (hash_ids, 0..) |algorithm, id| try expectStatus(ok, capi.hash.digest(@intCast(id), &f.data, f.data.len, &out, algorithm.digest_size));
 
-            for (0..2) |id| try expectStatus(ok, capi.hash.xof(@intCast(id), &f.data, f.data.len, &out, out.len));
+            for (0..capi.hash.xofs.len) |id| try expectStatus(ok, capi.hash.xof(@intCast(id), &f.data, f.data.len, &out, out.len));
 
-            for (0..4) |id| {
-                try expectStatus(ok, capi.hash.hmac(@intCast(id), &f.data, 200, &f.data, f.data.len, &out, hmac_ids[id].digest_size));
+            for (mac_ids, 0..) |algorithm, id| {
+                const key_length = keyLengths(algorithm)[2];
 
-                try expectStatus(ok, capi.hash.hmacVerify(@intCast(id), &f.data, 200, &f.data, f.data.len, &out, hmac_ids[id].digest_size));
+                try expectStatus(ok, capi.hash.hmac(@intCast(id), &f.data, key_length, &f.data, f.data.len, &out, algorithm.digest_size));
+
+                try expectStatus(ok, capi.hash.hmacVerify(@intCast(id), &f.data, key_length, &f.data, f.data.len, &out, algorithm.digest_size));
+            }
+        }
+    }.run },
+    .{ .name = "configured hash, xof, mac", .run = struct {
+        fn run(f: *Fixture) !void {
+            var out: [200]u8 = undefined;
+
+            try f.configured_hash.wipe();
+
+            try expectStatus(ok, capi.hash.configureHash(13, &f.data, 16, &f.data, 16, f.configured_hash.ptr(), f.configured_hash.len()));
+
+            try expectStatus(ok, capi.hash.digestWith(f.configured_hash.ptr(), f.configured_hash.len(), &f.data, f.data.len, &out, 64));
+
+            try f.configured_xof.wipe();
+
+            try expectStatus(ok, capi.hash.configureXof(3, &f.data, 300, &f.data, 700, f.configured_xof.ptr(), f.configured_xof.len()));
+
+            try expectStatus(ok, capi.hash.xofWith(f.configured_xof.ptr(), f.configured_xof.len(), &f.data, f.data.len, &out, out.len));
+
+            try f.configured_mac.wipe();
+
+            try expectStatus(ok, capi.hash.configureMac(5, 200, capi.hash.mac_length, &f.data, 500, null, 0, f.configured_mac.ptr(), f.configured_mac.len()));
+
+            try expectStatus(ok, capi.hash.macWith(f.configured_mac.ptr(), f.configured_mac.len(), &f.data, 300, &f.data, f.data.len, &out, 200));
+
+            try expectStatus(ok, capi.hash.macVerifyWith(f.configured_mac.ptr(), f.configured_mac.len(), &f.data, 300, &f.data, f.data.len, &out, 200));
+
+            try f.blake2_hasher.wipe();
+
+            try expectStatus(ok, capi.hash.initWith(f.configured_hash.ptr(), f.configured_hash.len(), f.blake2_hasher.ptr(), f.blake2_hasher.len()));
+
+            try expectStatus(ok, capi.hash.update(f.blake2_hasher.ptr(), f.blake2_hasher.len(), &f.data, f.data.len));
+
+            try expectStatus(ok, capi.hash.final(f.blake2_hasher.ptr(), f.blake2_hasher.len(), &out, 64));
+
+            try f.xof.wipe();
+
+            try expectStatus(ok, capi.hash.xofInitWith(f.configured_xof.ptr(), f.configured_xof.len(), f.xof.ptr(), f.xof.len()));
+
+            try expectStatus(ok, capi.hash.xofUpdate(f.xof.ptr(), f.xof.len(), &f.data, f.data.len));
+
+            try expectStatus(ok, capi.hash.xofRead(f.xof.ptr(), f.xof.len(), &out, out.len));
+
+            try f.kmac.wipe();
+
+            try expectStatus(ok, capi.hash.macInitWith(f.configured_mac.ptr(), f.configured_mac.len(), &f.data, 300, f.kmac.ptr(), f.kmac.len()));
+
+            try expectStatus(ok, capi.hash.hmacUpdate(f.kmac.ptr(), f.kmac.len(), &f.data, f.data.len));
+
+            try expectStatus(ok, capi.hash.hmacFinal(f.kmac.ptr(), f.kmac.len(), &out, 200));
+
+            try expectStatus(ok, capi.hash.hmacFinalVerify(f.kmac.ptr(), f.kmac.len(), &out, 200));
+
+            try f.blake2_mac.wipe();
+
+            try expectStatus(ok, capi.hash.hmacInit(6, &f.data, 64, f.blake2_mac.ptr(), f.blake2_mac.len()));
+
+            try expectStatus(ok, capi.hash.hmacUpdate(f.blake2_mac.ptr(), f.blake2_mac.len(), &f.data, f.data.len));
+
+            try expectStatus(ok, capi.hash.hmacFinal(f.blake2_mac.ptr(), f.blake2_mac.len(), &out, 64));
+
+            try expectStatus(ok, capi.hash.hmacFinalVerify(f.blake2_mac.ptr(), f.blake2_mac.len(), &out, 64));
+        }
+    }.run },
+    .{ .name = "kdf derive, extract, expand", .run = struct {
+        fn run(f: *Fixture) !void {
+            var out: [600]u8 = undefined;
+
+            for (capi.hash.kdfs, 0..) |algorithm, id| {
+                try expectStatus(ok, capi.hash.kdfDerive(@intCast(id), &f.data, 100, &f.data, 200, &f.data, 300, &out, out.len));
+
+                try expectStatus(ok, capi.hash.kdfExtract(@intCast(id), &f.data, 1000, &f.data, 300, &out, algorithm.hashSize()));
+
+                try expectStatus(ok, capi.hash.kdfExpand(@intCast(id), &f.data, 200, &f.data, 1000, &out, out.len));
             }
         }
     }.run },

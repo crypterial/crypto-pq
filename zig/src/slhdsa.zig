@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const ct = @import("ct.zig");
-const hash = @import("hash.zig");
 const keccak = @import("keccak.zig");
 const primitives = @import("primitives.zig");
 const sha2 = @import("sha2.zig");
@@ -209,7 +208,7 @@ pub fn Scheme(comptime p: Parameters) type {
 
             fn t(self: *const Hashes, adrs: *const Address, message: []const u8, out: *Node) void {
                 if (p.shake) {
-                    var xof = hash.shake256.create();
+                    var xof = primitives.shake256Sponge();
 
                     xof.update(&self.pk_seed);
 
@@ -1178,7 +1177,7 @@ pub fn Scheme(comptime p: Parameters) type {
             var out: [p.m]u8 = undefined;
 
             if (p.shake) {
-                var xof = hash.shake256.create();
+                var xof = primitives.shake256Sponge();
 
                 for ([_][]const u8{ r, pk_seed, pk_root }) |part| xof.update(part);
 
@@ -1189,11 +1188,9 @@ pub fn Scheme(comptime p: Parameters) type {
                 return out;
             }
 
-            const algorithm = if (n == 16) hash.sha_256 else hash.sha_512;
+            const size = if (n == 16) 32 else 64;
 
-            const size = algorithm.digest_size;
-
-            var hasher = algorithm.create();
+            var hasher = if (n == 16) sha2.Sha256.init(&sha2.iv_256) else sha2.Sha512.init(&sha2.iv_512);
 
             for ([_][]const u8{ r, pk_seed, pk_root }) |part| hasher.update(part);
 
@@ -1205,7 +1202,7 @@ pub fn Scheme(comptime p: Parameters) type {
 
             seed[n..][0..n].* = pk_seed.*;
 
-            hasher.digest(seed[2 * n ..][0..size]);
+            seed[2 * n ..][0..size].* = hasher.digest();
 
             var offset: usize = 0;
 
@@ -1216,7 +1213,7 @@ pub fn Scheme(comptime p: Parameters) type {
 
                 var block: [size]u8 = undefined;
 
-                algorithm.digest(&seed, &block);
+                if (n == 16) sha2.finish256(sha2.iv_256, 0, &seed, &block) else sha2.finish512(sha2.iv_512, 0, &seed, &block);
 
                 const take = @min(size, out.len - offset);
 
@@ -1231,7 +1228,7 @@ pub fn Scheme(comptime p: Parameters) type {
         // PRF_msg: SHAKE256, or HMAC-SHA-256 or HMAC-SHA-512 truncated to n bytes.
         fn messageRandomizer(sk_prf: *const Node, opt_rand: *const Node, message: []const []const u8, out: *Node) void {
             if (p.shake) {
-                var xof = hash.shake256.create();
+                var xof = primitives.shake256Sponge();
 
                 defer ct.wipe(std.mem.asBytes(&xof));
 
@@ -1246,21 +1243,7 @@ pub fn Scheme(comptime p: Parameters) type {
                 return;
             }
 
-            const algorithm = if (n == 16) hash.hmac_sha_256 else hash.hmac_sha_512;
-
-            var mac = algorithm.create(sk_prf);
-
-            defer ct.wipe(std.mem.asBytes(&mac));
-
-            mac.update(opt_rand);
-
-            for (message) |part| mac.update(part);
-
-            var full: [algorithm.digest_size]u8 = undefined;
-
-            mac.digest(&full);
-
-            out.* = full[0..n].*;
+            primitives.hmac(if (n == 16) u32 else u64, sk_prf, opt_rand, message, out);
         }
 
         const Split = struct {

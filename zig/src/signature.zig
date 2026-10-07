@@ -566,7 +566,7 @@ fn sameHash(a: hash.HashAlgorithm, b: hash.HashAlgorithm) bool {
 }
 
 fn sameXof(a: hash.XofAlgorithm, b: hash.XofAlgorithm) bool {
-    return std.mem.eql(u8, a.name, b.name) and a.rate == b.rate;
+    return std.mem.eql(u8, a.name, b.name) and a.rate == b.rate and std.meta.eql(a.kind, b.kind);
 }
 
 // Only the hash layer's own constants are pre-hashes; a hand-built value matches none of them.
@@ -632,8 +632,8 @@ pub const Representative = struct {
         };
 
         switch (e.pre_hash) {
-            .hash => |h| h.digest(message, digest),
-            .xof => |x| x.digest(message, digest),
+            .hash => |h| hash.preHashDigest(h, message, digest),
+            .xof => |x| hash.preHashXof(x, message, digest),
         }
 
         self.slices[2] = &self.oid;

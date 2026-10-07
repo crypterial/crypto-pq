@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 
 const ct = @import("ct.zig");
 const Error = @import("errors.zig").Error;
-const hash = @import("hash.zig");
 const merkle = @import("merkle.zig");
 const primitives = @import("primitives.zig");
 const sha2 = @import("sha2.zig");
@@ -162,7 +161,7 @@ fn hashFunction(p: Parameters, prefix: u8, key: []const u8, message: []const []c
     if (!p.shake and length <= 183) return primitives.sha256Finish(&sha2.iv_256, 0, all, out[0..p.n]);
 
     if (p.shake) {
-        var xof = hash.shake256.create();
+        var xof = primitives.shake256Sponge();
 
         defer ct.wipe(std.mem.asBytes(&xof));
 
@@ -170,15 +169,15 @@ fn hashFunction(p: Parameters, prefix: u8, key: []const u8, message: []const []c
 
         xof.read(out[0..p.n]);
     } else {
-        var hasher = hash.sha_256.create();
+        var hasher = sha2.Sha256.init(&sha2.iv_256);
 
         defer ct.wipe(std.mem.asBytes(&hasher));
 
         for (all) |part| hasher.update(part);
 
-        var full: [32]u8 = undefined;
+        var full = hasher.digest();
 
-        hasher.digest(&full);
+        defer ct.wipe(&full);
 
         @memcpy(out[0..p.n], full[0..p.n]);
     }

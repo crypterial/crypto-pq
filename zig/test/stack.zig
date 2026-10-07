@@ -466,7 +466,56 @@ const Hashes = struct {
         pq.hmac_sha_512.digest("key", &data, &out);
     }
 
-    const operations = [_]Operation{.{ .name = "hash functions", .run = run }};
+    // Every new function, with the longest options and keys, through its one-shot and streaming
+    // forms.
+    fn symmetric() !void {
+        var out: [200]u8 = undefined;
+
+        for ([_]pq.HashAlgorithm{ try pq.blake2b_512.configure(.{ .salt = data[0..16], .personalization = data[0..16] }), try pq.blake2s_256.configure(.{ .salt = data[0..8] }), pq.ascon_hash256 }) |hash| {
+            hash.digest(&data, out[0..hash.digest_size]);
+
+            var state = hash.create();
+
+            state.update(&data);
+
+            state.digest(out[0..hash.digest_size]);
+        }
+
+        for ([_]pq.XofAlgorithm{ try pq.cshake256.configure(.{ .customization = &data }), try pq.ascon_cxof128.configure(.{ .customization = data[0..256] }), pq.ascon_xof128 }) |xof| {
+            xof.digest(&data, &out);
+
+            var state = xof.create();
+
+            state.update(&data);
+
+            state.read(&out);
+        }
+
+        for ([_]pq.MacAlgorithm{ try pq.kmac256.configure(.{ .length = 200, .customization = &data, .xof = true }), try pq.blake2b_mac.configure(.{ .salt = data[0..16] }), pq.blake2s_mac, pq.hmac_sha_384 }) |mac| {
+            const key = data[0..if (mac.kind == .blake2s) 32 else 64];
+
+            mac.digest(key, &data, out[0..mac.digest_size]);
+
+            _ = mac.verify(key, &data, out[0..mac.digest_size]);
+
+            var state = mac.create(key);
+
+            state.update(&data);
+
+            _ = state.verify(out[0..mac.digest_size]);
+        }
+
+        for ([_]pq.KdfAlgorithm{ pq.hkdf_sha_256, pq.hkdf_sha_512 }) |kdf| {
+            try kdf.derive(&data, &out, .{ .salt = &data, .info = &data });
+
+            try kdf.expand(&data, &out, .{ .info = data[0..20] });
+        }
+    }
+
+    const operations = [_]Operation{
+        .{ .name = "hash functions", .run = run },
+        .{ .name = "BLAKE2, Ascon, cSHAKE, KMAC, HKDF", .run = symmetric },
+    };
 };
 
 fn supported() bool {

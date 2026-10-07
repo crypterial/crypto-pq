@@ -460,35 +460,62 @@ inline fn storeTag(comptime n: usize, words: [n]Chunk, tag: []u8) void {
     }
 }
 
-// HMAC-SHA-256, or HMAC-SHA-224 for a 28-byte tag, under a key of at most a block. The two key
-// blocks are independent, and the core overlaps them.
-pub fn hmac256(iv: *const [8]u32, key: []const u8, data: []const u8, tag: []u8) void {
-    var inner_abcd = [1]Words{iv[0..4].*};
+// The states after HMAC's inner and outer key blocks, each block a stream of its own, which the
+// core overlaps.
+const Keyed256 = struct {
+    inner_abcd: [1]Words,
+    inner_efgh: [1]Words,
+    outer_abcd: [1]Words,
+    outer_efgh: [1]Words,
 
-    var inner_efgh = [1]Words{iv[4..8].*};
+    inline fn init(iv: *const [8]u32, key: []const u8) Keyed256 {
+        var self: Keyed256 = .{ .inner_abcd = .{iv[0..4].*}, .inner_efgh = .{iv[4..8].*}, .outer_abcd = .{iv[0..4].*}, .outer_efgh = .{iv[4..8].*} };
 
-    var outer_abcd = inner_abcd;
+        sha256Chunks(&self.inner_abcd, &self.inner_efgh, keyBlock(4, key, 0x36));
 
-    var outer_efgh = inner_efgh;
+        sha256Chunks(&self.outer_abcd, &self.outer_efgh, keyBlock(4, key, 0x5c));
 
-    sha256Chunks(&inner_abcd, &inner_efgh, keyBlock(4, key, 0x36));
-
-    sha256Chunks(&outer_abcd, &outer_efgh, keyBlock(4, key, 0x5c));
-
-    sha256Tail(&inner_abcd, &inner_efgh, data, (data.len +% 64) *% 8);
-
-    // The outer block is the inner digest's words, the marker word and the length.
-    var m = [1][4]Words{.{ inner_abcd[0], inner_efgh[0], @splat(0), .{ 0, 0, 0, @intCast((64 + tag.len) * 8) } }};
-
-    if (tag.len == 32) {
-        m[0][2][0] = 0x8000_0000;
-    } else {
-        m[0][1][3] = 0x8000_0000;
+        return self;
     }
 
-    sha256Streams(1, &outer_abcd, &outer_efgh, &m);
+    // The inner hash of data and the outer hash of its digest, which never leaves the registers.
+    inline fn finish(self: *Keyed256, data: []const u8, tag: []u8) void {
+        sha256Tail(&self.inner_abcd, &self.inner_efgh, data, (data.len +% 64) *% 8);
 
-    storeTag(2, .{ @bitCast(@byteSwap(outer_abcd[0])), @bitCast(@byteSwap(outer_efgh[0])) }, tag);
+        // The outer block is the inner digest's words, the marker word and the length.
+        var m = [1][4]Words{.{ self.inner_abcd[0], self.inner_efgh[0], @splat(0), .{ 0, 0, 0, @intCast((64 + tag.len) * 8) } }};
+
+        if (tag.len == 32) {
+            m[0][2][0] = 0x8000_0000;
+        } else {
+            m[0][1][3] = 0x8000_0000;
+        }
+
+        sha256Streams(1, &self.outer_abcd, &self.outer_efgh, &m);
+
+        storeTag(2, .{ @bitCast(@byteSwap(self.outer_abcd[0])), @bitCast(@byteSwap(self.outer_efgh[0])) }, tag);
+    }
+};
+
+// HMAC-SHA-256, or HMAC-SHA-224 for a 28-byte tag, under a key of at most a block.
+pub fn hmac256(iv: *const [8]u32, key: []const u8, data: []const u8, tag: []u8) void {
+    var keyed: Keyed256 = .init(iv, key);
+
+    keyed.finish(data, tag);
+}
+
+// sha2.keyed256's states, the inner one first.
+pub fn keyed256(iv: *const [8]u32, key: []const u8) [2][8]u32 {
+    const keyed: Keyed256 = .init(iv, key);
+
+    return .{ @as([4]u32, keyed.inner_abcd[0]) ++ @as([4]u32, keyed.inner_efgh[0]), @as([4]u32, keyed.outer_abcd[0]) ++ @as([4]u32, keyed.outer_efgh[0]) };
+}
+
+// HMAC-SHA-256 from the states that keyed256 gives.
+pub fn hmacKeyed256(states: *const [2][8]u32, data: []const u8, tag: []u8) void {
+    var keyed: Keyed256 = .{ .inner_abcd = .{states[0][0..4].*}, .inner_efgh = .{states[0][4..8].*}, .outer_abcd = .{states[1][0..4].*}, .outer_efgh = .{states[1][4..8].*} };
+
+    keyed.finish(data, tag);
 }
 
 inline fn sha512Chunks(states: *[1]State512, chunks: [8]Chunk) void {
@@ -534,8 +561,8 @@ pub fn sha512Finish(state: *[8]u64, data: []const u8, bits: u128) void {
     inline for (0..4) |j| state[2 * j ..][0..2].* = s[0][j];
 }
 
-// hmac256 for HMAC-SHA-512, or HMAC-SHA-384 for a 48-byte tag; the key blocks run as a pair.
-pub fn hmac512(iv: *const [8]u64, key: []const u8, data: []const u8, tag: []u8) void {
+// The states after HMAC-SHA-512's key blocks, which run as a pair.
+inline fn keyBlocks512(iv: *const [8]u64, key: []const u8) [2]State512 {
     const start: State512 = .{ iv[0..2].*, iv[2..4].*, iv[4..6].*, iv[6..8].* };
 
     var keyed = [2]State512{ start, start };
@@ -550,6 +577,40 @@ pub fn hmac512(iv: *const [8]u64, key: []const u8, data: []const u8, tag: []u8) 
 
     sha512Streams(2, &keyed, &m);
 
+    return keyed;
+}
+
+// hmac256 for HMAC-SHA-512, or HMAC-SHA-384 for a 48-byte tag.
+pub fn hmac512(iv: *const [8]u64, key: []const u8, data: []const u8, tag: []u8) void {
+    finishHmac512(keyBlocks512(iv, key), data, tag);
+}
+
+// sha2.keyed512's states, the inner one first.
+pub fn keyed512(iv: *const [8]u64, key: []const u8) [2][8]u64 {
+    const keyed = keyBlocks512(iv, key);
+
+    var out: [2][8]u64 = undefined;
+
+    inline for (0..2) |i| {
+        inline for (0..4) |j| out[i][2 * j ..][0..2].* = keyed[i][j];
+    }
+
+    return out;
+}
+
+// HMAC-SHA-512 from the states that keyed512 gives.
+pub fn hmacKeyed512(states: *const [2][8]u64, data: []const u8, tag: []u8) void {
+    var keyed: [2]State512 = undefined;
+
+    inline for (0..2) |i| {
+        inline for (0..4) |j| keyed[i][j] = states[i][2 * j ..][0..2].*;
+    }
+
+    finishHmac512(keyed, data, tag);
+}
+
+// The inner hash of data and the outer hash of its digest, which never leaves the registers.
+inline fn finishHmac512(keyed: [2]State512, data: []const u8, tag: []u8) void {
     var inner = [1]State512{keyed[0]};
 
     var outer = [1]State512{keyed[1]};
@@ -845,6 +906,33 @@ pub fn encode12(f: *const [256]i16, out: *[384]u8) void {
 
         out[24 * i + 16 ..][0..8].* = lookupHalf(words[1], third);
     }
+}
+
+// ---- BLAKE2 (RFC 7693) ----
+
+const blake2_clobbers: std.builtin.assembly.Clobbers = blk: {
+    @setEvalBranchQuota(100_000);
+
+    var clobbers: std.builtin.assembly.Clobbers = .{ .memory = true, .nzcv = true };
+
+    for (4..29) |i| {
+        if (i != 18) @field(clobbers, std.fmt.comptimePrint("x{d}", .{i})) = true;
+    }
+
+    break :blk clobbers;
+};
+
+// BLAKE2b or BLAKE2s compressions of whole blocks in one statement (tools/asm.zig). `rest` holds
+// rows 2 and 3 of the working vector before the counter, the final flag applied, and then the
+// counter of the first block; the counter grows by a block per block.
+pub fn blake2(comptime W: type, h: *[8]W, blocks: []const u8, rest: *const [10]W) void {
+    asm volatile (@embedFile(if (W == u64) "asm/blake2b_arm64.s" else "asm/blake2s_arm64.s")
+        :
+        : [h] "{x0}" (h),
+          [blocks] "{x1}" (blocks.ptr),
+          [count] "{x2}" (blocks.len / (16 * @sizeOf(W))),
+          [rest] "{x3}" (rest),
+        : blake2_clobbers);
 }
 
 // ---- Keccak-f[1600] (FIPS 202) ----

@@ -215,19 +215,25 @@ fn hashes(allocator: Allocator) !void {
 
     var out: [200]u8 = undefined;
 
-    const sizes = [_]usize{ 28, 32, 48, 64, 28, 32, 28, 32, 48, 64 };
+    for (capi.hash.algorithms, 0..) |algorithm, id| try check(capi.hash.digest(@intCast(id), &data, data.len, &out, algorithm.digest_size));
 
-    for (sizes, 0..) |size, id| try check(capi.hash.digest(@intCast(id), &data, data.len, &out, size));
+    for (0..capi.hash.xof_count) |id| try check(capi.hash.xof(@intCast(id), &data, data.len, &out, out.len));
 
-    for (0..2) |id| try check(capi.hash.xof(@intCast(id), &data, data.len, &out, out.len));
+    for (capi.hash.macs, 0..) |algorithm, id| {
+        const size = algorithm.digest_size;
 
-    for ([_]usize{ 28, 32, 48, 64 }, 0..) |size, id| {
-        // A state's size depends on its hash.
+        // A state's size depends on its MAC.
         const state = try Slot.init(allocator, .hmac, @intCast(id));
 
         defer state.deinit(allocator);
 
-        for ([_]usize{ 20, 150 }) |length| {
+        const lengths: [2]usize = switch (algorithm.kind) {
+            .blake2b => .{ 1, 64 },
+            .blake2s => .{ 1, 32 },
+            else => .{ 20, 150 },
+        };
+
+        for (lengths) |length| {
             try check(capi.hash.hmac(@intCast(id), &key, length, &data, data.len, &out, size));
 
             // The tag is what the caller compares against; whether it matches is the answer.
@@ -243,6 +249,18 @@ fn hashes(allocator: Allocator) !void {
 
             try check(capi.hash.hmacFinalVerify(state.bytes.ptr, state.bytes.len, &out, size));
         }
+    }
+
+    try configured(allocator, &key, &data);
+
+    for (capi.hash.kdfs, 0..) |algorithm, id| {
+        try check(capi.hash.kdfDerive(@intCast(id), &key, key.len, &data, 20, "info", 4, &out, out.len));
+
+        var prk: [64]u8 = undefined;
+
+        try check(capi.hash.kdfExtract(@intCast(id), &key, key.len, &data, 20, &prk, algorithm.hashSize()));
+
+        try check(capi.hash.kdfExpand(@intCast(id), &prk, algorithm.hashSize(), &data, data.len, &out, out.len));
     }
 
     const hasher = try Slot.init(allocator, .hasher, 7);
@@ -264,6 +282,83 @@ fn hashes(allocator: Allocator) !void {
     try check(capi.hash.xofUpdate(xof.bytes.ptr, xof.bytes.len, &data, data.len));
 
     try check(capi.hash.xofRead(xof.bytes.ptr, xof.bytes.len, &out, out.len));
+}
+
+// Configured algorithms hold public options; the data hashed and the MAC keys are secret.
+fn configured(allocator: Allocator, key: *const [150]u8, data: *const [300]u8) !void {
+    var out: [200]u8 = undefined;
+
+    for ([_]u32{ 13, 17 }) |id| {
+        const spec = try Slot.init(allocator, .configured_hash, id);
+
+        defer spec.deinit(allocator);
+
+        const size = capi.hash.algorithms[id].digest_size;
+
+        try check(capi.hash.configureHash(id, "salt", 4, "personal", 8, spec.bytes.ptr, spec.bytes.len));
+
+        try check(capi.hash.digestWith(spec.bytes.ptr, spec.bytes.len, data, data.len, &out, size));
+
+        const state = try Slot.init(allocator, .hasher, id);
+
+        defer state.deinit(allocator);
+
+        try check(capi.hash.initWith(spec.bytes.ptr, spec.bytes.len, state.bytes.ptr, state.bytes.len));
+
+        try check(capi.hash.update(state.bytes.ptr, state.bytes.len, data, data.len));
+
+        try check(capi.hash.final(state.bytes.ptr, state.bytes.len, &out, size));
+    }
+
+    for ([_]u32{ 2, 5 }) |id| {
+        const spec = try Slot.init(allocator, .configured_xof, id);
+
+        defer spec.deinit(allocator);
+
+        try check(capi.hash.configureXof(id, null, 0, "customization", 13, spec.bytes.ptr, spec.bytes.len));
+
+        try check(capi.hash.xofWith(spec.bytes.ptr, spec.bytes.len, data, data.len, &out, out.len));
+
+        const state = try Slot.init(allocator, .xof, id);
+
+        defer state.deinit(allocator);
+
+        try check(capi.hash.xofInitWith(spec.bytes.ptr, spec.bytes.len, state.bytes.ptr, state.bytes.len));
+
+        try check(capi.hash.xofUpdate(state.bytes.ptr, state.bytes.len, data, data.len));
+
+        try check(capi.hash.xofRead(state.bytes.ptr, state.bytes.len, &out, out.len));
+    }
+
+    for ([_]u32{ 4, 5, 6, 7 }, [_]usize{ 100, 4, 33, 17 }) |id, size| {
+        const spec = try Slot.init(allocator, .configured_mac, id);
+
+        defer spec.deinit(allocator);
+
+        const options: []const u8 = if (id < 6) "customization" else "salt";
+
+        const flags = capi.hash.mac_length | @as(u32, if (id == 4) capi.hash.mac_xof else 0);
+
+        try check(capi.hash.configureMac(id, size, flags, options.ptr, options.len, null, 0, spec.bytes.ptr, spec.bytes.len));
+
+        const length: usize = if (id == 7) 32 else 64;
+
+        try check(capi.hash.macWith(spec.bytes.ptr, spec.bytes.len, key, length, data, data.len, &out, size));
+
+        memcheck.makeMemDefined(out[0..size]);
+
+        try check(capi.hash.macVerifyWith(spec.bytes.ptr, spec.bytes.len, key, length, data, data.len, &out, size));
+
+        const state = try Slot.init(allocator, .hmac, id);
+
+        defer state.deinit(allocator);
+
+        try check(capi.hash.macInitWith(spec.bytes.ptr, spec.bytes.len, key, length, state.bytes.ptr, state.bytes.len));
+
+        try check(capi.hash.hmacUpdate(state.bytes.ptr, state.bytes.len, data, data.len));
+
+        try check(capi.hash.hmacFinalVerify(state.bytes.ptr, state.bytes.len, &out, size));
+    }
 }
 
 // The seed is secret, and so is the state blob that holds it; the tree cache, the public key and

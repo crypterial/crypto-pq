@@ -21,6 +21,10 @@ const kernels = [_]Kernel{
     .{ .name = "keccak_x3_hybrid.s", .write = keccakHybrid },
     .{ .name = "keccak_x4_avx2.s", .write = keccakAvx2 },
     .{ .name = "sha256_x8_avx2.s", .write = sha256Avx2 },
+    .{ .name = "blake2b_avx2.s", .write = blake2bAvx2 },
+    .{ .name = "blake2s_avx2.s", .write = blake2sAvx2 },
+    .{ .name = "blake2b_arm64.s", .write = blake2bArm64 },
+    .{ .name = "blake2s_arm64.s", .write = blake2sArm64 },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -773,4 +777,338 @@ fn sha256RoundAvx2(w: *Writer, t: usize, comptime word: enum { load, schedule })
     try line(w, "vpaddd ymm{d}, ymm{d}, ymm8", .{ h, h });
 
     try line(w, "vpaddd ymm{d}, ymm{d}, ymm{d}", .{ h, h, carry });
+}
+
+// BLAKE2 (RFC 7693): the message words that round r reads, sigma[r mod 10].
+const sigma = [10][16]u8{
+    .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+    .{ 14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3 },
+    .{ 11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4 },
+    .{ 7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8 },
+    .{ 9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13 },
+    .{ 2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9 },
+    .{ 12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11 },
+    .{ 13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10 },
+    .{ 6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5 },
+    .{ 10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0 },
+};
+
+const Blake2 = struct {
+    // Register names, the letter of the word-sized instructions and the word size in bytes.
+    register: []const u8,
+    suffix: []const u8,
+    word: usize,
+    rounds: usize,
+    // The rotations of G, and the two by whole bytes that VPSHUFB makes with the orders in
+    // registers 12 and 13 (BLAKE2b turns its lanes by half with PSHUFD; the others shift).
+    rotations: [4]u32,
+    orders: [2]u32,
+};
+
+fn blake2bAvx2(w: *Writer) Writer.Error!void {
+    try blake2Avx2(w, .{ .register = "ymm", .suffix = "q", .word = 8, .rounds = 12, .rotations = .{ 32, 24, 16, 63 }, .orders = .{ 24, 16 } });
+}
+
+fn blake2sAvx2(w: *Writer) Writer.Error!void {
+    try blake2Avx2(w, .{ .register = "xmm", .suffix = "d", .word = 4, .rounds = 10, .rotations = .{ 16, 12, 8, 7 }, .orders = .{ 16, 8 } });
+}
+
+// BLAKE2b with AVX2, and BLAKE2s with the 128-bit forms of the same instructions, on whole
+// blocks. Row i of the working vector (words 4i to 4i + 3) lives in register i, the chaining
+// value in registers 4 and 5, the message words of the four G steps of a round in registers 6
+// to 9, and the VPSHUFB orders of the two rotations by whole bytes in registers 12 and 13; 10,
+// 11 and 14 are scratch. For the diagonal steps row 1 stays in place while rows 0, 2 and 3 turn
+// around it: those three are ready before row 1 at the end of a column step, so their
+// permutations overlap its last instructions. Inputs: rdi points to the chaining value, rsi to
+// the blocks, rdx holds their number (at least one), rcx points to rows 2 and 3 as they start,
+// the final flag applied but not the counter, followed by the counter of the first block (its
+// bytes included), and r8 to the two VPSHUFB orders. rax and r9 carry the counter, r10 walks the
+// blocks and r11 counts them.
+fn blake2Avx2(w: *Writer, comptime p: Blake2) Writer.Error!void {
+    const x = p.register;
+
+    const block = 16 * p.word;
+
+    try line(w, ".intel_syntax noprefix", .{});
+
+    try line(w, "vmovdqu {s}4, {s}word ptr [rdi]", .{ x, x });
+
+    try line(w, "vmovdqu {s}5, {s}word ptr [rdi + {d}]", .{ x, x, 4 * p.word });
+
+    try line(w, "vmovdqu {s}12, {s}word ptr [r8]", .{ x, x });
+
+    try line(w, "vmovdqu {s}13, {s}word ptr [r8 + 32]", .{ x, x });
+
+    try line(w, "mov rax, qword ptr [rcx + {d}]", .{8 * p.word});
+
+    if (p.word == 8) try line(w, "mov r9, qword ptr [rcx + 72]", .{});
+
+    try line(w, "mov r10, rsi", .{});
+
+    try line(w, "mov r11, rdx", .{});
+
+    try line(w, "1:", .{});
+
+    // Row 3 takes the counter in its first two words: a 64-bit move clears the rest of the
+    // register.
+    try line(w, "vmovq xmm14, rax", .{});
+
+    if (p.word == 8) try line(w, "vpinsrq xmm14, xmm14, r9, 1", .{});
+
+    try line(w, "vpxor {s}3, {s}14, {s}word ptr [rcx + {d}]", .{ x, x, x, 4 * p.word });
+
+    try line(w, "vmovdqa {s}0, {s}4", .{ x, x });
+
+    try line(w, "vmovdqa {s}1, {s}5", .{ x, x });
+
+    try line(w, "vmovdqu {s}2, {s}word ptr [rcx]", .{ x, x });
+
+    for (0..p.rounds) |r| {
+        const s = sigma[r % 10];
+
+        // Lane j of a diagonal step holds the G whose b is word 4 + j.
+        try blake2Gather(w, p, 6, .{ s[0], s[2], s[4], s[6] });
+
+        try blake2Gather(w, p, 7, .{ s[1], s[3], s[5], s[7] });
+
+        try blake2Gather(w, p, 8, .{ s[14], s[8], s[10], s[12] });
+
+        try blake2Gather(w, p, 9, .{ s[15], s[9], s[11], s[13] });
+
+        try blake2Half(w, p, 6, p.rotations[0..2].*);
+
+        try blake2Half(w, p, 7, p.rotations[2..4].*);
+
+        try blake2Turn(w, p, .{ 0x93, 0x39, 0x4e });
+
+        try blake2Half(w, p, 8, p.rotations[0..2].*);
+
+        try blake2Half(w, p, 9, p.rotations[2..4].*);
+
+        try blake2Turn(w, p, .{ 0x39, 0x93, 0x4e });
+    }
+
+    try line(w, "vpxor {s}0, {s}0, {s}2", .{ x, x, x });
+
+    try line(w, "vpxor {s}4, {s}4, {s}0", .{ x, x, x });
+
+    try line(w, "vpxor {s}1, {s}1, {s}3", .{ x, x, x });
+
+    try line(w, "vpxor {s}5, {s}5, {s}1", .{ x, x, x });
+
+    try line(w, "add r10, {d}", .{block});
+
+    try line(w, "add rax, {d}", .{block});
+
+    if (p.word == 8) try line(w, "adc r9, 0", .{});
+
+    try line(w, "dec r11", .{});
+
+    try line(w, "jnz 1b", .{});
+
+    try line(w, "vmovdqu {s}word ptr [rdi], {s}4", .{ x, x });
+
+    try line(w, "vmovdqu {s}word ptr [rdi + {d}], {s}5", .{ x, 4 * p.word, x });
+
+    try line(w, "vzeroupper", .{});
+
+    try line(w, ".att_syntax prefix", .{});
+}
+
+// Four message words into the lanes of a register: each is broadcast by a load, which needs no
+// shuffle port, and blended into its lane.
+fn blake2Gather(w: *Writer, comptime p: Blake2, target: usize, words: [4]u8) Writer.Error!void {
+    const x = p.register;
+
+    const size = if (p.word == 8) "qword" else "dword";
+
+    try line(w, "vpbroadcast{s} {s}{d}, {s} ptr [r10 + {d}]", .{ p.suffix, x, target, size, p.word * words[0] });
+
+    for (1..4) |lane| {
+        const scratch = 10 + lane % 2;
+
+        const mask: u8 = if (p.word == 8) @as(u8, 3) << @intCast(2 * lane) else @as(u8, 1) << @intCast(lane);
+
+        try line(w, "vpbroadcast{s} {s}{d}, {s} ptr [r10 + {d}]", .{ p.suffix, x, scratch, size, p.word * words[lane] });
+
+        try line(w, "vpblendd {s}{d}, {s}{d}, {s}{d}, 0x{x:0>2}", .{ x, target, x, target, x, scratch, mask });
+    }
+}
+
+// Half of G in four lanes: a += m + b, d = (d ^ a) >>> first, c += d, b = (b ^ c) >>> second.
+fn blake2Half(w: *Writer, comptime p: Blake2, message: usize, rotations: [2]u32) Writer.Error!void {
+    const x = p.register;
+
+    try line(w, "vpadd{s} {s}0, {s}0, {s}{d}", .{ p.suffix, x, x, x, message });
+
+    try line(w, "vpadd{s} {s}0, {s}0, {s}1", .{ p.suffix, x, x, x });
+
+    try line(w, "vpxor {s}3, {s}3, {s}0", .{ x, x, x });
+
+    try blake2Rotate(w, p, 3, rotations[0]);
+
+    try line(w, "vpadd{s} {s}2, {s}2, {s}3", .{ p.suffix, x, x, x });
+
+    try line(w, "vpxor {s}1, {s}1, {s}2", .{ x, x, x });
+
+    try blake2Rotate(w, p, 1, rotations[1]);
+}
+
+fn blake2Rotate(w: *Writer, comptime p: Blake2, register: usize, rotation: u32) Writer.Error!void {
+    const x = p.register;
+
+    const bits = 8 * p.word;
+
+    if (p.word == 8 and rotation == 32) return line(w, "vpshufd {s}{d}, {s}{d}, 0xb1", .{ x, register, x, register });
+
+    if (rotation % 8 == 0) {
+        const order: usize = if (rotation == p.orders[0]) 12 else 13;
+
+        return line(w, "vpshufb {s}{d}, {s}{d}, {s}{d}", .{ x, register, x, register, x, order });
+    }
+
+    // A rotation by one bit to the left adds the lane to itself instead of shifting it.
+    if (rotation == bits - 1) {
+        try line(w, "vpadd{s} {s}10, {s}{d}, {s}{d}", .{ p.suffix, x, x, register, x, register });
+    } else {
+        try line(w, "vpsll{s} {s}10, {s}{d}, {d}", .{ p.suffix, x, x, register, bits - rotation });
+    }
+
+    try line(w, "vpsrl{s} {s}{d}, {s}{d}, {d}", .{ p.suffix, x, register, x, register, rotation });
+
+    try line(w, "vpor {s}{d}, {s}{d}, {s}10", .{ x, register, x, register, x });
+}
+
+// Rows 0, 2 and 3 permuted by the given orders; across the two halves of a ymm register for
+// BLAKE2b, within the xmm register for BLAKE2s.
+fn blake2Turn(w: *Writer, comptime p: Blake2, orders: [3]u8) Writer.Error!void {
+    const x = p.register;
+
+    const instruction = if (p.word == 8) "vpermq" else "vpshufd";
+
+    for ([3]usize{ 0, 2, 3 }, orders) |register, order| {
+        try line(w, "{s} {s}{d}, {s}{d}, 0x{x:0>2}", .{ instruction, x, register, x, register, order });
+    }
+}
+
+fn blake2bArm64(w: *Writer) Writer.Error!void {
+    try blake2Arm64(w, 8);
+}
+
+fn blake2sArm64(w: *Writer) Writer.Error!void {
+    try blake2Arm64(w, 4);
+}
+
+// The BLAKE2b or BLAKE2s compressions of whole blocks on the general registers: the working
+// vector in x4-x17, x19 and x20, the message word of each G in x21 + g, the counter in x25 and
+// x26, the blocks walked by x27 and counted down by x28. Each half of a G function is written
+// whole, the four functions of a step one after the other: on Apple M3 that order beats both the
+// compiler's and four chains interleaved instruction by instruction. A rotated operand would
+// cost EOR a second cycle, so EOR and ROR stay apart. Inputs: x0 points to the chaining value,
+// which v0-v7 carry from block to block, x1 to the blocks, x2 holds their number (at least one),
+// x3 points to rows 2 and 3 as they start, the final flag applied but not the counter, followed
+// by the counter of the first block (its bytes included).
+fn blake2Arm64(w: *Writer, comptime word: usize) Writer.Error!void {
+    const block = 16 * word;
+
+    const rounds = if (word == 8) 12 else 10;
+
+    const rotations = if (word == 8) [4]u32{ 32, 24, 16, 63 } else [4]u32{ 16, 12, 8, 7 };
+
+    const columns = [4][4]usize{ .{ 0, 4, 8, 12 }, .{ 1, 5, 9, 13 }, .{ 2, 6, 10, 14 }, .{ 3, 7, 11, 15 } };
+
+    const diagonals = [4][4]usize{ .{ 0, 5, 10, 15 }, .{ 1, 6, 11, 12 }, .{ 2, 7, 8, 13 }, .{ 3, 4, 9, 14 } };
+
+    const r = if (word == 8) "x" else "w";
+
+    for (0..4) |i| try line(w, "ldp {s}{d}, {s}{d}, [x0, #{d}]", .{ r, blake2Register(2 * i), r, blake2Register(2 * i + 1), 2 * i * word });
+
+    if (word == 8) try line(w, "ldp x25, x26, [x3, #64]", .{}) else try line(w, "ldr x25, [x3, #32]", .{});
+
+    try line(w, "mov x27, x1", .{});
+
+    try line(w, "mov x28, x2", .{});
+
+    try line(w, "1:", .{});
+
+    for (0..4) |i| try line(w, "ldp {s}{d}, {s}{d}, [x3, #{d}]", .{ r, blake2Register(8 + 2 * i), r, blake2Register(9 + 2 * i), 2 * i * word });
+
+    if (word == 4) try line(w, "lsr x26, x25, #32", .{});
+
+    try line(w, "eor {s}{d}, {s}{d}, {s}25", .{ r, blake2Register(12), r, blake2Register(12), r });
+
+    try line(w, "eor {s}{d}, {s}{d}, {s}26", .{ r, blake2Register(13), r, blake2Register(13), r });
+
+    for (0..rounds) |round| {
+        const s = sigma[round % 10];
+
+        inline for (.{ columns, diagonals }, .{ 0, 8 }) |quads, offset| {
+            for (0..2) |half| {
+                for (quads, 0..) |q, g| {
+                    try blake2HalfArm64(w, r, word, g, q, s[offset + 2 * g + half], rotations[2 * half ..][0..2].*);
+                }
+            }
+        }
+    }
+
+    for (0..4) |i| {
+        try line(w, "ldp {s}21, {s}22, [x0, #{d}]", .{ r, r, 2 * i * word });
+
+        for (0..2) |j| {
+            const v = 2 * i + j;
+
+            try line(w, "eor {s}{d}, {s}{d}, {s}{d}", .{ r, blake2Register(v), r, blake2Register(v), r, 21 + j });
+
+            try line(w, "eor {s}{d}, {s}{d}, {s}{d}", .{ r, blake2Register(v), r, blake2Register(v), r, blake2Register(v + 8) });
+        }
+
+        try line(w, "stp {s}{d}, {s}{d}, [x0, #{d}]", .{ r, blake2Register(2 * i), r, blake2Register(2 * i + 1), 2 * i * word });
+    }
+
+    try line(w, "add x27, x27, #{d}", .{block});
+
+    if (word == 8) {
+        try line(w, "adds x25, x25, #{d}", .{block});
+
+        try line(w, "adc x26, x26, xzr", .{});
+    } else {
+        try line(w, "add x25, x25, #{d}", .{block});
+    }
+
+    try line(w, "subs x28, x28, #1", .{});
+
+    try line(w, "b.ne 1b", .{});
+}
+
+// v0-v13 in x4-x17, v14 and v15 in x19 and x20: x18 belongs to the platform on Apple and Windows.
+fn blake2Register(v: usize) usize {
+    return if (v < 14) 4 + v else 5 + v;
+}
+
+// Half of G: a += m + b, d = (d ^ a) >>> first, c += d, b = (b ^ c) >>> second, the message word
+// loaded where it is used and added to a before b, which arrives last.
+fn blake2HalfArm64(w: *Writer, r: []const u8, word: usize, g: usize, q: [4]usize, m: usize, rotations: [2]u32) Writer.Error!void {
+    const a = blake2Register(q[0]);
+
+    const b = blake2Register(q[1]);
+
+    const c = blake2Register(q[2]);
+
+    const d = blake2Register(q[3]);
+
+    try line(w, "ldr {s}{d}, [x27, #{d}]", .{ r, 21 + g, word * m });
+
+    try line(w, "add {s}{d}, {s}{d}, {s}{d}", .{ r, a, r, a, r, 21 + g });
+
+    try line(w, "add {s}{d}, {s}{d}, {s}{d}", .{ r, a, r, a, r, b });
+
+    try line(w, "eor {s}{d}, {s}{d}, {s}{d}", .{ r, d, r, d, r, a });
+
+    try line(w, "ror {s}{d}, {s}{d}, #{d}", .{ r, d, r, d, rotations[0] });
+
+    try line(w, "add {s}{d}, {s}{d}, {s}{d}", .{ r, c, r, c, r, d });
+
+    try line(w, "eor {s}{d}, {s}{d}, {s}{d}", .{ r, b, r, b, r, c });
+
+    try line(w, "ror {s}{d}, {s}{d}, #{d}", .{ r, b, r, b, rotations[1] });
 }

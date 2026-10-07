@@ -292,8 +292,117 @@ fn stateful(allocator: Allocator, algorithm: pq.StatefulSignatureAlgorithm, para
     try signs(allocator, &generated.public_key, &generated.private_key);
 }
 
+// A MAC's result is the answer the caller asked for: declassified before it is branched on.
+fn verified(result: bool) bool {
+    var copy = result;
+
+    memcheck.makeMemDefined(std.mem.asBytes(&copy));
+
+    return copy;
+}
+
+fn mac(algorithm: pq.MacAlgorithm, key: []const u8, data: []const u8) !void {
+    var tag: [200]u8 = undefined;
+
+    const out = tag[0..algorithm.digest_size];
+
+    algorithm.digest(key, data, out);
+
+    try check(verified(algorithm.verify(key, data, out)));
+
+    var state = algorithm.create(key);
+
+    const split = @min(7, data.len);
+
+    state.update(data[0..split]);
+
+    state.update(data[split..]);
+
+    var streamed: [200]u8 = undefined;
+
+    state.digest(streamed[0..out.len]);
+
+    try check(same(out, streamed[0..out.len]) and verified(state.verify(out)));
+}
+
+// Keyed functions with secret keys and data; plain hashes and XOFs, whose input may be secret too.
+fn symmetric() !void {
+    const key = secretBytes(200, 11);
+
+    const data = secretBytes(300, 12);
+
+    for ([_]pq.MacAlgorithm{ pq.hmac_sha_224, pq.hmac_sha_256, pq.hmac_sha_384, pq.hmac_sha_512 }) |algorithm| {
+        for ([_]usize{ 32, 200 }) |length| try mac(algorithm, key[0..length], &data);
+    }
+
+    for ([_]pq.MacAlgorithm{ pq.kmac128, pq.kmac256 }) |algorithm| {
+        try mac(algorithm, key[0..32], &data);
+
+        try mac(try algorithm.configure(.{ .length = 100, .customization = "customization", .xof = true }), &key, &data);
+
+        try mac(try algorithm.configure(.{ .length = 4 }), key[0..16], data[0..10]);
+    }
+
+    for ([_]pq.MacAlgorithm{ pq.blake2b_mac, pq.blake2s_mac }, [_]usize{ 64, 32 }) |algorithm, max| {
+        try mac(algorithm, key[0..max], &data);
+
+        try mac(try algorithm.configure(.{ .length = 17, .salt = "salt", .personalization = "personal" }), key[0..1], &data);
+
+        try mac(algorithm, key[0..max], data[0..0]);
+    }
+
+    for ([_]pq.KdfAlgorithm{ pq.hkdf_sha_256, pq.hkdf_sha_384, pq.hkdf_sha_512 }) |algorithm| {
+        var okm: [300]u8 = undefined;
+
+        try algorithm.derive(&data, &okm, .{ .salt = key[0..20], .info = "info" });
+
+        var prk: [64]u8 = undefined;
+
+        try algorithm.extract(&data, prk[0..algorithm.hashSize()], .{ .salt = key[0..20] });
+
+        var expanded: [300]u8 = undefined;
+
+        try algorithm.expand(prk[0..algorithm.hashSize()], &expanded, .{ .info = "info" });
+
+        try check(same(&okm, &expanded));
+
+        // A secret PRK longer than a block, and an info that takes the streaming path.
+        try algorithm.expand(&key, &expanded, .{ .info = &data });
+    }
+
+    var out: [64]u8 = undefined;
+
+    for ([_]pq.HashAlgorithm{ pq.blake2b_512, pq.blake2s_256, pq.blake2b_160, pq.ascon_hash256 }) |algorithm| {
+        algorithm.digest(&data, out[0..algorithm.digest_size]);
+
+        const configured = algorithm.configure(.{ .salt = "s", .personalization = "p" }) catch algorithm;
+
+        var hasher = configured.create();
+
+        hasher.update(&data);
+
+        hasher.digest(out[0..algorithm.digest_size]);
+    }
+
+    for ([_]pq.XofAlgorithm{ pq.cshake128, pq.cshake256, pq.ascon_xof128, pq.ascon_cxof128 }) |algorithm| {
+        const configured = algorithm.configure(.{ .customization = "customization" }) catch algorithm;
+
+        configured.digest(&data, &out);
+
+        var xof = configured.create();
+
+        xof.update(&data);
+
+        xof.read(&out);
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
+
+    try symmetric();
+
+    std.debug.print("hashes, MACs and HKDF: ok\n", .{});
 
     for ([_]pq.KemAlgorithm{ pq.ml_kem_512, pq.ml_kem_768, pq.ml_kem_1024 }) |algorithm| {
         try kem(allocator, algorithm, 64, 32);

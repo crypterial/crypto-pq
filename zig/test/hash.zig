@@ -25,7 +25,7 @@ const xofs = [_]struct { file: []const u8, algorithm: pq.XofAlgorithm }{
 };
 
 // HMAC.rsp labels each group by digest length in bytes; L=20 is SHA-1, which is out of scope.
-const hmacs = [_]struct { length: []const u8, name: []const u8, algorithm: pq.HmacAlgorithm }{
+const hmacs = [_]struct { length: []const u8, name: []const u8, algorithm: pq.MacAlgorithm }{
     .{ .length = "28", .name = "HMAC-SHA-224", .algorithm = pq.hmac_sha_224 },
     .{ .length = "32", .name = "HMAC-SHA-256", .algorithm = pq.hmac_sha_256 },
     .{ .length = "48", .name = "HMAC-SHA-384", .algorithm = pq.hmac_sha_384 },
@@ -442,6 +442,6 @@ test "hmac properties" {
     for (hmacs) |h| {
         try testing.expectEqualStrings(h.name, h.algorithm.name);
 
-        try testing.expectEqual(h.algorithm.hash.digest_size, h.algorithm.digest_size);
+        try testing.expectEqual(h.algorithm.kind.hmac.digest_size, h.algorithm.digest_size);
     }
 }

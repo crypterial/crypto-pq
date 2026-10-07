@@ -204,6 +204,89 @@ fn hashes(runner: *const Runner) !void {
     try runner.case("shake256/1KiB", &Digest{ .input = &data, .kind = .shake256 });
 }
 
+// The symmetric functions of round E: every hash, XOF and MAC on 64 bytes and 1 KiB (XOFs give 32
+// bytes, or 64 for cSHAKE256), keyed with 32 bytes, with the options configured once; HKDF from a
+// 32-byte IKM.
+fn symmetric(runner: *const Runner) !void {
+    const data = bytes(1024);
+
+    const key = bytes(32);
+
+    const Function = union(enum) {
+        hash: pq.HashAlgorithm,
+        xof: struct { pq.XofAlgorithm, usize },
+        mac: pq.MacAlgorithm,
+        kdf: pq.KdfAlgorithm,
+    };
+
+    const Case = struct {
+        function: Function,
+        input: []const u8,
+        key: *const [32]u8,
+        size: usize,
+
+        fn batch(self: *const @This(), r: *const Runner, count: u64) !i96 {
+            var out: [128]u8 = undefined;
+
+            const start = r.now();
+
+            for (0..count) |_| {
+                const input = blackBox(self.input);
+
+                switch (self.function) {
+                    .hash => |h| h.digest(input, out[0..h.digest_size]),
+                    .xof => |x| x[0].digest(input, out[0..x[1]]),
+                    .mac => |m| m.digest(self.key, input, out[0..m.digest_size]),
+                    .kdf => |k| try k.derive(input, out[0..self.size], .{ .salt = self.key, .info = "crypto-pq benchmark" }),
+                }
+
+                std.mem.doNotOptimizeAway(&out);
+            }
+
+            return r.now() - start;
+        }
+    };
+
+    const functions = [_]struct { []const u8, Function }{
+        .{ "blake2b-160", .{ .hash = pq.blake2b_160 } },
+        .{ "blake2b-256", .{ .hash = pq.blake2b_256 } },
+        .{ "blake2b-384", .{ .hash = pq.blake2b_384 } },
+        .{ "blake2b-512", .{ .hash = pq.blake2b_512 } },
+        .{ "blake2s-128", .{ .hash = pq.blake2s_128 } },
+        .{ "blake2s-160", .{ .hash = pq.blake2s_160 } },
+        .{ "blake2s-224", .{ .hash = pq.blake2s_224 } },
+        .{ "blake2s-256", .{ .hash = pq.blake2s_256 } },
+        .{ "blake2b-512+salt", .{ .hash = try pq.blake2b_512.configure(.{ .salt = "crypto-pq salt", .personalization = "crypto-pq person" }) } },
+        .{ "ascon-hash256", .{ .hash = pq.ascon_hash256 } },
+        .{ "cshake128+S", .{ .xof = .{ try pq.cshake128.configure(.{ .customization = "Email Signature" }), 32 } } },
+        .{ "cshake256+S", .{ .xof = .{ try pq.cshake256.configure(.{ .customization = "Email Signature" }), 64 } } },
+        .{ "ascon-xof128", .{ .xof = .{ pq.ascon_xof128, 32 } } },
+        .{ "ascon-cxof128+Z", .{ .xof = .{ try pq.ascon_cxof128.configure(.{ .customization = "crypto-pq" }), 32 } } },
+        .{ "kmac128+S", .{ .mac = try pq.kmac128.configure(.{ .customization = "My Tagged Application" }) } },
+        .{ "kmac256+S", .{ .mac = try pq.kmac256.configure(.{ .customization = "My Tagged Application" }) } },
+        .{ "blake2b-mac", .{ .mac = pq.blake2b_mac } },
+        .{ "blake2s-mac", .{ .mac = pq.blake2s_mac } },
+    };
+
+    for (functions) |entry| {
+        const name, const function = entry;
+
+        for ([_]usize{ 64, 1024 }, [_][]const u8{ "64B", "1KiB" }) |length, suffix| {
+            var buffer: [64]u8 = undefined;
+
+            try runner.case(try std.fmt.bufPrint(&buffer, "{s}/{s}", .{ name, suffix }), &Case{ .function = function, .input = data[0..length], .key = &key, .size = 0 });
+        }
+    }
+
+    for ([_]pq.KdfAlgorithm{ pq.hkdf_sha_256, pq.hkdf_sha_384, pq.hkdf_sha_512 }, [_][]const u8{ "hkdf-sha-256", "hkdf-sha-384", "hkdf-sha-512" }) |algorithm, name| {
+        for ([_]usize{ 32, 64, 128 }) |size| {
+            var buffer: [64]u8 = undefined;
+
+            try runner.case(try std.fmt.bufPrint(&buffer, "{s}/32B->{d}B", .{ name, size }), &Case{ .function = .{ .kdf = algorithm }, .input = data[0..32], .key = &key, .size = size });
+        }
+    }
+}
+
 fn kem(runner: *const Runner, algorithm: pq.KemAlgorithm, comptime seed_size: usize, comptime randomness_size: usize) !void {
     var storage: [3][64]u8 = undefined;
 
@@ -601,6 +684,8 @@ pub fn main(init: std.process.Init) !void {
     const runner: Runner = .{ .io = init.io, .allocator = init.gpa, .filter = filter, .out = &writer.interface };
 
     try hashes(&runner);
+
+    try symmetric(&runner);
 
     for ([_]pq.KemAlgorithm{ pq.ml_kem_512, pq.ml_kem_768, pq.ml_kem_1024 }) |algorithm| {
         try kem(&runner, algorithm, 64, 32);

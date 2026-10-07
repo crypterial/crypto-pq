@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 
 const ct = @import("ct.zig");
 const Error = @import("errors.zig").Error;
-const hash = @import("hash.zig");
+const keccak = @import("keccak.zig");
 const merkle = @import("merkle.zig");
 const primitives = @import("primitives.zig");
 const sha2 = @import("sha2.zig");
@@ -199,13 +199,13 @@ const Hash = struct {
     }
 
     fn start(self: Hash) Stream {
-        return if (self.shake) .{ .shake = hash.shake256.create() } else .{ .sha256 = hash.sha_256.create() };
+        return if (self.shake) .{ .shake = primitives.shake256Sponge() } else .{ .sha256 = .init(&sha2.iv_256) };
     }
 };
 
 const Stream = union(enum) {
-    shake: hash.Xof,
-    sha256: hash.Hasher,
+    shake: keccak.Keccak,
+    sha256: sha2.Sha256,
 
     fn update(self: *Stream, data: []const u8) void {
         switch (self.*) {
@@ -218,9 +218,7 @@ const Stream = union(enum) {
         switch (self.*) {
             .shake => |*xof| xof.read(out),
             .sha256 => |*hasher| {
-                var full: [32]u8 = undefined;
-
-                hasher.digest(&full);
+                const full = hasher.digest();
 
                 @memcpy(out, full[0..out.len]);
             },

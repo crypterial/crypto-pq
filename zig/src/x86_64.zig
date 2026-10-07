@@ -5,8 +5,9 @@ const ct = @import("ct.zig");
 const keccak = @import("keccak.zig");
 const sha2 = @import("sha2.zig");
 
-// x86-64 kernels for the dispatch in cpu.zig: SHA-256 with SHA-NI, and SHA-256 in eight lanes and
-// Keccak-f[1600] in four with AVX2 where a build for a baseline CPU must choose them at run time.
+// x86-64 kernels for the dispatch in cpu.zig: SHA-256 with SHA-NI, and SHA-256 in eight lanes,
+// Keccak-f[1600] in four and the BLAKE2 compressions with AVX2 where a build for a baseline CPU
+// must choose them at run time.
 // Every instruction here is on Intel's data-operand-independent-timing list, and nothing branches
 // on or indexes memory by data.
 
@@ -413,6 +414,36 @@ const rotations: [2][32]u8 align(32) = blk: {
 
     break :blk table;
 };
+
+// VPSHUFB orders that rotate every lane of `size` bytes right by whole bytes: byte j of a lane
+// takes byte j + bytes of the same lane, counted within its 128-bit half.
+fn byteRotations(comptime size: usize, comptime bytes: [2]usize) [2][32]u8 {
+    var table: [2][32]u8 = undefined;
+
+    for (&table, bytes) |*order, by| {
+        for (order, 0..) |*index, i| index.* = i % 16 / size * size + (i % size + by) % size;
+    }
+
+    return table;
+}
+
+const blake2b_rotations: [2][32]u8 align(32) = byteRotations(8, .{ 3, 2 });
+
+const blake2s_rotations: [2][32]u8 align(32) = byteRotations(4, .{ 2, 1 });
+
+// BLAKE2b or BLAKE2s compressions of whole blocks. `rest` holds rows 2 and 3 of the working
+// vector before the counter, the final flag applied, and then the counter of the first block;
+// the counter grows by a block per block.
+pub fn blake2(comptime W: type, h: *[8]W, blocks: []const u8, rest: *const [10]W) void {
+    asm volatile (@embedFile(if (W == u64) "asm/blake2b_avx2.s" else "asm/blake2s_avx2.s")
+        :
+        : [h] "{rdi}" (h),
+          [blocks] "{rsi}" (blocks.ptr),
+          [count] "{rdx}" (blocks.len / (16 * @sizeOf(W))),
+          [rest] "{rcx}" (rest),
+          [rotations] "{r8}" (if (W == u64) &blake2b_rotations else &blake2s_rotations),
+        : clobbers(&.{ "rax", "r9", "r10", "r11" }));
+}
 
 // Four permutations; the kernel moves the states into lane-major order and back.
 pub fn keccak4(states: *[4][25]u64) void {

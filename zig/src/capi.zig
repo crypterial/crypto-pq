@@ -110,7 +110,7 @@ fn sizeOf(slot_type: common.SlotType, algorithm: u32) usize {
     return switch (slot_type) {
         .kem_public, .kem_private => kem.size(slot_type, algorithm),
         .signature_public, .signature_private => signature.size(slot_type, algorithm),
-        .hasher, .xof, .hmac => hash.size(slot_type, algorithm),
+        .hasher, .xof, .hmac, .configured_hash, .configured_xof, .configured_mac => hash.size(slot_type, algorithm),
         .signer => stateful.size(slot_type, algorithm),
     };
 }
@@ -149,7 +149,7 @@ fn slotInfoChecked(memory_pointer: ?[*]u8, length: usize, out: ?*anyopaque) comm
         } else |_| {}
     }
 
-    const slot = try common.open(&.{ .kem_public, .kem_private, .signature_public, .signature_private, .hasher, .xof, .hmac }, memory_pointer, length, sizeOf, .shared);
+    const slot = try common.open(&.{ .kem_public, .kem_private, .signature_public, .signature_private, .hasher, .xof, .hmac, .configured_hash, .configured_xof, .configured_mac }, memory_pointer, length, sizeOf, .shared);
 
     defer slot.close();
 
@@ -292,22 +292,43 @@ comptime {
             });
         }
 
+        // The cpq_hmac names are those of ABI version 1; cpq_mac names the same functions, which
+        // take every MAC.
         if (options.hash) {
             exportAll(.{
                 .{ "cpq_hash", &hash.digest },
                 .{ "cpq_hash_init", &hash.init },
                 .{ "cpq_hash_update", &hash.update },
                 .{ "cpq_hash_final", &hash.final },
+                .{ "cpq_hash_configure", &hash.configureHash },
+                .{ "cpq_hash_with", &hash.digestWith },
+                .{ "cpq_hash_init_with", &hash.initWith },
                 .{ "cpq_xof", &hash.xof },
                 .{ "cpq_xof_init", &hash.xofInit },
                 .{ "cpq_xof_update", &hash.xofUpdate },
                 .{ "cpq_xof_read", &hash.xofRead },
+                .{ "cpq_xof_configure", &hash.configureXof },
+                .{ "cpq_xof_with", &hash.xofWith },
+                .{ "cpq_xof_init_with", &hash.xofInitWith },
                 .{ "cpq_hmac", &hash.hmac },
                 .{ "cpq_hmac_verify", &hash.hmacVerify },
                 .{ "cpq_hmac_init", &hash.hmacInit },
                 .{ "cpq_hmac_update", &hash.hmacUpdate },
                 .{ "cpq_hmac_final", &hash.hmacFinal },
                 .{ "cpq_hmac_final_verify", &hash.hmacFinalVerify },
+                .{ "cpq_mac", &hash.hmac },
+                .{ "cpq_mac_verify", &hash.hmacVerify },
+                .{ "cpq_mac_init", &hash.hmacInit },
+                .{ "cpq_mac_update", &hash.hmacUpdate },
+                .{ "cpq_mac_final", &hash.hmacFinal },
+                .{ "cpq_mac_final_verify", &hash.hmacFinalVerify },
+                .{ "cpq_mac_configure", &hash.configureMac },
+                .{ "cpq_mac_with", &hash.macWith },
+                .{ "cpq_mac_verify_with", &hash.macVerifyWith },
+                .{ "cpq_mac_init_with", &hash.macInitWith },
+                .{ "cpq_kdf_derive", &hash.kdfDerive },
+                .{ "cpq_kdf_extract", &hash.kdfExtract },
+                .{ "cpq_kdf_expand", &hash.kdfExpand },
             });
         }
     }

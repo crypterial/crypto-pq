@@ -38,6 +38,10 @@ const enabled = !build_options.portable and builtin.zig_backend == .stage2_llvm 
 // need no detection: the lattice arithmetic uses the ones LLVM does not choose by itself.
 pub const neon = enabled and arch == .aarch64 and builtin.cpu.has(.aarch64, .neon);
 
+// The general-purpose instructions of every AArch64 core, in kernels that run in an order LLVM
+// does not choose: BLAKE2.
+pub const aarch64_base = enabled and arch == .aarch64;
+
 // WebAssembly SIMD is a feature of the module, which the engine validates before running it: the
 // lattice arithmetic uses the instructions that LLVM does not choose by itself.
 pub const wasm_simd = !build_options.portable and builtin.zig_backend == .stage2_llvm and arch == .wasm32 and builtin.cpu.has(.wasm, .simd128);

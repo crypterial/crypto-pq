@@ -140,7 +140,9 @@ pub fn apart(written: []const []const u8, read: []const []const u8) Failure!void
     }
 }
 
-// The kinds of objects the caller holds in its own memory.
+// The kinds of objects the caller holds in its own memory. A configured algorithm (a hash with a
+// salt, a cSHAKE with a customization, a MAC with its length) holds what configure precomputed.
+// `hmac` holds the state of any MAC.
 pub const SlotType = enum(u32) {
     kem_public = 1,
     kem_private = 2,
@@ -150,6 +152,9 @@ pub const SlotType = enum(u32) {
     xof = 6,
     hmac = 7,
     signer = 8,
+    configured_hash = 9,
+    configured_xof = 10,
+    configured_mac = 11,
 };
 
 // Every slot starts with this header. The magic names the slot type and the ABI version, so that
