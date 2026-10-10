@@ -19,7 +19,7 @@ import {
   selfTest,
 } from "./keys.ts";
 import * as mldsa from "./mldsa.ts";
-import { PRE_HASHES, type PreHash } from "./prehash.ts";
+import { PRE_HASHES, type PreHash, REFUSED_PRE_HASHES } from "./prehash.ts";
 import { randomBytes } from "./rng.ts";
 import * as slhdsa from "./slhdsa.ts";
 import { type Core, type Family, PUBLIC, REJECTED, SECRET, Slot, check } from "./wasm.ts";
@@ -150,12 +150,15 @@ export interface SignatureBackend extends SignatureSizes {
   readonly wasm: Engine;
 }
 
+// A crypto-pq hash function that FIPS 204 and FIPS 205 do not approve as a pre-hash.
+const REFUSED: PreHash = { id: 0, arc: 0, strength: 0, digest: () => new Uint8Array(0) };
+
 function preHashEntry(value: unknown): PreHash | null {
   if (value === undefined) {
     return null;
   }
 
-  const entry = PRE_HASHES.get(value as object);
+  const entry = PRE_HASHES.get(value as object) ?? (REFUSED_PRE_HASHES.has(value as object) ? REFUSED : undefined);
 
   if (entry === undefined) {
     throw new CryptoPQError("INVALID_OPTION", "preHash must be one of the crypto-pq hash functions");
@@ -606,7 +609,9 @@ export class SignaturePublicKey {
 
     const backend = backendOf(this.algorithm);
 
-    if (tooWeak(backend, entry, policy) || context.length > 255 || data.length !== backend.signatureSize) {
+    const refused = entry === REFUSED || tooWeak(backend, entry, policy);
+
+    if (refused || context.length > 255 || data.length !== backend.signatureSize) {
       return false;
     }
 
@@ -671,6 +676,10 @@ export class SignaturePrivateKey {
       const [context, entry] = contextOf(value);
 
       const backend = backendOf(this.algorithm);
+
+      if (entry === REFUSED) {
+        throw new CryptoPQError("INVALID_OPTION", "FIPS 204 and FIPS 205 do not approve this pre-hash");
+      }
 
       if (tooWeak(backend, entry, policy)) {
         throw new CryptoPQError("INVALID_OPTION", "the pre-hash is weaker than the signature algorithm");

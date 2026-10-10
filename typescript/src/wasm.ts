@@ -440,12 +440,11 @@ export class Core {
     return this.#live;
   }
 
-  // The current view of linear memory, which a call that grows the memory replaces.
+  // The current view of linear memory. Growing the memory detaches its buffer, whose views then have
+  // length 0: only then is the new buffer fetched, which costs far more than the check.
   bytes(): Uint8Array {
-    const buffer = this.#memory.buffer;
-
-    if (this.#view.buffer !== buffer) {
-      this.#view = new Uint8Array(buffer);
+    if (this.#view.length === 0) {
+      this.#view = new Uint8Array(this.#memory.buffer);
     }
 
     return this.#view;
@@ -514,12 +513,12 @@ export class Core {
   // afterwards, with the given depth of the stack. A call made while another runs, which only the
   // platform's random source can start, gets a block of its own.
   run<T>(stack: number, lengths: readonly number[], body: (at: number[]) => T): T {
-    const offsets: number[] = [];
+    const at: number[] = [];
 
     let total = 0;
 
     for (const length of lengths) {
-      offsets.push(total);
+      at.push(total);
 
       total += (length + 15) & ~15;
     }
@@ -533,7 +532,11 @@ export class Core {
     try {
       base = own ? this.#allocate(total) : this.#reserve(total);
 
-      return body(offsets.map((offset) => base + offset));
+      for (let i = 0; i < at.length; i++) {
+        at[i] += base;
+      }
+
+      return body(at);
     } catch (error) {
       if (error instanceof CryptoPQError || error instanceof Exhausted) {
         throw error;
@@ -592,7 +595,7 @@ export class Core {
       view.fill(0, Math.max(this.#stackLow, this.#stackHigh - stack), this.#stackHigh);
     }
 
-    if (this.#depth === 0 && this.#residents === 0 && this.#memory.buffer.byteLength > MEMORY_LIMIT) {
+    if (this.#depth === 0 && this.#residents === 0 && this.bytes().length > MEMORY_LIMIT) {
       this.#live = false;
     }
   }

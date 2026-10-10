@@ -782,11 +782,380 @@ function mldsaPack(): string {
   ]);
 }
 
+// BLAKE2b and BLAKE2s (RFC 7693) compressions, unrolled, with the message words in variables.
+
+// RFC 7693, 2.7: the message word permutations of the rounds; round r uses row r mod 10.
+const SIGMA = [
+  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+  [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+  [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+  [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+  [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+  [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+  [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+  [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+  [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+];
+
+// The columns, then the diagonals, of the 4 x 4 working vector that the eight G calls of a round mix.
+const G_WORDS = [
+  [0, 4, 8, 12],
+  [1, 5, 9, 13],
+  [2, 6, 10, 14],
+  [3, 7, 11, 15],
+  [0, 5, 10, 15],
+  [1, 6, 11, 12],
+  [2, 7, 8, 13],
+  [3, 4, 9, 14],
+];
+
+// floor(sqrt(n)), by Newton's method from above.
+function squareRoot(n: bigint): bigint {
+  let x = 1n << BigInt(Math.ceil(n.toString(2).length / 2) + 1);
+
+  for (;;) {
+    const next = (x + n / x) / 2n;
+
+    if (next >= x) {
+      return x;
+    }
+
+    x = next;
+  }
+}
+
+// RFC 7693, 2.6: the IVs are those of SHA-256 and SHA-512 (FIPS 180-4, 5.3.3 and 5.3.5), the first 32
+// or 64 bits of the fractional parts of the square roots of the first eight primes.
+function blake2Iv(bits: number): bigint[] {
+  return primes(8).map((p) => squareRoot(BigInt(p) << BigInt(2 * bits)) & ((1n << BigInt(bits)) - 1n));
+}
+
+// The little-endian 32-bit word of data at the given byte offset past offset.
+function wordAt(at: number): string {
+  const byte = (k: number) => `data[offset${at + k > 0 ? ` + ${at + k}` : ""}]`;
+
+  return `${byte(0)} | (${byte(1)} << 8) | (${byte(2)} << 16) | (${byte(3)} << 24)`;
+}
+
+function blake2sG([a, b, c, d]: readonly string[], x: string, y: string): string[] {
+  return [
+    `${a} = (${a} + ${b} + ${x}) | 0;`,
+    `${d} ^= ${a};`,
+    `${d} = ${rotr(d, 16)};`,
+    `${c} = (${c} + ${d}) | 0;`,
+    `${b} ^= ${c};`,
+    `${b} = ${rotr(b, 12)};`,
+    `${a} = (${a} + ${b} + ${y}) | 0;`,
+    `${d} ^= ${a};`,
+    `${d} = ${rotr(d, 8)};`,
+    `${c} = (${c} + ${d}) | 0;`,
+    `${b} ^= ${c};`,
+    `${b} = ${rotr(b, 7)};`,
+  ];
+}
+
+// The 64-bit (high, low) = (high, low) + (yHigh, yLow), with the carry of the low halves from an
+// unsigned comparison of the new low half with one of the old ones.
+function add64Compare(name: string, yHigh: string, yLow: string): string[] {
+  return [
+    `sum = (${name}l + ${yLow}) | 0;`,
+    `${name}h = (${name}h + ${yHigh} + ((sum >>> 0) < (${yLow} >>> 0) ? 1 : 0)) | 0;`,
+    `${name}l = sum;`,
+  ];
+}
+
+// d = (d ^ a) rotated right by n, or b = (b ^ c), on (high, low) halves.
+function xorRotate64(target: string, other: string, n: number): string[] {
+  if (n === 32) {
+    return [`x = ${target}h ^ ${other}h;`, `${target}h = ${target}l ^ ${other}l;`, `${target}l = x;`];
+  }
+
+  const [high, low] = rot64("x", "y", n);
+
+  return [`x = ${target}h ^ ${other}h;`, `y = ${target}l ^ ${other}l;`, `${target}h = ${high};`, `${target}l = ${low};`];
+}
+
+function blake2bG([a, b, c, d]: readonly string[], x: string, y: string): string[] {
+  return [
+    ...add64Compare(a, `${b}h`, `${b}l`),
+    ...add64Compare(a, `${x}h`, `${x}l`),
+    ...xorRotate64(d, a, 32),
+    ...add64Compare(c, `${d}h`, `${d}l`),
+    ...xorRotate64(b, c, 24),
+    ...add64Compare(a, `${b}h`, `${b}l`),
+    ...add64Compare(a, `${y}h`, `${y}l`),
+    ...xorRotate64(d, a, 16),
+    ...add64Compare(c, `${d}h`, `${d}l`),
+    ...xorRotate64(b, c, 63),
+  ];
+}
+
+function blake2Rounds(rounds: number, g: (words: string[], x: string, y: string) => string[]): string[] {
+  return range(rounds).flatMap((r) =>
+    G_WORDS.flatMap((words, i) => {
+      const sigma = SIGMA[r % 10];
+
+      return g(
+        words.map((w) => `v${w}`),
+        `m${sigma[2 * i]}`,
+        `m${sigma[2 * i + 1]}`,
+      );
+    }),
+  );
+}
+
+const BLAKE2_PARAMETERS = ["h: Int32Array", "data: Uint8Array", "offset: number", "counter: number", "last: number"];
+
+function blake2s(): string[] {
+  const iv = blake2Iv(32).map((word) => hex(Number(word)));
+
+  const body: Statement[] = [
+    ...range(8).map((i) => `let v${i} = h[${i}] | 0;`),
+    ...range(4).map((i) => `let v${8 + i} = ${iv[i]};`),
+    `let v12 = ${iv[4]} ^ (counter | 0);`,
+    `let v13 = ${iv[5]} ^ ((counter / TWO_32) | 0);`,
+    `let v14 = ${iv[6]} ^ last;`,
+    `let v15 = ${iv[7]};`,
+    ...range(16).map((i) => `const m${i} = ${wordAt(4 * i)};`),
+    ...blake2Rounds(10, blake2sG),
+    ...range(8).map((i) => `h[${i}] ^= v${i} ^ v${i + 8};`),
+  ];
+
+  return [
+    "// The BLAKE2s compression of the 64-byte block at data[offset] into the chaining value h, with the",
+    "// counter t (the bytes hashed so far, this block included, below 2^53) and last = -1 for the final",
+    "// block, else 0.",
+    ...func("blake2sCompress", BLAKE2_PARAMETERS, true, body),
+  ];
+}
+
+function blake2b(): string[] {
+  const iv = blake2Iv(64).map((word) => [hex(Number(word >> 32n)), hex(Number(word & 0xffffffffn))]);
+
+  const halves = (i: number, high: string, low: string) => [`let v${i}h = ${high};`, `let v${i}l = ${low};`];
+
+  const body: Statement[] = [
+    ...range(8).flatMap((i) => halves(i, `h[${2 * i + 1}] | 0`, `h[${2 * i}] | 0`)),
+    ...range(4).flatMap((i) => halves(8 + i, iv[i][0], iv[i][1])),
+    ...halves(12, `${iv[4][0]} ^ ((counter / TWO_32) | 0)`, `${iv[4][1]} ^ (counter | 0)`),
+    ...halves(13, iv[5][0], iv[5][1]),
+    ...halves(14, `${iv[6][0]} ^ last`, `${iv[6][1]} ^ last`),
+    ...halves(15, iv[7][0], iv[7][1]),
+    ...range(16).flatMap((i) => [`const m${i}l = ${wordAt(8 * i)};`, `const m${i}h = ${wordAt(8 * i + 4)};`]),
+    "let sum = 0;",
+    "let x = 0;",
+    "let y = 0;",
+    ...blake2Rounds(12, blake2bG),
+    ...range(8).flatMap((i) => [`h[${2 * i}] ^= v${i}l ^ v${i + 8}l;`, `h[${2 * i + 1}] ^= v${i}h ^ v${i + 8}h;`]),
+  ];
+
+  return [
+    "// The BLAKE2b compression of the 128-byte block at data[offset] into the chaining value h, whose",
+    "// 64-bit words are (low, high) pairs of 32-bit halves, with the counter t (below 2^53) and last = -1",
+    "// for the final block, else 0. The 64-bit additions carry with an unsigned comparison.",
+    ...func("blake2bCompress", BLAKE2_PARAMETERS, true, body),
+  ];
+}
+
+function blake2(): string {
+  return module([["const TWO_32 = 0x100000000;"], blake2s(), blake2b()]);
+}
+
+// Ascon-p[12] (NIST SP 800-232, 3) on a bit-interleaved state: the 64-bit word x_i is s[2i], holding
+// its even-numbered bits, and s[2i + 1], holding its odd-numbered bits, as the lanes of src/keccak.ts.
+
+const MASK_64 = (1n << 64n) - 1n;
+
+// SP 800-232, 3.3: the rotations of the linear layer, per word.
+const ASCON_ROTATIONS = [
+  [19, 28],
+  [61, 39],
+  [1, 6],
+  [10, 17],
+  [7, 41],
+];
+
+// SP 800-232, Table 5: the constants of p[12] are const_4 to const_15.
+function asconConstant(round: number): number {
+  return ((15 - round) << 4) | round;
+}
+
+// The even-numbered and odd-numbered bits of a 64-bit value, each gathered into 32 bits.
+function interleave(x: bigint): [number, number] {
+  let even = 0;
+
+  let odd = 0;
+
+  for (let i = 0; i < 32; i++) {
+    even |= Number((x >> BigInt(2 * i)) & 1n) << i;
+
+    odd |= Number((x >> BigInt(2 * i + 1)) & 1n) << i;
+  }
+
+  return [even, odd];
+}
+
+function rotr64(x: bigint, n: number): bigint {
+  return ((x >> BigInt(n)) | (x << BigInt(64 - n))) & MASK_64;
+}
+
+// SP 800-232, Algorithms 1 to 4 on plain 64-bit words, for the initial states below.
+function asconReference(x: bigint[]): void {
+  for (let round = 0; round < 12; round++) {
+    x[2] ^= BigInt(asconConstant(round));
+
+    x[0] ^= x[4];
+
+    x[4] ^= x[3];
+
+    x[2] ^= x[1];
+
+    const t = x.map((word, i) => ~word & x[(i + 1) % 5] & MASK_64);
+
+    for (let i = 0; i < 5; i++) {
+      x[i] ^= t[(i + 1) % 5];
+    }
+
+    x[1] ^= x[0];
+
+    x[0] ^= x[4];
+
+    x[3] ^= x[2];
+
+    x[2] = ~x[2] & MASK_64;
+
+    ASCON_ROTATIONS.forEach(([a, b], i) => {
+      x[i] ^= rotr64(x[i], a) ^ rotr64(x[i], b);
+    });
+  }
+}
+
+// SP 800-232, Appendix B: the IVs of Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128, and the states that
+// Ascon-p[12] makes of IV || 0^256, interleaved, ten words each.
+function asconInitial(): number[] {
+  return [0x0000080100cc0002n, 0x0000080000cc0003n, 0x0000080000cc0004n].flatMap((iv) => {
+    const x = [iv, 0n, 0n, 0n, 0n];
+
+    asconReference(x);
+
+    return x.flatMap(interleave);
+  });
+}
+
+function rotr32(x: string, n: number): string {
+  return n === 0 ? x : rotr(x, n);
+}
+
+// The even or odd half of a 64-bit word rotated right by n: by 2k, both halves turn by k; by 2k + 1, the
+// halves also swap, the even half taking the odd one turned by k and the odd half the even one turned
+// by k + 1.
+function rotatedHalf(even: string, odd: string, n: number, half: "e" | "o"): string {
+  if (n % 2 === 0) {
+    return rotr32(half === "e" ? even : odd, n / 2);
+  }
+
+  return half === "e" ? rotr32(odd, (n - 1) / 2) : rotr32(even, (n + 1) / 2);
+}
+
+function asconRound(round: number): string[] {
+  const [even, odd] = interleave(BigInt(asconConstant(round)));
+
+  const s: string[] = [];
+
+  if (even !== 0) {
+    s.push(`x2e ^= ${hex(even)};`);
+  }
+
+  if (odd !== 0) {
+    s.push(`x2o ^= ${hex(odd)};`);
+  }
+
+  for (const h of ["e", "o"]) {
+    s.push(`x0${h} ^= x4${h};`, `x4${h} ^= x3${h};`, `x2${h} ^= x1${h};`);
+
+    s.push(...range(5).map((i) => `t${i} = x${(i + 1) % 5}${h} & ~x${i}${h};`));
+
+    s.push(...range(5).map((i) => `x${i}${h} ^= t${(i + 1) % 5};`));
+
+    s.push(`x1${h} ^= x0${h};`, `x0${h} ^= x4${h};`, `x3${h} ^= x2${h};`, `x2${h} = ~x2${h};`);
+  }
+
+  ASCON_ROTATIONS.forEach(([a, b], i) => {
+    s.push(`t0 = x${i}e;`, `t1 = x${i}o;`);
+
+    for (const h of ["e", "o"] as const) {
+      s.push(`x${i}${h} ^= ${rotatedHalf("t0", "t1", a, h)} ^ ${rotatedHalf("t0", "t1", b, h)};`);
+    }
+  });
+
+  return s;
+}
+
+const ASCON_WORDS = range(5).flatMap((i) => [`x${i}e`, `x${i}o`]);
+
+// The loads of the state into variables, the rounds, the stores back.
+function asconBody(inner: (rounds: string[]) => Statement[]): Statement[] {
+  return [
+    ...ASCON_WORDS.map((word, i) => `let ${word} = s[${i}] | 0;`),
+    ...range(5).map((i) => `let t${i} = 0;`),
+    ...inner(range(12).flatMap(asconRound)),
+    ...ASCON_WORDS.map((word, i) => `s[${i}] = ${word};`),
+  ];
+}
+
+// Gathers the even-numbered bits of the variable in its low half and the odd-numbered bits in its high
+// half, as unzip in src/keccak.ts.
+function unzip(x: string): string[] {
+  return [
+    [1, "0x22222222"],
+    [2, "0x0c0c0c0c"],
+    [4, "0x00f000f0"],
+    [8, "0x0000ff00"],
+  ].flatMap(([shift, mask]) => [`t0 = (${x} ^ (${x} >>> ${shift})) & ${mask};`, `${x} ^= t0 ^ (t0 << ${shift});`]);
+}
+
+function ascon(): string {
+  const absorb = asconBody((rounds) => [
+    "let lo = 0;",
+    "let hi = 0;",
+    block("for (; offset < end; offset += 8)", [
+      `lo = ${wordAt(0)};`,
+      `hi = ${wordAt(4)};`,
+      ...unzip("lo"),
+      ...unzip("hi"),
+      "x0e ^= (lo & 0xffff) | (hi << 16);",
+      "x0o ^= (lo >>> 16) | (hi & 0xffff0000);",
+      ...rounds,
+    ]),
+  ]);
+
+  return module([
+    [
+      "// The states after Ascon-p[12] of the IVs of Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128 with",
+      "// 256 zero bits (SP 800-232, Appendix A.3), ten interleaved words each.",
+      ...table("ASCON_INITIAL", asconInitial()).map((line, i) => (i === 0 ? `export ${line}` : line)),
+    ],
+    [
+      "// Ascon-p[12] on the interleaved state s. The words stay in variables through the twelve rounds,",
+      "// which are unrolled.",
+      ...func("asconPermute", ["s: Uint32Array"], true, asconBody((rounds) => rounds)),
+    ],
+    [
+      "// Absorbs the whole 8-byte blocks of data[offset .. end), little-endian into x0, each followed by",
+      "// Ascon-p[12], keeping the state in variables from block to block.",
+      ...func("asconAbsorb", ["s: Uint32Array", "data: Uint8Array", "offset: number", "end: number"], true, absorb),
+    ],
+  ]);
+}
+
 const MODULES: [string, () => string][] = [
   ["keccak-permute.ts", keccak],
   ["sha2-rounds.ts", sha2],
   ["x25519-field.ts", x25519],
   ["mldsa-pack.ts", mldsaPack],
+  ["blake2-rounds.ts", blake2],
+  ["ascon-permute.ts", ascon],
 ];
 
 const check = process.argv.includes("--check");

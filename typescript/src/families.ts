@@ -54,12 +54,25 @@ const HASH = [
   "cpq_xof_init",
   "cpq_xof_update",
   "cpq_xof_read",
-  "cpq_hmac",
-  "cpq_hmac_verify",
-  "cpq_hmac_init",
-  "cpq_hmac_update",
-  "cpq_hmac_final",
-  "cpq_hmac_final_verify",
+  "cpq_hash_configure",
+  "cpq_hash_with",
+  "cpq_hash_init_with",
+  "cpq_xof_configure",
+  "cpq_xof_with",
+  "cpq_xof_init_with",
+  "cpq_mac",
+  "cpq_mac_verify",
+  "cpq_mac_init",
+  "cpq_mac_update",
+  "cpq_mac_final",
+  "cpq_mac_final_verify",
+  "cpq_mac_configure",
+  "cpq_mac_with",
+  "cpq_mac_verify_with",
+  "cpq_mac_init_with",
+  "cpq_kdf_derive",
+  "cpq_kdf_extract",
+  "cpq_kdf_expand",
 ];
 
 function range(length: number, start: number): Uint8Array {
@@ -176,17 +189,14 @@ function digestTest(core: Core, call: string, id: number, size: number, expected
   });
 }
 
-function hmacTest(core: Core): boolean {
-  return core.run(SECRET, [32, 3, 32], ([key, data, tag]) => {
+// The tag of "abc" from cpq_mac with the key 0, 1, 2 ... 31.
+function macTest(core: Core, id: number, size: number, expected: string): boolean {
+  return core.run(SECRET, [32, 3, size], ([key, data, tag]) => {
     core.write(key, range(32, 0));
 
     core.write(data, Uint8Array.of(0x61, 0x62, 0x63));
 
-    const status = core.x.cpq_hmac(1, key, 32, data, 3, tag, 32);
-
-    const expected = "f0133729c4163dede81e21cd47839256da58171238c8a0d874397c73b14e1e47";
-
-    return status === OK && equal(core.read(tag, 32), fromHex(expected));
+    return core.x.cpq_mac(id, key, 32, data, 3, tag, size) === OK && equal(core.read(tag, size), fromHex(expected));
   });
 }
 
@@ -241,7 +251,17 @@ export const X_WING_HASH = /* @__PURE__ */ new Family(
     digestTest(core, "cpq_hash", 7, 32, "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532") &&
     digestTest(core, "cpq_xof", 0, 32, "5881092dd818bf5cf8a3ddb793fbcba74097d5c526a6d35f97b83351940f2cc8") &&
     digestTest(core, "cpq_xof", 1, 32, "483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739") &&
-    hmacTest(core),
+    digestTest(
+      core,
+      "cpq_hash",
+      13,
+      64,
+      "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923",
+    ) &&
+    digestTest(core, "cpq_hash", 17, 32, "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982") &&
+    digestTest(core, "cpq_hash", 18, 32, "45aa03431c3c829b3b066f33e844b0cc4d20a45af92d3dcfdf34f40fc20935cf") &&
+    macTest(core, 1, 32, "f0133729c4163dede81e21cd47839256da58171238c8a0d874397c73b14e1e47") &&
+    macTest(core, 4, 32, "db7cef4050cab7f3c14c7ab3afa8dbc6f4a01c0aad60f79bc8186ec2fef516a7"),
   KEM,
   HASH,
 );

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import * as pq from "../src/index.ts";
-import { type Fields, hex, records, toHex } from "./vectors.ts";
+import { type Fields, hex, pieces, records, toHex } from "./vectors.ts";
 
 const HASHES: [string, string, pq.HashAlgorithm][] = [
   ["SHA224", "SHA-224", pq.SHA_224],
@@ -23,15 +23,12 @@ const XOFS: [string, pq.XofAlgorithm][] = [
 ];
 
 // HMAC.rsp labels each group by digest length in bytes; L=20 is SHA-1, which is out of scope.
-const HMACS: [string, string, pq.HmacAlgorithm][] = [
+const HMACS: [string, string, pq.MacAlgorithm][] = [
   ["28", "HMAC-SHA-224", pq.HMAC_SHA_224],
   ["32", "HMAC-SHA-256", pq.HMAC_SHA_256],
   ["48", "HMAC-SHA-384", pq.HMAC_SHA_384],
   ["64", "HMAC-SHA-512", pq.HMAC_SHA_512],
 ];
-
-// Uneven sizes reach every buffering path: empty updates, partial blocks and whole blocks.
-const PIECES = [0, 1, 3, 64, 7, 136, 128, 168, 0, 200];
 
 function message(record: Fields): Uint8Array {
   const bits = Number(record.Len);
@@ -39,20 +36,6 @@ function message(record: Fields): Uint8Array {
   assert.equal(bits % 8, 0, "bit-oriented message");
 
   return hex(record.Msg).subarray(0, bits / 8);
-}
-
-function pieces(data: Uint8Array): Uint8Array[] {
-  const out: Uint8Array[] = [];
-
-  for (let offset = 0, index = 0; offset < data.length; index++) {
-    const end = Math.min(offset + PIECES[index % PIECES.length], data.length);
-
-    out.push(data.subarray(offset, end));
-
-    offset = end;
-  }
-
-  return out;
 }
 
 test("hash vectors", () => {

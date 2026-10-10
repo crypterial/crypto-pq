@@ -397,6 +397,151 @@ test("hashing: WebAssembly against TypeScript", () => {
   }
 });
 
+// BLAKE2, Ascon, cSHAKE, KMAC and HKDF with random options, including invalid ones, which must be
+// refused alike.
+test("BLAKE2, Ascon, cSHAKE, KMAC and HKDF: WebAssembly against TypeScript", () => {
+  const random = new Random(SEED + 5);
+
+  const size = () => (random.below(8) === 0 ? 33000 + random.below(40000) : random.below(1000));
+
+  // A byte string of up to limit bytes, at times one byte longer.
+  const option = (limit: number) => random.bytes(random.below(8) === 0 ? limit + 1 : random.below(limit + 1));
+
+  const configured = <T>(context: string, configure: () => T): T | null => {
+    const outcome = agreeOnBackends(`${context} configure`, () => {
+      configure();
+
+      return "configured";
+    });
+
+    return outcome === "configured" ? configure() : null;
+  };
+
+  for (let round = 0; round < 4 * ROUNDS; round++) {
+    const data = random.bytes(size());
+
+    const cut = random.below(data.length + 1);
+
+    const hashes = [pq.BLAKE2B_160, pq.BLAKE2B_256, pq.BLAKE2B_384, pq.BLAKE2B_512, pq.ASCON_HASH256];
+
+    hashes.push(pq.BLAKE2S_128, pq.BLAKE2S_160, pq.BLAKE2S_224, pq.BLAKE2S_256);
+
+    for (const base of hashes) {
+      const field = base.name.startsWith("BLAKE2b") ? 16 : base.name.startsWith("BLAKE2s") ? 8 : 0;
+
+      const options = { salt: option(field), personalization: option(field) };
+
+      const context = `${base.name} ${data.length} ${options.salt.length} ${options.personalization.length}`;
+
+      for (const hash of [base, configured(context, () => base.configure(options))]) {
+        if (hash === null) {
+          continue;
+        }
+
+        agreeOnBackends(context, () => hash.digest(data));
+
+        const states = made(() => hash.create().update(data.subarray(0, cut)));
+
+        const rest = data.subarray(cut);
+
+        agree(context, ...states.map((state) => () => state.update(rest).digest()), () => hash.digest(data));
+      }
+    }
+
+    for (const base of [pq.CSHAKE128, pq.CSHAKE256, pq.ASCON_XOF128, pq.ASCON_CXOF128]) {
+      const customization = option(base === pq.ASCON_CXOF128 ? 256 : random.below(300));
+
+      const context = `${base.name} ${data.length} ${customization.length}`;
+
+      const xofs = [base, configured(context, () => base.configure({ customization }))];
+
+      if (base.name.startsWith("cSHAKE")) {
+        xofs.push(configured(context, () => hazmat.configureCshake(base, option(20), customization)));
+      }
+
+      for (const xof of xofs) {
+        if (xof === null) {
+          continue;
+        }
+
+        const lengths = [random.below(200), size(), random.below(3)];
+
+        agreeOnBackends(context, () => xof.digest(data, lengths[1]));
+
+        const states = made(() => xof.create().update(data));
+
+        agree(context, ...states.map((state) => () => lengths.map((length) => toHex(state.read(length))).join()));
+      }
+    }
+
+    for (const base of [pq.KMAC128, pq.KMAC256, pq.BLAKE2B_MAC, pq.BLAKE2S_MAC]) {
+      const blake2 = base.name.startsWith("BLAKE2") ? base.digestSize : 0;
+
+      const options = {
+        length: blake2 > 0 ? random.below(blake2 + 2) : random.below(100),
+        customization: blake2 > 0 ? option(0) : option(random.below(300)),
+        xof: random.below(4) === 0,
+        salt: option(blake2 / 4),
+        personalization: blake2 > 0 ? option(blake2 / 4) : option(0),
+      };
+
+      const key = random.bytes(blake2 > 0 ? random.below(blake2 + 2) : random.below(300));
+
+      const lengths = JSON.stringify(options, (_, v) => (v instanceof Uint8Array ? v.length : v));
+
+      const context = `${base.name} key ${key.length} ${lengths}`;
+
+      for (const mac of [base, configured(context, () => base.configure(options))]) {
+        if (mac === null) {
+          continue;
+        }
+
+        const tag = agreeOnBackends(context, () => mac.digest(key, data));
+
+        if (tag.startsWith("error")) {
+          agreeOnBackends(`${context} create`, () => mac.create(key));
+
+          agreeOnBackends(`${context} verify`, () => mac.verify(key, data, new Uint8Array(mac.digestSize)));
+
+          continue;
+        }
+
+        const bytes = Uint8Array.from(Buffer.from(tag, "hex"));
+
+        const states = made(() => mac.create(key).update(data.subarray(0, cut)));
+
+        agree(context, ...states.map((state) => () => state.update(data.subarray(cut)).digest()));
+
+        for (const candidate of [bytes, random.mutate(bytes), bytes.subarray(1)]) {
+          agreeOnBackends(`${context} verify`, () => mac.verify(key, data, candidate));
+
+          agree(`${context} verify`, ...states.map((state) => () => state.verify(candidate)));
+        }
+      }
+    }
+
+    for (const kdf of [pq.HKDF_SHA_256, pq.HKDF_SHA_384, pq.HKDF_SHA_512]) {
+      const [salt, info] = [random.bytes(random.below(200)), random.bytes(random.below(300))];
+
+      const length = random.choice([0, 1, random.below(300), 255 * kdf.prkSize, 255 * kdf.prkSize + 1]);
+
+      const context = `${kdf.name} ${data.length} ${salt.length} ${info.length} ${length}`;
+
+      agreeOnBackends(context, () => kdf.derive(data, length, { salt, info }));
+
+      const prk = agreeOnBackends(`${context} extract`, () => kdf.extract(data, { salt }));
+
+      const extracted = Uint8Array.from(Buffer.from(prk, "hex"));
+
+      const key = random.choice([extracted, random.bytes(random.below(2 * kdf.prkSize))]);
+
+      agreeOnBackends(`${context} expand`, () => kdf.expand(key, length, { info }));
+
+      agreeOnBackends(`${context} options`, () => kdf.expand(key, 32, { salt }));
+    }
+  }
+});
+
 test("stateful signatures: WebAssembly against TypeScript", () => {
   const random = new Random(SEED + 3);
 

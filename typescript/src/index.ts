@@ -5,10 +5,27 @@ export { CryptoPQError } from "./errors.ts";
 export type { ErrorCode } from "./errors.ts";
 
 export {
+  ASCON_CXOF128,
+  ASCON_HASH256,
+  ASCON_XOF128,
+  BLAKE2B_160,
+  BLAKE2B_256,
+  BLAKE2B_384,
+  BLAKE2B_512,
+  BLAKE2B_MAC,
+  BLAKE2S_128,
+  BLAKE2S_160,
+  BLAKE2S_224,
+  BLAKE2S_256,
+  BLAKE2S_MAC,
+  CSHAKE128,
+  CSHAKE256,
   HMAC_SHA_224,
   HMAC_SHA_256,
   HMAC_SHA_384,
   HMAC_SHA_512,
+  KMAC128,
+  KMAC256,
   SHA3_224,
   SHA3_256,
   SHA3_384,
@@ -23,11 +40,17 @@ export {
   SHAKE256,
   HashAlgorithm,
   Hasher,
-  Hmac,
-  HmacAlgorithm,
+  Mac,
+  MacAlgorithm,
   Xof,
   XofAlgorithm,
 } from "./hash.ts";
+
+export type { HashOptions, MacOptions, XofOptions } from "./hash.ts";
+
+export { HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512, KdfAlgorithm } from "./kdf.ts";
+
+export type { KdfOptions } from "./kdf.ts";
 
 export { ML_KEM_512, ML_KEM_768, ML_KEM_1024, X_WING, KemAlgorithm, KemPrivateKey, KemPublicKey } from "./kem.ts";
 

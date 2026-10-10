@@ -13,3 +13,7 @@ export interface PreHash {
 }
 
 export const PRE_HASHES = new WeakMap<object, PreHash>();
+
+// The other hash functions and XOFs of crypto-pq, such as BLAKE2, Ascon and cSHAKE, which FIPS 204
+// and FIPS 205 do not approve: signing with one is refused and verifying with one fails.
+export const REFUSED_PRE_HASHES = new WeakSet<object>();

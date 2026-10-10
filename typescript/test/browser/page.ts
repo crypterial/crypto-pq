@@ -102,6 +102,11 @@ function fixed(): string[] {
     hex(pq.SHA_512.digest(range(1000, 0))),
     hex(pq.HMAC_SHA_256.digest(range(32, 0), range(100, 0))),
     hex(pq.SHAKE256.digest(range(200, 0), 64)),
+    hex(pq.BLAKE2B_512.configure({ salt: range(16, 0) }).digest(range(300, 0))),
+    hex(pq.BLAKE2S_MAC.digest(range(32, 0), range(100, 0))),
+    hex(pq.ASCON_CXOF128.configure({ customization: range(20, 0) }).digest(range(100, 0), 40)),
+    hex(pq.KMAC256.configure({ customization: range(5, 0), xof: true }).digest(range(32, 0), range(500, 0))),
+    hex(pq.HKDF_SHA_384.derive(range(32, 0), 100, { salt: range(16, 0), info: range(10, 0) })),
   ];
 }
 

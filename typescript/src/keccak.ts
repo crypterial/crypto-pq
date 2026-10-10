@@ -204,6 +204,15 @@ export class Keccak extends Blocks {
     this.#suffix = suffix;
   }
 
+  // A sponge from the state at the start of a block that a prefix left, such as cSHAKE's.
+  static fromState(rate: number, suffix: number, state: Uint32Array): Keccak {
+    const sponge = new Keccak(rate, suffix);
+
+    sponge.#state.set(state);
+
+    return sponge;
+  }
+
   override update(data: Uint8Array): void {
     if (this.#available >= 0) {
       throw new CryptoPQError("UNSUPPORTED", "cannot update after read");

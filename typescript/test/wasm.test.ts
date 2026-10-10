@@ -159,6 +159,10 @@ test("the self-tests' known answers are TypeScript's", () => {
       pq.SHAKE128.digest(abc, 32),
       pq.SHAKE256.digest(abc, 32),
       pq.HMAC_SHA_256.digest(range(32, 0), abc),
+      pq.BLAKE2B_512.digest(abc),
+      pq.BLAKE2S_256.digest(abc),
+      pq.ASCON_HASH256.digest(abc),
+      pq.KMAC128.digest(range(32, 0), abc),
     ];
 
     assert.deepEqual(answers.map(toHex), [
@@ -174,6 +178,10 @@ test("the self-tests' known answers are TypeScript's", () => {
       "5881092dd818bf5cf8a3ddb793fbcba74097d5c526a6d35f97b83351940f2cc8",
       "483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739",
       "f0133729c4163dede81e21cd47839256da58171238c8a0d874397c73b14e1e47",
+      "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923",
+      "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982",
+      "45aa03431c3c829b3b066f33e844b0cc4d20a45af92d3dcfdf34f40fc20935cf",
+      "db7cef4050cab7f3c14c7ab3afa8dbc6f4a01c0aad60f79bc8186ec2fef516a7",
     ]);
   } finally {
     pq.setBackend(BACKEND);
@@ -202,6 +210,8 @@ test("every engine tuning gives TypeScript's results", () => {
       pq.SHA3_256.digest(range(200, 6)),
       pq.SHAKE128.digest(range(300, 7), 400),
       pq.SHAKE256.digest(message, 64),
+      pq.CSHAKE128.configure({ customization: message }).digest(range(300, 9), 200),
+      pq.KMAC256.digest(range(32, 10), range(500, 11)),
       kem.publicKey.exportKey("raw"),
       hazmat.encapsulate(kem.publicKey, range(32, 8)).ciphertext,
       dsa.publicKey.exportKey("raw"),
@@ -254,6 +264,10 @@ test("the backend option", () => {
     pq.SHA_256,
     pq.SHAKE128,
     pq.HMAC_SHA_256,
+    pq.BLAKE2B_256,
+    pq.ASCON_CXOF128.configure({ customization: Uint8Array.of(1) }),
+    pq.KMAC128,
+    pq.HKDF_SHA_256,
   ];
 
   try {
@@ -461,9 +475,9 @@ test("a fault discards the instance and stateful keys rebuild their trees", () =
 test("every export stays within the stack that its wipe covers", (t) => {
   const deepest = child("stack", "wasm") as Record<string, number>;
 
-  const hashing = Object.entries(deepest).filter(([name]) => /^cpq_(hash|xof|hmac)/.test(name));
+  const hashing = Object.entries(deepest).filter(([name]) => /^cpq_(hash|xof|mac|kdf)/.test(name));
 
-  assert.ok(hashing.length >= 14);
+  assert.equal(hashing.length, 27);
 
   for (const [name, used] of hashing) {
     assert.ok(used <= HASHING, `${name} uses ${used} bytes of stack`);
@@ -568,6 +582,34 @@ test("no secret stays in WebAssembly memory", () => {
 
     absent([key, data.subarray(0, 32), data.subarray(-32)], "hashing");
 
+    const customized = pq.KMAC128.configure({ length: 48, customization: data.subarray(0, 10) });
+
+    const tags = [
+      pq.KMAC256.create(key).update(data).digest(),
+      pq.KMAC128.digest(key, data),
+      customized.digest(key, data),
+      customized.create(key).update(data).digest(),
+      pq.BLAKE2B_MAC.digest(key, data),
+      pq.BLAKE2S_MAC.create(key.subarray(0, 32)).update(data).digest(),
+      pq.BLAKE2B_MAC.configure({ salt: data.subarray(0, 16) }).digest(key, data),
+    ];
+
+    pq.KMAC256.verify(key, data, random(64));
+
+    pq.BLAKE2B_MAC.verify(key, data, tags[4]);
+
+    absent([key, ...tags.map((tag) => tag.subarray(0, 16))], "MACs");
+
+    const prk = pq.HKDF_SHA_512.extract(key, { salt: data.subarray(0, 64) });
+
+    const okms = [
+      pq.HKDF_SHA_256.derive(key, 100, { info: data.subarray(0, 20) }),
+      pq.HKDF_SHA_384.expand(prk, 1000),
+      pq.HKDF_SHA_512.expand(prk, 64),
+    ];
+
+    absent([key, prk, ...okms.map((okm) => okm.subarray(-16))], "HKDF");
+
     // A store that refuses the new key: its signer is freed at once.
     const seed = random(40);
 
@@ -604,6 +646,12 @@ test("inputs that misreport their length stay in their regions", () => {
     pq.SHAKE128.create().update(forged(70000, 40000)).read(10);
 
     pq.HMAC_SHA_256.digest(forged(5000, 2), forged(100000, 1));
+
+    pq.KMAC128.configure({ customization: forged(1000, 3) }).digest(forged(5000, 2), forged(100000, 1));
+
+    pq.BLAKE2B_MAC.configure({ salt: forged(1000, 16) }).create(forged(5000, 64)).update(forged(70000, 9)).digest();
+
+    pq.HKDF_SHA_256.derive(forged(5000, 3), 32, { salt: forged(1000, 1), info: forged(100000, 2) });
 
     const pair = pq.ML_DSA_44.generateKeyPair();
 

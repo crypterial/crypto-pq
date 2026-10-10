@@ -35,7 +35,11 @@
     "cryptography",
     "ml-kem",
     "ml-dsa",
-    "sha3"
+    "sha3",
+    "blake2",
+    "ascon",
+    "kmac",
+    "hkdf"
   ],
   "homepage": "https://crypterial.com",
   "repository": {

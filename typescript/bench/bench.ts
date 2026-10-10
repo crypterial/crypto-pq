@@ -103,6 +103,63 @@ function hashCases(): Case[] {
   return cases.map(([name, operation]) => ({ name, period: 1, prepare: () => sync(operation) }));
 }
 
+// The algorithms of SP 800-185, RFC 7693, SP 800-232 and RFC 5869 on 64 bytes and 1 KiB, with a
+// 32-byte key and, where they take one, the customization "crypto-pq"; HKDF from a 32-byte key to
+// 32, 64 and 128 bytes.
+function symmetricCases(): Case[] {
+  const key = bytes(32, 3);
+
+  const customization = new TextEncoder().encode("crypto-pq");
+
+  const [salt, info] = [bytes(32, 4), new TextEncoder().encode("crypto-pq hkdf")];
+
+  const cxof128 = pq.ASCON_CXOF128.configure({ customization });
+
+  const cshake128 = pq.CSHAKE128.configure({ customization });
+
+  const cshake256 = pq.CSHAKE256.configure({ customization });
+
+  const kmac128 = pq.KMAC128.configure({ customization });
+
+  const kmac256 = pq.KMAC256.configure({ customization });
+
+  const cases: [string, (data: Uint8Array) => unknown][] = [
+    ["blake2b-512", (data) => pq.BLAKE2B_512.digest(data)],
+    ["blake2s-256", (data) => pq.BLAKE2S_256.digest(data)],
+    ["blake2b-mac", (data) => pq.BLAKE2B_MAC.digest(key, data)],
+    ["blake2s-mac", (data) => pq.BLAKE2S_MAC.digest(key, data)],
+    ["ascon-hash256", (data) => pq.ASCON_HASH256.digest(data)],
+    ["ascon-xof128", (data) => pq.ASCON_XOF128.digest(data, 32)],
+    ["ascon-cxof128", (data) => cxof128.digest(data, 32)],
+    ["cshake128", (data) => cshake128.digest(data, 32)],
+    ["cshake256", (data) => cshake256.digest(data, 64)],
+    ["kmac128", (data) => kmac128.digest(key, data)],
+    ["kmac256", (data) => kmac256.digest(key, data)],
+  ];
+
+  const sized = cases.flatMap(([name, operation]) =>
+    [64, 1024].map((size): Case => {
+      const data = bytes(size, 5);
+
+      return { name: `${name}/${size === 64 ? "64B" : "1KiB"}`, period: 1, prepare: () => sync(() => operation(data)) };
+    }),
+  );
+
+  const ikm = bytes(32, 6);
+
+  const kdfs = [pq.HKDF_SHA_256, pq.HKDF_SHA_384, pq.HKDF_SHA_512].flatMap((kdf) =>
+    [32, 64, 128].map(
+      (length): Case => ({
+        name: `${kdf.name.toLowerCase()}/${length}B`,
+        period: 1,
+        prepare: () => sync(() => kdf.derive(ikm, length, { salt, info })),
+      }),
+    ),
+  );
+
+  return [...sized, ...kdfs];
+}
+
 function kemCases(algorithm: pq.KemAlgorithm, seedSize: number): Case[] {
   const seed = bytes(seedSize, 3);
 
@@ -243,6 +300,7 @@ const SLH_DSA: [pq.SignatureAlgorithm, number][] = [
 
 const CASES: Case[] = [
   ...hashCases(),
+  ...symmetricCases(),
   ...kemCases(pq.ML_KEM_512, 64),
   ...kemCases(pq.ML_KEM_768, 64),
   ...kemCases(pq.ML_KEM_1024, 64),

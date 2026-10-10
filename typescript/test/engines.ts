@@ -12,11 +12,21 @@ import {
   treeCache,
   vectors,
 } from "./cross-checks.ts";
+import {
+  asconVectors,
+  blake2Derived,
+  blake2Kats,
+  blake2Rfc,
+  cshakeVectors,
+  hkdfVectors,
+  kmacVectors,
+} from "./symmetric-vectors.ts";
 import { hex, toHex } from "./vectors.ts";
 
-// The cross vectors and the error code of every malformed input, on WebAssembly and in TypeScript,
-// for engines that run the package's sources without node:test, Deno and Bun among them. The slow
-// SLH-DSA and XMSS vectors run on WebAssembly only. Usage: deno run --allow-read --allow-env
+// The cross vectors, the error code of every malformed input and the official vectors of HKDF,
+// cSHAKE, KMAC, BLAKE2 and Ascon, on WebAssembly and in TypeScript, for engines that run the
+// package's sources without node:test, Deno and Bun among them. The slow SLH-DSA and XMSS vectors
+// run on WebAssembly only. Usage: deno run --allow-read --allow-env
 // test/engines.ts, bun test/engines.ts or node test/engines.ts; exits with status 1 on any failure.
 
 const engine = globalThis as { Deno?: { version: { deno: string } }; Bun?: { version: string } };
@@ -28,7 +38,7 @@ const name =
       ? `bun ${engine.Bun.version}`
       : `node ${process.versions.node}`;
 
-const ALGORITHMS = [pq.ML_KEM_768, pq.X_WING, pq.ML_DSA_65, pq.SLH_DSA_SHA2_128F, pq.HSS_LMS, pq.SHA_256];
+const ALGORITHMS = [pq.ML_KEM_768, pq.X_WING, pq.ML_DSA_65, pq.SLH_DSA_SHA2_128F, pq.HSS_LMS, pq.SHA_256, pq.KMAC256];
 
 function errorCodes(): number {
   let checked = 0;
@@ -101,6 +111,10 @@ for (const backend of ["wasm", "js"] as const) {
     }
 
     checked += errorCodes();
+
+    for (const check of [blake2Rfc, blake2Kats, blake2Derived, asconVectors, cshakeVectors, kmacVectors, hkdfVectors]) {
+      checked += check();
+    }
 
     const seconds = ((performance.now() - start) / 1000).toFixed(1);
 

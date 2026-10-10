@@ -1,6 +1,8 @@
 // Deterministic operations for test vectors. Production code must not call them: reusing a seed
 // or randomness value with a different key, message or ciphertext breaks the scheme, and these
 // functions skip the pre-hash strength policy of the public API.
+import { bytes } from "./bytes.ts";
+import { XofAlgorithm, configureCshake as cshakeWith } from "./hash.ts";
 import {
   type Encapsulation,
   KemAlgorithm,
@@ -93,4 +95,20 @@ export function verify(
   }
 
   return verifyUnchecked(publicKey, signature, message, options);
+}
+
+// cSHAKE with a function name N as well as a customization S (SP 800-185, 3.3), for the ACVP
+// vectors: N is reserved for functions that NIST defines. algorithm must be CSHAKE128 or CSHAKE256.
+export function configureCshake(
+  algorithm: XofAlgorithm,
+  functionName: Uint8Array,
+  customization: Uint8Array,
+): XofAlgorithm {
+  if (!(algorithm instanceof XofAlgorithm)) {
+    throw new TypeError("algorithm must be an XofAlgorithm");
+  }
+
+  const [name, custom] = [bytes(functionName, "functionName"), bytes(customization, "customization")];
+
+  return cshakeWith(algorithm, name.subarray(0, name.length), custom.subarray(0, custom.length));
 }

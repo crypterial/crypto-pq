@@ -53,6 +53,23 @@ export function records(name: string, field: string): [Fields, Fields][] {
   return found;
 }
 
+// Uneven sizes reach every buffering path: empty updates, partial blocks and whole blocks.
+const PIECES = [0, 1, 3, 64, 7, 136, 128, 168, 0, 200];
+
+export function pieces(data: Uint8Array): Uint8Array[] {
+  const out: Uint8Array[] = [];
+
+  for (let offset = 0, index = 0; offset < data.length; index++) {
+    const end = Math.min(offset + PIECES[index % PIECES.length], data.length);
+
+    out.push(data.subarray(offset, end));
+
+    offset = end;
+  }
+
+  return out;
+}
+
 export function hex(text: string): Uint8Array {
   assert.match(text, /^(?:[0-9a-f]{2})*$/i);
 

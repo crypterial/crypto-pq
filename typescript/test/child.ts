@@ -306,33 +306,85 @@ if (scenario === "trap") {
 
   pq.HSS_LMS.loadPrivateKey(store, { treeCache: pair.privateKey.exportTreeCache() }).sign(Uint8Array.of(2));
 
+  const field = new Uint8Array(16).fill(1);
+
+  const hashes = [
+    pq.SHA_224,
+    pq.SHA_256,
+    pq.SHA_384,
+    pq.SHA_512,
+    pq.SHA_512_224,
+    pq.SHA_512_256,
+    pq.SHA3_224,
+    pq.SHA3_256,
+    pq.SHA3_384,
+    pq.SHA3_512,
+    pq.BLAKE2B_160,
+    pq.BLAKE2B_512,
+    pq.BLAKE2S_128,
+    pq.BLAKE2S_256,
+    pq.ASCON_HASH256,
+    pq.BLAKE2B_512.configure({ salt: field, personalization: field }),
+    pq.BLAKE2S_256.configure({ salt: field.subarray(8), personalization: field.subarray(8) }),
+  ];
+
+  const xofs = [
+    pq.SHAKE128,
+    pq.SHAKE256,
+    pq.CSHAKE128,
+    pq.CSHAKE256,
+    pq.ASCON_XOF128,
+    pq.ASCON_CXOF128,
+    pq.CSHAKE256.configure({ customization: new Uint8Array(300) }),
+    pq.ASCON_CXOF128.configure({ customization: new Uint8Array(256) }),
+    hazmat.configureCshake(pq.CSHAKE128, new Uint8Array(200), new Uint8Array(200)),
+  ];
+
+  const macs = [
+    pq.HMAC_SHA_224,
+    pq.HMAC_SHA_256,
+    pq.HMAC_SHA_384,
+    pq.HMAC_SHA_512,
+    pq.KMAC128,
+    pq.KMAC256,
+    pq.BLAKE2B_MAC,
+    pq.BLAKE2S_MAC,
+    pq.KMAC256.configure({ length: 300, customization: new Uint8Array(300), xof: true }),
+    pq.BLAKE2B_MAC.configure({ length: 20, salt: field, personalization: field }),
+    pq.BLAKE2S_MAC.configure({ length: 1, salt: field.subarray(8) }),
+  ];
+
   for (const size of [0, 100, 5000, 70000]) {
     const data = new Uint8Array(size);
 
-    for (const hash of [pq.SHA_224, pq.SHA_256, pq.SHA_384, pq.SHA_512, pq.SHA_512_224, pq.SHA_512_256]) {
+    for (const hash of hashes) {
       hash.create().update(data).digest();
 
       hash.digest(data);
     }
 
-    for (const hash of [pq.SHA3_224, pq.SHA3_256, pq.SHA3_384, pq.SHA3_512]) {
-      hash.create().update(data).digest();
-
-      hash.digest(data);
-    }
-
-    for (const xof of [pq.SHAKE128, pq.SHAKE256]) {
+    for (const xof of xofs) {
       xof.create().update(data).read(size);
 
       xof.digest(data, 100);
     }
 
-    for (const hmac of [pq.HMAC_SHA_224, pq.HMAC_SHA_256, pq.HMAC_SHA_384, pq.HMAC_SHA_512]) {
-      const state = hmac.create(new Uint8Array(size % 300));
+    for (const mac of macs) {
+      const key = new Uint8Array(mac.name.startsWith("BLAKE2") ? 1 + (size % 32) : size % 300);
+
+      const state = mac.create(key);
 
       state.update(data).verify(state.digest());
 
-      hmac.verify(data, data, hmac.digest(data, data));
+      mac.verify(key, data, mac.digest(key, data));
+    }
+
+    for (const kdf of [pq.HKDF_SHA_256, pq.HKDF_SHA_384, pq.HKDF_SHA_512]) {
+      const prk = kdf.extract(data, { salt: data.subarray(0, 300) });
+
+      kdf.expand(prk, 255 * kdf.prkSize, { info: data.subarray(0, 1000) });
+
+      kdf.derive(data, 255 * kdf.prkSize, { salt: data, info: data });
     }
   }
 
