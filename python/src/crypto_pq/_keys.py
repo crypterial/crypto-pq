@@ -1,4 +1,4 @@
-from ._bytes import immutable
+from ._bytes import require_bytes
 from ._encoding import (
     CONTEXT_0,
     OCTET_STRING,
@@ -21,13 +21,6 @@ from ._errors import CryptoPQError, ErrorCode
 PUBLIC = b"PUBLIC KEY"
 
 PRIVATE = b"PRIVATE KEY"
-
-
-def require_bytes(value, name) -> bytes:
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return immutable(value)
-
-    raise TypeError(f"{name} must be bytes-like")
 
 
 def require_bool(value, name):

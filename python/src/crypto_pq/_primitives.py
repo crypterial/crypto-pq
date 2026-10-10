@@ -130,3 +130,9 @@ sha3_512 = _pick("sha3_512")
 shake_128 = _pick("shake_128")
 
 shake_256 = _pick("shake_256")
+
+# BLAKE2 with its key, salt, personalization and output length: hashlib's alone, without a twin of
+# crypto-pq's own.
+blake2b = getattr(hashlib, "blake2b", None)
+
+blake2s = getattr(hashlib, "blake2s", None)

@@ -2,6 +2,7 @@ import ast
 import binascii
 import copy
 import gc
+import hashlib
 import importlib
 import inspect
 import os
@@ -36,6 +37,26 @@ HASHES = (crypto_pq.SHA_224, crypto_pq.SHA_256, crypto_pq.SHA_384, crypto_pq.SHA
 XOFS = (crypto_pq.SHAKE128, crypto_pq.SHAKE256)
 
 HMACS = (crypto_pq.HMAC_SHA_224, crypto_pq.HMAC_SHA_256, crypto_pq.HMAC_SHA_384, crypto_pq.HMAC_SHA_512)
+
+# The hash functions, XOFs and MACs after SHA-2, SHA-3 and HMAC, in the order of the C ABI's ids.
+BLAKE2_HASHES = (
+    crypto_pq.BLAKE2B_160,
+    crypto_pq.BLAKE2B_256,
+    crypto_pq.BLAKE2B_384,
+    crypto_pq.BLAKE2B_512,
+    crypto_pq.BLAKE2S_128,
+    crypto_pq.BLAKE2S_160,
+    crypto_pq.BLAKE2S_224,
+    crypto_pq.BLAKE2S_256,
+)
+
+MORE_HASHES = (*BLAKE2_HASHES, crypto_pq.ASCON_HASH256)
+
+MORE_XOFS = (crypto_pq.CSHAKE128, crypto_pq.CSHAKE256, crypto_pq.ASCON_XOF128, crypto_pq.ASCON_CXOF128)
+
+MORE_MACS = (crypto_pq.KMAC128, crypto_pq.KMAC256, crypto_pq.BLAKE2B_MAC, crypto_pq.BLAKE2S_MAC)
+
+KDFS = (crypto_pq.HKDF_SHA_256, crypto_pq.HKDF_SHA_384, crypto_pq.HKDF_SHA_512)
 
 KEMS = (crypto_pq.ML_KEM_512, crypto_pq.ML_KEM_768, crypto_pq.ML_KEM_1024, crypto_pq.X_WING)
 
@@ -87,9 +108,34 @@ def pure_twins():
         twins[algorithm] = _hash.XofAlgorithm(algorithm.name, engine, partial(_hash._pure_xof, engine))
 
     for algorithm, hash_algorithm in zip(HMACS, HASHES[:4]):
-        engine = engines[hash_algorithm]
+        twins[algorithm] = _hash._pure_hmac(algorithm.name, algorithm.digest_size, engines[hash_algorithm])
 
-        twins[algorithm] = _hash.HmacAlgorithm(algorithm.name, algorithm.digest_size, partial(_hash._PureHmac, engine), partial(_hash._pure_hmac, engine), partial(_hash._pure_hmac_verify, engine))
+    # BLAKE2 on hashlib, a test-only oracle here, as in the pure backend.
+    for algorithm in BLAKE2_HASHES:
+        field, constructor = (16, hashlib.blake2b) if algorithm.name.startswith("BLAKE2b") else (8, hashlib.blake2s)
+
+        twins[algorithm] = _hash._pure_blake2(algorithm.name, algorithm.digest_size, field, constructor)
+
+    twins[crypto_pq.ASCON_HASH256] = _hash._pure_ascon_hash()
+
+    twins[crypto_pq.CSHAKE128] = _hash._pure_cshake("cSHAKE128", 168, twins[crypto_pq.SHAKE128])
+
+    twins[crypto_pq.CSHAKE256] = _hash._pure_cshake("cSHAKE256", 136, twins[crypto_pq.SHAKE256])
+
+    twins[crypto_pq.ASCON_XOF128] = _hash._pure_ascon_xof()
+
+    twins[crypto_pq.ASCON_CXOF128] = _hash._pure_ascon_cxof()
+
+    twins[crypto_pq.KMAC128] = _hash._pure_kmac("KMAC128", 32, 168)
+
+    twins[crypto_pq.KMAC256] = _hash._pure_kmac("KMAC256", 64, 136)
+
+    twins[crypto_pq.BLAKE2B_MAC] = _hash._pure_blake2_mac("BLAKE2b-MAC", 64, 16, hashlib.blake2b)
+
+    twins[crypto_pq.BLAKE2S_MAC] = _hash._pure_blake2_mac("BLAKE2s-MAC", 32, 8, hashlib.blake2s)
+
+    for algorithm, hmac in zip(KDFS, HMACS[1:]):
+        twins[algorithm] = _hash._pure_hkdf(algorithm.name, hmac.digest_size, twins[hmac])
 
     for algorithm, params, arc in zip(KEMS, (_mlkem.ML_KEM_512, _mlkem.ML_KEM_768, _mlkem.ML_KEM_1024), (1, 2, 3)):
         twins[algorithm] = crypto_pq.KemAlgorithm(algorithm.name, _kem._MlKem(params, arc))
@@ -278,6 +324,119 @@ class DifferentialTest(unittest.TestCase):
             yield data[offset : offset + size]
 
             offset += size
+
+    # Each new algorithm, plain and configured with random options, against its pure twin: digests
+    # one-shot and streamed, XOF reads in pieces, tags and their verification, and HKDF.
+    def test_symmetric(self):
+        rng = Random(303)
+
+        def options(*names, field=16):
+            return {name: rng.bytes(rng.below(field + 1)) for name in names if rng.below(2)}
+
+        hashes, xofs, macs = [], [], []
+
+        for _ in range(2 * SCALE):
+            for algorithm in MORE_HASHES:
+                chosen = options("salt", "personalization", field=16 if algorithm.name.startswith("BLAKE2b") else 8) if algorithm in BLAKE2_HASHES else {}
+
+                hashes.append((algorithm.configure(**chosen), self.twins[algorithm].configure(**chosen)))
+
+            for algorithm in MORE_XOFS:
+                chosen = {"customization": rng.bytes(rng.below(257 if algorithm is crypto_pq.ASCON_CXOF128 else 400))} if algorithm in (crypto_pq.CSHAKE128, crypto_pq.CSHAKE256, crypto_pq.ASCON_CXOF128) else {}
+
+                xofs.append((algorithm.configure(**chosen), self.twins[algorithm].configure(**chosen)))
+
+            for algorithm in MORE_XOFS[:2]:
+                function_name, customization = rng.bytes(rng.below(200)), rng.bytes(rng.below(200))
+
+                xofs.append((hazmat.configure_cshake(algorithm, function_name, customization), hazmat.configure_cshake(self.twins[algorithm], function_name, customization)))
+
+            for algorithm in MORE_MACS:
+                if algorithm.name.startswith("KMAC"):
+                    chosen = {"length": 4 + rng.below(300), "customization": rng.bytes(rng.below(300)), "xof": bool(rng.below(2))}
+                else:
+                    chosen = {"length": 1 + rng.below(algorithm.digest_size), **options("salt", "personalization", field=algorithm.digest_size // 4)}
+
+                macs.append((algorithm, self.twins[algorithm]))
+
+                macs.append((algorithm.configure(**chosen), self.twins[algorithm].configure(**chosen)))
+
+        sizes = [0, 1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 135, 136, 137, 167, 168, 169] + [rng.below(3000) for _ in range(5 * SCALE)]
+
+        for size in sizes:
+            data = rng.bytes(size)
+
+            for algorithm, twin in hashes:
+                self.assertEqual(algorithm.digest(data), twin.digest(data), (algorithm.name, size))
+
+                hasher, reference = algorithm.create(), twin.create()
+
+                for piece in self.pieces(rng, data):
+                    hasher.update(piece)
+
+                    reference.update(piece)
+
+                self.assertEqual(hasher.digest(), reference.digest())
+
+            for algorithm, twin in xofs:
+                length = rng.below(600)
+
+                self.assertEqual(algorithm.digest(data, length), twin.digest(data, length), (algorithm.name, size, length))
+
+                xof, reference = algorithm.create(), twin.create()
+
+                for piece in self.pieces(rng, data):
+                    xof.update(piece)
+
+                    reference.update(piece)
+
+                for _ in range(3):
+                    length = rng.below(400)
+
+                    self.assertEqual(xof.read(length), reference.read(length))
+
+                self.assertEqual(outcome(xof.update, b"x"), outcome(reference.update, b"x"))
+
+            for algorithm, twin in macs:
+                maximum = 400 if algorithm.name.startswith("KMAC") else 64 if algorithm.name.startswith("BLAKE2b") else 32
+
+                key = rng.bytes(rng.below(maximum + 2))
+
+                self.assertEqual(outcome(algorithm.digest, key, data), outcome(twin.digest, key, data), (algorithm.name, size, len(key)))
+
+                if outcome(algorithm.create, key)[0] != "ok":
+                    self.assertEqual(outcome(algorithm.create, key)[0], outcome(twin.create, key)[0])
+
+                    self.assertFalse(algorithm.verify(key, data, bytes(algorithm.digest_size)))
+
+                    continue
+
+                tag = algorithm.digest(key, data)
+
+                mac, reference = algorithm.create(key), twin.create(key)
+
+                for piece in self.pieces(rng, data):
+                    mac.update(piece)
+
+                    reference.update(piece)
+
+                self.assertEqual(mac.digest(), reference.digest())
+
+                for candidate in (tag, mutate(rng, tag), tag[:-1], tag + b"\x00", b""):
+                    self.assertEqual(algorithm.verify(key, data, candidate), twin.verify(key, data, candidate))
+
+                    self.assertEqual(mac.verify(candidate), reference.verify(candidate))
+
+            for algorithm in KDFS:
+                twin, length, salt, info = self.twins[algorithm], rng.below(9000), rng.bytes(rng.below(300)), rng.bytes(rng.below(300))
+
+                self.assertEqual(outcome(algorithm.derive, data, length, salt=salt, info=info), outcome(twin.derive, data, length, salt=salt, info=info), (algorithm.name, size, length))
+
+                self.assertEqual(algorithm.extract(data, salt=salt), twin.extract(data, salt=salt))
+
+                prk = data[: rng.below(100)]
+
+                self.assertEqual(outcome(algorithm.expand, prk, length, info=info), outcome(twin.expand, prk, length, info=info), (algorithm.name, len(prk), length))
 
     def test_kem(self):
         rng = Random(302)
@@ -521,6 +680,42 @@ class IsolationTest(unittest.TestCase):
 
             self.assertTrue(algorithm.verify(b"key", b"data", hmac.digest()))
 
+        configured = (crypto_pq.BLAKE2B_256.configure(salt=b"s", personalization=b"p"), crypto_pq.BLAKE2S_128.configure(salt=b"s"))
+
+        for algorithm in MORE_HASHES + configured:
+            hasher = algorithm.create()
+
+            hasher.update(b"abc")
+
+            self.assertEqual(hasher.digest(), algorithm.digest(b"abc"))
+
+        configured = (crypto_pq.CSHAKE128.configure(customization=b"c"), hazmat.configure_cshake(crypto_pq.CSHAKE256, b"N", b"S"), crypto_pq.ASCON_CXOF128.configure(customization=b"z"))
+
+        for algorithm in MORE_XOFS + configured:
+            xof = algorithm.create()
+
+            xof.update(b"abc")
+
+            self.assertEqual(xof.read(64), algorithm.digest(b"abc", 64))
+
+        configured = (crypto_pq.KMAC128.configure(length=20, customization=b"c", xof=True), crypto_pq.BLAKE2S_MAC.configure(length=7, salt=b"s"))
+
+        for algorithm in MORE_MACS + configured:
+            mac = algorithm.create(b"key")
+
+            mac.update(b"data")
+
+            self.assertTrue(mac.verify(algorithm.digest(b"key", b"data")))
+
+            self.assertTrue(algorithm.verify(b"key", b"data", mac.digest()))
+
+            self.assertFalse(algorithm.verify(bytes(65), b"data", mac.digest()))
+
+        for algorithm in KDFS:
+            prk = algorithm.extract(b"ikm", salt=b"salt")
+
+            self.assertEqual(algorithm.expand(prk, 100, info=b"info"), algorithm.derive(b"ikm", 100, salt=b"salt", info=b"info"))
+
         for algorithm in KEMS:
             pair = algorithm.generate_key_pair()
 
@@ -629,6 +824,16 @@ class WipeTest(unittest.TestCase):
         self.assertWiped(lambda: crypto_pq.SHA3_256.create(), lambda hasher: hasher._engine._slot)
 
         self.assertWiped(lambda: crypto_pq.SHAKE256.create(), lambda xof: xof._engine._slot)
+
+        self.assertWiped(lambda: crypto_pq.KMAC256.create(b"secret key"), lambda mac: mac._engine._slot)
+
+        self.assertWiped(lambda: crypto_pq.BLAKE2S_MAC.configure(length=9).create(b"secret key"), lambda mac: mac._engine._slot)
+
+        self.assertWiped(lambda: crypto_pq.BLAKE2B_512.configure(salt=b"s"), lambda algorithm: algorithm._digest.args[0])
+
+        self.assertWiped(lambda: crypto_pq.ASCON_CXOF128.configure(customization=b"c"), lambda algorithm: algorithm._digest.args[0])
+
+        self.assertWiped(lambda: crypto_pq.KMAC128.configure(customization=b"c"), lambda algorithm: algorithm._verify.args[0])
 
         self.assertWiped(lambda: crypto_pq.HSS_LMS.generate_key_pair(parameters=SMALL, state_store=MemoryStore()).private_key, lambda key: key._signer._slot)
 
@@ -760,6 +965,15 @@ class WipeTest(unittest.TestCase):
         _, buffers = self.recorded(lambda: pair.private_key.sign(b"m"))
 
         self.assertIn(bytes(len(store.state)), [buffer.raw for buffer in buffers])
+
+        prk, buffers = self.recorded(lambda: crypto_pq.HKDF_SHA_384.extract(b"ikm"))
+
+        self.assertEqual((len(prk), [buffer.raw for buffer in buffers]), (48, [bytes(48)]))
+
+        for function in (lambda: crypto_pq.HKDF_SHA_384.expand(prk, 100), lambda: crypto_pq.HKDF_SHA_256.derive(b"ikm", 100)):
+            okm, buffers = self.recorded(function)
+
+            self.assertEqual((len(okm), any(okm), [buffer.raw for buffer in buffers]), (100, True, [bytes(100)]))
 
 
 @unittest.skipUnless(NATIVE, "the native backend's caches")
@@ -906,6 +1120,22 @@ class ThreadTest(unittest.TestCase):
         self.run_threads(lambda number: [hmac.update(chunk) for _ in range(50)])
 
         self.assertTrue(hmac.verify(crypto_pq.HMAC_SHA_384.digest(b"key", chunk * self.THREADS * 50)))
+
+    # A configured algorithm's slot serves every thread at once: the calls only read it.
+    def test_shared_configured(self):
+        algorithms = (crypto_pq.BLAKE2B_256.configure(salt=b"salt"), crypto_pq.KMAC256.configure(length=40, customization=b"c"), crypto_pq.ASCON_CXOF128.configure(customization=b"z"))
+
+        messages = [pattern(3000, i) for i in range(self.ROUNDS)]
+
+        expected = [(algorithms[0].digest(m), algorithms[1].digest(b"key", m), algorithms[2].digest(m, 50)) for m in messages]
+
+        def work(number):
+            for message, values in zip(messages, expected):
+                self.assertEqual((algorithms[0].digest(message), algorithms[1].digest(b"key", message), algorithms[2].digest(message, 50)), values)
+
+                self.assertTrue(algorithms[1].verify(b"key", message, values[1]))
+
+        self.run_threads(work)
 
     # Many keys at once, each made, used and dropped in its own thread.
     def test_many_keys(self):
@@ -1306,18 +1536,18 @@ class ExtensionTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             self.module.Slot()
 
-    # A one-shot hash, XOF or HMAC is one call of the module.
+    # A one-shot hash, XOF or MAC is one call of the module.
     def test_shortest_path(self):
-        for algorithm, number in zip(HASHES, range(10)):
+        for number, algorithm in enumerate(HASHES + MORE_HASHES):
             self.assertIs(algorithm._digest, getattr(self.module, f"hash{number}"))
 
-        for algorithm, number in zip(XOFS, range(2)):
+        for number, algorithm in enumerate(XOFS + MORE_XOFS):
             self.assertIs(algorithm._digest, getattr(self.module, f"xof{number}"))
 
-        for algorithm, number in zip(HMACS, range(4)):
-            self.assertIs(algorithm._digest, getattr(self.module, f"hmac{number}"))
+        for number, algorithm in enumerate(HMACS + MORE_MACS):
+            self.assertIs(algorithm._digest, getattr(self.module, f"mac{number}"))
 
-            self.assertIs(algorithm._verify, getattr(self.module, f"hmac_verify{number}"))
+            self.assertIs(algorithm._verify, getattr(self.module, f"mac_verify{number}"))
 
     def test_arguments(self):
         data = b"crypto-pq"

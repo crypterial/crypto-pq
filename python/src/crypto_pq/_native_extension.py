@@ -4,6 +4,7 @@ package's exceptions through _native.failure. The incremental states and the sta
 hold their slots."""
 
 import sys
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 
@@ -35,6 +36,9 @@ DIRECT = (
     "verify",
     "stateful_verify",
     "stateful_check_public_key",
+    "hash_configure",
+    "xof_configure",
+    "mac_configure",
 )
 
 _cpq: Any = None
@@ -73,9 +77,15 @@ def load(path):
 
     binding.hash_function, binding.xof_function = hash_function, xof_function
 
-    binding.hmac_function, binding.hmac_verify_function = hmac_function, hmac_verify_function
+    binding.mac_function, binding.mac_verify_function = mac_function, mac_verify_function
 
-    binding.HashState, binding.XofState, binding.HmacState = HashState, XofState, HmacState
+    binding.hash_with_function, binding.xof_with_function = hash_with_function, xof_with_function
+
+    binding.mac_with_function, binding.mac_verify_with_function = mac_with_function, mac_verify_with_function
+
+    binding.kdf_functions = kdf_functions
+
+    binding.HashState, binding.XofState, binding.MacState = HashState, XofState, MacState
 
     binding.signer_create, binding.signer_load = signer_create, signer_load
 
@@ -99,21 +109,49 @@ def xof_function(number):
     return getattr(_cpq, f"xof{number}")
 
 
-def hmac_function(number, size):
-    return getattr(_cpq, f"hmac{number}")
+def mac_function(number, size):
+    return getattr(_cpq, f"mac{number}")
 
 
-def hmac_verify_function(number):
-    return getattr(_cpq, f"hmac_verify{number}")
+def mac_verify_function(number):
+    return getattr(_cpq, f"mac_verify{number}")
 
 
-# The incremental states. Their callers, the public Hasher, Xof and Hmac objects, take one call at
-# a time, which the library requires of a state.
+# The one-shot functions of a configured algorithm, whose slot `spec` the calls only read.
+def hash_with_function(spec, size):
+    return partial(_cpq.hash_with, spec)
+
+
+def xof_with_function(spec):
+    return partial(_cpq.xof_with, spec)
+
+
+def mac_with_function(spec, size):
+    mac_with = _cpq.mac_with
+
+    def digest(key, data):
+        return mac_with(spec, key, data, size)
+
+    return digest
+
+
+def mac_verify_with_function(spec):
+    return partial(_cpq.mac_verify_with, spec)
+
+
+# HKDF's derive(ikm, salt, info, length), extract(ikm, salt) and expand(prk, info, length).
+def kdf_functions(number, size):
+    return partial(_cpq.kdf_derive, number), partial(_cpq.kdf_extract, number), partial(_cpq.kdf_expand, number)
+
+
+# The incremental states, of an algorithm's defaults or of a configured algorithm's slot `spec`.
+# Their callers, the public Hasher, Xof and Mac objects, take one call at a time, which the library
+# requires of a state.
 class HashState:
     __slots__ = ("_slot",)
 
-    def __init__(self, number, size):
-        self._slot = _cpq.hash_init(number)
+    def __init__(self, number, size, spec=None):
+        self._slot = _cpq.hash_init(number) if spec is None else _cpq.hash_init_with(spec)
 
     def update(self, data):
         _cpq.hash_update(self._slot, data)
@@ -125,8 +163,8 @@ class HashState:
 class XofState:
     __slots__ = ("_slot",)
 
-    def __init__(self, number):
-        self._slot = _cpq.xof_init(number)
+    def __init__(self, number, spec=None):
+        self._slot = _cpq.xof_init(number) if spec is None else _cpq.xof_init_with(spec)
 
     def update(self, data):
         _cpq.xof_update(self._slot, data)
@@ -135,20 +173,22 @@ class XofState:
         return _cpq.xof_read(self._slot, length)
 
 
-class HmacState:
-    __slots__ = ("_slot",)
+class MacState:
+    __slots__ = ("_slot", "_size")
 
-    def __init__(self, number, size, key):
-        self._slot = _cpq.hmac_init(number, key)
+    def __init__(self, number, size, key, spec=None):
+        self._slot = _cpq.mac_init(number, key) if spec is None else _cpq.mac_init_with(spec, key)
+
+        self._size = size
 
     def update(self, data):
-        _cpq.hmac_update(self._slot, data)
+        _cpq.mac_update(self._slot, data)
 
     def digest(self):
-        return _cpq.hmac_final(self._slot)
+        return _cpq.mac_final(self._slot, self._size)
 
     def verify(self, tag):
-        return _cpq.hmac_final_verify(self._slot, tag)
+        return _cpq.mac_final_verify(self._slot, tag)
 
 
 class Signer:

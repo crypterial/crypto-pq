@@ -32,6 +32,13 @@ def immutable(data):
     return data.tobytes()
 
 
+def require_bytes(value, name) -> bytes:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return immutable(value)
+
+    raise TypeError(f"{name} must be bytes-like")
+
+
 def equal(a, b):
     if len(a) != len(b):
         return False

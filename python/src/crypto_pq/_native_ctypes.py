@@ -12,7 +12,7 @@ from functools import partial
 from typing import Any
 
 from ._bytes import immutable, require_output_length
-from ._native import ABI_VERSION, FILL_CACHE, HASHER, HMAC, INVALID_PRIVATE_KEY, INVALID_PUBLIC_KEY, KEM_PRIVATE, KEM_PUBLIC, REJECTED, SELF_TEST_FAILED, SIGNATURE_PRIVATE, SIGNATURE_PUBLIC, SIGNER, UNSUPPORTED, WITH_TREE_CACHE, XOF, Unusable, check, state_section
+from ._native import ABI_VERSION, CONFIGURED_HASH, CONFIGURED_MAC, CONFIGURED_XOF, FILL_CACHE, HASHER, INVALID_PRIVATE_KEY, INVALID_PUBLIC_KEY, KEM_PRIVATE, KEM_PUBLIC, MAC, REJECTED, SELF_TEST_FAILED, SIGNATURE_PRIVATE, SIGNATURE_PUBLIC, SIGNER, UNSUPPORTED, WITH_TREE_CACHE, XOF, Unusable, check, state_section
 
 NAME = "ctypes"
 
@@ -91,12 +91,25 @@ def declare(library, ctypes):
         ("cpq_xof_init", status, u32, memory, size),
         ("cpq_xof_update", status, memory, size, data, size),
         ("cpq_xof_read", status, memory, size, memory, size),
-        ("cpq_hmac", status, u32, data, size, data, size, memory, size),
-        ("cpq_hmac_verify", status, u32, data, size, data, size, data, size),
-        ("cpq_hmac_init", status, u32, data, size, memory, size),
-        ("cpq_hmac_update", status, memory, size, data, size),
-        ("cpq_hmac_final", status, memory, size, memory, size),
-        ("cpq_hmac_final_verify", status, memory, size, data, size),
+        ("cpq_hash_configure", status, u32, data, size, data, size, memory, size),
+        ("cpq_hash_with", status, memory, size, data, size, memory, size),
+        ("cpq_hash_init_with", status, memory, size, memory, size),
+        ("cpq_xof_configure", status, u32, data, size, data, size, memory, size),
+        ("cpq_xof_with", status, memory, size, data, size, memory, size),
+        ("cpq_xof_init_with", status, memory, size, memory, size),
+        ("cpq_mac", status, u32, data, size, data, size, memory, size),
+        ("cpq_mac_verify", status, u32, data, size, data, size, data, size),
+        ("cpq_mac_init", status, u32, data, size, memory, size),
+        ("cpq_mac_update", status, memory, size, data, size),
+        ("cpq_mac_final", status, memory, size, memory, size),
+        ("cpq_mac_final_verify", status, memory, size, data, size),
+        ("cpq_mac_configure", status, u32, size, u32, data, size, data, size, memory, size),
+        ("cpq_mac_with", status, memory, size, data, size, data, size, memory, size),
+        ("cpq_mac_verify_with", status, memory, size, data, size, data, size, data, size),
+        ("cpq_mac_init_with", status, memory, size, data, size, memory, size),
+        ("cpq_kdf_derive", status, u32, data, size, data, size, data, size, memory, size),
+        ("cpq_kdf_extract", status, u32, data, size, data, size, memory, size),
+        ("cpq_kdf_expand", status, u32, data, size, data, size, memory, size),
         ("cpq_stateful_info", status, u32, data, size, memory),
         ("cpq_stateful_signer_create", status, u32, data, size, data, size, u64, memory, size, memory, size),
         ("cpq_stateful_signer_load", status, u32, data, size, data, size, u32, memory, size, memory),
@@ -110,7 +123,10 @@ def declare(library, ctypes):
         ("cpq_stateful_check_public_key", status, u32, data, size),
         ("cpq_stateful_state_reseal", status, u32, memory, size, u64),
     ):
-        function = getattr(library, name)
+        function = getattr(library, name, None)
+
+        if function is None:
+            raise Unusable(f"the native library lacks {name}")
 
         function.restype = restype
 
@@ -118,7 +134,7 @@ def declare(library, ctypes):
 
 
 def query_sizes():
-    for kind, count, first in ((KEM_PUBLIC, 4, 0), (KEM_PRIVATE, 4, 0), (SIGNATURE_PUBLIC, 15, 0), (SIGNATURE_PRIVATE, 15, 0), (HASHER, 10, 0), (XOF, 2, 0), (HMAC, 4, 0), (SIGNER, 3, 1)):
+    for kind, count, first in ((KEM_PUBLIC, 4, 0), (KEM_PRIVATE, 4, 0), (SIGNATURE_PUBLIC, 15, 0), (SIGNATURE_PRIVATE, 15, 0), (HASHER, 19, 0), (XOF, 6, 0), (MAC, 8, 0), (SIGNER, 3, 1), (CONFIGURED_HASH, 19, 0), (CONFIGURED_XOF, 6, 0), (CONFIGURED_MAC, 8, 0)):
         for algorithm in range(first, first + count):
             size, alignment = _lib.cpq_slot_size(kind, algorithm), _lib.cpq_slot_align(kind, algorithm)
 
@@ -129,8 +145,9 @@ def query_sizes():
 
 
 class Slot:
-    """Memory for one object of the library: a key, a hash state or a stateful signer. The slot is
-    wiped, and a signer freed, when the object goes; nothing else holds its memory."""
+    """Memory for one object of the library: a key, a hash state, a configured hash function or a
+    stateful signer. The slot is wiped, and a signer freed, when the object goes; nothing else holds
+    its memory."""
 
     __slots__ = ("_memory", "address", "size")
 
@@ -381,21 +398,17 @@ def xof_digest(algorithm, data, length):
     return out.raw
 
 
-def hmac_digest(algorithm, size, key, data):
+def mac_digest(algorithm, size, key, data):
     key, data = immutable(key), immutable(data)
 
     out = output(size)
 
-    check(_lib.cpq_hmac(algorithm, key, len(key), data, len(data), out, size))
+    check(_lib.cpq_mac(algorithm, key, len(key), data, len(data), out, size))
 
     return out.raw
 
 
-def hmac_verify(algorithm, key, data, tag):
-    key, data, tag = immutable(key), immutable(data), immutable(tag)
-
-    status = _lib.cpq_hmac_verify(algorithm, key, len(key), data, len(data), tag, len(tag))
-
+def answer(status):
     if status == REJECTED:
         return False
 
@@ -404,15 +417,120 @@ def hmac_verify(algorithm, key, data, tag):
     return True
 
 
-# The incremental states. Their callers, the public Hasher, Xof and Hmac objects, take one call at
-# a time, which the library requires of a state.
+def mac_verify(algorithm, key, data, tag):
+    key, data, tag = immutable(key), immutable(data), immutable(tag)
+
+    return answer(_lib.cpq_mac_verify(algorithm, key, len(key), data, len(data), tag, len(tag)))
+
+
+# A configured algorithm: options checked and its state precomputed in a slot that the calls only
+# read, any number of them at once.
+def hash_configure(algorithm, salt, personalization):
+    salt, personalization, spec = immutable(salt), immutable(personalization), Slot(CONFIGURED_HASH, algorithm)
+
+    check(_lib.cpq_hash_configure(algorithm, salt, len(salt), personalization, len(personalization), spec.address, spec.size))
+
+    return spec
+
+
+def xof_configure(algorithm, function_name, customization):
+    function_name, customization, spec = immutable(function_name), immutable(customization), Slot(CONFIGURED_XOF, algorithm)
+
+    check(_lib.cpq_xof_configure(algorithm, function_name, len(function_name), customization, len(customization), spec.address, spec.size))
+
+    return spec
+
+
+def mac_configure(algorithm, size, flags, first, second):
+    first, second, spec = immutable(first), immutable(second), Slot(CONFIGURED_MAC, algorithm)
+
+    check(_lib.cpq_mac_configure(algorithm, size, flags, first, len(first), second, len(second), spec.address, spec.size))
+
+    return spec
+
+
+def hash_with(spec, size, data):
+    data, out = immutable(data), output(size)
+
+    check(_lib.cpq_hash_with(spec.address, spec.size, data, len(data), out, size))
+
+    return out.raw
+
+
+def xof_with(spec, data, length):
+    data, length = immutable(data), require_output_length(length)
+
+    out = output(length)
+
+    check(_lib.cpq_xof_with(spec.address, spec.size, data, len(data), out, length))
+
+    return out.raw
+
+
+def mac_with(spec, size, key, data):
+    key, data, out = immutable(key), immutable(data), output(size)
+
+    check(_lib.cpq_mac_with(spec.address, spec.size, key, len(key), data, len(data), out, size))
+
+    return out.raw
+
+
+def mac_verify_with(spec, key, data, tag):
+    key, data, tag = immutable(key), immutable(data), immutable(tag)
+
+    return answer(_lib.cpq_mac_verify_with(spec.address, spec.size, key, len(key), data, len(data), tag, len(tag)))
+
+
+# HKDF. The PRK and the OKM are secrets: their buffers are zeroed once copied out.
+def kdf_derive(algorithm, ikm, salt, info, length):
+    ikm, salt, info, out = immutable(ikm), immutable(salt), immutable(info), output(length)
+
+    status = _lib.cpq_kdf_derive(algorithm, ikm, len(ikm), salt, len(salt), info, len(info), out, length)
+
+    value = secret(out)
+
+    check(status)
+
+    return value
+
+
+def kdf_extract(algorithm, size, ikm, salt):
+    ikm, salt, out = immutable(ikm), immutable(salt), output(size)
+
+    status = _lib.cpq_kdf_extract(algorithm, ikm, len(ikm), salt, len(salt), out, size)
+
+    value = secret(out)
+
+    check(status)
+
+    return value
+
+
+def kdf_expand(algorithm, prk, info, length):
+    prk, info, out = immutable(prk), immutable(info), output(length)
+
+    status = _lib.cpq_kdf_expand(algorithm, prk, len(prk), info, len(info), out, length)
+
+    value = secret(out)
+
+    check(status)
+
+    return value
+
+
+# The incremental states, of an algorithm's defaults or of a configured algorithm's slot `spec`.
+# Their callers, the public Hasher, Xof and Mac objects, take one call at a time, which the library
+# requires of a state.
 class HashState:
     __slots__ = ("_slot", "_size")
 
-    def __init__(self, algorithm, size):
+    def __init__(self, algorithm, size, spec=None):
         slot = Slot(HASHER, algorithm)
 
-        check(_lib.cpq_hash_init(algorithm, slot.address, slot.size))
+        if spec is None:
+            check(_lib.cpq_hash_init(algorithm, slot.address, slot.size))
+        else:
+            check(_lib.cpq_hash_init_with(spec.address, spec.size, slot.address, slot.size))
 
         self._slot = slot
 
@@ -434,10 +552,13 @@ class HashState:
 class XofState:
     __slots__ = ("_slot",)
 
-    def __init__(self, algorithm):
+    def __init__(self, algorithm, spec=None):
         slot = Slot(XOF, algorithm)
 
-        check(_lib.cpq_xof_init(algorithm, slot.address, slot.size))
+        if spec is None:
+            check(_lib.cpq_xof_init(algorithm, slot.address, slot.size))
+        else:
+            check(_lib.cpq_xof_init_with(spec.address, spec.size, slot.address, slot.size))
 
         self._slot = slot
 
@@ -454,15 +575,18 @@ class XofState:
         return out.raw
 
 
-class HmacState:
+class MacState:
     __slots__ = ("_slot", "_size")
 
-    def __init__(self, algorithm, size, key):
+    def __init__(self, algorithm, size, key, spec=None):
         key = immutable(key)
 
-        slot = Slot(HMAC, algorithm)
+        slot = Slot(MAC, algorithm)
 
-        check(_lib.cpq_hmac_init(algorithm, key, len(key), slot.address, slot.size))
+        if spec is None:
+            check(_lib.cpq_mac_init(algorithm, key, len(key), slot.address, slot.size))
+        else:
+            check(_lib.cpq_mac_init_with(spec.address, spec.size, key, len(key), slot.address, slot.size))
 
         self._slot = slot
 
@@ -471,26 +595,19 @@ class HmacState:
     def update(self, data):
         data, slot = immutable(data), self._slot
 
-        check(_lib.cpq_hmac_update(slot.address, slot.size, data, len(data)))
+        check(_lib.cpq_mac_update(slot.address, slot.size, data, len(data)))
 
     def digest(self):
         slot, out = self._slot, output(self._size)
 
-        check(_lib.cpq_hmac_final(slot.address, slot.size, out, self._size))
+        check(_lib.cpq_mac_final(slot.address, slot.size, out, self._size))
 
         return out.raw
 
     def verify(self, tag):
         tag, slot = immutable(tag), self._slot
 
-        status = _lib.cpq_hmac_final_verify(slot.address, slot.size, tag, len(tag))
-
-        if status == REJECTED:
-            return False
-
-        check(status)
-
-        return True
+        return answer(_lib.cpq_mac_final_verify(slot.address, slot.size, tag, len(tag)))
 
 
 # Seed size, state size, public key size, signature size, capacity and the bytes that a signer of
@@ -636,9 +753,29 @@ def xof_function(number):
     return partial(xof_digest, number)
 
 
-def hmac_function(number, size):
-    return partial(hmac_digest, number, size)
+def mac_function(number, size):
+    return partial(mac_digest, number, size)
 
 
-def hmac_verify_function(number):
-    return partial(hmac_verify, number)
+def mac_verify_function(number):
+    return partial(mac_verify, number)
+
+
+def hash_with_function(spec, size):
+    return partial(hash_with, spec, size)
+
+
+def xof_with_function(spec):
+    return partial(xof_with, spec)
+
+
+def mac_with_function(spec, size):
+    return partial(mac_with, spec, size)
+
+
+def mac_verify_with_function(spec):
+    return partial(mac_verify_with, spec)
+
+
+def kdf_functions(number, size):
+    return partial(kdf_derive, number), partial(kdf_extract, number, size), partial(kdf_expand, number)

@@ -13,9 +13,10 @@ Both bindings keep the same rules. Inputs are read in place and held, so that no
 resizes them during the call; an operation on keys leaves the GIL only on bytes, which no other
 thread can change, and a hash of a large input releases it as hashlib does. Every output comes from
 a buffer of the exact size, and a buffer that held a secret is zeroed unless the secret is the result
-itself. Keys, hash states and stateful signers live in slots: memory that Python owns, aligned as
-the library asks, which the library tags and checks, and which is wiped when its object goes. The
-library reads no randomness: the callers pass bytes from the package's OS source.
+itself. Keys, hash states, configured hash functions and stateful signers live in slots: memory
+that Python owns, aligned as the library asks, which the library tags and checks, and which is
+wiped when its object goes. The library reads no randomness: the callers pass bytes from the
+package's OS source.
 
 The binding's functions become this module's, under the names that the backends call.
 """
@@ -38,7 +39,7 @@ EXTENSIONS = ("_cpq.abi3.so", "_cpq.pyd")
 
 LIBRARIES = ("libcrypto_pq.so", "libcrypto_pq.dylib", "crypto_pq.dll")
 
-KEM_PUBLIC, KEM_PRIVATE, SIGNATURE_PUBLIC, SIGNATURE_PRIVATE, HASHER, XOF, HMAC, SIGNER = range(1, 9)
+KEM_PUBLIC, KEM_PRIVATE, SIGNATURE_PUBLIC, SIGNATURE_PRIVATE, HASHER, XOF, MAC, SIGNER, CONFIGURED_HASH, CONFIGURED_XOF, CONFIGURED_MAC = range(1, 12)
 
 CODES = {
     1: ErrorCode.INVALID_LENGTH,
@@ -234,7 +235,7 @@ def self_test(binding):
     if not binding.verify(binding.signature_import_public(0, key), signature, SELF_TEST_MESSAGE, b"", 0, 0):
         raise Unusable("the known-answer test failed: ML-DSA-44 verification")
 
-    tag = binding.hmac_function(3, 64)(shared_secret, signature)
+    tag = binding.mac_function(3, 64)(shared_secret, signature)
 
     if binding.hash_function(1, 32)(public + ciphertext + shared_secret + key + signature + tag).hex() != SELF_TEST_DIGEST:
         raise Unusable("the known-answer test failed: the outputs differ from the pure backend's")
@@ -363,15 +364,31 @@ if binding is not None:
 
     xof_function = binding.xof_function
 
-    hmac_function = binding.hmac_function
+    mac_function = binding.mac_function
 
-    hmac_verify_function = binding.hmac_verify_function
+    mac_verify_function = binding.mac_verify_function
+
+    hash_configure = binding.hash_configure
+
+    hash_with_function = binding.hash_with_function
+
+    xof_configure = binding.xof_configure
+
+    xof_with_function = binding.xof_with_function
+
+    mac_configure = binding.mac_configure
+
+    mac_with_function = binding.mac_with_function
+
+    mac_verify_with_function = binding.mac_verify_with_function
+
+    kdf_functions = binding.kdf_functions
 
     HashState = binding.HashState
 
     XofState = binding.XofState
 
-    HmacState = binding.HmacState
+    MacState = binding.MacState
 
     stateful_verify = binding.stateful_verify
 

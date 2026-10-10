@@ -8,8 +8,28 @@ os.environ["CRYPTO_PQ_BACKEND"] = "pure"
 
 import crypto_pq
 from crypto_pq import (
+    ASCON_CXOF128,
+    ASCON_HASH256,
+    ASCON_XOF128,
+    BLAKE2B_160,
+    BLAKE2B_256,
+    BLAKE2B_384,
+    BLAKE2B_512,
+    BLAKE2B_MAC,
+    BLAKE2S_128,
+    BLAKE2S_160,
+    BLAKE2S_224,
+    BLAKE2S_256,
+    BLAKE2S_MAC,
+    CSHAKE128,
+    CSHAKE256,
+    HKDF_SHA_256,
+    HKDF_SHA_384,
+    HKDF_SHA_512,
     HMAC_SHA_256,
     HSS_LMS,
+    KMAC128,
+    KMAC256,
     ML_DSA_44,
     ML_DSA_65,
     ML_DSA_87,
@@ -44,8 +64,11 @@ from crypto_pq import (
     XMSS,
     XMSS_MT,
     CryptoPQError,
+    KdfAlgorithm,
     KemAlgorithm,
+    MacAlgorithm,
     SignatureAlgorithm,
+    XofAlgorithm,
     hazmat,
 )
 from crypto_pq._encoding import pem_encode
@@ -57,8 +80,9 @@ if crypto_pq.BACKEND != "pure":
 
 # The official vectors check the algorithms; these check what no standard fixes byte for byte:
 # key encodings and the PKCS#8 forms, hazmat signing with every pre-hash, implicit rejection, the
-# state blobs and tree caches, and the error code of each malformed input. The Python reference
-# computes every expected value, so a port that disagrees has a bug.
+# state blobs and tree caches, the options of the hash functions, XOFs, MACs and KDFs, and the
+# error code of each malformed input. The Python reference computes every expected value, so a
+# port that disagrees has a bug.
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 VECTORS = ROOT / "vectors"
@@ -593,8 +617,10 @@ class Table:
     """The error records of one algorithm. `expect` guards the construction of a case: the
     reference decides the result, but a case built wrong would test nothing."""
 
-    def __init__(self, algorithm):
+    def __init__(self, algorithm, run=execute):
         self.algorithm = algorithm
+
+        self.run = run
 
         self.records = []
 
@@ -607,7 +633,7 @@ class Table:
 
         record = {"name": name, "operation": operation, **{key: value for key, value in fields.items() if value is not None}}
 
-        outcome = execute(self.algorithm, record)
+        outcome = self.run(self.algorithm, record)
 
         result = text(outcome["result"])
 
@@ -2251,6 +2277,306 @@ def tree_cache_xmss():
     return [table.group()]
 
 
+# vectors/cross/symmetric.txt: what no official vector fixes for the hash functions, XOFs, MACs and
+# KDFs: the options of configure at their limits and one beyond them, the defaults, KMACXOF, the key
+# lengths of the BLAKE2 MACs and the output lengths of HKDF. Header algorithm (the name of a hash
+# function, XOF, MAC or KDF); fields name, operation, the options (salt, personalization,
+# customization, length: a MAC's output length, xof, and functionName for hazmat's
+# configure_cshake), the inputs (message, key, tag; a KDF's ikm, prk, salt and info; outputLength)
+# and result: ok with output, true or false, or the error code. Bytes are hexadecimal, lengths
+# decimal numbers of bytes, xof true or false. A record runs as follows: the algorithm is configured
+# with the options that the record has, the others at their defaults (with functionName, by hazmat's
+# configure_cshake with functionName and customization); then the operation runs: digest (a hash:
+# digest(message); an XOF: digest(message, outputLength); a MAC: digest(key, message)), verify (a
+# MAC's verify(key, message, tag): true or false), or, on a KDF, which takes no options, derive(ikm,
+# outputLength, salt, info), extract(ikm, salt) or expand(prk, outputLength, info). An error of
+# configure or of the operation is the result.
+OPTIONS = ("salt", "personalization", "customization", "length", "xof")
+
+
+def symmetric_execute(algorithm, record):
+    def get(name):
+        return record.get(name, b"")
+
+    operation = record["operation"]
+
+    try:
+        if isinstance(algorithm, KdfAlgorithm):
+            if operation == "derive":
+                output = algorithm.derive(get("ikm"), record["outputLength"], salt=get("salt"), info=get("info"))
+            elif operation == "extract":
+                output = algorithm.extract(get("ikm"), salt=get("salt"))
+            elif operation == "expand":
+                output = algorithm.expand(get("prk"), record["outputLength"], info=get("info"))
+            else:
+                raise ValueError(operation)
+
+            return {"result": "ok", "output": output}
+
+        if "functionName" in record:
+            configured = hazmat.configure_cshake(algorithm, record["functionName"], get("customization"))
+        else:
+            configured = algorithm.configure(**{key: record[key] for key in OPTIONS if key in record})
+
+        if operation == "verify":
+            return {"result": configured.verify(get("key"), get("message"), get("tag"))}
+
+        if operation != "digest":
+            raise ValueError(operation)
+
+        if isinstance(configured, MacAlgorithm):
+            output = configured.digest(get("key"), get("message"))
+        elif isinstance(configured, XofAlgorithm):
+            output = configured.digest(get("message"), record["outputLength"])
+        else:
+            output = configured.digest(get("message"))
+    except CryptoPQError as error:
+        return {"result": str(error.code)}
+
+    return {"result": "ok", "output": output}
+
+
+# Salt and personalization: absent, empty, one byte (zero-padded), the field's size and one byte
+# more, over an empty message and one of more than a block.
+def symmetric_hashes():
+    stream = Stream(500)
+
+    groups = []
+
+    for algorithm, field, block in ((BLAKE2B_160, 16, 128), (BLAKE2B_256, 16, 128), (BLAKE2B_384, 16, 128), (BLAKE2B_512, 16, 128), (BLAKE2S_128, 8, 64), (BLAKE2S_160, 8, 64), (BLAKE2S_224, 8, 64), (BLAKE2S_256, 8, 64)):
+        table = Table(algorithm, symmetric_execute)
+
+        salt, personalization = stream.bytes(field + 1), stream.bytes(field + 1)
+
+        for size in (0, block + 1):
+            message = stream.bytes(size)
+
+            for name, options in (
+                ("no options", {}),
+                ("empty options", {"salt": b"", "personalization": b""}),
+                ("one-byte salt", {"salt": salt[:1]}),
+                ("one-byte salt zero-padded", {"salt": salt[:1] + bytes(field - 1)}),
+                ("full salt", {"salt": salt[:field]}),
+                ("full personalization", {"personalization": personalization[:field]}),
+                ("full salt and personalization", {"salt": salt[:field], "personalization": personalization[:field]}),
+            ):
+                table.add(f"{name}, {size}-byte message", "digest", "ok", message=message, **options)
+
+        table.add("salt one byte too long", "digest", "INVALID_OPTION", salt=salt)
+
+        table.add("personalization one byte too long", "digest", "INVALID_OPTION", personalization=personalization)
+
+        groups.append(table.group())
+
+    for algorithm in (SHA_256, SHA3_256, ASCON_HASH256):
+        table = Table(algorithm, symmetric_execute)
+
+        table.add("empty options", "digest", "ok", message=b"abc", salt=b"", personalization=b"")
+
+        table.add("salt", "digest", "INVALID_OPTION", message=b"abc", salt=b"s")
+
+        table.add("personalization", "digest", "INVALID_OPTION", message=b"abc", personalization=b"p")
+
+        groups.append(table.group())
+
+    return groups
+
+
+# Customization strings that fill cSHAKE's first block or overflow it, around Ascon-CXOF128's
+# limit, output lengths from 0 to past a rate, and cSHAKE's function name through hazmat.
+def symmetric_xofs():
+    stream = Stream(501)
+
+    groups = []
+
+    for algorithm, rate in ((CSHAKE128, 168), (CSHAKE256, 136)):
+        table = Table(algorithm, symmetric_execute)
+
+        message = stream.bytes(rate + 1)
+
+        for size in (0, 1, rate - 7, rate - 6, 2 * rate, 600):
+            customization = stream.bytes(size)
+
+            for length in (0, 1, 32, rate + 1):
+                table.add(f"{size}-byte customization, {length}-byte output", "digest", "ok", message=message, customization=customization, outputLength=length)
+
+        for name, function_name, customization in (("empty", b"", b""), ("KMAC", b"KMAC", b""), ("KMAC with customization", b"KMAC", b"Tagged"), ("TupleHash", b"TupleHash", stream.bytes(rate)), ("long", stream.bytes(rate + 3), b"")):
+            table.add(f"hazmat function name {name}", "digest", "ok", message=message, functionName=function_name, customization=customization, outputLength=64)
+
+        groups.append(table.group())
+
+    table = Table(ASCON_CXOF128, symmetric_execute)
+
+    message = stream.bytes(33)
+
+    for size in (0, 1, 7, 8, 9, 255, 256):
+        for length in (0, 1, 32, 65):
+            table.add(f"{size}-byte customization, {length}-byte output", "digest", "ok", message=message, customization=stream.bytes(size), outputLength=length)
+
+    table.add("customization one byte too long", "digest", "INVALID_OPTION", message=message, customization=stream.bytes(257), outputLength=32)
+
+    groups.append(table.group())
+
+    for algorithm in (SHAKE128, ASCON_XOF128):
+        table = Table(algorithm, symmetric_execute)
+
+        table.add("empty customization", "digest", "ok", message=b"abc", customization=b"", outputLength=32)
+
+        table.add("customization", "digest", "INVALID_OPTION", message=b"abc", customization=b"c", outputLength=32)
+
+        table.add("hazmat function name", "digest", "INVALID_OPTION", message=b"abc", functionName=b"KMAC", outputLength=32)
+
+        groups.append(table.group())
+
+    return groups
+
+
+def mac_records(table, key, message, options, expect="ok"):
+    record = table.add(options.pop("name"), "digest", expect, key=key, message=message, **options)
+
+    if expect != "ok":
+        return
+
+    tag = record["output"]
+
+    table.add(f"{record['name']}, verify", "verify", "true", key=key, message=message, tag=tag, **options)
+
+    table.add(f"{record['name']}, verify a changed tag", "verify", "false", key=key, message=message, tag=flip(tag, len(tag) - 1), **options)
+
+    table.add(f"{record['name']}, verify a shortened tag", "verify", "false", key=key, message=message, tag=tag[:-1], **options)
+
+
+# KMAC: the default and minimum lengths and below, KMACXOF at several lengths, keys whose block
+# is full or overflows, customization strings. BLAKE2: every output length's ends, salt and
+# personalization at the field's size and one beyond, keys of every allowed size's ends and one
+# beyond (verify is false there). HMAC takes no option.
+def symmetric_macs():
+    stream = Stream(502)
+
+    groups = []
+
+    for algorithm, rate, default in ((KMAC128, 168, 32), (KMAC256, 136, 64)):
+        table = Table(algorithm, symmetric_execute)
+
+        message, customization = stream.bytes(rate + 1), stream.bytes(rate + 1)
+
+        for size in (0, 1, rate - 5, rate - 4, rate + 1):
+            mac_records(table, stream.bytes(size), message, {"name": f"{size}-byte key"})
+
+        key = stream.bytes(32)
+
+        for name, options in (
+            ("explicit default length", {"length": default}),
+            ("minimum length", {"length": 4}),
+            ("long output", {"length": rate + 1}),
+            ("customization", {"customization": customization}),
+            ("one-byte customization", {"customization": customization[:1]}),
+            ("KMACXOF", {"xof": True}),
+            ("KMACXOF minimum length", {"xof": True, "length": 4}),
+            ("KMACXOF long output with customization", {"xof": True, "length": rate + 1, "customization": customization}),
+            ("not KMACXOF", {"xof": False, "length": default}),
+        ):
+            mac_records(table, key, message, {"name": name, **options})
+
+        for name, options in (("length 3", {"length": 3}), ("length 0", {"length": 0}), ("salt", {"salt": b"s"}), ("personalization", {"personalization": b"p"})):
+            mac_records(table, key, message, {"name": name, **options}, "INVALID_OPTION")
+
+        groups.append(table.group())
+
+    for algorithm, maximum, field, block in ((BLAKE2B_MAC, 64, 16, 128), (BLAKE2S_MAC, 32, 8, 64)):
+        table = Table(algorithm, symmetric_execute)
+
+        message, salt, personalization = stream.bytes(block + 1), stream.bytes(field + 1), stream.bytes(field + 1)
+
+        for size in (1, maximum // 2, maximum):
+            mac_records(table, stream.bytes(size), message, {"name": f"{size}-byte key"})
+
+        key = stream.bytes(maximum)
+
+        for name, options in (
+            ("length 1", {"length": 1}),
+            ("explicit default length", {"length": maximum}),
+            ("full salt", {"salt": salt[:field]}),
+            ("one-byte personalization", {"personalization": personalization[:1]}),
+            ("everything", {"length": maximum // 2 + 1, "salt": salt[:field], "personalization": personalization[:field]}),
+        ):
+            mac_records(table, key, message, {"name": name, **options})
+
+        for name, options in (
+            ("length 0", {"length": 0}),
+            ("length one byte too long", {"length": maximum + 1}),
+            ("salt one byte too long", {"salt": salt}),
+            ("personalization one byte too long", {"personalization": personalization}),
+            ("customization", {"customization": b"c"}),
+            ("xof", {"xof": True}),
+        ):
+            mac_records(table, key, message, {"name": name, **options}, "INVALID_OPTION")
+
+        for size in (0, maximum + 1):
+            table.add(f"{size}-byte key", "digest", "INVALID_LENGTH", key=stream.bytes(size), message=message)
+
+            table.add(f"{size}-byte key, verify", "verify", "false", key=stream.bytes(size), message=message, tag=bytes(maximum))
+
+        groups.append(table.group())
+
+    table = Table(HMAC_SHA_256, symmetric_execute)
+
+    mac_records(table, b"key", b"message", {"name": "no options"})
+
+    for name, options in (("length", {"length": 32}), ("customization", {"customization": b"c"}), ("xof", {"xof": True}), ("salt", {"salt": b"s"})):
+        mac_records(table, b"key", b"message", {"name": name, **options}, "INVALID_OPTION")
+
+    groups.append(table.group())
+
+    return groups
+
+
+# HKDF at the output lengths' ends and one beyond, with absent, zero, long salts and long infos,
+# and pseudorandom keys one byte short of the hash length, of it and longer.
+def symmetric_kdfs():
+    stream = Stream(503)
+
+    groups = []
+
+    for algorithm, size in ((HKDF_SHA_256, 32), (HKDF_SHA_384, 48), (HKDF_SHA_512, 64)):
+        table = Table(algorithm, symmetric_execute)
+
+        ikm, salt, info = stream.bytes(32), stream.bytes(2 * size + 1), stream.bytes(300)
+
+        for length in (1, size - 1, size, size + 1, 255 * size):
+            table.add(f"derive {length} bytes", "derive", "ok", ikm=ikm, salt=salt[:size], info=info[:16], outputLength=length)
+
+        for length in (0, 255 * size + 1):
+            table.add(f"derive {length} bytes", "derive", "INVALID_LENGTH", ikm=ikm, outputLength=length)
+
+        empty = table.add("derive without salt", "derive", "ok", ikm=ikm, outputLength=size)["output"]
+
+        zeros = table.add("derive with a salt of hash-length zeros", "derive", "ok", ikm=ikm, salt=bytes(size), outputLength=size)["output"]
+
+        assert empty == zeros, algorithm.name
+
+        table.add("derive with a salt longer than a block", "derive", "ok", ikm=ikm, salt=salt, info=info, outputLength=size)
+
+        table.add("derive from an empty ikm", "derive", "ok", outputLength=size)
+
+        for name, options in (("no salt", {}), ("salt", {"salt": salt[:size]}), ("long salt", {"salt": salt}), ("empty ikm", {"ikm": b""})):
+            table.add(f"extract, {name}", "extract", "ok", **{"ikm": ikm, **options})
+
+        prk = stream.bytes(2 * size)
+
+        for length in (size - 1, size, 2 * size):
+            expect = "INVALID_LENGTH" if length < size else "ok"
+
+            table.add(f"expand a {length}-byte pseudorandom key", "expand", expect, prk=prk[:length], info=info[:16], outputLength=size)
+
+        for length in (0, 255 * size, 255 * size + 1):
+            table.add(f"expand {length} bytes", "expand", "ok" if 0 < length <= 255 * size else "INVALID_LENGTH", prk=prk[:size], info=info, outputLength=length)
+
+        groups.append(table.group())
+
+    return groups
+
+
 JOBS = {
     "kem": [(kem, ())],
     "mldsa": [(mldsa, ())],
@@ -2266,6 +2592,7 @@ JOBS = {
         (xmss_errors, ()),
     ],
     "treecache": [(tree_cache_hss, ()), (tree_cache_xmss_mt, ()), (tree_cache_xmss, ())],
+    "symmetric": [(symmetric_hashes, ()), (symmetric_xofs, ()), (symmetric_macs, ()), (symmetric_kdfs, ())],
 }
 
 

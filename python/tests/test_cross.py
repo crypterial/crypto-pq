@@ -2,7 +2,7 @@ import os
 import unittest
 
 import crypto_pq
-from crypto_pq import CryptoPQError, KemAlgorithm, SignatureAlgorithm, hazmat
+from crypto_pq import CryptoPQError, KdfAlgorithm, KemAlgorithm, MacAlgorithm, SignatureAlgorithm, XofAlgorithm, hazmat
 from test_mldsa import PRE_HASHES
 from test_stateful import MemoryStore
 from vectors import records, unhex
@@ -43,6 +43,36 @@ ALGORITHMS = {
 }
 
 ENCODINGS = (("der", "Der"), ("pem", "Pem"))
+
+SYMMETRIC = {
+    algorithm.name: algorithm
+    for algorithm in (
+        crypto_pq.BLAKE2B_160,
+        crypto_pq.BLAKE2B_256,
+        crypto_pq.BLAKE2B_384,
+        crypto_pq.BLAKE2B_512,
+        crypto_pq.BLAKE2S_128,
+        crypto_pq.BLAKE2S_160,
+        crypto_pq.BLAKE2S_224,
+        crypto_pq.BLAKE2S_256,
+        crypto_pq.SHA_256,
+        crypto_pq.SHA3_256,
+        crypto_pq.ASCON_HASH256,
+        crypto_pq.CSHAKE128,
+        crypto_pq.CSHAKE256,
+        crypto_pq.ASCON_CXOF128,
+        crypto_pq.SHAKE128,
+        crypto_pq.ASCON_XOF128,
+        crypto_pq.KMAC128,
+        crypto_pq.KMAC256,
+        crypto_pq.BLAKE2B_MAC,
+        crypto_pq.BLAKE2S_MAC,
+        crypto_pq.HMAC_SHA_256,
+        crypto_pq.HKDF_SHA_256,
+        crypto_pq.HKDF_SHA_384,
+        crypto_pq.HKDF_SHA_512,
+    )
+}
 
 
 def pre_hash(name):
@@ -115,6 +145,57 @@ def execute(algorithm, record, data):
         return str(error.code), None, None
 
     return "ok", output, remaining
+
+
+def symmetric(algorithm, record):
+    """Runs one record of cross/symmetric.txt (its format is described in tools/cross_vectors.py)."""
+
+    def get(name):
+        return unhex(record.get(name, ""))
+
+    operation = record["operation"]
+
+    try:
+        if isinstance(algorithm, KdfAlgorithm):
+            if operation == "derive":
+                return "ok", algorithm.derive(get("ikm"), int(record["outputLength"]), salt=get("salt"), info=get("info"))
+
+            if operation == "extract":
+                return "ok", algorithm.extract(get("ikm"), salt=get("salt"))
+
+            if operation == "expand":
+                return "ok", algorithm.expand(get("prk"), int(record["outputLength"]), info=get("info"))
+
+            raise AssertionError(f"unknown operation {operation}")
+
+        if "functionName" in record:
+            configured = hazmat.configure_cshake(algorithm, get("functionName"), get("customization"))
+        else:
+            options = {key: get(key) for key in ("salt", "personalization", "customization") if key in record}
+
+            if "length" in record:
+                options["length"] = int(record["length"])
+
+            if "xof" in record:
+                options["xof"] = record["xof"] == "true"
+
+            configured = algorithm.configure(**options)
+
+        if operation == "verify":
+            return str(configured.verify(get("key"), get("message"), get("tag"))).lower(), None
+
+        if operation != "digest":
+            raise AssertionError(f"unknown operation {operation}")
+
+        if isinstance(configured, MacAlgorithm):
+            return "ok", configured.digest(get("key"), get("message"))
+
+        if isinstance(configured, XofAlgorithm):
+            return "ok", configured.digest(get("message"), int(record["outputLength"]))
+
+        return "ok", configured.digest(get("message"))
+    except CryptoPQError as error:
+        return str(error.code), None
 
 
 class CrossTest(unittest.TestCase):
@@ -381,6 +462,22 @@ class CrossTest(unittest.TestCase):
 
                     if "remaining" in record:
                         self.assertEqual(remaining, int(record["remaining"]))
+
+    def test_symmetric(self):
+        found = records("cross/symmetric.txt", "result")
+
+        for header, record in found:
+            algorithm = SYMMETRIC[header["algorithm"]]
+
+            with self.subTest(algorithm=algorithm.name, name=record["name"]):
+                result, output = symmetric(algorithm, record)
+
+                self.assertEqual(result, record["result"])
+
+                if "output" in record:
+                    self.assertEqual(output, unhex(record["output"]))
+
+        self.assertEqual(len(found), 505)
 
 
 if __name__ == "__main__":

@@ -101,6 +101,40 @@ def hashes(runner):
         runner.case(name, lambda operation=operation: timed(operation))
 
 
+# The hash functions, XOFs and MACs after SHA-2 and SHA-3 on 64 bytes and 1 KiB, cSHAKE, Ascon-CXOF128
+# and KMAC with a customization string, MACs under a 32-byte key, and HKDF from a 32-byte IKM with
+# a 32-byte salt and a 16-byte info.
+def symmetric(runner):
+    key, customization = data(32), b"crypto-pq benchmark"
+
+    cases = [
+        ("blake2b-512", lambda m: crypto_pq.BLAKE2B_512.digest(m)),
+        ("blake2s-256", lambda m: crypto_pq.BLAKE2S_256.digest(m)),
+        ("ascon-hash256", lambda m: crypto_pq.ASCON_HASH256.digest(m)),
+        ("cshake128", lambda m, x=crypto_pq.CSHAKE128.configure(customization=customization): x.digest(m, 32)),
+        ("cshake256", lambda m, x=crypto_pq.CSHAKE256.configure(customization=customization): x.digest(m, 64)),
+        ("ascon-xof128", lambda m: crypto_pq.ASCON_XOF128.digest(m, 32)),
+        ("ascon-cxof128", lambda m, x=crypto_pq.ASCON_CXOF128.configure(customization=customization): x.digest(m, 32)),
+        ("hmac-sha-256", lambda m: crypto_pq.HMAC_SHA_256.digest(key, m)),
+        ("kmac128", lambda m, x=crypto_pq.KMAC128.configure(customization=customization): x.digest(key, m)),
+        ("kmac256", lambda m, x=crypto_pq.KMAC256.configure(customization=customization): x.digest(key, m)),
+        ("blake2b-mac", lambda m: crypto_pq.BLAKE2B_MAC.digest(key, m)),
+        ("blake2s-mac", lambda m: crypto_pq.BLAKE2S_MAC.digest(key, m)),
+    ]
+
+    for name, operation in cases:
+        for size, suffix in ((64, "64B"), (1024, "1KiB")):
+            message = data(size)
+
+            runner.case(f"{name}/{suffix}", lambda operation=operation, message=message: timed(lambda i: operation(message)))
+
+    salt, info = data(32), b"crypto-pq hkdf 1"
+
+    for algorithm in (crypto_pq.HKDF_SHA_256, crypto_pq.HKDF_SHA_384, crypto_pq.HKDF_SHA_512):
+        for size in (32, 64, 128):
+            runner.case(f"{algorithm.name.lower()}/{size}B", lambda algorithm=algorithm, size=size: timed(lambda i: algorithm.derive(key, size, salt=salt, info=info)))
+
+
 def kem(runner, algorithm, seed_size, randomness_size):
     seed, randomness = data(seed_size), data(randomness_size)
 
@@ -209,6 +243,8 @@ def main(arguments):
     runner = Runner(arguments)
 
     hashes(runner)
+
+    symmetric(runner)
 
     for algorithm in (crypto_pq.ML_KEM_512, crypto_pq.ML_KEM_768, crypto_pq.ML_KEM_1024):
         kem(runner, algorithm, 64, 32)
