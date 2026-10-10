@@ -570,8 +570,10 @@ fn sameXof(a: hash.XofAlgorithm, b: hash.XofAlgorithm) bool {
 }
 
 // Only the hash layer's own constants are pre-hashes; a hand-built value matches none of them.
-pub fn lookup(pre_hash: PreHash) ?Entry {
-    for (hash_entries) |entry| {
+// The entry is not copied out of the table: it holds whole algorithm values, configured state
+// included, and unoptimized builds give every frame and switch prong that passes it on a copy.
+pub fn lookup(pre_hash: PreHash) ?*const Entry {
+    for (&hash_entries) |*entry| {
         const same = switch (pre_hash) {
             .hash => |h| entry.pre_hash == .hash and sameHash(h, entry.pre_hash.hash),
             .xof => |x| entry.pre_hash == .xof and sameXof(x, entry.pre_hash.xof),
@@ -586,8 +588,8 @@ pub fn lookup(pre_hash: PreHash) ?Entry {
 // A pre-hash must give at least the collision strength of the signature (FIPS 204, 5.4, and
 // FIPS 205, 10.2): signing with a weaker one is refused and verification fails closed. hazmat
 // skips this policy because the ACVP vectors use every hash function.
-fn checkSignOptions(kind: SignatureAlgorithm.Kind, context: []const u8, pre_hash: ?PreHash, policy: bool) Error!?Entry {
-    var entry: ?Entry = null;
+fn checkSignOptions(kind: SignatureAlgorithm.Kind, context: []const u8, pre_hash: ?PreHash, policy: bool) Error!?*const Entry {
+    var entry: ?*const Entry = null;
 
     if (pre_hash) |value| {
         entry = lookup(value) orelse return error.InvalidOption;
@@ -609,7 +611,7 @@ pub const Representative = struct {
     slices: [4][]const u8,
     count: usize,
 
-    pub fn init(self: *Representative, message: []const u8, context: []const u8, entry: ?Entry) void {
+    pub fn init(self: *Representative, message: []const u8, context: []const u8, entry: ?*const Entry) void {
         self.header = .{ @intFromBool(entry != null), @intCast(context.len) };
 
         self.slices[0] = &self.header;
@@ -691,7 +693,7 @@ fn verifyRaw(key: *const SignaturePublicKey, message: []const []const u8, signat
 }
 
 // The options were checked and `randomness` has the algorithm's length.
-fn signWith(key: *const SignaturePrivateKey, allocator: Allocator, message: []const u8, randomness: []const u8, context: []const u8, entry: ?Entry) Allocator.Error![]u8 {
+fn signWith(key: *const SignaturePrivateKey, allocator: Allocator, message: []const u8, randomness: []const u8, context: []const u8, entry: ?*const Entry) Allocator.Error![]u8 {
     const out = try allocator.alloc(u8, signatureSize(key.algorithm.kind));
 
     errdefer allocator.free(out);

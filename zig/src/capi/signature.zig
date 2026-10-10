@@ -341,7 +341,7 @@ fn publicPart(comptime S: type, slot: Slot) *S.Public {
 // SHA3-512 is 10), 11 SHAKE128 and 12 SHAKE256.
 pub const pre_hash_count = 13;
 
-fn preHash(id: u32) Failure!?signatures.Entry {
+fn preHash(id: u32) Failure!?*const signatures.Entry {
     const value: signatures.PreHash = switch (id) {
         0 => return null,
         1...10 => .{ .hash = hashing.algorithms[id - 1] },
@@ -606,7 +606,7 @@ fn signChecked(memory: ?[*]u8, length: usize, message: ?[*]const u8, message_len
     }
 }
 
-fn signAs(comptime S: type, slot: Slot, m: []const u8, ctx: []const u8, random: []const u8, flags: u32, entry: ?signatures.Entry, signature: ?[*]u8, signature_length: usize) Failure!void {
+fn signAs(comptime S: type, slot: Slot, m: []const u8, ctx: []const u8, random: []const u8, flags: u32, entry: ?*const signatures.Entry, signature: ?[*]u8, signature_length: usize) Failure!void {
     const out = try common.exact(signature, signature_length, S.signature_size);
 
     try common.apart(&.{ slot.bytes, out }, &.{ m, ctx, random });

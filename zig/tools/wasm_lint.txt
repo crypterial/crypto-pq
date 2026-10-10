@@ -21,7 +21,7 @@ crypto_pq_ml_dsa capi.signature.exportPrivate 8 169 0 1 slot header and users wo
 crypto_pq_ml_dsa capi.signature.importPrivate 0 6 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
 crypto_pq_ml_dsa capi.signature.keygen 0 3 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
 crypto_pq_ml_dsa capi.signature.openPrivate 1 12 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
-crypto_pq_ml_dsa capi.signature.preHash 0 21 0 3 the pre-hash id
+crypto_pq_ml_dsa capi.signature.preHash 0 92 0 14 the pre-hash id
 crypto_pq_ml_dsa capi.signature.publicFromPrivate 3 68 0 1 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
 crypto_pq_ml_dsa capi.signature.sign 8 146 0 1 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
 crypto_pq_ml_dsa capi.signature.signAs 0 45 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
@@ -90,7 +90,7 @@ crypto_pq_slh_dsa capi.signature.exportPrivate 14 349 0 1 slot header and users 
 crypto_pq_slh_dsa capi.signature.importPrivate 0 15 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
 crypto_pq_slh_dsa capi.signature.keygen 0 3 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
 crypto_pq_slh_dsa capi.signature.openPrivate 1 12 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
-crypto_pq_slh_dsa capi.signature.preHash 0 21 0 3 the pre-hash id
+crypto_pq_slh_dsa capi.signature.preHash 0 92 0 14 the pre-hash id
 crypto_pq_slh_dsa capi.signature.publicFromPrivate 3 65 0 1 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
 crypto_pq_slh_dsa capi.signature.sign 17 308 0 1 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
 crypto_pq_slh_dsa capi.signature.signAs 0 180 0 0 slot header and users word, lengths, algorithm id, flags, pre-hash entry and context length
