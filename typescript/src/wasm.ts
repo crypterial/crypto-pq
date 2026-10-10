@@ -105,6 +105,12 @@ export function setBackend(backend: Backend): void {
   chosen = backend;
 }
 
+// MAC and KDF calls would run under the data-independent timing mode of ARM64 CPUs from now on, as
+// in the native libraries; neither JavaScript nor WebAssembly can set it, so the answer is false.
+export function enableDataIndependentTiming(): boolean {
+  return false;
+}
+
 // What the core is told of the engine (cpq_wasm_tune), which picks between code shapes of equal
 // results: bit 0 for V8 before version 15, which compiles a rotation of 64-bit vector lanes faster
 // as two added shifts, bit 1 for any V8, which runs a single Keccak state faster with two rounds
@@ -423,7 +429,7 @@ export class Core {
 
     this.#view = new Uint8Array(memory.buffer);
 
-    if (this.x.cpq_abi_version() !== 1) {
+    if (this.x.cpq_abi_version() !== 2) {
       throw new Error("the WebAssembly module has another ABI version");
     }
 

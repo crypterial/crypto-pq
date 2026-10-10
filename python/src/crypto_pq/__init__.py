@@ -1,6 +1,6 @@
 from . import hazmat
 from ._encoding import KeyFormat
-from ._native import BACKEND, LOAD_ERROR
+from ._native import BACKEND, LOAD_ERROR, enable_data_independent_timing
 from ._errors import CryptoPQError, ErrorCode
 from ._hash import (
     ASCON_CXOF128,
@@ -175,5 +175,6 @@ __all__ = [
     "X_WING",
     "Xof",
     "XofAlgorithm",
+    "enable_data_independent_timing",
     "hazmat",
 ]

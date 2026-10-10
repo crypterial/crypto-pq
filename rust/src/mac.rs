@@ -105,8 +105,8 @@ fn squeeze_equal(engine: &mut Keccak, tag: &[u8]) -> bool {
     ct::declassify_value(mask) == 0xFF
 }
 
-// Every keyed computation runs under DIT. Each public method takes the guard once, around
-// everything it does with the key, and the functions it calls take none of their own.
+// Each public method that uses the key takes the keyed DIT guard once, around everything it does
+// with the key, and the functions it calls take none of their own.
 impl MacAlgorithm {
     pub const fn name(&self) -> &'static str {
         self.name
@@ -215,7 +215,7 @@ impl MacAlgorithm {
 
         self.check_key(key);
 
-        let _dit = Dit::new();
+        let _dit = Dit::keyed();
 
         self.mac(key, data, out);
     }
@@ -223,7 +223,7 @@ impl MacAlgorithm {
     pub fn create(&self, key: &[u8]) -> Mac {
         self.check_key(key);
 
-        let _dit = Dit::new();
+        let _dit = Dit::keyed();
 
         let engine = match &self.kind {
             MacKind::Hmac(hash) => keyed_hmac(hash, key),
@@ -248,7 +248,7 @@ impl MacAlgorithm {
             return false;
         }
 
-        let _dit = Dit::new();
+        let _dit = Dit::keyed();
 
         if let MacKind::Kmac { prefix, rate, xof } = &self.kind {
             let mut engine = sp800_185::keyed(prefix, *rate, key);
@@ -352,7 +352,7 @@ pub struct Mac {
 
 impl Mac {
     pub fn update(&mut self, data: &[u8]) {
-        let _dit = Dit::new();
+        let _dit = Dit::keyed();
 
         match &mut self.engine {
             MacEngine::Hmac { inner, .. } => inner.update(data),
@@ -373,7 +373,7 @@ impl Mac {
     pub fn digest_into(&self, out: &mut [u8]) {
         check_length(out.len(), self.size);
 
-        let _dit = Dit::new();
+        let _dit = Dit::keyed();
 
         self.finish(out);
     }
@@ -383,7 +383,7 @@ impl Mac {
             return false;
         }
 
-        let _dit = Dit::new();
+        let _dit = Dit::keyed();
 
         if let MacEngine::Kmac { engine, xof } = &self.engine {
             let mut engine = engine.clone();

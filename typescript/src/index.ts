@@ -98,6 +98,6 @@ export type {
   StatefulParameters,
 } from "./stateful.ts";
 
-export { setBackend } from "./wasm.ts";
+export { enableDataIndependentTiming, setBackend } from "./wasm.ts";
 
 export type { Backend } from "./wasm.ts";

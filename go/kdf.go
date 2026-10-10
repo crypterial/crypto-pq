@@ -85,7 +85,9 @@ func (a KdfAlgorithm) DeriveInto(ikm, out []byte, options *KdfOptions) error {
 
 	salt, info := kdfInputs(options)
 
-	defer ditLeave(ditEnter())
+	if keyedDit() {
+		defer ditLeave(ditEnter())
+	}
 
 	var prk [64]byte
 
@@ -117,7 +119,9 @@ func (a KdfAlgorithm) ExtractInto(ikm, prk []byte, options *KdfOptions) {
 
 	salt, _ := kdfInputs(options)
 
-	defer ditLeave(ditEnter())
+	if keyedDit() {
+		defer ditLeave(ditEnter())
+	}
 
 	hmacInto(hash, salt, ikm, prk)
 }
@@ -151,7 +155,9 @@ func (a KdfAlgorithm) ExpandInto(prk, out []byte, options *KdfOptions) error {
 
 	_, info := kdfInputs(options)
 
-	defer ditLeave(ditEnter())
+	if keyedDit() {
+		defer ditLeave(ditEnter())
+	}
 
 	hkdfExpand(hash, prk, info, out)
 
@@ -164,7 +170,7 @@ const hkdfMessageLimit = 256
 // HKDF-Expand: T(i) = HMAC(PRK, T(i - 1) || info || i), with the keyed inner and outer states
 // computed once. With a short info the message of each T(i) is laid out once on the stack,
 // T(i - 1) then info then the counter, so that each hash is finished in one call; a longer info
-// streams through an engine on the stack. Every buffer is cleared; the callers hold DIT.
+// streams through an engine on the stack. Every buffer is cleared; the callers decide on DIT.
 func hkdfExpand(hash HashAlgorithm, prk, info, out []byte) {
 	spec := hashSpecOf(hash.id)
 

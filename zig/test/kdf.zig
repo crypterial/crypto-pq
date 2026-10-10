@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const pq = @import("crypto_pq");
 const vectors = @import("vectors");
 
@@ -35,6 +36,26 @@ fn checkDerive(algorithm: pq.KdfAlgorithm, ikm: []const u8, salt: []const u8, in
     try algorithm.expand(prk[0..algorithm.hashSize()], out, .{ .info = info });
 
     try testing.expectEqualSlices(u8, expected, out);
+}
+
+// The switch answers the same every time, false off AArch64, and changes no output; the vectors
+// after it run with DIT on MAC and KDF calls wherever the CPU has it.
+test "enableDataIndependentTiming changes no output" {
+    var before: [42]u8 = undefined;
+
+    try pq.hkdf_sha_256.derive("ikm", &before, .{ .salt = "salt", .info = "info" });
+
+    const enabled = pq.enableDataIndependentTiming();
+
+    try testing.expectEqual(enabled, pq.enableDataIndependentTiming());
+
+    if (builtin.cpu.arch != .aarch64) try testing.expect(!enabled);
+
+    var after: [42]u8 = undefined;
+
+    try pq.hkdf_sha_256.derive("ikm", &after, .{ .salt = "salt", .info = "info" });
+
+    try testing.expectEqualSlices(u8, &before, &after);
 }
 
 test "HKDF RFC 5869 vectors" {

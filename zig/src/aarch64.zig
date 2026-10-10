@@ -1030,6 +1030,10 @@ pub fn keccakAbsorb(state: *[25]u64, rate: usize, blocks: []const u8) void {
 
 // ---- DIT and the CPU's implementer ----
 
+// The reads and writes of the DIT register that enterDit and leaveDit make on this thread, which
+// the tests count.
+pub threadlocal var dit_trace: struct { reads: usize = 0, writes: usize = 0 } = .{};
+
 // PSTATE.DIT is bit 24 of the DIT register, S3_3_C4_C2_5, writable at EL0.
 pub fn ditIsSet() bool {
     const value = asm volatile ("mrs %[value], S3_3_C4_C2_5"
@@ -1041,7 +1045,11 @@ pub fn ditIsSet() bool {
 
 // Sets DIT and returns whether it was clear before.
 pub fn enterDit() bool {
+    if (builtin.is_test) dit_trace.reads += 1;
+
     if (ditIsSet()) return false;
+
+    if (builtin.is_test) dit_trace.writes += 1;
 
     asm volatile ("msr S3_3_C4_C2_5, %[value]"
         :
@@ -1052,6 +1060,8 @@ pub fn enterDit() bool {
 }
 
 pub fn leaveDit() void {
+    if (builtin.is_test) dit_trace.writes += 1;
+
     asm volatile ("msr S3_3_C4_C2_5, xzr" ::: .{ .memory = true });
 }
 

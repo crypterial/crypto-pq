@@ -9,7 +9,7 @@
 // asking the operating system for the features, and setting the DIT bit.
 
 use core::arch::aarch64::*;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::keccak::{self, ROUND_CONSTANTS};
 use crate::sha2::{K256, K512, last_bytes};
@@ -233,6 +233,12 @@ impl Dit {
     pub(crate) fn new() -> Self {
         Self(has(DIT) && set_dit())
     }
+
+    // The guard of a MAC or KDF call. KEYED is set only on a CPU with DIT.
+    #[inline]
+    pub(crate) fn keyed() -> Self {
+        Self(KEYED.load(Ordering::Relaxed) && set_dit())
+    }
 }
 
 impl Drop for Dit {
@@ -244,6 +250,24 @@ impl Drop for Dit {
     }
 }
 
+// MAC and KDF calls take DIT only after enable_data_independent_timing(): it costs 30-54 ns a call
+// on an Apple M3, the whole gap on short MACs, and the prefetcher attacks it stops (GoFetch) need
+// intermediates that a small key guess predicts, which ML-KEM, ML-DSA and X25519 have and keyed
+// SHA-2, Keccak and BLAKE2 states, each a function of the whole key, do not.
+static KEYED: AtomicBool = AtomicBool::new(false);
+
+// From now on every MAC and KDF call, on every thread, holds DIT as the asymmetric operations
+// always do; there is no way back. False when the CPU has no DIT.
+pub fn enable_data_independent_timing() -> bool {
+    if !has(DIT) {
+        return false;
+    }
+
+    KEYED.store(true, Ordering::Relaxed);
+
+    true
+}
+
 const DIT_BIT: u64 = 1 << 24;
 
 // S3_3_C4_C2_5 is the DIT register, named by its encoding so that the assembler accepts it
@@ -251,6 +275,9 @@ const DIT_BIT: u64 = 1 << 24;
 // compiler moves no load or store of a secret out of the guarded stretch.
 #[allow(unsafe_code)]
 fn set_dit() -> bool {
+    #[cfg(test)]
+    tests::count(&tests::READS);
+
     let previous: u64;
 
     // SAFETY: the CPU has FEAT_DIT (checked by the caller), whose register user space may read
@@ -267,6 +294,9 @@ fn set_dit() -> bool {
         return false;
     }
 
+    #[cfg(test)]
+    tests::count(&tests::WRITES);
+
     // SAFETY: as above.
     unsafe {
         core::arch::asm!(
@@ -281,6 +311,9 @@ fn set_dit() -> bool {
 
 #[allow(unsafe_code)]
 fn clear_dit() {
+    #[cfg(test)]
+    tests::count(&tests::WRITES);
+
     // SAFETY: as in set_dit, which found the bit clear and set it.
     unsafe {
         core::arch::asm!("msr s3_3_c4_c2_5, xzr", options(nostack, preserves_flags));
@@ -1936,6 +1969,37 @@ fn digest_sha3<const RATE: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::SHA_256;
+    use crate::kdf::{HKDF_SHA_256, HKDF_SHA_512, KdfOptions};
+    use crate::kem::ML_KEM_768;
+    use crate::mac::{BLAKE2B_MAC, BLAKE2S_MAC, HMAC_SHA_256, HMAC_SHA_512, KMAC128, KMAC256};
+    use std::boxed::Box;
+    use std::cell::{Cell, RefCell};
+    use std::thread::LocalKey;
+    use std::vec::Vec;
+
+    // The reads and the writes of the DIT register that set_dit and clear_dit make on this thread.
+    std::thread_local! {
+        pub(super) static READS: Cell<usize> = const { Cell::new(0) };
+
+        pub(super) static WRITES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn count(counter: &'static LocalKey<Cell<usize>>) {
+        counter.with(|value| value.set(value.get() + 1));
+    }
+
+    // What a call does to the DIT register of this thread: its reads and its writes.
+    fn accesses(call: &dyn Fn()) -> (usize, usize) {
+        let before = (READS.with(Cell::get), WRITES.with(Cell::get));
+
+        call();
+
+        (
+            READS.with(Cell::get) - before.0,
+            WRITES.with(Cell::get) - before.1,
+        )
+    }
 
     #[allow(unsafe_code)]
     fn dit_is_set() -> bool {
@@ -1979,8 +2043,131 @@ mod tests {
 
         assert!(!dit_is_set());
 
-        crate::mac::HMAC_SHA_256.digest(b"key", b"data");
+        HMAC_SHA_256.digest(b"key", b"data");
 
         assert!(!dit_is_set());
+    }
+
+    // Every public MAC and KDF call that uses a key, each on its own state.
+    fn keyed_calls() -> Vec<Box<dyn Fn()>> {
+        let mut calls: Vec<Box<dyn Fn()>> = Vec::new();
+
+        for algorithm in [
+            HMAC_SHA_256,
+            HMAC_SHA_512,
+            KMAC128,
+            KMAC256,
+            BLAKE2B_MAC,
+            BLAKE2S_MAC,
+        ] {
+            let (tag, empty) = (
+                algorithm.digest(b"key", b"data"),
+                algorithm.digest(b"key", b""),
+            );
+
+            let (updated, digested, verified) = (
+                RefCell::new(algorithm.create(b"key")),
+                algorithm.create(b"key"),
+                algorithm.create(b"key"),
+            );
+
+            let expected = tag.clone();
+
+            calls.push(Box::new(move || {
+                assert_eq!(algorithm.digest(b"key", b"data"), expected)
+            }));
+
+            calls.push(Box::new(move || {
+                assert!(algorithm.verify(b"key", b"data", &tag))
+            }));
+
+            calls.push(Box::new(move || drop(algorithm.create(b"key"))));
+
+            calls.push(Box::new(move || updated.borrow_mut().update(b"data")));
+
+            calls.push(Box::new(move || drop(digested.digest())));
+
+            calls.push(Box::new(move || assert!(verified.verify(&empty))));
+        }
+
+        for algorithm in [HKDF_SHA_256, HKDF_SHA_512] {
+            let options = KdfOptions::default();
+
+            calls.push(Box::new(move || {
+                assert!(algorithm.derive(b"ikm", 42, &options).is_ok())
+            }));
+
+            calls.push(Box::new(move || {
+                assert!(algorithm.extract(b"ikm", &options).is_ok())
+            }));
+
+            calls.push(Box::new(move || {
+                assert!(algorithm.expand(&[7; 64], 42, &options).is_ok())
+            }));
+        }
+
+        calls
+    }
+
+    // MAC and KDF calls leave the DIT register alone until enable_data_independent_timing(), and
+    // then set and clear it as the asymmetric operations always do; inside another guard they
+    // only read it. Hashes never touch it.
+    #[test]
+    fn keyed_dit_is_opt_in() {
+        KEYED.store(false, Ordering::Relaxed);
+
+        let calls = keyed_calls();
+
+        let pair = crate::hazmat::generate_kem_key_pair(ML_KEM_768, &[3; 64]).expect("key pair");
+
+        let sealed = pair.public_key.encapsulate().expect("encapsulation");
+
+        let decapsulate = || assert!(pair.private_key.decapsulate(&sealed.ciphertext).is_ok());
+
+        let hash = || drop(SHA_256.digest(b"data"));
+
+        let dit = has(DIT);
+
+        for call in &calls {
+            assert_eq!(accesses(call.as_ref()), (0, 0));
+        }
+
+        let (reads, writes) = accesses(&decapsulate);
+
+        assert!(if dit {
+            reads >= 1 && writes == 2
+        } else {
+            reads + writes == 0
+        });
+
+        assert_eq!(enable_data_independent_timing(), dit);
+
+        assert_eq!(enable_data_independent_timing(), dit);
+
+        assert_eq!(accesses(&hash), (0, 0));
+
+        for call in &calls {
+            if !dit {
+                assert_eq!(accesses(call.as_ref()), (0, 0));
+
+                continue;
+            }
+
+            assert_eq!(accesses(call.as_ref()), (1, 2));
+
+            assert!(!dit_is_set());
+
+            let outer = Dit::new();
+
+            assert_eq!(accesses(call.as_ref()), (1, 0));
+
+            assert!(dit_is_set());
+
+            drop(outer);
+
+            assert!(!dit_is_set());
+        }
+
+        KEYED.store(false, Ordering::Relaxed);
     }
 }

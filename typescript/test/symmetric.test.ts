@@ -91,6 +91,27 @@ test("HKDF: lengths and options", () => {
   );
 });
 
+// No engine can set the data-independent timing mode: the switch answers false every time, on
+// every backend, and changes no output.
+test("enableDataIndependentTiming answers false", () => {
+  const key = utf8("key");
+
+  const data = utf8("data");
+
+  const outputs = () => [
+    ...[pq.HMAC_SHA_256, pq.HMAC_SHA_512, pq.KMAC128, pq.BLAKE2B_MAC].map((algorithm) => algorithm.digest(key, data)),
+    pq.HKDF_SHA_256.derive(key, 42, { salt: data, info: data }),
+  ];
+
+  const before = outputs();
+
+  assert.equal(pq.enableDataIndependentTiming(), false);
+
+  assert.equal(pq.enableDataIndependentTiming(), false);
+
+  assert.deepEqual(outputs(), before);
+});
+
 test("configure: options, defaults and refusals", () => {
   const sixteen = new Uint8Array(16).fill(1);
 

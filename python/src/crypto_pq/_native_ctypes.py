@@ -62,6 +62,7 @@ def declare(library, ctypes):
     memory, data = ctypes.c_void_p, ctypes.c_char_p
 
     for name, restype, *argtypes in (
+        ("cpq_enable_data_independent_timing", status),
         ("cpq_slot_size", size, u32, u32),
         ("cpq_slot_align", size, u32, u32),
         ("cpq_slot_info", status, memory, size, memory),
@@ -742,6 +743,10 @@ def signer_load(kind, state, cache):
 
 def wipe(slot):
     return Slot.wipe(slot.address, slot.size)
+
+
+def enable_data_independent_timing():
+    return _lib.cpq_enable_data_independent_timing() == 1
 
 
 # The one-shot functions of the hash API.

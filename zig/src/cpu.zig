@@ -196,12 +196,39 @@ pub const Dit = struct {
         return .{ .set = aarch64.enterDit() };
     }
 
+    // The guard of a MAC or KDF call. The flag is set only on a CPU with DIT.
+    pub inline fn enterKeyed() Dit {
+        if (comptime !possible(.dit)) return .{ .set = false };
+
+        if (!keyed.load(.monotonic)) return .{ .set = false };
+
+        return .{ .set = aarch64.enterDit() };
+    }
+
     pub inline fn leave(self: Dit) void {
         if (comptime !possible(.dit)) return;
 
         if (self.set) aarch64.leaveDit();
     }
 };
+
+// MAC and KDF calls take DIT only after enableDataIndependentTiming: it costs 30-54 ns a call on
+// an Apple M3, the whole gap on short MACs, and the prefetcher attacks it stops (GoFetch) need
+// intermediates that a small key guess predicts, which ML-KEM, ML-DSA and X25519 have and keyed
+// SHA-2, Keccak and BLAKE2 states, each a function of the whole key, do not.
+pub var keyed: std.atomic.Value(bool) = .init(false);
+
+// From now on every MAC and KDF call, on every thread, holds DIT as the asymmetric operations
+// always do; there is no way back. False when the CPU has no DIT.
+pub fn enableDataIndependentTiming() bool {
+    if (comptime !possible(.dit)) return false;
+
+    if (!has(.dit)) return false;
+
+    keyed.store(true, .monotonic);
+
+    return true;
+}
 
 test "the guaranteed features are detected" {
     inline for (comptime std.enums.values(Feature)) |feature| {
@@ -249,4 +276,48 @@ test "DIT is set inside a scope and restored after it" {
     }
 
     try std.testing.expectEqual(before, aarch64.ditIsSet());
+}
+
+test "the keyed guard takes DIT only after enableDataIndependentTiming" {
+    keyed.store(false, .monotonic);
+
+    defer keyed.store(false, .monotonic);
+
+    const trace = aarch64.dit_trace;
+
+    const off = Dit.enterKeyed();
+
+    off.leave();
+
+    try std.testing.expect(!off.set);
+
+    try std.testing.expectEqual(trace, aarch64.dit_trace);
+
+    const dit = has(.dit);
+
+    try std.testing.expectEqual(dit, enableDataIndependentTiming());
+
+    try std.testing.expectEqual(dit, enableDataIndependentTiming());
+
+    if (comptime !possible(.dit)) return;
+
+    if (!dit) return;
+
+    try std.testing.expect(!aarch64.ditIsSet());
+
+    {
+        const outer = Dit.enterKeyed();
+
+        defer outer.leave();
+
+        try std.testing.expect(outer.set and aarch64.ditIsSet());
+
+        const inner = Dit.enterKeyed();
+
+        defer inner.leave();
+
+        try std.testing.expect(!inner.set and aarch64.ditIsSet());
+    }
+
+    try std.testing.expect(!aarch64.ditIsSet());
 }

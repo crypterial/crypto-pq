@@ -523,7 +523,7 @@ pub fn Mac(comptime id: u32) type {
             return true;
         }
 
-        // Built in place, from a configured MAC of this id, under the caller's DIT.
+        // Built in place, from a configured MAC of this id, under the caller's DIT guard.
         pub fn init(state: *State, mac: *const hash.MacAlgorithm, key: []const u8) void {
             switch (algorithm.kind) {
                 .hmac => Hmac(id).init(state, key),
@@ -1024,7 +1024,7 @@ fn hmacChecked(algorithm: u32, key: ?[*]const u8, key_length: usize, data: ?[*]c
 fn macDigest(mac: *const hash.MacAlgorithm, key: []const u8, data: []const u8, out: []u8) Failure!void {
     try checkKey(mac, key);
 
-    const dit = cpu.Dit.enter();
+    const dit = cpu.Dit.enterKeyed();
 
     defer dit.leave();
 
@@ -1054,7 +1054,7 @@ fn macVerify(mac: *const hash.MacAlgorithm, key: []const u8, data: []const u8, t
 
     if (tag.len != mac.digest_size) return error.Rejected;
 
-    const dit = cpu.Dit.enter();
+    const dit = cpu.Dit.enterKeyed();
 
     defer dit.leave();
 
@@ -1168,11 +1168,11 @@ fn hmacInitChecked(algorithm: u32, key: ?[*]const u8, key_length: usize, memory:
     slot.seal(0);
 }
 
-// The state of `mac`, whose id is the slot's, built in place under one DIT guard.
+// The state of `mac`, whose id is the slot's, built in place under one keyed DIT guard.
 fn macInit(slot: Slot, mac: *const hash.MacAlgorithm, key: []const u8) Failure!void {
     try checkKey(mac, key);
 
-    const dit = cpu.Dit.enter();
+    const dit = cpu.Dit.enterKeyed();
 
     defer dit.leave();
 
@@ -1225,7 +1225,7 @@ fn hmacUpdateChecked(memory: ?[*]u8, length: usize, data: ?[*]const u8, data_len
 
     defer slot.close();
 
-    const dit = cpu.Dit.enter();
+    const dit = cpu.Dit.enterKeyed();
 
     defer dit.leave();
 
@@ -1249,7 +1249,7 @@ fn hmacFinalChecked(memory: ?[*]u8, length: usize, out: ?[*]u8, out_length: usiz
 
     defer slot.close();
 
-    const dit = cpu.Dit.enter();
+    const dit = cpu.Dit.enterKeyed();
 
     defer dit.leave();
 
@@ -1280,7 +1280,7 @@ fn hmacFinalVerifyChecked(memory: ?[*]u8, length: usize, tag: ?[*]const u8, tag_
 
     defer slot.close();
 
-    const dit = cpu.Dit.enter();
+    const dit = cpu.Dit.enterKeyed();
 
     defer dit.leave();
 
@@ -1321,7 +1321,7 @@ fn kdfDeriveChecked(algorithm: u32, ikm: ?[*]const u8, ikm_length: usize, salt: 
 
     try common.apart(&.{target}, &.{ secret, s, i });
 
-    const dit = cpu.Dit.enter();
+    const dit = cpu.Dit.enterKeyed();
 
     defer dit.leave();
 
@@ -1344,7 +1344,7 @@ fn kdfExtractChecked(algorithm: u32, ikm: ?[*]const u8, ikm_length: usize, salt:
 
     try common.apart(&.{target}, &.{ secret, s });
 
-    const dit = cpu.Dit.enter();
+    const dit = cpu.Dit.enterKeyed();
 
     defer dit.leave();
 
@@ -1367,7 +1367,7 @@ fn kdfExpandChecked(algorithm: u32, prk: ?[*]const u8, prk_length: usize, info: 
 
     try common.apart(&.{target}, &.{ key, i });
 
-    const dit = cpu.Dit.enter();
+    const dit = cpu.Dit.enterKeyed();
 
     defer dit.leave();
 

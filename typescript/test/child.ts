@@ -76,7 +76,7 @@ if (scenario === "no-webassembly") {
     return call(...args);
   });
 } else if (scenario === "abi-version") {
-  wrapExports((name, call) => (name === "cpq_abi_version" ? () => 2 : call));
+  wrapExports((name, call) => (name === "cpq_abi_version" ? () => 1 : call));
 } else if (scenario === "trap") {
   wrapExports((name, call) => (...args) => {
     if (name === "cpq_kem_decapsulate" && trap) {

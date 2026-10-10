@@ -2,7 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const vectors = @import("vectors");
 
+const aarch64 = @import("aarch64.zig");
 const capi = @import("capi.zig");
+const cpu = @import("cpu.zig");
 const pq = @import("root.zig");
 
 const testing = std.testing;
@@ -261,7 +263,7 @@ test "slot sizes and alignment" {
 
     try testing.expectEqual(0, capi.slotAlign(99, 0));
 
-    try testing.expectEqual(1, capi.abiVersion());
+    try testing.expectEqual(2, capi.abiVersion());
 
     var text: [256]u8 = undefined;
 
@@ -269,7 +271,7 @@ test "slot sizes and alignment" {
 
     try testing.expect(length > 0 and length <= text.len);
 
-    try testing.expect(std.mem.startsWith(u8, text[0..length], "crypto-pq abi 1; zig 0.16.0;"));
+    try testing.expect(std.mem.startsWith(u8, text[0..length], "crypto-pq abi 2; zig 0.16.0;"));
 
     try testing.expectEqual(length, capi.buildInfo(null, 0));
 }
@@ -1413,6 +1415,137 @@ test "HKDF through the ABI equals the core" {
     }
 
     try expectStatus(common.bad_argument, capi.hash.kdfDerive(capi.hash.kdfs.len, &ikm, ikm.len, null, 0, null, 0, null, 0));
+}
+
+const Keyed = enum { off, on, nested };
+
+// Checks the reads and writes of the DIT register on this thread since `trace`, which then moves
+// on to now: none while the switch is off; once it is on, a set and a clear around the call, or
+// only reads under the caller's DIT.
+fn expectKeyed(mode: Keyed, trace: *@TypeOf(aarch64.dit_trace)) !void {
+    const now = aarch64.dit_trace;
+
+    defer trace.* = now;
+
+    const reads, const writes = .{ now.reads - trace.reads, now.writes - trace.writes };
+
+    switch (mode) {
+        .off => try testing.expectEqual([2]usize{ 0, 0 }, [2]usize{ reads, writes }),
+        .on => try testing.expect(reads >= 1 and writes == 2),
+        .nested => try testing.expect(reads >= 1 and writes == 0),
+    }
+
+    if (comptime cpu.possible(.dit)) {
+        if (mode != .off) try testing.expectEqual(mode == .nested, aarch64.ditIsSet());
+    }
+}
+
+// Every keyed MAC and KDF entry point of the ABI, each checked by expectKeyed.
+fn checkKeyedCalls(mode: Keyed) !void {
+    const key = pattern(64, 1);
+
+    const data = pattern(100, 2);
+
+    var out: [64]u8 = undefined;
+
+    var trace = aarch64.dit_trace;
+
+    for (mac_ids, 0..) |algorithm, id| {
+        const size = algorithm.digest_size;
+
+        const state = try Memory.init(testing.allocator, .hmac, @intCast(id));
+
+        defer state.deinit();
+
+        try expectStatus(ok, capi.hash.hmac(@intCast(id), &key, 32, &data, data.len, &out, size));
+
+        try expectKeyed(mode, &trace);
+
+        try expectStatus(ok, capi.hash.hmacVerify(@intCast(id), &key, 32, &data, data.len, &out, size));
+
+        try expectKeyed(mode, &trace);
+
+        try expectStatus(ok, capi.hash.hmacInit(@intCast(id), &key, 32, state.ptr(), state.len()));
+
+        try expectKeyed(mode, &trace);
+
+        try expectStatus(ok, capi.hash.hmacUpdate(state.ptr(), state.len(), &data, data.len));
+
+        try expectKeyed(mode, &trace);
+
+        try expectStatus(ok, capi.hash.hmacFinalVerify(state.ptr(), state.len(), &out, size));
+
+        try expectKeyed(mode, &trace);
+
+        try expectStatus(ok, capi.hash.hmacFinal(state.ptr(), state.len(), &out, size));
+
+        try expectKeyed(mode, &trace);
+    }
+
+    for (capi.hash.kdfs, 0..) |algorithm, id| {
+        try expectStatus(ok, capi.hash.kdfDerive(@intCast(id), &key, key.len, null, 0, &data, data.len, &out, out.len));
+
+        try expectKeyed(mode, &trace);
+
+        try expectStatus(ok, capi.hash.kdfExtract(@intCast(id), &key, key.len, &data, data.len, &out, algorithm.hashSize()));
+
+        try expectKeyed(mode, &trace);
+
+        try expectStatus(ok, capi.hash.kdfExpand(@intCast(id), &key, key.len, &data, data.len, &out, out.len));
+
+        try expectKeyed(mode, &trace);
+    }
+}
+
+// The ABI's MAC and KDF calls leave the DIT register alone until
+// cpq_enable_data_independent_timing, which answers 1 where the CPU has DIT, and then take it as
+// KEM decapsulation always does.
+test "MAC and KDF calls through the ABI take DIT only after cpq_enable_data_independent_timing" {
+    cpu.keyed.store(false, .monotonic);
+
+    defer cpu.keyed.store(false, .monotonic);
+
+    const dit = cpu.has(.dit);
+
+    try checkKeyedCalls(.off);
+
+    const seed = pattern(64, 3);
+
+    const randomness = pattern(32, 4);
+
+    const private = try Memory.init(testing.allocator, .kem_private, 1);
+
+    defer private.deinit();
+
+    try expectStatus(ok, Kem.keygen(1, &seed, 0, private));
+
+    var ciphertext: [1088]u8 = undefined;
+
+    var secret: [32]u8 = undefined;
+
+    try expectStatus(ok, Kem.encapsulate(private, &randomness, &ciphertext, &secret));
+
+    const before = aarch64.dit_trace;
+
+    try expectStatus(ok, Kem.decapsulate(private, &ciphertext, &secret));
+
+    try testing.expectEqual(@as(usize, if (dit) 2 else 0), aarch64.dit_trace.writes - before.writes);
+
+    try testing.expectEqual(@as(c_int, @intFromBool(dit)), capi.enableDataIndependentTiming());
+
+    try testing.expectEqual(@as(c_int, @intFromBool(dit)), capi.enableDataIndependentTiming());
+
+    try checkKeyedCalls(if (dit) .on else .off);
+
+    if (comptime !cpu.possible(.dit)) return;
+
+    if (!dit) return;
+
+    const outer = cpu.Dit.enter();
+
+    defer outer.leave();
+
+    try checkKeyedCalls(.nested);
 }
 
 test "a state in use by another call is busy" {

@@ -4,7 +4,11 @@ const builtin = @import("builtin");
 const aarch64 = @import("aarch64.zig");
 const blake2 = @import("blake2.zig");
 const cpu = @import("cpu.zig");
+const hash = @import("hash.zig");
+const hazmat = @import("hazmat.zig");
+const kdf = @import("kdf.zig");
 const keccak = @import("keccak.zig");
+const kem = @import("kem.zig");
 const mldsa = @import("mldsa.zig");
 const mlkem = @import("mlkem.zig");
 const sha2 = @import("sha2.zig");
@@ -848,4 +852,113 @@ test "x86-64 AVX2 BLAKE2b and BLAKE2s match the portable code" {
     try checkBlake2(blake2.Blake2b, prng.random());
 
     try checkBlake2(blake2.Blake2s, prng.random());
+}
+
+// Checks the reads and writes of the DIT register on this thread since `trace`, which then moves
+// on to now.
+fn expectSince(trace: *@TypeOf(aarch64.dit_trace), reads: usize, writes: usize) !void {
+    const now = aarch64.dit_trace;
+
+    defer trace.* = now;
+
+    try testing.expectEqual([2]usize{ reads, writes }, [2]usize{ now.reads - trace.reads, now.writes - trace.writes });
+}
+
+// Every keyed MAC and KDF call, each of which must read and write the DIT register as given.
+fn checkKeyed(reads: usize, writes: usize) !void {
+    var trace = aarch64.dit_trace;
+
+    inline for (.{ hash.hmac_sha_256, hash.hmac_sha_512, hash.kmac128, hash.kmac256, hash.blake2b_mac, hash.blake2s_mac }) |mac| {
+        var buffers: [2][64]u8 = undefined;
+
+        const tag, const again = .{ buffers[0][0..mac.digest_size], buffers[1][0..mac.digest_size] };
+
+        mac.digest("key", "data", tag);
+
+        try expectSince(&trace, reads, writes);
+
+        try testing.expect(mac.verify("key", "data", tag));
+
+        try expectSince(&trace, reads, writes);
+
+        var state = mac.create("key");
+
+        try expectSince(&trace, reads, writes);
+
+        state.update("data");
+
+        try expectSince(&trace, reads, writes);
+
+        state.digest(again);
+
+        try expectSince(&trace, reads, writes);
+
+        try testing.expect(state.verify(tag));
+
+        try expectSince(&trace, reads, writes);
+
+        try testing.expectEqualSlices(u8, tag, again);
+    }
+
+    inline for (.{ kdf.hkdf_sha_256, kdf.hkdf_sha_512 }) |algorithm| {
+        var out: [42]u8 = undefined;
+
+        var prk: [64]u8 = undefined;
+
+        try algorithm.derive("ikm", &out, .{});
+
+        try expectSince(&trace, reads, writes);
+
+        try algorithm.extract("ikm", prk[0..algorithm.hashSize()], .{});
+
+        try expectSince(&trace, reads, writes);
+
+        try algorithm.expand(prk[0..algorithm.hashSize()], &out, .{});
+
+        try expectSince(&trace, reads, writes);
+    }
+}
+
+// MAC and KDF calls leave the DIT register alone until enableDataIndependentTiming, and then set
+// and clear it as KEM decapsulation always does; under another guard they only read it.
+test "MAC and KDF calls take DIT only after enableDataIndependentTiming" {
+    cpu.keyed.store(false, .monotonic);
+
+    defer cpu.keyed.store(false, .monotonic);
+
+    const dit = cpu.has(.dit);
+
+    try checkKeyed(0, 0);
+
+    var pair = try hazmat.generateKemKeyPair(kem.ml_kem_768, testing.allocator, &([_]u8{3} ** 64));
+
+    defer pair.private_key.deinit();
+
+    defer pair.public_key.deinit();
+
+    const sealed = try hazmat.encapsulate(&pair.public_key, &([_]u8{4} ** 32));
+
+    const before = aarch64.dit_trace;
+
+    try testing.expectEqual(sealed.shared_secret, try pair.private_key.decapsulate(sealed.ciphertext()));
+
+    try testing.expectEqual(@as(usize, if (dit) 2 else 0), aarch64.dit_trace.writes - before.writes);
+
+    try testing.expectEqual(dit, cpu.enableDataIndependentTiming());
+
+    try checkKeyed(@intFromBool(dit), 2 * @as(usize, @intFromBool(dit)));
+
+    if (comptime !cpu.possible(.dit)) return;
+
+    if (!dit) return;
+
+    try testing.expect(!aarch64.ditIsSet());
+
+    const outer = cpu.Dit.enter();
+
+    defer outer.leave();
+
+    try checkKeyed(1, 0);
+
+    try testing.expect(aarch64.ditIsSet());
 }

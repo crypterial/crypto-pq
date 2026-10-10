@@ -20,6 +20,7 @@ const public_exports = [_][]const u8{
     "cpq_abi_version",
     "cpq_build_info",
     "cpq_cpu_features",
+    "cpq_enable_data_independent_timing",
     "cpq_slot_size",
     "cpq_slot_align",
     "cpq_slot_info",

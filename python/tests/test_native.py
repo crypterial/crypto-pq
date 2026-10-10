@@ -239,6 +239,38 @@ class KnownAnswerTest(unittest.TestCase):
                 self.assertIn(reason, _native.extension_refusal())
 
 
+# Whether the native library's own detection finds DIT: bit 16 of cpq_cpu_features, read through
+# ctypes from the plain library in the package, which the extension module is built beside.
+def library_has_dit():
+    import ctypes
+
+    directory = os.path.dirname(os.path.abspath(crypto_pq.__file__))
+
+    _, files = _native.read_record(directory)
+
+    return bool(ctypes.CDLL(os.path.join(directory, files["library"][0])).cpq_cpu_features() & 16)
+
+
+class DataIndependentTimingTest(unittest.TestCase):
+    # The switch answers whether MAC and KDF calls now run under DIT: where the library finds DIT,
+    # and never with the pure backend. It answers the same every time and changes no output.
+    def test_switch(self):
+        def outputs():
+            return [algorithm.digest(b"key", b"data") for algorithm in HMACS + MORE_MACS] + [algorithm.derive(b"ikm", 42, salt=b"salt", info=b"info") for algorithm in KDFS]
+
+        before = outputs()
+
+        enabled = crypto_pq.enable_data_independent_timing()
+
+        self.assertIs(enabled, NATIVE and library_has_dit())
+
+        self.assertIs(crypto_pq.enable_data_independent_timing(), enabled)
+
+        self.assertEqual(outputs(), before)
+
+        self.assertIn("enable_data_independent_timing", crypto_pq.__all__)
+
+
 @unittest.skipUnless(NATIVE, "compares the native backend with the pure one")
 class DifferentialTest(unittest.TestCase):
     # The pure algorithms hash through hashlib here, a test-only oracle apart from both of
@@ -1504,9 +1536,9 @@ class FallbackTest(ProbeCase):
             self.write(role, data)
 
     def test_abi_version(self):
-        self.patch_module("ABI_VERSION = 1", "ABI_VERSION = 2")
+        self.patch_module("ABI_VERSION = 2", "ABI_VERSION = 3")
 
-        self.without_either("the native library has ABI version 1, and this package needs 2", "the extension module has ABI version 1, and this package needs 2")
+        self.without_either("the native library has ABI version 2, and this package needs 3", "the extension module has ABI version 2, and this package needs 3")
 
     def test_self_test(self):
         self.patch_module(_native.SELF_TEST_DIGEST, "00" * 32)
@@ -1526,6 +1558,12 @@ class FallbackTest(ProbeCase):
 class ExtensionTest(unittest.TestCase):
     def setUp(self):
         self.module = importlib.import_module("crypto_pq._cpq")
+
+    # The switch is the module's own function, which calls the library in place.
+    def test_data_independent_timing(self):
+        self.assertIs(_native.binding.enable_data_independent_timing, self.module.enable_data_independent_timing)
+
+        self.assertIs(self.module.enable_data_independent_timing(), library_has_dit())
 
     # The module that passed the known-answer test is the one that an import finds.
     def test_registered(self):

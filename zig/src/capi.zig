@@ -96,6 +96,12 @@ pub fn cpuFeatures() callconv(.c) u32 {
     return bits;
 }
 
+// 1 when MAC and KDF calls now run under DIT, as the asymmetric operations always do, and 0 where
+// the CPU has no DIT; one way, for every thread.
+pub fn enableDataIndependentTiming() callconv(.c) c_int {
+    return @intFromBool(cpu.enableDataIndependentTiming());
+}
+
 // What the binding knows of the engine that runs a WebAssembly module, given before the module
 // does any work. It picks between code shapes of equal results: bit 0, the engine compiles a
 // rotation of 64-bit vector lanes faster as two added shifts (V8 before version 15); bit 1, it
@@ -232,6 +238,7 @@ comptime {
             .{ "cpq_abi_version", &abiVersion },
             .{ "cpq_build_info", &buildInfo },
             .{ "cpq_cpu_features", &cpuFeatures },
+            .{ "cpq_enable_data_independent_timing", &enableDataIndependentTiming },
             .{ "cpq_slot_size", &slotSize },
             .{ "cpq_slot_align", &slotAlign },
             .{ "cpq_slot_info", &slotInfo },

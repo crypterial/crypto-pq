@@ -282,9 +282,9 @@ const MacKind = union(enum) {
     blake2s: [8]u32,
 };
 
-// A MAC runs under DIT because its key is secret; plain hashes do not know whether their input is.
-// Each public function takes the guard once, around everything it does with the key, and the
-// functions it calls take none of their own.
+// A MAC runs under the keyed DIT guard because its key is secret; plain hashes do not know whether
+// their input is. Each public function takes the guard once, around everything it does with the
+// key, and the functions it calls take none of their own.
 pub const MacAlgorithm = struct {
     name: []const u8,
     digest_size: usize,
@@ -295,7 +295,7 @@ pub const MacAlgorithm = struct {
 
         self.checkKey(key);
 
-        const dit = cpu.Dit.enter();
+        const dit = cpu.Dit.enterKeyed();
 
         defer dit.leave();
 
@@ -316,7 +316,7 @@ pub const MacAlgorithm = struct {
     pub fn init(self: MacAlgorithm, mac_state: *Mac, key: []const u8) void {
         self.checkKey(key);
 
-        const dit = cpu.Dit.enter();
+        const dit = cpu.Dit.enterKeyed();
 
         defer dit.leave();
 
@@ -377,7 +377,7 @@ pub const MacAlgorithm = struct {
     pub fn verify(self: MacAlgorithm, key: []const u8, data: []const u8, tag: []const u8) bool {
         if (tag.len != self.digest_size or !self.takes(key)) return false;
 
-        const dit = cpu.Dit.enter();
+        const dit = cpu.Dit.enterKeyed();
 
         defer dit.leave();
 
@@ -595,7 +595,7 @@ pub const Mac = struct {
     size: usize,
 
     pub fn update(self: *Mac, data: []const u8) void {
-        const dit = cpu.Dit.enter();
+        const dit = cpu.Dit.enterKeyed();
 
         defer dit.leave();
 
@@ -609,7 +609,7 @@ pub const Mac = struct {
     pub fn digest(self: *const Mac, out: []u8) void {
         checkLength(out.len, self.size);
 
-        const dit = cpu.Dit.enter();
+        const dit = cpu.Dit.enterKeyed();
 
         defer dit.leave();
 
@@ -630,7 +630,7 @@ pub const Mac = struct {
     pub fn verify(self: *const Mac, tag: []const u8) bool {
         if (tag.len != self.size) return false;
 
-        const dit = cpu.Dit.enter();
+        const dit = cpu.Dit.enterKeyed();
 
         defer dit.leave();
 

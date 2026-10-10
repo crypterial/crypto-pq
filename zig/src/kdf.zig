@@ -18,7 +18,7 @@ pub const KdfOptions = struct {
 pub const Hash = enum { sha256, sha384, sha512 };
 
 // HKDF (RFC 5869) over HMAC-SHA-256, HMAC-SHA-384 or HMAC-SHA-512. Its keys, PRK and output are
-// secret: each public function runs under one DIT guard, and everything derived from them is
+// secret: each public function runs under one keyed DIT guard, and everything derived from them is
 // wiped.
 pub const KdfAlgorithm = struct {
     name: []const u8,
@@ -36,7 +36,7 @@ pub const KdfAlgorithm = struct {
     pub fn derive(self: KdfAlgorithm, ikm: []const u8, out: []u8, options: KdfOptions) Error!void {
         try self.checkOutput(out.len);
 
-        const dit = cpu.Dit.enter();
+        const dit = cpu.Dit.enterKeyed();
 
         defer dit.leave();
 
@@ -58,7 +58,7 @@ pub const KdfAlgorithm = struct {
 
         if (out.len != self.hashSize()) return error.InvalidLength;
 
-        const dit = cpu.Dit.enter();
+        const dit = cpu.Dit.enterKeyed();
 
         defer dit.leave();
 
@@ -73,7 +73,7 @@ pub const KdfAlgorithm = struct {
 
         try self.checkOutput(out.len);
 
-        const dit = cpu.Dit.enter();
+        const dit = cpu.Dit.enterKeyed();
 
         defer dit.leave();
 

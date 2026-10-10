@@ -189,8 +189,8 @@ func (a MacAlgorithm) DigestInto(key, data, out []byte) {
 	a.digestInto(key, data, out)
 }
 
-// The receiver is a copy, so KMAC absorbs into its state in place; DIT is held around everything
-// done with the key.
+// The receiver is a copy, so KMAC absorbs into its state in place; the keyed DIT bracket is held
+// around everything done with the key.
 func (a *MacAlgorithm) digestInto(key, data, out []byte) {
 	spec := macSpecOf(a.id)
 
@@ -200,7 +200,9 @@ func (a *MacAlgorithm) digestInto(key, data, out []byte) {
 		checkBlake2Key(spec, key)
 	}
 
-	defer ditLeave(ditEnter())
+	if keyedDit() {
+		defer ditLeave(ditEnter())
+	}
 
 	switch spec.kind {
 	case macKindHMAC:
@@ -229,7 +231,9 @@ func (a MacAlgorithm) Create(key []byte) *Mac {
 		checkBlake2Key(spec, key)
 	}
 
-	defer ditLeave(ditEnter())
+	if keyedDit() {
+		defer ditLeave(ditEnter())
+	}
 
 	switch spec.kind {
 	case macKindHMAC:
@@ -267,7 +271,9 @@ func (a MacAlgorithm) Verify(key, data, tag []byte) bool {
 		checkBlake2Key(spec, key)
 	}
 
-	defer ditLeave(ditEnter())
+	if keyedDit() {
+		defer ditLeave(ditEnter())
+	}
 
 	if spec.kind == macKindKMAC {
 		if len(tag) != a.length {
@@ -298,8 +304,8 @@ func (a MacAlgorithm) String() string {
 }
 
 // HMAC (RFC 2104) with every buffer on the stack, where it is cleared, so that a call allocates
-// nothing; the callers hold DIT. The inner and outer key blocks are compressed side by side where
-// the CPU can, and the inner and outer hashes are finished without engines.
+// nothing; the callers decide on DIT. The inner and outer key blocks are compressed side by side
+// where the CPU can, and the inner and outer hashes are finished without engines.
 func hmacInto(hash HashAlgorithm, key, data, out []byte) {
 	var block [128]byte
 
@@ -428,7 +434,9 @@ func newMac(e macEngine, size int) *Mac {
 }
 
 func (m *Mac) Update(data []byte) {
-	defer ditLeave(ditEnter())
+	if keyedDit() {
+		defer ditLeave(ditEnter())
+	}
 
 	m.engine.update(data)
 }
@@ -444,13 +452,17 @@ func (m *Mac) Digest() []byte {
 func (m *Mac) DigestInto(out []byte) {
 	checkDigestLength(len(out), m.size)
 
-	defer ditLeave(ditEnter())
+	if keyedDit() {
+		defer ditLeave(ditEnter())
+	}
 
 	m.engine.finish(out)
 }
 
 func (m *Mac) Verify(tag []byte) bool {
-	defer ditLeave(ditEnter())
+	if keyedDit() {
+		defer ditLeave(ditEnter())
+	}
 
 	return m.engine.verify(tag)
 }

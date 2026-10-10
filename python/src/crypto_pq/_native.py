@@ -27,7 +27,7 @@ import sys
 
 from ._errors import CryptoPQError, ErrorCode
 
-ABI_VERSION = 1
+ABI_VERSION = 2
 
 # The build record that the wheel builder writes next to the native files: the platform they were
 # built for, then each file's role, name, size and CRC-32.
@@ -317,6 +317,13 @@ def refuse(choice, reason, extension_error):
 BACKEND, LOAD_ERROR, binding, EXTENSION_ERROR = select()
 
 BINDING = binding.NAME if binding is not None else None
+
+
+# From now on every MAC and KDF call of the native library, on every thread, runs under DIT as its
+# KEM and signature operations always do; there is no way back. False where the CPU has no DIT,
+# and with the pure backend, which has none to set.
+def enable_data_independent_timing() -> bool:
+    return binding is not None and binding.enable_data_independent_timing()
 
 
 if binding is not None:

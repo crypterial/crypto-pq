@@ -10,7 +10,7 @@ use crate::sha2::{self, Sha256, Sha512, finish256, finish512};
 use crate::wipe::wipe;
 
 // HKDF (RFC 5869) over HMAC with SHA-2. The PRK, every T(i) and the keyed states are secret and
-// wiped; one DIT guard covers each public call.
+// wiped; one keyed DIT guard covers each public call.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct KdfAlgorithm {
     name: &'static str,
@@ -73,7 +73,7 @@ impl KdfAlgorithm {
     ) -> Result<(), Error> {
         self.check_output(out.len())?;
 
-        let _dit = Dit::new();
+        let _dit = Dit::keyed();
 
         let mut prk = [0; 64];
 
@@ -111,7 +111,7 @@ impl KdfAlgorithm {
             return Err(Error::InvalidLength);
         }
 
-        let _dit = Dit::new();
+        let _dit = Dit::keyed();
 
         hmac(&self.hash, options.salt, ikm, out);
 
@@ -150,7 +150,7 @@ impl KdfAlgorithm {
 
         self.check_output(out.len())?;
 
-        let _dit = Dit::new();
+        let _dit = Dit::keyed();
 
         self.expand_unchecked(prk, options.info, out);
 

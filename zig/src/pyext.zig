@@ -437,6 +437,12 @@ fn abiVersion(module: *Object) ?*Object {
     return py.PyLong_FromUnsignedLongLong(capi.abiVersion());
 }
 
+fn enableDataIndependentTiming(module: *Object) ?*Object {
+    _ = module;
+
+    return boolean(capi.enableDataIndependentTiming() != 0);
+}
+
 // The package's failure(status, message), which turns statuses into its exceptions.
 fn setup(module: *Object, failure: *Object) ?*Object {
     if (py.PyCallable_Check(failure) == 0) return typeError("failure must be callable");
@@ -1148,6 +1154,7 @@ fn oneShotMethods() [one_shot_count]py.MethodDef {
 
 const methods = [_]py.MethodDef{
     method("abi_version", abiVersion),
+    method("enable_data_independent_timing", enableDataIndependentTiming),
     method("setup", setup),
     method("slot_info", slotInfo),
     method("wipe", wipe),

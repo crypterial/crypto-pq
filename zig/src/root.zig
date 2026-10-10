@@ -1,3 +1,4 @@
+const cpu = @import("cpu.zig");
 const errors = @import("errors.zig");
 const hash = @import("hash.zig");
 const kdf = @import("kdf.zig");
@@ -7,6 +8,8 @@ const signature = @import("signature.zig");
 const stateful = @import("stateful.zig");
 
 pub const Error = errors.Error;
+
+pub const enableDataIndependentTiming = cpu.enableDataIndependentTiming;
 
 pub const KeyFormat = keys.KeyFormat;
 

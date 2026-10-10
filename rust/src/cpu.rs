@@ -384,6 +384,14 @@ impl Field {
 ))]
 pub(crate) use aarch64::Dit;
 
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    target_feature = "neon",
+    not(crypto_pq_portable)
+))]
+pub use aarch64::enable_data_independent_timing;
+
 // Data-independent timing is an arm64 mode; elsewhere the guard does nothing.
 #[cfg(not(all(
     target_arch = "aarch64",
@@ -404,6 +412,21 @@ impl Dit {
     pub(crate) fn new() -> Self {
         Self
     }
+
+    #[inline(always)]
+    pub(crate) fn keyed() -> Self {
+        Self
+    }
+}
+
+#[cfg(not(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    target_feature = "neon",
+    not(crypto_pq_portable)
+)))]
+pub fn enable_data_independent_timing() -> bool {
+    false
 }
 
 // ML-KEM's transforms on 16-bit lanes, twice as many coefficients per vector: q < 2^12, so the
@@ -551,4 +574,23 @@ pub(crate) mod testing {
     // Every bit clear, every bit set and the two alternating patterns, which drive the carries
     // and rotations of the kernels to their extremes.
     pub(crate) const EDGES: [u64; 4] = [0, u64::MAX, 0xAAAA_AAAA_AAAA_AAAA, 0x5555_5555_5555_5555];
+}
+
+// Without the arm64 kernels there is no DIT for MAC and KDF calls to take.
+#[cfg(all(
+    test,
+    not(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        target_feature = "neon",
+        not(crypto_pq_portable)
+    ))
+))]
+mod tests {
+    #[test]
+    fn no_data_independent_timing() {
+        assert!(!crate::enable_data_independent_timing());
+
+        assert!(!crate::enable_data_independent_timing());
+    }
 }

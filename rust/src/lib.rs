@@ -64,6 +64,7 @@ mod xmss;
 
 mod xwing;
 
+pub use cpu::enable_data_independent_timing;
 pub use error::Error;
 pub use hash::{
     ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_160, BLAKE2B_256, BLAKE2B_384, BLAKE2B_512,

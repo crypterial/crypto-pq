@@ -15,6 +15,7 @@ MODULE = f"{__package__}._cpq"
 # The functions of the module that are the binding's own, under the same names.
 DIRECT = (
     "Slot",
+    "enable_data_independent_timing",
     "slot_info",
     "wipe",
     "kem_generate",

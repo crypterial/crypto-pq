@@ -2,7 +2,10 @@
 
 package cryptopq
 
-import "runtime"
+import (
+	"runtime"
+	"sync/atomic"
+)
 
 // What the CPU offers, asked once when the package is initialized; the purego build tag leaves
 // all of it out and runs the portable code.
@@ -24,6 +27,15 @@ var (
 	useDIT = arm.dit
 )
 
+// MAC and KDF calls take DIT only after EnableDataIndependentTiming: it costs 30-54 ns a call on
+// an Apple M3, the whole gap on short MACs, and the prefetcher attacks it stops (GoFetch) need
+// intermediates that a small key guess predicts, which ML-KEM, ML-DSA and X25519 have and keyed
+// SHA-2, Keccak and BLAKE2 states, each a function of the whole key, do not.
+var keyedDIT atomic.Bool
+
+// A test sees every bracket through this, with what ditSet found; it is nil otherwise.
+var ditWatch func(wasSet bool)
+
 func midr() uint64
 
 func ditSet() bool
@@ -42,7 +54,13 @@ func ditEnter() bool {
 
 	runtime.LockOSThread()
 
-	return ditSet()
+	wasSet := ditSet()
+
+	if ditWatch != nil {
+		ditWatch(wasSet)
+	}
+
+	return wasSet
 }
 
 func ditLeave(wasSet bool) {
@@ -55,4 +73,20 @@ func ditLeave(wasSet bool) {
 	}
 
 	runtime.UnlockOSThread()
+}
+
+// EnableDataIndependentTiming makes every MAC and KDF call from now on, in every goroutine, run
+// under PSTATE.DIT, as the KEM and signature operations always do; there is no way back. It
+// reports whether the CPU has DIT.
+func EnableDataIndependentTiming() bool {
+	if useDIT {
+		keyedDIT.Store(true)
+	}
+
+	return useDIT
+}
+
+// Whether a MAC or KDF call brackets itself with ditEnter and ditLeave.
+func keyedDit() bool {
+	return keyedDIT.Load()
 }

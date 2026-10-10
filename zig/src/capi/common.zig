@@ -170,7 +170,7 @@ pub const Header = extern struct {
     users: u32,
 };
 
-pub const abi_version: u32 = 1;
+pub const abi_version: u32 = 2;
 
 // The little-endian bytes are the slot type, "cpq", the ABI version and "abi".
 pub fn magic(slot_type: SlotType) u64 {
