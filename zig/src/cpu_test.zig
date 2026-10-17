@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const aarch64 = @import("aarch64.zig");
+const ascon = @import("ascon.zig");
 const blake2 = @import("blake2.zig");
 const cpu = @import("cpu.zig");
 const hash = @import("hash.zig");
@@ -13,6 +14,7 @@ const mldsa = @import("mldsa.zig");
 const mlkem = @import("mlkem.zig");
 const sha2 = @import("sha2.zig");
 const x86_64 = @import("x86_64.zig");
+const xwing = @import("xwing.zig");
 
 // Every CPU-specific kernel against the portable code, on random inputs and edge cases, whenever
 // the CPU running the tests has its instructions. Nothing in the library imports this file, so
@@ -782,6 +784,64 @@ test "x86-64 AVX2 Keccak in four lanes matches the portable permutation" {
     try checkKeccak(4, x86_64.keccak4, prng.random());
 }
 
+// One to seven blocks split between the kernel's two parts at every point, and pairs of blocks
+// of two streams, against the portable compression.
+fn checkStream(comptime Word: type, random: std.Random) !void {
+    const block = 16 * @sizeOf(Word);
+
+    const compress = if (Word == u32) sha2.portable.compress256 else sha2.portable.compress512;
+
+    for (0..runs / 4) |case| {
+        var state: [8]Word = undefined;
+
+        var data: [7 * block]u8 = undefined;
+
+        fill(random, std.mem.asBytes(&state), case);
+
+        fill(random, &data, case);
+
+        const count = 1 + case % 7;
+
+        const split = random.uintAtMost(usize, count);
+
+        var expected = state;
+
+        for (0..count) |b| compress(&expected, data[block * b ..][0..block]);
+
+        var got = state;
+
+        const first = data[0 .. block * split];
+
+        const second = data[block * split .. block * count];
+
+        if (Word == u32) x86_64.sha256Stream(&got, first, second) else x86_64.sha512Stream(&got, first, second);
+
+        try testing.expectEqualSlices(Word, &expected, &got);
+
+        var states: [2][8]Word = .{ state, expected };
+
+        var pair = states;
+
+        for (&states, 0..) |*s, i| compress(s, data[block * i ..][0..block]);
+
+        if (Word == u32) x86_64.sha256Pair(&pair, data[0..block], data[block..][0..block]) else x86_64.sha512Pair(&pair, data[0..block], data[block..][0..block]);
+
+        try testing.expectEqual(states, pair);
+    }
+}
+
+test "x86-64 AVX2 SHA-256 and SHA-512 of one stream match the portable code" {
+    if (comptime arch != .x86_64 or !cpu.possible(.avx2)) return error.SkipZigTest;
+
+    if (!cpu.has(.avx2)) return error.SkipZigTest;
+
+    var prng: std.Random.DefaultPrng = .init(0x2562);
+
+    try checkStream(u32, prng.random());
+
+    try checkStream(u64, prng.random());
+}
+
 fn blake2Words(comptime W: type, bytes: []const u8) [16]W {
     var m: [16]W = undefined;
 
@@ -961,4 +1021,366 @@ test "MAC and KDF calls take DIT only after enableDataIndependentTiming" {
     try checkKeyed(1, 0);
 
     try testing.expect(aarch64.ditIsSet());
+}
+
+// The entry points that the x86-64-v3 build replaces (x86_64_v3.zig) run twice on the same random
+// inputs: through the object, and through this build's own code with the level hidden, which
+// then takes the portable code throughout. Every output must agree.
+
+const every_feature = std.enums.values(cpu.Feature);
+
+const below_v3 = [_]cpu.Feature{ .sha256, .sha512, .sha3, .dit };
+
+// pass 0 takes the x86-64-v3 build, pass 1 this build's code.
+fn levelFor(pass: usize) void {
+    cpu.restrict(if (pass == 0) every_feature else &below_v3);
+}
+
+fn v3Available() bool {
+    if (comptime !cpu.v3_object) return false;
+
+    return cpu.has(.avx2);
+}
+
+fn checkMlKemV3(comptime p: mlkem.Parameters, random: std.Random) !void {
+    const k = p.k;
+
+    const Key = mlkem.EncapsulationKey(k);
+
+    const keys = try testing.allocator.alloc(Key, 4);
+
+    defer testing.allocator.free(keys);
+
+    for (0..16) |case| {
+        var d: [32]u8 = undefined;
+
+        var z: [32]u8 = undefined;
+
+        var m: [32]u8 = undefined;
+
+        fill(random, &d, case);
+
+        fill(random, &z, case);
+
+        fill(random, &m, case);
+
+        var ek: [2][p.encapsulationKeySize()]u8 = undefined;
+
+        var dk: [2][p.decapsulationKeySize()]u8 = undefined;
+
+        var s_hat: [2][k]mlkem.Poly = undefined;
+
+        var c: [2][p.ciphertextSize()]u8 = undefined;
+
+        var shared: [2][3][32]u8 = undefined;
+
+        const flipped = random.uintLessThan(usize, p.ciphertextSize());
+
+        for (0..2) |pass| {
+            levelFor(pass);
+
+            mlkem.keyGen(p, &d, &z, &ek[pass], &dk[pass], &s_hat[pass], &keys[pass]);
+
+            keys[2 + pass].fill(&ek[pass]);
+
+            mlkem.encaps(p, &keys[pass], &m, &shared[pass][0], &c[pass]);
+
+            mlkem.decapsInto(p, &s_hat[pass], &keys[pass], &dk[pass], &c[pass], &shared[pass][1]);
+
+            // A ciphertext that does not re-encrypt to itself: the implicit rejection.
+            var wrong = c[pass];
+
+            wrong[flipped] ^= 1;
+
+            mlkem.decapsInto(p, &s_hat[pass], &keys[pass], &dk[pass], &wrong, &shared[pass][2]);
+        }
+
+        try testing.expectEqualSlices(u8, &ek[0], &ek[1]);
+
+        try testing.expectEqualSlices(u8, &dk[0], &dk[1]);
+
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&s_hat[0]), std.mem.asBytes(&s_hat[1]));
+
+        for ([_]usize{ 0, 2 }) |i| try testing.expectEqualSlices(u8, std.mem.asBytes(&keys[i]), std.mem.asBytes(&keys[i + 1]));
+
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&keys[0]), std.mem.asBytes(&keys[2]));
+
+        try testing.expectEqualSlices(u8, &c[0], &c[1]);
+
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&shared[0]), std.mem.asBytes(&shared[1]));
+
+        try testing.expectEqualSlices(u8, &shared[0][0], &shared[0][1]);
+    }
+}
+
+fn checkXWingV3(random: std.Random) !void {
+    const keys = try testing.allocator.alloc(xwing.EncapsulationKey, 2);
+
+    defer testing.allocator.free(keys);
+
+    for (0..16) |case| {
+        var seed: [xwing.seed_size]u8 = undefined;
+
+        var eseed: [xwing.randomness_size]u8 = undefined;
+
+        fill(random, &seed, case);
+
+        fill(random, &eseed, case);
+
+        var public_key: [2][xwing.public_key_size]u8 = undefined;
+
+        var dk: [2]xwing.DecapsulationKey = undefined;
+
+        var scalar: [2][32]u8 = undefined;
+
+        var s_hat: [2]xwing.Secret = undefined;
+
+        var ciphertext: [2][xwing.ciphertext_size]u8 = undefined;
+
+        var shared: [2][2][32]u8 = undefined;
+
+        for (0..2) |pass| {
+            levelFor(pass);
+
+            xwing.expand(&seed, &public_key[pass], &dk[pass], &scalar[pass], &s_hat[pass], &keys[pass]);
+
+            xwing.encapsulate(&keys[pass], &public_key[pass], &eseed, &shared[pass][0], &ciphertext[pass]);
+
+            xwing.decapsulateInto(&s_hat[pass], &keys[pass], &dk[pass], &scalar[pass], &public_key[pass], &ciphertext[pass], &shared[pass][1]);
+        }
+
+        try testing.expectEqualSlices(u8, &public_key[0], &public_key[1]);
+
+        try testing.expectEqualSlices(u8, &dk[0], &dk[1]);
+
+        try testing.expectEqualSlices(u8, &scalar[0], &scalar[1]);
+
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&s_hat[0]), std.mem.asBytes(&s_hat[1]));
+
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&keys[0]), std.mem.asBytes(&keys[1]));
+
+        try testing.expectEqualSlices(u8, &ciphertext[0], &ciphertext[1]);
+
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&shared[0]), std.mem.asBytes(&shared[1]));
+
+        try testing.expectEqualSlices(u8, &shared[0][0], &shared[0][1]);
+    }
+}
+
+test "x86-64 v3 build of ML-KEM and X-Wing matches the portable code" {
+    if (!v3Available()) return error.SkipZigTest;
+
+    defer cpu.restrict(every_feature);
+
+    var prng: std.Random.DefaultPrng = .init(0x3e3);
+
+    const random = prng.random();
+
+    try checkMlKemV3(mlkem.ml_kem_512, random);
+
+    try checkMlKemV3(mlkem.ml_kem_768, random);
+
+    try checkMlKemV3(mlkem.ml_kem_1024, random);
+
+    try checkXWingV3(random);
+}
+
+fn checkMlDsaV3(comptime p: mldsa.Parameters, random: std.Random) !void {
+    const State = struct {
+        public: [2]mldsa.PublicCache(p),
+        filled: [2]mldsa.PublicCache(p),
+        secret: [2]mldsa.SecretCache(p),
+        work: mldsa.Workspace(p),
+    };
+
+    const state = try testing.allocator.create(State);
+
+    defer testing.allocator.destroy(state);
+
+    for (0..8) |case| {
+        var seed: [32]u8 = undefined;
+
+        var rnd: [32]u8 = undefined;
+
+        var message: [100]u8 = undefined;
+
+        fill(random, &seed, case);
+
+        fill(random, &rnd, case);
+
+        fill(random, &message, case);
+
+        const parts = [_][]const u8{ message[0 .. case * 7 % 64], message[case * 7 % 64 ..] };
+
+        var pk: [2][p.publicKeySize()]u8 = undefined;
+
+        var sk: [2][p.privateKeySize()]u8 = undefined;
+
+        var rebuilt: [2][p.publicKeySize()]u8 = undefined;
+
+        var signature: [2][p.signatureSize()]u8 = undefined;
+
+        var answers: [2][5]bool = undefined;
+
+        const flipped = random.uintLessThan(usize, p.lambda / 4);
+
+        for (0..2) |pass| {
+            levelFor(pass);
+
+            mldsa.keyGen(p, &seed, &pk[pass], &sk[pass], &state.public[pass]);
+
+            state.filled[pass].fill(&pk[pass]);
+
+            state.secret[pass].fill(&sk[pass]);
+
+            answers[pass][0] = mldsa.checkPrivateKey(p, &sk[pass], &rebuilt[pass]);
+
+            // A changed coefficient of t0 no longer matches the rest of the key.
+            var changed = sk[pass];
+
+            changed[changed.len - 1] ^= 0x10;
+
+            var discarded: [p.publicKeySize()]u8 = undefined;
+
+            answers[pass][1] = mldsa.checkPrivateKey(p, &changed, &discarded);
+
+            mldsa.sign(p, &sk[pass], &state.secret[pass], &state.public[pass], &state.work, &parts, &rnd, &signature[pass]);
+
+            const tr = sk[pass][64..128];
+
+            answers[pass][2] = mldsa.verify(p, &pk[pass], tr, &state.public[pass], &parts, &signature[pass]);
+
+            answers[pass][3] = mldsa.verify(p, &pk[pass], tr, null, &parts, &signature[pass]);
+
+            var forged = signature[pass];
+
+            forged[flipped] ^= 1;
+
+            answers[pass][4] = mldsa.verify(p, &pk[pass], tr, &state.public[pass], &parts, &forged);
+        }
+
+        try testing.expectEqualSlices(u8, &pk[0], &pk[1]);
+
+        try testing.expectEqualSlices(u8, &sk[0], &sk[1]);
+
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&state.public[0]), std.mem.asBytes(&state.public[1]));
+
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&state.filled[0]), std.mem.asBytes(&state.filled[1]));
+
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&state.public[0]), std.mem.asBytes(&state.filled[0]));
+
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&state.secret[0]), std.mem.asBytes(&state.secret[1]));
+
+        try testing.expectEqualSlices(u8, &rebuilt[0], &rebuilt[1]);
+
+        try testing.expectEqualSlices(u8, &pk[0], &rebuilt[0]);
+
+        try testing.expectEqualSlices(u8, &signature[0], &signature[1]);
+
+        try testing.expectEqual(answers[0], answers[1]);
+
+        try testing.expectEqual([5]bool{ true, false, true, true, false }, answers[0]);
+    }
+}
+
+test "x86-64 v3 build of ML-DSA matches the portable code" {
+    if (!v3Available()) return error.SkipZigTest;
+
+    defer cpu.restrict(every_feature);
+
+    var prng: std.Random.DefaultPrng = .init(0xd5a);
+
+    const random = prng.random();
+
+    try checkMlDsaV3(mldsa.ml_dsa_44, random);
+
+    try checkMlDsaV3(mldsa.ml_dsa_65, random);
+
+    try checkMlDsaV3(mldsa.ml_dsa_87, random);
+}
+
+test "x86-64 BMI Keccak matches the portable permutation" {
+    if (comptime arch != .x86_64 or !cpu.possible(.avx2)) return error.SkipZigTest;
+
+    if (!cpu.has(.avx2)) return error.SkipZigTest;
+
+    var prng: std.Random.DefaultPrng = .init(0xb31);
+
+    const random = prng.random();
+
+    try checkKeccak(1, bmiOne, random);
+
+    // The absorbing kernel against XOR and the portable permutation block by block, for every
+    // rate it takes and one to three blocks.
+    const rates = [_]usize{ 72, 104, 136, 144, 168 };
+
+    for (0..runs / 4) |case| {
+        const rate = rates[case % rates.len];
+
+        const blocks = 1 + case / 5 % 3;
+
+        var state: [25]u64 = undefined;
+
+        var data: [3 * 168]u8 = undefined;
+
+        fill(random, std.mem.asBytes(&state), case / 15);
+
+        fill(random, &data, case / 15);
+
+        var expected = state;
+
+        for (0..blocks) |b| {
+            keccak.xorBytes(&expected, 0, data[rate * b ..][0..rate]);
+
+            keccak.portable.permute(&expected);
+        }
+
+        x86_64.keccakAbsorbBmi(&state, rate, data[0 .. rate * blocks]);
+
+        try testing.expectEqualSlices(u64, &expected, &state);
+    }
+}
+
+fn bmiOne(states: *[1][25]u64) void {
+    x86_64.keccakBmi(&states[0]);
+}
+
+test "x86-64 v3 build of Ascon matches the portable code" {
+    if (!v3Available()) return error.SkipZigTest;
+
+    defer cpu.restrict(every_feature);
+
+    var prng: std.Random.DefaultPrng = .init(0xa5c);
+
+    const random = prng.random();
+
+    var data: [300]u8 = undefined;
+
+    for (0..runs / 10) |case| {
+        fill(random, &data, case);
+
+        const length = random.uintAtMost(usize, data.len);
+
+        const split = random.uintAtMost(usize, length);
+
+        var out: [2][100]u8 = undefined;
+
+        const size = 1 + random.uintLessThan(usize, out[0].len);
+
+        for (0..2) |pass| {
+            levelFor(pass);
+
+            var sponge: ascon.Sponge = .{ .state = if (case % 2 == 0) ascon.hash_iv else ascon.xof_iv };
+
+            sponge.update(data[0..split]);
+
+            sponge.update(data[split..length]);
+
+            sponge.read(out[pass][0 .. size / 2]);
+
+            sponge.read(out[pass][size / 2 .. size]);
+        }
+
+        try testing.expectEqualSlices(u8, out[0][0..size], out[1][0..size]);
+    }
 }

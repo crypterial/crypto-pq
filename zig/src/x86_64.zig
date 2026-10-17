@@ -5,9 +5,10 @@ const ct = @import("ct.zig");
 const keccak = @import("keccak.zig");
 const sha2 = @import("sha2.zig");
 
-// x86-64 kernels for the dispatch in cpu.zig: SHA-256 with SHA-NI, and SHA-256 in eight lanes,
-// Keccak-f[1600] in four and the BLAKE2 compressions with AVX2 where a build for a baseline CPU
-// must choose them at run time.
+// x86-64 kernels for the dispatch in cpu.zig: SHA-256 with SHA-NI; SHA-256 in eight lanes,
+// Keccak-f[1600] in four and the BLAKE2 compressions with AVX2; SHA-256 and SHA-512 of one stream
+// with AVX2 and BMI2, and Keccak-f[1600] on one state with BMI1 and BMI2, where a build for a
+// baseline CPU must choose them at run time.
 // Every instruction here is on Intel's data-operand-independent-timing list, and nothing branches
 // on or indexes memory by data.
 
@@ -52,9 +53,19 @@ pub const Features = struct {
     avx2: bool,
 };
 
-// SHA-NI is CPUID.(EAX=7,ECX=0):EBX bit 29 and AVX2 bit 5; SSSE3, SSE4.1, OSXSAVE and AVX are
-// CPUID.1:ECX bits 9, 19, 27 and 28. XGETBV is defined only with OSXSAVE, and XCR0 bits 1 and 2
-// say that the xmm and ymm registers survive a context switch.
+// The x86-64-v3 level and the v2 level below it, as CPUID reports them: in CPUID.1:ECX, SSE3 (bit
+// 0), SSSE3 (9), FMA (12), CMPXCHG16B (13), SSE4.1 (19), SSE4.2 (20), MOVBE (22), POPCNT (23),
+// XSAVE (26), OSXSAVE (27), AVX (28) and F16C (29); in CPUID.(EAX=7,ECX=0):EBX, BMI1 (3), AVX2
+// (5) and BMI2 (8); in CPUID.80000001H:ECX, LAHF/SAHF (0) and LZCNT (5). The level is what
+// x86_64_v3.zig is compiled for.
+const v3_leaf1: u32 = 1 << 0 | 1 << 9 | 1 << 12 | 1 << 13 | 1 << 19 | 1 << 20 | 1 << 22 | 1 << 23 | 1 << 26 | 1 << 27 | 1 << 28 | 1 << 29;
+
+const v3_leaf7: u32 = 1 << 3 | 1 << 5 | 1 << 8;
+
+const v3_extended: u32 = 1 << 0 | 1 << 5;
+
+// SHA-NI is CPUID.(EAX=7,ECX=0):EBX bit 29, with SSSE3 and SSE4.1. XGETBV is defined only with
+// OSXSAVE, and XCR0 bits 1 and 2 say that the xmm and ymm registers survive a context switch.
 pub fn features() Features {
     if (cpuid(0, 0)[0] < 7) return .{ .sha256 = false, .avx2 = false };
 
@@ -62,11 +73,13 @@ pub fn features() Features {
 
     const leaf7 = cpuid(7, 0)[1];
 
-    const ymm = leaf1 & 1 << 27 != 0 and leaf1 & 1 << 28 != 0 and xgetbv() & 6 == 6;
+    const extended = if (cpuid(0x80000000, 0)[0] >= 0x80000001) cpuid(0x80000001, 0)[2] else 0;
+
+    const v3 = leaf1 & v3_leaf1 == v3_leaf1 and leaf7 & v3_leaf7 == v3_leaf7 and extended & v3_extended == v3_extended;
 
     return .{
         .sha256 = leaf7 & 1 << 29 != 0 and leaf1 & 1 << 9 != 0 and leaf1 & 1 << 19 != 0,
-        .avx2 = ymm and leaf7 & 1 << 5 != 0,
+        .avx2 = v3 and xgetbv() & 6 == 6,
     };
 }
 
@@ -349,12 +362,12 @@ pub fn sha256Rounds(comptime W: type, state: *[8]W, words: *const [16]W) void {
     ct.wipe(std.mem.asBytes(&s));
 }
 
-// ---- AVX2 kernels in one statement each (tools/asm.zig) ----
+// ---- AVX2 and BMI kernels in one statement each (tools/asm.zig) ----
 
 fn clobbers(comptime extra: []const []const u8) std.builtin.assembly.Clobbers {
     @setEvalBranchQuota(100_000);
 
-    var set: std.builtin.assembly.Clobbers = .{ .memory = true, .cc = true };
+    var set = scalarClobbers(extra);
 
     for (0..16) |i| {
         @field(set, std.fmt.comptimePrint("xmm{d}", .{i})) = true;
@@ -362,7 +375,15 @@ fn clobbers(comptime extra: []const []const u8) std.builtin.assembly.Clobbers {
         @field(set, std.fmt.comptimePrint("ymm{d}", .{i})) = true;
     }
 
-    for (extra) |register| @field(set, register) = true;
+    return set;
+}
+
+// Memory, the flags and `registers` alone, for the kernels without vector instructions: Windows
+// keeps xmm6-xmm15 across calls, so naming them would make every call save and restore all ten.
+fn scalarClobbers(comptime registers: []const []const u8) std.builtin.assembly.Clobbers {
+    var set: std.builtin.assembly.Clobbers = .{ .memory = true, .cc = true };
+
+    for (registers) |register| @field(set, register) = true;
 
     return set;
 }
@@ -389,6 +410,188 @@ pub fn sha256x8(state: *[8]@Vector(8, u32), words: *const [16]@Vector(8, u32)) v
           [constants] "{rdx}" (&k256_lanes),
           [schedule] "{rcx}" (&schedule),
         : clobbers(&.{ "rax", "r8" }));
+}
+
+// SHA-256 and SHA-512 of one stream (tools/asm.zig, sha2Stream): the message schedule of two
+// blocks at a time with AVX2, the rounds with RORX and ANDN. The frame holds W[t] + K[t] of the
+// two blocks, a group of rounds per 32 bytes, and then the arguments of a call.
+fn Sha2Frame(comptime groups: usize) type {
+    return extern struct {
+        schedule: [groups][32]u8 align(32),
+        state: *anyopaque,
+        second_state: *anyopaque,
+        first: [*]const u8,
+        second: [*]const u8,
+        constants: *const anyopaque,
+        count: usize,
+        clear: usize,
+    };
+}
+
+// The round constants of each group twice, one copy per block, then VPSHUFB orders: for
+// SHA-256 the byte swap of 32-bit words and the moves of sigma1's two results into the low or
+// the high half of each 128-bit lane (0x80 selects zero); for SHA-512 the byte swap of 64-bit
+// words and the rotation by 8.
+fn Sha2Constants(comptime Word: type) type {
+    const groups = if (Word == u32) 16 else 40;
+
+    return extern struct {
+        k: [groups][32 / @sizeOf(Word)]Word,
+        orders: [if (Word == u32) 3 else 2][32]u8,
+    };
+}
+
+fn sha2Constants(comptime Word: type) Sha2Constants(Word) {
+    @setEvalBranchQuota(10_000);
+
+    const per = 16 / @sizeOf(Word);
+
+    var self: Sha2Constants(Word) = undefined;
+
+    const k = if (Word == u32) sha2.k256 else sha2.k512;
+
+    for (&self.k, 0..) |*group, g| {
+        for (group, 0..) |*constant, i| constant.* = k[per * g + i % per];
+    }
+
+    for (&self.orders, 0..) |*order, o| {
+        for (order, 0..) |*index, i| {
+            const lane = i % 16;
+
+            index.* = switch (o) {
+                0 => @intCast(lane / @sizeOf(Word) * @sizeOf(Word) + @sizeOf(Word) - 1 - lane % @sizeOf(Word)),
+                1 => if (Word == u64) @intCast(lane / 8 * 8 + (lane + 1) % 8) else if (lane < 8) @intCast(lane / 4 * 8 + lane % 4) else 0x80,
+                else => if (lane < 8) 0x80 else @intCast((lane - 8) / 4 * 8 + lane % 4),
+            };
+        }
+    }
+
+    return self;
+}
+
+const sha256_constants: Sha2Constants(u32) align(32) = sha2Constants(u32);
+
+const sha512_constants: Sha2Constants(u64) align(32) = sha2Constants(u64);
+
+// The whole blocks of `first` and then those of `second`, two at a time, into state; or, with
+// second_state, `first` and `second` as one block each, of two streams that start from their
+// own states. Not inlined: the kernel's code is large and appears once.
+noinline fn sha2Stream(comptime Word: type, state: *[8]Word, second_state: ?*[8]Word, first: []const u8, second: []const u8) void {
+    const block = 16 * @sizeOf(Word);
+
+    var frame: Sha2Frame(if (Word == u32) 16 else 40) = undefined;
+
+    frame.state = state;
+
+    frame.second_state = second_state orelse state;
+
+    frame.constants = if (Word == u32) &sha256_constants else &sha512_constants;
+
+    var parts = [2][]const u8{ first, second };
+
+    while (take(&parts, block)) |a| {
+        const b = take(&parts, block);
+
+        frame.first = a;
+
+        frame.second = b orelse a;
+
+        frame.count = if (b == null) 1 else 2;
+
+        frame.clear = @intFromBool(parts[0].len == 0 and parts[1].len == 0);
+
+        asm volatile (@embedFile(if (Word == u32) "asm/sha256_avx2.s" else "asm/sha512_avx2.s")
+            :
+            : [frame] "{rdi}" (&frame),
+            : clobbers(&.{ "rax", "rbx", "rcx", "rdx", "rsi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" }));
+    }
+}
+
+// The next block of the first part that has one.
+fn take(parts: *[2][]const u8, block: usize) ?[*]const u8 {
+    for (parts) |*part| {
+        if (part.len == 0) continue;
+
+        const start = part.ptr;
+
+        part.* = part.*[block..];
+
+        return start;
+    }
+
+    return null;
+}
+
+pub fn sha256Stream(state: *[8]u32, first: []const u8, second: []const u8) void {
+    sha2Stream(u32, state, null, first, second);
+}
+
+pub fn sha512Stream(state: *[8]u64, first: []const u8, second: []const u8) void {
+    sha2Stream(u64, state, null, first, second);
+}
+
+// One block for each of two states, as HMAC's key blocks.
+pub fn sha256Pair(states: *[2][8]u32, first: *const [64]u8, second: *const [64]u8) void {
+    sha2Stream(u32, &states[0], &states[1], first, second);
+}
+
+pub fn sha512Pair(states: *[2][8]u64, first: *const [128]u8, second: *const [128]u8) void {
+    sha2Stream(u64, &states[0], &states[1], first, second);
+}
+
+// Keccak-f[1600] on one state with BMI1 and BMI2 (tools/asm.zig, keccakBmi). The rounds alternate
+// between the state and the frame's buffer; the absorbing kernel reads its arguments from the
+// frame.
+const KeccakFrame = extern struct {
+    other: [25]u64,
+    first: [*]const u64,
+    end: [*]const u64,
+    data: [*]const u8,
+    blocks: usize,
+    lanes: usize,
+};
+
+fn keccakFrame() KeccakFrame {
+    var frame: KeccakFrame = undefined;
+
+    frame.first = &keccak.round_constants;
+
+    frame.end = frame.first + keccak.round_constants.len;
+
+    return frame;
+}
+
+pub noinline fn keccakBmi(state: *[25]u64) void {
+    var frame = keccakFrame();
+
+    defer ct.wipe(std.mem.asBytes(&frame.other));
+
+    asm volatile (@embedFile("asm/keccak_x1_bmi.s")
+        :
+        : [state] "{rdi}" (state),
+          [frame] "{rsi}" (&frame),
+        : scalarClobbers(&.{ "rax", "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" }));
+}
+
+// Whole blocks of `rate` bytes (72, 104, 136, 144 or 168), each XORed into the state and permuted.
+pub noinline fn keccakAbsorbBmi(state: *[25]u64, rate: usize, data: []const u8) void {
+    std.debug.assert(data.len > 0 and data.len % rate == 0);
+
+    var frame = keccakFrame();
+
+    defer ct.wipe(std.mem.asBytes(&frame.other));
+
+    frame.data = data.ptr;
+
+    frame.blocks = data.len / rate;
+
+    frame.lanes = rate / 8;
+
+    asm volatile (@embedFile("asm/keccak_absorb_bmi.s")
+        :
+        : [state] "{rdi}" (state),
+          [frame] "{rsi}" (&frame),
+        : scalarClobbers(&.{ "rax", "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" }));
 }
 
 const keccak_lanes: [24][4]u64 align(32) = blk: {

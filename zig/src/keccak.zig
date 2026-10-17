@@ -22,11 +22,18 @@ pub const round_constants = [24]u64{
 
 const rotations = [25]u6{ 0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14 };
 
-// One permutation: with the SHA3 instructions on the cores that run them fast, the WebAssembly
-// code below, or the portable code.
+// The x86-64 kernel with BMI1 and BMI2, which come with the x86-64-v3 level (cpu.zig, avx2).
+const bmi = cpu.possible(.avx2) and @hasDecl(isa, "keccakBmi");
+
+// One permutation: with the SHA3 instructions on the cores that run them fast, with BMI1 and BMI2,
+// the WebAssembly code below, or the portable code.
 pub fn permute(state: *[25]u64) void {
     if (comptime cpu.possible(.sha3)) {
         if (cpu.has(.sha3)) return isa.keccak1(state);
+    }
+
+    if (comptime bmi) {
+        if (cpu.has(.avx2)) return isa.keccakBmi(state);
     }
 
     if (comptime cpu.wasm_simd) return webassembly.permute(state);
@@ -36,15 +43,26 @@ pub fn permute(state: *[25]u64) void {
 
 // Whole blocks XORed into a state and permuted, as many as `data` holds: with the SHA3
 // instructions, which keep the state in registers between the blocks, on the cores that run them
-// fast. Returns the number of bytes absorbed, zero where the code below takes them one by one.
+// fast, or with BMI1 and BMI2 in one call for all of them. Returns the number of bytes absorbed,
+// zero where the code below takes them one by one.
 fn absorbBlocks(state: *[25]u64, rate: usize, data: []const u8) usize {
-    if (comptime cpu.possible(.sha3)) {
-        const supported = rate == 72 or rate == 104 or rate == 136 or rate == 144 or rate == 168;
+    const supported = rate == 72 or rate == 104 or rate == 136 or rate == 144 or rate == 168;
 
+    if (comptime cpu.possible(.sha3)) {
         if (supported and data.len >= rate and cpu.has(.sha3)) {
             const length = data.len - data.len % rate;
 
             isa.keccakAbsorb(state, rate, data[0..length]);
+
+            return length;
+        }
+    }
+
+    if (comptime bmi) {
+        if (supported and data.len >= rate and cpu.has(.avx2)) {
+            const length = data.len - data.len % rate;
+
+            isa.keccakAbsorbBmi(state, rate, data[0..length]);
 
             return length;
         }
@@ -101,6 +119,12 @@ pub fn permuteSome(states: *[4][25]u64, count: usize) void {
             3 => webassembly.permute3(states),
             else => webassembly.permute4(states),
         };
+    }
+
+    // On x86-64 four states in AVX2 registers take about three quarters of the time of two with
+    // BMI1 and BMI2.
+    if (comptime bmi) {
+        if (count == 2 and cpu.has(.avx2)) return isa.keccak4(states);
     }
 
     if (count >= 3) return permute4(states);

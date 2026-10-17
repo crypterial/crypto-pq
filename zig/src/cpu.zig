@@ -20,7 +20,8 @@ pub const Feature = enum(u3) {
     // scalar code: Apple's. Arm's Neoverse N2, V1 and V2 run them on one pipe only, and the
     // scalar code is reported faster there.
     sha3,
-    // x86-64 AVX2, with the ymm state enabled by the operating system.
+    // x86-64 AVX2 with BMI1 and BMI2: the whole x86-64-v3 level (FMA, F16C, LZCNT and MOVBE, and
+    // the v2 level below it), with the ymm state enabled by the operating system.
     avx2,
     // AArch64 PSTATE.DIT, data-independent timing.
     dit,
@@ -46,6 +47,17 @@ pub const aarch64_base = enabled and arch == .aarch64;
 // lattice arithmetic uses the instructions that LLVM does not choose by itself.
 pub const wasm_simd = !build_options.portable and builtin.zig_backend == .stage2_llvm and arch == .wasm32 and builtin.cpu.has(.wasm, .simd128);
 
+// The instruction set features of the x86-64-v3 level; a target's features include the ones these
+// imply, such as SSE4.1 for AVX2.
+const v3_features = [_]std.Target.x86.Feature{ .avx2, .bmi, .bmi2, .cx16, .f16c, .fma, .lzcnt, .movbe, .popcnt, .sahf, .xsave };
+
+const v3_target = builtin.cpu.hasAll(.x86, &v3_features);
+
+// A build for an x86-64 CPU below the v3 level links the code of x86_64_v3.zig compiled a second
+// time for that level, an object that build.zig adds, and runs it where the CPU has the level.
+// Without build.zig's option the source builds on its own, with the code compiled once.
+pub const v3_object = enabled and arch == .x86_64 and !v3_target and @hasDecl(build_options, "x86_64_v3") and build_options.x86_64_v3;
+
 fn guaranteed(comptime feature: Feature) bool {
     if (!enabled or build_options.ct) return false;
 
@@ -61,7 +73,7 @@ fn guaranteed(comptime feature: Feature) bool {
         },
         .x86_64 => switch (feature) {
             .sha256 => cpu.has(.x86, .sha) and cpu.has(.x86, .ssse3) and cpu.has(.x86, .sse4_1),
-            .avx2 => cpu.has(.x86, .avx2),
+            .avx2 => v3_target,
             else => false,
         },
         else => false,
@@ -112,6 +124,17 @@ noinline fn detect() u8 {
     cache.store(bits, .monotonic);
 
     return bits;
+}
+
+// For the tests that compare the code for a feature with the code without it in one process:
+// has() reports only the detected features among `features` until the next call. Features the
+// target guarantees stay on.
+pub fn restrict(features: []const Feature) void {
+    var bits: u8 = 0;
+
+    for (features) |feature| bits |= @as(u8, 1) << @intFromEnum(feature);
+
+    cache.store(probe() & bits | 0x80, .monotonic);
 }
 
 fn probe() u8 {

@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const capi = @import("capi.zig");
+const cpu = @import("cpu.zig");
 
 const common = capi.common;
 
@@ -434,6 +435,17 @@ fn signer(allocator: Allocator, kind: u32, section: []const u8, comptime seed_si
 }
 
 pub fn main(init: std.process.Init) !void {
+    // On x86-64 the check is meant for the x86-64-v3 code that the shipped build takes at run time
+    // (the kernels, and below that level the object build.zig links): where valgrind does not
+    // report the level, the run would pass on the portable code alone.
+    if (comptime cpu.possible(.avx2)) {
+        if (!cpu.has(.avx2)) {
+            std.debug.print("x86-64-v3 code not taken: the runner's valgrind must report x86-64-v3\n", .{});
+
+            return error.CheckFailed;
+        }
+    }
+
     const allocator = init.gpa;
 
     inline for (0..4) |id| {

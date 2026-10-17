@@ -80,11 +80,19 @@ pub fn compress512(state: *[8]u64, block: *const [128]u8) void {
     blocks512(state, block);
 }
 
+// The x86-64 kernels for CPUs without SHA-NI: the message schedule of two blocks at a time with
+// AVX2, the rounds with BMI2 (x86_64.zig, sha2Stream).
+const stream = cpu.possible(.avx2) and @hasDecl(isa, "sha256Stream");
+
 // Whole blocks, one after another: with the instructions the state stays in registers between
 // them.
 pub fn blocks256(state: *[8]u32, blocks: []const u8) void {
     if (comptime cpu.possible(.sha256)) {
         if (cpu.has(.sha256)) return isa.sha256Blocks(state, blocks);
+    }
+
+    if (comptime stream) {
+        if (cpu.has(.avx2)) return isa.sha256Stream(state, blocks, &.{});
     }
 
     var offset: usize = 0;
@@ -97,6 +105,10 @@ pub fn blocks256(state: *[8]u32, blocks: []const u8) void {
 pub fn blocks512(state: *[8]u64, blocks: []const u8) void {
     if (comptime cpu.possible(.sha512)) {
         if (cpu.has(.sha512)) return isa.sha512Blocks(state, blocks);
+    }
+
+    if (comptime stream) {
+        if (cpu.has(.avx2)) return isa.sha512Stream(state, blocks, &.{});
     }
 
     var offset: usize = 0;
@@ -516,6 +528,15 @@ pub fn finish256(state: [8]u32, absorbed: u64, data: []const u8, out: []u8) void
 
     const used = pad(64, data, bits, 8, &last);
 
+    // The kernel without SHA-NI pairs the last whole block with the padding.
+    if (comptime stream) {
+        if (!cpu.has(.sha256) and cpu.has(.avx2)) {
+            isa.sha256Stream(&s, data[0 .. data.len / 64 * 64], last[0 .. 64 * used]);
+
+            return store(u32, &s, out);
+        }
+    }
+
     blocks256(&s, data[0 .. data.len / 64 * 64]);
 
     blocks256(&s, last[0 .. 64 * used]);
@@ -544,6 +565,14 @@ pub fn finish512(state: [8]u64, absorbed: u128, data: []const u8, out: []u8) voi
 
     const used = pad(128, data, bits, 16, &last);
 
+    if (comptime stream) {
+        if (cpu.has(.avx2)) {
+            isa.sha512Stream(&s, data[0 .. data.len / 128 * 128], last[0 .. 128 * used]);
+
+            return store(u64, &s, out);
+        }
+    }
+
     blocks512(&s, data[0 .. data.len / 128 * 128]);
 
     blocks512(&s, last[0 .. 128 * used]);
@@ -563,6 +592,10 @@ pub fn keyed256(iv: *const [8]u32, key: []const u8) [2][8]u32 {
     defer ct.wipe(&block);
 
     @memcpy(block[0..key.len], key);
+
+    if (comptime stream) {
+        if (!cpu.has(.sha256) and cpu.has(.avx2)) return keyBlocks(u32, iv, &block);
+    }
 
     var states: [8]@Vector(2, u32) = undefined;
 
@@ -604,6 +637,10 @@ pub fn keyed512(iv: *const [8]u64, key: []const u8) [2][8]u64 {
 
     @memcpy(block[0..key.len], key);
 
+    if (comptime stream) {
+        if (cpu.has(.avx2)) return keyBlocks(u64, iv, &block);
+    }
+
     var states: [8]@Vector(2, u64) = undefined;
 
     defer ct.wipe(std.mem.asBytes(&states));
@@ -629,6 +666,23 @@ pub fn keyed512(iv: *const [8]u64, key: []const u8) [2][8]u64 {
 
         keyed[1][i] = lanes[1];
     }
+
+    return keyed;
+}
+
+// The keyed states with the x86-64 kernel, the inner and the outer key block side by side.
+fn keyBlocks(comptime Word: type, iv: *const [8]Word, key: *const [16 * @sizeOf(Word)]u8) [2][8]Word {
+    var blocks: [2][16 * @sizeOf(Word)]u8 = undefined;
+
+    defer ct.wipe(std.mem.asBytes(&blocks));
+
+    for (&blocks, [2]u8{ 0x36, 0x5c }) |*block, pad_byte| {
+        for (block, key) |*byte, k| byte.* = k ^ pad_byte;
+    }
+
+    var keyed: [2][8]Word = .{ iv.*, iv.* };
+
+    if (Word == u32) isa.sha256Pair(&keyed, &blocks[0], &blocks[1]) else isa.sha512Pair(&keyed, &blocks[0], &blocks[1]);
 
     return keyed;
 }

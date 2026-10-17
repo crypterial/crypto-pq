@@ -5,6 +5,7 @@ const cpu = @import("cpu.zig");
 const ct = @import("ct.zig");
 const keccak = @import("keccak.zig");
 const primitives = @import("primitives.zig");
+const v3 = @import("x86_64_v3.zig");
 const vec = @import("vector.zig");
 const wasm = @import("wasm.zig");
 
@@ -809,7 +810,13 @@ pub fn PublicCache(comptime p: Parameters) type {
         matrix: [p.k][p.l]Poly,
         t1: [p.k]Poly,
 
-        pub fn fill(self: *@This(), pk: *const [p.publicKeySize()]u8) void {
+        pub inline fn fill(self: *@This(), pk: *const [p.publicKeySize()]u8) void {
+            if (v3.use()) return v3.entry(v3.MlDsa(p), "fillPublic")(self, pk);
+
+            @call(v3.apart, expand, .{ self, pk });
+        }
+
+        fn expand(self: *@This(), pk: *const [p.publicKeySize()]u8) void {
             expandMatrix(p, pk[0..32], &self.matrix);
 
             for (&self.t1, 0..) |*f, i| {
@@ -830,7 +837,13 @@ pub fn SecretCache(comptime p: Parameters) type {
         s2: [p.k]Poly,
         t0: [p.k]Poly,
 
-        pub fn fill(self: *@This(), sk: *const [p.privateKeySize()]u8) void {
+        pub inline fn fill(self: *@This(), sk: *const [p.privateKeySize()]u8) void {
+            if (v3.use()) return v3.entry(v3.MlDsa(p), "fillSecret")(self, sk);
+
+            @call(v3.apart, expand, .{ self, sk });
+        }
+
+        fn expand(self: *@This(), sk: *const [p.privateKeySize()]u8) void {
             const eta_size = 32 * @as(usize, p.etaBits());
 
             const t0_offset = 128 + eta_size * (@as(usize, p.l) + p.k);
@@ -851,9 +864,15 @@ pub fn SecretCache(comptime p: Parameters) type {
 // The secret vectors are encoded into sk as they are produced, and A is used as it is sampled; a
 // generated key also fills `public` from the same computation. s1 and s2 come four at a time from
 // one run of nonces, so s2 passes through `t` before the product overwrites it, and its rows are
-// read back from sk. The entry points are not inlined, so that callers that dispatch over the
-// parameter sets do not hold the frames of all of them at once.
-pub noinline fn keyGen(comptime p: Parameters, seed: *const [32]u8, pk: *[p.publicKeySize()]u8, sk: *[p.privateKeySize()]u8, public: ?*PublicCache(p)) void {
+// read back from sk. The work of the entry points is not inlined, so that callers that dispatch
+// over the parameter sets do not hold the frames of all of them at once.
+pub inline fn keyGen(comptime p: Parameters, seed: *const [32]u8, pk: *[p.publicKeySize()]u8, sk: *[p.privateKeySize()]u8, public: ?*PublicCache(p)) void {
+    if (v3.use()) return v3.entry(v3.MlDsa(p), "keyGen")(seed, pk, sk, public);
+
+    generate(p, seed, pk, sk, public);
+}
+
+noinline fn generate(comptime p: Parameters, seed: *const [32]u8, pk: *[p.publicKeySize()]u8, sk: *[p.privateKeySize()]u8, public: ?*PublicCache(p)) void {
     const eta_size = 32 * @as(usize, p.etaBits());
 
     const s2_offset = 128 + eta_size * @as(usize, p.l);
@@ -934,7 +953,13 @@ pub noinline fn keyGen(comptime p: Parameters, seed: *const [32]u8, pk: *[p.publ
 // parts disagree is rejected instead of producing signatures that never verify. The checks
 // accumulate differences so that the secret values do not decide any branch. The rows of s2 and
 // t0 are read from sk as they are needed.
-pub noinline fn checkPrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, pk: *[p.publicKeySize()]u8) bool {
+pub inline fn checkPrivateKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, pk: *[p.publicKeySize()]u8) bool {
+    if (v3.use()) return v3.entry(v3.MlDsa(p), "checkPrivateKey")(sk, pk);
+
+    return checkKey(p, sk, pk);
+}
+
+noinline fn checkKey(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, pk: *[p.publicKeySize()]u8) bool {
     const eta_size = 32 * @as(usize, p.etaBits());
 
     const s2_offset = 128 + eta_size * @as(usize, p.l);
@@ -1028,7 +1053,13 @@ pub fn Workspace(comptime p: Parameters) type {
 }
 
 // The caches hold A and the NTT forms of the secret vectors; `work` is wiped before it returns.
-pub noinline fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, secret: *const SecretCache(p), public: *const PublicCache(p), work: *Workspace(p), message: []const []const u8, rnd: *const [32]u8, signature: *[p.signatureSize()]u8) void {
+pub inline fn sign(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, secret: *const SecretCache(p), public: *const PublicCache(p), work: *Workspace(p), message: []const []const u8, rnd: *const [32]u8, signature: *[p.signatureSize()]u8) void {
+    if (v3.use()) return v3.entry(v3.MlDsa(p), "sign")(sk, secret, public, work, &message, rnd, signature);
+
+    signMessage(p, sk, secret, public, work, message, rnd, signature);
+}
+
+noinline fn signMessage(comptime p: Parameters, sk: *const [p.privateKeySize()]u8, secret: *const SecretCache(p), public: *const PublicCache(p), work: *Workspace(p), message: []const []const u8, rnd: *const [32]u8, signature: *[p.signatureSize()]u8) void {
     const l = p.l;
 
     const y = &work.y;
@@ -1240,7 +1271,13 @@ fn decodeHint(comptime p: Parameters, data: *const [p.omega + p.k]u8, h: *[p.k][
 
 // tr = H(pk, 64), which the key computed when it was created. Without a cache, which happens
 // only when it cannot be allocated, A is sampled again as the product uses it.
-pub noinline fn verify(comptime p: Parameters, pk: *const [p.publicKeySize()]u8, tr: *const [64]u8, public: ?*const PublicCache(p), message: []const []const u8, signature: *const [p.signatureSize()]u8) bool {
+pub inline fn verify(comptime p: Parameters, pk: *const [p.publicKeySize()]u8, tr: *const [64]u8, public: ?*const PublicCache(p), message: []const []const u8, signature: *const [p.signatureSize()]u8) bool {
+    if (v3.use()) return v3.entry(v3.MlDsa(p), "verify")(pk, tr, public, &message, signature);
+
+    return verifyMessage(p, pk, tr, public, message, signature);
+}
+
+noinline fn verifyMessage(comptime p: Parameters, pk: *const [p.publicKeySize()]u8, tr: *const [64]u8, public: ?*const PublicCache(p), message: []const []const u8, signature: *const [p.signatureSize()]u8) bool {
     const k = p.k;
 
     const l = p.l;

@@ -36,12 +36,12 @@ crypto_pq_ml_dsa keccak.webassembly.permute2 0 1 0 0 the code shape for the engi
 crypto_pq_ml_dsa keccak.webassembly.permute3 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
 crypto_pq_ml_dsa keccak.webassembly.permute4 0 1 0 0 the code shape for the engine, which the binding sets once through cpq_wasm_tune
 crypto_pq_ml_dsa mem.eql 2 7 0 0 comparisons of public bytes: pre-hash names, parameter sections, public keys
-crypto_pq_ml_dsa mldsa.checkPrivateKey 0 3 0 0 validity of an expanded key, declassified: import fails on it
+crypto_pq_ml_dsa mldsa.checkKey 0 3 0 0 validity of an expanded key, declassified: import fails on it
 crypto_pq_ml_dsa mldsa.expandSecret 0 1 0 0 which nibbles are accepted, declassified by the core: rejection sampling shows only which discarded values were out of range
-crypto_pq_ml_dsa mldsa.keyGen 0 1 0 0 loop counts, sponge lengths and the public matrix
+crypto_pq_ml_dsa mldsa.generate 0 1 0 0 loop counts, sponge lengths and the public matrix
 crypto_pq_ml_dsa mldsa.sampleInBall 3 48 0 0 challenge positions, public as in BoringSSL, declassified by the core
 crypto_pq_ml_dsa mldsa.sampleMatrix 0 15 0 0 rejection sampling of the public matrix from rho
-crypto_pq_ml_dsa mldsa.sign 2 68 0 0 an attempt's rejection outcome (declassified, FIPS 204), loop counts and sponge lengths
+crypto_pq_ml_dsa mldsa.signMessage 2 68 0 0 an attempt's rejection outcome (declassified, FIPS 204), loop counts and sponge lengths
 crypto_pq_ml_dsa signature.Representative.init 2 22 0 1 the pre-hash kind and the lengths of the message representative
 crypto_pq_ml_kem capi.common.Slot.close 1 18 0 0 the slot's users word: the last call out of a slot that a wipe marked zeroes it, by its length
 crypto_pq_ml_kem capi.common.apart 0 34 0 0 the addresses and lengths of the call's buffers

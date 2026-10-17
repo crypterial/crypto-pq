@@ -2,6 +2,7 @@ const ct = @import("ct.zig");
 const hash = @import("hash.zig");
 const mlkem = @import("mlkem.zig");
 const primitives = @import("primitives.zig");
+const v3 = @import("x86_64_v3.zig");
 const x25519 = @import("x25519.zig");
 
 const params = mlkem.ml_kem_768;
@@ -28,6 +29,8 @@ pub const Secret = [params.k]mlkem.Poly;
 
 // SHAKE256(seed) gives the ML-KEM-768 seeds d and z, then the X25519 private scalar.
 pub fn expand(seed: *const [seed_size]u8, public_key: *[public_key_size]u8, dk: *DecapsulationKey, scalar: *[32]u8, s_hat: *Secret, public: ?*EncapsulationKey) void {
+    if (v3.use()) return v3.entry(v3.XWing, "expand")(seed, public_key, dk, scalar, s_hat, public);
+
     var expanded: [96]u8 = undefined;
 
     defer ct.wipe(&expanded);
@@ -57,6 +60,8 @@ pub fn mlKemKey(public_key: *const [public_key_size]u8) *const [ek_size]u8 {
 }
 
 pub fn encapsulate(key: *const EncapsulationKey, public_key: *const [public_key_size]u8, eseed: *const [randomness_size]u8, shared_secret: *[32]u8, ciphertext: *[ciphertext_size]u8) void {
+    if (v3.use()) return v3.entry(v3.XWing, "encapsulate")(key, public_key, eseed, shared_secret, ciphertext);
+
     const pk_x = public_key[ek_size..];
 
     var ss_m: [32]u8 = undefined;
@@ -90,6 +95,8 @@ pub fn decapsulate(s_hat: *const Secret, key: *const EncapsulationKey, dk: *cons
 
 // The shared secret goes straight to `shared_secret`; ss_M and ss_X are wiped.
 pub fn decapsulateInto(s_hat: *const Secret, key: *const EncapsulationKey, dk: *const DecapsulationKey, scalar: *const [32]u8, public_key: *const [public_key_size]u8, ciphertext: *const [ciphertext_size]u8, shared_secret: *[32]u8) void {
+    if (v3.use()) return v3.entry(v3.XWing, "decapsulate")(s_hat, key, dk, scalar, public_key, ciphertext, shared_secret);
+
     const ct_x = ciphertext[ct_size..];
 
     var ss_m: [32]u8 = undefined;

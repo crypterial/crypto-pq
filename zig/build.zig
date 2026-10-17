@@ -15,13 +15,22 @@ pub fn build(b: *std.Build) void {
 
     options.addOption(bool, "portable", portable);
 
+    // This script links the x86-64-v3 object wherever the source looks for it (Core.link).
+    options.addOption(bool, "x86_64_v3", true);
+
     const build_options = options.createModule();
+
+    var core: Core = .{ .b = b, .options = build_options, .portable = portable };
 
     const crypto_pq = b.addModule("crypto_pq", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{.{ .name = "build_options", .module = build_options }},
     });
+
+    // The mode that a project which imports the module passes to this package: the closest this
+    // script knows to the mode the module is compiled in.
+    core.link(crypto_pq, optimize, false);
 
     const vectors = b.createModule(.{
         .root_source_file = b.path("test/vectors.zig"),
@@ -79,6 +88,8 @@ pub fn build(b: *std.Build) void {
             }),
         });
 
+        core.link(artifact.root_module, optimize, false);
+
         run(b, step, artifact);
 
         binaries.dependOn(&b.addInstallArtifact(artifact, .{}).step);
@@ -113,7 +124,7 @@ pub fn build(b: *std.Build) void {
 
     b.step("bench", "Run the benchmarks; an argument selects the cases whose names contain it").dependOn(&bench.step);
 
-    capi(b, target, optimize, build_options, vectors, step, binaries);
+    capi(&core, target, optimize, vectors, step, binaries);
 
     const check = b.step("ct", "Run the constant-time check under valgrind; needs -Dct=true");
 
@@ -124,7 +135,16 @@ pub fn build(b: *std.Build) void {
     }
 
     // Runtime safety checks branch on the values they check, secret ones included, so the check
-    // runs on ReleaseFast code. X25519 is internal: its check is a test in its own file.
+    // runs on ReleaseFast code. X25519 is internal: its check is a test in its own file. The core
+    // is a module of its own here, whose x86-64-v3 object is built the same way.
+    const checked = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .imports = &.{.{ .name = "build_options", .module = build_options }},
+    });
+
+    core.link(checked, .ReleaseFast, true);
+
     const checker = b.addExecutable(.{
         .name = "ct",
         .root_module = b.createModule(.{
@@ -132,7 +152,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
             .valgrind = true,
-            .imports = &.{.{ .name = "crypto_pq", .module = crypto_pq }},
+            .imports = &.{.{ .name = "crypto_pq", .module = checked }},
         }),
     });
 
@@ -150,7 +170,9 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"constant time"},
     });
 
-    for ([_]*std.Build.Step.Compile{ checker, x25519, capiConstantTime(b, target, build_options) }) |artifact| {
+    core.link(x25519.root_module, .ReleaseFast, true);
+
+    for ([_]*std.Build.Step.Compile{ checker, x25519, capiConstantTime(&core, target) }) |artifact| {
         // The long unrolled AVX2 blocks of the vector code exhaust the temporary storage of
         // valgrind's translator unless it translates fewer instructions at a time; how much it
         // translates at once does not change what memcheck reports.
@@ -188,6 +210,62 @@ fn run(b: *std.Build, step: *std.Build.Step, artifact: *std.Build.Step.Compile) 
 
     step.dependOn(&command.step);
 }
+
+// The settings of the core, src/, for every module that compiles it. A build for an x86-64 CPU
+// below the x86-64-v3 level also links src/x86_64_v3.zig compiled for that level, which the core
+// takes at run time where the CPU has it (src/cpu.zig, v3_object): one object for each target,
+// mode and valgrind setting.
+const Core = struct {
+    b: *std.Build,
+    options: *std.Build.Module,
+    portable: bool,
+    objects: std.StringHashMapUnmanaged(*std.Build.Step.Compile) = .empty,
+
+    // The features of the level, as src/cpu.zig lists them.
+    const v3_features = [_]std.Target.x86.Feature{ .avx2, .bmi, .bmi2, .cx16, .f16c, .fma, .lzcnt, .movbe, .popcnt, .sahf, .xsave };
+
+    fn link(self: *Core, module: *std.Build.Module, optimize: std.builtin.OptimizeMode, valgrind: bool) void {
+        const b = self.b;
+
+        const target = module.resolved_target.?;
+
+        const cpu = target.result.cpu;
+
+        if (self.portable or cpu.arch != .x86_64 or target.result.ptrBitWidth() != 64 or cpu.hasAll(.x86, &v3_features)) return;
+
+        const triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
+
+        const key = b.fmt("{s} {s} {}", .{ triple, @tagName(optimize), valgrind });
+
+        const entry = self.objects.getOrPut(b.allocator, key) catch @panic("OOM");
+
+        if (!entry.found_existing) {
+            var query = target.query;
+
+            query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
+
+            query.cpu_features_add = .empty;
+
+            query.cpu_features_sub = .empty;
+
+            // Position-independent, since shared libraries link it too.
+            entry.value_ptr.* = b.addObject(.{
+                .name = "crypto_pq_x86_64_v3",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/x86_64_v3.zig"),
+                    .target = b.resolveTargetQuery(query),
+                    .optimize = optimize,
+                    .strip = optimize != .Debug,
+                    .valgrind = valgrind,
+                    .pic = true,
+                    .imports = &.{.{ .name = "build_options", .module = self.options }},
+                }),
+            });
+        }
+
+        module.addObject(entry.value_ptr.*);
+    }
+};
 
 const Families = struct {
     ml_kem: bool = false,
@@ -238,25 +316,31 @@ fn capiOptions(b: *std.Build, families: Families, exports: bool) *std.Build.Modu
     return options.createModule();
 }
 
-fn capiModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Module, families: Families, strip: bool) *std.Build.Module {
-    return b.createModule(.{
+fn capiModule(core: *Core, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, families: Families, strip: bool) *std.Build.Module {
+    const b = core.b;
+
+    const module = b.createModule(.{
         .root_source_file = b.path("src/capi.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
         .single_threaded = if (target.result.cpu.arch.isWasm()) true else null,
         .imports = &.{
-            .{ .name = "build_options", .module = build_options },
+            .{ .name = "build_options", .module = core.options },
             .{ .name = "capi_options", .module = capiOptions(b, families, true) },
         },
     });
+
+    core.link(module, optimize, false);
+
+    return module;
 }
 
-fn capiLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Module) *std.Build.Step.Compile {
-    const library = b.addLibrary(.{
+fn capiLibrary(core: *Core, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const library = core.b.addLibrary(.{
         .linkage = .dynamic,
         .name = "crypto_pq",
-        .root_module = capiModule(b, target, optimize, build_options, every_family, optimize != .Debug),
+        .root_module = capiModule(core, target, optimize, every_family, optimize != .Debug),
     });
 
     // No build path may enter the binary.
@@ -265,12 +349,14 @@ fn capiLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     return library;
 }
 
-fn capiWasm(b: *std.Build, name: []const u8, families: Families, build_options: *std.Build.Module, strip: bool) *std.Build.Step.Compile {
+fn capiWasm(core: *Core, name: []const u8, families: Families, strip: bool) *std.Build.Step.Compile {
+    const b = core.b;
+
     const target = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = "wasm32-freestanding", .cpu_features = "lime1+simd128" }) catch unreachable);
 
     const module = b.addExecutable(.{
         .name = name,
-        .root_module = capiModule(b, target, .ReleaseFast, build_options, families, strip),
+        .root_module = capiModule(core, target, .ReleaseFast, families, strip),
     });
 
     module.entry = .disabled;
@@ -286,8 +372,10 @@ fn capiWasm(b: *std.Build, name: []const u8, families: Families, build_options: 
 // extension module, `wasm` the WebAssembly modules, and `dist` every library and module that ships,
 // always in ReleaseFast. The output of `dist` depends on nothing but the sources and the Zig
 // version, so builds on different hosts compare byte for byte.
-fn capi(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Module, vectors: *std.Build.Module, tests: *std.Build.Step, binaries: *std.Build.Step) void {
-    b.step("lib", "Build the C ABI shared library for the target").dependOn(&b.addInstallArtifact(capiLibrary(b, target, optimize, build_options), .{}).step);
+fn capi(core: *Core, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, vectors: *std.Build.Module, tests: *std.Build.Step, binaries: *std.Build.Step) void {
+    const b = core.b;
+
+    b.step("lib", "Build the C ABI shared library for the target").dependOn(&b.addInstallArtifact(capiLibrary(core, target, optimize), .{}).step);
 
     const wasm = b.step("wasm", "Build the C ABI WebAssembly modules, one per family");
 
@@ -312,7 +400,7 @@ fn capi(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.O
     for (wasm_modules) |entry| {
         const name, const families = entry;
 
-        const module = capiWasm(b, name, families, build_options, true);
+        const module = capiWasm(core, name, families, true);
 
         wasm.dependOn(&b.addInstallArtifact(module, .{}).step);
 
@@ -322,21 +410,21 @@ fn capi(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.O
 
         lint.addArtifactArg(module);
 
-        lint.addArtifactArg(capiWasm(b, name, families, build_options, false));
+        lint.addArtifactArg(capiWasm(core, name, families, false));
     }
 
-    b.step("pyext", "Build the CPython extension module for the target").dependOn(&b.addInstallArtifact(pyextLibrary(b, target, optimize, build_options), .{}).step);
+    b.step("pyext", "Build the CPython extension module for the target").dependOn(&b.addInstallArtifact(pyextLibrary(core, target, optimize), .{}).step);
 
     for (native_targets) |entry| {
         const query, const directory, const file = entry;
 
         const native_target = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = query }) catch unreachable);
 
-        const library = capiLibrary(b, native_target, .ReleaseFast, build_options);
+        const library = capiLibrary(core, native_target, .ReleaseFast);
 
         dist.dependOn(&b.addInstallFileWithDir(library.getEmittedBin(), .{ .custom = b.fmt("dist/{s}", .{directory}) }, file).step);
 
-        const extension = pyextLibrary(b, native_target, .ReleaseFast, build_options);
+        const extension = pyextLibrary(core, native_target, .ReleaseFast);
 
         dist.dependOn(&b.addInstallFileWithDir(extension.getEmittedBin(), .{ .custom = b.fmt("dist/{s}", .{directory}) }, pyextFile(native_target)).step);
     }
@@ -348,12 +436,14 @@ fn capi(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.O
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "build_options", .module = build_options },
+                .{ .name = "build_options", .module = core.options },
                 .{ .name = "capi_options", .module = capiOptions(b, every_family, false) },
                 .{ .name = "vectors", .module = vectors },
             },
         }),
     });
+
+    core.link(capi_tests.root_module, optimize, false);
 
     run(b, tests, capi_tests);
 
@@ -366,17 +456,21 @@ fn capi(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.O
 // for the stable ABI of CPython 3.11 and later. Python's symbols come from the interpreter that
 // loads it; on Windows from python3.dll, through an import library made here from the module's
 // own list of them, so that nothing outside this repository and Zig takes part in the build.
-fn pyextLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Module) *std.Build.Step.Compile {
+fn pyextLibrary(core: *Core, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const b = core.b;
+
     const module = b.createModule(.{
         .root_source_file = b.path("src/pyext.zig"),
         .target = target,
         .optimize = optimize,
         .strip = optimize != .Debug,
         .imports = &.{
-            .{ .name = "build_options", .module = build_options },
+            .{ .name = "build_options", .module = core.options },
             .{ .name = "capi_options", .module = capiOptions(b, every_family, false) },
         },
     });
+
+    core.link(module, optimize, false);
 
     if (target.result.os.tag == .windows) module.addObjectFile(python3ImportLibrary(b, target));
 
@@ -427,8 +521,10 @@ fn python3ImportLibrary(b: *std.Build, target: std.Build.ResolvedTarget) std.Bui
 
 // The secret-handling entry points of the C ABI, driven as a C caller would with every secret
 // marked undefined; like the library's own check, on ReleaseFast code.
-fn capiConstantTime(b: *std.Build, target: std.Build.ResolvedTarget, build_options: *std.Build.Module) *std.Build.Step.Compile {
-    return b.addExecutable(.{
+fn capiConstantTime(core: *Core, target: std.Build.ResolvedTarget) *std.Build.Step.Compile {
+    const b = core.b;
+
+    const checker = b.addExecutable(.{
         .name = "capi-ct",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/capi_ct.zig"),
@@ -436,9 +532,13 @@ fn capiConstantTime(b: *std.Build, target: std.Build.ResolvedTarget, build_optio
             .optimize = .ReleaseFast,
             .valgrind = true,
             .imports = &.{
-                .{ .name = "build_options", .module = build_options },
+                .{ .name = "build_options", .module = core.options },
                 .{ .name = "capi_options", .module = capiOptions(b, every_family, false) },
             },
         }),
     });
+
+    core.link(checker.root_module, .ReleaseFast, true);
+
+    return checker;
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const ct = @import("ct.zig");
+const v3 = @import("x86_64_v3.zig");
 
 // Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128 (NIST SP 800-232, section 5): a sponge of rate 64
 // bits over the 320-bit Ascon permutation, bytes in little-endian order.
@@ -143,6 +144,8 @@ pub const Sponge = struct {
     pub fn update(self: *Sponge, data: []const u8) void {
         if (self.squeezing) @panic("UNSUPPORTED: cannot update after read");
 
+        if (v3.use()) return v3.entry(v3.Ascon, "update")(self, &data);
+
         var rest = data;
 
         if (self.used > 0) {
@@ -189,6 +192,8 @@ pub const Sponge = struct {
     // The next out.len bytes of output; the permutation runs between blocks only, never after the
     // last one read.
     pub fn read(self: *Sponge, out: []u8) void {
+        if (v3.use()) return v3.entry(v3.Ascon, "read")(self, &out);
+
         if (!self.squeezing) {
             self.pad();
 

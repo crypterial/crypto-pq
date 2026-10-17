@@ -7,6 +7,7 @@ const ct = @import("ct.zig");
 const hash = @import("hash.zig");
 const keccak = @import("keccak.zig");
 const primitives = @import("primitives.zig");
+const v3 = @import("x86_64_v3.zig");
 const vec = @import("vector.zig");
 const wasm = @import("wasm.zig");
 
@@ -711,7 +712,13 @@ pub fn EncapsulationKey(comptime k: usize) type {
         h: [32]u8,
 
         // For a valid ek (checkEncapsulationKey).
-        pub fn fill(self: *@This(), ek: *const [384 * k + 32]u8) void {
+        pub inline fn fill(self: *@This(), ek: *const [384 * k + 32]u8) void {
+            if (v3.use()) return v3.entry(v3.MlKem(v3.mlKemSet(k)), "fill")(self, ek);
+
+            @call(v3.apart, expand, .{ self, ek });
+        }
+
+        fn expand(self: *@This(), ek: *const [384 * k + 32]u8) void {
             primitives.digest(hash.sha3_256, &.{ek}, &self.h);
 
             sampleMatrix(k, ek[384 * k ..][0..32], true, &self.matrix);
@@ -849,9 +856,15 @@ fn decrypt(comptime p: Parameters, s: *const [p.k]Poly, c: *const [p.ciphertextS
 }
 
 // Fills `public` when it is given, so that a generated key starts with its cache; otherwise the
-// matrix lives on the stack for this call only. It is not inlined, so that a caller that
+// matrix lives on the stack for this call only. The work is not inlined, so that a caller that
 // dispatches over the parameter sets does not hold the frames of all of them at once.
-pub noinline fn keyGen(comptime p: Parameters, d: *const [32]u8, z: *const [32]u8, ek: *[p.encapsulationKeySize()]u8, dk: *[p.decapsulationKeySize()]u8, s_hat: *[p.k]Poly, public: ?*EncapsulationKey(p.k)) void {
+pub inline fn keyGen(comptime p: Parameters, d: *const [32]u8, z: *const [32]u8, ek: *[p.encapsulationKeySize()]u8, dk: *[p.decapsulationKeySize()]u8, s_hat: *[p.k]Poly, public: ?*EncapsulationKey(p.k)) void {
+    if (v3.use()) return v3.entry(v3.MlKem(p), "keyGen")(d, z, ek, dk, s_hat, public);
+
+    generate(p, d, z, ek, dk, s_hat, public);
+}
+
+noinline fn generate(comptime p: Parameters, d: *const [32]u8, z: *const [32]u8, ek: *[p.encapsulationKeySize()]u8, dk: *[p.decapsulationKeySize()]u8, s_hat: *[p.k]Poly, public: ?*EncapsulationKey(p.k)) void {
     const k: usize = p.k;
 
     var g: [64]u8 = undefined;
@@ -940,7 +953,13 @@ pub noinline fn keyGen(comptime p: Parameters, d: *const [32]u8, z: *const [32]u
     }
 }
 
-pub fn encaps(comptime p: Parameters, key: *const EncapsulationKey(p.k), m: *const [32]u8, shared_secret: *[32]u8, c: *[p.ciphertextSize()]u8) void {
+pub inline fn encaps(comptime p: Parameters, key: *const EncapsulationKey(p.k), m: *const [32]u8, shared_secret: *[32]u8, c: *[p.ciphertextSize()]u8) void {
+    if (v3.use()) return v3.entry(v3.MlKem(p), "encaps")(key, m, shared_secret, c);
+
+    @call(v3.apart, encapsulate, .{ p, key, m, shared_secret, c });
+}
+
+fn encapsulate(comptime p: Parameters, key: *const EncapsulationKey(p.k), m: *const [32]u8, shared_secret: *[32]u8, c: *[p.ciphertextSize()]u8) void {
     var g: [64]u8 = undefined;
 
     defer ct.wipe(&g);
@@ -967,7 +986,13 @@ pub fn decaps(comptime p: Parameters, s_hat: *const [p.k]Poly, key: *const Encap
 
 // The shared secret goes straight to `shared_secret`, and every temporary is wiped: no frame
 // keeps a copy of it, of m' or of r'.
-pub fn decapsInto(comptime p: Parameters, s_hat: *const [p.k]Poly, key: *const EncapsulationKey(p.k), dk: *const [p.decapsulationKeySize()]u8, c: *const [p.ciphertextSize()]u8, shared_secret: *[32]u8) void {
+pub inline fn decapsInto(comptime p: Parameters, s_hat: *const [p.k]Poly, key: *const EncapsulationKey(p.k), dk: *const [p.decapsulationKeySize()]u8, c: *const [p.ciphertextSize()]u8, shared_secret: *[32]u8) void {
+    if (v3.use()) return v3.entry(v3.MlKem(p), "decaps")(s_hat, key, dk, c, shared_secret);
+
+    @call(v3.apart, decapsulate, .{ p, s_hat, key, dk, c, shared_secret });
+}
+
+fn decapsulate(comptime p: Parameters, s_hat: *const [p.k]Poly, key: *const EncapsulationKey(p.k), dk: *const [p.decapsulationKeySize()]u8, c: *const [p.ciphertextSize()]u8, shared_secret: *[32]u8) void {
     const k: usize = p.k;
 
     const z = dk[768 * k + 64 ..][0..32];

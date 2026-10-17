@@ -20,7 +20,11 @@ const kernels = [_]Kernel{
     .{ .name = "keccak_absorb_sha3.s", .write = keccakSha3Absorb },
     .{ .name = "keccak_x3_hybrid.s", .write = keccakHybrid },
     .{ .name = "keccak_x4_avx2.s", .write = keccakAvx2 },
+    .{ .name = "keccak_x1_bmi.s", .write = keccakBmiOne },
+    .{ .name = "keccak_absorb_bmi.s", .write = keccakBmiAbsorb },
     .{ .name = "sha256_x8_avx2.s", .write = sha256Avx2 },
+    .{ .name = "sha256_avx2.s", .write = sha256Stream },
+    .{ .name = "sha512_avx2.s", .write = sha512Stream },
     .{ .name = "blake2b_avx2.s", .write = blake2bAvx2 },
     .{ .name = "blake2s_avx2.s", .write = blake2sAvx2 },
     .{ .name = "blake2b_arm64.s", .write = blake2bArm64 },
@@ -507,6 +511,134 @@ fn keccakAvx2(w: *Writer) Writer.Error!void {
     try line(w, ".att_syntax prefix", .{});
 }
 
+// Keccak-f[1600] on one state in general-purpose registers with BMI1 and BMI2: ANDN computes
+// chi's ~b & c and RORX rotates without a copy. The 25 lanes do not fit in registers, so a round
+// reads them from one buffer and writes the next state to the other, the two alternating.
+// Theta's column sums go to the B registers (rax, rbx, rcx, r8, r9), which then give D[x] in
+// r10-r14; each output plane y loads its five lanes into the B registers, applies D and rho, and
+// writes chi's five results through r15. Output lane x + 5y comes from lane ((x + 3y) mod 5) +
+// 5x. Inputs: rdi points to the state, rsi to a 240-byte frame (x86_64.zig, KeccakFrame): the
+// other buffer, the first and the past-the-last round constant, then for the absorbing kernel the
+// data, the number of blocks and the rate in lanes. rdx walks the round constants; rdi and rsi
+// are preserved.
+const keccak_bmi_b = [5][]const u8{ "rax", "rbx", "rcx", "r8", "r9" };
+
+const keccak_bmi_d = [5][]const u8{ "r10", "r11", "r12", "r13", "r14" };
+
+fn keccakBmiOne(w: *Writer) Writer.Error!void {
+    try line(w, ".intel_syntax noprefix", .{});
+
+    try keccakBmiPermutation(w);
+
+    try line(w, ".att_syntax prefix", .{});
+}
+
+// Whole blocks XORed into the state, each followed by a permutation; the data advances in the
+// frame.
+fn keccakBmiAbsorb(w: *Writer) Writer.Error!void {
+    try line(w, ".intel_syntax noprefix", .{});
+
+    try line(w, "3:", .{});
+
+    try line(w, "mov rax, qword ptr [rsi + 216]", .{});
+
+    try line(w, "mov rcx, qword ptr [rsi + 232]", .{});
+
+    // The rates of SHA3-512, -384, -256 and SHAKE256, -224 and SHAKE128: 9, 13, 17, 18 and 21
+    // lanes, which decide the branches.
+    const ends = [_]usize{ 9, 13, 17, 18, 21 };
+
+    var lane: usize = 0;
+
+    for (ends, 0..) |end, i| {
+        while (lane < end) : (lane += 1) {
+            try line(w, "mov rbx, qword ptr [rax + {d}]", .{8 * lane});
+
+            try line(w, "xor qword ptr [rdi + {d}], rbx", .{8 * lane});
+        }
+
+        if (i + 1 < ends.len) {
+            try line(w, "cmp rcx, {d}", .{end});
+
+            try line(w, "je 4f", .{});
+        }
+    }
+
+    try line(w, "4:", .{});
+
+    try line(w, "lea rax, [rax + 8 * rcx]", .{});
+
+    try line(w, "mov qword ptr [rsi + 216], rax", .{});
+
+    try keccakBmiPermutation(w);
+
+    try line(w, "dec qword ptr [rsi + 224]", .{});
+
+    try line(w, "jnz 3b", .{});
+
+    try line(w, ".att_syntax prefix", .{});
+}
+
+// 24 rounds, two per loop iteration: from the state into the other buffer and back.
+fn keccakBmiPermutation(w: *Writer) Writer.Error!void {
+    try line(w, "mov rdx, qword ptr [rsi + 200]", .{});
+
+    try line(w, "1:", .{});
+
+    try keccakBmiRound(w, "rdi", "rsi", 0);
+
+    try keccakBmiRound(w, "rsi", "rdi", 8);
+
+    try line(w, "add rdx, 16", .{});
+
+    try line(w, "cmp rdx, qword ptr [rsi + 208]", .{});
+
+    try line(w, "jb 1b", .{});
+}
+
+fn keccakBmiRound(w: *Writer, from: []const u8, to: []const u8, constant: usize) Writer.Error!void {
+    const b = keccak_bmi_b;
+
+    const d = keccak_bmi_d;
+
+    for (0..5) |x| {
+        try line(w, "mov {s}, qword ptr [{s} + {d}]", .{ b[x], from, 8 * x });
+
+        for (1..5) |y| try line(w, "xor {s}, qword ptr [{s} + {d}]", .{ b[x], from, 8 * (x + 5 * y) });
+    }
+
+    // D[x] = C[x - 1] ^ rol(C[x + 1], 1), a rotation right by 63.
+    for (0..5) |x| {
+        try line(w, "rorx {s}, {s}, 63", .{ d[x], b[(x + 1) % 5] });
+
+        try line(w, "xor {s}, {s}", .{ d[x], b[(x + 4) % 5] });
+    }
+
+    for (0..5) |y| {
+        for (0..5) |x| {
+            const column = (x + 3 * y) % 5;
+
+            const source = column + 5 * x;
+
+            try line(w, "mov {s}, qword ptr [{s} + {d}]", .{ b[x], from, 8 * source });
+
+            try line(w, "xor {s}, {s}", .{ b[x], d[column] });
+
+            if (rho[source] != 0) try line(w, "rorx {s}, {s}, {d}", .{ b[x], b[x], 64 - rho[source] });
+        }
+
+        for (0..5) |x| {
+            try line(w, "andn r15, {s}, {s}", .{ b[(x + 1) % 5], b[(x + 2) % 5] });
+
+            try line(w, "xor r15, {s}", .{b[x]});
+
+            if (x == 0 and y == 0) try line(w, "xor r15, qword ptr [rdx + {d}]", .{constant});
+
+            try line(w, "mov qword ptr [{s} + {d}], r15", .{ to, 8 * (x + 5 * y) });
+        }
+    }
+}
+
 // Lanes 4k .. 4k + 3 of the four states form a 4 x 4 matrix of 64-bit words; unpacking pairs and
 // exchanging 128-bit halves transposes it, in either direction. Lane 24 is moved word by word.
 fn transpose4(w: *Writer, comptime direction: enum { in, out }) Writer.Error!void {
@@ -777,6 +909,427 @@ fn sha256RoundAvx2(w: *Writer, t: usize, comptime word: enum { load, schedule })
     try line(w, "vpaddd ymm{d}, ymm{d}, ymm8", .{ h, h });
 
     try line(w, "vpaddd ymm{d}, ymm{d}, ymm{d}", .{ h, h, carry });
+}
+
+// SHA-256 and SHA-512 (FIPS 180-4) of one stream with AVX2 and BMI2, two blocks at a time. The
+// message schedule of both blocks runs in the two 128-bit halves of ymm registers, four words
+// (SHA-256) or two (SHA-512) per half, interleaved with the rounds of the first block, which run
+// in general-purpose registers with RORX and ANDN; it stores W[t] + K[t] of both blocks, so the
+// second block's rounds only read it. A group is the rounds of one register of the schedule; the
+// schedule stays a group ahead, so each group reads words stored during the one before it. The
+// rounds go sixteen at a time in loops, which keeps the kernel small.
+//
+// Variable i of round t lives in state register (i - t) mod 8 (eax, ebx, ecx, r8d, edx, r9d,
+// r10d, r11d at t = 0, or the 64-bit registers); r12 is scratch, and r13 and r14 take turns as
+// the second scratch register and as b ^ c, which the round before computed as a ^ b, for
+// Maj(a, b, c) = ((a ^ b) & (b ^ c)) ^ b. rsi holds the constants (the round constants of each
+// group twice, then the VPSHUFB orders), r15 the offset of the current sixteen rounds in them
+// and in the schedule. Input: rdi points to the frame (x86_64.zig, Sha2Frame): the schedule, a
+// group per 32 bytes, then the pointers to the state of block 1 and that of block 2 (the same
+// state unless the blocks start independent streams), the two blocks and the constants, the
+// number of blocks (1 or 2) and whether to clear the schedule at the end. rdi is preserved.
+const Sha2 = struct {
+    // Word size in bytes, rounds, and the rotations of Sigma1 and Sigma0.
+    word: usize,
+    rounds: usize,
+    sigma1: [3]u32,
+    sigma0: [3]u32,
+
+    fn perGroup(p: Sha2) usize {
+        return 16 / p.word;
+    }
+
+    // Groups in sixteen rounds, and in all of them.
+    fn groupsPerLoop(p: Sha2) usize {
+        return 16 / p.perGroup();
+    }
+
+    fn groups(p: Sha2) usize {
+        return p.rounds / p.perGroup();
+    }
+
+    fn registers(p: Sha2) usize {
+        return 16 / p.perGroup();
+    }
+
+    fn suffix(p: Sha2) []const u8 {
+        return if (p.word == 4) "d" else "q";
+    }
+
+    fn size(p: Sha2) []const u8 {
+        return if (p.word == 4) "dword" else "qword";
+    }
+
+    // Frame offsets past the schedule.
+    fn field(p: Sha2, index: usize) usize {
+        return 32 * p.groups() + 8 * index;
+    }
+
+    // Offsets in the constants past the round constants.
+    fn order(p: Sha2, index: usize) usize {
+        return 32 * p.groups() + 32 * index;
+    }
+};
+
+const sha256_stream: Sha2 = .{ .word = 4, .rounds = 64, .sigma1 = .{ 6, 11, 25 }, .sigma0 = .{ 2, 13, 22 } };
+
+const sha512_stream: Sha2 = .{ .word = 8, .rounds = 80, .sigma1 = .{ 14, 18, 41 }, .sigma0 = .{ 28, 34, 39 } };
+
+fn sha256Stream(w: *Writer) Writer.Error!void {
+    try sha2Stream(w, sha256_stream);
+}
+
+fn sha512Stream(w: *Writer) Writer.Error!void {
+    try sha2Stream(w, sha512_stream);
+}
+
+const sha2_registers = [2][11][]const u8{
+    .{ "eax", "ebx", "ecx", "r8d", "edx", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d" },
+    .{ "rax", "rbx", "rcx", "r8", "rdx", "r9", "r10", "r11", "r12", "r13", "r14" },
+};
+
+fn sha2Register(comptime p: Sha2, i: usize) []const u8 {
+    return sha2_registers[if (p.word == 4) 0 else 1][i];
+}
+
+// Frame fields, in the order of Sha2Frame.
+const Sha2Field = enum(usize) { state, second_state, first, second, constants, count, clear };
+
+fn sha2Stream(w: *Writer, comptime p: Sha2) Writer.Error!void {
+    const g = p.groupsPerLoop();
+
+    try line(w, ".intel_syntax noprefix", .{});
+
+    try line(w, "mov rsi, qword ptr [rdi + {d}]", .{p.field(@intFromEnum(Sha2Field.constants))});
+
+    try line(w, "mov rdx, qword ptr [rdi + {d}]", .{p.field(@intFromEnum(Sha2Field.first))});
+
+    try line(w, "mov rcx, qword ptr [rdi + {d}]", .{p.field(@intFromEnum(Sha2Field.second))});
+
+    // The blocks, big-endian words, the first block in the low halves.
+    try line(w, "vmovdqa ymm15, ymmword ptr [rsi + {d}]", .{p.order(0)});
+
+    for (0..p.registers()) |i| {
+        try line(w, "vmovdqu xmm{d}, xmmword ptr [rdx + {d}]", .{ i, 16 * i });
+
+        try line(w, "vinserti128 ymm{d}, ymm{d}, xmmword ptr [rcx + {d}], 1", .{ i, i, 16 * i });
+
+        try line(w, "vpshufb ymm{d}, ymm{d}, ymm15", .{ i, i });
+    }
+
+    try line(w, "vpadd{s} ymm15, ymm0, ymmword ptr [rsi]", .{p.suffix()});
+
+    try line(w, "vmovdqa ymmword ptr [rdi], ymm15", .{});
+
+    try sha2Load(w, p, .state);
+
+    try line(w, "xor r15d, r15d", .{});
+
+    try line(w, "1:", .{});
+
+    for (0..g) |q| {
+        var vector_buffer: [8 << 10]u8 = undefined;
+
+        var vector: Writer = .fixed(&vector_buffer);
+
+        try sha2Next(&vector, p, q);
+
+        if (p.word == 4) try sha256Schedule(&vector, q) else try sha512Schedule(&vector, q);
+
+        var scalar_buffer: [16 << 10]u8 = undefined;
+
+        var scalar: Writer = .fixed(&scalar_buffer);
+
+        for (0..p.perGroup()) |i| try sha2Round(&scalar, p, q * p.perGroup() + i, 0);
+
+        try interleave(w, vector.buffered(), scalar.buffered());
+    }
+
+    try line(w, "add r15, {d}", .{32 * g});
+
+    try line(w, "cmp r15, {d}", .{32 * (p.groups() - g)});
+
+    try line(w, "jb 1b", .{});
+
+    // The last sixteen rounds of the first block: the schedule is complete.
+    for (0..g) |q| {
+        var vector_buffer: [1 << 10]u8 = undefined;
+
+        var vector: Writer = .fixed(&vector_buffer);
+
+        if (q + 1 < g) try sha2Next(&vector, p, q);
+
+        var scalar_buffer: [16 << 10]u8 = undefined;
+
+        var scalar: Writer = .fixed(&scalar_buffer);
+
+        for (0..p.perGroup()) |i| try sha2Round(&scalar, p, q * p.perGroup() + i, 0);
+
+        try interleave(w, vector.buffered(), scalar.buffered());
+    }
+
+    try sha2Store(w, p, .state);
+
+    try line(w, "cmp qword ptr [rdi + {d}], 2", .{p.field(@intFromEnum(Sha2Field.count))});
+
+    try line(w, "jne 3f", .{});
+
+    try sha2Load(w, p, .second_state);
+
+    try line(w, "xor r15d, r15d", .{});
+
+    try line(w, "2:", .{});
+
+    for (0..16) |t| try sha2Round(w, p, t, 16);
+
+    try line(w, "add r15, {d}", .{32 * g});
+
+    try line(w, "cmp r15, {d}", .{32 * p.groups()});
+
+    try line(w, "jb 2b", .{});
+
+    try sha2Store(w, p, .second_state);
+
+    try line(w, "3:", .{});
+
+    // The schedule holds the message: cleared after the last call on it.
+    try line(w, "cmp qword ptr [rdi + {d}], 0", .{p.field(@intFromEnum(Sha2Field.clear))});
+
+    try line(w, "je 4f", .{});
+
+    try line(w, "vpxor xmm0, xmm0, xmm0", .{});
+
+    for (0..p.groups()) |i| try line(w, "vmovdqa ymmword ptr [rdi + {d}], ymm0", .{32 * i});
+
+    try line(w, "4:", .{});
+
+    try line(w, "vzeroupper", .{});
+
+    try line(w, ".att_syntax prefix", .{});
+}
+
+// The state into the state registers, and b ^ c for the first round's Maj in r14.
+fn sha2Load(w: *Writer, comptime p: Sha2, comptime which: Sha2Field) Writer.Error!void {
+    try line(w, "mov r12, qword ptr [rdi + {d}]", .{p.field(@intFromEnum(which))});
+
+    for (0..8) |i| try line(w, "mov {s}, {s} ptr [r12 + {d}]", .{ sha2Register(p, i), p.size(), p.word * i });
+
+    try line(w, "mov {s}, {s}", .{ sha2Register(p, 10), sha2Register(p, 1) });
+
+    try line(w, "xor {s}, {s}", .{ sha2Register(p, 10), sha2Register(p, 2) });
+}
+
+// The state plus the block's result, stored.
+fn sha2Store(w: *Writer, comptime p: Sha2, comptime which: Sha2Field) Writer.Error!void {
+    try line(w, "mov r12, qword ptr [rdi + {d}]", .{p.field(@intFromEnum(which))});
+
+    for (0..8) |i| {
+        try line(w, "add {s}, {s} ptr [r12 + {d}]", .{ sha2Register(p, i), p.size(), p.word * i });
+
+        try line(w, "mov {s} ptr [r12 + {d}], {s}", .{ p.size(), p.word * i, sha2Register(p, i) });
+    }
+}
+
+// W + K of the next group from the register of the schedule that holds its words.
+fn sha2Next(w: *Writer, comptime p: Sha2, q: usize) Writer.Error!void {
+    const next = (q + 1) % p.registers();
+
+    try line(w, "vpadd{s} ymm15, ymm{d}, ymmword ptr [rsi + r15 + {d}]", .{ p.suffix(), next, 32 * (q + 1) });
+
+    try line(w, "vmovdqa ymmword ptr [rdi + r15 + {d}], ymm15", .{32 * (q + 1)});
+}
+
+// Round t of the current sixteen, W + K read from the half at `half` bytes of its group.
+fn sha2Round(w: *Writer, comptime p: Sha2, t: usize, half: usize) Writer.Error!void {
+    const s = struct {
+        fn v(round: usize, i: usize) []const u8 {
+            return sha2Register(p, (i + 8 - round % 8) % 8);
+        }
+    };
+
+    const a = s.v(t, 0);
+
+    const b = s.v(t, 1);
+
+    const d = s.v(t, 3);
+
+    const e = s.v(t, 4);
+
+    const f = s.v(t, 5);
+
+    const g = s.v(t, 6);
+
+    const h = s.v(t, 7);
+
+    const t0 = sha2Register(p, 8);
+
+    const t1 = sha2Register(p, 9 + t % 2);
+
+    const carry = sha2Register(p, 9 + (t + 1) % 2);
+
+    const offset = 32 * (t / p.perGroup()) + half + p.word * (t % p.perGroup());
+
+    try line(w, "rorx {s}, {s}, {d}", .{ t0, e, p.sigma1[0] });
+
+    try line(w, "rorx {s}, {s}, {d}", .{ t1, e, p.sigma1[1] });
+
+    try line(w, "add {s}, {s} ptr [rdi + r15 + {d}]", .{ h, p.size(), offset });
+
+    try line(w, "xor {s}, {s}", .{ t0, t1 });
+
+    try line(w, "rorx {s}, {s}, {d}", .{ t1, e, p.sigma1[2] });
+
+    try line(w, "xor {s}, {s}", .{ t0, t1 });
+
+    // Ch(e, f, g) = (~e & g) + (e & f): the two have no bit in common.
+    try line(w, "andn {s}, {s}, {s}", .{ t1, e, g });
+
+    try line(w, "add {s}, {s}", .{ h, t1 });
+
+    try line(w, "mov {s}, {s}", .{ t1, e });
+
+    try line(w, "and {s}, {s}", .{ t1, f });
+
+    try line(w, "add {s}, {s}", .{ h, t1 });
+
+    try line(w, "add {s}, {s}", .{ h, t0 });
+
+    try line(w, "add {s}, {s}", .{ d, h });
+
+    try line(w, "rorx {s}, {s}, {d}", .{ t0, a, p.sigma0[0] });
+
+    try line(w, "rorx {s}, {s}, {d}", .{ t1, a, p.sigma0[1] });
+
+    try line(w, "xor {s}, {s}", .{ t0, t1 });
+
+    try line(w, "rorx {s}, {s}, {d}", .{ t1, a, p.sigma0[2] });
+
+    try line(w, "xor {s}, {s}", .{ t0, t1 });
+
+    // a ^ b is the next round's b ^ c.
+    try line(w, "mov {s}, {s}", .{ t1, a });
+
+    try line(w, "xor {s}, {s}", .{ t1, b });
+
+    try line(w, "and {s}, {s}", .{ carry, t1 });
+
+    try line(w, "xor {s}, {s}", .{ carry, b });
+
+    try line(w, "add {s}, {s}", .{ t0, carry });
+
+    try line(w, "add {s}, {s}", .{ h, t0 });
+}
+
+// W[16 + 4g .. 19 + 4g] of both blocks, from the registers of group q of the sixteen rounds:
+// x[k] holds W[4(g + k) ..]. sigma1 of the first two words comes from W[t - 2] and W[t - 1],
+// that of the last two from the first two, so it runs twice on words spread over 64-bit lanes,
+// whose right shifts are rotations of the low word.
+fn sha256Schedule(w: *Writer, q: usize) Writer.Error!void {
+    var x: [4]usize = undefined;
+
+    for (&x, 0..) |*r, k| r.* = (q + k) % 4;
+
+    try line(w, "vpalignr ymm4, ymm{d}, ymm{d}, 4", .{ x[1], x[0] });
+
+    try line(w, "vpalignr ymm5, ymm{d}, ymm{d}, 4", .{ x[3], x[2] });
+
+    try line(w, "vpsrld ymm6, ymm4, 7", .{});
+
+    try line(w, "vpslld ymm7, ymm4, 25", .{});
+
+    try line(w, "vpxor ymm6, ymm6, ymm7", .{});
+
+    try line(w, "vpsrld ymm7, ymm4, 18", .{});
+
+    try line(w, "vpxor ymm6, ymm6, ymm7", .{});
+
+    try line(w, "vpslld ymm7, ymm4, 14", .{});
+
+    try line(w, "vpxor ymm6, ymm6, ymm7", .{});
+
+    try line(w, "vpsrld ymm7, ymm4, 3", .{});
+
+    try line(w, "vpxor ymm6, ymm6, ymm7", .{});
+
+    try line(w, "vpaddd ymm5, ymm5, ymm{d}", .{x[0]});
+
+    try line(w, "vpaddd ymm5, ymm5, ymm6", .{});
+
+    for (0..2) |half| {
+        if (half == 0) {
+            try line(w, "vpshufd ymm6, ymm{d}, 0xfa", .{x[3]});
+        } else {
+            try line(w, "vpshufd ymm6, ymm5, 0x50", .{});
+        }
+
+        try line(w, "vpsrld ymm7, ymm6, 10", .{});
+
+        try line(w, "vpsrlq ymm8, ymm6, 17", .{});
+
+        try line(w, "vpxor ymm7, ymm7, ymm8", .{});
+
+        try line(w, "vpsrlq ymm8, ymm6, 19", .{});
+
+        try line(w, "vpxor ymm7, ymm7, ymm8", .{});
+
+        try line(w, "vpshufb ymm7, ymm7, ymmword ptr [rsi + {d}]", .{sha256_stream.order(1 + half)});
+
+        if (half == 0) {
+            try line(w, "vpaddd ymm5, ymm5, ymm7", .{});
+        } else {
+            try line(w, "vpaddd ymm{d}, ymm5, ymm7", .{x[0]});
+        }
+    }
+}
+
+// W[16 + 2g], W[17 + 2g] of both blocks: x[k] holds W[2(g + k) ..]. The rotation by 8 is a
+// byte shuffle.
+fn sha512Schedule(w: *Writer, q: usize) Writer.Error!void {
+    var x: [8]usize = undefined;
+
+    for (&x, 0..) |*r, k| r.* = (q + k) % 8;
+
+    try line(w, "vpalignr ymm8, ymm{d}, ymm{d}, 8", .{ x[1], x[0] });
+
+    try line(w, "vpalignr ymm9, ymm{d}, ymm{d}, 8", .{ x[5], x[4] });
+
+    try line(w, "vpsrlq ymm10, ymm8, 1", .{});
+
+    try line(w, "vpsllq ymm11, ymm8, 63", .{});
+
+    try line(w, "vpxor ymm10, ymm10, ymm11", .{});
+
+    try line(w, "vpsrlq ymm11, ymm8, 7", .{});
+
+    try line(w, "vpxor ymm10, ymm10, ymm11", .{});
+
+    try line(w, "vpshufb ymm11, ymm8, ymmword ptr [rsi + {d}]", .{sha512_stream.order(1)});
+
+    try line(w, "vpxor ymm10, ymm10, ymm11", .{});
+
+    try line(w, "vpaddq ymm9, ymm9, ymm{d}", .{x[0]});
+
+    try line(w, "vpaddq ymm9, ymm9, ymm10", .{});
+
+    try line(w, "vpsrlq ymm10, ymm{d}, 6", .{x[7]});
+
+    try line(w, "vpsrlq ymm11, ymm{d}, 19", .{x[7]});
+
+    try line(w, "vpxor ymm10, ymm10, ymm11", .{});
+
+    try line(w, "vpsllq ymm11, ymm{d}, 45", .{x[7]});
+
+    try line(w, "vpxor ymm10, ymm10, ymm11", .{});
+
+    try line(w, "vpsrlq ymm11, ymm{d}, 61", .{x[7]});
+
+    try line(w, "vpxor ymm10, ymm10, ymm11", .{});
+
+    try line(w, "vpsllq ymm11, ymm{d}, 3", .{x[7]});
+
+    try line(w, "vpxor ymm10, ymm10, ymm11", .{});
+
+    try line(w, "vpaddq ymm{d}, ymm9, ymm10", .{x[0]});
 }
 
 // BLAKE2 (RFC 7693): the message words that round r reads, sigma[r mod 10].
