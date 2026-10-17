@@ -78,6 +78,22 @@ func permuteGeneric(s *[25]uint64) {
 	s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22], s[23], s[24] = a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24
 }
 
+// Xors every whole block of rate bytes of data into the state and permutes after each, data
+// holding whole blocks only; the portable form of keccakAbsorb.
+func keccakAbsorbGeneric(state *[25]uint64, data []byte, rate int) {
+	lanes := rate / 8
+
+	for ; len(data) >= rate; data = data[rate:] {
+		block := data[:rate]
+
+		for i := range lanes {
+			state[i] ^= binary.LittleEndian.Uint64(block[8*i:])
+		}
+
+		permute(state)
+	}
+}
+
 // The portable form of permuteLanes.
 func permuteLanesGeneric(states [][25]uint64) {
 	for i := range states {
@@ -157,6 +173,14 @@ type keccak struct {
 func (k *keccak) update(data []byte) {
 	if k.squeezing {
 		panic("cryptopq: UNSUPPORTED: cannot update after read")
+	}
+
+	if k.position == 0 && len(data) >= k.rate {
+		whole := len(data) - len(data)%k.rate
+
+		keccakAbsorb(&k.state, data[:whole], k.rate)
+
+		data = data[whole:]
 	}
 
 	for len(data) > 0 {

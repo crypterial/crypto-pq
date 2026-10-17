@@ -46,7 +46,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
-        target: [FuzzSHA256Kernels, FuzzSHA256Chains, FuzzSHA512Kernels, FuzzKeccakKernels, FuzzX25519Kernels, FuzzNTTKernels, FuzzBlake2Kernels, FuzzAsconKernels]
+        target: [FuzzSHA256Kernels, FuzzSHA256Chains, FuzzSHA512Kernels, FuzzKeccakKernels, FuzzX25519Kernels, FuzzNTTKernels, FuzzBlake2Kernels, FuzzAsconKernels, FuzzKemKernels, FuzzX25519Tiers, FuzzDsaKernels]
     defaults:
       run:
         shell: bash

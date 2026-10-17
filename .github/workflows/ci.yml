@@ -699,8 +699,8 @@ jobs:
 
   # The x86-64 paths the runner's CPU may lack, under QEMU's CPU models:
   # Skylake-Client has AVX2, BMI2 and ADX but not the SHA extensions (most Intel desktops
-  # before Ice Lake); Haswell has AVX2 without ADX, so X25519 stays portable; Denverton has the
-  # SHA extensions without AVX; Nehalem has none of them; max has all of them.
+  # before Ice Lake); Haswell has AVX2 and BMI2 without ADX, so X25519 takes the MULX-only tier;
+  # Denverton has the SHA extensions without AVX; Nehalem has none of them; max has all of them.
   go-x86-models:
     name: go x86-64 ${{ matrix.cpu }} (qemu)
     runs-on: ubuntu-latest

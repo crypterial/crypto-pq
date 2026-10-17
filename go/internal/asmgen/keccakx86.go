@@ -11,6 +11,12 @@ import "fmt"
 func keccakAmd64(a *asm) {
 	keccakLanesAVX2(a)
 
+	keccakF1600BMI(a)
+
+	keccakAbsorbBMI(a)
+
+	a.table("keccakRC", 8, keccakConstants())
+
 	var constants []uint64
 
 	for _, rc := range keccakConstants() {
@@ -234,6 +240,274 @@ func keccakLanesAVX2(a *asm) {
 	a.label("done")
 
 	a.op("VZEROUPPER")
+
+	a.op("RET")
+}
+
+// Keccak-f[1600] on one state in the general-purpose registers, with ANDN (BMI1) for chi and RORX
+// (BMI2) for D. The 25 lanes do not fit in the fifteen registers, so a round reads its input lanes
+// from memory and writes its output lanes to the other copy, the state at DI and a copy in the
+// frame alternating, as the four-state kernel does. The rounds loop in pairs: the unrolled
+// permutation is too long for the decoded-instruction cache, and the decoders would then limit it.
+//
+// Registers: DI the state; the column parities C[0]-C[4] of the input lanes in AX, BX, CX, DX, SI;
+// D[0], D[1], D[2] in BP, R8, R9; one plane's B[0]-B[4] in R10-R14; R15 an output lane. D[3] and
+// D[4] are computed into R13 and R14, which the first plane of the round reads, and are kept in the
+// frame for the four planes after it. That first plane's output lanes start the parities of the
+// next round, and every later plane adds to them, so a round begins with its parities in registers.
+// The frame holds the copy (bytes 0-199), the pointer to the next round constants (200), the count
+// of round pairs left (208), D[3] (216) and D[4] (224). The copy may hold secret lanes and D secret
+// parities, so the frame is cleared before return.
+
+var (
+	keccakC = [5]string{"AX", "BX", "CX", "DX", "SI"}
+	keccakD = [3]string{"BP", "R8", "R9"}
+	keccakB = [5]string{"R10", "R11", "R12", "R13", "R14"}
+)
+
+const keccakT = "R15"
+
+func stateLane(i int) string {
+	return fmt.Sprintf("%d(DI)", 8*i)
+}
+
+func frameLane(i int) string {
+	return fmt.Sprintf("%d(SP)", 8*i)
+}
+
+// Output plane y lane x takes B from the input lane source[5y + x] (rho and pi).
+func keccakSources() (source [25]int) {
+	for s := range 25 {
+		x, y := s%5, s/5
+
+		source[y+5*((2*x+3*y)%5)] = s
+	}
+
+	return source
+}
+
+// D[x] = C[x - 1] ^ rol(C[x + 1], 1) into register r.
+func keccakTheta(a *asm, x int, r string) {
+	a.op("RORXQ\t$63, %s, %s", keccakC[(x+1)%5], r)
+
+	a.op("XORQ\t%s, %s", keccakC[(x+4)%5], r)
+}
+
+// One round from the lanes at in to those at out, with the round constant at offset rc from the
+// pointer in the frame. Chi writes B[x] ^ (~B[x + 1] & B[x + 2]) in the order x = 1, 2, 3, 4, 0, so
+// that R13 is free for the pointer when lane 0 takes the round constant.
+func keccakRoundBMI(a *asm, in, out func(int) string, rc int) {
+	source := keccakSources()
+
+	for x := range 3 {
+		keccakTheta(a, x, keccakD[x])
+	}
+
+	keccakTheta(a, 3, keccakB[3])
+
+	keccakTheta(a, 4, keccakB[4])
+
+	a.op("MOVQ\t%s, 216(SP)", keccakB[3])
+
+	a.op("MOVQ\t%s, 224(SP)", keccakB[4])
+
+	for y := range 5 {
+		for x := range 5 {
+			s := source[5*y+x]
+
+			column := s % 5
+
+			switch {
+			case y == 0 && column >= 3:
+				a.op("XORQ\t%s, %s", in(s), keccakB[x])
+			case column >= 3:
+				a.op("MOVQ\t%s, %s", in(s), keccakB[x])
+
+				a.op("XORQ\t%d(SP), %s", 216+8*(column-3), keccakB[x])
+			default:
+				a.op("MOVQ\t%s, %s", in(s), keccakB[x])
+
+				a.op("XORQ\t%s, %s", keccakD[column], keccakB[x])
+			}
+
+			if keccakRho[s] != 0 {
+				a.op("ROLQ\t$%d, %s", keccakRho[s], keccakB[x])
+			}
+		}
+
+		for _, x := range []int{1, 2, 3, 4, 0} {
+			lane := keccakT
+
+			if y == 0 {
+				lane = keccakC[x]
+			}
+
+			a.op("ANDNQ\t%s, %s, %s", keccakB[(x+2)%5], keccakB[(x+1)%5], lane)
+
+			a.op("XORQ\t%s, %s", keccakB[x], lane)
+
+			if y == 0 && x == 0 {
+				a.op("MOVQ\t200(SP), R13")
+
+				a.op("XORQ\t%d(R13), %s", rc, lane)
+			}
+
+			a.op("MOVQ\t%s, %s", lane, out(5*y+x))
+
+			if y > 0 {
+				a.op("XORQ\t%s, %s", lane, keccakC[x])
+			}
+		}
+	}
+}
+
+// The 24 rounds on the state at DI, the round constants' pointer and the pair count in the frame.
+func keccakPermutationBMI(a *asm) {
+	a.op("LEAQ\tkeccakRC<>(SB), R15")
+
+	a.op("MOVQ\tR15, 200(SP)")
+
+	a.op("MOVQ\t$12, 208(SP)")
+
+	for x := range 5 {
+		a.op("MOVQ\t%s, %s", stateLane(x), keccakC[x])
+
+		for y := 1; y < 5; y++ {
+			a.op("XORQ\t%s, %s", stateLane(x+5*y), keccakC[x])
+		}
+	}
+
+	a.label("rounds")
+
+	keccakRoundBMI(a, stateLane, frameLane, 0)
+
+	keccakRoundBMI(a, frameLane, stateLane, 8)
+
+	a.op("ADDQ\t$16, 200(SP)")
+
+	a.op("DECQ\t208(SP)")
+
+	a.op("JNZ\trounds")
+}
+
+// Clears the frame's n bytes (a multiple of 8) and leaves. The bytes from n on are the saved frame
+// pointer and the caller's, so no store may reach them.
+func keccakLeaveBMI(a *asm, n int) {
+	a.op("VPXOR\tY0, Y0, Y0")
+
+	i := 0
+
+	for ; i+32 <= n; i += 32 {
+		a.op("VMOVDQU\tY0, %d(SP)", i)
+	}
+
+	if i+16 <= n {
+		a.op("VMOVDQU\tX0, %d(SP)", i)
+
+		i += 16
+	}
+
+	if i < n {
+		a.op("VMOVQ\tX0, %d(SP)", i)
+	}
+
+	a.op("VZEROUPPER")
+
+	a.op("RET")
+}
+
+func keccakF1600BMI(a *asm) {
+	a.text.WriteString("\n")
+
+	a.comment("Keccak-f[1600] of the state s, for CPUs with BMI1, BMI2 and AVX (which clears the",
+		"frame).",
+		"func keccakF1600BMI(s *[25]uint64)")
+
+	a.text.WriteString("TEXT ·keccakF1600BMI(SB), NOSPLIT, $232-8\n")
+
+	a.op("MOVQ\ts+0(FP), DI")
+
+	keccakPermutationBMI(a)
+
+	keccakLeaveBMI(a, 232)
+}
+
+// The sponge's absorption of whole blocks: each block of lanes 64-bit words of data is xored into
+// the state and the state permuted, without returning to Go between blocks. The rates of SHA-3,
+// SHAKE and cSHAKE have 9, 13, 17, 18 or 21 lanes: the first nine are xored unconditionally, the
+// rest in steps that compare against lanes. The frame adds the data pointer (232), its end (240)
+// and lanes (248) to the permutation's.
+func keccakAbsorbBMI(a *asm) {
+	a.text.WriteString("\n")
+
+	a.comment("Absorbs data, whole blocks of 8 lanes bytes, into s and permutes after each block.",
+		"func keccakAbsorbBMI(s *[25]uint64, data []byte, lanes int)")
+
+	a.text.WriteString("TEXT ·keccakAbsorbBMI(SB), NOSPLIT, $256-40\n")
+
+	a.op("MOVQ\ts+0(FP), DI")
+
+	a.op("MOVQ\tdata_base+8(FP), SI")
+
+	a.op("MOVQ\tdata_len+16(FP), AX")
+
+	a.op("MOVQ\tlanes+32(FP), CX")
+
+	a.op("TESTQ\tAX, AX")
+
+	a.op("JZ\tdone")
+
+	a.op("ADDQ\tSI, AX")
+
+	a.op("MOVQ\tSI, 232(SP)")
+
+	a.op("MOVQ\tAX, 240(SP)")
+
+	a.op("MOVQ\tCX, 248(SP)")
+
+	a.label("block")
+
+	a.op("MOVQ\t232(SP), SI")
+
+	a.op("MOVQ\t248(SP), CX")
+
+	xor := func(i int) {
+		a.op("MOVQ\t%d(SI), AX", 8*i)
+
+		a.op("XORQ\tAX, %s", stateLane(i))
+	}
+
+	for i := range 9 {
+		xor(i)
+	}
+
+	for _, step := range [][2]int{{9, 13}, {13, 17}, {17, 18}, {18, 21}} {
+		a.op("CMPQ\tCX, $%d", step[1])
+
+		a.op("JB\txored")
+
+		for i := step[0]; i < step[1]; i++ {
+			xor(i)
+		}
+	}
+
+	a.label("xored")
+
+	a.op("LEAQ\t(SI)(CX*8), SI")
+
+	a.op("MOVQ\tSI, 232(SP)")
+
+	keccakPermutationBMI(a)
+
+	a.op("MOVQ\t232(SP), SI")
+
+	a.op("CMPQ\tSI, 240(SP)")
+
+	a.op("JB\tblock")
+
+	keccakLeaveBMI(a, 256)
+
+	a.label("done")
 
 	a.op("RET")
 }

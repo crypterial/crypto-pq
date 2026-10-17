@@ -212,6 +212,46 @@ func TestKeccakKernels(t *testing.T) {
 	}
 }
 
+// keccakAbsorb against xoring each block in and permuting with the portable code, for every rate
+// of SHA-3, SHAKE and cSHAKE, zero to four blocks, random and edge data.
+func TestKeccakAbsorbKernels(t *testing.T) {
+	r := rand.New(rand.NewPCG(1600, 2))
+
+	data := make([]byte, 4*168)
+
+	for _, rate := range []int{72, 104, 136, 144, 168} {
+		for blocks := range 5 {
+			for i := range 200 {
+				var state [25]uint64
+
+				fillWords64(r, state[:])
+
+				fillBytes(r, data)
+
+				if i < len(kernelEdges) {
+					edgeBytes(i, data)
+				}
+
+				want, got := state, state
+
+				for b := range blocks {
+					for l := range rate / 8 {
+						want[l] ^= binary.LittleEndian.Uint64(data[rate*b+8*l:])
+					}
+
+					permuteGeneric(&want)
+				}
+
+				keccakAbsorb(&got, data[:rate*blocks], rate)
+
+				if got != want {
+					t.Fatalf("keccakAbsorb of %d blocks at rate %d differs from the portable code", blocks, rate)
+				}
+			}
+		}
+	}
+}
+
 // sha256Chains against the steps written out with the portable block function.
 func chainReference(init *[8]uint32, lanes []uint32, words int, shift uint) {
 	var w [16]uint32

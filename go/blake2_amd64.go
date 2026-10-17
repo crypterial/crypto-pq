@@ -8,7 +8,7 @@ func blake2bBlocksAVX(h *[8]uint64, counter *[2]uint64, flag uint64, blocks []by
 //go:noescape
 func blake2sBlocksAVX(h *[8]uint32, counter *[2]uint32, flag uint32, blocks []byte)
 
-// The kernels take whole blocks; the BLAKE2s one needs only AVX, which AVX2 implies.
+// The kernels take whole blocks.
 
 func blake2bBlocks(h *[8]uint64, counter *[2]uint64, flag uint64, blocks []byte) {
 	if !useAVX2 {

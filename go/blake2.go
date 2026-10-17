@@ -275,8 +275,8 @@ func blake2bFinal(h *[8]uint64, counter [2]uint64, tail, out []byte) {
 func blake2bOutput(h *[8]uint64, out []byte) {
 	words := len(out) / 8
 
-	for i := range words {
-		binary.LittleEndian.PutUint64(out[8*i:], h[i])
+	for i, word := range h[:words] {
+		binary.LittleEndian.PutUint64(out[8*i:], word)
 	}
 
 	for j := range len(out) % 8 {
@@ -305,8 +305,8 @@ func blake2sFinal(h *[8]uint32, counter [2]uint32, tail, out []byte) {
 func blake2sOutput(h *[8]uint32, out []byte) {
 	words := len(out) / 4
 
-	for i := range words {
-		binary.LittleEndian.PutUint32(out[4*i:], h[i])
+	for i, word := range h[:words] {
+		binary.LittleEndian.PutUint32(out[4*i:], word)
 	}
 
 	for j := range len(out) % 4 {
@@ -347,7 +347,9 @@ func blake2bSum(params *[4]uint64, key, data, out []byte) {
 
 		blake2bOutput(&h, out)
 	case len(data) > 0 || len(key) == 0:
-		blake2bBlocks(&h, &counter, 0, data[:whole])
+		if whole > 0 {
+			blake2bBlocks(&h, &counter, 0, data[:whole])
+		}
 
 		blake2bFinal(&h, counter, data[whole:], out)
 	default:
@@ -386,7 +388,9 @@ func blake2sSum(params *[4]uint64, key, data, out []byte) {
 
 		blake2sOutput(&h, out)
 	case len(data) > 0 || len(key) == 0:
-		blake2sBlocks(&h, &counter, 0, data[:whole])
+		if whole > 0 {
+			blake2sBlocks(&h, &counter, 0, data[:whole])
+		}
 
 		blake2sFinal(&h, counter, data[whole:], out)
 	default:

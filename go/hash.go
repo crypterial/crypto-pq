@@ -21,12 +21,12 @@ func newSha3(size int) engine {
 	return &sha3Engine{sponge: keccak{rate: 200 - 2*size, suffix: 0x06}, size: size}
 }
 
+// A one-shot SHA-3 digest is the XOF path with the SHA-3 domain bits: out is shorter than the rate,
+// so one squeeze gives it.
 func sha3DigestInto(data, out []byte) {
-	e := sha3Engine{sponge: keccak{rate: 200 - 2*len(out), suffix: 0x06}, size: len(out)}
+	var state [25]uint64
 
-	e.update(data)
-
-	e.digestInto(out)
+	keccakXof(&state, 200-2*len(out), 0x06, data, out)
 }
 
 func (e *sha3Engine) update(data []byte) {

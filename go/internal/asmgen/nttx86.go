@@ -100,7 +100,7 @@ func nttAmd64(a *asm) {
 
 	var constants []uint64
 
-	for _, c := range []uint64{kemQ, 2 * kemQ, 1 << 26 / kemQ} {
+	for _, c := range []uint64{kemQ, 2 * kemQ, 1 << 16 / kemQ} {
 		for range 16 {
 			constants = append(constants, c)
 		}
@@ -110,7 +110,7 @@ func nttAmd64(a *asm) {
 }
 
 // Registers: Y0-Y3 the data, Y4-Y6 temporaries, Y7-Y10 shuffled lanes, Y11 a zeta and Y12 its
-// companion, Y13 = q, Y14 = 2q and Y15 = floor(2^26 / q) in every lane.
+// companion, Y13 = q, Y14 = 2q and Y15 = floor(2^16 / q) in every lane.
 
 // t = b * zeta mod q, or that plus q, into Y4, the zeta in Y11 and the companion in Y12.
 func kemShoupAVX2(a *asm, b string) {
@@ -159,11 +159,10 @@ func kemReduceOnceAVX2(a *asm, x string) {
 	a.op("VPMINUW\tY4, %s, %s", x, x)
 }
 
-// x mod q for any 16-bit x, as kemReduce16.
+// x mod q for x below 15q, which the last forward layer leaves: x * floor(2^16 / q) / 2^16 falls
+// short of x / q by less than 15 * (1 - 19 q / 2^16) < 0.53, so it is the quotient or one less.
 func kemReduce16AVX2(a *asm, x string) {
 	a.op("VPMULHUW\tY15, %s, Y5", x)
-
-	a.op("VPSRLW\t$10, Y5, Y5")
 
 	a.op("VPMULLW\tY13, Y5, Y5")
 
@@ -204,13 +203,19 @@ func shuffle4(a *asm, x, y, even, odd string) {
 	a.op("VPUNPCKHQDQ\t%s, %s, %s", y, x, odd)
 }
 
-// Doublewords: the even ones of x and y, interleaved, and the odd ones; Y4 is a temporary.
-func shuffle2(a *asm, x, y, even, odd string) {
+// Doublewords: the even ones of x and y, interleaved, and the odd ones; Y4 is a temporary. With
+// shuffle set the odd ones of x come down by VMOVSHDUP, which leaves port 0 of Intel's cores to the
+// multiplications of the forward transform; the inverse, heavier in shuffles, shifts them.
+func shuffle2(a *asm, x, y, even, odd string, shuffle bool) {
 	a.op("VMOVSLDUP\t%s, Y4", y)
 
 	a.op("VPBLENDD\t$0xaa, Y4, %s, %s", x, even)
 
-	a.op("VPSRLQ\t$32, %s, Y4", x)
+	if shuffle {
+		a.op("VMOVSHDUP\t%s, Y4", x)
+	} else {
+		a.op("VPSRLQ\t$32, %s, Y4", x)
+	}
 
 	a.op("VPBLENDD\t$0xaa, %s, Y4, %s", y, odd)
 }
@@ -323,7 +328,7 @@ func kemNTTAVX2(a *asm) {
 
 		kemForwardAVX2(a, "Y9", "Y10")
 
-		shuffle2(a, "Y9", "Y10", "Y7", "Y8")
+		shuffle2(a, "Y9", "Y10", "Y7", "Y8", true)
 
 		kemNextLanes(a)
 
@@ -333,7 +338,7 @@ func kemNTTAVX2(a *asm) {
 
 		kemReduce16AVX2(a, "Y8")
 
-		shuffle2(a, "Y7", "Y8", "Y9", "Y10")
+		shuffle2(a, "Y7", "Y8", "Y9", "Y10", true)
 
 		shuffle4(a, "Y9", "Y10", "Y7", "Y8")
 
@@ -385,13 +390,13 @@ func kemInverseNTTAVX2(a *asm) {
 
 		shuffle4(a, "Y7", "Y8", "Y9", "Y10")
 
-		shuffle2(a, "Y9", "Y10", "Y7", "Y8")
+		shuffle2(a, "Y9", "Y10", "Y7", "Y8", false)
 
 		kemNextLanes(a)
 
 		kemInverseAVX2(a, "Y7", "Y8", true)
 
-		shuffle2(a, "Y7", "Y8", "Y9", "Y10")
+		shuffle2(a, "Y7", "Y8", "Y9", "Y10", false)
 
 		kemNextLanes(a)
 

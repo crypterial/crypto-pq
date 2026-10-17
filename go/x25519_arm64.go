@@ -44,3 +44,8 @@ func x25519(scalar, u []byte) [32]byte {
 
 	return out
 }
+
+// The portable comb beats the ladder in assembly here, so the fixed base takes it.
+func x25519Base(scalar []byte) [32]byte {
+	return x25519BaseGeneric(scalar)
+}

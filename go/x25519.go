@@ -494,8 +494,8 @@ func edwardsToAffine(points []edwardsPoint, d2 *fieldElement, out []edwardsAffin
 	}
 }
 
-// The table of x25519Base, entry [i][j] being (j + 1) 256^i B, computed from B on first use. d is
-// -121665 / 121666 (RFC 7748, 4.1).
+// The table of x25519BaseGeneric, entry [i][j] being (j + 1) 256^i B, computed from B on first
+// use. d is -121665 / 121666 (RFC 7748, 4.1).
 var edwardsTable = sync.OnceValue(func() *[32][8]edwardsAffine {
 	inverse := feInvert(&fieldElement{121666})
 
@@ -584,8 +584,10 @@ func (v *edwardsAffine) selectFrom(row *[8]edwardsAffine, digit int8) {
 	feSwap(&v.xy2d, &negated, negative)
 }
 
-// X25519(scalar, 9): the u-coordinate of [k]B for the clamped scalar k.
-func x25519Base(scalar []byte) [32]byte {
+// The clamped scalar k as the sum of digits[i] 16^i with every digit in [-8, 8]: each nibble above
+// 7 becomes the nibble minus 16 and carries one into the next. The top digit stays at most 8 since
+// bit 255 is clear.
+func x25519BaseDigits(scalar []byte, digits *[64]int8) {
 	var k [32]byte
 
 	copy(k[:], scalar)
@@ -595,10 +597,6 @@ func x25519Base(scalar []byte) [32]byte {
 	k[31] &= 127
 
 	k[31] |= 64
-
-	// k = sum of digits[i] 16^i with every digit in [-8, 8]: each nibble above 7 becomes the nibble
-	// minus 16 and carries one into the next. The top digit stays at most 8 since bit 255 is clear.
-	var digits [64]int8
 
 	for i, b := range k {
 		digits[2*i], digits[2*i+1] = int8(b&15), int8(b>>4)
@@ -615,6 +613,16 @@ func x25519Base(scalar []byte) [32]byte {
 	}
 
 	digits[63] += carry
+
+	clear(k[:])
+}
+
+// X25519(scalar, 9): the u-coordinate of [k]B for the clamped scalar k. This is the portable form
+// of x25519Base.
+func x25519BaseGeneric(scalar []byte) [32]byte {
+	var digits [64]int8
+
+	x25519BaseDigits(scalar, &digits)
 
 	table := edwardsTable()
 
@@ -643,8 +651,6 @@ func x25519Base(scalar []byte) [32]byte {
 	inverse := feInvert(&denominator)
 
 	u := feMul(&numerator, &inverse)
-
-	clear(k[:])
 
 	clear(digits[:])
 

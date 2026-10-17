@@ -80,14 +80,12 @@ func cshakeAlgorithm(id uint8, functionName, customization []byte) XofAlgorithm 
 func keccakXof(state *[25]uint64, rate int, suffix byte, data, out []byte) {
 	lanes := rate / 8
 
-	for ; len(data) >= rate; data = data[rate:] {
-		block := data[:rate]
+	if len(data) >= rate {
+		whole := len(data) - len(data)%rate
 
-		for i := range lanes {
-			state[i] ^= binary.LittleEndian.Uint64(block[8*i:])
-		}
+		keccakAbsorb(state, data[:whole], rate)
 
-		permute(state)
+		data = data[whole:]
 	}
 
 	whole := len(data) / 8

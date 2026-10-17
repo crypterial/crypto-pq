@@ -31,6 +31,8 @@ var outputs = []output{
 	{"blake2_amd64.s", blake2Amd64},
 	{"ascon_amd64.s", asconAmd64},
 	{"ntt_amd64.s", nttAmd64},
+	{"kem_amd64.s", kemAmd64},
+	{"dsa_amd64.s", dsaAmd64},
 	{"x25519_amd64.s", x25519Amd64},
 }
 

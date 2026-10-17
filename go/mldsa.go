@@ -13,6 +13,10 @@ import (
 const (
 	dsaQ = 8380417
 	dsaD = 13
+
+	// 2^32 mod q. Montgomery products carry the factor 2^-32, which a challenge with +-2^32 in
+	// place of +-1 cancels (dsaChallengeOne).
+	dsaMontR = 4193792
 )
 
 type mldsaParams struct {
@@ -256,17 +260,120 @@ func dsaDot(out *dsaPoly, a, b []dsaPoly) {
 	}
 }
 
-// acc += a * b in the NTT domain, unreduced, for a matrix row sampled one entry at a time.
-func dsaMultiplyAdd(acc *[256]uint64, a, b *dsaPoly) {
-	for x, c := range a {
-		acc[x] += uint64(c) * uint64(b[x])
-	}
-}
-
 func dsaPointwise(out, a, b *dsaPoly) {
 	for x := range out {
 		out[x] = dsaMul(a[x], b[x])
 	}
+}
+
+// The products of the scheme, each ending in the inverse NTT; the kernels compute the same values
+// another way (dsa_amd64.go). This is the portable form of dsaRowProduct: NTT^-1 of the sum of
+// a[j] b[j], a row of the matrix times a vector, both in the NTT domain.
+func dsaRowProductGeneric(out *dsaPoly, a, b []dsaPoly) {
+	dsaDot(out, a, b)
+
+	dsaInverseNTT(out)
+}
+
+// The portable form of dsaRowProductSub: NTT^-1(sum of a[j] b[j] - c t), verification's row.
+func dsaRowProductSubGeneric(out *dsaPoly, a, b []dsaPoly, c, t *dsaPoly) {
+	var product dsaPoly
+
+	dsaDot(out, a, b)
+
+	dsaPointwise(&product, c, t)
+
+	for x := range out {
+		out[x] = dsaSub(out[x], product[x])
+	}
+
+	dsaInverseNTT(out)
+}
+
+// The portable form of dsaProduct: NTT^-1(c s + y), y being nil for NTT^-1(c s); out may be y. c
+// is the challenge scaled by dsaChallengeOne.
+func dsaProductGeneric(out, c, s, y *dsaPoly) {
+	if y == nil {
+		dsaPointwise(out, c, s)
+	} else {
+		for x := range out {
+			out[x] = dsaAdd(dsaMul(c[x], s[x]), y[x])
+		}
+	}
+
+	dsaInverseNTT(out)
+}
+
+// The portable form of dsaBeyond: 1 when the centered absolute value of some coefficient of w is
+// at least bound, otherwise 0.
+func dsaBeyondGeneric(w *dsaPoly, bound uint32) uint32 {
+	var beyond uint32
+
+	for _, x := range w {
+		beyond |= dsaAtLeast(x, bound)
+	}
+
+	return beyond
+}
+
+// The portable form of dsaSubLow: w = w - p, and 1 when the centered low bits of some new
+// coefficient (Decompose's r0) are at least bound in absolute value, otherwise 0.
+func dsaSubLowGeneric(w, p *dsaPoly, gamma2, bound uint32) uint32 {
+	var beyond uint32
+
+	for x := range w {
+		w[x] = dsaSub(w[x], p[x])
+
+		_, r0 := dsaDecompose(w[x], gamma2)
+
+		beyond |= dsaAtLeast(dsaFromSigned(r0), bound)
+	}
+
+	return beyond
+}
+
+// The portable form of dsaHints for the vector w - c s2 and p = c t0: beyond is 1 when the
+// centered c t0 reaches gamma2 somewhere; bit x of hints is MakeHint(-p, w + p), and count their
+// sum.
+func dsaHintsGeneric(hints *[4]uint64, w, p *dsaPoly, gamma2 uint32) (beyond, count uint32) {
+	*hints = [4]uint64{}
+
+	for x := range w {
+		beyond |= dsaAtLeast(p[x], gamma2)
+
+		hint := dsaMakeHint(dsaSub(0, p[x]), dsaAdd(w[x], p[x]), gamma2)
+
+		hints[x/64] |= uint64(hint) << (x % 64)
+
+		count += hint
+	}
+
+	return beyond, count
+}
+
+// The portable form of dsaHighBits: w1Encode of the high bits of w, width bits each.
+func dsaHighBitsGeneric(out []byte, w *dsaPoly, gamma2 uint32, width int) {
+	var high [256]uint32
+
+	for x := range high {
+		r1, _ := dsaDecompose(w[x], gamma2)
+
+		high[x] = uint32(r1)
+	}
+
+	packBits(out, high[:], width)
+}
+
+// The portable form of dsaUseHints: w = UseHint(hints, w) with the hints as bits, then its
+// w1Encode, width bits each.
+func dsaUseHintsGeneric(out []byte, w *dsaPoly, hints *[4]uint64, gamma2 uint32, width int) {
+	m := int32((dsaQ - 1) / (2 * gamma2))
+
+	for x := range w {
+		w[x] = dsaUseHint(uint32(hints[x/64]>>(x%64)&1), w[x], gamma2, m)
+	}
+
+	packBits(out, w[:], width)
 }
 
 // BitPack (FIPS 204, Algorithm 17): stores b - w for coefficients w in [-a, b].
@@ -282,6 +389,33 @@ func dsaPack(out []byte, w *dsaPoly, b uint32, width int) {
 	clear(values[:])
 }
 
+// The portable form of dsaUnpackT1: t1 2^d from the 10-bit values at in (pkDecode).
+func dsaUnpackT1Generic(w *dsaPoly, in []byte) {
+	unpackBits(w[:], in[:320], 10)
+
+	for x := range w {
+		w[x] <<= dsaD
+	}
+}
+
+// The portable form of dsaPower2RoundPack: Power2Round of t, t1 packed with 10 bits (pkEncode)
+// into t1 and t0 as skEncode packs it (BitPack with b = 2^12, 13 bits) into t0.
+func dsaPower2RoundPackGeneric(t1, t0 []byte, t *dsaPoly) {
+	var high, low dsaPoly
+
+	for x := range t {
+		r1, r0 := dsaPower2Round(t[x])
+
+		high[x], low[x] = r1, dsaFromSigned(r0)
+	}
+
+	packBits(t1, high[:], 10)
+
+	dsaPack(t0, &low, 1<<(dsaD-1), dsaD)
+
+	clear(low[:])
+}
+
 func dsaUnpack(w *dsaPoly, in []byte, b uint32, width int) {
 	unpackBits(w[:], in[:32*width], width)
 
@@ -292,6 +426,34 @@ func dsaUnpack(w *dsaPoly, in []byte, b uint32, width int) {
 
 // The most entries sampled together: a row of the ML-DSA-87 matrix, and a group of secret vectors.
 const dsaRowLanes, dsaBoundedLanes = 8, 4
+
+// RejNTTPoly's candidates, three bytes each, from block appended to f from count on while it is
+// below 256; returns the new count. The data is public.
+func dsaRejUniformGeneric(f *dsaPoly, count int, block []byte) int {
+	for rest := block; len(rest) >= 3 && count < 256; rest = rest[3:] {
+		z := uint32(rest[0]) | uint32(rest[1])<<8 | uint32(rest[2]&0x7f)<<16
+
+		if z < dsaQ {
+			f[count] = z
+
+			count++
+		}
+	}
+
+	return count
+}
+
+// The portable form of dsaRejUniformLane: dsaRejUniformGeneric of the 168 rate bytes of a SHAKE128
+// state.
+func dsaRejUniformLaneGeneric(f *dsaPoly, count int, state *[25]uint64) int {
+	var block [168]byte
+
+	for i, lane := range state[:21] {
+		binary.LittleEndian.PutUint64(block[8*i:], lane)
+	}
+
+	return dsaRejUniformGeneric(f, count, block[:])
+}
 
 // RejNTTPoly (FIPS 204, Algorithm 30) of one entry, as dsaSampleUniforms does many.
 func dsaSampleUniform(f *dsaPoly, rho []byte, s, r byte) {
@@ -308,15 +470,7 @@ func dsaSampleUniform(f *dsaPoly, rho []byte, s, r byte) {
 	for count < 256 {
 		sponge.read(block[:])
 
-		for rest := block[:]; len(rest) >= 3 && count < 256; rest = rest[3:] {
-			z := uint32(rest[0]) | uint32(rest[1])<<8 | uint32(rest[2]&0x7f)<<16
-
-			if z < dsaQ {
-				f[count] = z
-
-				count++
-			}
-		}
+		count = dsaRejUniformGeneric(f, count, block[:])
 	}
 }
 
@@ -386,8 +540,6 @@ func dsaSampleUniforms(polys []*dsaPoly, rho []byte, positions []uint16) {
 
 	sponges.start(168, rho, positions, 2)
 
-	var block [168]byte
-
 	var counts [dsaRowLanes]int
 
 	for remaining := len(polys); remaining > 0; {
@@ -400,17 +552,7 @@ func dsaSampleUniforms(polys []*dsaPoly, rho []byte, positions []uint16) {
 				continue
 			}
 
-			sponges.read(l, block[:])
-
-			for rest := block[:]; len(rest) >= 3 && count < 256; rest = rest[3:] {
-				z := uint32(rest[0]) | uint32(rest[1])<<8 | uint32(rest[2]&0x7f)<<16
-
-				if z < dsaQ {
-					f[count] = z
-
-					count++
-				}
-			}
+			count = dsaRejUniformLane(f, count, &sponges.states[l])
 
 			counts[l] = count
 
@@ -538,40 +680,47 @@ func dsaExpandA(a []dsaPoly, rho []byte, p *mldsaParams) {
 	}
 }
 
-// Groups of four keep the sampling buffers of dsaSampleBoundeds small.
-func dsaExpandS(s []dsaPoly, rhoPrime []byte, p *mldsaParams) {
+// ExpandS (FIPS 204, Algorithm 33) into s1 and s2, which may lie apart; groups of four keep the
+// sampling buffers of dsaSampleBoundeds small.
+func dsaExpandS(s1, s2 []dsaPoly, rhoPrime []byte, p *mldsaParams) {
 	var group [dsaBoundedLanes]*dsaPoly
 
-	for first := 0; first < len(s); first += dsaBoundedLanes {
-		count := min(dsaBoundedLanes, len(s)-first)
+	total := len(s1) + len(s2)
+
+	for first := 0; first < total; first += dsaBoundedLanes {
+		count := min(dsaBoundedLanes, total-first)
 
 		for l := range count {
-			group[l] = &s[first+l]
+			if i := first + l; i < len(s1) {
+				group[l] = &s1[i]
+			} else {
+				group[l] = &s2[i-len(s1)]
+			}
 		}
 
 		dsaSampleBoundeds(group[:count], rhoPrime, first, p.eta)
 	}
 }
 
+// The SHAKE256 output of each y[r], kept by the caller for the sparse products (dsaSparse): five
+// blocks of 136 bytes, more than the 640 bytes that the largest gamma1 takes.
+type dsaMaskStreams [dsaMaxL][680]byte
+
 // ExpandMask (FIPS 204, Algorithm 34): y[r] from SHAKE256(rho' || kappa + r), all at once where the
-// lane kernels are fast.
-func dsaExpandMask(y []dsaPoly, rhoPrime []byte, kappa int, p *mldsaParams) {
+// lane kernels are fast. streams receives the packed form of each y[r]; the caller wipes it.
+func dsaExpandMask(y []dsaPoly, streams *dsaMaskStreams, rhoPrime []byte, kappa int, p *mldsaParams) {
 	width := p.gamma1Bits()
 
 	if !permuteLanesFast() {
-		var stream [640]byte
-
 		var nonce [2]byte
 
 		for r := range y {
 			binary.LittleEndian.PutUint16(nonce[:], uint16(kappa+r))
 
-			shake256Sum(stream[:32*width], rhoPrime, nonce[:])
+			shake256Sum(streams[r][:32*width], rhoPrime, nonce[:])
 
-			dsaUnpack(&y[r], stream[:], p.gamma1, width)
+			dsaUnpackGamma1(&y[r], streams[r][:], p.gamma1, width)
 		}
-
-		clear(stream[:])
 
 		return
 	}
@@ -586,8 +735,6 @@ func dsaExpandMask(y []dsaPoly, rhoPrime []byte, kappa int, p *mldsaParams) {
 
 	sponges.start(136, rhoPrime, nonces[:len(y)], 2)
 
-	var streams [dsaMaxL][680]byte
-
 	for offset := 0; offset < 32*width; offset += 136 {
 		sponges.squeeze()
 
@@ -597,43 +744,162 @@ func dsaExpandMask(y []dsaPoly, rhoPrime []byte, kappa int, p *mldsaParams) {
 	}
 
 	for r := range y {
-		dsaUnpack(&y[r], streams[r][:], p.gamma1, width)
+		dsaUnpackGamma1(&y[r], streams[r][:], p.gamma1, width)
 	}
-
-	clear(streams[:])
 
 	sponges.wipe()
 }
 
-// SampleInBall (FIPS 204, Algorithm 29) from the commitment hash, which the signature reveals.
+// SampleInBall (FIPS 204, Algorithm 29) from the commitment hash, which the signature reveals; the
+// stream is read a block at a time.
 func dsaSampleInBall(c *dsaPoly, seed []byte, tau int) {
 	sponge := keccak{rate: 136, suffix: 0x1f}
 
 	sponge.update(seed)
 
-	var signBytes [8]byte
+	var block [136]byte
 
-	sponge.read(signBytes[:])
+	sponge.read(block[:])
 
-	signs := binary.LittleEndian.Uint64(signBytes[:])
+	signs := binary.LittleEndian.Uint64(block[:8])
+
+	position := 8
 
 	clear(c[:])
 
-	var j [1]byte
-
 	for i := 256 - tau; i < 256; i++ {
-		sponge.read(j[:])
+		var j int
 
-		for int(j[0]) > i {
-			sponge.read(j[:])
+		for {
+			if position == len(block) {
+				sponge.read(block[:])
+
+				position = 0
+			}
+
+			j = int(block[position])
+
+			position++
+
+			if j <= i {
+				break
+			}
 		}
 
-		c[i] = c[j[0]]
+		c[i] = c[j]
 
-		c[j[0]] = dsaFromSigned(1 - 2*int32(signs&1))
+		c[j] = dsaFromSigned(1 - 2*int32(signs&1))
 
 		signs >>= 1
 	}
+}
+
+// The challenge's coefficients +-1 become +-one, so that its products can absorb a constant
+// factor (dsaChallengeOne).
+func dsaScaleChallenge(c *dsaPoly, one uint32) {
+	if one == 1 {
+		return
+	}
+
+	for x, v := range c {
+		c[x] = one&-(v&1) | (dsaQ-one)&-(v>>22&1)
+	}
+}
+
+// The challenge as the starts of the windows of the extended secret [-s, s] whose signed sum is c s
+// (dsaSparseProductGeneric): a coefficient +-1 at x adds +-s shifted by x, which is the window at
+// 256 - x. The positions are public but the signs of a rejected attempt are not, so a sign only
+// sets bit 15 of its start, which the products apply with masks, never with an address. Returns
+// the number of windows, tau.
+func dsaChallengeStarts(starts *[64]uint16, c *dsaPoly) int {
+	n := 0
+
+	for x, v := range c {
+		starts[n] = uint16(256-x) | uint16(v>>22&1)<<15
+
+		n += int(v&1 | v>>22&1)
+	}
+
+	return n
+}
+
+// The small secret polynomial packed at in (BitPack with b = eta, 3 or 4 bits) as [-s, s].
+func dsaExtendGeneric(ext *[512]int16, in []byte, eta int) {
+	var raw [256]uint32
+
+	width := 4
+
+	if eta == 2 {
+		width = 3
+	}
+
+	unpackBits(raw[:], in[:32*width], width)
+
+	for x, v := range raw {
+		s := int16(eta) - int16(v)
+
+		ext[x], ext[256+x] = -s, s
+	}
+
+	clear(raw[:])
+}
+
+// The portable form of dsaSparseProduct: d = c s as small integers, for the challenge given by its
+// window starts and the secret polynomial packed at in. A negative window is xored with all ones,
+// -w - 1, and the count of those adds the ones back.
+func dsaSparseProductGeneric(d *[256]int16, starts *[64]uint16, n int, in []byte, eta int) {
+	var ext [512]int16
+
+	dsaExtendGeneric(&ext, in, eta)
+
+	clear(d[:])
+
+	var negative int16
+
+	for _, start := range starts[:n] {
+		window := ext[start&0x1ff : int(start&0x1ff)+256]
+
+		mask := -int16(start >> 15)
+
+		for x := range d {
+			d[x] += window[x] ^ mask
+		}
+
+		negative -= mask
+	}
+
+	for x := range d {
+		d[x] += negative
+	}
+
+	clear(ext[:])
+}
+
+// The portable form of dsaUnpackAdd: z = y + d for y unpacked from in, and 1 when the centered
+// absolute value of some coefficient of z is at least bound, otherwise 0.
+func dsaUnpackAddGeneric(z *dsaPoly, in []byte, d *[256]int16, gamma1 uint32, width int, bound uint32) uint32 {
+	dsaUnpack(z, in, gamma1, width)
+
+	for x := range z {
+		z[x] = dsaAdd(z[x], dsaFromSigned(int32(d[x])))
+	}
+
+	return dsaBeyondGeneric(z, bound)
+}
+
+// The portable form of dsaSubSmallLow: dsaSubLow with the small integers d.
+func dsaSubSmallLowGeneric(w *dsaPoly, d *[256]int16, gamma2, bound uint32) uint32 {
+	var p dsaPoly
+
+	for x := range p {
+		p[x] = dsaFromSigned(int32(d[x]))
+	}
+
+	beyond := dsaSubLowGeneric(w, &p, gamma2, bound)
+
+	clear(p[:])
+
+	return beyond
 }
 
 // Power2Round (FIPS 204, Algorithm 35) for r in [0, q).
@@ -697,8 +963,9 @@ func dsaUseHint(h, r, gamma2 uint32, m int32) uint32 {
 	}
 }
 
-// t = NTT^-1(A * NTT(s1)) + s2, with each row of A sampled just before its products are added.
-func dsaPublicT(t []dsaPoly, rho []byte, s1Hat, s2 []dsaPoly, p *mldsaParams) {
+// t = NTT^-1(A * NTT(s1)) + s2 for t holding s2, with each row of A sampled just before its
+// products are added.
+func dsaPublicT(t []dsaPoly, rho []byte, s1Hat []dsaPoly) {
 	var a [dsaMaxL]dsaPoly
 
 	var row [dsaMaxL]*dsaPoly
@@ -707,29 +974,19 @@ func dsaPublicT(t []dsaPoly, rho []byte, s1Hat, s2 []dsaPoly, p *mldsaParams) {
 		row[j] = &a[j]
 	}
 
-	var acc [256]uint64
+	var product dsaPoly
 
 	for i := range t {
-		clear(acc[:])
-
 		dsaSampleRow(row[:len(s1Hat)], rho, i)
 
-		for j := range s1Hat {
-			dsaMultiplyAdd(&acc, &a[j], &s1Hat[j])
-		}
-
-		for x, sum := range acc {
-			t[i][x] = dsaReduce(sum)
-		}
-
-		dsaInverseNTT(&t[i])
+		dsaRowProduct(&product, a[:len(s1Hat)], s1Hat)
 
 		for x := range t[i] {
-			t[i][x] = dsaAdd(t[i][x], s2[i][x])
+			t[i][x] = dsaAdd(product[x], t[i][x])
 		}
 	}
 
-	clear(acc[:])
+	clear(product[:])
 }
 
 // What verification and signing derive from a public key, kept by the key: tr = H(pk, 64), set when
@@ -766,11 +1023,7 @@ func (c *dsaPublic) t1Hat(p *mldsaParams, pk []byte) []dsaPoly {
 		t1 := make([]dsaPoly, p.k)
 
 		for i := range t1 {
-			unpackBits(t1[i][:], pk[32+320*i:32+320*(i+1)], 10)
-
-			for x := range t1[i] {
-				t1[i][x] <<= dsaD
-			}
+			dsaUnpackT1(&t1[i], pk[32+320*i:])
 
 			dsaNTT(&t1[i])
 		}
@@ -781,7 +1034,8 @@ func (c *dsaPublic) t1Hat(p *mldsaParams, pk []byte) []dsaPoly {
 	return c.t1
 }
 
-// ŝ1, ŝ2 and t̂0 of a private key, in one slice: decoded on first use and wiped with the key.
+// t̂0 of a private key, after ŝ1 and ŝ2 unless signing takes s1 and s2 from the key bytes
+// (dsaSparse), in one slice: decoded on first use and wiped with the key.
 type dsaSecrets struct {
 	once  sync.Once
 	polys []dsaPoly
@@ -789,6 +1043,25 @@ type dsaSecrets struct {
 
 func (c *dsaSecrets) get(p *mldsaParams, sk []byte) []dsaPoly {
 	c.once.Do(func() {
+		// Signing with sparse products reads s1 and s2 from the key itself.
+		if dsaSparse() {
+			t0 := make([]dsaPoly, p.k)
+
+			offset := 128 + 32*(p.l+p.k)*p.etaBits()
+
+			for i := range t0 {
+				dsaUnpack(&t0[i], sk[offset:], 1<<(dsaD-1), dsaD)
+
+				dsaNTT(&t0[i])
+
+				offset += 32 * dsaD
+			}
+
+			c.polys = t0
+
+			return
+		}
+
 		polys := make([]dsaPoly, p.l+2*p.k)
 
 		dsaDecodePrivateKey(polys[:p.l+p.k], polys[p.l+p.k:], sk, p)
@@ -831,65 +1104,49 @@ func mldsaKeyGen(p *mldsaParams, xi []byte) (pk, sk []byte) {
 
 	rho, rhoPrime, key := expanded[:32], expanded[32:96], expanded[96:]
 
-	s := make([]dsaPoly, p.l+p.k, dsaMaxL+dsaMaxK)
+	// s2 goes where t is computed, which adds it.
+	s1, t := make([]dsaPoly, p.l, dsaMaxL), make([]dsaPoly, p.k, dsaMaxK)
 
-	dsaExpandS(s, rhoPrime, p)
+	dsaExpandS(s1, t, rhoPrime, p)
 
-	s1Hat := make([]dsaPoly, p.l, dsaMaxL)
+	pk, sk = make([]byte, p.publicKeySize()), make([]byte, p.privateKeySize())
 
-	copy(s1Hat, s)
-
-	for i := range s1Hat {
-		dsaNTT(&s1Hat[i])
-	}
-
-	t := make([]dsaPoly, p.k, dsaMaxK)
-
-	dsaPublicT(t, rho, s1Hat, s[p.l:], p)
-
-	pk = dsaEncodePublicKey(rho, t, p)
-
-	sk = make([]byte, p.privateKeySize())
+	copy(pk, rho)
 
 	copy(sk, rho)
 
 	copy(sk[32:], key)
 
-	shake256Sum(sk[64:128], pk)
-
 	width := p.etaBits()
 
 	offset := 128
 
-	for i := range s {
-		dsaPack(sk[offset:], &s[i], uint32(p.eta), width)
+	for _, part := range [][]dsaPoly{s1, t} {
+		for i := range part {
+			dsaPackEta(sk[offset:], &part[i], p.eta, width)
 
-		offset += 32 * width
+			offset += 32 * width
+		}
 	}
 
-	var t0 dsaPoly
+	// Once packed, s1 makes way for NTT(s1).
+	for i := range s1 {
+		dsaNTT(&s1[i])
+	}
+
+	dsaPublicT(t, rho, s1)
 
 	for i := range t {
-		for x := range t0 {
-			_, low := dsaPower2Round(t[i][x])
-
-			t0[x] = dsaFromSigned(low)
-		}
-
-		dsaPack(sk[offset:], &t0, 1<<(dsaD-1), dsaD)
-
-		offset += 32 * dsaD
+		dsaPower2RoundPack(pk[32+320*i:], sk[offset+32*dsaD*i:], &t[i])
 	}
+
+	shake256Sum(sk[64:128], pk)
 
 	clear(expanded[:])
 
-	clear(s)
-
-	clear(s1Hat)
+	clear(s1)
 
 	clear(t)
-
-	clear(t0[:])
 
 	return pk, sk
 }
@@ -934,17 +1191,15 @@ func mldsaCheckPrivateKey(p *mldsaParams, sk []byte) []byte {
 
 	invalid := dsaDecodePrivateKey(s, t0, sk, p)
 
-	s1Hat := make([]dsaPoly, p.l, dsaMaxL)
-
-	copy(s1Hat, s)
-
-	for i := range s1Hat {
-		dsaNTT(&s1Hat[i])
+	for i := range p.l {
+		dsaNTT(&s[i])
 	}
 
 	t := make([]dsaPoly, p.k, dsaMaxK)
 
-	dsaPublicT(t, sk[:32], s1Hat, s[p.l:], p)
+	copy(t, s[p.l:])
+
+	dsaPublicT(t, sk[:32], s[:p.l])
 
 	var difference uint32
 
@@ -968,8 +1223,6 @@ func mldsaCheckPrivateKey(p *mldsaParams, sk []byte) []byte {
 
 	clear(s)
 
-	clear(s1Hat)
-
 	clear(t0)
 
 	clear(t)
@@ -981,11 +1234,17 @@ func mldsaCheckPrivateKey(p *mldsaParams, sk []byte) []byte {
 	return pk
 }
 
-// a is Â and secrets holds ŝ1, ŝ2 and t̂0, which the key keeps.
+// a is Â and secrets what dsaSecrets keeps: t̂0, after ŝ1 and ŝ2 without the sparse products.
 func mldsaSign(p *mldsaParams, sk []byte, a, secrets []dsaPoly, message, rnd []byte) []byte {
 	k, l := p.k, p.l
 
-	s1Hat, s2Hat, t0 := secrets[:l], secrets[l:l+k], secrets[l+k:]
+	t0 := secrets[len(secrets)-k:]
+
+	var s1Hat, s2Hat []dsaPoly
+
+	if len(secrets) > k {
+		s1Hat, s2Hat = secrets[:l], secrets[l:l+k]
+	}
 
 	var mu, rhoPrime [64]byte
 
@@ -993,95 +1252,108 @@ func mldsaSign(p *mldsaParams, sk []byte, a, secrets []dsaPoly, message, rnd []b
 
 	shake256Sum(rhoPrime[:], sk[32:64], rnd, mu[:])
 
-	y, yHat, z := make([]dsaPoly, l, dsaMaxL), make([]dsaPoly, l, dsaMaxL), make([]dsaPoly, l, dsaMaxL)
+	// z = y + c s1 takes the place of NTT(y), which only the products of w need before it.
+	yHat := make([]dsaPoly, l, dsaMaxL)
 
-	w, hints := make([]dsaPoly, k, dsaMaxK), make([][256]byte, k, dsaMaxK)
+	z := yHat
+
+	w, hints := make([]dsaPoly, k, dsaMaxK), make([][4]uint64, k, dsaMaxK)
 
 	w1 := make([]byte, 32*k*p.w1Bits(), 32*dsaMaxK*6)
 
 	cTilde := make([]byte, p.lambda/4, 64)
 
-	var high, c, product dsaPoly
+	var c, product dsaPoly
+
+	var streams dsaMaskStreams
+
+	var starts [64]uint16
+
+	var small [256]int16
 
 	gamma1Bound, gamma2Bound := p.gamma1-p.beta(), p.gamma2-p.beta()
 
-	for kappa := 0; ; kappa += l {
-		dsaExpandMask(y, rhoPrime[:], kappa, p)
+	// s1 and s2 as packed in the private key, for the sparse products, which may read a little past
+	// a polynomial.
+	packed := 32 * p.etaBits()
 
-		copy(yHat, y)
+	s1, s2 := sk[128:], sk[128+l*packed:]
+
+	// y lives in the NTT domain only, and in its packed form in streams: z = y + c s1 is either
+	// NTT^-1(NTT(y) + c NTT(s1)) or y + c s1 from the sparse product of c and s1.
+	for kappa := 0; ; kappa += l {
+		dsaExpandMask(yHat, &streams, rhoPrime[:], kappa, p)
 
 		for i := range yHat {
 			dsaNTT(&yHat[i])
 		}
 
 		for i := range w {
-			dsaDot(&w[i], a[i*l:(i+1)*l], yHat)
+			dsaRowProduct(&w[i], a[i*l:(i+1)*l], yHat)
 
-			dsaInverseNTT(&w[i])
-
-			for x := range high {
-				r1, _ := dsaDecompose(w[i][x], p.gamma2)
-
-				high[x] = uint32(r1)
-			}
-
-			packBits(w1[32*p.w1Bits()*i:], high[:], p.w1Bits())
+			dsaHighBits(w1[32*p.w1Bits()*i:], &w[i], p.gamma2, p.w1Bits())
 		}
 
 		shake256Sum(cTilde, mu[:], w1)
 
 		dsaSampleInBall(&c, cTilde, p.tau)
 
-		dsaNTT(&c)
-
 		var reject uint32
 
-		for r := range z {
-			dsaPointwise(&product, &c, &s1Hat[r])
+		if dsaSparse() {
+			n := dsaChallengeStarts(&starts, &c)
 
-			dsaInverseNTT(&product)
+			for r := range z {
+				dsaSparseProduct(&small, &starts, n, s1[packed*r:], p.eta)
 
-			for x := range product {
-				z[r][x] = dsaAdd(y[r][x], product[x])
-
-				reject |= dsaAtLeast(z[r][x], gamma1Bound)
+				reject |= dsaUnpackAdd(&z[r], streams[r][:], &small, p.gamma1, p.gamma1Bits(), gamma1Bound)
 			}
-		}
 
-		for i := range w {
-			dsaPointwise(&product, &c, &s2Hat[i])
+			for i := range w {
+				dsaSparseProduct(&small, &starts, n, s2[packed*i:], p.eta)
 
-			dsaInverseNTT(&product)
-
-			for x := range product {
-				w[i][x] = dsaSub(w[i][x], product[x])
-
-				_, r0 := dsaDecompose(w[i][x], p.gamma2)
-
-				reject |= dsaAtLeast(dsaFromSigned(r0), gamma2Bound)
+				reject |= dsaSubSmallLow(&w[i], &small, p.gamma2, gamma2Bound)
 			}
-		}
 
-		if reject != 0 {
-			continue
+			if reject != 0 {
+				continue
+			}
+
+			dsaScaleChallenge(&c, dsaChallengeOne())
+
+			dsaNTT(&c)
+		} else {
+			dsaScaleChallenge(&c, dsaChallengeOne())
+
+			dsaNTT(&c)
+
+			for r := range z {
+				dsaProduct(&z[r], &c, &s1Hat[r], &yHat[r])
+
+				reject |= dsaBeyond(&z[r], gamma1Bound)
+			}
+
+			for i := range w {
+				dsaProduct(&product, &c, &s2Hat[i], nil)
+
+				reject |= dsaSubLow(&w[i], &product, p.gamma2, gamma2Bound)
+			}
+
+			if reject != 0 {
+				continue
+			}
 		}
 
 		var count uint32
 
 		for i := range w {
-			dsaPointwise(&product, &c, &t0[i])
+			dsaProduct(&product, &c, &t0[i], nil)
 
-			dsaInverseNTT(&product)
+			beyond, n := dsaHints(&hints[i], &w[i], &product, p.gamma2)
 
-			for x := range product {
-				reject |= dsaAtLeast(product[x], p.gamma2)
+			reject |= beyond
 
-				hint := dsaMakeHint(dsaSub(0, product[x]), dsaAdd(w[i][x], product[x]), p.gamma2)
-
-				hints[i][x] = byte(hint)
-
-				count += hint
-			}
+			count += n
 		}
 
 		// The ct0 bound and the hint count make one restart decision, as in the Rust and Zig
@@ -1097,16 +1369,12 @@ func mldsaSign(p *mldsaParams, sk []byte, a, secrets []dsaPoly, message, rnd []b
 		offset := len(cTilde)
 
 		for r := range z {
-			dsaPack(signature[offset:], &z[r], p.gamma1, p.gamma1Bits())
+			dsaPackGamma1(signature[offset:], &z[r], p.gamma1, p.gamma1Bits())
 
 			offset += 32 * p.gamma1Bits()
 		}
 
 		dsaPackHints(signature[offset:], hints, p)
-
-		clear(y)
-
-		clear(yHat)
 
 		clear(z)
 
@@ -1116,18 +1384,22 @@ func mldsaSign(p *mldsaParams, sk []byte, a, secrets []dsaPoly, message, rnd []b
 
 		clear(product[:])
 
+		clear(streams[:])
+
+		clear(small[:])
+
 		return signature
 	}
 }
 
 // HintBitPack (FIPS 204, Algorithm 20) of an accepted signature, whose hints are public.
-func dsaPackHints(out []byte, hints [][256]byte, p *mldsaParams) {
+func dsaPackHints(out []byte, hints [][4]uint64, p *mldsaParams) {
 	index := 0
 
 	for i := range hints {
-		for j, bit := range hints[i] {
-			if bit != 0 {
-				out[index] = byte(j)
+		for j, word := range hints[i] {
+			for ; word != 0; word &= word - 1 {
+				out[index] = byte(64*j + bits.TrailingZeros64(word))
 
 				index++
 			}
@@ -1139,7 +1411,7 @@ func dsaPackHints(out []byte, hints [][256]byte, p *mldsaParams) {
 
 // HintBitUnpack (FIPS 204, Algorithm 21): the encoding must be canonical, with strictly
 // increasing indices and zero padding, or the signature is rejected.
-func dsaUnpackHints(hints [][256]byte, data []byte, p *mldsaParams) bool {
+func dsaUnpackHints(hints [][4]uint64, data []byte, p *mldsaParams) bool {
 	index := 0
 
 	for i := range hints {
@@ -1154,7 +1426,7 @@ func dsaUnpackHints(hints [][256]byte, data []byte, p *mldsaParams) bool {
 				return false
 			}
 
-			hints[i][data[index]] = 1
+			hints[i][data[index]/64] |= 1 << (data[index] % 64)
 		}
 	}
 
@@ -1184,16 +1456,14 @@ func mldsaVerify(p *mldsaParams, pk []byte, public *dsaPublic, message, signatur
 	var notBelow uint32
 
 	for r := range z {
-		dsaUnpack(&z[r], signature[offset:], p.gamma1, p.gamma1Bits())
+		dsaUnpackGamma1(&z[r], signature[offset:], p.gamma1, p.gamma1Bits())
 
 		offset += 32 * p.gamma1Bits()
 
-		for _, x := range z[r] {
-			notBelow |= dsaAtLeast(x, p.gamma1-p.beta())
-		}
+		notBelow |= dsaBeyond(&z[r], p.gamma1-p.beta())
 	}
 
-	hints := make([][256]byte, k, dsaMaxK)
+	hints := make([][4]uint64, k, dsaMaxK)
 
 	if !dsaUnpackHints(hints, signature[offset:], p) || notBelow != 0 {
 		return false
@@ -1203,7 +1473,7 @@ func mldsaVerify(p *mldsaParams, pk []byte, public *dsaPublic, message, signatur
 
 	shake256Sum(mu[:], public.tr[:], message)
 
-	var c, product, w dsaPoly
+	var c, w dsaPoly
 
 	dsaSampleInBall(&c, cTilde, p.tau)
 
@@ -1215,28 +1485,12 @@ func mldsaVerify(p *mldsaParams, pk []byte, public *dsaPublic, message, signatur
 
 	w1 := make([]byte, 32*k*p.w1Bits(), 32*dsaMaxK*6)
 
-	var high [256]uint32
-
-	m := int32((dsaQ - 1) / (2 * p.gamma2))
-
 	a, t1 := public.matrix(p, pk[:32]), public.t1Hat(p, pk)
 
 	for i := range k {
-		dsaDot(&w, a[i*l:(i+1)*l], z)
+		dsaRowProductSub(&w, a[i*l:(i+1)*l], z, &c, &t1[i])
 
-		dsaPointwise(&product, &c, &t1[i])
-
-		for x := range w {
-			w[x] = dsaSub(w[x], product[x])
-		}
-
-		dsaInverseNTT(&w)
-
-		for x := range w {
-			high[x] = dsaUseHint(uint32(hints[i][x]), w[x], p.gamma2, m)
-		}
-
-		packBits(w1[32*p.w1Bits()*i:], high[:], p.w1Bits())
+		dsaUseHints(w1[32*p.w1Bits()*i:], &w, &hints[i], p.gamma2, p.w1Bits())
 	}
 
 	expected := make([]byte, len(cTilde), 64)

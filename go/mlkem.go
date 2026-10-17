@@ -227,41 +227,6 @@ func kemInverseNTTGeneric(f *kemPoly) {
 	}
 }
 
-// A polynomial in the NTT domain prepared as the fixed factor of kemMultiplyAdd: odd[i] holds
-// f[2i + 1] gamma_i mod q, which the base case would otherwise reduce at every use. Key material
-// that is multiplied again and again is kept in this form.
-type kemFactor struct {
-	f   kemPoly
-	odd [128]uint16
-}
-
-func (f *kemFactor) prepare() {
-	for i := range f.odd {
-		f.odd[i] = kemReduce(uint32(f.f[2*i+1]) * uint32(kemGammas[i]))
-	}
-}
-
-// acc += f * g in the NTT domain (FIPS 203, Algorithms 11 and 12) for canonical f and g, without any
-// reduction: a product adds less than 2q^2 to a coefficient, so a canonical start plus k <= 4
-// products stays far below 2^32.
-func kemMultiplyAdd(acc *[256]uint32, f *kemFactor, g *kemPoly) {
-	for i := range f.odd {
-		a0, a1, odd := uint32(f.f[2*i]), uint32(f.f[2*i+1]), uint32(f.odd[i])
-
-		b0, b1 := uint32(g[2*i]), uint32(g[2*i+1])
-
-		acc[2*i] += a0*b0 + odd*b1
-
-		acc[2*i+1] += a0*b1 + a1*b0
-	}
-}
-
-func kemReduceAll(f *kemPoly, acc *[256]uint32) {
-	for x, c := range acc {
-		f[x] = kemReduce(c)
-	}
-}
-
 // Packs the 256 d-bit values of a polynomial into 32d bytes, least significant bits first (FIPS 203
 // ByteEncode, FIPS 204 SimpleBitPack), 32 bits at a time; unpackBits reads them the same way.
 func packBits[T uint16 | uint32](out []byte, values []T, d int) {
@@ -310,8 +275,8 @@ func unpackBits[T uint16 | uint32](values []T, in []byte, d int) {
 	}
 }
 
-// ByteEncode_12 of canonical coefficients, two in three bytes.
-func kemEncode12(out []byte, f *kemPoly) {
+// ByteEncode_12 of canonical coefficients, two in three bytes; the portable form of kemEncode12.
+func kemEncode12Generic(out []byte, f *kemPoly) {
 	out = out[:384]
 
 	for i := range 128 {
@@ -321,8 +286,8 @@ func kemEncode12(out []byte, f *kemPoly) {
 	}
 }
 
-// ByteDecode_12 reduces modulo q; every 12-bit value is below 2q.
-func kemDecode12(f *kemPoly, in []byte) {
+// ByteDecode_12 reduces modulo q; every 12-bit value is below 2q. The portable form of kemDecode12.
+func kemDecode12Generic(f *kemPoly, in []byte) {
 	in = in[:384]
 
 	for i := range 128 {
@@ -330,6 +295,24 @@ func kemDecode12(f *kemPoly, in []byte) {
 
 		f[2*i], f[2*i+1] = kemReduceOnce(x|(y&0x0f)<<8), kemReduceOnce(y>>4|z<<4)
 	}
+}
+
+// Whether every 12-bit value of the 384 bytes is below q (FIPS 203, 7.2); the portable form of
+// kemCheck12. The values are public.
+func kemCheck12Generic(in []byte) bool {
+	in = in[:384]
+
+	for i := 0; i < 384; i += 3 {
+		d1 := uint16(in[i]) | uint16(in[i+1]&0x0f)<<8
+
+		d2 := uint16(in[i+1]>>4) | uint16(in[i+2])<<4
+
+		if d1 >= kemQ || d2 >= kemQ {
+			return false
+		}
+	}
+
+	return true
 }
 
 // round(2^d * x / q) mod 2^d as floor((2^d * x + 1664) / q): the dividend is below 2^24, where
@@ -344,9 +327,62 @@ func kemDecompress(y uint16, d int) uint16 {
 	return uint16((uint32(y)*kemQ + 1<<(d-1)) >> d)
 }
 
+// ByteEncode_d(Compress_d(u + e)) into the 32d bytes of out, overwriting u: the u part of a K-PKE
+// ciphertext (FIPS 203, Algorithm 14, lines 21 and 22). The portable form of kemCompressU.
+func kemCompressUGeneric(out []byte, u, e *kemPoly, d int) {
+	for x := range u {
+		u[x] = kemCompress(kemAdd(u[x], e[x]), d)
+	}
+
+	packBits(out[:32*d], u[:], d)
+}
+
+// ByteEncode_d(Compress_d(u + e + Decompress_1(m))) into the 32d bytes of out, overwriting u: the v
+// part of a K-PKE ciphertext (lines 21 and 23). The portable form of kemCompressV.
+func kemCompressVGeneric(out []byte, u, e *kemPoly, m []byte, d int) {
+	var mu kemPoly
+
+	unpackBits(mu[:], m[:32], 1)
+
+	for x := range u {
+		u[x] = kemCompress(kemAdd(kemAdd(u[x], e[x]), kemDecompress(mu[x], 1)), d)
+	}
+
+	packBits(out[:32*d], u[:], d)
+
+	clear(mu[:])
+}
+
+// u = Decompress_d(ByteDecode_d(in)) for the 32d bytes of in (FIPS 203, Algorithm 15, line 3). The
+// portable form of kemDecompressU.
+func kemDecompressUGeneric(u *kemPoly, in []byte, d int) {
+	unpackBits(u[:], in[:32*d], d)
+
+	for x := range u {
+		u[x] = kemDecompress(u[x], d)
+	}
+}
+
+// m = ByteEncode_1(Compress_1(Decompress_d(ByteDecode_d(in)) - w)) (lines 4 and 7). The portable form
+// of kemDecodeMessage.
+func kemDecodeMessageGeneric(m, in []byte, w *kemPoly, d int) {
+	var v kemPoly
+
+	unpackBits(v[:], in[:32*d], d)
+
+	for x := range v {
+		v[x] = kemCompress(kemSub(kemDecompress(v[x], d), w[x]), 1)
+	}
+
+	packBits(m[:32], v[:], 1)
+
+	clear(v[:])
+}
+
 // SamplePolyCBD (FIPS 203, Algorithm 8). Masks add up each pair (eta = 2) or triple (eta = 3) of
-// neighbouring bits in place; a coefficient is the difference of two such sums.
-func kemSampleCBD(f *kemPoly, data []byte, eta int) {
+// neighbouring bits in place; a coefficient is the difference of two such sums. The portable form of
+// kemSampleCBD.
+func kemSampleCBDGeneric(f *kemPoly, data []byte, eta int) {
 	if eta == 2 {
 		for i := range 32 {
 			t := binary.LittleEndian.Uint32(data[4*i:])
@@ -439,6 +475,14 @@ func kemNoises(polys []*kemPoly, seed []byte, first byte, eta int) {
 
 	sponges.start(136, seed, nonces[:len(polys)], 1)
 
+	kemSampleNoises(polys, &sponges, eta)
+
+	sponges.wipe()
+}
+
+// SamplePolyCBD_eta of the next 64 eta bytes that each sponge squeezes, one polynomial per sponge.
+// The portable form of kemSampleNoises.
+func kemSampleNoisesGeneric(polys []*kemPoly, sponges *keccakLanes, eta int) {
 	var data [keccakMaxLanes][272]byte
 
 	for offset := 0; offset < 64*eta; offset += 136 {
@@ -454,8 +498,6 @@ func kemNoises(polys []*kemPoly, seed []byte, first byte, eta int) {
 	}
 
 	clear(data[:])
-
-	sponges.wipe()
 }
 
 // The most matrix entries sampled together: a row of ML-KEM-1024.
@@ -464,8 +506,9 @@ const kemRowLanes = 4
 // SampleNTT (FIPS 203, Algorithm 7) of rho || j || i for the entries (j, i) given as j + 256 i, all
 // at once where the lane kernels are fast: rejection sampling over public data. Each candidate is
 // stored and then kept or overwritten by advancing the count or not, which avoids a hard-to-predict
-// branch; the slot after the last one absorbs a candidate beyond the 256th.
-func kemSampleNTTs(polys []*kemPoly, rho []byte, positions []uint16) {
+// branch; the slot after the last one absorbs a candidate beyond the 256th. The portable form of
+// kemSampleNTTs.
+func kemSampleNTTsGeneric(polys []*kemPoly, rho []byte, positions []uint16) {
 	if !permuteLanesFast() {
 		for l, f := range polys {
 			kemSampleNTT(f, rho, byte(positions[l]), byte(positions[l]>>8))
@@ -521,19 +564,8 @@ func kemSampleNTTs(polys []*kemPoly, rho []byte, positions []uint16) {
 	}
 }
 
-// Row i of the matrix: A[i][j] = SampleNTT(rho || j || i) for every j.
-func kemSampleRow(row []*kemPoly, rho []byte, i int) {
-	var positions [kemRowLanes]uint16
-
-	for j := range row {
-		positions[j] = uint16(j) | uint16(i)<<8
-	}
-
-	kemSampleNTTs(row, rho, positions[:len(row)])
-}
-
 // K-PKE.KeyGen (FIPS 203, Algorithm 13). Each entry A[i][j] = SampleNTT(rho || j || i) is folded into
-// t as soon as it is sampled, so the matrix is never stored.
+// t as soon as it is sampled (kemKeyGenRows), so the matrix is never stored.
 func kpkeKeyGen(p *mlkemParams, d, ek, dkPKE []byte) {
 	k := p.k
 
@@ -547,63 +579,41 @@ func kpkeKeyGen(p *mlkemParams, d, ek, dkPKE []byte) {
 
 	var e [4]kemPoly
 
-	noise := make([]*kemPoly, 2*k, 8)
+	// A local array: pointers stored into the elements of a slice count as escaping, which moved s
+	// and e to the heap.
+	var noise [8]*kemPoly
 
 	for n := range k {
 		noise[n], noise[k+n] = &s[n].f, &e[n]
 	}
 
-	kemNoises(noise, sigma, 0, p.eta1)
+	kemNoises(noise[:2*k], sigma, 0, p.eta1)
 
 	for n := range k {
 		kemNTT(&s[n].f)
+
+		kemEncode12(dkPKE[384*n:384*(n+1)], &s[n].f)
 
 		s[n].prepare()
 
 		kemNTT(&e[n])
 	}
 
-	var a [4]kemPoly
-
-	row := []*kemPoly{&a[0], &a[1], &a[2], &a[3]}[:k]
-
-	var acc [256]uint32
-
-	for i := range k {
-		for x, c := range e[i] {
-			acc[x] = uint32(c)
-		}
-
-		kemSampleRow(row, rho, i)
-
-		for j := range k {
-			kemMultiplyAdd(&acc, &s[j], &a[j])
-		}
-
-		kemReduceAll(&a[0], &acc)
-
-		kemEncode12(ek[384*i:], &a[0])
-	}
+	kemKeyGenRows(ek, rho, s[:k], e[:k])
 
 	copy(ek[384*k:], rho)
-
-	for i := range k {
-		kemEncode12(dkPKE[384*i:], &s[i].f)
-	}
 
 	clear(g[:])
 
 	clear(s[:])
 
 	clear(e[:])
-
-	clear(a[:])
 }
 
 // What encapsulation derives from an encapsulation key, kept by the key: H(ek), set when the key is
-// made, and the prepared factors of Â in the NTT domain, entry i*k + j holding A[i][j] =
-// SampleNTT(rho || j || i), and of the decoded vector t̂, computed on first use. A private key shares
-// it with the public keys it returns.
+// made, and the factors of Â in the NTT domain, entry i*k + j holding A[i][j] = SampleNTT(rho || j ||
+// i), and of the decoded vector t̂, computed on first use. A private key shares it with the public
+// keys it returns.
 type mlkemPublic struct {
 	h    [32]byte
 	once sync.Once
@@ -628,30 +638,22 @@ func (c *mlkemPublic) expand(p *mlkemParams, ek []byte) *mlkemPublic {
 
 		c.a, c.t = factors[:k*k], factors[k*k:]
 
-		var row [kemRowLanes]*kemPoly
+		kemSampleMatrix(c.a, ek[384*k:], 0, k, k)
 
 		for i := range k {
-			for j := range k {
-				row[j] = &c.a[i*k+j].f
-			}
+			kemDecode12(&c.t[i].f, ek[384*i:384*(i+1)])
+		}
 
-			kemSampleRow(row[:k], ek[384*k:], i)
-
-			for j := range k {
-				c.a[i*k+j].prepare()
-			}
-
-			kemDecode12(&c.t[i].f, ek[384*i:])
-
-			c.t[i].prepare()
+		for i := range factors {
+			factors[i].prepare()
 		}
 	})
 
 	return c
 }
 
-// ŝ of a private key as prepared factors: decoded from the decapsulation key on first use and wiped
-// with the key.
+// ŝ of a private key as factors: decoded from the decapsulation key on first use and wiped with the
+// key.
 type mlkemSecret struct {
 	once sync.Once
 	s    []kemFactor
@@ -662,7 +664,7 @@ func (c *mlkemSecret) get(p *mlkemParams, dk []byte) []kemFactor {
 		s := make([]kemFactor, p.k)
 
 		for i := range s {
-			kemDecode12(&s[i].f, dk[384*i:])
+			kemDecode12(&s[i].f, dk[384*i:384*(i+1)])
 
 			s[i].prepare()
 		}
@@ -674,7 +676,8 @@ func (c *mlkemSecret) get(p *mlkemParams, dk []byte) []kemFactor {
 }
 
 // K-PKE.Encrypt (FIPS 203, Algorithm 14) with the expanded encapsulation key, whose matrix it reads
-// transposed.
+// transposed: u_i = NTT^-1(sum over j of Â[j][i] ŷ[j]) + e1[i] and v = NTT^-1(t̂ ŷ) + e2 + mu, both
+// compressed into the ciphertext.
 func kpkeEncrypt(p *mlkemParams, key *mlkemPublic, m, r, c []byte) {
 	k, du, dv := p.k, p.du, p.dv
 
@@ -684,110 +687,96 @@ func kpkeEncrypt(p *mlkemParams, key *mlkemPublic, m, r, c []byte) {
 
 	var u kemPoly
 
-	var acc [256]uint32
+	// y takes the nonces 0 to k - 1 and e the next k + 1, so one batch of sponges serves both where
+	// they share eta and fit.
+	var noise [9]*kemPoly
 
-	noise := []*kemPoly{&y[0], &y[1], &y[2], &y[3], &e[0], &e[1], &e[2], &e[3], &e[4]}
+	for n := range k {
+		noise[n] = &y[n]
+	}
 
-	kemNoises(noise[:k], r, 0, p.eta1)
+	for n := range k + 1 {
+		noise[k+n] = &e[n]
+	}
 
-	kemNoises(noise[4:5+k], r, byte(k), p.eta2)
+	if p.eta1 == p.eta2 && 2*k+1 <= keccakMaxLanes {
+		kemNoises(noise[:2*k+1], r, 0, p.eta1)
+	} else {
+		kemNoises(noise[:k], r, 0, p.eta1)
+
+		kemNoises(noise[k:2*k+1], r, byte(k), p.eta2)
+	}
 
 	for n := range k {
 		kemNTT(&y[n])
 	}
 
+	var prepared kemPrepared
+
+	kemPrepareVectors(&prepared, y[:k])
+
 	for i := range k {
-		clear(acc[:])
-
-		for j := range k {
-			kemMultiplyAdd(&acc, &key.a[j*k+i], &y[j])
-		}
-
-		kemReduceAll(&u, &acc)
+		kemProduct(&u, key.a, i, k, y[:k], &prepared, nil)
 
 		kemInverseNTT(&u)
 
-		for x := range u {
-			u[x] = kemCompress(kemAdd(u[x], e[i][x]), du)
-		}
-
-		packBits(c[32*du*i:], u[:], du)
+		kemCompressU(c[32*du*i:32*du*(i+1)], &u, &e[i], du)
 	}
 
-	clear(acc[:])
-
-	for j := range k {
-		kemMultiplyAdd(&acc, &key.t[j], &y[j])
-	}
-
-	kemReduceAll(&u, &acc)
+	kemProduct(&u, key.t, 0, 1, y[:k], &prepared, nil)
 
 	kemInverseNTT(&u)
 
-	var mu kemPoly
+	kemCompressV(c[32*du*k:32*(du*k+dv)], &u, &e[k], m, dv)
 
-	unpackBits(mu[:], m, 1)
+	clear(y[:k])
 
-	for x := range u {
-		u[x] = kemCompress(kemAdd(kemAdd(u[x], e[k][x]), kemDecompress(mu[x], 1)), dv)
-	}
-
-	packBits(c[32*du*k:], u[:], dv)
-
-	clear(y[:])
-
-	clear(e[:])
-
-	clear(mu[:])
+	clear(e[:k+1])
 
 	clear(u[:])
 
-	clear(acc[:])
+	prepared.wipe()
 }
 
 // K-PKE.Decrypt (FIPS 203, Algorithm 15) with the decoded ŝ.
 func kpkeDecrypt(p *mlkemParams, sHat []kemFactor, c, m []byte) {
 	k, du, dv := p.k, p.du, p.dv
 
-	var u, w kemPoly
+	var u [4]kemPoly
 
-	var acc [256]uint32
+	var w kemPoly
 
 	for i := range k {
-		unpackBits(u[:], c[32*du*i:32*du*(i+1)], du)
+		kemDecompressU(&u[i], c[32*du*i:32*du*(i+1)], du)
 
-		for x := range u {
-			u[x] = kemDecompress(u[x], du)
-		}
-
-		kemNTT(&u)
-
-		kemMultiplyAdd(&acc, &sHat[i], &u)
+		kemNTT(&u[i])
 	}
 
-	kemReduceAll(&u, &acc)
+	var prepared kemPrepared
 
-	kemInverseNTT(&u)
+	kemPrepareVectors(&prepared, u[:k])
 
-	unpackBits(w[:], c[32*du*k:], dv)
+	kemProduct(&w, sHat, 0, 1, u[:k], &prepared, nil)
 
-	for x := range w {
-		w[x] = kemCompress(kemSub(kemDecompress(w[x], dv), u[x]), 1)
-	}
+	kemInverseNTT(&w)
 
-	packBits(m, w[:], 1)
+	kemDecodeMessage(m, c[32*du*k:32*(du*k+dv)], &w, dv)
 
 	clear(u[:])
 
 	clear(w[:])
 
-	clear(acc[:])
+	prepared.wipe()
 }
 
 func mlkemKeyGen(p *mlkemParams, d, z []byte) (ek, dk []byte) {
-	k := p.k
+	return mlkemKeyGenInto(p, d, z, make([]byte, p.encapsulationKeySize()))
+}
 
-	ek = make([]byte, p.encapsulationKeySize())
+// mlkemKeyGen with the encapsulation key written into ek, which the caller may give spare capacity
+// for what it appends.
+func mlkemKeyGenInto(p *mlkemParams, d, z, ek []byte) (_, dk []byte) {
+	k := p.k
 
 	dk = make([]byte, p.decapsulationKeySize())
 
@@ -804,26 +793,38 @@ func mlkemKeyGen(p *mlkemParams, d, z []byte) (ek, dk []byte) {
 
 // key holds what the encapsulation key ek derives.
 func mlkemEncapsulate(p *mlkemParams, ek []byte, key *mlkemPublic, m []byte) (sharedSecret, ciphertext []byte) {
+	sharedSecret, ciphertext = make([]byte, 32), make([]byte, p.ciphertextSize())
+
+	mlkemEncapsulateInto(p, ek, key, m, sharedSecret, ciphertext)
+
+	return sharedSecret, ciphertext
+}
+
+// mlkemEncapsulate into the caller's buffers, so that X-Wing allocates its ciphertext once.
+func mlkemEncapsulateInto(p *mlkemParams, ek []byte, key *mlkemPublic, m, sharedSecret, ciphertext []byte) {
 	var g [64]byte
 
 	sha3Sum512(g[:], m, key.h[:])
 
-	ciphertext = make([]byte, p.ciphertextSize())
-
 	kpkeEncrypt(p, key.expand(p, ek), m, g[32:], ciphertext)
-
-	sharedSecret = make([]byte, 32)
 
 	copy(sharedSecret, g[:32])
 
 	clear(g[:])
-
-	return sharedSecret, ciphertext
 }
 
 // Implicit rejection: a ciphertext that does not re-encrypt to itself yields J(z || c), chosen
 // with a mask rather than a branch. secret and key hold what dk derives.
 func mlkemDecapsulate(p *mlkemParams, dk []byte, secret *mlkemSecret, key *mlkemPublic, c []byte) []byte {
+	sharedSecret := make([]byte, 32)
+
+	mlkemDecapsulateInto(p, dk, secret, key, c, sharedSecret)
+
+	return sharedSecret
+}
+
+// mlkemDecapsulate into the caller's 32 bytes.
+func mlkemDecapsulateInto(p *mlkemParams, dk []byte, secret *mlkemSecret, key *mlkemPublic, c, sharedSecret []byte) {
 	k := p.k
 
 	ek, h, z := dk[384*k:768*k+32], dk[768*k+32:768*k+64], dk[768*k+64:]
@@ -844,9 +845,7 @@ func mlkemDecapsulate(p *mlkemParams, dk []byte, secret *mlkemSecret, key *mlkem
 
 	kpkeEncrypt(p, key.expand(p, ek), m[:], g[32:], reencrypted[:len(c)])
 
-	sharedSecret := make([]byte, 32)
-
-	selectBytes(equalBit(c, reencrypted[:len(c)]), g[:32], rejected[:], sharedSecret)
+	selectBytes(kemEqualBit(c, reencrypted[:len(c)]), g[:32], rejected[:], sharedSecret[:32])
 
 	clear(m[:])
 
@@ -855,8 +854,20 @@ func mlkemDecapsulate(p *mlkemParams, dk []byte, secret *mlkemSecret, key *mlkem
 	clear(rejected[:])
 
 	clear(reencrypted[:])
+}
 
-	return sharedSecret
+// 1 when the ciphertexts, as long as each other and a multiple of eight bytes long, match, otherwise
+// 0, eight bytes at a time and without a branch on their contents.
+func kemEqualBit(a, b []byte) int {
+	var difference uint64
+
+	b = b[:len(a)]
+
+	for i := 0; i+8 <= len(a); i += 8 {
+		difference |= binary.LittleEndian.Uint64(a[i:]) ^ binary.LittleEndian.Uint64(b[i:])
+	}
+
+	return int((difference|-difference)>>63) ^ 1
 }
 
 // FIPS 203, 7.2: every coefficient of the encoded vector must already be reduced modulo q.
@@ -865,12 +876,8 @@ func mlkemCheckEncapsulationKey(p *mlkemParams, ek []byte) bool {
 		return false
 	}
 
-	for i := 0; i < 384*p.k; i += 3 {
-		d1 := uint16(ek[i]) | uint16(ek[i+1]&0x0f)<<8
-
-		d2 := uint16(ek[i+1]>>4) | uint16(ek[i+2])<<4
-
-		if d1 >= kemQ || d2 >= kemQ {
+	for i := range p.k {
+		if !kemCheck12(ek[384*i : 384*(i+1)]) {
 			return false
 		}
 	}

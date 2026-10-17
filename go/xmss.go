@@ -141,20 +141,27 @@ type xmssHasher struct {
 	skSeed, pubSeed       []byte
 	prfState, keygenState [8]uint32
 	midstates             bool
-	blocks, digests       []uint32
-	current               [][8]uint32
+	blocks                [16 * xmssMaxLanes]uint32
+	digests               [8 * xmssMaxLanes]uint32
+	current               [67][8]uint32
 }
 
 // The batched midstate form hands its hashes to the lane kernels: up to two PRF outputs for each
 // of the 67 chains of a WOTS+ key, a lane having up to three blocks of 16 words.
 const xmssMaxLanes = 2 * 67
 
+// The lane buffers are part of the hasher, so that a verification keeps it on its stack and a
+// signing key holds it with the key.
 func newXmssHasher(p *xmssParams, skSeed, pubSeed []byte) *xmssHasher {
-	x := &xmssHasher{p: p, skSeed: skSeed, pubSeed: pubSeed, midstates: !p.shake && p.n == 32}
+	x := &xmssHasher{}
 
-	if x.batched() {
-		x.blocks, x.digests, x.current = make([]uint32, 16*xmssMaxLanes), make([]uint32, 8*xmssMaxLanes), make([][8]uint32, 67)
-	}
+	x.init(p, skSeed, pubSeed)
+
+	return x
+}
+
+func (x *xmssHasher) init(p *xmssParams, skSeed, pubSeed []byte) {
+	x.p, x.skSeed, x.pubSeed, x.midstates = p, skSeed, pubSeed, !p.shake && p.n == 32
 
 	if x.midstates {
 		var block [64]byte
@@ -177,8 +184,6 @@ func newXmssHasher(p *xmssParams, skSeed, pubSeed []byte) *xmssHasher {
 
 		clear(block[:])
 	}
-
-	return x
 }
 
 func (x *xmssHasher) digest(out []byte, prefix byte, key, message []byte) {
@@ -498,11 +503,11 @@ func (x *xmssHasher) batched() bool {
 
 // Clears the lane buffers, which hold secret chain values while a key signs or builds a tree.
 func (x *xmssHasher) wipeLanes() {
-	clear(x.blocks)
+	clear(x.blocks[:])
 
-	clear(x.digests)
+	clear(x.digests[:])
 
-	clear(x.current)
+	clear(x.current[:])
 }
 
 var (
@@ -767,8 +772,11 @@ func (x *xmssHasher) computeRoot(node []byte, index uint32, auth []byte, layer u
 }
 
 // H_msg(r || root || toByte(index, n), M).
-func xmssMessageDigest(p *xmssParams, r, root []byte, index uint64, message []byte) []byte {
-	prefix := make([]byte, p.padding()+2*p.n+p.n)
+// H_msg into out (n bytes), with the prefix and the hash engine on the stack.
+func xmssMessageDigest(p *xmssParams, r, root []byte, index uint64, message, out []byte) {
+	var buffer [32 + 3*32]byte
+
+	prefix := buffer[:p.padding()+3*p.n]
 
 	prefix[p.padding()-1] = xmssHashMessage
 
@@ -778,23 +786,23 @@ func xmssMessageDigest(p *xmssParams, r, root []byte, index uint64, message []by
 
 	binary.BigEndian.PutUint64(prefix[len(prefix)-8:], index)
 
-	out := make([]byte, p.n)
-
 	if p.shake {
-		shake256Sum(out, prefix, message)
+		shake256Sum(out[:p.n], prefix, message)
 
-		return out
+		return
 	}
 
-	engine := newSha256(&iv256, 32)
+	e := sha256Engine{state: iv256, size: 32}
 
-	engine.update(prefix)
+	e.update(prefix)
 
-	engine.update(message)
+	e.update(message)
 
-	copy(out, engine.digest())
+	var digest [32]byte
 
-	return out
+	e.digestInto(digest[:])
+
+	copy(out[:p.n], digest[:])
 }
 
 func xmssVerify(p *xmssParams, publicKey, message, signature []byte) bool {
@@ -816,13 +824,21 @@ func xmssVerify(p *xmssParams, publicKey, message, signature []byte) bool {
 		return false
 	}
 
-	x := newXmssHasher(p, nil, pubSeed)
+	var x xmssHasher
 
-	node := xmssMessageDigest(p, signature[p.indexSize():p.indexSize()+n], root, index, message)
+	x.init(p, nil, pubSeed)
+
+	var digest [32]byte
+
+	node := digest[:n]
+
+	xmssMessageDigest(p, signature[p.indexSize():p.indexSize()+n], root, index, message, node)
 
 	offset := p.indexSize() + n
 
-	values := make([]byte, p.wotsLength()*n)
+	var buffer [67 * 32]byte
+
+	values := buffer[:p.wotsLength()*n]
 
 	height := p.treeHeight()
 
@@ -941,11 +957,15 @@ func (s *xmssSigner) sign(index uint64, message []byte) []byte {
 
 	binary.BigEndian.PutUint64(counter[24:], index)
 
-	r := make([]byte, p.n)
+	var randomizer, digest [32]byte
+
+	r := randomizer[:p.n]
 
 	s.hasher.digest(r, xmssPRF, s.skPrf, counter[:])
 
-	node := xmssMessageDigest(p, r, s.root, index, message)
+	node := digest[:p.n]
+
+	xmssMessageDigest(p, r, s.root, index, message, node)
 
 	signature := make([]byte, p.indexSize(), p.signatureSize())
 

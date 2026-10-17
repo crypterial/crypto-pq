@@ -15,6 +15,14 @@ func sha2Amd64(a *asm) {
 
 	sha256AVX2(a)
 
+	sha256BlocksAVX2(a)
+
+	sha256WordsAVX2(a)
+
+	sha512BlocksAVX2(a)
+
+	sha2SingleTables(a)
+
 	a.table("k256", 4, sha256Constants())
 
 	a.table("flip", 8, []uint64{0x0405060700010203, 0x0c0d0e0f08090a0b})

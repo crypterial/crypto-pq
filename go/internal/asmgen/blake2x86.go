@@ -2,28 +2,33 @@ package main
 
 import "fmt"
 
-// BLAKE2b with AVX2 and BLAKE2s with 128-bit AVX: one row of the working vector per register (a in
+// BLAKE2b with AVX2 and BLAKE2s with 128-bit AVX2: one row of the working vector per register (a in
 // 0, b in 1, c in 2, d in 3), so that each step of four G functions is one instruction per
-// operation. The rows are rotated against each other between the column and the diagonal step and
-// back. Each round's four message vectors are gathered from the block with VMOVQ/VMOVD and inserts
-// into 4-7, the chaining value stays in 8 and 9 from block to block, the IV in 10 and 11, the
-// byte-shuffle rotations in 12 and 13, and 14 and 15 are scratch. Right rotations by whole bytes
-// are VPSHUFB, by 32 bits within a 64-bit element VPSHUFD, and the others two shifts and an OR.
+// operation. A block is one chain of dependent instructions through b, whose length sets the speed:
+// for the diagonal step rows a, c and d are rotated against b and back after it, rather than b, c
+// and d against a, so that the lane permutations (three cycles for VPERMQ on Intel cores) overlap
+// the instructions that compute b. Each message vector is built from broadcast loads of the block's
+// words merged with VPBLENDD, which leaves the shuffle port to the rotations. The chaining value
+// stays in 8 and 9 from block to block, the IV in 10 and 11 (BLAKE2s, which needs 10 as scratch,
+// reads its first half from memory once a block), the byte-shuffle rotations in 12 and 13, the
+// message vectors in 4-7, and 14 and 15 are scratch. Right rotations by whole bytes are VPSHUFB, by
+// 32 bits within a 64-bit element VPSHUFD, by 63 bits the element added to itself, a shift and an
+// XOR, and the others two shifts and an OR.
 
-// One flavor of the vector code: the element width in bits, the register prefix, the word load and
-// insert, and the lane permutation.
+// One flavor of the vector code: the element width in bits, the register prefix, the broadcast load
+// of one word, the add and the lane permutation.
 type blake2Vector struct {
-	flavor  blake2Flavor
-	width   int
-	reg     string
-	load    string
-	insert  string
-	permute string
+	flavor    blake2Flavor
+	width     int
+	reg       string
+	broadcast string
+	add       string
+	permute   string
 }
 
 var (
-	blake2bVector = blake2Vector{blake2bFlavor, 64, "Y", "VMOVQ", "VPINSRQ", "VPERMQ"}
-	blake2sVector = blake2Vector{blake2sFlavor, 32, "X", "VMOVD", "VPINSRD", "VPSHUFD"}
+	blake2bVector = blake2Vector{blake2bFlavor, 64, "Y", "VPBROADCASTQ", "VPADDQ", "VPERMQ"}
+	blake2sVector = blake2Vector{blake2sFlavor, 32, "X", "VPBROADCASTD", "VPADDD", "VPSHUFD"}
 )
 
 func blake2Amd64(a *asm) {
@@ -50,9 +55,14 @@ func (v blake2Vector) r(i int) string {
 	return fmt.Sprintf("%s%d", v.reg, i)
 }
 
-// Element-wise right rotation of register i by bits, with 15 as scratch.
-func (v blake2Vector) rotate(a *asm, i, bits int) {
+// Element-wise right rotation of register i by bits, with 15 as scratch. A rotation by two shifts,
+// which only BLAKE2s has, leaves its halves in 10 and 15 as well, and reports it: they have no bit
+// in common, so that the next half can add both to a instead of waiting for the OR. Haswell shifts
+// vectors on one port only, so there the second shift waits a cycle and the OR would add one more.
+func (v blake2Vector) rotate(a *asm, i, bits int) (split bool) {
 	x, t := v.r(i), v.r(15)
+
+	shift := map[int]string{64: "Q", 32: "D"}[v.width]
 
 	switch {
 	case v.width == 64 && bits == 32:
@@ -61,78 +71,108 @@ func (v blake2Vector) rotate(a *asm, i, bits int) {
 		a.op("VPSHUFB\t%s, %s, %s", v.r(12+(24-bits)/8), x, x)
 	case v.width == 32 && (bits == 16 || bits == 8):
 		a.op("VPSHUFB\t%s, %s, %s", v.r(12+(16-bits)/8), x, x)
+	case bits == v.width-1:
+		a.op("%s\t%s, %s, %s", v.add, x, x, t)
+
+		a.op("VPSRL%s\t$%d, %s, %s", shift, bits, x, x)
+
+		a.op("VPXOR\t%s, %s, %s", t, x, x)
 	default:
-		a.op("VPSRL%s\t$%d, %s, %s", map[int]string{64: "Q", 32: "D"}[v.width], bits, x, t)
+		a.op("VPSRL%s\t$%d, %s, %s", shift, bits, x, v.r(10))
 
-		a.op("VPSLL%s\t$%d, %s, %s", map[int]string{64: "Q", 32: "D"}[v.width], v.width-bits, x, x)
+		a.op("VPSLL%s\t$%d, %s, %s", shift, v.width-bits, x, t)
 
-		a.op("VPOR\t%s, %s, %s", t, x, x)
+		a.op("VPOR\t%s, %s, %s", v.r(10), t, x)
+
+		return true
 	}
+
+	return false
 }
 
-// Gathers the message words at the schedule positions words into register i, the upper half of a
-// 256-bit register through 14.
+// Builds in register i the vector of the message words at the schedule positions words, one per
+// lane: a broadcast of each word, blended into its lane, with 14 as scratch.
 func (v blake2Vector) gather(a *asm, i int, words [4]int) {
 	size := v.width / 8
 
-	x := fmt.Sprintf("X%d", i)
+	x, t := v.r(i), v.r(14)
 
-	if v.width == 64 {
-		a.op("%s\t%d(SI), %s", v.load, size*words[0], x)
-
-		a.op("%s\t$1, %d(SI), %s, %s", v.insert, size*words[1], x, x)
-
-		a.op("%s\t%d(SI), X14", v.load, size*words[2])
-
-		a.op("%s\t$1, %d(SI), X14, X14", v.insert, size*words[3])
-
-		a.op("VINSERTI128\t$1, X14, Y%d, Y%d", i, i)
-
-		return
-	}
-
-	a.op("%s\t%d(SI), %s", v.load, size*words[0], x)
+	a.op("%s\t%d(SI), %s", v.broadcast, size*words[0], x)
 
 	for lane := 1; lane < 4; lane++ {
-		a.op("%s\t$%d, %d(SI), %s, %s", v.insert, lane, size*words[lane], x, x)
+		mask := 1 << lane
+
+		if v.width == 64 {
+			mask = 3 << (2 * lane)
+		}
+
+		a.op("%s\t%d(SI), %s", v.broadcast, size*words[lane], t)
+
+		a.op("VPBLENDD\t$%#x, %s, %s, %s", mask, t, x, x)
 	}
 }
 
-// Half of a step: the four G halves with message register m and the rotations.
-func (v blake2Vector) half(a *asm, m int, rotations [2]int) {
-	add := map[int]string{64: "VPADDQ", 32: "VPADDD"}[v.width]
+// The schedule positions of message vector i of round r, one per lane: the column step's halves,
+// then the diagonal step's in the lane order of diagonalize.
+func blake2Words(r, i int) [4]int {
+	s := blake2Sigma[r%10]
 
-	a.op("%s\t%s, %s, %s", add, v.r(m), v.r(0), v.r(0))
+	switch i {
+	case 0:
+		return [4]int{s[0], s[2], s[4], s[6]}
+	case 1:
+		return [4]int{s[1], s[3], s[5], s[7]}
+	case 2:
+		return [4]int{s[14], s[8], s[10], s[12]}
+	default:
+		return [4]int{s[15], s[9], s[11], s[13]}
+	}
+}
 
-	a.op("%s\t%s, %s, %s", add, v.r(1), v.r(0), v.r(0))
+// Half of a step: the four G halves with message register m and the rotations, b taken from its
+// split halves when the previous half left them; reports whether this one does.
+func (v blake2Vector) half(a *asm, m int, rotations [2]int, split bool) bool {
+	a.op("%s\t%s, %s, %s", v.add, v.r(m), v.r(0), v.r(0))
+
+	if split {
+		a.op("%s\t%s, %s, %s", v.add, v.r(10), v.r(0), v.r(0))
+
+		a.op("%s\t%s, %s, %s", v.add, v.r(15), v.r(0), v.r(0))
+	} else {
+		a.op("%s\t%s, %s, %s", v.add, v.r(1), v.r(0), v.r(0))
+	}
 
 	a.op("VPXOR\t%s, %s, %s", v.r(0), v.r(3), v.r(3))
 
 	v.rotate(a, 3, rotations[0])
 
-	a.op("%s\t%s, %s, %s", add, v.r(3), v.r(2), v.r(2))
+	a.op("%s\t%s, %s, %s", v.add, v.r(3), v.r(2), v.r(2))
 
 	a.op("VPXOR\t%s, %s, %s", v.r(2), v.r(1), v.r(1))
 
-	v.rotate(a, 1, rotations[1])
+	return v.rotate(a, 1, rotations[1])
 }
 
-// Rotates rows b, c and d left by one, two and three elements, or back.
+// For the diagonal step, lane i holds the G function of b's element i, which is diagonal function
+// (i + 3) mod 4: rows a, c and d move by three, one and two lanes, and back after the step.
+var blake2DiagonalShifts = [3]int{3, 1, 2}
+
+// Rotates rows a, c and d for the diagonal step, or back.
 func (v blake2Vector) diagonalize(a *asm, back bool) {
-	shifts := [3]int{1, 2, 3}
+	for k, row := range [3]int{0, 2, 3} {
+		shift := blake2DiagonalShifts[k]
 
-	if back {
-		shifts = [3]int{3, 2, 1}
-	}
+		if back {
+			shift = (4 - shift) % 4
+		}
 
-	for row, shift := range shifts {
 		order := 0
 
 		for lane := range 4 {
 			order |= (lane + shift) % 4 << (2 * lane)
 		}
 
-		a.op("%s\t$%#x, %s, %s", v.permute, order, v.r(1+row), v.r(1+row))
+		a.op("%s\t$%#x, %s, %s", v.permute, order, v.r(row), v.r(row))
 	}
 }
 
@@ -184,8 +224,6 @@ func blake2BlocksAmd(a *asm, v blake2Vector) {
 
 		a.op("VMOVDQU\t16(AX), X9")
 
-		a.op("VMOVDQU\tblake2sIVx86<>+0(SB), X10")
-
 		a.op("VMOVDQU\tblake2sIVx86<>+16(SB), X11")
 
 		a.op("VMOVDQU\tblake2sRotate16<>(SB), X12")
@@ -229,39 +267,41 @@ func blake2BlocksAmd(a *asm, v blake2Vector) {
 
 	a.op("VMOVDQA\t%s, %s", v.r(9), v.r(1))
 
-	a.op("VMOVDQA\t%s, %s", v.r(10), v.r(2))
+	if v.width == 64 {
+		a.op("VMOVDQA\tY10, Y2")
+	} else {
+		a.op("VMOVDQU\tblake2sIVx86<>+0(SB), X2")
+	}
+
+	split := false
 
 	for r := range f.rounds {
-		s := blake2Sigma[r%10]
+		for i := range 4 {
+			v.gather(a, 4+i, blake2Words(r, i))
+		}
 
-		v.gather(a, 4, [4]int{s[0], s[2], s[4], s[6]})
+		split = v.half(a, 4, [2]int{f.rotations[0], f.rotations[1]}, split)
 
-		v.gather(a, 5, [4]int{s[1], s[3], s[5], s[7]})
-
-		v.gather(a, 6, [4]int{s[8], s[10], s[12], s[14]})
-
-		v.gather(a, 7, [4]int{s[9], s[11], s[13], s[15]})
-
-		v.half(a, 4, [2]int{f.rotations[0], f.rotations[1]})
-
-		v.half(a, 5, [2]int{f.rotations[2], f.rotations[3]})
+		split = v.half(a, 5, [2]int{f.rotations[2], f.rotations[3]}, split)
 
 		v.diagonalize(a, false)
 
-		v.half(a, 6, [2]int{f.rotations[0], f.rotations[1]})
+		split = v.half(a, 6, [2]int{f.rotations[0], f.rotations[1]}, split)
 
-		v.half(a, 7, [2]int{f.rotations[2], f.rotations[3]})
+		split = v.half(a, 7, [2]int{f.rotations[2], f.rotations[3]}, split)
 
 		v.diagonalize(a, true)
 	}
+
+	a.comment("h ^= v[0:8] ^ v[8:16], with b, the last row to settle, XORed last.")
 
 	a.op("VPXOR\t%s, %s, %s", v.r(0), v.r(8), v.r(8))
 
 	a.op("VPXOR\t%s, %s, %s", v.r(2), v.r(8), v.r(8))
 
-	a.op("VPXOR\t%s, %s, %s", v.r(1), v.r(9), v.r(9))
-
 	a.op("VPXOR\t%s, %s, %s", v.r(3), v.r(9), v.r(9))
+
+	a.op("VPXOR\t%s, %s, %s", v.r(1), v.r(9), v.r(9))
 
 	a.op("ADDQ\t$%d, SI", 16*f.word)
 

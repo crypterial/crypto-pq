@@ -15,7 +15,7 @@ func xwingExpand(seed []byte) (public, dk, scalar, point []byte) {
 
 	shake256Sum(expanded[:], seed)
 
-	ek, dk := mlkemKeyGen(&mlkem768, expanded[:32], expanded[32:64])
+	ek, dk := mlkemKeyGenInto(&mlkem768, expanded[:32], expanded[32:64], make([]byte, xwingMlkemSize, xwingPublicKeySize))
 
 	scalar = make([]byte, 32)
 
@@ -25,9 +25,9 @@ func xwingExpand(seed []byte) (public, dk, scalar, point []byte) {
 
 	base := x25519Base(scalar)
 
-	point = base[:]
+	public = append(ek, base[:]...)
 
-	return append(ek, point...), dk, scalar, point
+	return public, dk, scalar, public[xwingMlkemSize:]
 }
 
 func xwingCombine(ssM, ssX, ctX, pkX []byte) []byte {
@@ -46,31 +46,39 @@ func xwingCheckPublicKey(pk []byte) bool {
 func xwingEncapsulate(pk []byte, key *mlkemPublic, eseed []byte) (sharedSecret, ciphertext []byte) {
 	pkM, pkX := pk[:xwingMlkemSize], pk[xwingMlkemSize:]
 
-	ssM, ctM := mlkemEncapsulate(&mlkem768, pkM, key, eseed[:32])
+	ciphertext = make([]byte, xwingCiphertextSize)
+
+	var ssM [32]byte
+
+	mlkemEncapsulateInto(&mlkem768, pkM, key, eseed[:32], ssM[:], ciphertext[:xwingCiphertextSize-32])
 
 	ctX := x25519Base(eseed[32:])
 
 	ssX := x25519(eseed[32:], pkX)
 
-	sharedSecret = xwingCombine(ssM, ssX[:], ctX[:], pkX)
+	copy(ciphertext[xwingCiphertextSize-32:], ctX[:])
 
-	clear(ssM)
+	sharedSecret = xwingCombine(ssM[:], ssX[:], ctX[:], pkX)
+
+	clear(ssM[:])
 
 	clear(ssX[:])
 
-	return sharedSecret, append(ctM, ctX[:]...)
+	return sharedSecret, ciphertext
 }
 
 func xwingDecapsulate(dk []byte, secret *mlkemSecret, key *mlkemPublic, scalar, point, ciphertext []byte) []byte {
 	ctM, ctX := ciphertext[:1088], ciphertext[1088:]
 
-	ssM := mlkemDecapsulate(&mlkem768, dk, secret, key, ctM)
+	var ssM [32]byte
+
+	mlkemDecapsulateInto(&mlkem768, dk, secret, key, ctM, ssM[:])
 
 	ssX := x25519(scalar, ctX)
 
-	sharedSecret := xwingCombine(ssM, ssX[:], ctX, point)
+	sharedSecret := xwingCombine(ssM[:], ssX[:], ctX, point)
 
-	clear(ssM)
+	clear(ssM[:])
 
 	clear(ssX[:])
 

@@ -18,6 +18,11 @@ func permute(s *[25]uint64) {
 	keccak1ARM(s)
 }
 
+// Absorbs data, whole blocks of rate bytes, into the state.
+func keccakAbsorb(state *[25]uint64, data []byte, rate int) {
+	keccakAbsorbGeneric(state, data, rate)
+}
+
 // Whether permuteLanes beats permuting the states one by one; callers batch only then.
 func permuteLanesFast() bool {
 	return useKeccakSHA3

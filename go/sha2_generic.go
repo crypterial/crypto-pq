@@ -7,6 +7,11 @@ func sha256LanesFast() bool {
 	return false
 }
 
+// Whether compress256 hashes two blocks for little more than the price of one.
+func sha256PairsFast() bool {
+	return false
+}
+
 func compress256(state *[8]uint32, p []byte) {
 	compress256Generic(state, p)
 }

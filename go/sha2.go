@@ -952,12 +952,24 @@ func (e *sha512Engine) clone() engine {
 	return &copied
 }
 
+// The whole blocks of data that sha256Finish compresses before the tail: all of them, or all but
+// the last where the kernel takes blocks in pairs and the padding then fits beside that block.
+func sha256Whole(data []byte) int {
+	whole := len(data) &^ 63
+
+	if sha256PairsFast() && whole&64 != 0 && len(data)-whole+9 <= 64 {
+		whole -= 64
+	}
+
+	return whole
+}
+
 // Completes a SHA-256 hash whose first absorbed bytes, a multiple of 64, are already compressed
 // into state, and writes the first len(out) bytes of the digest. Nothing is allocated, and the
 // stack buffer is indexed directly for the race detector's sake, as in compress256. The one-shot
 // digests come here too: an engine on the stack cost them a tenth more on a block of data.
 func sha256Finish(state [8]uint32, absorbed int, data, out []byte) {
-	whole := len(data) &^ 63
+	whole := sha256Whole(data)
 
 	if whole > 0 {
 		compress256(&state, data[:whole])
@@ -995,7 +1007,7 @@ func sha256Finish(state [8]uint32, absorbed int, data, out []byte) {
 // spilled argument, and with it up to two fifths of the time of a one-block SHA-512 in some
 // binaries.
 func sha256FinishSecret(state [8]uint32, absorbed int, data, out []byte) {
-	whole := len(data) &^ 63
+	whole := sha256Whole(data)
 
 	if whole > 0 {
 		compress256(&state, data[:whole])

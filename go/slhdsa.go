@@ -102,7 +102,9 @@ func (a *slhAddress) retyped(kind int) slhAddress {
 // PK.seed and its zero padding is compressed once and that state reused for every call; for SHAKE
 // PK.seed is kept as Keccak lanes. Where the CPU-specific kernels are fast, independent
 // computations of F go through lanes, batches they compute together: blocks and digests, and
-// whole chains as records, for SHA2, states for SHAKE.
+// whole chains as records, for SHA2, states for SHAKE. The buffers have the sizes of the largest
+// parameter set and live with the context on the caller's stack, so that an operation allocates
+// nothing but its result.
 type slhContext struct {
 	p         *slhParams
 	pkSeed    []byte
@@ -110,37 +112,30 @@ type slhContext struct {
 	small     [8]uint32
 	large     [8]uint64
 	seedLanes [4]uint64
-	values    []byte
-	input     []byte
-	blocks    []uint32
-	digests   []uint32
-	records   []uint32
-	states    [][25]uint64
-	active    []int
+	values    [slhMaxValues]byte
+	input     [22 + slhMaxValues]byte
+	blocks    [16 * slhMaxLanes]uint32
+	digests   [8 * slhMaxLanes]uint32
+	records   [chainRecord * slhMaxLanes]uint32
+	states    [slhMaxLanes][25]uint64
+	active    [slhMaxLanes]int
 }
 
 // The most F computations in one batch: the chains of a WOTS+ key, 2n + 3.
 const slhMaxLanes = 67
 
-func newSlhContext(p *slhParams, pkSeed, skSeed []byte) *slhContext {
-	size := max(p.wotsLength(), p.k) * p.n
+// The most n-byte values held at once: the chains of a WOTS+ key or the FORS roots, at n = 32.
+const slhMaxValues = slhMaxLanes * 32
 
-	c := &slhContext{p: p, pkSeed: pkSeed, skSeed: skSeed, values: make([]byte, size), input: make([]byte, 32+p.n+size), active: make([]int, 0, slhMaxLanes)}
+func (c *slhContext) init(p *slhParams, pkSeed, skSeed []byte) {
+	c.p, c.pkSeed, c.skSeed = p, pkSeed, skSeed
 
 	if p.shake {
-		if c.lanesFast() {
-			c.states = make([][25]uint64, slhMaxLanes)
-		}
-
 		for i := range p.n / 8 {
 			c.seedLanes[i] = binary.LittleEndian.Uint64(pkSeed[8*i:])
 		}
 
-		return c
-	}
-
-	if c.lanesFast() {
-		c.blocks, c.digests, c.records = make([]uint32, 16*slhMaxLanes), make([]uint32, 8*slhMaxLanes), make([]uint32, chainRecord*slhMaxLanes)
+		return
 	}
 
 	var block [128]byte
@@ -154,24 +149,22 @@ func newSlhContext(p *slhParams, pkSeed, skSeed []byte) *slhContext {
 	c.large = iv512
 
 	compress512(&c.large, block[:])
-
-	return c
 }
 
 // Clears what may hold secret chain values: a signature reveals some of them, but not those below
 // the revealed ones.
 func (c *slhContext) wipe() {
-	clear(c.values)
+	clear(c.values[:])
 
-	clear(c.input)
+	clear(c.input[:])
 
-	clear(c.blocks)
+	clear(c.blocks[:])
 
-	clear(c.digests)
+	clear(c.digests[:])
 
-	clear(c.records)
+	clear(c.records[:])
 
-	clear(c.states)
+	clear(c.states[:])
 }
 
 // F, H and PRF hash ADRS with a message of n or 2n bytes, which always fits in a single block, so
@@ -847,7 +840,9 @@ func slhRoot(p *slhParams, skSeed, pkSeed []byte) []byte {
 
 	root := make([]byte, p.n)
 
-	c := newSlhContext(p, pkSeed, skSeed)
+	var c slhContext
+
+	c.init(p, pkSeed, skSeed)
 
 	c.xmssNode(root, 0, p.hp, &adrs)
 
@@ -866,75 +861,124 @@ func slhKeyGen(p *slhParams, skSeed, skPrf, pkSeed []byte) (sk, pk []byte) {
 	return sk, append(append([]byte{}, pkSeed...), root...)
 }
 
-func slhPrfMessage(p *slhParams, skPrf, optRand, message []byte) []byte {
-	out := make([]byte, p.n)
-
+// PRF_msg into out (n bytes): SHAKE256, or HMAC with the hash of the parameter set, its inner
+// hash over opt_rand || M streamed by an engine on the stack, so that nothing is allocated.
+func slhPrfMessage(p *slhParams, skPrf, optRand, message, out []byte) {
 	if p.shake {
-		shake256Sum(out, skPrf, optRand, message)
+		shake256Sum(out[:p.n], skPrf, optRand, message)
 
-		return out
+		return
 	}
 
-	algorithm := HMAC_SHA_512
+	var block [128]byte
+
+	copy(block[:], skPrf)
+
+	var inner, tag [64]byte
 
 	if p.n == 16 {
-		algorithm = HMAC_SHA_256
+		keyed := hmacKeys256(&iv256, &block)
+
+		e := sha256Engine{state: [8]uint32(keyed[:8]), length: 64, size: 32}
+
+		e.update(optRand)
+
+		e.update(message)
+
+		e.digestInto(inner[:32])
+
+		sha256FinishSecret([8]uint32(keyed[8:]), 64, inner[:32], tag[:32])
+
+		clear(keyed[:])
+
+		clear(e.state[:])
+
+		clear(e.buffer[:])
+	} else {
+		keyed := hmacKeys512(&iv512, &block)
+
+		e := sha512Engine{state: keyed[0], length: 128, size: 64}
+
+		e.update(optRand)
+
+		e.update(message)
+
+		e.digestInto(inner[:64])
+
+		sha512FinishSecret(keyed[1], 128, inner[:64], tag[:64])
+
+		clear(keyed[0][:])
+
+		clear(keyed[1][:])
+
+		clear(e.state[:])
+
+		clear(e.buffer[:])
 	}
 
-	hmac := algorithm.Create(skPrf)
+	copy(out[:p.n], tag[:])
 
-	hmac.Update(optRand)
+	clear(block[:])
 
-	hmac.Update(message)
+	clear(inner[:])
 
-	digest := hmac.Digest()
-
-	copy(out, digest)
-
-	clear(digest)
-
-	return out
+	clear(tag[:])
 }
 
-// H_msg: SHAKE256 directly, or MGF1 over R || PK.seed || SHA-x(R || PK.seed || PK.root || M).
-func slhHashMessage(p *slhParams, r, pkSeed, pkRoot, message []byte) []byte {
-	out := make([]byte, p.m)
-
+// H_msg into out (m bytes): SHAKE256 directly, or MGF1 over R || PK.seed || SHA-x(R || PK.seed ||
+// PK.root || M), with the hash engine and the MGF1 seed on the stack.
+func slhHashMessage(p *slhParams, r, pkSeed, pkRoot, message, out []byte) {
 	if p.shake {
-		shake256Sum(out, r, pkSeed, pkRoot, message)
+		shake256Sum(out[:p.m], r, pkSeed, pkRoot, message)
 
-		return out
+		return
 	}
 
-	algorithm := SHA_512
+	var seed [2*32 + 64 + 4]byte
+
+	size := 2 * p.n
+
+	copy(seed[:], r)
+
+	copy(seed[p.n:], pkSeed)
 
 	if p.n == 16 {
-		algorithm = SHA_256
+		e := sha256Engine{state: iv256, size: 32}
+
+		for _, part := range [][]byte{r, pkSeed, pkRoot, message} {
+			e.update(part)
+		}
+
+		e.digestInto(seed[size : size+32])
+
+		size += 32
+	} else {
+		e := sha512Engine{state: iv512, size: 64}
+
+		for _, part := range [][]byte{r, pkSeed, pkRoot, message} {
+			e.update(part)
+		}
+
+		e.digestInto(seed[size : size+64])
+
+		size += 64
 	}
 
-	hasher := algorithm.Create()
+	var block [64]byte
 
-	for _, part := range [][]byte{r, pkSeed, pkRoot, message} {
-		hasher.Update(part)
+	for offset, counter := 0, uint32(0); offset < p.m; counter++ {
+		binary.BigEndian.PutUint32(seed[size:], counter)
+
+		if p.n == 16 {
+			sha256Finish(iv256, 0, seed[:size+4], block[:32])
+
+			offset += copy(out[offset:p.m], block[:32])
+		} else {
+			sha512Finish(iv512, 0, seed[:size+4], block[:64])
+
+			offset += copy(out[offset:p.m], block[:64])
+		}
 	}
-
-	seed := append(append(append([]byte{}, r...), pkSeed...), hasher.Digest()...)
-
-	var counter [4]byte
-
-	for offset := 0; offset < p.m; {
-		hasher = algorithm.Create()
-
-		hasher.Update(seed)
-
-		hasher.Update(counter[:])
-
-		offset += copy(out[offset:], hasher.Digest())
-
-		binary.BigEndian.PutUint32(counter[:], binary.BigEndian.Uint32(counter[:])+1)
-	}
-
-	return out
 }
 
 // The message digest splits into the FORS digest, the hypertree tree index and the leaf index.
@@ -969,15 +1013,21 @@ func slhSign(p *slhParams, message, sk, optRand []byte) []byte {
 
 	skSeed, skPrf, pkSeed, pkRoot := sk[:n], sk[n:2*n], sk[2*n:3*n], sk[3*n:]
 
-	c := newSlhContext(p, pkSeed, skSeed)
+	var c slhContext
+
+	c.init(p, pkSeed, skSeed)
 
 	signature := make([]byte, p.signatureSize())
 
-	r := slhPrfMessage(p, skPrf, optRand, message)
+	r := signature[:n]
 
-	copy(signature, r)
+	slhPrfMessage(p, skPrf, optRand, message, r)
 
-	md, tree, leaf := slhSplitDigest(p, slhHashMessage(p, r, pkSeed, pkRoot, message))
+	var digest [64]byte
+
+	slhHashMessage(p, r, pkSeed, pkRoot, message, digest[:])
+
+	md, tree, leaf := slhSplitDigest(p, digest[:p.m])
 
 	var adrs slhAddress
 
@@ -1011,9 +1061,15 @@ func slhVerify(p *slhParams, message, signature, pk []byte) bool {
 
 	pkSeed, pkRoot := pk[:n], pk[n:]
 
-	c := newSlhContext(p, pkSeed, nil)
+	var c slhContext
 
-	md, tree, leaf := slhSplitDigest(p, slhHashMessage(p, signature[:n], pkSeed, pkRoot, message))
+	c.init(p, pkSeed, nil)
+
+	var digest [64]byte
+
+	slhHashMessage(p, signature[:n], pkSeed, pkRoot, message, digest[:])
+
+	md, tree, leaf := slhSplitDigest(p, digest[:p.m])
 
 	var adrs slhAddress
 
