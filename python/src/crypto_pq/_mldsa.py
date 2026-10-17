@@ -2,7 +2,7 @@ import struct
 from functools import lru_cache
 from typing import NamedTuple
 
-from . import _bits, _primitives
+from . import _bits, _lanes, _primitives
 from ._ntt import Ntt
 
 Q = 8380417
@@ -72,7 +72,7 @@ def ones(count, bits):
 # The sum of the products of matching coefficients, three products per pass, unreduced: the
 # inverse transform reduces it.
 def dot(row, vector):
-    terms = list(zip(row, vector))
+    terms = [*zip(row, vector)]
 
     total = [0] * 256
 
@@ -86,6 +86,13 @@ def dot(row, vector):
                 total = [t + a * b for t, a, b in zip(total, f, g)]
 
     return total
+
+
+# The products of the rows of a matrix with `vector`, one at a time, for the inverse transform to
+# read: the vector goes with the generator when it ends.
+def dots(rows, vector):
+    for row in rows:
+        yield dot(row, vector)
 
 
 # The norm of a vector whose coefficients are already centred, as signed integers.
@@ -302,10 +309,29 @@ def _sample(xof, rate, blocks, parse, seed):
     return poly
 
 
-# FIPS 204, Algorithm 32: five blocks give 280 candidates, each accepted with probability
-# q / 2^23 > 0.999.
-def expand_a(rho, p):
-    return [[_sample(_primitives.shake_128, 168, 5, rej_ntt_poly, rho + bytes([s, r])) for s in range(p.l)] for r in range(p.k)]
+# The XOF streams of `seeds` read together (see _lanes), parsed `per` at a time; a stream whose
+# blocks fall short is read again on its own.
+def _sample_groups(xof, rate, blocks, parse, seeds, per):
+    streams = _lanes.shake_many(rate, seeds, blocks * rate)
+
+    for first in range(0, len(seeds), per):
+        polys = [parse(data) for data in streams[first : first + per]]
+
+        yield [poly if len(poly) >= 256 else _sample(xof, rate, blocks, parse, seed) for poly, seed in zip(polys, seeds[first : first + per])]
+
+
+# The streams of ExpandA read together, at most: up to about 16 lanes, a computation costs little
+# more than one lane (see _lanes).
+_STREAMS = 16
+
+
+# FIPS 204, Algorithm 32, row by row: five blocks give 280 candidates, each accepted with
+# probability q / 2^23 > 0.999. The streams of as many rows as _STREAMS allows are read together.
+def expand_rows(rho, p):
+    rows = max(1, _STREAMS // p.l)
+
+    for first in range(0, p.k, rows):
+        yield from _sample_groups(_primitives.shake_128, 168, 5, rej_ntt_poly, [rho + bytes([s, r]) for r in range(first, min(first + rows, p.k)) for s in range(p.l)], p.l)
 
 
 # FIPS 204, Algorithm 33: two blocks give 544 candidates, each accepted with probability 15/16
@@ -314,7 +340,7 @@ def expand_s(rho_prime, p):
     def bounded(data):
         return rej_bounded_poly(data, p.eta)
 
-    polys = [_sample(_primitives.shake_256, 136, 2, bounded, rho_prime + r.to_bytes(2, "little")) for r in range(p.l + p.k)]
+    polys = next(_sample_groups(_primitives.shake_256, 136, 2, bounded, [rho_prime + r.to_bytes(2, "little") for r in range(p.l + p.k)], p.l + p.k))
 
     return polys[: p.l], polys[p.l :]
 
@@ -323,7 +349,7 @@ def expand_s(rho_prime, p):
 def expand_masks(rho, kappa, count, p):
     size = 32 * gamma1_bits(p)
 
-    return [bit_unpack(_primitives.shake_256(rho + (kappa + r).to_bytes(2, "little")).digest(size), p.gamma1 - 1, p.gamma1) for r in range(count * p.l)]
+    return [bit_unpack(data, p.gamma1 - 1, p.gamma1) for data in _lanes.shake_many(136, [rho + (kappa + r).to_bytes(2, "little") for r in range(count * p.l)], size)]
 
 
 # FIPS 204, Algorithm 29, on the first bytes of a SHAKE256 stream; None if they run out.
@@ -443,12 +469,17 @@ class VerificationKey:
         return self._tr
 
     def matrix(self):
+        return [*self.rows()]
+
+    # The rows of the matrix, each unpacked when it is reached.
+    def rows(self):
         if self._matrix is None:
-            self._matrix = b"".join(_ROW.pack(*poly) for row in expand_a(self.pk[:32], self.params) for poly in row)
+            self._matrix = b"".join(_ROW.pack(*poly) for row in expand_rows(self.pk[:32], self.params) for poly in row)
 
         l, data = self.params.l, self._matrix
 
-        return [[_ROW.unpack_from(data, 1024 * (i * l + j)) for j in range(l)] for i in range(self.params.k)]
+        for i in range(self.params.k):
+            yield [_ROW.unpack_from(data, 1024 * (i * l + j)) for j in range(l)]
 
     def t1(self):
         if self._t1 is None:
@@ -504,12 +535,10 @@ _T0_OFFSET = 4096 * _ONES32
 # skEncode, on every coefficient at once in 32-bit fields: with r0' = r mod 2^13 and a carry of
 # one where r0' > 2^12, t1 = (r >> 13) + carry, and the encoding of t0 = r0' - 2^13 * carry is
 # 2^12 - t0. Returns the encodings of t1 and t0.
-def public_t(a, s1, s2, p):
-    s1_hat = _NTT.forward(s1)
-
+def public_t(rho, s1, s2, p):
     t1, t0 = [], []
 
-    for poly in _NTT.inverse([dot(a[i], s1_hat) for i in range(p.k)], s2):
+    for poly in _NTT.inverse(dots(expand_rows(rho, p), _NTT.forward(s1)), s2, p.k):
         r = int.from_bytes(struct.pack("<256I", *poly), "little")
 
         low = r & _LOW13
@@ -528,11 +557,9 @@ def keygen_internal(xi, p):
 
     rho, rho_prime, key = expanded[:32], expanded[32:96], expanded[96:]
 
-    a = expand_a(rho, p)
-
     s1, s2 = expand_s(rho_prime, p)
 
-    t1, t0 = public_t(a, s1, s2, p)
+    t1, t0 = public_t(rho, s1, s2, p)
 
     pk = rho + t1
 
@@ -547,7 +574,7 @@ def check_private_key(sk, p):
     if any(abs(x) > p.eta for poly in s1 + s2 for x in poly):
         return None
 
-    t1, t0 = public_t(expand_a(rho, p), s1, s2, p)
+    t1, t0 = public_t(rho, s1, s2, p)
 
     if t0 != sk[128 + 32 * eta_bits(p) * (p.l + p.k) :]:
         return None
@@ -563,21 +590,59 @@ def check_private_key(sk, p):
 GROUP = 3
 
 
-def _attempts(a, rho_prime, kappa, mu, p):
+# A y-hat of each attempt of a group in turn, for the inverse transform to read.
+def _products(a, y_hat, l):
+    for n in range(GROUP):
+        yield from dots(a, y_hat[n * l : (n + 1) * l])
+
+
+# One group of attempts from kappa on: the signature of the first that passes its checks, or None.
+# Each attempt runs in a call of its own, so that its values go when it fails.
+def _group(a, secrets, rho_prime, kappa, mu, p):
     k, l = p.k, p.l
 
     y = expand_masks(rho_prime, kappa, GROUP, p)
 
-    y_hat = _NTT.forward(y)
-
-    w = _NTT.inverse([dot(a[i], y_hat[n * l : (n + 1) * l]) for n in range(GROUP) for i in range(k)])
+    w = _NTT.inverse(_products(a, _NTT.forward(y), l), count=GROUP * k)
 
     for n in range(GROUP):
-        attempt = w[n * k : (n + 1) * k]
+        signature = _attempt(y[n * l : (n + 1) * l], w[n * k : (n + 1) * k], secrets, mu, p)
 
-        c_tilde = _primitives.shake_256(mu + w1_encode([high_bits(poly, p.gamma2) for poly in attempt], p)).digest(p.lam // 4)
+        if signature is not None:
+            return signature
 
-        yield y[n * l : (n + 1) * l], attempt, c_tilde, Challenge(challenge(c_tilde, p.tau))
+    return None
+
+
+# FIPS 204, Algorithm 7, steps 15 to 32, for one mask y and w = A y; z is checked before the rest
+# is computed, as in the reference implementation.
+def _attempt(y, w, secrets, mu, p):
+    s1, s2, t0 = secrets
+
+    c_tilde = _primitives.shake_256(mu + w1_encode([high_bits(poly, p.gamma2) for poly in w], p)).digest(p.lam // 4)
+
+    c = Challenge(challenge(c_tilde, p.tau))
+
+    z = [[x + e for x, e in zip(y[i], c.times(s1[i], 16))] for i in range(p.l)]
+
+    if infinity_norm(z) >= p.gamma1 - p.beta:
+        return None
+
+    difference = [[(x - e) % Q for x, e in zip(w[i], c.times(s2[i], 16))] for i in range(p.k)]
+
+    r1, r0 = zip(*[decompose(poly, p.gamma2) for poly in difference])
+
+    if infinity_norm(r0) >= p.gamma2 - p.beta:
+        return None
+
+    ct0 = [c.times(t, 32) for t in t0]
+
+    h = [make_hint(ct0[i], difference[i], r1[i], p.gamma2) for i in range(p.k)]
+
+    if infinity_norm(ct0) >= p.gamma2 or sum(map(sum, h)) > p.omega:
+        return None
+
+    return sig_encode(c_tilde, z, h, p)
 
 
 def sign_internal(key, message, rnd, p):
@@ -592,24 +657,10 @@ def sign_internal(key, message, rnd, p):
     kappa = 0
 
     while True:
-        for y, w, c_tilde, c in _attempts(a, rho_prime, kappa, mu, p):
-            z = [[x + e for x, e in zip(y[i], c.times(s1[i], 16))] for i in range(p.l)]
+        signature = _group(a, (s1, s2, t0), rho_prime, kappa, mu, p)
 
-            difference = [[(x - e) % Q for x, e in zip(w[i], c.times(s2[i], 16))] for i in range(p.k)]
-
-            r1, r0 = zip(*[decompose(poly, p.gamma2) for poly in difference])
-
-            if infinity_norm(z) >= p.gamma1 - p.beta or infinity_norm(r0) >= p.gamma2 - p.beta:
-                continue
-
-            ct0 = [c.times(t, 32) for t in t0]
-
-            h = [make_hint(ct0[i], difference[i], r1[i], p.gamma2) for i in range(p.k)]
-
-            if infinity_norm(ct0) >= p.gamma2 or sum(map(sum, h)) > p.omega:
-                continue
-
-            return sig_encode(c_tilde, z, h, p)
+        if signature is not None:
+            return signature
 
         kappa += GROUP * p.l
 
@@ -632,13 +683,7 @@ def verify_internal(key, message, sig, p):
 
     mu = _primitives.shake_256(key.tr() + message).digest(64)
 
-    a = key.matrix()
-
-    t1 = key.t1()
-
-    z_hat = _NTT.forward(z)
-
-    w = _NTT.inverse([dot(a[i], z_hat) for i in range(p.k)], [[-(y << D) for y in c.times(t1[i], 32)] for i in range(p.k)])
+    w = _NTT.inverse(dots(key.rows(), _NTT.forward(z)), ([-(y << D) for y in c.times(t, 32)] for t in key.t1()), p.k)
 
     w1 = [use_hint(h[i], w[i], p.gamma2) for i in range(p.k)]
 

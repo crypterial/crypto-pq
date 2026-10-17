@@ -2,8 +2,8 @@ import operator
 import threading
 from functools import partial
 
-from . import _ascon, _native, _primitives, _sp800_185
-from ._bytes import equal, immutable, require_bytes, require_output_length, view
+from . import _ascon, _blake2, _native, _primitives, _sp800_185
+from ._bytes import equal, immutable, readable, require_bytes, require_output_length, view, wipe
 from ._errors import CryptoPQError, ErrorCode
 from ._keccak import Keccak
 
@@ -283,11 +283,17 @@ class KdfAlgorithm:
         return f"<KdfAlgorithm {self._name}>"
 
 
-# HMAC on crypto-pq's own hash engines.
+# The bytes XORed with HMAC's ipad and opad.
+_IPAD = bytes(b ^ 0x36 for b in range(256))
+
+_OPAD = bytes(b ^ 0x5C for b in range(256))
+
+
+# HMAC (RFC 2104) on crypto-pq's own hash engines.
 class _PureHmac:
     __slots__ = ("_inner", "_outer")
 
-    # The padded key is zeroed afterwards; Python cannot promise that no other copy remains.
+    # The padded keys are zeroed afterwards; Python cannot promise that no other copy remains.
     def __init__(self, engine, key):
         inner = engine()
 
@@ -302,19 +308,16 @@ class _PureHmac:
         else:
             pad[: len(key)] = key
 
-        for i in range(len(pad)):
-            pad[i] ^= 0x36
+        ipad, opad = pad.translate(_IPAD), pad.translate(_OPAD)
 
-        inner.update(pad)
-
-        for i in range(len(pad)):
-            pad[i] ^= 0x36 ^ 0x5C
+        inner.update(ipad)
 
         outer = engine()
 
-        outer.update(pad)
+        outer.update(opad)
 
-        pad[:] = bytes(len(pad))
+        for buffer in (pad, ipad, opad):
+            buffer[:] = bytes(len(buffer))
 
         self._inner = inner
 
@@ -334,35 +337,20 @@ class _PureHmac:
         return equal(self.digest(), tag)
 
 
-# HMAC from the standard library's hmac module, for a hash that hashlib provides.
-class _HashlibHmac:
-    __slots__ = ("_hmac", "_compare")
+def _blake2_key(key, maximum):
+    if not 0 < len(key) <= maximum:
+        raise CryptoPQError(ErrorCode.INVALID_LENGTH, f"a BLAKE2 key has 1 to {maximum} bytes")
 
-    def __init__(self, module, name, key):
-        self._hmac = module.new(immutable(key), digestmod=name)
-
-        self._compare = module.compare_digest
-
-    def update(self, data):
-        self._hmac.update(data)
-
-    def digest(self):
-        return self._hmac.digest()
-
-    def verify(self, tag):
-        return self._compare(self._hmac.digest(), tag)
+    return key
 
 
-# Keyed BLAKE2 from hashlib (RFC 7693: the key is the first block); `constructor` holds the output
-# length, the salt and the personalization.
-class _HashlibBlake2Mac:
+# Keyed BLAKE2 (RFC 7693: the key is the first block), with the output length, the salt and the
+# personalization in its initial chaining value h0.
+class _Blake2Mac:
     __slots__ = ("_hash",)
 
-    def __init__(self, constructor, maximum, key):
-        if not 0 < len(key) <= maximum:
-            raise CryptoPQError(ErrorCode.INVALID_LENGTH, f"a BLAKE2 key has 1 to {maximum} bytes")
-
-        self._hash = constructor(key=immutable(key))
+    def __init__(self, variant, h0, size, maximum, key):
+        self._hash = _blake2.Blake2(variant, h0, _blake2_key(key, maximum), size)
 
     def update(self, data):
         self._hash.update(data)
@@ -374,49 +362,79 @@ class _HashlibBlake2Mac:
         return equal(self._hash.digest(), tag)
 
 
+# The pure one-shots read every input at their start, before any state of theirs exists, so that a
+# caller's __index__ or __buffer__ runs once and finds nothing of theirs half done.
 def _pure_digest(engine, data):
+    data = readable(data)
+
     hasher = engine()
 
-    hasher.update(view(data))
+    hasher.update(data)
 
     return hasher.digest()
 
 
-def _hashlib_digest(constructor, data):
-    return constructor(view(data)).digest()
-
-
 def _pure_xof(engine, data, length):
+    length, data = require_output_length(length), readable(data)
+
     xof = engine()
 
-    xof.update(view(data))
+    xof.update(data)
 
-    return xof.read(require_output_length(length))
+    return xof.read(length)
 
 
 def _shake_digest(constructor, data, length):
-    return constructor(view(data)).digest(require_output_length(length))
+    length, data = require_output_length(length), readable(data)
+
+    return constructor(data).digest(length)
+
+
+# BLAKE2 in one pass from the initial chaining value h0, unkeyed or keyed.
+def _blake2_digest(variant, h0, size, data):
+    return _blake2.digest(variant, h0, b"", readable(data), size)
+
+
+def _blake2_mac_digest(variant, h0, size, maximum, key, data):
+    key, data = readable(key), readable(data)
+
+    return _blake2.digest(variant, h0, _blake2_key(key, maximum), data, size)
+
+
+# Ascon-Hash256 and the Ascon XOFs in one pass from their initial `state`.
+def _ascon_digest(state, size, data):
+    return _ascon.oneshot(state, readable(data), size)
+
+
+def _ascon_xof_digest(state, data, length):
+    length, data = require_output_length(length), readable(data)
+
+    return _ascon.oneshot(state, data, length)
 
 
 # `engine(key)` is a MAC state.
 def _pure_mac(engine, key, data):
-    mac = engine(view(key))
+    key, data = readable(key), readable(data)
 
-    mac.update(view(data))
+    mac = engine(key)
+
+    mac.update(data)
 
     return mac.digest()
 
 
 def _pure_mac_verify(engine, key, data, tag):
-    mac = engine(view(key))
+    key, data, tag = readable(key), readable(data), readable(tag)
 
-    mac.update(view(data))
+    mac = engine(key)
 
-    return mac.verify(view(tag))
+    mac.update(data)
+
+    return mac.verify(tag)
 
 
 def _blake2_mac_verify(engine, maximum, key, data, tag):
-    key, data, tag = view(key), view(data), view(tag)
+    key, data, tag = readable(key), readable(data), readable(tag)
 
     if not 0 < len(key) <= maximum:
         return False
@@ -424,47 +442,41 @@ def _blake2_mac_verify(engine, maximum, key, data, tag):
     return _pure_mac_verify(engine, key, data, tag)
 
 
-def _hashlib_hmac(module, name, key, data):
-    return module.digest(immutable(key), view(data), name)
-
-
-def _hashlib_hmac_verify(module, name, key, data, tag):
-    return module.compare_digest(module.digest(immutable(key), view(data), name), view(tag))
-
-
 # HKDF (RFC 5869) on a backend's HMAC function hmac(key, data).
 def _pure_extract(hmac, ikm, salt):
     return hmac(salt, ikm)
 
 
+# PRK keys every block, so it is read once into a buffer of ours, zeroed at the end, and `info`
+# into bytes.
 def _pure_expand(hmac, size, prk, info, length):
-    info = immutable(info)
+    prk, info = bytearray(readable(prk)), immutable(info)
 
-    okm = bytearray()
+    blocks = -(-length // size)
+
+    okm = bytearray(size * blocks)
 
     block = b""
 
-    for counter in range(1, -(-length // size) + 1):
+    for counter in range(1, blocks + 1):
         block = hmac(prk, block + info + bytes([counter]))
 
-        okm += block
+        okm[size * (counter - 1) : size * counter] = block
 
-    out = bytes(okm[:length])
+    with memoryview(okm) as view:
+        out = view[:length].tobytes()
 
-    okm[:] = bytes(len(okm))
+    wipe(okm)
+
+    wipe(prk)
 
     return out
 
 
 def _pure_derive(hmac, size, ikm, salt, info, length):
+    ikm, salt, info = readable(ikm), readable(salt), immutable(info)
+
     return _pure_expand(hmac, size, _pure_extract(hmac, ikm, salt), info, length)
-
-
-def _unsupported(name):
-    def refuse(*args, **kwargs):
-        raise CryptoPQError(ErrorCode.UNSUPPORTED, f"this Python's hashlib has no {name}, which the pure backend computes BLAKE2 with")
-
-    return refuse
 
 
 def _blake2_hash_options(field, build):
@@ -527,9 +539,7 @@ NATIVE = _native.BACKEND == "native"
 
 
 # Each algorithm is the native library's when the native backend is in use, by the library's id
-# `number`; otherwise the pure backend's: hashlib's where it has the algorithm (see _primitives),
-# crypto-pq's own code where it does not, and crypto-pq's own sponge for the streaming XOF reads
-# that hashlib cannot make.
+# `number`; otherwise the pure backend's, on crypto-pq's own code (see _primitives).
 def _hash(name, digest_size, number, hash_name):
     if NATIVE:
         return HashAlgorithm(name, digest_size, partial(_native.HashState, number, digest_size), _native.hash_function(number, digest_size))
@@ -539,9 +549,9 @@ def _hash(name, digest_size, number, hash_name):
     return HashAlgorithm(name, digest_size, constructor, partial(_pure_digest, constructor))
 
 
-def _blake2(name, digest_size, number, field, hash_name):
+def _blake2_hash(name, digest_size, number, field, variant):
     if not NATIVE:
-        return _pure_blake2(name, digest_size, field, getattr(_primitives, hash_name) or _unsupported(hash_name))
+        return _pure_blake2(name, digest_size, field, variant)
 
     def build(salt, personalization):
         spec = _native.hash_configure(number, salt, personalization)
@@ -551,12 +561,12 @@ def _blake2(name, digest_size, number, field, hash_name):
     return HashAlgorithm(name, digest_size, partial(_native.HashState, number, digest_size), _native.hash_function(number, digest_size), _blake2_hash_options(field, build))
 
 
-# BLAKE2 in the pure backend is hashlib's, the one place that takes its parameters.
-def _pure_blake2(name, digest_size, field, constructor):
+# The output length, the salt and the personalization go into BLAKE2's initial chaining value.
+def _pure_blake2(name, digest_size, field, variant):
     def build(salt, personalization):
-        engine = partial(constructor, digest_size=digest_size, salt=salt, person=personalization)
+        h0 = _blake2.initial(variant, digest_size, salt, personalization)
 
-        return engine, partial(_hashlib_digest, engine)
+        return partial(_blake2.Blake2, variant, h0, b"", digest_size), partial(_blake2_digest, variant, h0, digest_size)
 
     return HashAlgorithm(name, digest_size, *build(b"", b""), _blake2_hash_options(field, build))
 
@@ -569,9 +579,7 @@ def _ascon_hash():
 
 
 def _pure_ascon_hash():
-    engine = partial(_ascon.Ascon, _ascon.HASH256, 32)
-
-    return HashAlgorithm("Ascon-Hash256", 32, engine, partial(_pure_digest, engine))
+    return HashAlgorithm("Ascon-Hash256", 32, partial(_ascon.Ascon, _ascon.HASH256, 32), partial(_ascon_digest, _ascon.HASH256, 32))
 
 
 def _xof(name, number, rate, hash_name):
@@ -619,9 +627,7 @@ def _ascon_xof():
 
 
 def _pure_ascon_xof():
-    engine = partial(_ascon.Ascon, _ascon.XOF128)
-
-    return XofAlgorithm("Ascon-XOF128", engine, partial(_pure_xof, engine))
+    return XofAlgorithm("Ascon-XOF128", partial(_ascon.Ascon, _ascon.XOF128), partial(_ascon_xof_digest, _ascon.XOF128))
 
 
 def _ascon_cxof():
@@ -631,8 +637,12 @@ def _ascon_cxof():
     return _pure_ascon_cxof()
 
 
+# A configured Ascon-CXOF128 goes on from the state after its customization string.
 def _pure_ascon_cxof():
-    build = _pure_xof_build(lambda function_name, customization: _ascon.customized(customization))
+    def build(function_name, customization):
+        prefix = _ascon.customized(customization)
+
+        return prefix.copy, partial(_ascon_xof_digest, prefix.state)
 
     return XofAlgorithm("Ascon-CXOF128", *build(b"", b""), _xof_options(_ascon.MAX_CUSTOMIZATION, build))
 
@@ -641,14 +651,7 @@ def _hmac(name, digest_size, number, hash_name):
     if NATIVE:
         return MacAlgorithm(name, digest_size, *_native_mac(number, digest_size))
 
-    engine = getattr(_primitives, hash_name)
-
-    if _primitives.hashlib is not None and engine is getattr(_primitives.hashlib, hash_name, None):
-        import hmac
-
-        return MacAlgorithm(name, digest_size, partial(_HashlibHmac, hmac, hash_name), partial(_hashlib_hmac, hmac, hash_name), partial(_hashlib_hmac_verify, hmac, hash_name))
-
-    return _pure_hmac(name, digest_size, engine)
+    return _pure_hmac(name, digest_size, getattr(_primitives, hash_name))
 
 
 def _pure_hmac(name, digest_size, engine):
@@ -684,9 +687,9 @@ def _pure_kmac(name, default, rate):
     return MacAlgorithm(name, default, *build(default, b"", False), _kmac_options(build))
 
 
-def _blake2_mac(name, maximum, number, field, hash_name):
+def _blake2_mac(name, maximum, number, field, variant):
     if not NATIVE:
-        return _pure_blake2_mac(name, maximum, field, getattr(_primitives, hash_name) or _unsupported(hash_name))
+        return _pure_blake2_mac(name, maximum, field, variant)
 
     def build(length, salt, personalization):
         return _native_mac(number, length, _native.mac_configure(number, length, 2, salt, personalization))
@@ -694,11 +697,13 @@ def _blake2_mac(name, maximum, number, field, hash_name):
     return MacAlgorithm(name, maximum, *_native_mac(number, maximum), _blake2_mac_options(maximum, field, build))
 
 
-def _pure_blake2_mac(name, maximum, field, constructor):
+def _pure_blake2_mac(name, maximum, field, variant):
     def build(length, salt, personalization):
-        engine = partial(_HashlibBlake2Mac, partial(constructor, digest_size=length, salt=salt, person=personalization), maximum)
+        h0 = _blake2.initial(variant, length, salt, personalization)
 
-        return engine, partial(_pure_mac, engine), partial(_blake2_mac_verify, engine, maximum)
+        engine = partial(_Blake2Mac, variant, h0, length, maximum)
+
+        return engine, partial(_blake2_mac_digest, variant, h0, length, maximum), partial(_blake2_mac_verify, engine, maximum)
 
     return MacAlgorithm(name, maximum, *build(maximum, b"", b""), _blake2_mac_options(maximum, field, build))
 
@@ -737,21 +742,21 @@ SHA3_384 = _hash("SHA3-384", 48, 8, "sha3_384")
 
 SHA3_512 = _hash("SHA3-512", 64, 9, "sha3_512")
 
-BLAKE2B_160 = _blake2("BLAKE2b-160", 20, 10, 16, "blake2b")
+BLAKE2B_160 = _blake2_hash("BLAKE2b-160", 20, 10, 16, _blake2.BLAKE2B)
 
-BLAKE2B_256 = _blake2("BLAKE2b-256", 32, 11, 16, "blake2b")
+BLAKE2B_256 = _blake2_hash("BLAKE2b-256", 32, 11, 16, _blake2.BLAKE2B)
 
-BLAKE2B_384 = _blake2("BLAKE2b-384", 48, 12, 16, "blake2b")
+BLAKE2B_384 = _blake2_hash("BLAKE2b-384", 48, 12, 16, _blake2.BLAKE2B)
 
-BLAKE2B_512 = _blake2("BLAKE2b-512", 64, 13, 16, "blake2b")
+BLAKE2B_512 = _blake2_hash("BLAKE2b-512", 64, 13, 16, _blake2.BLAKE2B)
 
-BLAKE2S_128 = _blake2("BLAKE2s-128", 16, 14, 8, "blake2s")
+BLAKE2S_128 = _blake2_hash("BLAKE2s-128", 16, 14, 8, _blake2.BLAKE2S)
 
-BLAKE2S_160 = _blake2("BLAKE2s-160", 20, 15, 8, "blake2s")
+BLAKE2S_160 = _blake2_hash("BLAKE2s-160", 20, 15, 8, _blake2.BLAKE2S)
 
-BLAKE2S_224 = _blake2("BLAKE2s-224", 28, 16, 8, "blake2s")
+BLAKE2S_224 = _blake2_hash("BLAKE2s-224", 28, 16, 8, _blake2.BLAKE2S)
 
-BLAKE2S_256 = _blake2("BLAKE2s-256", 32, 17, 8, "blake2s")
+BLAKE2S_256 = _blake2_hash("BLAKE2s-256", 32, 17, 8, _blake2.BLAKE2S)
 
 ASCON_HASH256 = _ascon_hash()
 
@@ -779,9 +784,9 @@ KMAC128 = _kmac("KMAC128", 32, 4, 168)
 
 KMAC256 = _kmac("KMAC256", 64, 5, 136)
 
-BLAKE2B_MAC = _blake2_mac("BLAKE2b-MAC", 64, 6, 16, "blake2b")
+BLAKE2B_MAC = _blake2_mac("BLAKE2b-MAC", 64, 6, 16, _blake2.BLAKE2B)
 
-BLAKE2S_MAC = _blake2_mac("BLAKE2s-MAC", 32, 7, 8, "blake2s")
+BLAKE2S_MAC = _blake2_mac("BLAKE2s-MAC", 32, 7, 8, _blake2.BLAKE2S)
 
 HKDF_SHA_256 = _hkdf("HKDF-SHA-256", 32, 0, HMAC_SHA_256)
 

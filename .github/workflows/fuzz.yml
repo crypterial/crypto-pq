@@ -77,14 +77,6 @@ jobs:
           package-manager-cache: false
       - working-directory: typescript
         run: node --test test/robustness.test.ts
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.x"
-      - working-directory: python
-        run: python -m unittest discover -s tests -p test_robustness.py
-        env:
-          PYTHONPATH: src
-          CRYPTO_PQ_SLOW: "1"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/zig-x86_64-linux-0.16.0.tar.xz
@@ -97,6 +89,25 @@ jobs:
           echo ~/zig >> "$GITHUB_PATH"
       - working-directory: zig
         run: zig build test -Doptimize=ReleaseSafe --summary all
+
+  # The pure backend hashes with its own Python engines, about 1 MB/s, so its long run (the 16 MiB
+  # inputs and fifty times the fuzz rounds) takes most of an hour on its own.
+  long-python:
+    name: long robustness runs (Python, pure)
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    env:
+      CRYPTO_PQ_FUZZ: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+      - working-directory: python
+        run: python -m unittest discover -s tests -p test_robustness.py
+        env:
+          PYTHONPATH: src
+          CRYPTO_PQ_SLOW: "1"
 
   # The WebAssembly core against the TypeScript implementation on random inputs for every family,
   # keys of each backend used by the other, on both architectures (V8 lowers SIMD differently on

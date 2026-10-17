@@ -2,7 +2,6 @@ import ast
 import binascii
 import copy
 import gc
-import hashlib
 import importlib
 import inspect
 import os
@@ -18,8 +17,7 @@ from unittest import mock
 
 import crypto_pq
 from crypto_pq import CryptoPQError, ErrorCode, hazmat
-from crypto_pq import _hash, _keccak, _kem, _lms, _mldsa, _mlkem, _native, _sha2, _signature, _slhdsa, _stateful
-from test_primitives import on_hashlib
+from crypto_pq import _blake2, _hash, _keccak, _kem, _lms, _mldsa, _mlkem, _native, _sha2, _signature, _slhdsa, _stateful
 from test_robustness import MemoryStore, Random, mutate, mutate_state, pattern
 from vectors import expanded_key
 
@@ -110,11 +108,10 @@ def pure_twins():
     for algorithm, hash_algorithm in zip(HMACS, HASHES[:4]):
         twins[algorithm] = _hash._pure_hmac(algorithm.name, algorithm.digest_size, engines[hash_algorithm])
 
-    # BLAKE2 on hashlib, a test-only oracle here, as in the pure backend.
     for algorithm in BLAKE2_HASHES:
-        field, constructor = (16, hashlib.blake2b) if algorithm.name.startswith("BLAKE2b") else (8, hashlib.blake2s)
+        field, variant = (16, _blake2.BLAKE2B) if algorithm.name.startswith("BLAKE2b") else (8, _blake2.BLAKE2S)
 
-        twins[algorithm] = _hash._pure_blake2(algorithm.name, algorithm.digest_size, field, constructor)
+        twins[algorithm] = _hash._pure_blake2(algorithm.name, algorithm.digest_size, field, variant)
 
     twins[crypto_pq.ASCON_HASH256] = _hash._pure_ascon_hash()
 
@@ -130,9 +127,9 @@ def pure_twins():
 
     twins[crypto_pq.KMAC256] = _hash._pure_kmac("KMAC256", 64, 136)
 
-    twins[crypto_pq.BLAKE2B_MAC] = _hash._pure_blake2_mac("BLAKE2b-MAC", 64, 16, hashlib.blake2b)
+    twins[crypto_pq.BLAKE2B_MAC] = _hash._pure_blake2_mac("BLAKE2b-MAC", 64, 16, _blake2.BLAKE2B)
 
-    twins[crypto_pq.BLAKE2S_MAC] = _hash._pure_blake2_mac("BLAKE2s-MAC", 32, 8, hashlib.blake2s)
+    twins[crypto_pq.BLAKE2S_MAC] = _hash._pure_blake2_mac("BLAKE2s-MAC", 32, 8, _blake2.BLAKE2S)
 
     for algorithm, hmac in zip(KDFS, HMACS[1:]):
         twins[algorithm] = _hash._pure_hkdf(algorithm.name, hmac.digest_size, twins[hmac])
@@ -273,14 +270,9 @@ class DataIndependentTimingTest(unittest.TestCase):
 
 @unittest.skipUnless(NATIVE, "compares the native backend with the pure one")
 class DifferentialTest(unittest.TestCase):
-    # The pure algorithms hash through hashlib here, a test-only oracle apart from both of
-    # crypto-pq's engines: on crypto-pq's own pure engines, which test_primitives checks against
-    # hashlib, every SLH-DSA signature would take seconds.
     @classmethod
     def setUpClass(cls):
         cls.twins = pure_twins()
-
-        cls.enterClassContext(on_hashlib())
 
     def test_hashes(self):
         rng = Random(301)

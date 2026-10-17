@@ -1,7 +1,8 @@
 import struct
 from typing import NamedTuple
 
-from . import _primitives
+from . import _lanes, _primitives, _sha2
+from ._bytes import Output
 from ._merkle import MerkleTree
 
 W = 16
@@ -118,97 +119,118 @@ _WORD = struct.Struct(">I").pack
 
 _KEY_AND_MASK = [_WORD(i) for i in range(3)]
 
+# The chain addresses of every WOTS+ key, and the zero hash and key-and-mask words of a secret.
+_CHAINS = [_WORD(i) for i in range(67)]
+
+_SECRET = bytes(8)
+
 
 class _Hashes:
-    """The keyed hashes of one XMSS key. PRF and PRF_keygen have fixed prefixes (toByte(3) ||
-    PUB_SEED, and toByte(4) || SK_SEED || PUB_SEED), which fill at least one SHA-256 block when n
-    = 32: where states copy cheaply, they continue copies of the states after them. F and H hash
-    their whole input."""
+    """The keyed hashes of one XMSS key, many at a time (see _lanes): PRF and PRF_keygen have fixed
+    prefixes (toByte(3) || PUB_SEED, and toByte(4) || SK_SEED || PUB_SEED), and the SHA-2 hashes
+    continue the chaining value after their whole blocks."""
 
-    __slots__ = ("p", "_hash", "_prf", "_keygen", "_prf_state", "_keygen_state", "_f", "_h")
+    __slots__ = ("p", "_prf", "_keygen", "_f", "_h")
 
     def __init__(self, p, pub_seed, sk_seed=None):
-        constructor = _primitives.shake_256 if p.shake else _primitives.sha256
-
         self.p = p
 
-        self._hash = constructor
+        self._prf = self._start(PRF.to_bytes(p.padding, "big") + pub_seed)
 
-        self._prf = PRF.to_bytes(p.padding, "big") + pub_seed
+        self._keygen = None if sk_seed is None else self._start(PRF_KEYGEN.to_bytes(p.padding, "big") + sk_seed + pub_seed)
 
-        self._keygen = None if sk_seed is None else PRF_KEYGEN.to_bytes(p.padding, "big") + sk_seed + pub_seed
+        self._f = self._start(F.to_bytes(p.padding, "big"))
 
-        copies = _primitives.copies_cheaply(constructor)
+        self._h = self._start(H.to_bytes(p.padding, "big"))
 
-        self._prf_state = constructor(self._prf).copy if copies else None
+    # A prefix as SHAKE takes it, or SHA-256's chaining value after its whole blocks, their length
+    # and the rest of the prefix.
+    def _start(self, prefix):
+        if self.p.shake:
+            return prefix
 
-        self._keygen_state = constructor(self._keygen).copy if copies and sk_seed is not None else None
+        whole = len(prefix) - len(prefix) % 64
 
-        self._f = F.to_bytes(p.padding, "big")
+        state = _sha2.IV_256
 
-        self._h = H.to_bytes(p.padding, "big")
+        for offset in range(0, whole, 64):
+            state = _sha2.chain256(state, prefix[offset : offset + 64])
 
-    def _digest(self, h):
-        return h.digest(self.p.n) if self.p.shake else h.digest()[: self.p.n]
+        return state, whole, prefix[whole:]
 
-    def _keyed(self, state, prefix, adrs):
-        if state is None:
-            return self._digest(self._hash(prefix + adrs))
+    # The hashes of the prefix `start` followed by each of `messages`, which share one length.
+    def _many(self, start, messages):
+        n = self.p.n
 
-        h = state()
+        if self.p.shake:
+            return _lanes.shake_many(136, [start + message for message in messages], n)
 
-        h.update(adrs)
+        state, done, rest = start
 
-        return self._digest(h)
+        return [digest[:n] for digest in _lanes.sha256_many([rest + message for message in messages], state, done)]
 
-    def prf(self, adrs):
-        return self._keyed(self._prf_state, self._prf, adrs)
+    def prf_many(self, addresses):
+        return self._many(self._prf, addresses)
 
-    def prf_keygen(self, adrs):
-        return self._keyed(self._keygen_state, self._keygen, adrs)
+    def keygen_many(self, addresses):
+        return self._many(self._keygen, addresses)
 
-    def f(self, key, message):
-        return self._digest(self._hash(self._f + key + message))
+    # RAND_HASH of RFC 8391 for many nodes, each under an address prefix that lacks only its
+    # key-and-mask word.
+    def rand_hash_many(self, prefixes, lefts, rights):
+        m = len(prefixes)
 
-    # RAND_HASH of RFC 8391, for an address `prefix` that lacks only its key-and-mask word.
-    def rand_hash(self, prefix, left, right):
-        key, mask0, mask1 = (self.prf(prefix + word) for word in _KEY_AND_MASK)
+        prf = self.prf_many([prefix + word for word in _KEY_AND_MASK for prefix in prefixes])
 
-        return self._digest(self._hash(self._h + key + xor(left, mask0) + xor(right, mask1)))
+        return self._many(self._h, [key + xor(left, mask0) + xor(right, mask1) for key, left, right, mask0, mask1 in zip(prf[:m], lefts, rights, prf[m : 2 * m], prf[2 * m :])])
 
-    # The steps first .. last - 1 of the chain whose address, up to its hash word, is `prefix`.
-    def chain(self, prefix, value, first, last):
-        for k in range(first, last):
-            adrs = prefix + _WORD(k)
+    # The chains under `prefixes` (addresses up to the hash word), stepped together: chain i runs
+    # from values[i] at step firsts[i] to lasts[i].
+    def chains(self, prefixes, values, firsts, lasts):
+        values = [*values]
 
-            key = self.prf(adrs + _KEY_AND_MASK[0])
+        for j in range(min(firsts), max(lasts)):
+            active = [i for i in range(len(values)) if firsts[i] <= j < lasts[i]]
 
-            value = self.f(key, xor(value, self.prf(adrs + _KEY_AND_MASK[1])))
+            if not active:
+                continue
 
-        return value
+            step = _WORD(j)
 
-    # The WOTS+ secret values of one leaf, at the address of its chains up to the chain word.
-    def secrets(self, prefix):
-        return [self.prf_keygen(prefix + _WORD(i) + bytes(8)) for i in range(self.p.length)]
+            prf = self.prf_many([prefixes[i] + step + word for word in _KEY_AND_MASK[:2] for i in active])
 
-    # RFC 8391, Algorithm 4: the L-tree of a WOTS+ public key.
+            m = len(active)
+
+            for i, value in zip(active, self._many(self._f, [key + xor(values[i], mask) for i, key, mask in zip(active, prf[:m], prf[m:])])):
+                values[i] = value
+
+        return values
+
+    # The secret values of the chains of one leaf, whose addresses `prefixes` reach their chain words.
+    def secrets(self, prefixes):
+        return self.keygen_many([prefix + _SECRET for prefix in prefixes])
+
+    # RFC 8391, Algorithm 4: the L-tree of a WOTS+ public key, each level in place of the one below.
     def ltree(self, layer, tree, leaf, values):
         height = 0
 
         while len(values) > 1:
             pairs = len(values) // 2
 
-            parents = [self.rand_hash(address(layer, tree, LTREE, leaf, height, i)[:-4], values[2 * i], values[2 * i + 1]) for i in range(pairs)]
+            values[:pairs] = self.rand_hash_many([address(layer, tree, LTREE, leaf, height, i)[:-4] for i in range(pairs)], values[0 : 2 * pairs : 2], values[1 : 2 * pairs : 2])
 
-            values = parents + values[2 * pairs :]
+            values[pairs:] = values[2 * pairs :]
 
             height += 1
 
         return values[0]
 
 
-def _chain_prefix(layer, tree, leaf):
-    return address(layer, tree, OTS, leaf)[:20]
+# The addresses of the chains of one leaf up to their hash words.
+def _prefixes(p, layer, tree, leaf):
+    head = address(layer, tree, OTS, leaf)[:20]
+
+    return [head + chain for chain in _CHAINS[: p.length]]
 
 
 # The leaves first .. first + count - 1 of one XMSS tree: the L-trees of their WOTS+ public keys.
@@ -218,11 +240,9 @@ def leaves(p, sk_seed, pub_seed, layer, tree, first, count):
     out = []
 
     for leaf in range(first, first + count):
-        prefix = _chain_prefix(layer, tree, leaf)
+        prefixes = _prefixes(p, layer, tree, leaf)
 
-        values = [hashes.chain(prefix + _WORD(i), x, 0, W - 1) for i, x in enumerate(hashes.secrets(prefix))]
-
-        out.append(hashes.ltree(layer, tree, leaf, values))
+        out.append(hashes.ltree(layer, tree, leaf, hashes.chains(prefixes, hashes.secrets(prefixes), [0] * p.length, [W - 1] * p.length)))
 
     return out
 
@@ -230,7 +250,7 @@ def leaves(p, sk_seed, pub_seed, layer, tree, first, count):
 def combine(p, pub_seed, layer, tree, z, first, lefts, rights):
     hashes = _Hashes(p, pub_seed)
 
-    return [hashes.rand_hash(address(layer, tree, HASH_TREE, 0, z, first + i)[:-4], left, right) for i, (left, right) in enumerate(zip(lefts, rights))]
+    return hashes.rand_hash_many([address(layer, tree, HASH_TREE, 0, z, first + i)[:-4] for i in range(len(lefts))], lefts, rights)
 
 
 def subtree(p, sk_seed, pub_seed, layer, tree, levels=None):
@@ -243,31 +263,35 @@ def subtree(p, sk_seed, pub_seed, layer, tree, levels=None):
     return MerkleTree(p.tree_height, tree_leaves, tree_combine, levels)
 
 
-def wots_sign(p, message, sk_seed, pub_seed, layer, tree, leaf):
+# The WOTS+ signature of `message`, written to out[offset:].
+def wots_sign(p, message, sk_seed, pub_seed, layer, tree, leaf, out, offset):
+    n = p.n
+
     hashes = _Hashes(p, pub_seed, sk_seed)
 
-    prefix = _chain_prefix(layer, tree, leaf)
+    prefixes = _prefixes(p, layer, tree, leaf)
 
-    return b"".join(hashes.chain(prefix + _WORD(i), x, 0, a) for i, (x, a) in enumerate(zip(hashes.secrets(prefix), wots_digits(p, message))))
+    for i, value in enumerate(hashes.chains(prefixes, hashes.secrets(prefixes), [0] * p.length, wots_digits(p, message))):
+        out[offset + i * n : offset + (i + 1) * n] = value
 
 
-def leaf_from_signature(p, signature, message, pub_seed, layer, tree, leaf):
+# The leaf that the WOTS+ signature at signature[offset:] gives.
+def leaf_from_signature(p, signature, offset, message, pub_seed, layer, tree, leaf):
     n = p.n
 
     hashes = _Hashes(p, pub_seed)
 
-    prefix = _chain_prefix(layer, tree, leaf)
+    starts = [signature[offset + i * n : offset + (i + 1) * n] for i in range(p.length)]
 
-    values = [hashes.chain(prefix + _WORD(i), signature[i * n : (i + 1) * n], a, W - 1) for i, a in enumerate(wots_digits(p, message))]
-
-    return hashes.ltree(layer, tree, leaf, values)
+    return hashes.ltree(layer, tree, leaf, hashes.chains(_prefixes(p, layer, tree, leaf), starts, wots_digits(p, message), [W - 1] * p.length))
 
 
-def compute_root(p, node, index, auth, pub_seed, layer, tree):
+# The root from `node` along the authentication path at signature[offset:].
+def compute_root(p, node, index, signature, offset, pub_seed, layer, tree):
     n = p.n
 
     for k in range(p.tree_height):
-        sibling = auth[k * n : (k + 1) * n]
+        sibling = signature[offset + k * n : offset + (k + 1) * n]
 
         if (index >> k) & 1:
             node = rand_hash(p, sibling, node, pub_seed, layer, tree, HASH_TREE, 0, k, index >> (k + 1))
@@ -308,11 +332,11 @@ def verify(p, public_key, message, signature):
 
         index >>= p.tree_height
 
-        leaf = leaf_from_signature(p, signature[offset : offset + p.length * n], node, pub_seed, layer, index, leaf_index)
+        leaf = leaf_from_signature(p, signature, offset, node, pub_seed, layer, index, leaf_index)
 
         offset += p.length * n
 
-        node = compute_root(p, leaf, leaf_index, signature[offset : offset + p.tree_height * n], pub_seed, layer, index)
+        node = compute_root(p, leaf, leaf_index, signature, offset, pub_seed, layer, index)
 
         offset += p.tree_height * n
 
@@ -378,9 +402,13 @@ class Xmss:
 
             node = self._tree(layer - 1, prefix).root
 
-            part = wots_sign(p, node, self.sk_seed, self.pub_seed, layer, tree, leaf) + b"".join(self._tree(layer, tree).auth_path(leaf))
+            part = Output((p.length + p.tree_height) * p.n)
 
-            cached = (prefix, part)
+            wots_sign(p, node, self.sk_seed, self.pub_seed, layer, tree, leaf, part.view, 0)
+
+            _write(part.view, p.length * p.n, self._tree(layer, tree).auth_path(leaf))
+
+            cached = (prefix, part.finish())
 
             self.signed[layer] = cached
 
@@ -395,10 +423,30 @@ class Xmss:
 
         leaf, tree = index & ((1 << p.tree_height) - 1), index >> p.tree_height
 
-        out = [index.to_bytes(p.index_size, "big"), r, wots_sign(p, node, self.sk_seed, self.pub_seed, 0, tree, leaf)]
+        # The trees and the upper layers' parts are built, when they change, before the
+        # signature's buffer exists.
+        bottom = self._tree(0, tree)
 
-        out += self._tree(0, tree).auth_path(leaf)
+        layers = [self._layer(layer, index >> (layer * p.tree_height)) for layer in range(1, p.d)]
 
-        out += [self._layer(layer, index >> (layer * p.tree_height)) for layer in range(1, p.d)]
+        signature = Output(p.signature_size)
 
-        return b"".join(out)
+        out, offset = signature.view, p.index_size + p.n
+
+        out[:offset] = index.to_bytes(p.index_size, "big") + r
+
+        wots_sign(p, node, self.sk_seed, self.pub_seed, 0, tree, leaf, out, offset)
+
+        _write(out, _write(out, offset + p.length * p.n, bottom.auth_path(leaf)), layers)
+
+        return signature.finish()
+
+
+# Writes `parts` in turn to out[offset:]; returns the offset after them.
+def _write(out, offset, parts):
+    for part in parts:
+        out[offset : offset + len(part)] = part
+
+        offset += len(part)
+
+    return offset

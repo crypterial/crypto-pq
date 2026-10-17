@@ -1,10 +1,11 @@
+from ._bytes import Output
 from ._encoding import invalid
 
 CACHED_HEIGHT = 15
 
-# Leaves per request when the tree is taller than the cache, which bounds the leaves that one
-# request holds.
-BATCH = 1024
+# Leaves per request, which bounds the leaves that one request holds, and pairs per check of a
+# cached level.
+BATCH = 256
 
 
 class MerkleTree:
@@ -49,35 +50,57 @@ class MerkleTree:
 
         self.root = levels[-1]
 
+    # Each request's subtrees are hashed up to their common root, their levels written in place
+    # into the cached levels; the levels above come from those roots.
     def _build(self):
-        total = 1 << (self.height - self.low)
+        low, height = self.low, self.height
 
-        per_request = max(1, BATCH >> self.low) if self.low else total
+        total = 1 << (height - low)
 
-        nodes = []
+        per_request = min(total, max(1, BATCH >> low))
+
+        top = per_request.bit_length() - 1
+
+        levels, roots = [], []
 
         for first in range(0, total, per_request):
-            nodes += self._subtrees(first, min(per_request, total - first))[-1]
+            nodes = self._subtrees(first, per_request)[-1]
 
-        levels = [b"".join(nodes)]
+            if not levels:
+                size = len(nodes[0])
 
-        for z in range(self.low, self.height):
-            nodes = self._combine(z, 0, nodes[0::2], nodes[1::2])
+                levels = [Output((total >> r) * size) for r in range(height - low + 1)]
 
-            levels.append(b"".join(nodes))
+            for r in range(top + 1):
+                start = (first >> r) * size
 
-        return levels
+                levels[r].view[start : start + len(nodes) * size] = b"".join(nodes)
+
+                if r < top:
+                    nodes = self._combine(low + r, first >> (r + 1), nodes[0::2], nodes[1::2])
+
+            roots.append(nodes[0])
+
+        for r in range(top, height - low):
+            roots = self._combine(low + r, 0, roots[0::2], roots[1::2])
+
+            levels[r + 1].view[:] = b"".join(roots)
+
+        return [level.finish() for level in levels]
 
     def _check(self, levels):
         size = len(levels[-1])
 
         for z in range(self.low, self.height):
-            level = levels[z - self.low]
+            level, parents = levels[z - self.low], levels[z - self.low + 1]
 
-            nodes = [level[i : i + size] for i in range(0, len(level), size)]
+            for start in range(0, len(level), 2 * BATCH * size):
+                nodes = [level[i : i + size] for i in range(start, min(start + 2 * BATCH * size, len(level)), size)]
 
-            if b"".join(self._combine(z, 0, nodes[0::2], nodes[1::2])) != levels[z - self.low + 1]:
-                raise invalid("the tree cache holds a node that its children do not give")
+                first = start // (2 * size)
+
+                if b"".join(self._combine(z, first, nodes[0::2], nodes[1::2])) != parents[first * size : (first + len(nodes) // 2) * size]:
+                    raise invalid("the tree cache holds a node that its children do not give")
 
     # Every level up to height `low` of `count` consecutive subtrees of 2^low leaves.
     def _subtrees(self, first, count):

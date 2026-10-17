@@ -2,7 +2,7 @@ import struct
 from functools import lru_cache
 from typing import NamedTuple
 
-from . import _bits, _primitives
+from . import _bits, _lanes, _primitives
 from ._bytes import equal
 from ._ntt import Ntt
 
@@ -150,11 +150,22 @@ def _sample(seed):
     return poly
 
 
-# The matrix A-hat of FIPS 203, Algorithm 13: entry (i, j) from rho || j || i.
-def sample_matrix(rho, k):
-    polys = [_sample(rho + bytes([j, i])) for i in range(k) for j in range(k)]
+# The matrix A-hat of FIPS 203, Algorithm 13, row by row: entry (i, j) from rho || j || i. The k^2
+# XOF streams, 16 at most, are read together (see _lanes: that many lanes cost little more than
+# one) and parsed a row at a time; a stream whose three blocks fall short is read again on its own.
+def sample_rows(rho, k):
+    seeds = [rho + bytes([j, i]) for i in range(k) for j in range(k)]
 
-    return [polys[i * k : (i + 1) * k] for i in range(k)]
+    streams = _lanes.shake_many(168, seeds, 3 * 168)
+
+    for i in range(0, k * k, k):
+        row = [sample_ntt(data) for data in streams[i : i + k]]
+
+        yield [poly if len(poly) == 256 else _sample(seed) for poly, seed in zip(row, seeds[i : i + k])]
+
+
+def sample_matrix(rho, k):
+    return [*sample_rows(rho, k)]
 
 
 def _cbd_masks(eta):
@@ -189,9 +200,17 @@ def _noise_etas(params):
     return [params.eta1] * params.k + [params.eta2] * (params.k + 1)
 
 
-# The PRF outputs for nonces 0, 1, ... with the given eta each.
+# The PRF outputs for nonces 0, 1, ... with the given eta each, computed together for each eta.
 def prfs(seed, etas):
-    return [_primitives.shake_256(seed + bytes([n])).digest(64 * eta) for n, eta in enumerate(etas)]
+    out = [b""] * len(etas)
+
+    for eta in dict.fromkeys(etas):
+        nonces = [n for n, e in enumerate(etas) if e == eta]
+
+        for n, data in zip(nonces, _lanes.shake_many(136, [seed + bytes([n]) for n in nonces], 64 * eta)):
+            out[n] = data
+
+    return out
 
 
 # K-PKE.KeyGen.
@@ -202,13 +221,14 @@ def pke_keygen(d, params):
 
     rho, sigma = g[:32], g[32:]
 
-    a = sample_matrix(rho, k)
-
     noise = _NTT.forward([[x - eta for x in sample_cbd(data, eta)] for data in prfs(sigma, [eta] * (2 * k))])
 
     s, e = [[x % Q for x in poly] for poly in noise[:k]], noise[k:]
 
-    t = [[(x + y) % Q for x, y in zip(dot(a[i], s), e[i])] for i in range(k)]
+    # The unreduced s goes, and A comes one row at a time.
+    del noise
+
+    t = [[(x + y) % Q for x, y in zip(dot(row, s), e[i])] for i, row in enumerate(sample_rows(rho, k))]
 
     ek = b"".join(byte_encode(x, 12) for x in t) + rho
 
@@ -256,6 +276,10 @@ def _evaluate24(values):
     return int.from_bytes(packed, "little")
 
 
+_HALF = struct.Struct("<256I")
+
+
+# The lower and the upper 256 digits of `value` at 2^24.
 def _digits24(value):
     data = value.to_bytes(1536, "little")
 
@@ -267,7 +291,7 @@ def _digits24(value):
 
     spread[2::4] = data[2::3]
 
-    return struct.unpack("<512I", spread)
+    return _HALF.unpack_from(spread, 0), _HALF.unpack_from(spread, 1024)
 
 
 # The evaluation of y + 2^23 + eta1 at 2^24, from the values of sample_cbd.
@@ -286,9 +310,7 @@ def _evaluate32(values):
 # The two halves of the digits of sum(public * secret) - correction, whose difference is the
 # product modulo X^256 + 1.
 def _product24(publics, secrets, correction):
-    digits = _digits24(sum(a * b for a, b in zip(publics, secrets)) - correction)
-
-    return digits[:256], digits[256:]
+    return _digits24(sum(a * b for a, b in zip(publics, secrets)) - correction)
 
 
 # The matrix columns and t of K-PKE in the normal domain, evaluated at 2^24, with the corrections
@@ -315,18 +337,12 @@ def _encrypt(state, m, noise, params):
 
     y = [_noise_operand(sample_cbd(data, params.eta1)) for data in noise[:k]]
 
-    c = []
-
-    for i in range(k):
-        lo, hi = _product24(rows[i], y, corrections[i])
-
-        c.append(byte_encode(compress(lo, hi, sample_cbd(noise[k + i], params.eta2), du), du))
-
-    lo, hi = _product24(rows[k], y, corrections[k])
+    # Each product's digits go as soon as their part of the ciphertext is encoded.
+    c = [byte_encode(compress(*_product24(rows[i], y, corrections[i]), sample_cbd(noise[k + i], params.eta2), du), du) for i in range(k)]
 
     e2 = [e + 1665 * bit for e, bit in zip(sample_cbd(noise[2 * k], params.eta2), byte_decode(m, 1))]
 
-    return b"".join(c) + byte_encode(compress(lo, hi, e2, dv), dv)
+    return b"".join(c) + byte_encode(compress(*_product24(rows[k], y, corrections[k]), e2, dv), dv)
 
 
 # K-PKE.Decrypt: w = v - s^T u, with the evaluations of s from the decapsulation key.
@@ -347,9 +363,9 @@ def _decrypt(secret, c, params):
 
         product = sum(u[j] * secret[j] for j in group) - sum(u[j] for j in group) * _OPERAND_32 + _BIAS_32
 
-        digits = struct.unpack("<512I", product.to_bytes(2048, "little"))
+        digits = product.to_bytes(2048, "little")
 
-        lo, hi = digits[:256], digits[256:]
+        lo, hi = _HALF.unpack_from(digits, 0), _HALF.unpack_from(digits, 1024)
 
         if start + 3 < k:
             w = [x - a + b for x, a, b in zip(w, lo, hi)]

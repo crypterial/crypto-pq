@@ -1,4 +1,5 @@
 import os
+import sys
 import threading
 import time
 import unittest
@@ -558,7 +559,6 @@ class ImportRobustnessTest(RobustnessCase):
                 key = private_key if private else private_key.public_key
 
                 for format in ("raw", "der", "pem"):
-
                     for data in inputs(rng, [key.export_key(format)], rounds):
                         if private:
                             self.check_signature_private(algorithm, data, format)
@@ -1210,6 +1210,277 @@ class ConcurrencyTest(RobustnessCase):
         self.assertEqual(crypto_pq.HSS_LMS.load_private_key(store).remaining_signatures(), 32 - len(indices))
 
 
+class Reentrant(bytes):
+    """Bytes whose hooks first run `hook`, which calls crypto_pq again: __buffer__ (honoured from
+    Python 3.12), __len__, __getitem__, __iter__ and __bytes__."""
+
+    hook = staticmethod(lambda: None)
+
+    def __buffer__(self, flags):
+        Reentrant.hook()
+
+        return super().__buffer__(flags)
+
+    def __len__(self):
+        Reentrant.hook()
+
+        return super().__len__()
+
+    def __getitem__(self, key):
+        Reentrant.hook()
+
+        return super().__getitem__(key)
+
+    def __iter__(self):
+        Reentrant.hook()
+
+        return super().__iter__()
+
+    def __bytes__(self):
+        Reentrant.hook()
+
+        return bytes(memoryview(self))
+
+
+class ReentrantArray(bytearray):
+    """A bytearray whose __buffer__ and __len__ run Reentrant.hook first."""
+
+    def __buffer__(self, flags):
+        Reentrant.hook()
+
+        return super().__buffer__(flags)
+
+    def __len__(self):
+        Reentrant.hook()
+
+        return super().__len__()
+
+
+# A length whose __index__ runs Reentrant.hook.
+class ReentrantLength:
+    def __init__(self, value):
+        self.value = value
+
+    def __index__(self):
+        Reentrant.hook()
+
+        return self.value
+
+
+# A store whose callbacks run `hook` first.
+class ReentrantStore(MemoryStore):
+    def __init__(self, hook):
+        super().__init__()
+
+        self.hook = hook
+
+    def read(self):
+        self.hook()
+
+        return super().read()
+
+    def update(self, previous, next):
+        self.hook()
+
+        return super().update(previous, next)
+
+
+# User code that runs in the middle of an operation, through the hooks of its inputs or a state
+# store, calls crypto_pq again with the same algorithms and keys. Each call from a hook is checked
+# against its known result, and each outer result against the result for plain bytes: no operation
+# may leave state half done where another can reach it.
+class ReentrancyTest(RobustnessCase):
+    LEVELS = [("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1")]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.kem = hazmat.generate_key_pair(crypto_pq.ML_KEM_512, pattern(64))
+
+        cls.encapsulation = hazmat.encapsulate(cls.kem.public_key, pattern(32, 0x80))
+
+        cls.signer = hazmat.generate_key_pair(crypto_pq.ML_DSA_44, pattern(32))
+
+        cls.expected = cls.inner()
+
+    @classmethod
+    def inner(cls):
+        return (
+            crypto_pq.SHA3_256.digest(b"inner"),
+            crypto_pq.SHAKE128.digest(b"inner", 40),
+            crypto_pq.BLAKE2B_512.digest(b"inner"),
+            crypto_pq.HMAC_SHA_256.digest(b"key", b"inner"),
+            crypto_pq.HKDF_SHA_256.derive(b"inner", 42, salt=b"salt", info=b"info"),
+            cls.kem.private_key.decapsulate(cls.encapsulation.ciphertext),
+            hazmat.encapsulate(cls.kem.public_key, pattern(32, 0x40)),
+            cls.signer.private_key.sign(b"inner", deterministic=True),
+        )
+
+    def hook(self):
+        self.calls += 1
+
+        self.assertEqual(self.inner(), self.expected)
+
+    def setUp(self):
+        self.calls = 0
+
+        Reentrant.hook = staticmethod(self.hook)
+
+    def tearDown(self):
+        Reentrant.hook = staticmethod(lambda: None)
+
+    # From Python 3.12 every bytes input runs the hook; before, only lengths and stores do.
+    def assertHooksRan(self, always):
+        if always or (sys.implementation.name == "cpython" and sys.version_info >= (3, 12)):
+            self.assertGreater(self.calls, 0)
+
+    def test_hashes(self):
+        data, key, info = pattern(300), pattern(40, 7), b"info"
+
+        for algorithm in (crypto_pq.SHA_256, crypto_pq.SHA3_256, crypto_pq.BLAKE2B_512, crypto_pq.BLAKE2S_256, crypto_pq.ASCON_HASH256):
+            expected = algorithm.digest(data)
+
+            self.assertEqual(algorithm.digest(Reentrant(data)), expected)
+
+            self.assertEqual(algorithm.digest(ReentrantArray(data)), expected)
+
+            hasher = algorithm.create()
+
+            hasher.update(Reentrant(data))
+
+            self.assertEqual(hasher.digest(), expected)
+
+            hasher = algorithm.create()
+
+            hasher.update(ReentrantArray(data))
+
+            self.assertEqual(hasher.digest(), expected)
+
+        for algorithm in (crypto_pq.SHAKE128, crypto_pq.SHAKE256, crypto_pq.CSHAKE128.configure(customization=b"email"), crypto_pq.ASCON_XOF128):
+            expected = algorithm.digest(data, 77)
+
+            self.assertEqual(algorithm.digest(Reentrant(data), ReentrantLength(77)), expected)
+
+            xof = algorithm.create()
+
+            xof.update(Reentrant(data))
+
+            self.assertEqual(xof.read(ReentrantLength(77)), expected)
+
+        self.assertEqual(crypto_pq.CSHAKE128.configure(customization=Reentrant(b"email")).digest(data, 77), crypto_pq.CSHAKE128.configure(customization=b"email").digest(data, 77))
+
+        for algorithm in (crypto_pq.HMAC_SHA_256, crypto_pq.HMAC_SHA_512, crypto_pq.KMAC128, crypto_pq.BLAKE2B_MAC):
+            expected = algorithm.digest(key, data)
+
+            self.assertEqual(algorithm.digest(Reentrant(key), Reentrant(data)), expected)
+
+            self.assertEqual(algorithm.digest(ReentrantArray(key), ReentrantArray(data)), expected)
+
+            self.assertTrue(algorithm.verify(Reentrant(key), Reentrant(data), Reentrant(expected)))
+
+            mac = algorithm.create(Reentrant(key))
+
+            mac.update(Reentrant(data))
+
+            self.assertEqual(mac.digest(), expected)
+
+            self.assertTrue(mac.verify(Reentrant(expected)))
+
+        for algorithm in (crypto_pq.HKDF_SHA_256, crypto_pq.HKDF_SHA_512):
+            expected, prk = algorithm.derive(data, 99, salt=key, info=info), algorithm.extract(data, salt=key)
+
+            self.assertEqual(algorithm.derive(Reentrant(data), ReentrantLength(99), salt=Reentrant(key), info=Reentrant(info)), expected)
+
+            self.assertEqual(algorithm.extract(Reentrant(data), salt=Reentrant(key)), prk)
+
+            self.assertEqual(algorithm.expand(Reentrant(prk), ReentrantLength(99), info=Reentrant(info)), expected)
+
+        self.assertHooksRan(True)
+
+    def test_kem(self):
+        for algorithm in (crypto_pq.ML_KEM_512, crypto_pq.ML_KEM_768, crypto_pq.X_WING):
+            backend = algorithm._backend
+
+            seed, randomness = pattern(backend.seed_size), pattern(backend.randomness_size, 0x80)
+
+            pair = hazmat.generate_key_pair(algorithm, seed)
+
+            expected = hazmat.encapsulate(pair.public_key, randomness)
+
+            again = hazmat.generate_key_pair(algorithm, Reentrant(seed))
+
+            self.assertEqual(again.public_key.export_key("raw"), pair.public_key.export_key("raw"))
+
+            self.assertEqual(hazmat.encapsulate(pair.public_key, Reentrant(randomness)), expected)
+
+            self.assertEqual(pair.private_key.decapsulate(Reentrant(expected.ciphertext)), expected.shared_secret)
+
+            public_key = algorithm.import_public_key(Reentrant(pair.public_key.export_key("raw")), "raw")
+
+            self.assertEqual(hazmat.encapsulate(public_key, randomness), expected)
+
+            private_key = algorithm.import_private_key(Reentrant(pair.private_key.export_key("raw")), "raw")
+
+            self.assertEqual(private_key.decapsulate(expected.ciphertext), expected.shared_secret)
+
+        self.assertHooksRan(False)
+
+    def test_signatures(self):
+        message, context = pattern(100, 3), b"context"
+
+        for algorithm in (crypto_pq.ML_DSA_44, crypto_pq.ML_DSA_65, crypto_pq.SLH_DSA_SHA2_128F):
+            backend = algorithm._backend
+
+            pair = hazmat.generate_key_pair(algorithm, pattern(backend.seed_size))
+
+            randomness = pattern(backend.randomness_size, 0x60)
+
+            expected = pair.private_key.sign(message, context=context, deterministic=True)
+
+            hedged = hazmat.sign(pair.private_key, message, randomness, context=context)
+
+            self.assertEqual(pair.private_key.sign(Reentrant(message), context=Reentrant(context), deterministic=True), expected)
+
+            self.assertEqual(pair.private_key.sign(ReentrantArray(message), context=ReentrantArray(context), deterministic=True), expected)
+
+            self.assertEqual(hazmat.sign(pair.private_key, Reentrant(message), Reentrant(randomness), context=Reentrant(context)), hedged)
+
+            self.assertTrue(pair.public_key.verify(Reentrant(expected), Reentrant(message), context=Reentrant(context)))
+
+            self.assertTrue(hazmat.verify(pair.public_key, Reentrant(hedged), Reentrant(message), context=Reentrant(context)))
+
+            public_key = algorithm.import_public_key(Reentrant(pair.public_key.export_key("raw")), "raw")
+
+            self.assertTrue(public_key.verify(expected, message, context=context))
+
+        self.assertHooksRan(False)
+
+    # The store of the key that signs runs the hook and tries that key again, which finds it busy;
+    # a twin key on a plain store gives the same signatures.
+    def test_stateful(self):
+        algorithm = crypto_pq.HSS_LMS
+
+        seed = pattern(algorithm._backend.seed_size(algorithm._backend.parameters(self.LEVELS)))
+
+        key = None
+
+        def hook():
+            self.hook()
+
+            if key is not None:
+                self.assertCode(ErrorCode.STATE_CONFLICT, key.sign, b"again")
+
+        twin = hazmat.generate_key_pair(algorithm, seed, parameters=self.LEVELS, state_store=MemoryStore()).private_key
+
+        key = hazmat.generate_key_pair(algorithm, Reentrant(seed), parameters=self.LEVELS, state_store=ReentrantStore(hook)).private_key
+
+        for i in range(4):
+            message = pattern(50, i)
+
+            self.assertEqual(key.sign(Reentrant(message)), twin.sign(message))
+
+        self.assertHooksRan(True)
+
+
 # Every implementation runs these rounds on the same inputs, made by the same generator from
 # byte-identical keys, and hashes each input with its outcome: an error code, true or false, or
 # OK and the result. Equal digests mean that all five implementations accept, refuse and compute
@@ -1408,6 +1679,7 @@ class TranscriptTest(RobustnessCase):
             return sum(ots.p << (lms.h + ots.w) for lms, ots in parameters)
 
         return (parameters.d << (parameters.h // parameters.d)) * (2 * parameters.n + 3) * 16
+
 
 if __name__ == "__main__":
     unittest.main()

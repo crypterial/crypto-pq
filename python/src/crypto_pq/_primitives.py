@@ -1,32 +1,13 @@
-"""The hash functions of the pure algorithms, with hashlib's interface: a constructor takes the
-first data and returns a state with update, copy and digest (digest(length) for SHAKE), which
-leaves the state as it was.
-
-While the pure backend is in use, they are the standard library's hashlib for every algorithm
-that hashlib provides, and crypto-pq's own code for the rest (SHA-512/224 and SHA-512/256 without
-OpenSSL, for instance). The native backend computes everything in its library, so it never
-imports hashlib: the pure algorithms then run on crypto-pq's own code, as the tests' pure twins
-do.
+"""The hash functions of the pure algorithms, crypto-pq's own SHA-2 and Keccak code, with hashlib's
+interface: a constructor takes the first data and returns a state with update, copy and digest
+(digest(length) for SHAKE), which leaves the state as it was. The pure backend runs on this code
+alone: it imports neither hashlib nor hmac.
 """
 
-import sys
 from functools import partial
 
-from . import _native
 from ._keccak import Keccak
 from ._sha2 import IV_224, IV_256, IV_384, IV_512, IV_512_224, IV_512_256, Sha256, Sha512
-
-
-def _hashlib():
-    if _native.BACKEND != "pure":
-        return None
-
-    import hashlib
-
-    return hashlib
-
-
-hashlib = _hashlib()
 
 
 class _Shake:
@@ -62,7 +43,7 @@ def _own(engine):
     return construct
 
 
-# crypto-pq's own engines, by hashlib's names.
+# The constructors by hashlib's names.
 OWN = {
     "sha224": _own(partial(Sha256, IV_224, 28)),
     "sha256": _own(partial(Sha256, IV_256, 32)),
@@ -78,61 +59,26 @@ OWN = {
     "shake_256": partial(_Shake, 136),
 }
 
-_FROM_HASHLIB: set = set()
+sha224 = OWN["sha224"]
 
+sha256 = OWN["sha256"]
 
-# hashlib's constructor of `name`, or crypto-pq's engine where hashlib lacks the algorithm or
-# refuses it.
-def _pick(name):
-    if hashlib is None:
-        return OWN[name]
+sha384 = OWN["sha384"]
 
-    constructor = getattr(hashlib, name, None) or partial(hashlib.new, name)
+sha512 = OWN["sha512"]
 
-    try:
-        constructor(b"")
-    except ValueError:
-        return OWN[name]
+sha512_224 = OWN["sha512_224"]
 
-    _FROM_HASHLIB.add(constructor)
+sha512_256 = OWN["sha512_256"]
 
-    return constructor
+sha3_224 = OWN["sha3_224"]
 
+sha3_256 = OWN["sha3_256"]
 
-# Whether the states of `constructor` copy and update cheaply, so that hashes with a common prefix
-# continue a copy of the state after it. On PyPy 3.11, hashlib's copy() takes about 8 us and
-# update() 4 us, against 0.5 us for a new state of the whole input; on CPython copy() takes 0.1 us
-# (measured).
-def copies_cheaply(constructor):
-    return constructor not in _FROM_HASHLIB or sys.implementation.name != "pypy"
+sha3_384 = OWN["sha3_384"]
 
+sha3_512 = OWN["sha3_512"]
 
-sha224 = _pick("sha224")
+shake_128 = OWN["shake_128"]
 
-sha256 = _pick("sha256")
-
-sha384 = _pick("sha384")
-
-sha512 = _pick("sha512")
-
-sha512_224 = _pick("sha512_224")
-
-sha512_256 = _pick("sha512_256")
-
-sha3_224 = _pick("sha3_224")
-
-sha3_256 = _pick("sha3_256")
-
-sha3_384 = _pick("sha3_384")
-
-sha3_512 = _pick("sha3_512")
-
-shake_128 = _pick("shake_128")
-
-shake_256 = _pick("shake_256")
-
-# BLAKE2 with its key, salt, personalization and output length: hashlib's alone, without a twin of
-# crypto-pq's own.
-blake2b = getattr(hashlib, "blake2b", None)
-
-blake2s = getattr(hashlib, "blake2s", None)
+shake_256 = OWN["shake_256"]

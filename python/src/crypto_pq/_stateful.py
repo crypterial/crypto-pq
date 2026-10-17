@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import NamedTuple, Protocol
 
 from . import _lms, _native, _xmss
+from ._bytes import Output
 from ._encoding import KeyFormat, invalid, object_identifier
 from ._errors import CryptoPQError, ErrorCode
 from ._hash import HMAC_SHA_256, SHA_256
@@ -94,35 +95,50 @@ def tree_cache_key(seed):
 # level's parameters. The body is the version, the kind, the parameters as the state blob encodes
 # them, the public key and every cached tree, top first: its level or layer, its number on that
 # level, its lowest cached height, its height, n, its node count and its nodes, level by level
-# from the lowest, left to right. The tag, HMAC-SHA-256 of the body, follows it.
+# from the lowest, left to right. The tag, HMAC-SHA-256 of the body, follows it. The body goes
+# straight into the cache's buffer, with room for the tag at its end.
 def tree_cache_body(kind, section, signer):
     public_key = signer.public_key
 
     trees = signer.cached()
 
-    body = bytearray([TREE_CACHE_VERSION, kind]) + section + len(public_key).to_bytes(4, "big") + public_key + bytes([len(trees)])
+    parts = [bytes([TREE_CACHE_VERSION, kind]) + section + len(public_key).to_bytes(4, "big") + public_key + bytes([len(trees)])]
 
     for level, tree, merkle in trees:
-        nodes = b"".join(merkle.levels)
+        count = sum(map(len, merkle.levels)) // merkle.size
 
-        body += bytes([level]) + tree.to_bytes(8, "big") + bytes([merkle.low, merkle.height, merkle.size])
+        parts.append(bytes([level]) + tree.to_bytes(8, "big") + bytes([merkle.low, merkle.height, merkle.size]) + count.to_bytes(4, "big"))
 
-        body += (len(nodes) // merkle.size).to_bytes(4, "big") + nodes
+        parts += merkle.levels
 
-    return bytes(body)
+    cache = Output(sum(map(len, parts)) + TAG_SIZE)
+
+    offset = 0
+
+    for part in parts:
+        cache.view[offset : offset + len(part)] = part
+
+        offset += len(part)
+
+    return cache
 
 
 # Python cannot wipe every copy of the tag key; the one it holds is zeroed.
-def seal_tree_cache(body, seed):
+def seal_tree_cache(cache, seed):
     key = tree_cache_key(seed)
 
     try:
-        return body + HMAC_SHA_256.digest(key, body)
+        cache.view[-TAG_SIZE:] = HMAC_SHA_256.digest(key, cache.view[:-TAG_SIZE])
     finally:
         key[:] = bytes(len(key))
 
+    return cache.finish()
 
+
+# The fields of a tree cache as views of it, so that its megabytes of nodes are not copied here.
 def parse_tree_cache(data):
+    data = memoryview(data)
+
     position = 0
 
     def take(size):
@@ -241,7 +257,7 @@ def split_levels(nodes, low, height, n):
     for z in range(low, height + 1):
         size = n << (height - z)
 
-        levels.append(nodes[offset : offset + size])
+        levels.append(bytes(nodes[offset : offset + size]))
 
         offset += size
 
@@ -274,14 +290,14 @@ class _Signer:
     def next_state(self, state, index):
         return self._backend.encode(self._parameters, self._seed, index)
 
-    # The body of the tree cache, under the key's lock; the tag follows outside it.
+    # The tree cache without its tag, under the key's lock; the tag follows outside it.
     def tree_cache(self):
         backend = self._backend
 
         return tree_cache_body(backend.kind, backend.parameter_section(self._parameters), self._trees)
 
-    def seal_tree_cache(self, body):
-        return seal_tree_cache(body, self._seed)
+    def seal_tree_cache(self, cache):
+        return seal_tree_cache(cache, self._seed)
 
     def free(self):
         pass

@@ -78,7 +78,7 @@ _COPY64 = (1 << 64) + 1
 
 
 def _compress256(state, data, offset):
-    w = list(_SCHEDULE256.unpack_from(data, offset))
+    w = [*_SCHEDULE256.unpack_from(data, offset)]
 
     for t in range(16, 64):
         x = w[t - 15]
@@ -108,7 +108,7 @@ def _compress256(state, data, offset):
 
 
 def _compress512(state, data, offset):
-    w = list(_SCHEDULE512.unpack_from(data, offset))
+    w = [*_SCHEDULE512.unpack_from(data, offset)]
 
     for t in range(16, 80):
         x = w[t - 15]
@@ -137,13 +137,61 @@ def _compress512(state, data, offset):
     state[:] = [(s + v) & _M64 for s, v in zip(state, (a, b, c, d, e, f, g, h))]
 
 
+_DIGEST256 = struct.Struct(">8I")
+
+_DIGEST512 = struct.Struct(">8Q")
+
+
+# The chaining value after `block` (one whole block) from `state`, and the digest bytes of the
+# chaining value after one last, already padded block, `state` left as it was.
+def chain256(state, block):
+    state = [*state]
+
+    _compress256(state, block, 0)
+
+    return tuple(state)
+
+
+def chain512(state, block):
+    state = [*state]
+
+    _compress512(state, block, 0)
+
+    return tuple(state)
+
+
+def last256(state, block):
+    state = [*state]
+
+    _compress256(state, block, 0)
+
+    return _DIGEST256.pack(*state)
+
+
+def last512(state, block):
+    state = [*state]
+
+    _compress512(state, block, 0)
+
+    return _DIGEST512.pack(*state)
+
+
+# The padding of SHA-256 and SHA-512 after `size` bytes of a block, for a message of `total` bytes.
+def tail256(size, total):
+    return b"\x80" + bytes(55 - size) + (8 * total).to_bytes(8, "big")
+
+
+def tail512(size, total):
+    return b"\x80" + bytes(111 - size) + (8 * total).to_bytes(16, "big")
+
+
 class _Sha2(Blocks):
     __slots__ = ("_state", "_count", "_size")
 
     def __init__(self, iv, size):
         super().__init__(self._BLOCK)
 
-        self._state = list(iv)
+        self._state = [*iv]
 
         self._count = 0
 
@@ -167,7 +215,7 @@ class _Sha2(Blocks):
         self._compress(self._state, data, offset)
 
     def digest(self):
-        state = list(self._state)
+        state = self._state[:]
 
         tail = self._buffer + b"\x80"
 

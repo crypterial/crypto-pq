@@ -90,6 +90,10 @@ class Ascon:
 
         self._position = -1
 
+    @property
+    def state(self):
+        return self._state
+
     def copy(self):
         other = Ascon(self._state, self._size)
 
@@ -181,6 +185,34 @@ class Ascon:
             self._position += take
 
         return bytes(out)
+
+
+# `size` bytes of the sponge from `state` on `data` (bytes or a byte view) in one pass, without a
+# sponge object: the full words straight from the data, then the padded rest, then the squeeze.
+def oneshot(state, data, size):
+    x0, x1, x2, x3, x4 = state
+
+    full = len(data) - len(data) % 8
+
+    for (word,) in _WORD.iter_unpack(data if full == len(data) else memoryview(data)[:full]):
+        x0, x1, x2, x3, x4 = permute(x0 ^ word, x1, x2, x3, x4)
+
+    x0, x1, x2, x3, x4 = permute(x0 ^ int.from_bytes(data[full:], "little") ^ (1 << (8 * (len(data) - full))), x1, x2, x3, x4)
+
+    # Each word goes straight to its place: one integer grown by a word at a time would copy itself
+    # at every word, which takes time quadratic in the size.
+    out = bytearray(8 * max(1, -(-size // 8)))
+
+    _WORD.pack_into(out, 0, x0)
+
+    for offset in range(8, len(out), 8):
+        x0, x1, x2, x3, x4 = permute(x0, x1, x2, x3, x4)
+
+        _WORD.pack_into(out, offset, x0)
+
+    del out[size:]
+
+    return bytes(out)
 
 
 # Ascon-CXOF128 after its customization string: its bit length as one block, then the string

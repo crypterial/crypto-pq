@@ -5,6 +5,10 @@ butterfly, a few big-integer operations, acts on every polynomial at the same po
 order of FIPS 203 and FIPS 204. A product with a zeta is reduced by Shoup's method: with
 z' = floor(z * 2^32 / q), b * z - floor(b * z' / 2^32) * q lies in [0, 2q) for any b below 2^32.
 The bounds below keep every field below 2^64, so no operation carries into the next field.
+
+The polynomials to transform may come from an iterator, with their count: each is read once, in
+turn, so that the caller need not hold them all, and each stage of a transform frees the data of
+the stage before it.
 """
 
 import struct
@@ -32,10 +36,8 @@ class Ntt:
 
         self.scale = scale
 
-    def _pack(self, polys):
+    def _pack(self, polys, count):
         q = self.q
-
-        count = len(polys)
 
         flat = [0] * (256 * count)
 
@@ -43,6 +45,8 @@ class Ntt:
             flat[index::count] = [x % q for x in poly]
 
         data = struct.pack(f"<{256 * count}Q", *flat)
+
+        del flat
 
         step = 8 * count
 
@@ -54,12 +58,12 @@ class Ntt:
 
     # Every field grows by less than 2q per layer from below q, so it stays below 17q < 2^32; the
     # results keep those unreduced values.
-    def forward(self, polys):
+    def forward(self, polys, count=None):
         q, zetas, shoup = self.q, self.zetas, self.shoup
 
-        count = len(polys)
+        count = len(polys) if count is None else count
 
-        w = self._pack(polys)
+        w = self._pack(polys, count)
 
         one = _ones(count)
 
@@ -92,17 +96,19 @@ class Ntt:
 
         flat = self._flat(w, count)
 
+        del w
+
         return [flat[index::count] for index in range(count)]
 
     # Before the layer with blocks of 2^s * last coefficients per half, every field is below
     # 2^s * q: that bias keeps hi - lo positive, and the Shoup input stays below 2^8 * q < 2^31.
-    # Polynomials in `extra` are added to the results before their reduction.
-    def inverse(self, polys, extra=None):
+    # Polynomials in `extra`, one per result, are added to the results before their reduction.
+    def inverse(self, polys, extra=None, count=None):
         q, zetas, shoup, scale = self.q, self.zetas, self.shoup, self.scale
 
-        count = len(polys)
+        count = len(polys) if count is None else count
 
-        w = self._pack(polys)
+        w = self._pack(polys, count)
 
         one = _ones(count)
 
@@ -139,7 +145,9 @@ class Ntt:
 
         flat = self._flat(w, count)
 
+        del w
+
         if extra is None:
             return [[x * scale % q for x in flat[index::count]] for index in range(count)]
 
-        return [[(x * scale + e) % q for x, e in zip(flat[index::count], extra[index])] for index in range(count)]
+        return [[(x * scale + e) % q for x, e in zip(flat[index::count], more)] for index, more in enumerate(extra)]

@@ -983,12 +983,13 @@ jobs:
   # the installed package (the fallback, thread, wipe, differential and isolation tests included)
   # under that binding, under ctypes where the extension serves (a None in sys.modules blocks the
   # extension module, as it blocks an import), and under the pure backend. 3.14t is the
-  # free-threaded build, where the thread tests run truly in parallel.
+  # free-threaded build, where the thread tests run truly in parallel. The pure run hashes with
+  # the package's own Python engines, hence the longer limit on the slower runners.
   python-native:
     name: python ${{ matrix.python }} wheel (${{ matrix.os }})
     needs: python-wheels
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

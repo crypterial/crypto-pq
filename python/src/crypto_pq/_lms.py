@@ -1,6 +1,7 @@
 from typing import NamedTuple
 
-from . import _primitives
+from . import _lanes, _primitives
+from ._bytes import Output
 from ._merkle import MerkleTree
 
 D_PBLC = b"\x80\x80"
@@ -88,6 +89,11 @@ for _index, (_shake, _n, _ots, _lms) in enumerate(FAMILIES):
 
 OTS_BY_NAME = {t.name: t for t in OTS_TYPES.values()}
 
+# The chain indices i as the two bytes that addresses hold, for every chain of every OTS type.
+_CHAINS = [i.to_bytes(2, "big") for i in range(max(t.p for t in OTS_TYPES.values()))]
+
+_SECRET = b"\xff"
+
 LMS_BY_NAME = {t.name: t for t in LMS_TYPES.values()}
 
 
@@ -103,8 +109,17 @@ def digest(shake, n, data):
     return _primitives.shake_256(data).digest(n) if shake else _primitives.sha256(data).digest()[:n]
 
 
+# A hash state that takes `data` and then the caller's further data, and its digest.
+def hasher(shake, data):
+    return _primitives.shake_256(data) if shake else _primitives.sha256(data)
+
+
+def finish(shake, n, h):
+    return h.digest(n) if shake else h.digest()[:n]
+
+
 def derive(shake, n, i_value, q, index, seed):
-    return digest(shake, n, i_value + u32(q) + u16(index) + b"\xff" + seed)
+    return digest(shake, n, i_value + u32(q) + u16(index) + _SECRET + seed)
 
 
 def coefficients(t, data, count):
@@ -129,47 +144,62 @@ def digits(t, q_hash):
 
 _STEPS = [bytes([j]) for j in range(256)]
 
+# The leaves whose public keys K, 34 blocks each when n = 32, are hashed together: 8 keys take
+# about 17 KB.
+_K_GROUP = 8
 
-# The steps first .. last - 1 of a chain: H(I || q || i || j || value) with `prefix` I || q || i.
-# SHA-256 with n = 32 keeps the whole digest.
-def chain(shake, n, prefix, value, first, last):
+
+# The hashes of `messages`, which share one length, computed together (see _lanes).
+def digests(shake, n, messages):
     if shake:
-        shake_256 = _primitives.shake_256
+        return _lanes.shake_many(136, messages, n)
 
-        for step in _STEPS[first:last]:
-            value = shake_256(prefix + step + value).digest(n)
-    elif n == 32:
-        sha256 = _primitives.sha256
+    return [d[:n] for d in _lanes.sha256_many(messages)]
 
-        for step in _STEPS[first:last]:
-            value = sha256(prefix + step + value).digest()
-    else:
-        sha256 = _primitives.sha256
 
-        for step in _STEPS[first:last]:
-            value = sha256(prefix + step + value).digest()[:n]
+# The chains of one OTS key under `prefix` (I || q), stepped together: chain i runs H(I || q || i ||
+# j || value) for j from firsts[i] to lasts[i] - 1, from values[i].
+def run_chains(shake, n, prefix, values, firsts, lasts):
+    values = [*values]
 
-    return value
+    for j in range(min(firsts), max(lasts)):
+        active = [i for i in range(len(values)) if firsts[i] <= j < lasts[i]]
+
+        if not active:
+            continue
+
+        step = _STEPS[j]
+
+        for i, value in zip(active, digests(shake, n, [prefix + _CHAINS[i] + step + values[i] for i in active])):
+            values[i] = value
+
+    return values
 
 
 # The chain starts x_i of RFC 8554, Appendix A.
-def chain_starts(t, i_value, q, seed):
-    return [derive(t.shake, t.n, i_value, q, i, seed) for i in range(t.p)]
+def chain_starts(t, prefix, seed):
+    return digests(t.shake, t.n, [prefix + _CHAINS[i] + _SECRET + seed for i in range(t.p)])
 
 
+# The leaves first .. first + count - 1: each the hash of the OTS public key K of its index q,
+# whose chains run from their starts x_i to their ends. K and the leaves of a group of leaves are
+# hashed together.
 def leaves(lms, ots, i_value, seed, first, count):
-    shake, n, last = ots.shake, ots.n, (1 << ots.w) - 1
+    shake, n, p, last = ots.shake, ots.n, ots.p, (1 << ots.w) - 1
 
     out = []
 
-    for q in range(first, first + count):
-        prefix = i_value + u32(q)
+    for start in range(first, first + count, _K_GROUP):
+        group = range(start, min(start + _K_GROUP, first + count))
 
-        y = [chain(shake, n, prefix + u16(i), x, 0, last) for i, x in enumerate(chain_starts(ots, i_value, q, seed))]
+        keys = []
 
-        k_value = digest(shake, n, prefix + D_PBLC + b"".join(y))
+        for q in group:
+            prefix = i_value + u32(q)
 
-        out.append(digest(shake, n, i_value + u32((1 << lms.h) + q) + D_LEAF + k_value))
+            keys.append(prefix + D_PBLC + b"".join(run_chains(shake, n, prefix, chain_starts(ots, prefix, seed), [0] * p, [last] * p)))
+
+        out += digests(shake, n, [i_value + u32((1 << lms.h) + q) + D_LEAF + k for q, k in zip(group, digests(shake, n, keys))])
 
     return out
 
@@ -177,35 +207,52 @@ def leaves(lms, ots, i_value, seed, first, count):
 def combine(lms, i_value, z, first, lefts, rights):
     base = (1 << (lms.h - z - 1)) + first
 
-    return [digest(lms.shake, lms.m, i_value + u32(base + i) + D_INTR + left + right) for i, (left, right) in enumerate(zip(lefts, rights))]
+    return digests(lms.shake, lms.m, [i_value + u32(base + i) + D_INTR + left + right for i, (left, right) in enumerate(zip(lefts, rights))])
 
 
-def ots_sign(t, i_value, q, seed, message):
-    c = derive(t.shake, t.n, i_value, q, RANDOMIZER, seed)
+# The hash of `message` that leaf q signs, with the randomizer `c`.
+def message_hash(t, prefix, c, message):
+    h = hasher(t.shake, prefix + D_MESG + c)
 
-    prefix = i_value + u32(q)
+    h.update(message)
 
-    q_hash = digest(t.shake, t.n, prefix + D_MESG + c + message)
-
-    starts = chain_starts(t, i_value, q, seed)
-
-    y = [chain(t.shake, t.n, prefix + u16(i), x, 0, a) for i, (x, a) in enumerate(zip(starts, digits(t, q_hash)))]
-
-    return u32(t.code) + c + b"".join(y)
+    return finish(t.shake, t.n, h)
 
 
-def ots_candidate(t, i_value, q, signature, message):
-    n, last = t.n, (1 << t.w) - 1
+# The OTS signature of `message` with leaf q, written to out[offset:].
+def ots_sign(t, i_value, q, seed, message, out, offset):
+    shake, n = t.shake, t.n
 
-    c = signature[4 : 4 + n]
+    c = derive(shake, n, i_value, q, RANDOMIZER, seed)
 
     prefix = i_value + u32(q)
 
-    q_hash = digest(t.shake, n, prefix + D_MESG + c + message)
+    out[offset : offset + 4] = u32(t.code)
 
-    z = [chain(t.shake, n, prefix + u16(i), signature[4 + n * (i + 1) : 4 + n * (i + 2)], a, last) for i, a in enumerate(digits(t, q_hash))]
+    out[offset + 4 : offset + 4 + n] = c
 
-    return digest(t.shake, n, prefix + D_PBLC + b"".join(z))
+    offset += 4 + n
+
+    for i, value in enumerate(run_chains(shake, n, prefix, chain_starts(t, prefix, seed), [0] * t.p, digits(t, message_hash(t, prefix, c, message)))):
+        out[offset + i * n : offset + (i + 1) * n] = value
+
+
+# The candidate OTS public key of the signature at signature[offset:].
+def ots_candidate(t, i_value, q, signature, offset, message):
+    shake, n, last = t.shake, t.n, (1 << t.w) - 1
+
+    prefix = i_value + u32(q)
+
+    k_value = hasher(shake, prefix + D_PBLC)
+
+    start = offset + 4 + n
+
+    starts = [signature[start + i * n : start + (i + 1) * n] for i in range(t.p)]
+
+    for value in run_chains(shake, n, prefix, starts, digits(t, message_hash(t, prefix, signature[offset + 4 : start], message)), [last] * t.p):
+        k_value.update(value)
+
+    return finish(shake, n, k_value)
 
 
 def lms_signature_size(lms, ots):
@@ -226,27 +273,28 @@ def parse_public_key(data):
     return lms, ots, data[8:24], data[24:]
 
 
-def lms_verify(public_key, message, signature):
+# The LMS signature signature[start:end] of `message`.
+def lms_verify(public_key, message, signature, start, end):
     parsed = parse_public_key(public_key)
 
-    if parsed is None or len(signature) < 8:
+    if parsed is None or end - start < 8:
         return False
 
     lms, ots, i_value, root = parsed
 
-    q = int.from_bytes(signature[:4], "big")
+    q = int.from_bytes(signature[start : start + 4], "big")
 
-    if int.from_bytes(signature[4:8], "big") != ots.code or len(signature) != lms_signature_size(lms, ots):
+    if int.from_bytes(signature[start + 4 : start + 8], "big") != ots.code or end - start != lms_signature_size(lms, ots):
         return False
 
-    offset = 4 + ots.signature_size
+    offset = start + 4 + ots.signature_size
 
     if int.from_bytes(signature[offset : offset + 4], "big") != lms.code or q >= 1 << lms.h:
         return False
 
     node = 1 << lms.h | q
 
-    candidate = digest(lms.shake, lms.m, i_value + u32(node) + D_LEAF + ots_candidate(ots, i_value, q, signature[4:offset], message))
+    candidate = digest(lms.shake, lms.m, i_value + u32(node) + D_LEAF + ots_candidate(ots, i_value, q, signature, start + 4, message))
 
     for i in range(lms.h):
         sibling = signature[offset + 4 + i * lms.m : offset + 4 + (i + 1) * lms.m]
@@ -295,14 +343,14 @@ def hss_verify(public_key, message, signature):
 
         child = signature[end : end + child_lms.public_key_size]
 
-        if parse_public_key(child) is None or not lms_verify(key, child, signature[offset:end]):
+        if parse_public_key(child) is None or not lms_verify(key, child, signature, offset, end):
             return False
 
         key = child
 
         offset = end + len(child)
 
-    return lms_verify(key, message, signature[offset:])
+    return lms_verify(key, message, signature, offset, len(signature))
 
 
 # The I and SEED of the child tree that leaf q signs, from the I and SEED of its parent.
@@ -335,10 +383,29 @@ class Tree:
 
         self.public_key = u32(lms.code) + u32(ots.code) + i_value + self.merkle.root
 
-    def sign(self, q, message):
-        ots_signature = ots_sign(self.ots, self.i_value, q, self.seed, message)
+    # The LMS signature of `message` with leaf q, written to out[offset:].
+    def sign_into(self, q, message, out, offset):
+        out[offset : offset + 4] = u32(q)
 
-        return u32(q) + ots_signature + u32(self.lms.code) + b"".join(self.merkle.auth_path(q))
+        ots_sign(self.ots, self.i_value, q, self.seed, message, out, offset + 4)
+
+        offset += 4 + self.ots.signature_size
+
+        out[offset : offset + 4] = u32(self.lms.code)
+
+        offset += 4
+
+        for node in self.merkle.auth_path(q):
+            out[offset : offset + len(node)] = node
+
+            offset += len(node)
+
+    def sign(self, q, message):
+        signature = Output(lms_signature_size(self.lms, self.ots))
+
+        self.sign_into(q, message, signature.view, 0)
+
+        return signature.finish()
 
     def child(self, lms, ots, q):
         return Tree(lms, ots, *child_keys(self.lms, self.i_value, self.seed, q))
@@ -423,6 +490,21 @@ class Hss:
 
             self.prefixes.append(prefix)
 
-        bottom = self.trees[-1].sign(self.leaf_index(index, len(self.levels) - 1), message)
+        bottom = self.trees[-1]
 
-        return u32(len(self.levels) - 1) + b"".join(self.signed) + bottom
+        signature = Output(4 + sum(map(len, self.signed)) + lms_signature_size(bottom.lms, bottom.ots))
+
+        out = signature.view
+
+        out[:4] = u32(len(self.levels) - 1)
+
+        offset = 4
+
+        for part in self.signed:
+            out[offset : offset + len(part)] = part
+
+            offset += len(part)
+
+        bottom.sign_into(self.leaf_index(index, len(self.levels) - 1), message, out, offset)
+
+        return signature.finish()

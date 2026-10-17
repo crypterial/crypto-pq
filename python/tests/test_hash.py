@@ -1,3 +1,4 @@
+import os
 import pathlib
 import unittest
 
@@ -20,6 +21,10 @@ HASHES = {
 }
 
 XOFS = {"SHAKE128": crypto_pq.SHAKE128, "SHAKE256": crypto_pq.SHAKE256}
+
+# Each Monte Carlo test chains 100,000 hashes; on the pure backend, whose own engines take tens of
+# microseconds a hash, the first 10 of its 100 checkpoints run unless CRYPTO_PQ_SLOW=1 is set.
+CHECKPOINTS = None if os.environ.get("CRYPTO_PQ_SLOW") or crypto_pq.BACKEND != "pure" else 10
 
 # HMAC.rsp labels each group by digest length in bytes; L=20 is SHA-1, which is out of scope.
 HMACS = {
@@ -118,7 +123,7 @@ class HashTest(unittest.TestCase):
 
             seed = bytes.fromhex(first["Seed"])
 
-            for _, record in checkpoints:
+            for _, record in checkpoints[:CHECKPOINTS]:
                 if prefix.startswith("SHA3_"):
                     for _ in range(1000):
                         seed = algorithm.digest(seed)
@@ -213,7 +218,7 @@ class XofTest(unittest.TestCase):
 
             length = maximum
 
-            for _, record in checkpoints:
+            for _, record in checkpoints[:CHECKPOINTS]:
                 for _ in range(1000):
                     output = algorithm.digest((output + bytes(16))[:16], length)
 

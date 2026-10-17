@@ -26,6 +26,9 @@ _LANES = {rate: struct.Struct(f"<{rate // 8}Q") for rate in (72, 104, 136, 144, 
 def permute(state):
     (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24) = state
 
+    # The lanes live in the locals during the rounds, so the list lets go of the old ones.
+    state.clear()
+
     a1 ^= _M64
 
     a2 ^= _M64
@@ -218,6 +221,26 @@ def permute(state):
     state[:] = (a0, a1 ^ _M64, a2 ^ _M64, a3, a4, a5, a6, a7, a8 ^ _M64, a9, a10, a11, a12 ^ _M64, a13, a14, a15, a16, a17 ^ _M64, a18, a19, a20 ^ _M64, a21, a22, a23, a24)
 
 
+# Keccak-f[1600] of one padded block of `rate` bytes absorbed into a zero state, and the first
+# `size` bytes of the state (size <= rate).
+def one_block(block, rate, size):
+    state = [*_LANES[rate].unpack(block)]
+
+    state += [0] * (25 - len(state))
+
+    permute(state)
+
+    return _STATE.pack(*state)[:size]
+
+
+# The block of `rate` bytes that pads `size` bytes of a SHAKE input (suffix 1111, then pad10*1).
+def shake_tail(rate, size):
+    if size == rate - 1:
+        return b"\x9f"
+
+    return b"\x1f" + bytes(rate - size - 2) + b"\x80"
+
+
 class Keccak(Blocks):
     __slots__ = ("_state", "_suffix", "_size", "_lanes", "_output", "_position")
 
@@ -236,10 +259,12 @@ class Keccak(Blocks):
 
         self._position = -1
 
+    # States are copied by slicing: unlike list(), it takes a list object that the interpreter keeps
+    # from freed lists, so that copies made and dropped in turn do not pile freed lists up.
     def copy(self):
         other = Keccak(self._block, self._suffix, self._size)
 
-        other._state = list(self._state)
+        other._state = self._state[:]
 
         other._buffer[:] = self._buffer
 
@@ -276,7 +301,7 @@ class Keccak(Blocks):
         self._absorb(state, last, 0)
 
     def digest(self):
-        state = list(self._state)
+        state = self._state[:]
 
         self._finish(state)
 

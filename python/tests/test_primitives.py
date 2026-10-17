@@ -1,11 +1,14 @@
 import hashlib
+import os
 import random
+import subprocess
+import sys
 import unittest
 from functools import partial
 from unittest import mock
 
 import crypto_pq
-from crypto_pq import _mldsa, _mlkem, _primitives, _slhdsa, _xmss
+from crypto_pq import _keccak, _lanes, _mldsa, _mlkem, _primitives, _sha2, _slhdsa
 
 # Lengths around the block sizes of SHA-256 (64), SHA-512 (128) and the Keccak rates (72 to 168).
 LENGTHS = (0, 1, 55, 56, 63, 64, 65, 71, 72, 73, 103, 104, 111, 112, 127, 128, 129, 135, 136, 137, 143, 144, 167, 168, 169, 300, 1000)
@@ -13,8 +16,7 @@ LENGTHS = (0, 1, 55, 56, 63, 64, 65, 71, 72, 73, 103, 104, 111, 112, 127, 128, 1
 SHAKES = ("shake_128", "shake_256")
 
 
-# crypto-pq's own engines serve the pure algorithms wherever hashlib cannot and under the native
-# backend; hashlib, a test-only oracle here, checks them.
+# crypto-pq's own engines serve every pure algorithm; hashlib, a test-only oracle here, checks them.
 class OwnEngineTest(unittest.TestCase):
     def setUp(self):
         self.random = random.Random(20261006)
@@ -68,67 +70,89 @@ class OwnEngineTest(unittest.TestCase):
 
 
 class ProviderTest(unittest.TestCase):
-    # The pure backend takes hashlib's constructors; the native backend never imports hashlib.
+    # The pure algorithms take crypto-pq's own engines, whatever the backend.
     def test_choice(self):
         for name, own in _primitives.OWN.items():
             with self.subTest(name=name):
-                constructor = getattr(_primitives, name)
+                self.assertIs(getattr(_primitives, name), own)
 
-                if crypto_pq.BACKEND == "pure":
-                    self.assertIn(constructor, _primitives._FROM_HASHLIB)
+    # The pure backend imports neither hashlib nor hmac: in a new process that uses every kind of
+    # pure algorithm, neither module is loaded.
+    def test_no_hashlib(self):
+        code = (
+            "import sys, crypto_pq\n"
+            "from crypto_pq import hazmat\n"
+            "assert crypto_pq.BACKEND == 'pure'\n"
+            "for algorithm in (crypto_pq.SHA_256, crypto_pq.SHA3_256, crypto_pq.BLAKE2B_512, crypto_pq.BLAKE2S_256):\n"
+            "    algorithm.digest(b'm')\n"
+            "crypto_pq.SHAKE256.digest(b'm', 32)\n"
+            "for algorithm in (crypto_pq.HMAC_SHA_256, crypto_pq.BLAKE2B_MAC, crypto_pq.KMAC128):\n"
+            "    algorithm.verify(b'k', b'm', algorithm.digest(b'k', b'm'))\n"
+            "crypto_pq.HKDF_SHA_256.derive(b'k', 32)\n"
+            "hazmat.generate_key_pair(crypto_pq.ML_KEM_512, bytes(64))\n"
+            "print(sorted({'hashlib', 'hmac', '_hashlib'} & set(sys.modules)))\n"
+        )
 
-                    self.assertEqual(constructor(b"abc").digest(*((10,) if name in SHAKES else ())), hashlib.new(name, b"abc").digest(*((10,) if name in SHAKES else ())))
-                else:
-                    self.assertIs(constructor, own)
+        found = subprocess.run([sys.executable, "-c", code], env=dict(os.environ, CRYPTO_PQ_BACKEND="pure"), capture_output=True, text=True, check=True)
 
-    # Where states copy and update slowly (hashlib on PyPy), the SHA-2 sets of SLH-DSA and the keyed
-    # hashes of XMSS hash their whole inputs instead of continuing copies; both give the same values.
-    def test_whole_inputs(self):
-        for params in (_slhdsa.SHA2[1], _slhdsa.SHA2[3], _slhdsa.SHA2[5]):
-            with self.subTest(params=params.name):
-                n = params.n
+        self.assertEqual(found.stdout.strip(), "[]")
 
-                keys = bytes(range(n)), bytes(range(1, n + 1))
 
-                copied, whole = _slhdsa._Sha2Hashes(params, *keys), _slhdsa._Sha2WholeHashes(params, *keys)
+# The lane engines give each lane the hash that hashlib gives its input, at lane counts that take
+# one computation or several (more than 64 lanes, 32 for SHA-512).
+class LanesTest(unittest.TestCase):
+    COUNTS = (1, 2, 3, 17, 33, 64, 65, 130)
 
-                head, value = copied.head(1, 2, 3), bytes(range(2, n + 2))
+    def setUp(self):
+        self.random = random.Random(20261010)
 
-                adrs = head + bytes(12)
+    def blocks(self, n, size):
+        return [self.random.randbytes(size) for _ in range(n)]
 
-                for name in ("f", "h", "t"):
-                    self.assertEqual(getattr(copied, name)(adrs, value), getattr(whole, name)(adrs, value))
+    def test_join(self):
+        for n in self.COUNTS:
+            with self.subTest(n=n):
+                state = _sha2.chain256(_sha2.IV_256, self.random.randbytes(64))
 
-                self.assertEqual(copied.prf(adrs), whole.prf(adrs))
+                blocks = self.blocks(n, 64)
 
-                self.assertEqual(copied.chain(head + bytes(8), value, 3, 15), whole.chain(head + bytes(8), value, 3, 15))
+                self.assertEqual(_lanes.sha256_join(state, b"".join(blocks), n), b"".join(_sha2.last256(state, block) for block in blocks))
 
-                nodes = [bytes([i]) * n for i in range(8)]
+                state = _sha2.chain512(_sha2.IV_512, self.random.randbytes(128))
 
-                self.assertEqual(copied.parents(head + bytes(8), 5, nodes), whole.parents(head + bytes(8), 5, nodes))
+                blocks = self.blocks(n, 128)
 
-        def slow():
-            return mock.patch.object(_primitives, "copies_cheaply", lambda constructor: False)
+                self.assertEqual(_lanes.sha512_join(state, b"".join(blocks), n), b"".join(_sha2.last512(state, block) for block in blocks))
 
-        with slow():
-            self.assertIsInstance(_slhdsa._hashes(_slhdsa.SHA2[1], bytes(16), bytes(16)), _slhdsa._Sha2WholeHashes)
+                for rate, name, size in ((136, "shake_256", 32), (168, "shake_128", 504), (136, "shake_256", 13)):
+                    messages = self.blocks(n, rate - 2)
 
-        for name in ("XMSS-SHA2_10_256", "XMSS-SHA2_10_192", "XMSS-SHAKE256_10_256"):
-            with self.subTest(name=name):
-                params = _xmss.XMSS_SETS[name]
+                    joined = b"".join(message + _keccak.shake_tail(rate, rate - 2) for message in messages)
 
-                keys = bytes(range(params.n)), bytes(range(1, params.n + 1))
+                    self.assertEqual(_lanes.keccak_join(joined, n, rate, size), b"".join(hashlib.new(name, message).digest(size) for message in messages))
 
-                copied = _xmss._Hashes(params, *keys)
+    def test_many(self):
+        for n in self.COUNTS:
+            for length in (0, 1, 55, 56, 64, 119, 135, 136, 167, 168, 300):
+                with self.subTest(n=n, length=length):
+                    messages = self.blocks(n, length)
 
-                with slow():
-                    whole = _xmss._Hashes(params, *keys)
+                    prefix = self.random.randbytes(64)
 
-                self.assertIsNone(whole._prf_state)
+                    state = _sha2.chain256(_sha2.IV_256, prefix)
 
-                self.assertEqual(whole.prf(bytes(32)), copied.prf(bytes(32)))
+                    self.assertEqual(_lanes.sha256_many(messages), [hashlib.sha256(message).digest() for message in messages])
 
-                self.assertEqual(whole.prf_keygen(bytes(32)), copied.prf_keygen(bytes(32)))
+                    self.assertEqual(_lanes.sha256_many(messages, state, 64), [hashlib.sha256(prefix + message).digest() for message in messages])
+
+                    for rate, name, size in ((136, "shake_256", 24), (168, "shake_128", 170)):
+                        self.assertEqual(_lanes.shake_many(rate, messages, size), [hashlib.new(name, message).digest(size) for message in messages])
+
+    def test_one_block(self):
+        for length in (0, 1, 133, 134, 135):
+            message = self.random.randbytes(length)
+
+            self.assertEqual(_keccak.one_block(message + _keccak.shake_tail(136, length), 136, 32), hashlib.shake_256(message).digest(32))
 
 
 # The provider's constructors replaced: hashlib's (an oracle in tests, whatever the backend), or
@@ -141,10 +165,12 @@ def on_own_engines():
     return mock.patch.multiple(_primitives, **_primitives.OWN)
 
 
-# The pure algorithms give the same results on crypto-pq's own engines as on hashlib's.
-class FallbackTest(unittest.TestCase):
-    # Signing on the own engines takes seconds, so its parts are compared one by one: the FORS
-    # signature and one layer of the hypertree signature.
+# The pure algorithms give the same results whether their single hashes run on crypto-pq's own
+# engines or on hashlib's, a test-only oracle; their batched hashes run on the lane engines either
+# way, which LanesTest checks.
+class OracleTest(unittest.TestCase):
+    # The parts of a signature are compared one by one: the FORS signature and one layer of the
+    # hypertree signature.
     def test_slh_dsa(self):
         message = bytes([0, 0]) + b"message"
 
@@ -158,7 +184,11 @@ class FallbackTest(unittest.TestCase):
 
                         hashes = _slhdsa._hashes(params, pk[:16], sk[:16])
 
-                        parts.append((pk, _slhdsa.fors_sign(hashes, params, bytes(range(25)), 5, 3), _slhdsa.xmss_levels(hashes, params, 0, 5, bytes(16), 3)))
+                        fors, xmss = bytearray(params.k * (1 + params.a) * 16), bytearray((params.length + params.hp) * 16)
+
+                        roots = _slhdsa.fors_sign(hashes, params, bytes(range(25)), 5, 3, fors, 0), _slhdsa.xmss_sign(hashes, params, 0, 5, bytes(16), 3, xmss, 0)
+
+                        parts.append((pk, roots, fors, xmss))
 
                         if provider is on_hashlib:
                             signature = _slhdsa.sign_internal(message, sk, pk[:16], params)
