@@ -65,6 +65,12 @@ pub(crate) trait Word:
         counter: u128,
         last: Last<'_, Self>,
     ) -> bool;
+
+    // The CPU kernel of digest, which returns whether it did the work.
+    fn digest_kernel(h: &[Self; 8], data: &[u8], out: &mut [u8]) -> bool;
+
+    // The CPU kernel of mac, from the chaining value with the key's length in.
+    fn mac_kernel(h: &[Self; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> bool;
 }
 
 impl Word for u64 {
@@ -129,6 +135,17 @@ impl Word for u64 {
         last: Last<'_, Self>,
     ) -> bool {
         cpu::blake2b(h, first, blocks.as_chunks().0, counter, last)
+    }
+
+    #[inline(always)]
+    fn digest_kernel(h: &[Self; 8], data: &[u8], out: &mut [u8]) -> bool {
+        cpu::blake2b_digest(h, data, out)
+    }
+
+    // BLAKE2b's MAC takes the kernel of process.
+    #[inline(always)]
+    fn mac_kernel(_: &[Self; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
+        false
     }
 }
 
@@ -195,6 +212,16 @@ impl Word for u32 {
         last: Last<'_, Self>,
     ) -> bool {
         cpu::blake2s(h, first, blocks.as_chunks().0, counter as u64, last)
+    }
+
+    #[inline(always)]
+    fn digest_kernel(h: &[Self; 8], data: &[u8], out: &mut [u8]) -> bool {
+        cpu::blake2s_digest(h, data, out)
+    }
+
+    #[inline(always)]
+    fn mac_kernel(h: &[Self; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> bool {
+        cpu::blake2s_mac(h, key, data, out)
     }
 }
 
@@ -412,6 +439,10 @@ fn leading<W: Word>(length: usize) -> usize {
 
 // The digest of data, out.len() bytes, from the chaining value h, in one pass over data.
 pub(crate) fn digest<W: Word>(h: &[W; 8], data: &[u8], out: &mut [u8]) {
+    if W::digest_kernel(h, data, out) {
+        return;
+    }
+
     let mut h = *h;
 
     let whole = leading::<W>(data.len());
@@ -441,6 +472,10 @@ pub(crate) fn mac<W: Word>(h: &[W; 8], key: &[u8], data: &[u8], out: &mut [u8]) 
     let mut h = *h;
 
     h[0] = h[0] ^ W::key_length(key.len());
+
+    if W::mac_kernel(&h, key, data, out) {
+        return;
+    }
 
     let mut key_block = [W::default(); 16];
 
@@ -678,6 +713,138 @@ mod tests {
         let s = kernel_matches::<u32>(&mut inputs, |x| x as u32);
 
         std::eprintln!("BLAKE2b: {b} of 10000, BLAKE2s: {s} of 10000 cases through a CPU kernel");
+    }
+
+    // The one-call digest kernels against the portable compression, from random chaining values,
+    // for every length up to three blocks and nine bytes and every digest size.
+    fn digest_kernel_matches<W: Word>(inputs: &mut Inputs, word: impl Fn(u64) -> W) -> usize {
+        let mut accelerated = 0;
+
+        let block = 16 * W::BYTES;
+
+        for n in 0..4_000 {
+            let h: [W; 8] = core::array::from_fn(|_| word(inputs.next()));
+
+            let bytes: [u8; 3 * 128 + 9] = inputs.bytes();
+
+            let data = &bytes[..n % (3 * block + 10)];
+
+            let size = 1 + n % (8 * W::BYTES);
+
+            let mut state = h;
+
+            let whole = leading::<W>(data.len());
+
+            for (i, chunk) in data[..whole].chunks_exact(block).enumerate() {
+                let m: [W; 16] =
+                    core::array::from_fn(|j| W::from_le(&chunk[j * W::BYTES..(j + 1) * W::BYTES]));
+
+                compress(&mut state, &m, (block * (i + 1)) as u128, false);
+            }
+
+            let mut last = [W::default(); 16];
+
+            words(data, whole, &mut last);
+
+            compress(&mut state, &last, data.len() as u128, true);
+
+            let (mut expected, mut actual) = ([0; 64], [0; 64]);
+
+            W::store(&state, &mut expected[..size]);
+
+            if W::digest_kernel(&h, data, &mut actual[..size]) {
+                assert_eq!(actual, expected, "case {n}");
+
+                accelerated += 1;
+            }
+        }
+
+        accelerated
+    }
+
+    #[test]
+    fn blake2_digest_kernels_match_portable() {
+        let mut inputs = Inputs::new(11);
+
+        let b = digest_kernel_matches::<u64>(&mut inputs, |x| x);
+
+        let s = digest_kernel_matches::<u32>(&mut inputs, |x| x as u32);
+
+        std::eprintln!("BLAKE2 digest: b {b} of 4000, s {s} of 4000 cases through a CPU kernel");
+    }
+
+    // The one-call MAC kernels against the portable compression, from random chaining values,
+    // for every key length, every length up to three blocks and nine bytes and every digest
+    // size.
+    fn mac_kernel_matches<W: Word>(inputs: &mut Inputs, word: impl Fn(u64) -> W) -> usize {
+        let mut accelerated = 0;
+
+        let block = 16 * W::BYTES;
+
+        for n in 0..4_000 {
+            let h: [W; 8] = core::array::from_fn(|_| word(inputs.next()));
+
+            let bytes: [u8; 3 * 128 + 9] = inputs.bytes();
+
+            let data = &bytes[..n % (3 * block + 10)];
+
+            let key: [u8; 64] = inputs.bytes();
+
+            let key = &key[..1 + n / 7 % (8 * W::BYTES)];
+
+            let size = 1 + n % (8 * W::BYTES);
+
+            let mut key_block = [W::default(); 16];
+
+            words(key, 0, &mut key_block);
+
+            let mut state = h;
+
+            if data.is_empty() {
+                compress(&mut state, &key_block, block as u128, true);
+            } else {
+                compress(&mut state, &key_block, block as u128, false);
+
+                let whole = leading::<W>(data.len());
+
+                for (i, chunk) in data[..whole].chunks_exact(block).enumerate() {
+                    let m: [W; 16] = core::array::from_fn(|j| {
+                        W::from_le(&chunk[j * W::BYTES..(j + 1) * W::BYTES])
+                    });
+
+                    compress(&mut state, &m, (block * (i + 2)) as u128, false);
+                }
+
+                let mut last = [W::default(); 16];
+
+                words(data, whole, &mut last);
+
+                compress(&mut state, &last, (block + data.len()) as u128, true);
+            }
+
+            let (mut expected, mut actual) = ([0; 64], [0; 64]);
+
+            W::store(&state, &mut expected[..size]);
+
+            if W::mac_kernel(&h, key, data, &mut actual[..size]) {
+                assert_eq!(actual, expected, "case {n}");
+
+                accelerated += 1;
+            }
+        }
+
+        accelerated
+    }
+
+    #[test]
+    fn blake2_mac_kernels_match_portable() {
+        let mut inputs = Inputs::new(12);
+
+        let b = mac_kernel_matches::<u64>(&mut inputs, |x| x);
+
+        let s = mac_kernel_matches::<u32>(&mut inputs, |x| x as u32);
+
+        std::eprintln!("BLAKE2 MAC: b {b} of 4000, s {s} of 4000 cases through a CPU kernel");
     }
 
     // The one-shot digest and MAC against the engine fed in pieces, for lengths around the block

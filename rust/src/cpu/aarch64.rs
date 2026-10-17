@@ -559,6 +559,70 @@ pub(crate) fn digest(
     true
 }
 
+// ML-DSA's packing stays portable.
+#[inline(always)]
+pub(crate) fn mldsa_pack(
+    _: &mut [u8],
+    _: &[i32; 256],
+    _: u32,
+    _: crate::cpu::Pack,
+    _: i32,
+) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn mlkem_multiply_cache(
+    _: &[u16; 256],
+    _: &[i16; 128],
+    _: u16,
+    _: &mut [u16; 128],
+) -> bool {
+    false
+}
+
+// ML-KEM's inner products go through base_multiply_add and inverse_ntt16, whose widening
+// multiply-adds keep the sums in registers already.
+#[inline(always)]
+pub(crate) fn mlkem_inner_product(
+    _: &mut [u16; 256],
+    _: &[&[u16; 256]],
+    _: &[[u16; 256]],
+    _: &[[u16; 128]],
+    _: &crate::cpu::Field16,
+) -> bool {
+    false
+}
+
+// ML-KEM's decoding, compression and message encoding stay portable, which NEON's compiled loops
+// already serve.
+#[inline(always)]
+pub(crate) fn decode12(_: &[u8; 384], _: u16, _: &mut [u16; 256]) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn mlkem_compress(
+    _: &[u16; 256],
+    _: &[u16; 256],
+    _: Option<&[u8; 32]>,
+    _: u32,
+    _: u16,
+    _: &mut [u8],
+) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn mlkem_decompress(_: &[u8], _: u32, _: u16, _: &mut [u16; 256]) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn mlkem_message(_: &[u16; 256], _: &[u16; 256], _: u16, _: &mut [u8; 32]) -> bool {
+    false
+}
+
 // BLAKE2 runs best on the scalar pipes as compiled: four independent G functions per step keep
 // them busy, a hand-ordered assembly version measured the same, and NEON's two-cycle instructions
 // and two-instruction rotations lengthen the chain.
@@ -581,6 +645,21 @@ pub(crate) fn blake2s(
     _: u64,
     _: Option<(&[u32; 16], u128)>,
 ) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn blake2b_digest(_: &[u64; 8], _: &[u8], _: &mut [u8]) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn blake2s_digest(_: &[u32; 8], _: &[u8], _: &mut [u8]) -> bool {
+    false
+}
+
+#[inline(always)]
+pub(crate) fn blake2s_mac(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
     false
 }
 

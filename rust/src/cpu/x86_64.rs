@@ -1,24 +1,72 @@
-// SHA-256 with the SHA extensions (SHA256RNDS2, SHA256MSG1, SHA256MSG2); the SHA-256 lanes,
-// Keccak-f[1600] on four states, BLAKE2b and the ML-KEM and ML-DSA transforms with AVX2; BLAKE2s,
-// and BLAKE2b without AVX2, with SSE4.1. Every instruction used is on Intel's list of
-// data-operand-independent timing instructions, and the code around them has no branch or
-// address that depends on the data. x86-64 has no common SHA-512 extension, so SHA-512 stays
-// portable. The kernels are safe code inside #[target_feature] functions; what is unsafe is
-// calling one once its feature is known to be there, and CPUID with XGETBV.
+// SHA-256 with the SHA extensions (SHA256RNDS2, SHA256MSG1, SHA256MSG2); with AVX2, BMI1 and BMI2
+// (the AVX2 tier): the SHA-256 lanes, SHA-256 without the SHA extensions and SHA-512,
+// Keccak-f[1600] on four states and on one, BLAKE2b and BLAKE2s, Ascon, and the ML-KEM and ML-DSA
+// arithmetic, sampling and encodings; BLAKE2b and BLAKE2s without AVX2 with SSE4.1. Every
+// instruction used is on Intel's list of data-operand-independent timing instructions, and the code
+// around them has no branch or address that depends on secret data. The kernels are safe code
+// inside #[target_feature] functions, apart from the loads and stores of memory.rs and the assembly
+// of the SHA-2 rounds and of single shuffles and blends; what is unsafe is calling one once its
+// feature is known to be there, and CPUID with XGETBV.
 
 use core::arch::x86_64::*;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, Ordering};
+
+// A function of one AVX2 instruction in assembly, for shuffles that must stay as written: as
+// intrinsics, LLVM's shuffle combining rewrote them into other shuffles, in BLAKE2 a rotation by
+// 16 into two of them on both of its operands, which doubled the work of the one port that runs
+// shuffles on Intel cores, and in SHA-512 a lane-crossing pair into a permutation that takes two
+// operations and twice the latency on AMD cores. An instruction in assembly is opaque to it.
+macro_rules! instruction {
+    ($name:ident, $vector:ty, $class:ident, $template:literal, $($input:ident),+) => {
+        #[target_feature(enable = "avx2")]
+        #[inline]
+        #[allow(unsafe_code)]
+        fn $name($($input: $vector),+) -> $vector {
+            let out: $vector;
+
+            // SAFETY: one AVX2 instruction on registers, which this function's target feature
+            // provides; it reads and writes no memory, stack or flags.
+            unsafe {
+                core::arch::asm!(
+                    $template,
+                    out = lateout($class) out,
+                    $($input = in($class) $input),+,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+
+            out
+        }
+    };
+}
+
+mod ascon;
 
 mod blake2;
 
-use crate::cpu::{Field, Field16, Prepare};
-use crate::keccak::ROUND_CONSTANTS;
+mod dsa;
+
+mod keccak;
+
+mod kem;
+
+mod memory;
+
+mod ntt;
+
+mod sha2;
+
+use crate::cpu::{Field, Field16, Pack};
 use crate::sha2::{K256, compress256_lanes_portable};
+use crate::wipe::wipe;
 
 // The SHA extensions together with the SSSE3 and SSE4.1 shuffles that the kernel needs.
 const SHA: u32 = 1;
 
-// AVX2, with ymm state that the operating system saves.
+// AVX2 with ymm state that the operating system saves, together with BMI1 and BMI2, as Go's
+// standard library also requires them: every CPU with AVX2 has them, and the kernels that the
+// flag selects use either.
 const AVX2: u32 = 1 << 1;
 
 // SSSE3 and SSE4.1.
@@ -38,7 +86,11 @@ const fn guaranteed(feature: u32) -> bool {
             target_feature = "ssse3",
             target_feature = "sse4.1"
         )),
-        AVX2 => cfg!(target_feature = "avx2"),
+        AVX2 => cfg!(all(
+            target_feature = "avx2",
+            target_feature = "bmi1",
+            target_feature = "bmi2"
+        )),
         SSE41 => cfg!(all(target_feature = "ssse3", target_feature = "sse4.1")),
         _ => false,
     }
@@ -78,8 +130,11 @@ fn has(feature: u32) -> bool {
     found & feature != 0
 }
 
-// CPUID leaf 1 ECX: SSSE3 bit 9, SSE4.1 bit 19, OSXSAVE bit 27, AVX bit 28; leaf 7 EBX: AVX2
-// bit 5, SHA bit 29. Newer Rust makes __cpuid safe, hence unused_unsafe.
+// CPUID leaf 1 ECX: SSSE3 bit 9, SSE4.1 bit 19, OSXSAVE bit 27, AVX bit 28; leaf 7 EBX: BMI1
+// bit 3, AVX2 bit 5, BMI2 bit 8, SHA bit 29. Newer Rust makes __cpuid safe, hence unused_unsafe.
+// Out of line, as CPUID's registers made every kernel's caller save six, for the first call only.
+#[cold]
+#[inline(never)]
 #[allow(unsafe_code, unused_unsafe)]
 fn probe() -> u32 {
     // SAFETY: every x86-64 CPU has CPUID; the one environment where it faults, an SGX enclave,
@@ -103,7 +158,9 @@ fn probe() -> u32 {
         found |= SHA;
     }
 
-    let avx = leaf7.ebx & (1 << 5) != 0 && leaf1.ecx & (1 << 28) != 0;
+    let bmi = leaf7.ebx & (1 << 3) != 0 && leaf7.ebx & (1 << 8) != 0;
+
+    let avx = bmi && leaf7.ebx & (1 << 5) != 0 && leaf1.ecx & (1 << 28) != 0;
 
     // XGETBV exists once the operating system has enabled XSAVE (OSXSAVE); bits 1 and 2 of XCR0
     // say that it saves the SSE and AVX registers on a context switch.
@@ -118,14 +175,21 @@ fn probe() -> u32 {
 
 #[allow(unsafe_code)]
 pub(crate) fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) -> bool {
-    if !has(SHA) {
-        return false;
+    if has(SHA) {
+        // SAFETY: the CPU has the SHA extensions, SSSE3 and SSE4.1, all that the kernel needs.
+        unsafe { compress256_sha(state, blocks, more) };
+
+        return true;
     }
 
-    // SAFETY: the CPU has the SHA extensions, SSSE3 and SSE4.1, all that the kernel needs.
-    unsafe { compress256_sha(state, blocks, more) };
+    if has(AVX2) {
+        // SAFETY: the CPU has AVX2, BMI1 and BMI2, and the operating system saves the registers.
+        unsafe { sha2::compress256(state, blocks, more) };
 
-    true
+        return true;
+    }
+
+    false
 }
 
 // SHA-NI two lanes at a time where it exists; otherwise the portable lanes compiled for AVX2,
@@ -152,56 +216,119 @@ pub(crate) fn compress256_lanes<const LANES: usize>(
     false
 }
 
-// The one-shot hashes build their padding in memory, as the portable code does.
-#[inline(always)]
-pub(crate) fn finish256(_: &mut [u32; 8], _: &[u8], _: u64) -> bool {
-    false
+// The one-shot hashes build their padding in memory, as the portable code does; with the SHA
+// extensions, the portable code calls compress256 for the blocks.
+#[allow(unsafe_code)]
+pub(crate) fn finish256(state: &mut [u32; 8], data: &[u8], bits: u64) -> bool {
+    if has(SHA) || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { sha2::finish256(state, data, bits) };
+
+    true
 }
 
-#[inline(always)]
-pub(crate) fn finish512(_: &mut [u64; 8], _: &[u8], _: u128) -> bool {
-    false
+#[allow(unsafe_code)]
+pub(crate) fn finish512(state: &mut [u64; 8], data: &[u8], bits: u128) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { sha2::finish512(state, data, bits) };
+
+    true
 }
 
-#[inline(always)]
-pub(crate) fn hmac256(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
-    false
+// HMAC in one call on the AVX2 path; with the SHA extensions the generic code calls compress256.
+#[allow(unsafe_code)]
+pub(crate) fn hmac256(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) -> bool {
+    if has(SHA) || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { sha2::hmac256(iv, key, data, tag) };
+
+    true
 }
 
-#[inline(always)]
-pub(crate) fn hmac512(_: &[u64; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
-    false
+#[allow(unsafe_code)]
+pub(crate) fn hmac512(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { sha2::hmac512(iv, key, data, tag) };
+
+    true
 }
 
-#[inline(always)]
-pub(crate) fn hmac256_keyed(_: &[[u32; 8]; 2], _: &[u8], _: &mut [u8]) -> bool {
-    false
+#[allow(unsafe_code)]
+pub(crate) fn hmac256_keyed(keyed: &[[u32; 8]; 2], data: &[u8], tag: &mut [u8]) -> bool {
+    if has(SHA) || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { sha2::hmac256_keyed(keyed, data, tag) };
+
+    true
 }
 
-#[inline(always)]
-pub(crate) fn hmac512_keyed(_: &[[u64; 8]; 2], _: &[u8], _: &mut [u8]) -> bool {
-    false
+#[allow(unsafe_code)]
+pub(crate) fn hmac512_keyed(keyed: &[[u64; 8]; 2], data: &[u8], tag: &mut [u8]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { sha2::hmac512_keyed(keyed, data, tag) };
+
+    true
 }
 
-// The pair goes through compress256_lanes, which has the SHA-NI and AVX2 kernels.
-#[inline(always)]
-pub(crate) fn compress256_pair(_: &mut [[u32; 8]; 2], _: &[[u8; 64]; 2]) -> bool {
-    false
+// With the SHA extensions the pair goes through compress256_lanes, two streams side by side.
+#[allow(unsafe_code)]
+pub(crate) fn compress256_pair(states: &mut [[u32; 8]; 2], blocks: &[[u8; 64]; 2]) -> bool {
+    if has(SHA) || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { sha2::compress256_pair(states, blocks) };
+
+    true
 }
 
-#[inline(always)]
-pub(crate) fn compress512(_: &mut [u64; 8], _: &[[u8; 128]], _: &[[u8; 128]]) -> bool {
-    false
+#[allow(unsafe_code)]
+pub(crate) fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { sha2::compress512(state, blocks, more) };
+
+    true
 }
 
-#[inline(always)]
-pub(crate) fn compress512_pair(_: &mut [[u64; 8]; 2], _: &[[u8; 128]; 2]) -> bool {
-    false
+#[allow(unsafe_code)]
+pub(crate) fn compress512_pair(states: &mut [[u64; 8]; 2], blocks: &[[u8; 128]; 2]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { sha2::compress512_pair(states, blocks) };
+
+    true
 }
 
-// The transforms and products of ML-KEM and ML-DSA: the portable arithmetic written once for
-// both fields and compiled for AVX2, where the signed 32-bit products that SSE2 lacks give eight
-// coefficients per vector.
+// The transforms and products of ML-DSA, and of ML-KEM where the 16-bit kernels are not used.
 #[allow(unsafe_code)]
 pub(crate) fn ntt(w: &mut [i32; 256], field: &Field) -> bool {
     if !has(AVX2) {
@@ -209,7 +336,7 @@ pub(crate) fn ntt(w: &mut [i32; 256], field: &Field) -> bool {
     }
 
     // SAFETY: the CPU has AVX2 and the operating system saves its registers.
-    unsafe { forward_avx2(w, field) };
+    unsafe { ntt::forward(w, field) };
 
     true
 }
@@ -221,7 +348,7 @@ pub(crate) fn inverse_ntt(w: &mut [i32; 256], field: &Field) -> bool {
     }
 
     // SAFETY: as in ntt.
-    unsafe { inverse_avx2(w, field) };
+    unsafe { ntt::inverse(w, field) };
 
     true
 }
@@ -238,7 +365,7 @@ pub(crate) fn multiply(
     }
 
     // SAFETY: as in ntt.
-    unsafe { products_avx2::<false>(out, f, g, field) };
+    unsafe { ntt::products(out, f, g, field) };
 
     true
 }
@@ -254,10 +381,8 @@ pub(crate) fn multiply_add(
         return false;
     }
 
-    for (f, g) in f.iter().zip(g) {
-        // SAFETY: as in ntt.
-        unsafe { products_avx2::<true>(acc, f, g, field) };
-    }
+    // SAFETY: as in ntt.
+    unsafe { ntt::products_add(acc, f, g, field) };
 
     true
 }
@@ -274,233 +399,356 @@ pub(crate) fn base_multiply_add(
     }
 
     // SAFETY: as in ntt.
-    unsafe { base_products_avx2(acc, a, b, cache) };
+    unsafe { kem::base_multiply_add(acc, a, b, cache) };
 
     true
 }
 
-#[inline(always)]
-pub(crate) fn binomial(_: usize, _: &[u64], _: u16, _: &mut [u16; 256]) -> bool {
-    false
+// The PRF output is given as the 64-bit lanes of the sponges, in stream order.
+#[allow(unsafe_code)]
+pub(crate) fn binomial(eta: usize, lanes: &[u64], q: u16, out: &mut [u16; 256]) -> bool {
+    if !matches!((eta, lanes.len()), (2, 16) | (3, 24)) || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { kem::binomial(eta, lanes, q, out) };
+
+    true
 }
 
-#[inline(always)]
-pub(crate) fn mldsa_add(_: &mut [i32; 256], _: &[i32; 256], _: &[i32; 256], _: i32) -> bool {
-    false
+#[allow(unsafe_code)]
+pub(crate) fn mldsa_add(out: &mut [i32; 256], a: &[i32; 256], b: &[i32; 256], q: i32) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { dsa::combine::<true>(out, a, b, q) };
+
+    true
 }
 
-#[inline(always)]
-pub(crate) fn mldsa_sub(_: &mut [i32; 256], _: &[i32; 256], _: &[i32; 256], _: i32) -> bool {
-    false
+#[allow(unsafe_code)]
+pub(crate) fn mldsa_sub(out: &mut [i32; 256], a: &[i32; 256], b: &[i32; 256], q: i32) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { dsa::combine::<false>(out, a, b, q) };
+
+    true
 }
 
-#[inline(always)]
-pub(crate) fn mldsa_norm(_: &[i32; 256], _: i32, _: Option<i32>, _: i32) -> Option<i32> {
-    None
-}
-
-#[inline(always)]
-pub(crate) fn mldsa_hints(
-    _: &mut [i32; 256],
-    _: &[i32; 256],
-    _: &[i32; 256],
-    _: i32,
-    _: i32,
+// -1 when some value reaches the bound in absolute value: the centered coefficients, or with
+// gamma2 the low bits of Decompose; 0 otherwise.
+#[allow(unsafe_code)]
+pub(crate) fn mldsa_norm(
+    values: &[i32; 256],
+    bound: i32,
+    gamma2: Option<i32>,
+    q: i32,
 ) -> Option<i32> {
-    None
-}
-
-#[inline(always)]
-pub(crate) fn mldsa_w1(_: &mut [u8], _: &[i32; 256], _: i32, _: i32) -> bool {
-    false
-}
-
-#[inline(always)]
-pub(crate) fn mldsa_mask(_: &mut [i32; 256], _: &[u8], _: u32, _: i32, _: i32) -> bool {
-    false
-}
-
-#[inline(always)]
-pub(crate) fn mlkem_matrix_vector(
-    _: &mut [[u16; 256]],
-    _: &[[u16; 256]],
-    _: &[[u16; 256]],
-    _: &[[u16; 128]],
-    _: &[[u16; 256]],
-    _: u16,
-) -> bool {
-    false
-}
-
-#[inline(always)]
-pub(crate) fn reduce(_: &[i32; 256], _: i32, _: &Field, _: &mut [u16; 256]) -> bool {
-    false
-}
-
-#[inline(always)]
-pub(crate) fn encode12(_: &[u16; 256], _: &mut [u8; 384]) -> bool {
-    false
-}
-
-#[inline(always)]
-pub(crate) fn uniform12(_: &[u64; 21], _: u16, _: &mut [u16; 256], _: &mut usize) -> bool {
-    false
-}
-
-#[inline(always)]
-pub(crate) fn uniform23(_: &[u64; 21], _: i32, _: &mut [i32; 256], _: &mut usize) -> bool {
-    false
-}
-
-#[inline(always)]
-pub(crate) fn bounded(_: &[u64; 17], _: i32, _: &mut [i32; 256], _: &mut usize) -> bool {
-    false
-}
-
-// x86-64 runs ML-KEM's transforms on the 32-bit kernels above.
-#[inline(always)]
-pub(crate) fn ntt16(_: &mut [u16; 256], _: &Field16) -> bool {
-    false
-}
-
-#[inline(always)]
-pub(crate) fn inverse_ntt16(_: &[i32; 256], _: &mut [u16; 256], _: &Field16) -> bool {
-    false
-}
-
-const fn high(a: i32, b: i32) -> i32 {
-    ((a as i64 * b as i64) >> 32) as i32
-}
-
-// The portable Montgomery product of both schemes.
-const fn montgomery(a: i32, b: i32, b_qinv: i32, q: i32) -> i32 {
-    high(a, b) - high(a.wrapping_mul(b_qinv), q)
-}
-
-const fn freeze(a: i32, q: i32) -> i32 {
-    a + (q & (a >> 31))
-}
-
-#[target_feature(enable = "avx2")]
-fn forward_avx2(w: &mut [i32; 256], field: &Field) {
-    let q = field.q;
-
-    let mut m = 1;
-
-    let mut length = 128;
-
-    while length >= 256 >> field.layers {
-        for start in (0..256).step_by(2 * length) {
-            let (zeta, zeta_qinv) = (field.forward[m], field.forward_qinv[m]);
-
-            m += 1;
-
-            let (low, high) = w[start..start + 2 * length].split_at_mut(length);
-
-            for (a, b) in low.iter_mut().zip(high) {
-                let t = montgomery(*b, zeta, zeta_qinv, q);
-
-                *b = *a - t;
-
-                *a += t;
-            }
-        }
-
-        length /= 2;
+    if !has(AVX2) {
+        return None;
     }
 
-    if let Some(scale) = field.forward_scale {
-        let scale_qinv = scale.wrapping_mul(field.qinv);
-
-        for x in w.iter_mut() {
-            *x = freeze(montgomery(*x, scale, scale_qinv, q), q);
-        }
-    }
+    // SAFETY: as in ntt.
+    Some(unsafe { dsa::norm(values, bound, gamma2, q) })
 }
 
-// The inverse layers take the reversed table from 256 - 256 / d on for the layer that pairs
-// coefficients d apart.
-#[target_feature(enable = "avx2")]
-fn inverse_avx2(w: &mut [i32; 256], field: &Field) {
-    let q = field.q;
-
-    for x in w.iter_mut() {
-        *x = match field.prepare {
-            Prepare::Reduce => *x - ((*x + (1 << 22)) >> 23) * q,
-            Prepare::Montgomery(factor) => {
-                montgomery(*x, factor, factor.wrapping_mul(field.qinv), q)
-            }
-        };
+// The hints of r and ct0, one per coefficient, and how many are set.
+#[allow(unsafe_code)]
+pub(crate) fn mldsa_hints(
+    h: &mut [i32; 256],
+    r: &[i32; 256],
+    ct0: &[i32; 256],
+    gamma2: i32,
+    q: i32,
+) -> Option<i32> {
+    if !has(AVX2) {
+        return None;
     }
 
-    let mut length = 256 >> field.layers;
-
-    while length <= 128 {
-        for (m, start) in (256 - 256 / length..).zip((0..256).step_by(2 * length)) {
-            let (zeta, zeta_qinv) = (field.inverse[m], field.inverse_qinv[m]);
-
-            let (low, high) = w[start..start + 2 * length].split_at_mut(length);
-
-            for (a, b) in low.iter_mut().zip(high) {
-                let t = *a;
-
-                *a = t + *b;
-
-                *b = montgomery(*b - t, zeta, zeta_qinv, q);
-            }
-        }
-
-        length *= 2;
-    }
-
-    let (scale, scale_qinv) = (
-        field.inverse_scale,
-        field.inverse_scale.wrapping_mul(field.qinv),
-    );
-
-    for x in w.iter_mut() {
-        *x = freeze(montgomery(*x, scale, scale_qinv, q), q);
-    }
+    // SAFETY: as in ntt.
+    Some(unsafe { dsa::hints(h, r, ct0, gamma2, q) })
 }
 
-#[target_feature(enable = "avx2")]
-fn products_avx2<const ADD: bool>(
+// HighBits of every coefficient packed in four bits, for gamma2 = (q - 1) / 32, or six, for
+// gamma2 = (q - 1) / 88.
+#[allow(unsafe_code)]
+pub(crate) fn mldsa_w1(out: &mut [u8], w: &[i32; 256], gamma2: i32, q: i32) -> bool {
+    let bits = if gamma2 == (q - 1) / 32 { 4 } else { 6 };
+
+    if (gamma2 != (q - 1) / 32 && gamma2 != (q - 1) / 88) || out.len() != 32 * bits || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { dsa::encode_w1(out, w, gamma2, q) };
+
+    true
+}
+
+// The coefficients mapped as `map` says and packed in `bits` bits each.
+#[allow(unsafe_code)]
+pub(crate) fn mldsa_pack(out: &mut [u8], poly: &[i32; 256], bits: u32, map: Pack, q: i32) -> bool {
+    if !matches!(bits, 3 | 4 | 10 | 13 | 18 | 20) || out.len() != 32 * bits as usize || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { dsa::pack(out, poly, bits, map, q) };
+
+    true
+}
+
+// gamma1 - x modulo q for the mask's values x of 18 or 20 bits.
+#[allow(unsafe_code)]
+pub(crate) fn mldsa_mask(
     out: &mut [i32; 256],
-    f: &[i32; 256],
-    g: &[i32; 256],
-    field: &Field,
-) {
-    for ((x, a), b) in out.iter_mut().zip(f).zip(g) {
-        let product = montgomery(*a, *b, b.wrapping_mul(field.qinv), field.q);
-
-        *x = if ADD { *x + product } else { product };
+    bytes: &[u8],
+    bits: u32,
+    gamma1: i32,
+    q: i32,
+) -> bool {
+    if !has(AVX2) {
+        return false;
     }
-}
 
-#[target_feature(enable = "avx2")]
-fn base_products_avx2(acc: &mut [i32; 256], a: &[u16; 256], b: &[u16; 256], cache: &[u16; 128]) {
-    let pairs = acc.as_chunks_mut::<2>().0.iter_mut();
-
-    let factors = a.as_chunks::<2>().0.iter().zip(b.as_chunks::<2>().0);
-
-    for ((acc, (a, b)), &c) in pairs.zip(factors).zip(cache) {
-        let ([a0, a1], [b0, b1]) = (a.map(i32::from), b.map(i32::from));
-
-        acc[0] += a0 * b0 + a1 * i32::from(c);
-
-        acc[1] += a0 * b1 + a1 * b0;
+    // SAFETY: as in ntt.
+    unsafe {
+        match (bits, bytes.len()) {
+            (18, 576) => dsa::unpack_mask::<18>(out, bytes, gamma1, q),
+            (20, 640) => dsa::unpack_mask::<20>(out, bytes, gamma1, q),
+            _ => return false,
+        }
     }
+
+    true
 }
 
-// The portable Ascon permutation, unrolled, is all there is.
-#[inline(always)]
-pub(crate) fn ascon(_: &mut [u64; 5]) -> bool {
-    false
+#[allow(unsafe_code)]
+pub(crate) fn mlkem_matrix_vector(
+    t: &mut [[u16; 256]],
+    a: &[[u16; 256]],
+    s: &[[u16; 256]],
+    caches: &[[u16; 128]],
+    e: &[[u16; 256]],
+    q: u16,
+) -> bool {
+    let k = s.len();
+
+    if k > 4 || a.len() != t.len() * k || caches.len() != k || e.len() != t.len() || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { kem::matrix_vector(t, a, s, caches, e, q) };
+
+    true
 }
 
-#[inline(always)]
-pub(crate) fn ascon_digest(_: &[u64; 5], _: &[u8], _: &mut [u8]) -> bool {
-    false
+#[allow(unsafe_code)]
+pub(crate) fn reduce(w: &[i32; 256], factor: i32, field: &Field, out: &mut [u16; 256]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { kem::reduce(w, factor, field.q, field.qinv, out) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn encode12(f: &[u16; 256], out: &mut [u8; 384]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { kem::encode12(f, out) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn decode12(data: &[u8; 384], q: u16, out: &mut [u16; 256]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { kem::decode12(data, q, out) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn mlkem_compress(
+    f: &[u16; 256],
+    e: &[u16; 256],
+    message: Option<&[u8; 32]>,
+    d: u32,
+    q: u16,
+    out: &mut [u8],
+) -> bool {
+    if !matches!(d, 1 | 4 | 5 | 10 | 11) || out.len() != 32 * d as usize || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { kem::compress(f, e, message, d, q, out) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn mlkem_decompress(data: &[u8], d: u32, q: u16, out: &mut [u16; 256]) -> bool {
+    if !matches!(d, 4 | 5 | 10 | 11) || data.len() != 32 * d as usize || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { kem::decompress(data, d, q, out) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn mlkem_message(v: &[u16; 256], w: &[u16; 256], q: u16, out: &mut [u8; 32]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { kem::message(v, w, q, out) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn uniform12(lanes: &[u64; 21], q: u16, a: &mut [u16; 256], count: &mut usize) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { kem::uniform12(lanes, q, a, count) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn uniform23(lanes: &[u64; 21], q: i32, a: &mut [i32; 256], count: &mut usize) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { dsa::uniform23(lanes, q, a, count) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn bounded(lanes: &[u64; 17], eta: i32, a: &mut [i32; 256], count: &mut usize) -> bool {
+    if (eta != 2 && eta != 4) || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { dsa::bounded(lanes, eta, a, count) };
+
+    true
+}
+
+// The products b[2i + 1] gamma_i mod q of ML-KEM's base multiplication, with the gammas in
+// Montgomery form for 2^16.
+#[allow(unsafe_code)]
+pub(crate) fn mlkem_multiply_cache(
+    b: &[u16; 256],
+    gammas: &[i16; 128],
+    q: u16,
+    cache: &mut [u16; 128],
+) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { kem::multiply_cache(b, gammas, q, cache) };
+
+    true
+}
+
+// InvNTT of the sum of the products a[j] * b[j], with the caches of the b[j], for at most four.
+#[allow(unsafe_code)]
+pub(crate) fn mlkem_inner_product(
+    out: &mut [u16; 256],
+    a: &[&[u16; 256]],
+    b: &[[u16; 256]],
+    caches: &[[u16; 128]],
+    field: &Field16,
+) -> bool {
+    if a.len() > 4 || b.len() != a.len() || caches.len() != a.len() || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { kem::inner_product(out, a, b, caches, field) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn ntt16(f: &mut [u16; 256], field: &Field16) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { kem::ntt(f, field) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn inverse_ntt16(acc: &[i32; 256], out: &mut [u16; 256], field: &Field16) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { kem::inverse_ntt(acc, out, field) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn ascon(s: &mut [u64; 5]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: the CPU has BMI1 and BMI2, which AVX2 implies here.
+    unsafe { ascon::ascon_bmi(s) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn ascon_digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ascon.
+    unsafe { ascon::digest_bmi(start, data, out) };
+
+    true
 }
 
 // Groups of four fill the AVX2 kernel.
@@ -508,15 +756,60 @@ pub(crate) const fn keccak_group() -> usize {
     4
 }
 
-// The AVX2 kernel permutes several states at once, so a single sponge keeps the scalar code.
-#[inline(always)]
-pub(crate) fn absorb(_: &mut [u64; 25], _: usize, _: &[u8]) -> usize {
-    0
+// Absorbs the whole blocks of data, rate bytes each, into one state, and returns how many bytes
+// that was.
+#[allow(unsafe_code)]
+pub(crate) fn absorb(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
+    let length = data.len() - data.len() % rate;
+
+    if length == 0 || !has(AVX2) {
+        return 0;
+    }
+
+    let blocks = &data[..length];
+
+    // SAFETY: the CPU has BMI1 and BMI2, which AVX2 implies here.
+    unsafe {
+        match rate {
+            72 => keccak::absorb_bmi::<72>(state, blocks.as_chunks().0),
+            104 => keccak::absorb_bmi::<104>(state, blocks.as_chunks().0),
+            136 => keccak::absorb_bmi::<136>(state, blocks.as_chunks().0),
+            144 => keccak::absorb_bmi::<144>(state, blocks.as_chunks().0),
+            168 => keccak::absorb_bmi::<168>(state, blocks.as_chunks().0),
+            _ => return 0,
+        }
+    }
+
+    length
 }
 
-#[inline(always)]
-pub(crate) fn digest(_: Option<&[u64; 25]>, _: usize, _: u8, _: &[u8], _: &mut [u8]) -> bool {
-    false
+// The output of a sponge of the given rate and suffix that absorbs data and is read once into
+// out, in one call.
+#[allow(unsafe_code)]
+pub(crate) fn digest(
+    initial: Option<&[u64; 25]>,
+    rate: usize,
+    suffix: u8,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in absorb.
+    unsafe {
+        match rate {
+            72 => keccak::digest_bmi::<72>(initial, data, suffix, out),
+            104 => keccak::digest_bmi::<104>(initial, data, suffix, out),
+            136 => keccak::digest_bmi::<136>(initial, data, suffix, out),
+            144 => keccak::digest_bmi::<144>(initial, data, suffix, out),
+            168 => keccak::digest_bmi::<168>(initial, data, suffix, out),
+            _ => return false,
+        }
+    }
+
+    true
 }
 
 #[allow(unsafe_code)]
@@ -552,6 +845,34 @@ pub(crate) fn blake2s(
     counter: u64,
     last: Option<(&[u32; 16], u128)>,
 ) -> bool {
+    if has(AVX2) {
+        let mut first = first.map(blake2::bytes32);
+
+        let mut last = last.map(|(m, total)| (blake2::bytes32(m), total as u64));
+
+        // SAFETY: the CPU has AVX2 and the operating system saves its registers.
+        unsafe {
+            blake2::blake2s_avx2(
+                h,
+                first.as_ref(),
+                blocks,
+                last.as_ref().map(|(block, total)| (block, *total)),
+                counter,
+                None,
+            )
+        };
+
+        if let Some(bytes) = &mut first {
+            wipe(bytes);
+        }
+
+        if let Some((bytes, _)) = &mut last {
+            wipe(bytes);
+        }
+
+        return true;
+    }
+
     if !has(SSE41) {
         return false;
     }
@@ -562,28 +883,129 @@ pub(crate) fn blake2s(
     true
 }
 
-// Four states per AVX2 call, and three with one lane idle; one or two stay with the scalar
-// permutation, where a mostly idle vector call is unlikely to pay.
+// BLAKE2's digest in one call with the state in registers throughout: the generic path's word
+// conversions, chaining value copies and calls cost a 64-byte message a sixth of its time.
+#[allow(unsafe_code)]
+pub(crate) fn blake2b_digest(h: &[u64; 8], data: &[u8], out: &mut [u8]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: the CPU has AVX2 and the operating system saves its registers.
+    unsafe { blake2::blake2b_digest_avx2(h, data, out) };
+
+    true
+}
+
+// BLAKE2s's digest and MAC in one call of the AVX2 code each, with the blocks found here.
+#[allow(unsafe_code)]
+pub(crate) fn blake2s_digest(h: &[u32; 8], data: &[u8], out: &mut [u8]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    let (blocks, tail) = blake2::split32(data);
+
+    blake2::final32(tail, |last| {
+        let total = data.len() as u64;
+
+        // SAFETY: the CPU has AVX2 and the operating system saves its registers.
+        unsafe {
+            blake2::blake2s_avx2(
+                &mut h.clone(),
+                None,
+                blocks,
+                Some((last, total)),
+                0,
+                Some(out),
+            )
+        };
+    });
+
+    true
+}
+
+// The key, zero-padded to a block, comes first, or last for empty data.
+#[allow(unsafe_code)]
+pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    let mut key_block = [0; 64];
+
+    key_block[..key.len()].copy_from_slice(key);
+
+    let total = 64 + data.len() as u64;
+
+    if data.is_empty() {
+        // SAFETY: the CPU has AVX2 and the operating system saves its registers.
+        unsafe {
+            blake2::blake2s_avx2(
+                &mut h.clone(),
+                None,
+                &[],
+                Some((&key_block, total)),
+                0,
+                Some(out),
+            )
+        };
+    } else {
+        let (blocks, tail) = blake2::split32(data);
+
+        blake2::final32(tail, |last| {
+            let first = Some(&key_block);
+
+            // SAFETY: as above.
+            unsafe {
+                blake2::blake2s_avx2(
+                    &mut h.clone(),
+                    first,
+                    blocks,
+                    Some((last, total)),
+                    0,
+                    Some(out),
+                )
+            };
+        });
+    }
+
+    wipe(&mut key_block);
+
+    true
+}
+
+// Four states per AVX2 call, and two or three with lanes idle, which still costs less than their
+// scalar permutations. One alone, as the fifth of five, takes the scalar permutation built for
+// BMI1 and BMI2: four in vectors beside one in general registers measured no faster than one after
+// the other, as both compete for the same ports.
 #[allow(unsafe_code)]
 pub(crate) fn permute_many(states: &mut [&mut [u64; 25]]) -> usize {
     if !has(AVX2) {
         return 0;
     }
 
-    let mut done = 0;
+    let count = states.len();
 
-    for group in states.chunks_mut(4) {
-        if group.len() < 3 {
-            break;
+    let mut rest = states;
+
+    while !rest.is_empty() {
+        let size = rest.len().min(4);
+
+        let (group, tail) = core::mem::take(&mut rest).split_at_mut(size);
+
+        // SAFETY: the CPU has AVX2, BMI1 and BMI2, and the operating system saves the registers.
+        unsafe {
+            match group {
+                [only] => keccak::permute_bmi(only),
+                _ => keccak::permute4_avx2(group),
+            }
         }
 
-        // SAFETY: the CPU has AVX2 and the operating system saves its registers.
-        unsafe { permute4_avx2(group) };
-
-        done += group.len();
+        rest = tail;
     }
 
-    done
+    count
 }
 
 // Four state words as SHA256RNDS2 holds them, the first in the highest lane.
@@ -785,127 +1207,41 @@ fn compress256_lanes_sha<const LANES: usize>(
     }
 }
 
+#[repr(C, align(32))]
+struct Aligned<T>(T);
+
+// With eight lanes or more, the state and the schedule of the portable rounds live in 32-byte
+// stack slots and in w, and an access 16 bytes off a 32-byte boundary splits a cache line half of
+// the time: for sixteen lanes, 660 of a call's 1430 loads and stores when the caller's stack puts
+// both there. The aligned anchor makes the compiler align this frame, and with it every spill
+// slot; a schedule off the boundary is moved into an aligned copy first, and wiped there.
 #[target_feature(enable = "avx2")]
 fn compress256_lanes_avx2<const LANES: usize>(
     states: &mut [[u32; LANES]; 8],
     w: &mut [[u32; LANES]; 16],
 ) {
+    if LANES >= 8 {
+        if !w.as_ptr().addr().is_multiple_of(32) {
+            compress256_lanes_moved(states, w);
+
+            return;
+        }
+
+        core::hint::black_box(&mut MaybeUninit::<Aligned<[u8; 32]>>::uninit());
+    }
+
     compress256_lanes_portable(states, w);
 }
 
 #[target_feature(enable = "avx2")]
-#[inline]
-fn rotate<const LEFT: i32, const RIGHT: i32>(x: __m256i) -> __m256i {
-    _mm256_or_si256(_mm256_slli_epi64::<LEFT>(x), _mm256_srli_epi64::<RIGHT>(x))
-}
+#[inline(never)]
+fn compress256_lanes_moved<const LANES: usize>(
+    states: &mut [[u32; LANES]; 8],
+    w: &mut [[u32; LANES]; 16],
+) {
+    let mut aligned = Aligned(*w);
 
-// One Keccak-f[1600] round on four states, lane i of each in vector i, written plane by plane
-// like the scalar round so that few values are live at once. AVX2 has no 64-bit rotation: the
-// rotations by 8 and 56 are byte shuffles, the others two shifts and an OR.
-#[target_feature(enable = "avx2")]
-#[inline]
-fn round(a: &mut [__m256i; 25], constant: u64) {
-    let mut c = [_mm256_setzero_si256(); 5];
+    compress256_lanes_avx2(states, &mut aligned.0);
 
-    for (x, c) in c.iter_mut().enumerate() {
-        *c = _mm256_xor_si256(
-            _mm256_xor_si256(
-                _mm256_xor_si256(a[x], a[x + 5]),
-                _mm256_xor_si256(a[x + 10], a[x + 15]),
-            ),
-            a[x + 20],
-        );
-    }
-
-    let mut d = [_mm256_setzero_si256(); 5];
-
-    for (x, d) in d.iter_mut().enumerate() {
-        *d = _mm256_xor_si256(c[(x + 4) % 5], rotate::<1, 63>(c[(x + 1) % 5]));
-    }
-
-    let by8 = _mm256_set_epi64x(
-        0x0E0D_0C0B_0A09_080F,
-        0x0605_0403_0201_0007,
-        0x0E0D_0C0B_0A09_080F,
-        0x0605_0403_0201_0007,
-    );
-
-    let by56 = _mm256_set_epi64x(
-        0x080F_0E0D_0C0B_0A09,
-        0x0007_0605_0403_0201,
-        0x080F_0E0D_0C0B_0A09,
-        0x0007_0605_0403_0201,
-    );
-
-    let t = |s: usize| _mm256_xor_si256(a[s], d[s % 5]);
-
-    let b = [
-        t(0),
-        rotate::<44, 20>(t(6)),
-        rotate::<43, 21>(t(12)),
-        rotate::<21, 43>(t(18)),
-        rotate::<14, 50>(t(24)),
-        rotate::<28, 36>(t(3)),
-        rotate::<20, 44>(t(9)),
-        rotate::<3, 61>(t(10)),
-        rotate::<45, 19>(t(16)),
-        rotate::<61, 3>(t(22)),
-        rotate::<1, 63>(t(1)),
-        rotate::<6, 58>(t(7)),
-        rotate::<25, 39>(t(13)),
-        _mm256_shuffle_epi8(t(19), by8),
-        rotate::<18, 46>(t(20)),
-        rotate::<27, 37>(t(4)),
-        rotate::<36, 28>(t(5)),
-        rotate::<10, 54>(t(11)),
-        rotate::<15, 49>(t(17)),
-        _mm256_shuffle_epi8(t(23), by56),
-        rotate::<62, 2>(t(2)),
-        rotate::<55, 9>(t(8)),
-        rotate::<39, 25>(t(14)),
-        rotate::<41, 23>(t(15)),
-        rotate::<2, 62>(t(21)),
-    ];
-
-    for (plane, b) in a
-        .as_chunks_mut::<5>()
-        .0
-        .iter_mut()
-        .zip(b.as_chunks::<5>().0)
-    {
-        for (x, lane) in plane.iter_mut().enumerate() {
-            *lane = _mm256_xor_si256(b[x], _mm256_andnot_si256(b[(x + 1) % 5], b[(x + 2) % 5]));
-        }
-    }
-
-    a[0] = _mm256_xor_si256(a[0], _mm256_set1_epi64x(constant as i64));
-}
-
-// One to four states; missing ones run as zeros in their lanes and are not stored.
-#[target_feature(enable = "avx2")]
-fn permute4_avx2(states: &mut [&mut [u64; 25]]) {
-    let lane = |state: usize, i: usize| states.get(state).map_or(0, |s| s[i] as i64);
-
-    let mut a = [_mm256_setzero_si256(); 25];
-
-    for (i, vector) in a.iter_mut().enumerate() {
-        *vector = _mm256_set_epi64x(lane(3, i), lane(2, i), lane(1, i), lane(0, i));
-    }
-
-    for &constant in &ROUND_CONSTANTS {
-        round(&mut a, constant);
-    }
-
-    for (i, vector) in a.iter().enumerate() {
-        let words = [
-            _mm256_extract_epi64::<0>(*vector),
-            _mm256_extract_epi64::<1>(*vector),
-            _mm256_extract_epi64::<2>(*vector),
-            _mm256_extract_epi64::<3>(*vector),
-        ];
-
-        for (state, word) in states.iter_mut().zip(words) {
-            state[i] = word as u64;
-        }
-    }
+    wipe(aligned.0.as_flattened_mut());
 }

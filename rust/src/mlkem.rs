@@ -366,7 +366,38 @@ fn inverse_ntt_portable(w: &mut Wide) -> Poly {
 // computed once: cache[i] = b[2i + 1] * gamma_i mod q.
 type Cache = [u16; 128];
 
+// GAMMAS in Montgomery form for 2^16, in (-q / 2, q / 2], for the 16-bit kernels.
+const GAMMAS16: [i16; 128] = {
+    let mut table = [0; 128];
+
+    let mut i = 0;
+
+    while i < 128 {
+        let gamma = (power(17, 2 * bit_reverse7(i) + 1) as u64 * 65536 % Q as u64) as i16;
+
+        table[i] = if gamma > (Q as i16 - 1) / 2 {
+            gamma - Q as i16
+        } else {
+            gamma
+        };
+
+        i += 1;
+    }
+
+    table
+};
+
 fn multiply_cache(b: &Poly) -> Cache {
+    let mut cache = [0; 128];
+
+    if cpu::mlkem_multiply_cache(b, &GAMMAS16, Q as u16, &mut cache) {
+        return cache;
+    }
+
+    multiply_cache_portable(b)
+}
+
+fn multiply_cache_portable(b: &Poly) -> Cache {
     core::array::from_fn(|i| {
         let gamma = GAMMAS[i];
 
@@ -389,6 +420,28 @@ fn multiply_accumulate(acc: &mut Wide, a: &Poly, b: &Poly, cache: &Cache) {
     if !cpu::base_multiply_add(acc, a, b, cache) {
         multiply_accumulate_portable(acc, a, b, cache);
     }
+}
+
+// InvNTT of the sum of the products a[j] * b[j] in the NTT domain, as canonical coefficients, with
+// the caches of the b[j]; a CPU kernel keeps the sums in registers.
+fn inner_product(a: &[&Poly], b: &[Poly], caches: &[Cache]) -> Poly {
+    let mut f = [0; 256];
+
+    if cpu::mlkem_inner_product(&mut f, a, b, caches, &FIELD16) {
+        return f;
+    }
+
+    let mut acc = [0; 256];
+
+    for ((a, b), cache) in a.iter().zip(b).zip(caches) {
+        multiply_accumulate(&mut acc, a, b, cache);
+    }
+
+    let f = inverse_ntt(&acc);
+
+    wipe(&mut acc);
+
+    f
 }
 
 fn multiply_accumulate_portable(acc: &mut Wide, a: &Poly, b: &Poly, cache: &Cache) {
@@ -477,6 +530,14 @@ fn decode_bits<const D: usize>(data: &[u8]) -> Poly {
 }
 
 fn decode12(data: &[u8]) -> Poly {
+    let mut f = [0; 256];
+
+    if let Ok(data) = <&[u8; 384]>::try_from(data)
+        && cpu::decode12(data, Q as u16, &mut f)
+    {
+        return f;
+    }
+
     byte_decode(data, 12).map(|x| subtract_q(u32::from(x)))
 }
 
@@ -487,6 +548,52 @@ const fn compress(x: u16, d: u32) -> u16 {
 
 const fn decompress(y: u16, d: u32) -> u16 {
     ((y as u32 * Q + (1 << (d - 1))) >> d) as u16
+}
+
+// ByteEncode_d(Compress_d(f + e)), with Decompress_1 of the message's bits added first if there
+// is a message: the last steps of K-PKE.Encrypt for u and v. f is left changed.
+fn compress_into(f: &mut Poly, e: &Poly, message: Option<&[u8; 32]>, d: u32, out: &mut [u8]) {
+    if cpu::mlkem_compress(f, e, message, d, Q as u16, out) {
+        return;
+    }
+
+    add_assign(f, e);
+
+    if let Some(message) = message {
+        let mut mu = byte_decode(message, 1).map(|bit| decompress(bit, 1));
+
+        add_assign(f, &mu);
+
+        wipe(&mut mu);
+    }
+
+    byte_encode(&f.map(|x| compress(x, d)), d, out);
+}
+
+// Decompress_d(ByteDecode_d(data)).
+fn decompress_from(data: &[u8], d: u32) -> Poly {
+    let mut f = [0; 256];
+
+    if !cpu::mlkem_decompress(data, d, Q as u16, &mut f) {
+        f = byte_decode(data, d).map(|x| decompress(x, d));
+    }
+
+    f
+}
+
+// ByteEncode_1(Compress_1(v - w)), the message of K-PKE.Decrypt. w is left changed.
+fn message_of(v: &Poly, w: &mut Poly) -> [u8; 32] {
+    let mut m = [0; 32];
+
+    if !cpu::mlkem_message(v, w, Q as u16, &mut m) {
+        for (x, y) in w.iter_mut().zip(v) {
+            *x = compress(sub(*y, *x), 1);
+        }
+
+        byte_encode(w, 1, &mut m);
+    }
+
+    m
 }
 
 // One block of an XOF stream, as the lanes of the sponge, into the coefficients accepted so far.
@@ -843,6 +950,8 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) -> [u8; 32
 fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &mut [u8]) {
     let k = p.k;
 
+    let m: &[u8; 32] = m.try_into().expect("the message has 32 bytes");
+
     let mut sponges = Sponges::empty();
 
     let mut y = [[0; 256]; 4];
@@ -869,50 +978,28 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
     let mut u = [0; 256];
 
     for (i, chunk) in c1.chunks_exact_mut(32 * p.du as usize).enumerate() {
-        let mut acc = [0; 256];
+        let column: [&Poly; 4] = core::array::from_fn(|j| &key.matrix[j.min(k - 1) * k + i]);
 
-        for (j, (y_j, cache)) in y[..k].iter().zip(&caches).enumerate() {
-            multiply_accumulate(&mut acc, &key.matrix[j * k + i], y_j, cache);
-        }
+        u = inner_product(&column[..k], &y[..k], &caches[..k]);
 
-        u = inverse_ntt(&acc);
-
-        wipe(&mut acc);
-
-        add_assign(&mut u, &noise[i]);
-
-        byte_encode(&u.map(|x| compress(x, p.du)), p.du, chunk);
+        compress_into(&mut u, &noise[i], None, p.du, chunk);
     }
 
-    let mut acc = [0; 256];
+    let t: [&Poly; 4] = core::array::from_fn(|j| &key.t[j.min(k - 1)]);
 
-    for ((t_i, y_i), cache) in key.t.iter().zip(&y[..k]).zip(&caches) {
-        multiply_accumulate(&mut acc, t_i, y_i, cache);
-    }
+    let mut v = inner_product(&t[..k], &y[..k], &caches[..k]);
 
-    let mut v = inverse_ntt(&acc);
-
-    add_assign(&mut v, &noise[k]);
-
-    let mut mu = byte_decode(m, 1).map(|bit| decompress(bit, 1));
-
-    add_assign(&mut v, &mu);
-
-    byte_encode(&v.map(|x| compress(x, p.dv)), p.dv, c2);
+    compress_into(&mut v, &noise[k], Some(m), p.dv, c2);
 
     wipe(y.as_flattened_mut());
 
     wipe(caches.as_flattened_mut());
-
-    wipe(&mut acc);
 
     wipe(&mut u);
 
     wipe(&mut v);
 
     wipe(noise[..k + 1].as_flattened_mut());
-
-    wipe(&mut mu);
 }
 
 fn pke_decrypt(secret: &DecapsulationKey, c: &[u8], p: &Parameters) -> [u8; 32] {
@@ -920,31 +1007,19 @@ fn pke_decrypt(secret: &DecapsulationKey, c: &[u8], p: &Parameters) -> [u8; 32] 
 
     let (c1, c2) = c.split_at(32 * p.du as usize * k);
 
-    let mut acc = [0; 256];
+    let mut u = [[0; 256]; 4];
 
-    let chunks = c1.chunks_exact(32 * p.du as usize);
+    for (u, chunk) in u.iter_mut().zip(c1.chunks_exact(32 * p.du as usize)) {
+        *u = decompress_from(chunk, p.du);
 
-    for (chunk, (s_i, cache)) in chunks.zip(secret.s.iter().zip(&secret.caches)) {
-        let mut u = byte_decode(chunk, p.du).map(|x| decompress(x, p.du));
-
-        ntt(&mut u);
-
-        multiply_accumulate(&mut acc, &u, s_i, cache);
+        ntt(u);
     }
 
-    let mut w = inverse_ntt(&acc);
+    let u: [&Poly; 4] = core::array::from_fn(|i| &u[i]);
 
-    let v = byte_decode(c2, p.dv).map(|x| decompress(x, p.dv));
+    let mut w = inner_product(&u[..k], &secret.s, &secret.caches);
 
-    for (x, y) in w.iter_mut().zip(v) {
-        *x = compress(sub(y, *x), 1);
-    }
-
-    let mut m = [0; 32];
-
-    byte_encode(&w, 1, &mut m);
-
-    wipe(&mut acc);
+    let m = message_of(&decompress_from(c2, p.dv), &mut w);
 
     wipe(&mut w);
 
@@ -1145,9 +1220,15 @@ mod tests {
 
             let g = values(&mut inputs, n + 1, 0, q, |x| x as u16);
 
-            let cache = multiply_cache(&g);
+            let cache = multiply_cache_portable(&g);
 
             assert!(cache.iter().all(|&c| u32::from(c) < Q), "cache, case {n}");
+
+            let mut actual = [0; 128];
+
+            if cpu::mlkem_multiply_cache(&g, &GAMMAS16, Q as u16, &mut actual) {
+                assert_eq!(actual, cache, "cache kernel, case {n}");
+            }
 
             let acc = values(&mut inputs, n, 0, 3 << 26, |x| x as i32);
 
@@ -1344,6 +1425,236 @@ mod tests {
         }
 
         std::eprintln!("ML-KEM noise: {accelerated} of 40000 cases through a CPU kernel");
+    }
+
+    // The compression kernel against the portable steps for every encoding size: f taking every
+    // value below q once with e zero, then canonical f and e at their bounds and random ones, with
+    // and without a message.
+    #[test]
+    fn compression_kernel_matches_portable() {
+        let mut inputs = Inputs::new(1088);
+
+        let mut accelerated = 0;
+
+        for n in 0..5_000 {
+            let d = [1, 4, 5, 10, 11][n % 5];
+
+            let case = n / 5;
+
+            let (mut f, e): (Poly, Poly) = if case < 14 {
+                (
+                    core::array::from_fn(|i| ((256 * case + i) % Q as usize) as u16),
+                    [0; 256],
+                )
+            } else {
+                let q = i64::from(Q);
+
+                (
+                    values(&mut inputs, case - 14, 0, q, |x| x as u16),
+                    values(&mut inputs, case - 13, 0, q, |x| x as u16),
+                )
+            };
+
+            let message: Option<[u8; 32]> = (n % 3 == 0).then(|| inputs.bytes());
+
+            let size = 32 * d as usize;
+
+            let mut portable = f;
+
+            add_assign(&mut portable, &e);
+
+            if let Some(message) = &message {
+                add_assign(
+                    &mut portable,
+                    &byte_decode(message, 1).map(|bit| decompress(bit, 1)),
+                );
+            }
+
+            let mut expected = [0; 352];
+
+            byte_encode(&portable.map(|x| compress(x, d)), d, &mut expected[..size]);
+
+            let mut actual = [0; 352];
+
+            if cpu::mlkem_compress(&f, &e, message.as_ref(), d, Q as u16, &mut actual[..size]) {
+                assert_eq!(actual, expected, "d = {d}, case {n}");
+
+                accelerated += 1;
+            }
+
+            compress_into(&mut f, &e, message.as_ref(), d, &mut actual[..size]);
+
+            assert_eq!(actual, expected, "compress_into, d = {d}, case {n}");
+        }
+
+        std::eprintln!("ML-KEM compression: {accelerated} of 5000 cases through a CPU kernel");
+    }
+
+    // The decompression kernel against the portable steps on bytes of all zeros, all ones,
+    // alternating bits and random bytes, and the message kernel on every difference below q and
+    // on random canonical polynomials.
+    #[test]
+    fn decompression_kernels_match_portable() {
+        let mut inputs = Inputs::new(320);
+
+        let mut accelerated = 0;
+
+        for n in 0..4_000 {
+            let d = [4, 5, 10, 11][n % 4];
+
+            let data: [u8; 352] = match n / 4 {
+                0 => [0; 352],
+                1 => [0xFF; 352],
+                2 => [0x55; 352],
+                _ => inputs.bytes(),
+            };
+
+            let data = &data[..32 * d as usize];
+
+            let expected = byte_decode(data, d).map(|x| decompress(x, d));
+
+            let mut actual = [0; 256];
+
+            if cpu::mlkem_decompress(data, d, Q as u16, &mut actual) {
+                assert_eq!(actual, expected, "d = {d}, case {n}");
+
+                accelerated += 1;
+            }
+
+            assert_eq!(decompress_from(data, d), expected, "d = {d}, case {n}");
+
+            let (v, w): (Poly, Poly) = if n < 14 {
+                (
+                    core::array::from_fn(|i| ((256 * n + i) % Q as usize) as u16),
+                    [0; 256],
+                )
+            } else {
+                let q = i64::from(Q);
+
+                (
+                    values(&mut inputs, n - 14, 0, q, |x| x as u16),
+                    values(&mut inputs, n - 13, 0, q, |x| x as u16),
+                )
+            };
+
+            let mut portable = w;
+
+            for (x, y) in portable.iter_mut().zip(v) {
+                *x = compress(sub(y, *x), 1);
+            }
+
+            let mut expected = [0; 32];
+
+            byte_encode(&portable, 1, &mut expected);
+
+            let mut actual = [0; 32];
+
+            if cpu::mlkem_message(&v, &w, Q as u16, &mut actual) {
+                assert_eq!(actual, expected, "message, case {n}");
+
+                accelerated += 1;
+            }
+
+            assert_eq!(
+                message_of(&v, &mut w.clone()),
+                expected,
+                "message, case {n}"
+            );
+        }
+
+        std::eprintln!("ML-KEM decompression: {accelerated} of 8000 cases through a CPU kernel");
+    }
+
+    // The decoding kernel against the portable code on random bytes, all ones and the values q
+    // - 1, q and 4095 around the reduction.
+    #[test]
+    fn decoding_kernel_matches_portable() {
+        let mut inputs = Inputs::new(12);
+
+        let mut accelerated = 0;
+
+        for n in 0..4_000 {
+            let data: [u8; 384] = match n {
+                0 => [0xFF; 384],
+                1..=3 => {
+                    let x = [Q - 1, Q, 4095][n - 1];
+
+                    let word = x | x << 12;
+
+                    let mut data = [0; 384];
+
+                    for bytes in data.as_chunks_mut::<3>().0 {
+                        *bytes = [word as u8, (word >> 8) as u8, (word >> 16) as u8];
+                    }
+
+                    data
+                }
+                _ => inputs.bytes(),
+            };
+
+            let expected = byte_decode(&data, 12).map(|x| subtract_q(u32::from(x)));
+
+            let mut actual = [0; 256];
+
+            if cpu::decode12(&data, Q as u16, &mut actual) {
+                assert_eq!(actual, expected, "case {n}");
+
+                accelerated += 1;
+            }
+
+            assert_eq!(decode12(&data), expected, "case {n}");
+        }
+
+        std::eprintln!("ML-KEM decoding: {accelerated} of 4000 cases through a CPU kernel");
+    }
+
+    // The inner-product kernel against the portable products and inverse transform, for one to
+    // four products of canonical polynomials, at their bounds first.
+    #[test]
+    fn inner_product_kernel_matches_portable() {
+        let mut inputs = Inputs::new(4096);
+
+        let mut accelerated = 0;
+
+        for n in 0..4_000 {
+            let k = 1 + n % 4;
+
+            let q = i64::from(Q);
+
+            let a: [Poly; 4] =
+                core::array::from_fn(|i| values(&mut inputs, n / 4 + i, 0, q, |x| x as u16));
+
+            let b: [Poly; 4] =
+                core::array::from_fn(|i| values(&mut inputs, n / 4 + i + 1, 0, q, |x| x as u16));
+
+            let caches = b.each_ref().map(multiply_cache);
+
+            let mut acc = [0; 256];
+
+            for ((a, b), cache) in a[..k].iter().zip(&b[..k]).zip(&caches[..k]) {
+                multiply_accumulate_portable(&mut acc, a, b, cache);
+            }
+
+            let expected = inverse_ntt_portable(&mut acc);
+
+            let a: [&Poly; 4] = core::array::from_fn(|i| &a[i]);
+
+            let mut actual = [0; 256];
+
+            if cpu::mlkem_inner_product(&mut actual, &a[..k], &b[..k], &caches[..k], &FIELD16) {
+                assert_eq!(actual, expected, "k = {k}, case {n}");
+
+                accelerated += 1;
+            }
+
+            assert_eq!(
+                inner_product(&a[..k], &b[..k], &caches[..k]),
+                expected,
+                "k = {k}, case {n}"
+            );
+        }
+
+        std::eprintln!("ML-KEM inner products: {accelerated} of 4000 cases through a CPU kernel");
     }
 
     #[test]

@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use core::hint::black_box;
 use core::ops::{Deref, DerefMut};
 
-use crate::cpu::{self, Field, Prepare};
+use crate::cpu::{self, Field, Pack, Prepare};
 use crate::ct::{self, declassify, declassify_value};
 use crate::keccak::{self, Keccak, MAX_SPONGES, Sponges};
 use crate::primitives::{shake256, shake256_into};
@@ -500,6 +500,20 @@ fn pack_with(out: &mut [u8], bits: u32, poly: &Poly, f: impl Fn(i32) -> i32) {
     }
 }
 
+// pack_with of one of the maps of the encodings, through a CPU kernel where there is one.
+fn pack_mapped(out: &mut [u8], bits: u32, poly: &Poly, map: Pack) {
+    if cpu::mldsa_pack(out, poly, bits, map, Q) {
+        return;
+    }
+
+    match map {
+        Pack::High => pack_with(out, bits, poly, |x| power2round(x).0),
+        Pack::Low => pack_with(out, bits, poly, |x| (1 << (D - 1)) - power2round(x).1),
+        Pack::Eta(eta) => pack_with(out, bits, poly, |x| eta - x),
+        Pack::Gamma1(gamma1) => pack_with(out, bits, poly, |x| gamma1 - centered(x)),
+    }
+}
+
 fn unpack(data: &[u8], bits: u32) -> Poly {
     match bits {
         3 => unpack_bits::<3>(data),
@@ -905,13 +919,106 @@ fn public_t(a: &[Poly], s1: &[Poly], s2: &[Poly], p: &Parameters) -> Polys {
     t
 }
 
+// Key generation's pk, t and tr = H(pk, 64) together. When the entries of Â do not fill the last
+// group of sponges, the rows of t that the whole groups complete are computed first, and the
+// blocks of pk they fill are hashed in the free slot beside the last group's squeezes, where a
+// permutation costs little next to the group's, instead of alone afterwards (ML-DSA-65 with four
+// sponges a group: about 5 of tr's 15 permutations).
+fn public_key_and_tr(
+    rho: &[u8],
+    s1: &[Poly],
+    s2: &[Poly],
+    p: &Parameters,
+) -> (Vec<u8>, Polys, [u8; 64]) {
+    let s1_hat = ntt_all(s1);
+
+    let mut a = vec![[0; 256]; p.k * p.l];
+
+    let mut t = Polys::new(p.k);
+
+    let mut pk = vec![0; p.public_key_size()];
+
+    pk[..32].copy_from_slice(rho);
+
+    let mut sponges = Sponges::empty();
+
+    let size = keccak::group();
+
+    let total = p.k * p.l;
+
+    let whole = total / size * size;
+
+    for (first, group) in (0..whole).step_by(size).zip(a[..whole].chunks_mut(size)) {
+        rej_ntt_poly(&mut sponges, rho, p.l, first, group, Sponges::squeeze);
+    }
+
+    let row = |i: usize, t: &mut Polys, pk: &mut [u8], a: &[Poly]| {
+        multiply_add(&mut t[i], &a[i * p.l..(i + 1) * p.l], &s1_hat);
+
+        inverse_ntt(&mut t[i]);
+
+        for (x, e) in t[i].iter_mut().zip(&s2[i]) {
+            *x = add(*x, canonical(*e));
+        }
+
+        let chunk = &mut pk[32 + 320 * i..32 + 320 * (i + 1)];
+
+        pack_mapped(chunk, 10, &t[i], Pack::High);
+
+        // t1 is part of the public key.
+        declassify(chunk);
+    };
+
+    let rows = whole / p.l;
+
+    for i in 0..rows {
+        row(i, &mut t, &mut pk, &a);
+    }
+
+    let mut hash = Keccak::new(136, SHAKE);
+
+    let mut hashed = 0;
+
+    if whole < total {
+        let mut blocks = pk[..32 + 320 * rows].as_chunks::<136>().0.iter();
+
+        rej_ntt_poly(
+            &mut sponges,
+            rho,
+            p.l,
+            whole,
+            &mut a[whole..],
+            |sponges, active| match blocks.next() {
+                Some(block) => {
+                    hash.update_block_with(block, |state| sponges.squeeze_beside(active, state));
+
+                    hashed += 136;
+                }
+                None => sponges.squeeze(active),
+            },
+        );
+    }
+
+    for i in rows..p.k {
+        row(i, &mut t, &mut pk, &a);
+    }
+
+    hash.update(&pk[hashed..]);
+
+    let mut tr = [0; 64];
+
+    hash.read(&mut tr);
+
+    (pk, t, tr)
+}
+
 fn encode_public_key(rho: &[u8], t: &Polys, p: &Parameters) -> Vec<u8> {
     let mut pk = vec![0; p.public_key_size()];
 
     pk[..32].copy_from_slice(rho);
 
     for (chunk, poly) in pk[32..].as_chunks_mut::<320>().0.iter_mut().zip(t.iter()) {
-        pack_with(chunk, 10, poly, |x| power2round(x).0);
+        pack_mapped(chunk, 10, poly, Pack::High);
     }
 
     pk
@@ -931,7 +1038,7 @@ fn encode_private_key(parts: [&[u8]; 3], s: &Polys, t: &Polys, p: &Parameters) -
     let (s_bytes, t0_bytes) = sk[128..].split_at_mut((p.l + p.k) * size);
 
     for (chunk, poly) in s_bytes.chunks_exact_mut(size).zip(s.iter()) {
-        pack_with(chunk, p.eta_bits(), poly, |x| p.eta - x);
+        pack_mapped(chunk, p.eta_bits(), poly, Pack::Eta(p.eta));
     }
 
     for (chunk, poly) in t0_bytes
@@ -940,7 +1047,7 @@ fn encode_private_key(parts: [&[u8]; 3], s: &Polys, t: &Polys, p: &Parameters) -
         .iter_mut()
         .zip(t.iter())
     {
-        pack_with(chunk, D, poly, |x| (1 << (D - 1)) - power2round(x).1);
+        pack_mapped(chunk, D, poly, Pack::Low);
     }
 
     sk
@@ -1072,13 +1179,9 @@ pub(crate) fn keygen_internal(xi: &[u8], p: &Parameters) -> (Vec<u8>, SecretByte
 
     let (s1, s2) = s.split_at(p.l);
 
-    let t = public_t(&expand_a(rho, p), s1, s2, p);
+    let (pk, t, tr) = public_key_and_tr(rho, s1, s2, p);
 
-    let pk = encode_public_key(rho, &t, p);
-
-    declassify(&pk);
-
-    let sk = encode_private_key([rho, key, &hash_public_key(&pk)], &s, &t, p);
+    let sk = encode_private_key([rho, key, &tr], &s, &t, p);
 
     wipe(&mut seeds);
 
@@ -1331,7 +1434,7 @@ pub(crate) fn sign_internal(
     let bits = p.gamma1_bits();
 
     for (chunk, poly) in z_part.chunks_exact_mut(32 * bits as usize).zip(z.iter()) {
-        pack_with(chunk, bits, poly, |x| p.gamma1 - centered(x));
+        pack_mapped(chunk, bits, poly, Pack::Gamma1(p.gamma1));
     }
 
     hint_bit_pack(&h, p, hints);
@@ -1715,6 +1818,65 @@ mod tests {
         }
 
         std::eprintln!("ML-DSA signing: {accelerated} of 20000 cases through the CPU kernels");
+    }
+
+    // The packing kernel against pack_with for every map and size of the encodings, on the
+    // domain of each map with its bounds first: t in [0, q), s in [-eta, eta], and z whose
+    // centered value lies in (-gamma1, gamma1].
+    #[test]
+    fn packing_kernel_matches_portable() {
+        let mut inputs = Inputs::new(13);
+
+        let mut accelerated = 0;
+
+        for n in 0..6_000 {
+            let (bits, map, poly) = match n % 6 {
+                0 => (10, Pack::High, coefficients(&mut inputs, n / 6, 0, Q)),
+                1 => (D, Pack::Low, coefficients(&mut inputs, n / 6, 0, Q)),
+                2 => (3, Pack::Eta(2), coefficients(&mut inputs, n / 6, -2, 3)),
+                3 => (4, Pack::Eta(4), coefficients(&mut inputs, n / 6, -4, 5)),
+                _ => {
+                    let (bits, gamma1) = if n % 6 == 4 {
+                        (18, 1 << 17)
+                    } else {
+                        (20, 1 << 19)
+                    };
+
+                    let centered = coefficients(&mut inputs, n / 6, 1 - gamma1, gamma1 + 1);
+
+                    (bits, Pack::Gamma1(gamma1), centered.map(freeze))
+                }
+            };
+
+            let size = 32 * bits as usize;
+
+            let mut expected = [0; 640];
+
+            match map {
+                Pack::High => pack_with(&mut expected[..size], bits, &poly, |x| power2round(x).0),
+                Pack::Low => pack_with(&mut expected[..size], bits, &poly, |x| {
+                    (1 << (D - 1)) - power2round(x).1
+                }),
+                Pack::Eta(eta) => pack_with(&mut expected[..size], bits, &poly, |x| eta - x),
+                Pack::Gamma1(gamma1) => {
+                    pack_with(&mut expected[..size], bits, &poly, |x| gamma1 - centered(x))
+                }
+            }
+
+            let mut actual = [0; 640];
+
+            if cpu::mldsa_pack(&mut actual[..size], &poly, bits, map, Q) {
+                assert_eq!(actual, expected, "{bits} bits, case {n}");
+
+                accelerated += 1;
+            }
+
+            pack_mapped(&mut actual[..size], bits, &poly, map);
+
+            assert_eq!(actual, expected, "pack_mapped, {bits} bits, case {n}");
+        }
+
+        std::eprintln!("ML-DSA packing: {accelerated} of 6000 cases through a CPU kernel");
     }
 
     fn reference_decompose(r: i32, gamma2: i32) -> (i32, i32) {

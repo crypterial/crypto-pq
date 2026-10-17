@@ -324,7 +324,7 @@ pub(crate) fn last_bytes(data: &[u8], count: usize) -> u128 {
 // message length in bits, at the end. Returns how many of the two blocks are used. Each 16-byte
 // chunk gets a single store, which the compression's 16-byte load of it can forward: a chunk
 // made of byte stores and read right away cost an Apple M3 tens of cycles.
-fn pad<const BLOCK: usize>(
+pub(crate) fn pad<const BLOCK: usize>(
     data: &[u8],
     bits: u128,
     field: usize,
@@ -1070,6 +1070,15 @@ mod tests {
         std::eprintln!("SHA-256: {accelerated} of {CASES} cases through a CPU kernel");
     }
 
+    // A schedule on a 32-byte boundary and one 16 bytes past it: kernels with 32-byte accesses
+    // take the first where it is and may move the second.
+    #[repr(C, align(32))]
+    struct Placed<T> {
+        aligned: T,
+        _pad: [u32; 4],
+        offset: T,
+    }
+
     fn lanes_match<const LANES: usize>(inputs: &mut Inputs, cases: usize) -> usize {
         let mut accelerated = 0;
 
@@ -1102,7 +1111,19 @@ mod tests {
 
             let mut actual = states;
 
-            if cpu::compress256_lanes(&mut actual, &mut w) {
+            let mut placed = Placed {
+                aligned: w,
+                _pad: [0; 4],
+                offset: w,
+            };
+
+            let w = if n % 2 == 0 {
+                &mut placed.aligned
+            } else {
+                &mut placed.offset
+            };
+
+            if cpu::compress256_lanes(&mut actual, w) {
                 assert_eq!(actual, expected, "{LANES} lanes, case {n}");
 
                 accelerated += 1;

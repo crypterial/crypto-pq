@@ -621,6 +621,83 @@ mod tests {
         std::eprintln!("Keccak absorb: {accelerated} of 20000 cases through a CPU kernel");
     }
 
+    // The one-call kernel against a sponge built from XOR and the portable permutation alone, for
+    // every rate, three suffixes, from zero and from a given state, message lengths over several
+    // blocks and outputs around the block size.
+    #[test]
+    fn digest_kernel_matches_portable() {
+        let mut inputs = Inputs::new(200);
+
+        let mut accelerated = 0;
+
+        for n in 0..6_000 {
+            let rate = [72, 104, 136, 144, 168][n % 5];
+
+            let suffix = [0x06, 0x1F, 0x04][n / 5 % 3];
+
+            let data: [u8; 3 * 168 + 9] = inputs.bytes();
+
+            let length = (n / 15 * 37 + n) % data.len();
+
+            let size = [
+                0,
+                1,
+                7,
+                8,
+                9,
+                32,
+                64,
+                rate - 1,
+                rate,
+                rate + 1,
+                2 * rate + 5,
+            ][n % 11];
+
+            let initial: Option<[u64; 25]> = (n % 2 == 1).then(|| inputs.words());
+
+            let mut padded = data[..length].to_vec();
+
+            padded.push(suffix);
+
+            padded.resize(padded.len().next_multiple_of(rate), 0);
+
+            *padded.last_mut().expect("a block") ^= 0x80;
+
+            let mut state = initial.unwrap_or([0; 25]);
+
+            for block in padded.chunks(rate) {
+                for (lane, bytes) in state.iter_mut().zip(block.as_chunks::<8>().0) {
+                    *lane ^= u64::from_le_bytes(*bytes);
+                }
+
+                permute(&mut state);
+            }
+
+            let mut expected = vec![0; size];
+
+            for (i, byte) in expected.iter_mut().enumerate() {
+                if i > 0 && i % rate == 0 {
+                    permute(&mut state);
+                }
+
+                *byte = (state[i % rate / 8] >> (8 * (i % 8))) as u8;
+            }
+
+            let mut actual = vec![0; size];
+
+            if cpu::digest(initial.as_ref(), rate, suffix, &data[..length], &mut actual) {
+                assert_eq!(
+                    actual, expected,
+                    "rate {rate}, length {length}, size {size}"
+                );
+
+                accelerated += 1;
+            }
+        }
+
+        std::eprintln!("Keccak digest: {accelerated} of 6000 cases through a CPU kernel");
+    }
+
     fn started(rate: usize, suffix: u8, messages: &[&[&[u8]]]) -> Sponges {
         let mut sponges = Sponges::empty();
 

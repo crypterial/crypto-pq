@@ -164,6 +164,21 @@ mod arch {
     }
 
     #[inline(always)]
+    pub(crate) fn blake2b_digest(_: &[u64; 8], _: &[u8], _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn blake2s_digest(_: &[u32; 8], _: &[u8], _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn blake2s_mac(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
     pub(crate) const fn keccak_group() -> usize {
         4
     }
@@ -214,6 +229,27 @@ mod arch {
     }
 
     #[inline(always)]
+    pub(crate) fn mlkem_multiply_cache(
+        _: &[u16; 256],
+        _: &[i16; 128],
+        _: u16,
+        _: &mut [u16; 128],
+    ) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn mlkem_inner_product(
+        _: &mut [u16; 256],
+        _: &[&[u16; 256]],
+        _: &[[u16; 256]],
+        _: &[[u16; 128]],
+        _: &super::Field16,
+    ) -> bool {
+        false
+    }
+
+    #[inline(always)]
     pub(crate) fn inverse_ntt16(_: &[i32; 256], _: &mut [u16; 256], _: &super::Field16) -> bool {
         false
     }
@@ -260,6 +296,11 @@ mod arch {
     }
 
     #[inline(always)]
+    pub(crate) fn mldsa_pack(_: &mut [u8], _: &[i32; 256], _: u32, _: super::Pack, _: i32) -> bool {
+        false
+    }
+
+    #[inline(always)]
     pub(crate) fn mlkem_matrix_vector(
         _: &mut [[u16; 256]],
         _: &[[u16; 256]],
@@ -282,6 +323,33 @@ mod arch {
     }
 
     #[inline(always)]
+    pub(crate) fn decode12(_: &[u8; 384], _: u16, _: &mut [u16; 256]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn mlkem_compress(
+        _: &[u16; 256],
+        _: &[u16; 256],
+        _: Option<&[u8; 32]>,
+        _: u32,
+        _: u16,
+        _: &mut [u8],
+    ) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn mlkem_decompress(_: &[u8], _: u32, _: u16, _: &mut [u16; 256]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn mlkem_message(_: &[u16; 256], _: &[u16; 256], _: u16, _: &mut [u8; 32]) -> bool {
+        false
+    }
+
+    #[inline(always)]
     pub(crate) fn uniform12(_: &[u64; 21], _: u16, _: &mut [u16; 256], _: &mut usize) -> bool {
         false
     }
@@ -298,12 +366,14 @@ mod arch {
 }
 
 pub(crate) use arch::{
-    absorb, ascon, ascon_digest, base_multiply_add, binomial, blake2b, blake2s, bounded,
-    compress256, compress256_lanes, compress256_pair, compress512, compress512_pair, digest,
-    encode12, finish256, finish512, hmac256, hmac256_keyed, hmac512, hmac512_keyed, inverse_ntt,
-    inverse_ntt16, keccak_group, mldsa_add, mldsa_hints, mldsa_mask, mldsa_norm, mldsa_sub,
-    mldsa_w1, mlkem_matrix_vector, multiply, multiply_add, ntt, ntt16, permute_many, reduce,
-    uniform12, uniform23,
+    absorb, ascon, ascon_digest, base_multiply_add, binomial, blake2b, blake2b_digest, blake2s,
+    blake2s_digest, blake2s_mac, bounded, compress256, compress256_lanes, compress256_pair,
+    compress512, compress512_pair, decode12, digest, encode12, finish256, finish512, hmac256,
+    hmac256_keyed, hmac512, hmac512_keyed, inverse_ntt, inverse_ntt16, keccak_group, mldsa_add,
+    mldsa_hints, mldsa_mask, mldsa_norm, mldsa_pack, mldsa_sub, mldsa_w1, mlkem_compress,
+    mlkem_decompress, mlkem_inner_product, mlkem_matrix_vector, mlkem_message,
+    mlkem_multiply_cache, multiply, multiply_add, ntt, ntt16, permute_many, reduce, uniform12,
+    uniform23,
 };
 
 // What the transform kernels need of the field of ML-KEM or ML-DSA, so that they compute exactly
@@ -323,6 +393,17 @@ pub(crate) struct Field {
     pub(crate) prepare: Prepare,
     pub(crate) forward_scale: Option<i32>,
     pub(crate) inverse_scale: i32,
+}
+
+// How ML-DSA maps each coefficient as it packs it: power2round's r1 (t1 of a public key), 2^12
+// minus its r0 (t0 of a private key), eta - x (the signed coefficients of s1 and s2), or gamma1
+// minus the centered coefficient (z of a signature).
+#[derive(Clone, Copy)]
+pub(crate) enum Pack {
+    High,
+    Low,
+    Eta(i32),
+    Gamma1(i32),
 }
 
 // The first step of the inverse transform: ML-DSA's x - ((x + 2^22) >> 23) q, or ML-KEM's
@@ -449,6 +530,16 @@ pub(crate) struct Field16 {
     pub(crate) barrett: i16,
     pub(crate) reduce32: i32,
     pub(crate) qinv32: i32,
+    // The AVX2 kernels keep 32 coefficients in two vectors of sixteen lanes and transpose them for
+    // the layers that pair coefficients 8, 4 and 2 apart: per layer and block of 32, the factor of
+    // each lane in that order, then its product by q^-1 (layer i in entries 2i and 2i + 1).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) forward_x86: [[[i16; 16]; 8]; 6],
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) inverse_x86: [[[i16; 16]; 8]; 6],
+    // inverse_scale times 2^16: the AVX2 inverse starts from the sums times 2^-16.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) inverse_scale_x86: i16,
 }
 
 impl Field16 {
@@ -487,6 +578,20 @@ impl Field16 {
             barrett: (((1 << 26) + q as i32 / 2) / q as i32) as i16,
             reduce32,
             qinv32,
+            #[cfg(target_arch = "x86_64")]
+            forward_x86: [[[0; 16]; 8]; 6],
+            #[cfg(target_arch = "x86_64")]
+            inverse_x86: [[[0; 16]; 8]; 6],
+            #[cfg(target_arch = "x86_64")]
+            inverse_scale_x86: {
+                let scale = (inverse_scale as i32 * 65536).rem_euclid(q as i32);
+
+                if scale > q as i32 / 2 {
+                    (scale - q as i32) as i16
+                } else {
+                    scale as i16
+                }
+            },
         };
 
         let mut m = 0;
@@ -533,6 +638,52 @@ impl Field16 {
             }
 
             p += 1;
+        }
+
+        // Block b, lane l: groups 16 + 2b + l / 8, 32 + 4b + l / 4 and 64 + 8b + l / 2 forward,
+        // and their counterparts 96 + 2b + l / 8, 64 + 4b + l / 4 and 8b + l / 2 of the reversed
+        // table for the inverse.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut b = 0;
+
+            while b < 8 {
+                let mut lane = 0;
+
+                while lane < 16 {
+                    let forward = [
+                        16 + 2 * b + lane / 8,
+                        32 + 4 * b + lane / 4,
+                        64 + 8 * b + lane / 2,
+                    ];
+
+                    let inverse = [
+                        96 + 2 * b + lane / 8,
+                        64 + 4 * b + lane / 4,
+                        8 * b + lane / 2,
+                    ];
+
+                    let mut layer = 0;
+
+                    while layer < 3 {
+                        field.forward_x86[2 * layer][b][lane] = zetas[forward[layer]];
+
+                        field.forward_x86[2 * layer + 1][b][lane] =
+                            field.forward_qinv[forward[layer]];
+
+                        field.inverse_x86[2 * layer][b][lane] = field.inverse[inverse[layer]];
+
+                        field.inverse_x86[2 * layer + 1][b][lane] =
+                            field.inverse_qinv[inverse[layer]];
+
+                        layer += 1;
+                    }
+
+                    lane += 1;
+                }
+
+                b += 1;
+            }
         }
 
         field
