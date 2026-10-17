@@ -240,19 +240,14 @@ function nttOf(values: Int32Array): Float64Array {
   return w;
 }
 
-function pointwise(f: Float64Array, g: Int32Array): Float64Array {
-  const h = new Float64Array(256);
-
-  for (let i = 0; i < 256; i++) {
-    h[i] = reduceLazy(f[i] * g[i]);
-  }
-
-  return h;
+function polys(count: number): Int32Array[] {
+  return Array.from({ length: count }, () => new Int32Array(256));
 }
 
-// sum(row[i] * vector[i]) in the NTT domain; each product is below 2^48, so the sums are exact.
-function dot(row: Int32Array[], vector: Float64Array[]): Float64Array {
-  const total = new Float64Array(256);
+// sum(row[i] * vector[i]) in the NTT domain, into total; each product is below 2^48, so the sums are
+// exact.
+function dot(row: Int32Array[], vector: Float64Array[], total: Float64Array): void {
+  total.fill(0);
 
   for (let i = 0; i < row.length; i++) {
     const f = row[i];
@@ -267,40 +262,50 @@ function dot(row: Int32Array[], vector: Float64Array[]): Float64Array {
   for (let j = 0; j < 256; j++) {
     total[j] = reduceLazy(total[j]);
   }
-
-  return total;
 }
 
-// The inverse NTT of w, which it overwrites, into a new array.
-function inverseOf(w: Float64Array): Int32Array {
-  const out = new Int32Array(256);
-
-  inverseNtt(w, out);
-
-  return out;
-}
-
-// t = NTT^-1(A * NTT(s1)) + s2, with canonical coefficients.
-function publicT(a: Int32Array[][], s1: Int32Array[], s2: Int32Array[]): Int32Array[] {
+// t = NTT^-1(A * NTT(s1)) + s2 with canonical coefficients, row by row: each row of A is sampled when
+// it is needed, and row(i, t) gets row i of t in a scratch polynomial.
+function publicT(
+  rho: Uint8Array,
+  s1: Int32Array[],
+  s2: Int32Array[],
+  p: Parameters,
+  row: (i: number, t: Int32Array) => void,
+): void {
   const s1Hat = s1.map(nttOf);
 
-  const t = a.map((row, i) => {
-    const product = dot(row, s1Hat);
+  const a = polys(p.l);
 
-    const w = inverseOf(product);
+  const seed = new Uint8Array(34);
 
-    product.fill(0);
+  const product = new Float64Array(256);
 
-    for (let j = 0; j < 256; j++) {
-      w[j] = addMod(w[j], canonical(s2[i][j]));
+  const t = new Int32Array(256);
+
+  seed.set(rho);
+
+  for (let i = 0; i < p.k; i++) {
+    for (let j = 0; j < p.l; j++) {
+      seed[32] = j;
+
+      seed[33] = i;
+
+      rejNttPoly(seed, a[j]);
     }
 
-    return w;
-  });
+    dot(a, s1Hat, product);
 
-  wipe(...s1Hat);
+    inverseNtt(product, t);
 
-  return t;
+    for (let j = 0; j < 256; j++) {
+      t[j] = addMod(t[j], canonical(s2[i][j]));
+    }
+
+    row(i, t);
+  }
+
+  wipe(product, t, ...s1Hat);
 }
 
 function power2RoundHigh(r: number): number {
@@ -362,9 +367,7 @@ function pack(values: ArrayLike<number>, bits: number, out: Uint8Array, offset: 
   }
 }
 
-function unpack(data: Uint8Array, offset: number, bits: number): Int32Array {
-  const out = new Int32Array(256);
-
+function unpack(data: Uint8Array, offset: number, bits: number, out: Int32Array = new Int32Array(256)): Int32Array {
   const mask = (1 << bits) - 1;
 
   let buffer = 0;
@@ -388,21 +391,8 @@ function unpack(data: Uint8Array, offset: number, bits: number): Int32Array {
   return out;
 }
 
-// BitPack(w, a, b) packs b - w[i]; the values here are centered.
-function bitPack(w: Int32Array, b: number, bits: number, out: Uint8Array, offset: number): void {
-  const values = new Int32Array(256);
-
-  for (let i = 0; i < 256; i++) {
-    values[i] = b - w[i];
-  }
-
-  pack(values, bits, out, offset);
-
-  values.fill(0);
-}
-
-function bitUnpack(data: Uint8Array, offset: number, b: number, bits: number): Int32Array {
-  const w = unpack(data, offset, bits);
+function bitUnpack(data: Uint8Array, offset: number, b: number, bits: number, out?: Int32Array): Int32Array {
+  const w = unpack(data, offset, bits, out);
 
   for (let i = 0; i < 256; i++) {
     w[i] = b - w[i];
@@ -411,12 +401,13 @@ function bitUnpack(data: Uint8Array, offset: number, b: number, bits: number): I
   return w;
 }
 
-function hintBitPack(h: Uint8Array[], p: Parameters, out: Uint8Array, offset: number): void {
+// The hints h[256 i + j] of the k polynomials.
+function hintBitPack(h: Uint8Array, p: Parameters, out: Uint8Array, offset: number): void {
   let index = 0;
 
   for (let i = 0; i < p.k; i++) {
     for (let j = 0; j < 256; j++) {
-      if (h[i][j] !== 0) {
+      if (h[256 * i + j] !== 0) {
         out[offset + index++] = j;
       }
     }
@@ -425,42 +416,36 @@ function hintBitPack(h: Uint8Array[], p: Parameters, out: Uint8Array, offset: nu
   }
 }
 
-// FIPS 204, Algorithm 21: the encoding must be canonical (strictly increasing indices, zero
-// padding), otherwise the signature is rejected.
-function hintBitUnpack(data: Uint8Array, p: Parameters): Uint8Array[] | null {
-  const h: Uint8Array[] = [];
-
+// FIPS 204, Algorithm 21: the hints from data[at] into h[256 i + j]. The encoding must be canonical
+// (strictly increasing indices, zero padding), otherwise the signature is rejected.
+function hintBitUnpack(data: Uint8Array, at: number, p: Parameters, h: Uint8Array): boolean {
   let index = 0;
 
   for (let i = 0; i < p.k; i++) {
-    const end = data[p.omega + i];
+    const end = data[at + p.omega + i];
 
     if (end < index || end > p.omega) {
-      return null;
+      return false;
     }
-
-    const poly = new Uint8Array(256);
 
     const first = index;
 
     for (; index < end; index++) {
-      if (index > first && data[index - 1] >= data[index]) {
-        return null;
+      if (index > first && data[at + index - 1] >= data[at + index]) {
+        return false;
       }
 
-      poly[data[index]] = 1;
+      h[256 * i + data[at + index]] = 1;
     }
-
-    h.push(poly);
   }
 
   for (; index < p.omega; index++) {
-    if (data[index] !== 0) {
-      return null;
+    if (data[at + index] !== 0) {
+      return false;
     }
   }
 
-  return h;
+  return true;
 }
 
 // The XOF streams of the samplers, reused from one polynomial to the next; reset() also clears what
@@ -471,12 +456,13 @@ const XOF256 = new Keccak(136, 0x1f);
 
 const MASK = new Uint8Array(640);
 
-function rejNttPoly(seed: Uint8Array): Int32Array {
+// The two-byte nonce of a sampler's seed.
+const NONCE = new Uint8Array(2);
+
+function rejNttPoly(seed: Uint8Array, a: Int32Array = new Int32Array(256)): Int32Array {
   XOF128.reset();
 
   XOF128.update(seed);
-
-  const a = new Int32Array(256);
 
   let count = 0;
 
@@ -502,7 +488,11 @@ function rejBoundedPoly(rho: Uint8Array, nonce: number, eta: number): Int32Array
 
   XOF256.update(rho);
 
-  XOF256.update(Uint8Array.of(nonce & 0xff, nonce >> 8));
+  NONCE[0] = nonce & 0xff;
+
+  NONCE[1] = nonce >> 8;
+
+  XOF256.update(NONCE);
 
   const a = new Int32Array(256);
 
@@ -564,11 +554,9 @@ function expandS(rho: Uint8Array, p: Parameters): [Int32Array[], Int32Array[]] {
   return [s.slice(0, p.l), s.slice(p.l)];
 }
 
-// y = gamma1 - BitUnpack(H(rho' || counter)), with the 18-bit (gamma1 = 2^17) or 20-bit (2^19)
-// fields read four or two at a time.
-function expandMask(rho: Uint8Array, kappa: number, p: Parameters): Int32Array[] {
-  const y: Int32Array[] = [];
-
+// y = gamma1 - BitUnpack(H(rho' || counter)), into y, with the 18-bit (gamma1 = 2^17) or 20-bit
+// (2^19) fields read four or two at a time.
+function expandMask(rho: Uint8Array, kappa: number, p: Parameters, y: Int32Array[]): void {
   const data = MASK.subarray(0, 32 * p.gamma1Bits);
 
   const gamma1 = p.gamma1;
@@ -580,11 +568,15 @@ function expandMask(rho: Uint8Array, kappa: number, p: Parameters): Int32Array[]
 
     XOF256.update(rho);
 
-    XOF256.update(Uint8Array.of(counter & 0xff, (counter >> 8) & 0xff));
+    NONCE[0] = counter & 0xff;
+
+    NONCE[1] = (counter >> 8) & 0xff;
+
+    XOF256.update(NONCE);
 
     XOF256.readInto(data);
 
-    const poly = new Int32Array(256);
+    const poly = y[r];
 
     if (p.gamma1Bits === 18) {
       for (let i = 0, at = 0; i < 256; i += 4, at += 9) {
@@ -603,20 +595,16 @@ function expandMask(rho: Uint8Array, kappa: number, p: Parameters): Int32Array[]
         poly[i + 1] = gamma1 - ((data[at + 2] >> 4) | (data[at + 3] << 4) | (data[at + 4] << 12));
       }
     }
-
-    y.push(poly);
   }
 
   data.fill(0);
 
   XOF256.reset();
-
-  return y;
 }
 
 // The signs are the first 64 bits of the stream, little-endian; each position j then comes from one
-// byte, retried until it is at most i.
-function sampleInBall(seed: Uint8Array, tau: number): Int32Array {
+// byte, retried until it is at most i. The polynomial goes into c.
+function sampleInBall(seed: Uint8Array, tau: number, c: Int32Array): void {
   XOF256.reset();
 
   XOF256.update(seed);
@@ -627,7 +615,7 @@ function sampleInBall(seed: Uint8Array, tau: number): Int32Array {
 
   const high = block[4] | (block[5] << 8) | (block[6] << 16) | (block[7] << 24);
 
-  const c = new Int32Array(256);
+  c.fill(0);
 
   let offset = 8;
 
@@ -650,18 +638,6 @@ function sampleInBall(seed: Uint8Array, tau: number): Int32Array {
   }
 
   XOF256.reset();
-
-  return c;
-}
-
-function pkEncode(rho: Uint8Array, t1: Int32Array[]): Uint8Array {
-  const pk = new Uint8Array(32 + 320 * t1.length);
-
-  pk.set(rho);
-
-  t1.forEach((t, i) => simpleBitPack10(t, pk, 32 + 320 * i));
-
-  return pk;
 }
 
 interface SecretKey {
@@ -678,17 +654,16 @@ interface SecretKey {
   readonly t0: Int32Array[];
 }
 
+// The private key up to t0, which follows at t0Offset(p).
 function skEncode(
   rho: Uint8Array,
   key: Uint8Array,
   tr: Uint8Array,
   s1: Int32Array[],
   s2: Int32Array[],
-  t0: Int32Array[],
   p: Parameters,
-): Uint8Array {
-  const sk = new Uint8Array(p.privateKeySize);
-
+  sk: Uint8Array,
+): void {
   sk.set(rho);
 
   sk.set(key, 32);
@@ -704,14 +679,10 @@ function skEncode(
 
     offset += 32 * p.etaBits;
   }
+}
 
-  for (const t of t0) {
-    bitPack13(t, 1 << (D - 1), sk, offset);
-
-    offset += 32 * D;
-  }
-
-  return sk;
+function t0Offset(p: Parameters): number {
+  return 128 + 32 * (p.k + p.l) * p.etaBits;
 }
 
 function skDecode(sk: Uint8Array, p: Parameters): SecretKey {
@@ -741,27 +712,6 @@ function skDecode(sk: Uint8Array, p: Parameters): SecretKey {
     s2: s.slice(p.l),
     t0,
   };
-}
-
-function w1Encode(w1: Int32Array[], p: Parameters): Uint8Array {
-  const out = new Uint8Array(32 * p.w1Bits * w1.length);
-
-  w1.forEach((w, i) => pack(w, p.w1Bits, out, 32 * p.w1Bits * i));
-
-  return out;
-}
-
-// The high (Power2Round t1) or low (t0) parts of the coefficients of each polynomial in t.
-function power2Round(t: Int32Array[], high: boolean): Int32Array[] {
-  return t.map((poly) => {
-    const out = new Int32Array(256);
-
-    for (let j = 0; j < 256; j++) {
-      out[j] = high ? power2RoundHigh(poly[j]) : power2RoundLow(poly[j]);
-    }
-
-    return out;
-  });
 }
 
 // What verification and signing derive from a public key, kept with the key object and shared by a
@@ -798,7 +748,8 @@ function t1Hat(pk: Uint8Array, p: Parameters): Int32Array[] {
   });
 }
 
-// Also returns the cache of the new public key, holding tr; Â is expanded again on first use.
+// Also returns the cache of the new public key, holding tr; Â is expanded again on first use. Each
+// row of t goes straight into the keys, t1 into pk and t0 into sk.
 export function keygenInternal(xi: Uint8Array, p: Parameters): [Uint8Array, Uint8Array, PublicCache] {
   const expanded = shake256(128, xi, Uint8Array.of(p.k, p.l));
 
@@ -806,19 +757,33 @@ export function keygenInternal(xi: Uint8Array, p: Parameters): [Uint8Array, Uint
 
   const [s1, s2] = expandS(expanded.subarray(32, 96), p);
 
-  const a = expandA(rho, p);
+  const pk = new Uint8Array(p.publicKeySize);
 
-  const t = publicT(a, s1, s2);
+  const sk = new Uint8Array(p.privateKeySize);
 
-  const t0 = power2Round(t, false);
+  const high = new Int32Array(256);
 
-  const pk = pkEncode(rho, power2Round(t, true));
+  const low = new Int32Array(256);
+
+  pk.set(rho);
+
+  publicT(rho, s1, s2, p, (i, t) => {
+    for (let j = 0; j < 256; j++) {
+      high[j] = power2RoundHigh(t[j]);
+
+      low[j] = power2RoundLow(t[j]);
+    }
+
+    simpleBitPack10(high, pk, 32 + 320 * i);
+
+    bitPack13(low, 1 << (D - 1), sk, t0Offset(p) + 32 * D * i);
+  });
 
   const tr = shake256(64, pk);
 
-  const sk = skEncode(rho, expanded.subarray(96), tr, s1, s2, t0, p);
+  skEncode(rho, expanded.subarray(96), tr, s1, s2, p, sk);
 
-  wipe(expanded, ...s1, ...s2, ...t, ...t0);
+  wipe(expanded, low, ...s1, ...s2);
 
   return [pk, sk, publicCache(tr)];
 }
@@ -840,19 +805,21 @@ export function checkPrivateKey(sk: Uint8Array, p: Parameters): [Uint8Array, Pub
       return null;
     }
 
-    const a = expandA(rho, p);
+    const pk = new Uint8Array(p.publicKeySize);
 
-    const t = publicT(a, s1, s2);
+    const high = new Int32Array(256);
 
-    for (let i = 0; i < p.k; i++) {
+    pk.set(rho);
+
+    publicT(rho, s1, s2, p, (i, t) => {
       for (let j = 0; j < 256; j++) {
-        bad |= power2RoundLow(t[i][j]) ^ t0[i][j];
+        bad |= power2RoundLow(t[j]) ^ t0[i][j];
+
+        high[j] = power2RoundHigh(t[j]);
       }
-    }
 
-    const pk = pkEncode(rho, power2Round(t, true));
-
-    wipe(...t);
+      simpleBitPack10(high, pk, 32 + 320 * i);
+    });
 
     return bad === 0 && equal(shake256(64, pk), tr) ? [pk, publicCache(tr.slice())] : null;
   } finally {
@@ -860,15 +827,13 @@ export function checkPrivateKey(sk: Uint8Array, p: Parameters): [Uint8Array, Pub
   }
 }
 
-// NTT^-1(cHat * sHat), wiping the product left in the NTT domain.
-function multiply(cHat: Float64Array, sHat: Int32Array): Int32Array {
-  const product = pointwise(cHat, sHat);
+// NTT^-1(cHat * sHat) into out, through product, which holds what is left in the NTT domain.
+function multiply(cHat: Float64Array, sHat: Int32Array, out: Int32Array, product: Float64Array): void {
+  for (let i = 0; i < 256; i++) {
+    product[i] = reduceLazy(cHat[i] * sHat[i]);
+  }
 
-  const out = inverseOf(product);
-
-  product.fill(0);
-
-  return out;
+  inverseNtt(product, out);
 }
 
 // 1 when some |LowBits(coefficient)| is at least bound, accumulated without branches.
@@ -903,7 +868,9 @@ function decodeSecrets(sk: Uint8Array, p: Parameters): [Int32Array[], Int32Array
   return vectors;
 }
 
-// cache and secret hold what the key derives from sk.
+// cache and secret hold what the key derives from sk. The polynomials of an attempt are made once
+// and reused by the next one: y and its NTT, w, a row of w1, z, w - cs2, ct0, c and its NTT, and the
+// hints.
 export function signInternal(
   sk: Uint8Array,
   cache: PublicCache,
@@ -920,59 +887,85 @@ export function signInternal(
 
   const rhoPrime = shake256(64, sk.subarray(32, 64), rnd, mu);
 
-  const w1 = Array.from({ length: p.k }, () => new Int32Array(256));
+  const y = polys(p.l);
 
-  const centeredZ = new Int32Array(256);
+  const yHat = Array.from({ length: p.l }, () => new Float64Array(256));
 
-  const secrets: (Int32Array | Float64Array)[] = [centeredZ];
+  const w = polys(p.k);
+
+  const w1 = new Int32Array(256);
+
+  const z = polys(p.l);
+
+  const wcs2 = polys(p.k);
+
+  const ct0 = new Int32Array(256);
+
+  const c = new Int32Array(256);
+
+  const cHat = new Float64Array(256);
+
+  const product = new Float64Array(256);
+
+  const hints = new Uint8Array(256 * p.k);
+
+  const w1Bytes = new Uint8Array(32 * p.w1Bits * p.k);
+
+  const cTilde = new Uint8Array(p.lambda / 4);
 
   try {
     for (let kappa = 0; ; kappa += p.l) {
-      const y = expandMask(rhoPrime, kappa, p);
+      expandMask(rhoPrime, kappa, p, y);
 
-      const yHat = y.map(nttOf);
+      for (let r = 0; r < p.l; r++) {
+        yHat[r].set(y[r]);
 
-      const w = a.map((row) => {
-        const product = dot(row, yHat);
-
-        const out = inverseOf(product);
-
-        product.fill(0);
-
-        return out;
-      });
+        ntt(yHat[r]);
+      }
 
       for (let i = 0; i < p.k; i++) {
+        dot(a[i], yHat, product);
+
+        inverseNtt(product, w[i]);
+
         for (let j = 0; j < 256; j++) {
-          w1[i][j] = highBits(w[i][j], p.gamma2);
+          w1[j] = highBits(w[i][j], p.gamma2);
+        }
+
+        pack(w1, p.w1Bits, w1Bytes, 32 * p.w1Bits * i);
+      }
+
+      XOF256.reset();
+
+      XOF256.update(mu);
+
+      XOF256.update(w1Bytes);
+
+      XOF256.readInto(cTilde);
+
+      XOF256.reset();
+
+      sampleInBall(cTilde, p.tau, c);
+
+      cHat.set(c);
+
+      ntt(cHat);
+
+      for (let r = 0; r < p.l; r++) {
+        multiply(cHat, s1Hat[r], z[r], product);
+
+        for (let j = 0; j < 256; j++) {
+          z[r][j] = addMod(canonical(y[r][j]), z[r][j]);
         }
       }
 
-      const cTilde = shake256(p.lambda / 4, mu, w1Encode(w1, p));
-
-      const cHat = nttOf(sampleInBall(cTilde, p.tau));
-
-      const z = s1Hat.map((s, r) => {
-        const cs1 = multiply(cHat, s);
+      for (let i = 0; i < p.k; i++) {
+        multiply(cHat, s2Hat[i], wcs2[i], product);
 
         for (let j = 0; j < 256; j++) {
-          cs1[j] = addMod(canonical(y[r][j]), cs1[j]);
+          wcs2[i][j] = subtractMod(w[i][j], wcs2[i][j]);
         }
-
-        return cs1;
-      });
-
-      const wcs2 = s2Hat.map((s, i) => {
-        const cs2 = multiply(cHat, s);
-
-        for (let j = 0; j < 256; j++) {
-          cs2[j] = subtractMod(w[i][j], cs2[j]);
-        }
-
-        return cs2;
-      });
-
-      secrets.push(...y, ...yHat, ...w, ...z, ...wcs2);
+      }
 
       let reject = 0;
 
@@ -988,28 +981,20 @@ export function signInternal(
         continue;
       }
 
-      const h: Uint8Array[] = [];
-
       let ones = 0;
 
       for (let i = 0; i < p.k; i++) {
-        const ct0 = multiply(cHat, t0Hat[i]);
+        multiply(cHat, t0Hat[i], ct0, product);
 
         reject |= exceeds(ct0, p.gamma2, false);
-
-        const hint = new Uint8Array(256);
 
         for (let j = 0; j < 256; j++) {
           const difference = highBits(addMod(wcs2[i][j], ct0[j]), p.gamma2) ^ highBits(wcs2[i][j], p.gamma2);
 
-          hint[j] = (difference | -difference) >>> 31;
+          hints[256 * i + j] = (difference | -difference) >>> 31;
 
-          ones += hint[j];
+          ones += hints[256 * i + j];
         }
-
-        h.push(hint);
-
-        secrets.push(ct0);
       }
 
       if (reject !== 0 || ones > p.omega) {
@@ -1022,26 +1007,28 @@ export function signInternal(
 
       let offset = p.lambda / 4;
 
+      // BitPack(z, gamma1 - 1, gamma1) packs gamma1 - z, through ct0.
       for (const poly of z) {
         for (let j = 0; j < 256; j++) {
-          centeredZ[j] = centered(poly[j]);
+          ct0[j] = p.gamma1 - centered(poly[j]);
         }
 
-        bitPack(centeredZ, p.gamma1, p.gamma1Bits, signature, offset);
+        pack(ct0, p.gamma1Bits, signature, offset);
 
         offset += 32 * p.gamma1Bits;
       }
 
-      hintBitPack(h, p, signature, offset);
+      hintBitPack(hints, p, signature, offset);
 
       return signature;
     }
   } finally {
-    wipe(rhoPrime, ...secrets);
+    wipe(rhoPrime, ...y, ...yHat, ...w, w1, ...z, ...wcs2, ct0, c, cHat, product, hints, w1Bytes);
   }
 }
 
-// cache holds what the key derives from pk.
+// cache holds what the key derives from pk. Each row of A z - c t1 is formed, rounded with its hints
+// and packed in turn.
 export function verifyInternal(
   pk: Uint8Array,
   cache: PublicCache,
@@ -1053,19 +1040,29 @@ export function verifyInternal(
     return false;
   }
 
-  const z: Int32Array[] = [];
+  const zHat = Array.from({ length: p.l }, () => new Float64Array(256));
+
+  const poly = new Int32Array(256);
+
+  const h = new Uint8Array(256 * p.k);
 
   let offset = p.lambda / 4;
 
+  let bad = 0;
+
   for (let r = 0; r < p.l; r++) {
-    z.push(bitUnpack(signature, offset, p.gamma1, p.gamma1Bits));
+    bitUnpack(signature, offset, p.gamma1, p.gamma1Bits, poly);
+
+    bad |= exceeds(poly, p.gamma1 - p.beta, true);
+
+    zHat[r].set(poly);
+
+    ntt(zHat[r]);
 
     offset += 32 * p.gamma1Bits;
   }
 
-  const h = hintBitUnpack(signature.subarray(offset), p);
-
-  if (h === null || z.some((poly) => exceeds(poly, p.gamma1 - p.beta, true) !== 0)) {
+  if (!hintBitUnpack(signature, offset, p, h) || bad !== 0) {
     return false;
   }
 
@@ -1077,25 +1074,29 @@ export function verifyInternal(
 
   const mu = shake256(64, (cache.tr ??= shake256(64, pk)), message);
 
-  const cHat = nttOf(sampleInBall(cTilde, p.tau));
+  sampleInBall(cTilde, p.tau, poly);
 
-  const zHat = z.map(nttOf);
+  const cHat = nttOf(poly);
 
-  const w1 = a.map((row, i) => {
-    const w = dot(row, zHat);
+  const w = new Float64Array(256);
+
+  const w1Bytes = new Uint8Array(32 * p.w1Bits * p.k);
+
+  for (let i = 0; i < p.k; i++) {
+    dot(a[i], zHat, w);
 
     for (let j = 0; j < 256; j++) {
       w[j] = reduceLazy(w[j] - reduceLazy(cHat[j] * t1[i][j]) + 2 * Q);
     }
 
-    const r = inverseOf(w);
+    inverseNtt(w, poly);
 
     for (let j = 0; j < 256; j++) {
-      r[j] = useHint(h[i][j], r[j], p.gamma2);
+      poly[j] = useHint(h[256 * i + j], poly[j], p.gamma2);
     }
 
-    return r;
-  });
+    pack(poly, p.w1Bits, w1Bytes, 32 * p.w1Bits * i);
+  }
 
-  return equal(shake256(p.lambda / 4, mu, w1Encode(w1, p)), cTilde);
+  return equal(shake256(p.lambda / 4, mu, w1Bytes), cTilde);
 }

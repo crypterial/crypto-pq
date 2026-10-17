@@ -488,8 +488,11 @@ function add64(high: string, low: string, xHigh: string, xLow: string, yHigh: st
   ];
 }
 
-// t1 = h + sigma1(e) + ch(e, f, g) + K[t] + W[t] accumulates in h; then d += t1 and h = t1 + sigma0(a)
-// + maj(a, b, c), adding the 64-bit values with integer carries.
+// t1 = h + K[t] + W[t] + ch(e, f, g) + sigma1(e) with its low halves summed below 5 * 2^32 and its high
+// halves without their carry; e = d + t1 and a = t1 + maj(a, b, c) + sigma0(a), the new a written over h,
+// then take the carries of their own low sums: two per round, each the sum divided by 2^32. V8 adds
+// such sums of 32-bit halves in 64-bit registers, which on x86-64 keeps fewer general registers in use
+// than the integer carry formula and makes SHA-512 there faster than noble's.
 function round512(v: readonly string[], t: string): string[] {
   const [a, b, c, d, e, f, g, h] = v;
 
@@ -497,24 +500,20 @@ function round512(v: readonly string[], t: string): string[] {
 
   const [s0h, s0l] = sigma(a, [28, 34, 39]);
 
-  const addToH = (yHigh: string, yLow: string) => add64(`${h}h`, `${h}l`, `${h}h`, `${h}l`, yHigh, yLow);
-
   return [
     `sigmaHigh = ${s1h};`,
     `sigmaLow = ${s1l};`,
-    ...addToH("sigmaHigh", "sigmaLow"),
-    `sigmaHigh = ${g}h ^ (${e}h & (${f}h ^ ${g}h));`,
-    `sigmaLow = ${g}l ^ (${e}l & (${f}l ^ ${g}l));`,
-    ...addToH("sigmaHigh", "sigmaLow"),
-    ...addToH(`K512[2 * (${t})]`, `K512[2 * (${t}) + 1]`),
-    ...addToH(`WH[${t}]`, `WL[${t}]`),
-    ...add64(`${d}h`, `${d}l`, `${d}h`, `${d}l`, `${h}h`, `${h}l`),
+    `sum = (${h}l >>> 0) + (K512[2 * (${t}) + 1] >>> 0) + (WL[${t}] >>> 0);`,
+    `sum += ((${g}l ^ (${e}l & (${f}l ^ ${g}l))) >>> 0) + (sigmaLow >>> 0);`,
+    `carry = (${h}h + K512[2 * (${t})] + WH[${t}] + (${g}h ^ (${e}h & (${f}h ^ ${g}h))) + sigmaHigh) | 0;`,
+    `low = (${d}l >>> 0) + sum;`,
+    `${d}h = (${d}h + carry + ((low / TWO_32) | 0)) | 0;`,
+    `${d}l = low | 0;`,
     `sigmaHigh = ${s0h};`,
     `sigmaLow = ${s0l};`,
-    ...addToH("sigmaHigh", "sigmaLow"),
-    `sigmaHigh = (${a}h & ${b}h) | (${c}h & (${a}h | ${b}h));`,
-    `sigmaLow = (${a}l & ${b}l) | (${c}l & (${a}l | ${b}l));`,
-    ...addToH("sigmaHigh", "sigmaLow"),
+    `low = sum + (((${a}l & ${b}l) | (${c}l & (${a}l | ${b}l))) >>> 0) + (sigmaLow >>> 0);`,
+    `${h}h = (carry + ((${a}h & ${b}h) | (${c}h & (${a}h | ${b}h))) + sigmaHigh + ((low / TWO_32) | 0)) | 0;`,
+    `${h}l = low | 0;`,
   ];
 }
 
@@ -578,8 +577,7 @@ function block512(): string[] {
 
   return [
     "// The SHA-512 compression function on 32 words, the (high, low) halves of the 16 message words:",
-    "// out = init + rounds(w[offset .. offset + 32]); init and out may be the same array. The 64-bit",
-    "// additions carry between the halves with integer operations only.",
+    "// out = init + rounds(w[offset .. offset + 32]); init and out may be the same array.",
     ...func("block512", ["init: Int32Array", "w: Int32Array", "offset: number", "out: Int32Array"], true, body),
   ];
 }
@@ -654,6 +652,19 @@ function sha2(): string {
       "const XL = new Int32Array(80);",
       "",
       "const HALF = new Int32Array(48);",
+    ],
+    [
+      "// The words of the last blocks compressed, zeroed by the operations that compress keys or secrets:",
+      "// the SHA-512 schedule after one-lane SHA-512, everything after the two-lane compressions.",
+      ...func("wipeSchedule512", [], true, ["WH.fill(0);", "WL.fill(0);"]),
+      "",
+      ...func("wipeSchedules", [], true, [
+        "WH.fill(0);",
+        "WL.fill(0);",
+        "XH.fill(0);",
+        "XL.fill(0);",
+        "HALF.fill(0);",
+      ]),
     ],
     block256(),
     block256x2(k256),
@@ -855,14 +866,9 @@ function blake2sG([a, b, c, d]: readonly string[], x: string, y: string): string
   ];
 }
 
-// The 64-bit (high, low) = (high, low) + (yHigh, yLow), with the carry of the low halves from an
-// unsigned comparison of the new low half with one of the old ones.
-function add64Compare(name: string, yHigh: string, yLow: string): string[] {
-  return [
-    `sum = (${name}l + ${yLow}) | 0;`,
-    `${name}h = (${name}h + ${yHigh} + ((sum >>> 0) < (${yLow} >>> 0) ? 1 : 0)) | 0;`,
-    `${name}l = sum;`,
-  ];
+// The 64-bit (high, low) = (high, low) + (yHigh, yLow) of add64.
+function addTo64(name: string, yHigh: string, yLow: string): string[] {
+  return add64(`${name}h`, `${name}l`, `${name}h`, `${name}l`, yHigh, yLow);
 }
 
 // d = (d ^ a) rotated right by n, or b = (b ^ c), on (high, low) halves.
@@ -878,31 +884,32 @@ function xorRotate64(target: string, other: string, n: number): string[] {
 
 function blake2bG([a, b, c, d]: readonly string[], x: string, y: string): string[] {
   return [
-    ...add64Compare(a, `${b}h`, `${b}l`),
-    ...add64Compare(a, `${x}h`, `${x}l`),
+    ...addTo64(a, `${b}h`, `${b}l`),
+    ...addTo64(a, `${x}h`, `${x}l`),
     ...xorRotate64(d, a, 32),
-    ...add64Compare(c, `${d}h`, `${d}l`),
+    ...addTo64(c, `${d}h`, `${d}l`),
     ...xorRotate64(b, c, 24),
-    ...add64Compare(a, `${b}h`, `${b}l`),
-    ...add64Compare(a, `${y}h`, `${y}l`),
+    ...addTo64(a, `${b}h`, `${b}l`),
+    ...addTo64(a, `${y}h`, `${y}l`),
     ...xorRotate64(d, a, 16),
-    ...add64Compare(c, `${d}h`, `${d}l`),
+    ...addTo64(c, `${d}h`, `${d}l`),
     ...xorRotate64(b, c, 63),
   ];
 }
 
-function blake2Rounds(rounds: number, g: (words: string[], x: string, y: string) => string[]): string[] {
-  return range(rounds).flatMap((r) =>
-    G_WORDS.flatMap((words, i) => {
-      const sigma = SIGMA[r % 10];
+// Rounds from to to - 1.
+function blake2Rounds(from: number, to: number, g: (words: string[], x: string, y: string) => string[]): string[] {
+  return range(to - from).flatMap((k) => {
+    const sigma = SIGMA[(from + k) % 10];
 
-      return g(
+    return G_WORDS.flatMap((words, i) =>
+      g(
         words.map((w) => `v${w}`),
         `m${sigma[2 * i]}`,
         `m${sigma[2 * i + 1]}`,
-      );
-    }),
-  );
+      ),
+    );
+  });
 }
 
 const BLAKE2_PARAMETERS = ["h: Int32Array", "data: Uint8Array", "offset: number", "counter: number", "last: number"];
@@ -918,7 +925,7 @@ function blake2s(): string[] {
     `let v14 = ${iv[6]} ^ last;`,
     `let v15 = ${iv[7]};`,
     ...range(16).map((i) => `const m${i} = ${wordAt(4 * i)};`),
-    ...blake2Rounds(10, blake2sG),
+    ...blake2Rounds(0, 10, blake2sG),
     ...range(8).map((i) => `h[${i}] ^= v${i} ^ v${i + 8};`),
   ];
 
@@ -935,7 +942,9 @@ function blake2b(): string[] {
 
   const halves = (i: number, high: string, low: string) => [`let v${i}h = ${high};`, `let v${i}l = ${low};`];
 
-  const body: Statement[] = [
+  const temporaries = ["let sum = 0;", "let x = 0;", "let y = 0;"];
+
+  const low: Statement[] = [
     ...range(8).flatMap((i) => halves(i, `h[${2 * i + 1}] | 0`, `h[${2 * i}] | 0`)),
     ...range(4).flatMap((i) => halves(8 + i, iv[i][0], iv[i][1])),
     ...halves(12, `${iv[4][0]} ^ ((counter / TWO_32) | 0)`, `${iv[4][1]} ^ (counter | 0)`),
@@ -943,23 +952,57 @@ function blake2b(): string[] {
     ...halves(14, `${iv[6][0]} ^ last`, `${iv[6][1]} ^ last`),
     ...halves(15, iv[7][0], iv[7][1]),
     ...range(16).flatMap((i) => [`const m${i}l = ${wordAt(8 * i)};`, `const m${i}h = ${wordAt(8 * i + 4)};`]),
-    "let sum = 0;",
-    "let x = 0;",
-    "let y = 0;",
-    ...blake2Rounds(12, blake2bG),
+    ...range(16).flatMap((i) => [`WORDS[${2 * i}] = m${i}l;`, `WORDS[${2 * i + 1}] = m${i}h;`]),
+    ...temporaries,
+    ...blake2Rounds(0, 6, blake2bG),
+    ...range(16).flatMap((i) => [`WORK[${2 * i}] = v${i}l;`, `WORK[${2 * i + 1}] = v${i}h;`]),
+  ];
+
+  const high: Statement[] = [
+    ...range(16).flatMap((i) => halves(i, `WORK[${2 * i + 1}]`, `WORK[${2 * i}]`)),
+    ...range(16).flatMap((i) => [`const m${i}l = WORDS[${2 * i}];`, `const m${i}h = WORDS[${2 * i + 1}];`]),
+    ...temporaries,
+    ...blake2Rounds(6, 12, blake2bG),
     ...range(8).flatMap((i) => [`h[${2 * i}] ^= v${i}l ^ v${i + 8}l;`, `h[${2 * i + 1}] ^= v${i}h ^ v${i + 8}h;`]),
+    ...range(32).map((i) => `WORK[${i}] = 0;`),
+    ...range(32).map((i) => `WORDS[${i}] = 0;`),
   ];
 
   return [
+    "// Rounds 0 to 5 of blake2bCompress, which leave the working vector in WORK and the message words in",
+    "// WORDS.",
+    ...func("blake2bLow", BLAKE2_PARAMETERS, false, low),
+    "",
+    "// Rounds 6 to 11 of blake2bCompress from WORK and WORDS, then the new chaining value. Both are zeroed",
+    "// with stores, which cost less here than fill, as they may hold a key block or a keyed state.",
+    ...func("blake2bHigh", ["h: Int32Array"], false, high),
+    "",
     "// The BLAKE2b compression of the 128-byte block at data[offset] into the chaining value h, whose",
     "// 64-bit words are (low, high) pairs of 32-bit halves, with the counter t (below 2^53) and last = -1",
-    "// for the final block, else 0. The 64-bit additions carry with an unsigned comparison.",
-    ...func("blake2bCompress", BLAKE2_PARAMETERS, true, body),
+    "// for the final block, else 0. The rounds are unrolled in two halves, since one function would pass",
+    "// the 60 KB of bytecode above which V8 stops optimizing it, and the 64-bit additions carry with",
+    "// integer operations only: a comparison would compile to a branch on the data.",
+    ...func("blake2bCompress", BLAKE2_PARAMETERS, true, [
+      "blake2bLow(h, data, offset, counter, last);",
+      "blake2bHigh(h);",
+    ]),
   ];
 }
 
 function blake2(): string {
-  return module([["const TWO_32 = 0x100000000;"], blake2s(), blake2b()]);
+  return module([
+    [
+      "const TWO_32 = 0x100000000;",
+      "",
+      "// The working vector of blake2bCompress between its halves and the message words of its block, as",
+      "// (low, high) pairs.",
+      "const WORK = new Int32Array(32);",
+      "",
+      "const WORDS = new Int32Array(32);",
+    ],
+    blake2s(),
+    blake2b(),
+  ]);
 }
 
 // Ascon-p[12] (NIST SP 800-232, 3) on a bit-interleaved state: the 64-bit word x_i is s[2i], holding

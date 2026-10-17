@@ -623,56 +623,86 @@ test("no secret stays in WebAssembly memory", () => {
   });
 });
 
-// An input whose length property says less than it holds is copied only as far as it says: the
-// regions next to it, the library's own memory and later calls stay intact.
-test("inputs that misreport their length stay in their regions", () => {
+// An input whose length property says something other than what it holds is read at the length it
+// holds: the library takes length, offset and buffer from the array's internal slots. A lie neither
+// cuts an input short nor reaches into the regions next to it, the library's own memory or later
+// calls, and a size the library refuses is refused whatever the property claims.
+test("inputs that misreport their length are read at their real length", () => {
   onWasm(() => {
-    const forged = (size: number, claimed: number) => {
-      const data = new Uint8Array(size).fill(0xa5);
+    const honest = (size: number) => new Uint8Array(size).fill(0xa5);
 
-      Object.defineProperty(data, "length", { value: claimed });
+    const lie = (data: Uint8Array, claimed: number) => {
+      const copy = data.slice();
 
-      return data;
+      Object.defineProperty(copy, "length", { value: claimed });
+
+      return copy;
+    };
+
+    const forged = (size: number, claimed: number) => lie(honest(size), claimed);
+
+    const sameAsHonest = (name: string, run: (make: typeof forged) => Uint8Array) => {
+      assert.equal(toHex(run(forged)), toHex(run((size) => honest(size))), name);
     };
 
     const abc = Uint8Array.of(0x61, 0x62, 0x63);
 
     const expected = toHex(pq.SHA_256.digest(abc));
 
-    pq.SHA_256.digest(forged(100000, 5));
+    sameAsHonest("SHA-256", (make) => pq.SHA_256.digest(make(100000, 5)));
 
-    pq.SHA3_256.create().update(forged(70000, 3)).digest();
+    sameAsHonest("SHA-256 of an input that claims more", (make) => pq.SHA_256.digest(make(100, 100000)));
 
-    pq.SHAKE128.create().update(forged(70000, 40000)).read(10);
+    sameAsHonest("SHA3-256", (make) => pq.SHA3_256.create().update(make(70000, 3)).digest());
 
-    pq.HMAC_SHA_256.digest(forged(5000, 2), forged(100000, 1));
+    sameAsHonest("SHAKE128", (make) => pq.SHAKE128.create().update(make(70000, 40000)).read(10));
 
-    pq.KMAC128.configure({ customization: forged(1000, 3) }).digest(forged(5000, 2), forged(100000, 1));
+    sameAsHonest("HMAC-SHA-256", (make) => pq.HMAC_SHA_256.digest(make(5000, 2), make(100000, 1)));
 
-    pq.BLAKE2B_MAC.configure({ salt: forged(1000, 16) }).create(forged(5000, 64)).update(forged(70000, 9)).digest();
+    sameAsHonest("KMAC128", (make) =>
+      pq.KMAC128.configure({ customization: make(1000, 3) }).digest(make(5000, 2), make(100000, 1)),
+    );
 
-    pq.HKDF_SHA_256.derive(forged(5000, 3), 32, { salt: forged(1000, 1), info: forged(100000, 2) });
+    sameAsHonest("BLAKE2b-MAC", (make) =>
+      pq.BLAKE2B_MAC.configure({ salt: make(16, 1000) }).create(make(64, 5)).update(make(70000, 9)).digest(),
+    );
+
+    sameAsHonest("HKDF-SHA-256", (make) =>
+      pq.HKDF_SHA_256.derive(make(5000, 3), 32, { salt: make(1000, 1), info: make(100000, 2) }),
+    );
+
+    throwsCode("INVALID_OPTION", () => pq.BLAKE2B_MAC.configure({ salt: forged(1000, 16) }));
+
+    throwsCode("INVALID_LENGTH", () => pq.BLAKE2B_MAC.create(forged(5000, 64)));
 
     const pair = pq.ML_DSA_44.generateKeyPair();
 
-    const options = { context: forged(1000, 1) };
+    const signature = pair.privateKey.sign(forged(100000, 4), { context: forged(200, 1) });
 
-    const signature = pair.privateKey.sign(forged(100000, 4), options);
+    assert.ok(pair.publicKey.verify(signature, honest(100000), { context: honest(200) }));
 
-    assert.ok(pair.publicKey.verify(signature, forged(100000, 4), options));
+    assert.ok(pair.publicKey.verify(lie(signature, 9), forged(100000, 4), { context: forged(200, 1) }));
+
+    throwsCode("INVALID_CONTEXT", () => pair.privateKey.sign(honest(10), { context: forged(1000, 1) }));
 
     const kem = pq.ML_KEM_512.generateKeyPair();
 
-    throwsCode("INVALID_LENGTH", () => kem.privateKey.decapsulate(forged(5000, 767)));
+    const { ciphertext, sharedSecret } = kem.publicKey.encapsulate();
 
-    assert.equal(kem.privateKey.decapsulate(forged(5000, 768)).length, 32);
+    assert.equal(toHex(kem.privateKey.decapsulate(lie(ciphertext, 767))), toHex(sharedSecret));
+
+    throwsCode("INVALID_LENGTH", () => kem.privateKey.decapsulate(forged(5000, 768)));
 
     const hss = hazmat.generateStatefulKeyPair(pq.HSS_LMS, random(40), {
       parameters: H5,
       stateStore: new MemoryStore(),
     });
 
-    assert.ok(hss.publicKey.verify(hss.privateKey.sign(forged(100000, 2)), forged(100000, 2)));
+    const hssSignature = hss.privateKey.sign(forged(100000, 2));
+
+    assert.ok(hss.publicKey.verify(hssSignature, honest(100000)));
+
+    assert.ok(hss.publicKey.verify(lie(hssSignature, 3), forged(100000, 2)));
 
     assert.ok(FAMILIES.every((family) => family.core().live));
 

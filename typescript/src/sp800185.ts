@@ -27,19 +27,18 @@ function leftEncodeInto(value: number, out: Uint8Array, offset: number): number 
   return offset + count + 1;
 }
 
-// right_encode(value) (2.3.1): the bytes big-endian, at least one, then their count.
-export function rightEncode(value: number): Uint8Array {
-  const scratch = new Uint8Array(9);
+// right_encode(value) (2.3.1) at out[offset], returning the offset after it: the bytes big-endian, at
+// least one, then their count.
+function rightEncodeInto(value: number, out: Uint8Array, offset: number): number {
+  const end = leftEncodeInto(value, out, offset);
 
-  const end = leftEncodeInto(value, scratch, 0);
+  const count = out[offset];
 
-  const out = new Uint8Array(end);
+  out.copyWithin(offset, offset + 1, end);
 
-  out.set(scratch.subarray(1, end));
+  out[end - 1] = count;
 
-  out[end - 1] = scratch[0];
-
-  return out;
+  return end;
 }
 
 const HEADER = new Uint8Array(20);
@@ -122,13 +121,13 @@ export function kmacDigest(
 
   absorbPadded(s, rate, key, null);
 
-  HEADER.fill(0);
-
   let position = absorbBytes(s, rate, 0, data, 0, data.length);
 
-  const encodedLength = rightEncode(xof ? 0 : 8 * length);
+  const end = rightEncodeInto(xof ? 0 : 8 * length, HEADER, 0);
 
-  position = absorbBytes(s, rate, position, encodedLength, 0, encodedLength.length);
+  position = absorbBytes(s, rate, position, HEADER, 0, end);
+
+  HEADER.fill(0);
 
   const out = new Uint8Array(length);
 
@@ -170,7 +169,9 @@ export class Kmac {
   digest(): Uint8Array {
     const sponge = this.#sponge.copy();
 
-    sponge.update(rightEncode(this.#xof ? 0 : 8 * this.#length));
+    const encoded = new Uint8Array(9);
+
+    sponge.update(encoded.subarray(0, rightEncodeInto(this.#xof ? 0 : 8 * this.#length, encoded, 0)));
 
     return sponge.read(this.#length);
   }

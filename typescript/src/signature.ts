@@ -1,4 +1,4 @@
-import { bytes, concat, equal, wipe } from "./bytes.ts";
+import { bytes, checkBytes, concat, equal, wipe } from "./bytes.ts";
 import { type KeyFormat, OBJECT_IDENTIFIER, element, objectIdentifier } from "./encoding.ts";
 import { CryptoPQError } from "./errors.ts";
 import { ML_DSA, SLH_DSA } from "./families.ts";
@@ -167,11 +167,8 @@ function preHashEntry(value: unknown): PreHash | null {
   return entry;
 }
 
-function contextOf(value: VerifyOptions | undefined): [Uint8Array, PreHash | null] {
-  const { context = new Uint8Array(), preHash } = readOptions(value);
-
-  return [bytes(context, "context"), preHashEntry(preHash)];
-}
+// An absent context, which every call shares: it has no bytes to change.
+const NO_CONTEXT = new Uint8Array(0);
 
 // A pre-hash must give at least the collision strength of the signature (FIPS 204, 5.4, and
 // FIPS 205, 10.2): signing with a weaker one is refused and verification fails closed.
@@ -302,7 +299,7 @@ function wasmEngine(family: Family, id: number, sizes: SignatureSizes, invalid: 
 
       const size = slot.bytes.length;
 
-      return core.run(PUBLIC, [size, signature.length, message.length, context.length], ([key, s, m, c]) => {
+      return core.run(PUBLIC, [size, signature.length, message.length, context.length], (key, s, m, c) => {
         slot.load(core, key);
 
         core.write(s, signature);
@@ -343,7 +340,7 @@ function wasmEngine(family: Family, id: number, sizes: SignatureSizes, invalid: 
     const exported = (which: number, length: number) => {
       const core = family.core();
 
-      return core.run(SECRET, [size, length], ([key, out]) => {
+      return core.run(SECRET, [size, length], (key, out) => {
         slot.load(core, key);
 
         check(core.x.cpq_sig_export_private(key, size, which, out, length));
@@ -362,7 +359,7 @@ function wasmEngine(family: Family, id: number, sizes: SignatureSizes, invalid: 
 
         const regions = [size, message.length, context.length, length, sizes.signatureSize];
 
-        return core.run(SECRET, regions, ([key, m, c, r, signature]) => {
+        return core.run(SECRET, regions, (key, m, c, r, signature) => {
           slot.load(core, key);
 
           core.write(m, message);
@@ -408,7 +405,7 @@ function wasmEngine(family: Family, id: number, sizes: SignatureSizes, invalid: 
 
     const publicSize = core.size(PUBLIC_SLOT, id);
 
-    return core.run(PUBLIC, [publicSize, pk.length], ([publicSlot, input]) => {
+    return core.run(PUBLIC, [publicSize, pk.length], (publicSlot, input) => {
       core.write(input, pk);
 
       check(core.x.cpq_sig_import_public(id, input, pk.length, publicSlot, publicSize));
@@ -432,9 +429,14 @@ function wasmEngine(family: Family, id: number, sizes: SignatureSizes, invalid: 
 
   // The key made in the private slot at key: its public slot, made at public, and the public key,
   // exported at raw.
-  const created = (core: Core, at: readonly number[], seeded: boolean, filled: boolean): NewKey => {
-    const [key, publicSlot, raw] = at;
-
+  const created = (
+    core: Core,
+    key: number,
+    publicSlot: number,
+    raw: number,
+    seeded: boolean,
+    filled: boolean,
+  ): NewKey => {
     const privateSize = core.size(PRIVATE_SLOT, id);
 
     const publicSize = core.size(PUBLIC_SLOT, id);
@@ -457,9 +459,7 @@ function wasmEngine(family: Family, id: number, sizes: SignatureSizes, invalid: 
       const core = family.core();
 
       try {
-        return core.run(SECRET, [...slots(core), sizes.seedSize], (at) => {
-          const [key, , , s] = at;
-
+        return core.run(SECRET, [...slots(core), sizes.seedSize], (key, publicSlot, raw, s) => {
           if (seed === null) {
             core.random(s, sizes.seedSize);
           } else {
@@ -468,7 +468,7 @@ function wasmEngine(family: Family, id: number, sizes: SignatureSizes, invalid: 
 
           check(core.x.cpq_sig_keygen(id, s, sizes.seedSize, fill ? FILL_CACHE : 0, key, core.size(PRIVATE_SLOT, id)));
 
-          return created(core, at, mlDsaKey, fill);
+          return created(core, key, publicSlot, raw, mlDsaKey, fill);
         });
       } finally {
         seed?.fill(0);
@@ -478,16 +478,14 @@ function wasmEngine(family: Family, id: number, sizes: SignatureSizes, invalid: 
       const core = family.core();
 
       try {
-        return core.run(SECRET, [...slots(core), sk.length], (at) => {
-          const [key, , , input] = at;
-
+        return core.run(SECRET, [...slots(core), sk.length], (key, publicSlot, raw, input) => {
           core.write(input, sk);
 
           const status = core.x.cpq_sig_import_private(id, input, sk.length, key, core.size(PRIVATE_SLOT, id));
 
           check(status, { INVALID_PRIVATE_KEY: invalid });
 
-          return created(core, at, false, false);
+          return created(core, key, publicSlot, raw, false, false);
         });
       } finally {
         sk.fill(0);
@@ -600,12 +598,21 @@ export class SignaturePublicKey {
     );
   }
 
+  // The inputs are read once the option getters, caller code that may change them, have run.
   #verify(signature: Uint8Array, message: Uint8Array, value: VerifyOptions | undefined, policy: boolean): boolean {
+    checkBytes(signature, "signature");
+
+    checkBytes(message, "message");
+
+    const { context: given = NO_CONTEXT, preHash } = readOptions(value);
+
     const data = bytes(signature, "signature");
 
     const text = bytes(message, "message");
 
-    const [context, entry] = contextOf(value);
+    const context = bytes(given, "context");
+
+    const entry = preHashEntry(preHash);
 
     const backend = backendOf(this.algorithm);
 
@@ -669,11 +676,18 @@ export class SignaturePrivateKey {
     }
   }
 
+  // The message is read once the option getters, caller code that may change it, have run.
   #sign(message: Uint8Array, randomness: Randomness, value: SignOptions | undefined, policy: boolean): Uint8Array {
     try {
+      checkBytes(message, "message");
+
+      const { context: given = NO_CONTEXT, preHash } = readOptions(value);
+
       const text = bytes(message, "message");
 
-      const [context, entry] = contextOf(value);
+      const context = bytes(given, "context");
+
+      const entry = preHashEntry(preHash);
 
       const backend = backendOf(this.algorithm);
 

@@ -1,6 +1,6 @@
 import { Blocks } from "./blocks.ts";
 import { readUint32, writeUint32 } from "./bytes.ts";
-import { block256, block512 } from "./sha2-rounds.ts";
+import { block256, block512, wipeSchedule512, wipeSchedules } from "./sha2-rounds.ts";
 
 export const IV_224 = Int32Array.of(
   0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4,
@@ -36,25 +36,25 @@ const TAIL = new Uint8Array(256);
 const WORDS = new Int32Array(32);
 
 // The state of a one-shot digest, cleared after each: a digest runs to its end without calling
-// out, so one serves every call.
+// out, so one serves every call. HMAC also keeps its padded key and inner hash here.
 const STATE = new Int32Array(16);
 
-// The digest of a whole message without an engine: its whole blocks are compressed where they
-// are, and only its end goes into the tail with the padding, as in Sha2.digest.
-function oneShot(
-  iv: Int32Array,
-  size: number,
+const PAD = new Uint8Array(128);
+
+const INNER = new Uint8Array(64);
+
+// Hashes the first length bytes of data into state, which holds the chaining value after prefix
+// bytes: its whole blocks are compressed where they are, and only its end goes into the tail with
+// the padding and the total length, as in Sha2.digest.
+function absorbFinal(
+  state: Int32Array,
   block: number,
   compress: (state: Int32Array, data: Uint8Array, offset: number) => void,
   data: Uint8Array,
-): Uint8Array {
-  const state = STATE;
-
-  const length = data.length;
-
+  length: number,
+  prefix: number,
+): void {
   const whole = length - (length % block);
-
-  state.set(iv);
 
   for (let offset = 0; offset < whole; offset += block) {
     compress(state, data, offset);
@@ -74,21 +74,44 @@ function oneShot(
 
   tail.fill(0, buffered + 1, end - 8);
 
-  writeUint32(tail, end - 8, Math.floor(length / 0x20000000));
+  const total = prefix + length;
 
-  writeUint32(tail, end - 4, (length % 0x20000000) * 8);
+  writeUint32(tail, end - 8, Math.floor(total / 0x20000000));
+
+  writeUint32(tail, end - 4, (total % 0x20000000) * 8);
 
   for (let offset = 0; offset < end; offset += block) {
     compress(state, tail, offset);
   }
 
   tail.fill(0, 0, end);
+}
 
+function output(state: Int32Array, size: number): Uint8Array {
   const out = new Uint8Array(size);
 
   for (let i = 0; i < size; i++) {
     out[i] = state[i >>> 2] >>> (24 - 8 * (i & 3));
   }
+
+  return out;
+}
+
+// The digest of a whole message without an engine.
+function oneShot(
+  iv: Int32Array,
+  size: number,
+  block: number,
+  compress: (state: Int32Array, data: Uint8Array, offset: number) => void,
+  data: Uint8Array,
+): Uint8Array {
+  const state = STATE;
+
+  state.set(iv);
+
+  absorbFinal(state, block, compress, data, data.length, 0);
+
+  const out = output(state, size);
 
   state.fill(0);
 
@@ -101,6 +124,86 @@ export function digest256(iv: Int32Array, size: number, data: Uint8Array): Uint8
 
 export function digest512(iv: Int32Array, size: number, data: Uint8Array): Uint8Array {
   return oneShot(iv, size, 128, compress512, data);
+}
+
+// HMAC (RFC 2104) of data with the SHA-2 function of iv and size, without an engine: the padded key
+// blocks and both hashes run in the shared scratch, which is cleared before it returns.
+export function hmacDigest(iv: Int32Array, size: number, key: Uint8Array, data: Uint8Array): Uint8Array {
+  const block = iv.length === 8 ? 64 : 128;
+
+  const compress = block === 64 ? compress256 : compress512;
+
+  const pad = PAD;
+
+  const state = STATE;
+
+  pad.fill(0);
+
+  if (key.length > block) {
+    const hashed = oneShot(iv, size, block, compress, key);
+
+    pad.set(hashed);
+
+    hashed.fill(0);
+  } else {
+    for (let i = 0; i < key.length; i++) {
+      pad[i] = key[i];
+    }
+  }
+
+  for (let i = 0; i < block; i++) {
+    pad[i] ^= 0x36;
+  }
+
+  state.set(iv);
+
+  compress(state, pad, 0);
+
+  absorbFinal(state, block, compress, data, data.length, block);
+
+  for (let i = 0; i < size; i++) {
+    INNER[i] = state[i >>> 2] >>> (24 - 8 * (i & 3));
+  }
+
+  for (let i = 0; i < block; i++) {
+    pad[i] ^= 0x36 ^ 0x5c;
+  }
+
+  state.set(iv);
+
+  compress(state, pad, 0);
+
+  absorbFinal(state, block, compress, INNER, size, block);
+
+  const out = output(state, size);
+
+  state.fill(0);
+
+  pad.fill(0);
+
+  INNER.fill(0);
+
+  wipeSha2(block === 128);
+
+  return out;
+}
+
+// After keyed or secret input: the message words of the last block compressed and, when wide, the
+// SHA-512 message schedule, which hold words of that block.
+export function wipeSha2(wide: boolean): void {
+  WORDS.fill(0);
+
+  if (wide) {
+    wipeSchedule512();
+  }
+}
+
+// After hash-based signing, whose two-lane compressions also leave words in the two-lane schedules
+// and halves.
+export function wipeSha2Lanes(): void {
+  WORDS.fill(0);
+
+  wipeSchedules();
 }
 
 export function compress256(state: Int32Array, data: Uint8Array, offset: number): void {

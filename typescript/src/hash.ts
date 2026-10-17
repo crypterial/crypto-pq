@@ -31,6 +31,8 @@ import {
   Sha512,
   digest256,
   digest512,
+  hmacDigest,
+  wipeSha2,
 } from "./sha2.ts";
 import { Kmac, cshake, cshakeDigest, cshakePrefix, kmacDigest, kmacPrefix } from "./sp800185.ts";
 import { type Core, HASHING, OK, REJECTED, check } from "./wasm.ts";
@@ -192,13 +194,18 @@ function macState(engine: HashState): MacState {
   };
 }
 
-function jsHmac(inner: Engine, outer: Engine): MacState {
+// wide: SHA-384 and SHA-512, whose message schedule wipeSha2 also clears.
+function jsHmac(inner: Engine, outer: Engine, wide: boolean): MacState {
   const digest = () => {
     const copy = outer.copy();
 
     copy.update(inner.digest());
 
-    return copy.digest();
+    const tag = copy.digest();
+
+    wipeSha2(wide);
+
+    return tag;
   };
 
   return { update: (data) => inner.update(data), digest, verify: (tag) => equal(digest(), tag) };
@@ -225,15 +232,9 @@ function optionsOf<T extends object>(value: T | undefined): Partial<T> {
   return value;
 }
 
-// A view of exactly the length that the value reports, which configure copies.
+// An option's bytes through the input boundary, which configure copies.
 function optionBytes(value: unknown, name: string): Uint8Array {
-  if (value === undefined) {
-    return EMPTY;
-  }
-
-  const data = bytes(value, name);
-
-  return data.subarray(0, data.length);
+  return value === undefined ? EMPTY : bytes(value, name);
 }
 
 function invalidOption(message: string): CryptoPQError {
@@ -286,7 +287,7 @@ class WasmState {
     if (this.#length + data.length <= GATHER) {
       this.#gathered ??= new Uint8Array(GATHER);
 
-      this.#gathered.set(data.subarray(0, data.length), this.#length);
+      this.#gathered.set(data, this.#length);
 
       this.#length += data.length;
     } else {
@@ -298,7 +299,7 @@ class WasmState {
   run<T>(
     data: Uint8Array,
     lengths: readonly number[],
-    body: (core: Core, slot: number, size: number, at: number[]) => T,
+    body: (core: Core, slot: number, size: number, ...at: number[]) => T,
   ): T {
     const core = X_WING_HASH.core();
 
@@ -313,14 +314,14 @@ class WasmState {
     }
 
     try {
-      return core.run(HASHING, [state.length, input, ...lengths], ([slot, at, ...rest]) => {
+      return core.run(HASHING, [state.length, input, ...lengths], (slot, at, ...rest) => {
         core.write(slot, state);
 
         for (const part of [gathered, data]) {
           pieces(core, at, part, (length) => check(core.x[this.#absorb](slot, state.length, at, length)));
         }
 
-        const result = body(core, slot, state.length, rest);
+        const result = body(core, slot, state.length, ...rest);
 
         state.set(core.bytes().subarray(slot, slot + state.length));
 
@@ -349,7 +350,7 @@ function created(
 
   const size = core.size(type, id);
 
-  return core.run(HASHING, [size, ...lengths], ([slot, ...at]) => {
+  return core.run(HASHING, [size, ...lengths], (slot, ...at) => {
     check(init(core, slot, size, at));
 
     return core.read(slot, size);
@@ -438,7 +439,7 @@ function wasmHash(state: Uint8Array, size: number): HashState {
   return {
     update: (data) => wasm.update(data),
     digest: () =>
-      wasm.run(EMPTY, [size], (core, slot, length, [out]) => {
+      wasm.run(EMPTY, [size], (core, slot, length, out) => {
         check(core.x.cpq_hash_final(slot, length, out, size));
 
         return core.read(out, size);
@@ -464,7 +465,7 @@ function wasmXof(state: Uint8Array): XofState {
     read(length) {
       reading ||= length > 0;
 
-      return wasm.run(EMPTY, [Math.min(length, PIECE)], (core, slot, size, [piece]) => {
+      return wasm.run(EMPTY, [Math.min(length, PIECE)], (core, slot, size, piece) => {
         const out = new Uint8Array(length);
 
         for (let offset = 0; offset < length; offset += PIECE) {
@@ -488,13 +489,13 @@ function wasmMac(state: Uint8Array, size: number): MacState {
   return {
     update: (data) => wasm.update(data),
     digest: () =>
-      wasm.run(EMPTY, [size], (core, slot, length, [out]) => {
+      wasm.run(EMPTY, [size], (core, slot, length, out) => {
         check(core.x.cpq_mac_final(slot, length, out, size));
 
         return core.read(out, size);
       }),
     verify: (tag) =>
-      wasm.run(EMPTY, [tag.length], (core, slot, length, [input]) => {
+      wasm.run(EMPTY, [tag.length], (core, slot, length, input) => {
         core.write(input, tag);
 
         return verified(core.x.cpq_mac_final_verify(slot, length, input, tag.length));
@@ -632,7 +633,7 @@ export class HashAlgorithm {
     if (configuration !== null) {
       const spec = configuration.slot;
 
-      return core.run(HASHING, [spec.length, input.length, digestSize], ([at, data, out]) => {
+      return core.run(HASHING, [spec.length, input.length, digestSize], (at, data, out) => {
         core.write(at, spec);
 
         core.write(data, input);
@@ -643,7 +644,7 @@ export class HashAlgorithm {
       });
     }
 
-    return core.run(HASHING, [input.length, digestSize], ([at, out]) => {
+    return core.run(HASHING, [input.length, digestSize], (at, out) => {
       core.write(at, input);
 
       check(core.x.cpq_hash(id, at, input.length, out, digestSize));
@@ -795,7 +796,7 @@ export class XofAlgorithm {
     if (configuration !== null) {
       const spec = configuration.slot;
 
-      return core.run(HASHING, [spec.length, input.length, length], ([at, data, out]) => {
+      return core.run(HASHING, [spec.length, input.length, length], (at, data, out) => {
         core.write(at, spec);
 
         core.write(data, input);
@@ -808,7 +809,7 @@ export class XofAlgorithm {
 
     const id = this.#spec.id;
 
-    return core.run(HASHING, [input.length, length], ([at, out]) => {
+    return core.run(HASHING, [input.length, length], (at, out) => {
       core.write(at, input);
 
       check(core.x.cpq_xof(id, at, input.length, out, length));
@@ -918,7 +919,9 @@ export class MacAlgorithm {
   digest(key: Uint8Array, data: Uint8Array): Uint8Array {
     const core = X_WING_HASH.select();
 
-    const [secret, input] = [this.#key(key), bytes(data, "data")];
+    const secret = this.#key(key);
+
+    const input = bytes(data, "data");
 
     return core === null ? this.#spec.digest(secret, input) : this.#wasmDigest(core, secret, input);
   }
@@ -937,7 +940,7 @@ export class MacAlgorithm {
 
       const lengths = [spec.length, secret.length, input.length, digestSize];
 
-      return core.run(HASHING, lengths, ([at, k, data, out]) => {
+      return core.run(HASHING, lengths, (at, k, data, out) => {
         core.write(at, spec);
 
         core.write(k, secret);
@@ -950,7 +953,7 @@ export class MacAlgorithm {
       });
     }
 
-    return core.run(HASHING, [secret.length, input.length, digestSize], ([k, at, out]) => {
+    return core.run(HASHING, [secret.length, input.length, digestSize], (k, at, out) => {
       core.write(k, secret);
 
       core.write(at, input);
@@ -1000,7 +1003,11 @@ export class MacAlgorithm {
   verify(key: Uint8Array, data: Uint8Array, tag: Uint8Array): boolean {
     const core = X_WING_HASH.select();
 
-    const [secret, input, expected] = [bytes(key, "key"), bytes(data, "data"), bytes(tag, "tag")];
+    const secret = bytes(key, "key");
+
+    const input = bytes(data, "data");
+
+    const expected = bytes(tag, "tag");
 
     if (!takes(this.#spec, secret) || expected.length !== this.digestSize) {
       return false;
@@ -1025,7 +1032,7 @@ export class MacAlgorithm {
 
       const lengths = [spec.length, secret.length, input.length, expected.length];
 
-      return core.run(HASHING, lengths, ([at, k, data, t]) => {
+      return core.run(HASHING, lengths, (at, k, data, t) => {
         core.write(at, spec);
 
         core.write(k, secret);
@@ -1042,7 +1049,7 @@ export class MacAlgorithm {
 
     const id = this.#spec.id;
 
-    return core.run(HASHING, [secret.length, input.length, expected.length], ([k, at, t]) => {
+    return core.run(HASHING, [secret.length, input.length, expected.length], (k, at, t) => {
       core.write(k, secret);
 
       core.write(at, input);
@@ -1268,19 +1275,14 @@ function asconXofSpec(id: number, kind: "ascon" | "cxof", initial: Uint32Array):
   };
 }
 
-function hmacSpec(hash: Spec): MacSpec {
+// iv is that of hash, whose one-shot HMAC runs without an engine.
+function hmacSpec(hash: Spec, iv: Int32Array): MacSpec {
   return {
     id: hash.id,
     kind: "hmac",
     digestSize: hash.digestSize,
     keyLimit: 0,
-    digest(key, data) {
-      const state = this.create(key);
-
-      state.update(data);
-
-      return state.digest();
-    },
+    digest: (key, data) => hmacDigest(iv, hash.digestSize, key, data),
     // The padded key is zeroed before returning; JavaScript cannot promise that no other copy remains.
     create(key) {
       const pad = new Uint8Array(hash.blockSize);
@@ -1313,7 +1315,11 @@ function hmacSpec(hash: Spec): MacSpec {
 
       pad.fill(0);
 
-      return jsHmac(inner, outer);
+      const wide = hash.blockSize === 128;
+
+      wipeSha2(wide);
+
+      return jsHmac(inner, outer, wide);
     },
   };
 }
@@ -1444,13 +1450,25 @@ export const ASCON_CXOF128 = /* @__PURE__ */ new XofAlgorithm(
   /* @__PURE__ */ asconXofSpec(5, "cxof", /* @__PURE__ */ customize(EMPTY)),
 );
 
-export const HMAC_SHA_224 = /* @__PURE__ */ new MacAlgorithm("HMAC-SHA-224", /* @__PURE__ */ hmacSpec(SHA_224_SPEC));
+export const HMAC_SHA_224 = /* @__PURE__ */ new MacAlgorithm(
+  "HMAC-SHA-224",
+  /* @__PURE__ */ hmacSpec(SHA_224_SPEC, IV_224),
+);
 
-export const HMAC_SHA_256 = /* @__PURE__ */ new MacAlgorithm("HMAC-SHA-256", /* @__PURE__ */ hmacSpec(SHA_256_SPEC));
+export const HMAC_SHA_256 = /* @__PURE__ */ new MacAlgorithm(
+  "HMAC-SHA-256",
+  /* @__PURE__ */ hmacSpec(SHA_256_SPEC, IV_256),
+);
 
-export const HMAC_SHA_384 = /* @__PURE__ */ new MacAlgorithm("HMAC-SHA-384", /* @__PURE__ */ hmacSpec(SHA_384_SPEC));
+export const HMAC_SHA_384 = /* @__PURE__ */ new MacAlgorithm(
+  "HMAC-SHA-384",
+  /* @__PURE__ */ hmacSpec(SHA_384_SPEC, IV_384),
+);
 
-export const HMAC_SHA_512 = /* @__PURE__ */ new MacAlgorithm("HMAC-SHA-512", /* @__PURE__ */ hmacSpec(SHA_512_SPEC));
+export const HMAC_SHA_512 = /* @__PURE__ */ new MacAlgorithm(
+  "HMAC-SHA-512",
+  /* @__PURE__ */ hmacSpec(SHA_512_SPEC, IV_512),
+);
 
 export const KMAC128 = /* @__PURE__ */ new MacAlgorithm("KMAC128", /* @__PURE__ */ kmacSpec(4, 168, 32, EMPTY, false));
 

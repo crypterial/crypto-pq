@@ -4,7 +4,7 @@ import { test } from "node:test";
 import * as hazmat from "../src/hazmat.ts";
 import * as pq from "../src/index.ts";
 import { LMS_TYPES, type LmsType, type OtsType, lmsSignatureSize, parsePublicKey } from "../src/lms.ts";
-import { MerkleTree } from "../src/merkle.ts";
+import { MerkleTree, type TreeHashes } from "../src/merkle.ts";
 import { sha256 } from "../src/primitives.ts";
 import { MemoryStore, SLOW, concat, hex, isCode, records, throwsCode, toHex, utf8 } from "./vectors.ts";
 
@@ -707,7 +707,20 @@ test("Merkle cache", () => {
   const combine = (z: number, j: number, left: Uint8Array, right: Uint8Array) =>
     sha256(Uint8Array.of(z), index32(j), left, right);
 
-  const tree = new MerkleTree(height, 32, leaf, combine);
+  const hashes: TreeHashes = {
+    leaf: (index, out, offset) => out.set(leaf(index), offset),
+    combine(z, first, count, children, from, out, offset) {
+      for (let j = 0; j < count; j++) {
+        const left = children.subarray(from + 64 * j, from + 64 * j + 32);
+
+        const right = children.subarray(from + 64 * j + 32, from + 64 * j + 64);
+
+        out.set(combine(z, first + j, left, right), offset + 32 * j);
+      }
+    },
+  };
+
+  const tree = new MerkleTree(height, 32, hashes);
 
   assert.equal(tree.low, 2);
 
@@ -738,11 +751,13 @@ test("Merkle cache", () => {
   for (const [index, rebuilt] of paths) {
     leaves = 0;
 
-    const path = tree.authPath(index);
+    const path = new Uint8Array(32 * height + 1).fill(0xa5);
+
+    tree.authPath(index, path, 0);
 
     assert.equal(leaves, rebuilt, `leaf ${index}`);
 
-    assert.equal(path.length, 32 * height);
+    assert.equal(path[32 * height], 0xa5, "the path stays within its 32 * height bytes");
 
     let node = sha256(index32(index));
 
@@ -757,12 +772,12 @@ test("Merkle cache", () => {
     assert.deepEqual(node, tree.root, `leaf ${index}`);
   }
 
-  const small = new MerkleTree(5, 32, leaf, combine);
+  const small = new MerkleTree(5, 32, hashes);
 
   leaves = 0;
 
   for (let index = 0; index < 32; index++) {
-    small.authPath(index);
+    small.authPath(index, new Uint8Array(32 * 5), 0);
   }
 
   assert.equal(leaves, 0);

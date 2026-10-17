@@ -1,11 +1,25 @@
-import { concat, equal } from "./bytes.ts";
+import { concat } from "./bytes.ts";
 import { invalid } from "./encoding.ts";
 
 export const CACHED_HEIGHT = 15;
 
-export type Leaf = (index: number) => Uint8Array;
+// The hashes of a tree's nodes, which write each node where the tree keeps it.
+export interface TreeHashes {
+  // Leaf index, into out[offset .. offset + n).
+  leaf(index: number, out: Uint8Array, offset: number): void;
 
-export type Combine = (z: number, j: number, left: Uint8Array, right: Uint8Array) => Uint8Array;
+  // The count nodes from index first on at height z + 1, into out from offset on, from their children,
+  // which lie in order from children[from] on.
+  combine(
+    z: number,
+    first: number,
+    count: number,
+    children: Uint8Array,
+    from: number,
+    out: Uint8Array,
+    offset: number,
+  ): void;
+}
 
 // The levels of a tree in a tree cache, from height low up: its number on its level or layer, and
 // each level's nodes left to right.
@@ -28,13 +42,16 @@ export function leavesComputed(): number {
   return computed;
 }
 
+// The parents that the check of a tree cache recomputes at a time.
+const CHECKED = 64;
+
 // A Merkle tree of n-byte nodes that keeps every node from height low = max(0, h - 15) upwards, one
 // buffer per level rather than one object per node, so that it holds fewer than 2^16 nodes whatever
 // its height. Building it computes every leaf once. Below low, an authentication path takes its
 // nodes from the 2^low-leaf subtree under the signed leaf; the tree keeps the last subtree it
 // rebuilt, so that consecutive leaves share one rebuild, and a tree of height 15 or less never
-// recomputes a leaf. The levels of a tree cache replace the build: every parent is recomputed from
-// its children, so only the nodes at height low are taken as given.
+// recomputes a leaf. The levels of a tree cache replace the build, and the tree keeps them: every
+// parent is recomputed from its children, so only the nodes at height low are taken as given.
 export class MerkleTree {
   readonly height: number;
 
@@ -53,20 +70,16 @@ export class MerkleTree {
 
   #chunk = -1;
 
-  readonly #leaf: Leaf;
+  readonly #hashes: TreeHashes;
 
-  readonly #combine: Combine;
-
-  constructor(height: number, n: number, leaf: Leaf, combine: Combine, levels?: readonly Uint8Array[]) {
+  constructor(height: number, n: number, hashes: TreeHashes, levels?: readonly Uint8Array[]) {
     this.height = height;
 
     this.low = Math.max(0, height - CACHED_HEIGHT);
 
     this.n = n;
 
-    this.#leaf = leaf;
-
-    this.#combine = combine;
+    this.#hashes = hashes;
 
     for (let z = 0; z < this.low; z++) {
       this.#bottom.push(new Uint8Array(2 ** (this.low - z) * n));
@@ -87,7 +100,7 @@ export class MerkleTree {
     let level = new Uint8Array(2 ** (this.height - this.low) * n);
 
     for (let chunk = 0; chunk < 2 ** (this.height - this.low); chunk++) {
-      level.set(this.#subtree(chunk), chunk * n);
+      this.#subtree(chunk, level, chunk * n);
     }
 
     this.#levels.push(level);
@@ -95,7 +108,7 @@ export class MerkleTree {
     for (let z = this.low; z < this.height; z++) {
       const parents = new Uint8Array(level.length / 2);
 
-      combineLevel(this.#combine, z, 0, level, parents, n);
+      this.#hashes.combine(z, 0, parents.length / n, level, 0, parents, 0);
 
       level = parents;
 
@@ -104,62 +117,77 @@ export class MerkleTree {
   }
 
   #restore(levels: readonly Uint8Array[]): void {
+    const n = this.n;
+
+    const scratch = new Uint8Array(CHECKED * n);
+
     for (let z = this.low; z < this.height; z++) {
-      const parents = new Uint8Array(levels[z - this.low].length / 2);
+      const parents = levels[z - this.low + 1];
 
-      combineLevel(this.#combine, z, 0, levels[z - this.low], parents, this.n);
+      const count = parents.length / n;
 
-      if (!equal(parents, levels[z - this.low + 1])) {
-        throw invalid("the tree cache holds a node that its children do not give");
+      for (let first = 0; first < count; first += CHECKED) {
+        const size = Math.min(CHECKED, count - first) * n;
+
+        this.#hashes.combine(z, first, size / n, levels[z - this.low], 2 * first * n, scratch, 0);
+
+        for (let i = 0; i < size; i++) {
+          if (scratch[i] !== parents[first * n + i]) {
+            throw invalid("the tree cache holds a node that its children do not give");
+          }
+        }
       }
     }
 
-    // Copies, so that the tree holds its own nodes rather than the whole cache.
-    this.#levels.push(...levels.map((level) => level.slice()));
+    this.#levels.push(...levels);
   }
 
-  // The node at height low over the leaves from chunk * 2^low on: the leaf itself when low is 0,
-  // and otherwise the root of the subtree that this rebuilds into #bottom.
-  #subtree(chunk: number): Uint8Array {
+  // The node at height low over the leaves from chunk * 2^low on, into out at offset: the leaf itself
+  // when low is 0, and otherwise the root of the subtree that this rebuilds into #bottom. Without
+  // out, only #bottom is rebuilt.
+  #subtree(chunk: number, out: Uint8Array | null, offset: number): void {
     const n = this.n;
 
     const low = this.low;
+
+    const hashes = this.#hashes;
 
     computed += 2 ** low;
 
     if (low === 0) {
-      return this.#leaf(chunk);
+      hashes.leaf(chunk, out as Uint8Array, offset);
+
+      return;
     }
 
     const bottom = this.#bottom;
 
-    const root = new Uint8Array(n);
-
     this.#chunk = -1;
 
     for (let i = 0; i < 2 ** low; i++) {
-      bottom[0].set(this.#leaf(chunk * 2 ** low + i), i * n);
+      hashes.leaf(chunk * 2 ** low + i, bottom[0], i * n);
     }
 
-    for (let z = 0; z < low; z++) {
-      combineLevel(this.#combine, z, chunk * 2 ** (low - z - 1), bottom[z], z + 1 < low ? bottom[z + 1] : root, n);
+    for (let z = 0; z + 1 < low; z++) {
+      hashes.combine(z, chunk * 2 ** (low - z - 1), 2 ** (low - z - 1), bottom[z], 0, bottom[z + 1], 0);
+    }
+
+    if (out !== null) {
+      hashes.combine(low - 1, chunk, 1, bottom[low - 1], 0, out, offset);
     }
 
     this.#chunk = chunk;
-
-    return root;
   }
 
-  // The siblings of the path from a leaf to the root, n bytes each, from height 0 up.
-  authPath(index: number): Uint8Array {
+  // The siblings of the path from a leaf to the root, n bytes each from height 0 up, into out from
+  // offset on.
+  authPath(index: number, out: Uint8Array, offset: number): void {
     const n = this.n;
 
     const low = this.low;
 
-    const path = new Uint8Array(this.height * n);
-
     if (low > 0 && index >>> low !== this.#chunk) {
-      this.#subtree(index >>> low);
+      this.#subtree(index >>> low, null, 0);
     }
 
     for (let z = 0; z < this.height; z++) {
@@ -170,33 +198,14 @@ export class MerkleTree {
       // Below low, nodes are numbered within the kept subtree.
       const position = z < low ? sibling & ((1 << (low - z)) - 1) : sibling;
 
-      path.set(level.subarray(position * n, (position + 1) * n), z * n);
+      for (let i = 0; i < n; i++) {
+        out[offset + z * n + i] = level[position * n + i];
+      }
     }
-
-    return path;
   }
 
   // The cached nodes as a tree cache lists them: level by level from height low, left to right.
   nodes(): Uint8Array {
     return concat(...this.#levels);
-  }
-}
-
-// Writes the parents of the nodes in children, which lie at height z, into parents; the first
-// parent has index first at height z + 1.
-function combineLevel(
-  combine: Combine,
-  z: number,
-  first: number,
-  children: Uint8Array,
-  parents: Uint8Array,
-  n: number,
-): void {
-  for (let j = 0; j < parents.length / n; j++) {
-    const left = children.subarray(2 * j * n, (2 * j + 1) * n);
-
-    const right = children.subarray((2 * j + 1) * n, (2 * j + 2) * n);
-
-    parents.set(combine(z, first + j, left, right), j * n);
   }
 }

@@ -49,6 +49,26 @@ const XL = new Int32Array(80);
 
 const HALF = new Int32Array(48);
 
+// The words of the last blocks compressed, zeroed by the operations that compress keys or secrets:
+// the SHA-512 schedule after one-lane SHA-512, everything after the two-lane compressions.
+export function wipeSchedule512(): void {
+  WH.fill(0);
+
+  WL.fill(0);
+}
+
+export function wipeSchedules(): void {
+  WH.fill(0);
+
+  WL.fill(0);
+
+  XH.fill(0);
+
+  XL.fill(0);
+
+  HALF.fill(0);
+}
+
 // The SHA-256 compression function on words: out = init + rounds(w[offset .. offset + 16]). init and
 // out may be the same array. The message schedule rolls through sixteen variables, which V8 keeps in
 // registers, instead of an array of 64 words.
@@ -1962,8 +1982,7 @@ export function block256x2(
 }
 
 // The SHA-512 compression function on 32 words, the (high, low) halves of the 16 message words:
-// out = init + rounds(w[offset .. offset + 32]); init and out may be the same array. The 64-bit
-// additions carry between the halves with integer operations only.
+// out = init + rounds(w[offset .. offset + 32]); init and out may be the same array.
 export function block512(init: Int32Array, w: Int32Array, offset: number, out: Int32Array): void {
   let sigmaHigh = 0;
 
@@ -2050,472 +2069,209 @@ export function block512(init: Int32Array, w: Int32Array, offset: number, out: I
 
     sigmaLow = ((el >>> 14) | (eh << 18)) ^ ((el >>> 18) | (eh << 14)) ^ ((eh >>> 9) | (el << 23));
 
-    sum = (hl + sigmaLow) | 0;
+    sum = (hl >>> 0) + (K512[2 * (t) + 1] >>> 0) + (WL[t] >>> 0);
 
-    hh = (hh + sigmaHigh + (((hl & sigmaLow) | ((hl | sigmaLow) & ~sum)) >>> 31)) | 0;
+    sum += ((gl ^ (el & (fl ^ gl))) >>> 0) + (sigmaLow >>> 0);
 
-    hl = sum;
+    carry = (hh + K512[2 * (t)] + WH[t] + (gh ^ (eh & (fh ^ gh))) + sigmaHigh) | 0;
 
-    sigmaHigh = gh ^ (eh & (fh ^ gh));
+    low = (dl >>> 0) + sum;
 
-    sigmaLow = gl ^ (el & (fl ^ gl));
+    dh = (dh + carry + ((low / TWO_32) | 0)) | 0;
 
-    sum = (hl + sigmaLow) | 0;
-
-    hh = (hh + sigmaHigh + (((hl & sigmaLow) | ((hl | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    hl = sum;
-
-    sum = (hl + K512[2 * (t) + 1]) | 0;
-
-    hh = (hh + K512[2 * (t)] + (((hl & K512[2 * (t) + 1]) | ((hl | K512[2 * (t) + 1]) & ~sum)) >>> 31)) | 0;
-
-    hl = sum;
-
-    sum = (hl + WL[t]) | 0;
-
-    hh = (hh + WH[t] + (((hl & WL[t]) | ((hl | WL[t]) & ~sum)) >>> 31)) | 0;
-
-    hl = sum;
-
-    sum = (dl + hl) | 0;
-
-    dh = (dh + hh + (((dl & hl) | ((dl | hl) & ~sum)) >>> 31)) | 0;
-
-    dl = sum;
+    dl = low | 0;
 
     sigmaHigh = ((ah >>> 28) | (al << 4)) ^ ((al >>> 2) | (ah << 30)) ^ ((al >>> 7) | (ah << 25));
 
     sigmaLow = ((al >>> 28) | (ah << 4)) ^ ((ah >>> 2) | (al << 30)) ^ ((ah >>> 7) | (al << 25));
 
-    sum = (hl + sigmaLow) | 0;
+    low = sum + (((al & bl) | (cl & (al | bl))) >>> 0) + (sigmaLow >>> 0);
 
-    hh = (hh + sigmaHigh + (((hl & sigmaLow) | ((hl | sigmaLow) & ~sum)) >>> 31)) | 0;
+    hh = (carry + ((ah & bh) | (ch & (ah | bh))) + sigmaHigh + ((low / TWO_32) | 0)) | 0;
 
-    hl = sum;
-
-    sigmaHigh = (ah & bh) | (ch & (ah | bh));
-
-    sigmaLow = (al & bl) | (cl & (al | bl));
-
-    sum = (hl + sigmaLow) | 0;
-
-    hh = (hh + sigmaHigh + (((hl & sigmaLow) | ((hl | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    hl = sum;
+    hl = low | 0;
 
     sigmaHigh = ((dh >>> 14) | (dl << 18)) ^ ((dh >>> 18) | (dl << 14)) ^ ((dl >>> 9) | (dh << 23));
 
     sigmaLow = ((dl >>> 14) | (dh << 18)) ^ ((dl >>> 18) | (dh << 14)) ^ ((dh >>> 9) | (dl << 23));
 
-    sum = (gl + sigmaLow) | 0;
+    sum = (gl >>> 0) + (K512[2 * (t + 1) + 1] >>> 0) + (WL[t + 1] >>> 0);
 
-    gh = (gh + sigmaHigh + (((gl & sigmaLow) | ((gl | sigmaLow) & ~sum)) >>> 31)) | 0;
+    sum += ((fl ^ (dl & (el ^ fl))) >>> 0) + (sigmaLow >>> 0);
 
-    gl = sum;
+    carry = (gh + K512[2 * (t + 1)] + WH[t + 1] + (fh ^ (dh & (eh ^ fh))) + sigmaHigh) | 0;
 
-    sigmaHigh = fh ^ (dh & (eh ^ fh));
+    low = (cl >>> 0) + sum;
 
-    sigmaLow = fl ^ (dl & (el ^ fl));
+    ch = (ch + carry + ((low / TWO_32) | 0)) | 0;
 
-    sum = (gl + sigmaLow) | 0;
-
-    gh = (gh + sigmaHigh + (((gl & sigmaLow) | ((gl | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    gl = sum;
-
-    sum = (gl + K512[2 * (t + 1) + 1]) | 0;
-
-    gh = (gh + K512[2 * (t + 1)] + (((gl & K512[2 * (t + 1) + 1]) | ((gl | K512[2 * (t + 1) +
-        1]) & ~sum)) >>> 31)) | 0;
-
-    gl = sum;
-
-    sum = (gl + WL[t + 1]) | 0;
-
-    gh = (gh + WH[t + 1] + (((gl & WL[t + 1]) | ((gl | WL[t + 1]) & ~sum)) >>> 31)) | 0;
-
-    gl = sum;
-
-    sum = (cl + gl) | 0;
-
-    ch = (ch + gh + (((cl & gl) | ((cl | gl) & ~sum)) >>> 31)) | 0;
-
-    cl = sum;
+    cl = low | 0;
 
     sigmaHigh = ((hh >>> 28) | (hl << 4)) ^ ((hl >>> 2) | (hh << 30)) ^ ((hl >>> 7) | (hh << 25));
 
     sigmaLow = ((hl >>> 28) | (hh << 4)) ^ ((hh >>> 2) | (hl << 30)) ^ ((hh >>> 7) | (hl << 25));
 
-    sum = (gl + sigmaLow) | 0;
+    low = sum + (((hl & al) | (bl & (hl | al))) >>> 0) + (sigmaLow >>> 0);
 
-    gh = (gh + sigmaHigh + (((gl & sigmaLow) | ((gl | sigmaLow) & ~sum)) >>> 31)) | 0;
+    gh = (carry + ((hh & ah) | (bh & (hh | ah))) + sigmaHigh + ((low / TWO_32) | 0)) | 0;
 
-    gl = sum;
-
-    sigmaHigh = (hh & ah) | (bh & (hh | ah));
-
-    sigmaLow = (hl & al) | (bl & (hl | al));
-
-    sum = (gl + sigmaLow) | 0;
-
-    gh = (gh + sigmaHigh + (((gl & sigmaLow) | ((gl | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    gl = sum;
+    gl = low | 0;
 
     sigmaHigh = ((ch >>> 14) | (cl << 18)) ^ ((ch >>> 18) | (cl << 14)) ^ ((cl >>> 9) | (ch << 23));
 
     sigmaLow = ((cl >>> 14) | (ch << 18)) ^ ((cl >>> 18) | (ch << 14)) ^ ((ch >>> 9) | (cl << 23));
 
-    sum = (fl + sigmaLow) | 0;
+    sum = (fl >>> 0) + (K512[2 * (t + 2) + 1] >>> 0) + (WL[t + 2] >>> 0);
 
-    fh = (fh + sigmaHigh + (((fl & sigmaLow) | ((fl | sigmaLow) & ~sum)) >>> 31)) | 0;
+    sum += ((el ^ (cl & (dl ^ el))) >>> 0) + (sigmaLow >>> 0);
 
-    fl = sum;
+    carry = (fh + K512[2 * (t + 2)] + WH[t + 2] + (eh ^ (ch & (dh ^ eh))) + sigmaHigh) | 0;
 
-    sigmaHigh = eh ^ (ch & (dh ^ eh));
+    low = (bl >>> 0) + sum;
 
-    sigmaLow = el ^ (cl & (dl ^ el));
+    bh = (bh + carry + ((low / TWO_32) | 0)) | 0;
 
-    sum = (fl + sigmaLow) | 0;
-
-    fh = (fh + sigmaHigh + (((fl & sigmaLow) | ((fl | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    fl = sum;
-
-    sum = (fl + K512[2 * (t + 2) + 1]) | 0;
-
-    fh = (fh + K512[2 * (t + 2)] + (((fl & K512[2 * (t + 2) + 1]) | ((fl | K512[2 * (t + 2) +
-        1]) & ~sum)) >>> 31)) | 0;
-
-    fl = sum;
-
-    sum = (fl + WL[t + 2]) | 0;
-
-    fh = (fh + WH[t + 2] + (((fl & WL[t + 2]) | ((fl | WL[t + 2]) & ~sum)) >>> 31)) | 0;
-
-    fl = sum;
-
-    sum = (bl + fl) | 0;
-
-    bh = (bh + fh + (((bl & fl) | ((bl | fl) & ~sum)) >>> 31)) | 0;
-
-    bl = sum;
+    bl = low | 0;
 
     sigmaHigh = ((gh >>> 28) | (gl << 4)) ^ ((gl >>> 2) | (gh << 30)) ^ ((gl >>> 7) | (gh << 25));
 
     sigmaLow = ((gl >>> 28) | (gh << 4)) ^ ((gh >>> 2) | (gl << 30)) ^ ((gh >>> 7) | (gl << 25));
 
-    sum = (fl + sigmaLow) | 0;
+    low = sum + (((gl & hl) | (al & (gl | hl))) >>> 0) + (sigmaLow >>> 0);
 
-    fh = (fh + sigmaHigh + (((fl & sigmaLow) | ((fl | sigmaLow) & ~sum)) >>> 31)) | 0;
+    fh = (carry + ((gh & hh) | (ah & (gh | hh))) + sigmaHigh + ((low / TWO_32) | 0)) | 0;
 
-    fl = sum;
-
-    sigmaHigh = (gh & hh) | (ah & (gh | hh));
-
-    sigmaLow = (gl & hl) | (al & (gl | hl));
-
-    sum = (fl + sigmaLow) | 0;
-
-    fh = (fh + sigmaHigh + (((fl & sigmaLow) | ((fl | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    fl = sum;
+    fl = low | 0;
 
     sigmaHigh = ((bh >>> 14) | (bl << 18)) ^ ((bh >>> 18) | (bl << 14)) ^ ((bl >>> 9) | (bh << 23));
 
     sigmaLow = ((bl >>> 14) | (bh << 18)) ^ ((bl >>> 18) | (bh << 14)) ^ ((bh >>> 9) | (bl << 23));
 
-    sum = (el + sigmaLow) | 0;
+    sum = (el >>> 0) + (K512[2 * (t + 3) + 1] >>> 0) + (WL[t + 3] >>> 0);
 
-    eh = (eh + sigmaHigh + (((el & sigmaLow) | ((el | sigmaLow) & ~sum)) >>> 31)) | 0;
+    sum += ((dl ^ (bl & (cl ^ dl))) >>> 0) + (sigmaLow >>> 0);
 
-    el = sum;
+    carry = (eh + K512[2 * (t + 3)] + WH[t + 3] + (dh ^ (bh & (ch ^ dh))) + sigmaHigh) | 0;
 
-    sigmaHigh = dh ^ (bh & (ch ^ dh));
+    low = (al >>> 0) + sum;
 
-    sigmaLow = dl ^ (bl & (cl ^ dl));
+    ah = (ah + carry + ((low / TWO_32) | 0)) | 0;
 
-    sum = (el + sigmaLow) | 0;
-
-    eh = (eh + sigmaHigh + (((el & sigmaLow) | ((el | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    el = sum;
-
-    sum = (el + K512[2 * (t + 3) + 1]) | 0;
-
-    eh = (eh + K512[2 * (t + 3)] + (((el & K512[2 * (t + 3) + 1]) | ((el | K512[2 * (t + 3) +
-        1]) & ~sum)) >>> 31)) | 0;
-
-    el = sum;
-
-    sum = (el + WL[t + 3]) | 0;
-
-    eh = (eh + WH[t + 3] + (((el & WL[t + 3]) | ((el | WL[t + 3]) & ~sum)) >>> 31)) | 0;
-
-    el = sum;
-
-    sum = (al + el) | 0;
-
-    ah = (ah + eh + (((al & el) | ((al | el) & ~sum)) >>> 31)) | 0;
-
-    al = sum;
+    al = low | 0;
 
     sigmaHigh = ((fh >>> 28) | (fl << 4)) ^ ((fl >>> 2) | (fh << 30)) ^ ((fl >>> 7) | (fh << 25));
 
     sigmaLow = ((fl >>> 28) | (fh << 4)) ^ ((fh >>> 2) | (fl << 30)) ^ ((fh >>> 7) | (fl << 25));
 
-    sum = (el + sigmaLow) | 0;
+    low = sum + (((fl & gl) | (hl & (fl | gl))) >>> 0) + (sigmaLow >>> 0);
 
-    eh = (eh + sigmaHigh + (((el & sigmaLow) | ((el | sigmaLow) & ~sum)) >>> 31)) | 0;
+    eh = (carry + ((fh & gh) | (hh & (fh | gh))) + sigmaHigh + ((low / TWO_32) | 0)) | 0;
 
-    el = sum;
-
-    sigmaHigh = (fh & gh) | (hh & (fh | gh));
-
-    sigmaLow = (fl & gl) | (hl & (fl | gl));
-
-    sum = (el + sigmaLow) | 0;
-
-    eh = (eh + sigmaHigh + (((el & sigmaLow) | ((el | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    el = sum;
+    el = low | 0;
 
     sigmaHigh = ((ah >>> 14) | (al << 18)) ^ ((ah >>> 18) | (al << 14)) ^ ((al >>> 9) | (ah << 23));
 
     sigmaLow = ((al >>> 14) | (ah << 18)) ^ ((al >>> 18) | (ah << 14)) ^ ((ah >>> 9) | (al << 23));
 
-    sum = (dl + sigmaLow) | 0;
+    sum = (dl >>> 0) + (K512[2 * (t + 4) + 1] >>> 0) + (WL[t + 4] >>> 0);
 
-    dh = (dh + sigmaHigh + (((dl & sigmaLow) | ((dl | sigmaLow) & ~sum)) >>> 31)) | 0;
+    sum += ((cl ^ (al & (bl ^ cl))) >>> 0) + (sigmaLow >>> 0);
 
-    dl = sum;
+    carry = (dh + K512[2 * (t + 4)] + WH[t + 4] + (ch ^ (ah & (bh ^ ch))) + sigmaHigh) | 0;
 
-    sigmaHigh = ch ^ (ah & (bh ^ ch));
+    low = (hl >>> 0) + sum;
 
-    sigmaLow = cl ^ (al & (bl ^ cl));
+    hh = (hh + carry + ((low / TWO_32) | 0)) | 0;
 
-    sum = (dl + sigmaLow) | 0;
-
-    dh = (dh + sigmaHigh + (((dl & sigmaLow) | ((dl | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    dl = sum;
-
-    sum = (dl + K512[2 * (t + 4) + 1]) | 0;
-
-    dh = (dh + K512[2 * (t + 4)] + (((dl & K512[2 * (t + 4) + 1]) | ((dl | K512[2 * (t + 4) +
-        1]) & ~sum)) >>> 31)) | 0;
-
-    dl = sum;
-
-    sum = (dl + WL[t + 4]) | 0;
-
-    dh = (dh + WH[t + 4] + (((dl & WL[t + 4]) | ((dl | WL[t + 4]) & ~sum)) >>> 31)) | 0;
-
-    dl = sum;
-
-    sum = (hl + dl) | 0;
-
-    hh = (hh + dh + (((hl & dl) | ((hl | dl) & ~sum)) >>> 31)) | 0;
-
-    hl = sum;
+    hl = low | 0;
 
     sigmaHigh = ((eh >>> 28) | (el << 4)) ^ ((el >>> 2) | (eh << 30)) ^ ((el >>> 7) | (eh << 25));
 
     sigmaLow = ((el >>> 28) | (eh << 4)) ^ ((eh >>> 2) | (el << 30)) ^ ((eh >>> 7) | (el << 25));
 
-    sum = (dl + sigmaLow) | 0;
+    low = sum + (((el & fl) | (gl & (el | fl))) >>> 0) + (sigmaLow >>> 0);
 
-    dh = (dh + sigmaHigh + (((dl & sigmaLow) | ((dl | sigmaLow) & ~sum)) >>> 31)) | 0;
+    dh = (carry + ((eh & fh) | (gh & (eh | fh))) + sigmaHigh + ((low / TWO_32) | 0)) | 0;
 
-    dl = sum;
-
-    sigmaHigh = (eh & fh) | (gh & (eh | fh));
-
-    sigmaLow = (el & fl) | (gl & (el | fl));
-
-    sum = (dl + sigmaLow) | 0;
-
-    dh = (dh + sigmaHigh + (((dl & sigmaLow) | ((dl | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    dl = sum;
+    dl = low | 0;
 
     sigmaHigh = ((hh >>> 14) | (hl << 18)) ^ ((hh >>> 18) | (hl << 14)) ^ ((hl >>> 9) | (hh << 23));
 
     sigmaLow = ((hl >>> 14) | (hh << 18)) ^ ((hl >>> 18) | (hh << 14)) ^ ((hh >>> 9) | (hl << 23));
 
-    sum = (cl + sigmaLow) | 0;
+    sum = (cl >>> 0) + (K512[2 * (t + 5) + 1] >>> 0) + (WL[t + 5] >>> 0);
 
-    ch = (ch + sigmaHigh + (((cl & sigmaLow) | ((cl | sigmaLow) & ~sum)) >>> 31)) | 0;
+    sum += ((bl ^ (hl & (al ^ bl))) >>> 0) + (sigmaLow >>> 0);
 
-    cl = sum;
+    carry = (ch + K512[2 * (t + 5)] + WH[t + 5] + (bh ^ (hh & (ah ^ bh))) + sigmaHigh) | 0;
 
-    sigmaHigh = bh ^ (hh & (ah ^ bh));
+    low = (gl >>> 0) + sum;
 
-    sigmaLow = bl ^ (hl & (al ^ bl));
+    gh = (gh + carry + ((low / TWO_32) | 0)) | 0;
 
-    sum = (cl + sigmaLow) | 0;
-
-    ch = (ch + sigmaHigh + (((cl & sigmaLow) | ((cl | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    cl = sum;
-
-    sum = (cl + K512[2 * (t + 5) + 1]) | 0;
-
-    ch = (ch + K512[2 * (t + 5)] + (((cl & K512[2 * (t + 5) + 1]) | ((cl | K512[2 * (t + 5) +
-        1]) & ~sum)) >>> 31)) | 0;
-
-    cl = sum;
-
-    sum = (cl + WL[t + 5]) | 0;
-
-    ch = (ch + WH[t + 5] + (((cl & WL[t + 5]) | ((cl | WL[t + 5]) & ~sum)) >>> 31)) | 0;
-
-    cl = sum;
-
-    sum = (gl + cl) | 0;
-
-    gh = (gh + ch + (((gl & cl) | ((gl | cl) & ~sum)) >>> 31)) | 0;
-
-    gl = sum;
+    gl = low | 0;
 
     sigmaHigh = ((dh >>> 28) | (dl << 4)) ^ ((dl >>> 2) | (dh << 30)) ^ ((dl >>> 7) | (dh << 25));
 
     sigmaLow = ((dl >>> 28) | (dh << 4)) ^ ((dh >>> 2) | (dl << 30)) ^ ((dh >>> 7) | (dl << 25));
 
-    sum = (cl + sigmaLow) | 0;
+    low = sum + (((dl & el) | (fl & (dl | el))) >>> 0) + (sigmaLow >>> 0);
 
-    ch = (ch + sigmaHigh + (((cl & sigmaLow) | ((cl | sigmaLow) & ~sum)) >>> 31)) | 0;
+    ch = (carry + ((dh & eh) | (fh & (dh | eh))) + sigmaHigh + ((low / TWO_32) | 0)) | 0;
 
-    cl = sum;
-
-    sigmaHigh = (dh & eh) | (fh & (dh | eh));
-
-    sigmaLow = (dl & el) | (fl & (dl | el));
-
-    sum = (cl + sigmaLow) | 0;
-
-    ch = (ch + sigmaHigh + (((cl & sigmaLow) | ((cl | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    cl = sum;
+    cl = low | 0;
 
     sigmaHigh = ((gh >>> 14) | (gl << 18)) ^ ((gh >>> 18) | (gl << 14)) ^ ((gl >>> 9) | (gh << 23));
 
     sigmaLow = ((gl >>> 14) | (gh << 18)) ^ ((gl >>> 18) | (gh << 14)) ^ ((gh >>> 9) | (gl << 23));
 
-    sum = (bl + sigmaLow) | 0;
+    sum = (bl >>> 0) + (K512[2 * (t + 6) + 1] >>> 0) + (WL[t + 6] >>> 0);
 
-    bh = (bh + sigmaHigh + (((bl & sigmaLow) | ((bl | sigmaLow) & ~sum)) >>> 31)) | 0;
+    sum += ((al ^ (gl & (hl ^ al))) >>> 0) + (sigmaLow >>> 0);
 
-    bl = sum;
+    carry = (bh + K512[2 * (t + 6)] + WH[t + 6] + (ah ^ (gh & (hh ^ ah))) + sigmaHigh) | 0;
 
-    sigmaHigh = ah ^ (gh & (hh ^ ah));
+    low = (fl >>> 0) + sum;
 
-    sigmaLow = al ^ (gl & (hl ^ al));
+    fh = (fh + carry + ((low / TWO_32) | 0)) | 0;
 
-    sum = (bl + sigmaLow) | 0;
-
-    bh = (bh + sigmaHigh + (((bl & sigmaLow) | ((bl | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    bl = sum;
-
-    sum = (bl + K512[2 * (t + 6) + 1]) | 0;
-
-    bh = (bh + K512[2 * (t + 6)] + (((bl & K512[2 * (t + 6) + 1]) | ((bl | K512[2 * (t + 6) +
-        1]) & ~sum)) >>> 31)) | 0;
-
-    bl = sum;
-
-    sum = (bl + WL[t + 6]) | 0;
-
-    bh = (bh + WH[t + 6] + (((bl & WL[t + 6]) | ((bl | WL[t + 6]) & ~sum)) >>> 31)) | 0;
-
-    bl = sum;
-
-    sum = (fl + bl) | 0;
-
-    fh = (fh + bh + (((fl & bl) | ((fl | bl) & ~sum)) >>> 31)) | 0;
-
-    fl = sum;
+    fl = low | 0;
 
     sigmaHigh = ((ch >>> 28) | (cl << 4)) ^ ((cl >>> 2) | (ch << 30)) ^ ((cl >>> 7) | (ch << 25));
 
     sigmaLow = ((cl >>> 28) | (ch << 4)) ^ ((ch >>> 2) | (cl << 30)) ^ ((ch >>> 7) | (cl << 25));
 
-    sum = (bl + sigmaLow) | 0;
+    low = sum + (((cl & dl) | (el & (cl | dl))) >>> 0) + (sigmaLow >>> 0);
 
-    bh = (bh + sigmaHigh + (((bl & sigmaLow) | ((bl | sigmaLow) & ~sum)) >>> 31)) | 0;
+    bh = (carry + ((ch & dh) | (eh & (ch | dh))) + sigmaHigh + ((low / TWO_32) | 0)) | 0;
 
-    bl = sum;
-
-    sigmaHigh = (ch & dh) | (eh & (ch | dh));
-
-    sigmaLow = (cl & dl) | (el & (cl | dl));
-
-    sum = (bl + sigmaLow) | 0;
-
-    bh = (bh + sigmaHigh + (((bl & sigmaLow) | ((bl | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    bl = sum;
+    bl = low | 0;
 
     sigmaHigh = ((fh >>> 14) | (fl << 18)) ^ ((fh >>> 18) | (fl << 14)) ^ ((fl >>> 9) | (fh << 23));
 
     sigmaLow = ((fl >>> 14) | (fh << 18)) ^ ((fl >>> 18) | (fh << 14)) ^ ((fh >>> 9) | (fl << 23));
 
-    sum = (al + sigmaLow) | 0;
+    sum = (al >>> 0) + (K512[2 * (t + 7) + 1] >>> 0) + (WL[t + 7] >>> 0);
 
-    ah = (ah + sigmaHigh + (((al & sigmaLow) | ((al | sigmaLow) & ~sum)) >>> 31)) | 0;
+    sum += ((hl ^ (fl & (gl ^ hl))) >>> 0) + (sigmaLow >>> 0);
 
-    al = sum;
+    carry = (ah + K512[2 * (t + 7)] + WH[t + 7] + (hh ^ (fh & (gh ^ hh))) + sigmaHigh) | 0;
 
-    sigmaHigh = hh ^ (fh & (gh ^ hh));
+    low = (el >>> 0) + sum;
 
-    sigmaLow = hl ^ (fl & (gl ^ hl));
+    eh = (eh + carry + ((low / TWO_32) | 0)) | 0;
 
-    sum = (al + sigmaLow) | 0;
-
-    ah = (ah + sigmaHigh + (((al & sigmaLow) | ((al | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    al = sum;
-
-    sum = (al + K512[2 * (t + 7) + 1]) | 0;
-
-    ah = (ah + K512[2 * (t + 7)] + (((al & K512[2 * (t + 7) + 1]) | ((al | K512[2 * (t + 7) +
-        1]) & ~sum)) >>> 31)) | 0;
-
-    al = sum;
-
-    sum = (al + WL[t + 7]) | 0;
-
-    ah = (ah + WH[t + 7] + (((al & WL[t + 7]) | ((al | WL[t + 7]) & ~sum)) >>> 31)) | 0;
-
-    al = sum;
-
-    sum = (el + al) | 0;
-
-    eh = (eh + ah + (((el & al) | ((el | al) & ~sum)) >>> 31)) | 0;
-
-    el = sum;
+    el = low | 0;
 
     sigmaHigh = ((bh >>> 28) | (bl << 4)) ^ ((bl >>> 2) | (bh << 30)) ^ ((bl >>> 7) | (bh << 25));
 
     sigmaLow = ((bl >>> 28) | (bh << 4)) ^ ((bh >>> 2) | (bl << 30)) ^ ((bh >>> 7) | (bl << 25));
 
-    sum = (al + sigmaLow) | 0;
+    low = sum + (((bl & cl) | (dl & (bl | cl))) >>> 0) + (sigmaLow >>> 0);
 
-    ah = (ah + sigmaHigh + (((al & sigmaLow) | ((al | sigmaLow) & ~sum)) >>> 31)) | 0;
+    ah = (carry + ((bh & ch) | (dh & (bh | ch))) + sigmaHigh + ((low / TWO_32) | 0)) | 0;
 
-    al = sum;
-
-    sigmaHigh = (bh & ch) | (dh & (bh | ch));
-
-    sigmaLow = (bl & cl) | (dl & (bl | cl));
-
-    sum = (al + sigmaLow) | 0;
-
-    ah = (ah + sigmaHigh + (((al & sigmaLow) | ((al | sigmaLow) & ~sum)) >>> 31)) | 0;
-
-    al = sum;
+    al = low | 0;
   }
 
   sum = (init[1] + al) | 0;

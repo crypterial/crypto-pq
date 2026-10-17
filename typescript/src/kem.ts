@@ -30,10 +30,10 @@ const PUBLIC_CACHE = 0x100;
 
 const INVALID_PUBLIC_KEY = 4;
 
-// How a key encapsulates on the backend that made it. Without randomness it draws its own; given
-// randomness is wiped after use.
+// How a key encapsulates on the backend that made it. Without randomness it draws its own, which it
+// wipes after use; given randomness is the caller's and stays as it was.
 interface Encapsulator {
-  encapsulate(randomness: Uint8Array | null): [Uint8Array, Uint8Array];
+  encapsulate(randomness: Uint8Array | null): Encapsulation;
 }
 
 // The private half of a key on the backend that made it. raw and expanded return new arrays: the
@@ -103,16 +103,20 @@ function encapsulator(encapsulate: (randomness: Uint8Array) => [Uint8Array, Uint
       const m = randomness ?? randomBytes(size);
 
       try {
-        return encapsulate(m);
+        const result = encapsulate(m);
+
+        return Object.freeze({ sharedSecret: result[0], ciphertext: result[1] });
       } finally {
-        m.fill(0);
+        if (randomness === null) {
+          m.fill(0);
+        }
       }
     },
   };
 }
 
 function pairwise(key: NewKey): NewKey {
-  const [sharedSecret, ciphertext] = key[1].encapsulate(null);
+  const { sharedSecret, ciphertext } = key[1].encapsulate(null);
 
   const decapsulated = key[2].decapsulate(ciphertext);
 
@@ -213,25 +217,23 @@ function kemWasm(family: Family, id: number, sizes: KemSizes): Engine {
 
       const size = slot.bytes.length;
 
-      try {
-        return core.run(SECRET, [size, sizes.randomness, sizes.ciphertext, 32], ([key, r, ciphertext, shared]) => {
-          slot.load(core, key);
+      return core.run(SECRET, [size, sizes.randomness, sizes.ciphertext, 32], (key, r, ciphertext, shared) => {
+        slot.load(core, key);
 
-          if (randomness === null) {
-            core.random(r, sizes.randomness);
-          } else {
-            core.write(r, randomness);
-          }
+        if (randomness === null) {
+          core.random(r, sizes.randomness);
+        } else {
+          core.write(r, randomness);
+        }
 
-          check(core.x.cpq_kem_encapsulate(key, size, r, sizes.randomness, ciphertext, sizes.ciphertext, shared, 32));
+        check(core.x.cpq_kem_encapsulate(key, size, r, sizes.randomness, ciphertext, sizes.ciphertext, shared, 32));
 
-          slot.update(core, key);
+        slot.update(core, key);
 
-          return [core.read(shared, 32), core.read(ciphertext, sizes.ciphertext)];
-        });
-      } finally {
-        randomness?.fill(0);
-      }
+        const sharedSecret = core.read(shared, 32);
+
+        return Object.freeze({ sharedSecret, ciphertext: core.read(ciphertext, sizes.ciphertext) });
+      });
     },
   });
 
@@ -241,7 +243,7 @@ function kemWasm(family: Family, id: number, sizes: KemSizes): Engine {
     const exported = (which: number, length: number) => {
       const core = family.core();
 
-      return core.run(SECRET, [size, length], ([key, out]) => {
+      return core.run(SECRET, [size, length], (key, out) => {
         slot.load(core, key);
 
         check(core.x.cpq_kem_export_private(key, size, which, out, length));
@@ -256,7 +258,7 @@ function kemWasm(family: Family, id: number, sizes: KemSizes): Engine {
       decapsulate(ciphertext) {
         const core = family.core();
 
-        return core.run(SECRET, [size, ciphertext.length, 32], ([key, input, shared]) => {
+        return core.run(SECRET, [size, ciphertext.length, 32], (key, input, shared) => {
           slot.load(core, key);
 
           core.write(input, ciphertext);
@@ -274,9 +276,7 @@ function kemWasm(family: Family, id: number, sizes: KemSizes): Engine {
 
   // The key made in the private slot at key: its public slot, made at public, and the public key,
   // exported at raw.
-  const created = (core: Core, at: readonly number[], seeded: boolean): NewKey => {
-    const [key, publicSlot, raw] = at;
-
+  const created = (core: Core, key: number, publicSlot: number, raw: number, seeded: boolean): NewKey => {
     const privateSize = core.size(PRIVATE_SLOT, id);
 
     const publicSize = core.size(PUBLIC_SLOT, id);
@@ -299,9 +299,7 @@ function kemWasm(family: Family, id: number, sizes: KemSizes): Engine {
       const core = family.core();
 
       try {
-        return core.run(SECRET, [...slots(core), sizes.seed, sizes.randomness], (at) => {
-          const [key, , , s, r] = at;
-
+        return core.run(SECRET, [...slots(core), sizes.seed, sizes.randomness], (key, publicSlot, raw, s, r) => {
           const privateSize = core.size(PRIVATE_SLOT, id);
 
           if (seed === null) {
@@ -318,7 +316,7 @@ function kemWasm(family: Family, id: number, sizes: KemSizes): Engine {
             check(core.x.cpq_kem_self_test(key, privateSize, r, sizes.randomness));
           }
 
-          return created(core, at, true);
+          return created(core, key, publicSlot, raw, true);
         });
       } finally {
         seed?.fill(0);
@@ -328,16 +326,14 @@ function kemWasm(family: Family, id: number, sizes: KemSizes): Engine {
       const core = family.core();
 
       try {
-        return core.run(SECRET, [...slots(core), dk.length], (at) => {
-          const [key, , , input] = at;
-
+        return core.run(SECRET, [...slots(core), dk.length], (key, publicSlot, raw, input) => {
           core.write(input, dk);
 
           const status = core.x.cpq_kem_import_private(id, input, dk.length, key, core.size(PRIVATE_SLOT, id));
 
           check(status, { INVALID_PRIVATE_KEY: "the decapsulation key fails the FIPS 203 checks" });
 
-          return created(core, at, false);
+          return created(core, key, publicSlot, raw, false);
         });
       } finally {
         dk.fill(0);
@@ -348,7 +344,7 @@ function kemWasm(family: Family, id: number, sizes: KemSizes): Engine {
 
       const publicSize = core.size(PUBLIC_SLOT, id);
 
-      return core.run(PUBLIC, [publicSize, pk.length], ([publicSlot, input]) => {
+      return core.run(PUBLIC, [publicSize, pk.length], (publicSlot, input) => {
         core.write(input, pk);
 
         const status = core.x.cpq_kem_import_public(id, input, pk.length, publicSlot, publicSize);
@@ -445,9 +441,7 @@ export class KemPublicKey {
   }
 
   #encapsulate(randomness: Uint8Array | null): Encapsulation {
-    const [sharedSecret, ciphertext] = this.#encapsulator.encapsulate(randomness);
-
-    return Object.freeze({ sharedSecret, ciphertext });
+    return this.#encapsulator.encapsulate(randomness);
   }
 
   static {
@@ -628,7 +622,7 @@ export function encapsulateDeterministic(publicKey: KemPublicKey, randomness: Ui
 
   requireLength(data, backendOf(publicKey.algorithm).randomness, "randomness");
 
-  return encapsulateWith(publicKey, data.slice());
+  return encapsulateWith(publicKey, data);
 }
 
 export const ML_KEM_512 = /* @__PURE__ */ new KemAlgorithm("ML-KEM-512", /* @__PURE__ */ mlKem(mlkem.ML_KEM_512, 1, 0));

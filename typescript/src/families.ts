@@ -90,9 +90,9 @@ function kemTest(core: Core, id: number, sizes: readonly number[], start: number
 
   const slot = core.size(2, id);
 
-  return core.run(SECRET, [slot, seedSize, randomnessSize, ciphertextSize, 32, 32], (at) => {
-    const [key, seed, randomness, ciphertext, encapsulated, decapsulated] = at;
+  const lengths = [slot, seedSize, randomnessSize, ciphertextSize, 32, 32];
 
+  return core.run(SECRET, lengths, (key, seed, randomness, ciphertext, encapsulated, decapsulated) => {
     const x = core.x;
 
     core.write(seed, range(seedSize, 0));
@@ -118,7 +118,7 @@ function kemTest(core: Core, id: number, sizes: readonly number[], start: number
 function mlDsaTest(core: Core, id: number, signatureSize: number, expected: string): boolean {
   const slot = core.size(4, id);
 
-  return core.run(SECRET, [slot, 32, 32, signatureSize], ([key, seed, message, signature]) => {
+  return core.run(SECRET, [slot, 32, 32, signatureSize], (key, seed, message, signature) => {
     const x = core.x;
 
     core.write(seed, range(32, 0));
@@ -141,7 +141,7 @@ function mlDsaTest(core: Core, id: number, signatureSize: number, expected: stri
 function slhDsaTest(core: Core, id: number, expected: string): boolean {
   const slot = core.size(4, id);
 
-  return core.run(SECRET, [slot, 48, 32], ([key, seed, publicKey]) => {
+  return core.run(SECRET, [slot, 48, 32], (key, seed, publicKey) => {
     const x = core.x;
 
     core.write(seed, range(48, 0));
@@ -159,7 +159,7 @@ function hssTest(core: Core, types: readonly number[], expected: string): boolea
 
   const parameters = Uint8Array.of(1, 0, 0, 0, types[0], 0, 0, 0, types[1]);
 
-  return core.run(SECRET, [slot, parameters.length, 40, 75, 52], ([signer, section, seed, state, publicKey]) => {
+  return core.run(SECRET, [slot, parameters.length, 40, 75, 52], (signer, section, seed, state, publicKey) => {
     const x = core.x;
 
     core.write(section, parameters);
@@ -182,7 +182,7 @@ function hssTest(core: Core, types: readonly number[], expected: string): boolea
 
 // The digest of "abc" from cpq_hash or cpq_xof.
 function digestTest(core: Core, call: string, id: number, size: number, expected: string): boolean {
-  return core.run(SECRET, [3, size], ([data, digest]) => {
+  return core.run(SECRET, [3, size], (data, digest) => {
     core.write(data, Uint8Array.of(0x61, 0x62, 0x63));
 
     return core.x[call](id, data, 3, digest, size) === OK && equal(core.read(digest, size), fromHex(expected));
@@ -191,7 +191,7 @@ function digestTest(core: Core, call: string, id: number, size: number, expected
 
 // The tag of "abc" from cpq_mac with the key 0, 1, 2 ... 31.
 function macTest(core: Core, id: number, size: number, expected: string): boolean {
-  return core.run(SECRET, [32, 3, size], ([key, data, tag]) => {
+  return core.run(SECRET, [32, 3, size], (key, data, tag) => {
     core.write(key, range(32, 0));
 
     core.write(data, Uint8Array.of(0x61, 0x62, 0x63));

@@ -19,6 +19,39 @@ function field(value = 0): Field {
   return out;
 }
 
+// The temporaries of the ladder, of inversion and of encoding, and the clamped scalar, shared since
+// JavaScript runs one call at a time. Each function clears the ones it used before it returns.
+const LADDER = Array.from({ length: 14 }, () => field());
+
+const INVERSION = Array.from({ length: 4 }, () => field());
+
+const ENCODING = Array.from({ length: 2 }, () => field());
+
+const SCALAR = new Uint8Array(32);
+
+function clear(fields: Field[]): void {
+  for (let i = 0; i < fields.length; i++) {
+    fields[i].fill(0);
+  }
+}
+
+// The clamped scalar, in SCALAR (RFC 7748, 5).
+function clamp(scalar: Uint8Array): Uint8Array {
+  const k = SCALAR;
+
+  for (let i = 0; i < 32; i++) {
+    k[i] = scalar[i];
+  }
+
+  k[0] &= 248;
+
+  k[31] &= 127;
+
+  k[31] |= 64;
+
+  return k;
+}
+
 // Brings every limb into [0, 2^16), folding the carry out of the top limb back as 2^256 = 38.
 function carry(o: Field): void {
   for (let i = 0; i < 16; i++) {
@@ -80,13 +113,7 @@ function squares(o: Field, a: Field, count: number): void {
 
 // a^(p - 2) = a^-1 by the fixed addition chain of 254 squarings and 11 multiplications in ref10.
 function invert(o: Field, a: Field): void {
-  const t0 = field();
-
-  const t1 = field();
-
-  const t2 = field();
-
-  const t3 = field();
+  const [t0, t1, t2, t3] = INVERSION;
 
   square(t0, a);
 
@@ -132,12 +159,10 @@ function invert(o: Field, a: Field): void {
 
   multiply(o, t1, t0);
 
-  wipe(t0, t1, t2, t3);
+  clear(INVERSION);
 }
 
-function unpack(data: Uint8Array): Field {
-  const o = field();
-
+function unpack(data: Uint8Array, o: Field = field()): Field {
   for (let i = 0; i < 16; i++) {
     o[i] = data[2 * i] + (data[2 * i + 1] << 8);
   }
@@ -149,9 +174,9 @@ function unpack(data: Uint8Array): Field {
 
 // The canonical encoding: p is subtracted twice, each result kept only when it did not borrow.
 function pack(n: Field): Uint8Array {
-  const t = n.slice();
+  const [t, m] = ENCODING;
 
-  const m = field();
+  t.set(n);
 
   carry(t);
 
@@ -185,48 +210,30 @@ function pack(n: Field): Uint8Array {
     out[2 * i + 1] = t[i] >> 8;
   }
 
-  wipe(t, m);
+  clear(ENCODING);
 
   return out;
 }
 
 // RFC 7748, section 5: the Montgomery ladder over u-coordinates with a masked conditional swap.
 export function x25519(scalar: Uint8Array, u: Uint8Array): Uint8Array {
-  const k = scalar.slice();
+  const k = clamp(scalar);
 
-  k[0] &= 248;
+  const [x1, x2, z2, x3, z3, a, aa, b, bb, e, c, d, da, cb] = LADDER;
 
-  k[31] &= 127;
+  unpack(u, x1);
 
-  k[31] |= 64;
+  x2.fill(0);
 
-  const x1 = unpack(u);
+  x2[0] = 1;
 
-  const x2 = field(1);
+  z2.fill(0);
 
-  const z2 = field();
+  x3.set(x1);
 
-  const x3 = x1.slice();
+  z3.fill(0);
 
-  const z3 = field(1);
-
-  const a = field();
-
-  const aa = field();
-
-  const b = field();
-
-  const bb = field();
-
-  const e = field();
-
-  const c = field();
-
-  const d = field();
-
-  const da = field();
-
-  const cb = field();
+  z3[0] = 1;
 
   let swapped = 0;
 
@@ -288,7 +295,9 @@ export function x25519(scalar: Uint8Array, u: Uint8Array): Uint8Array {
 
   const out = pack(x2);
 
-  wipe(k, x1, x2, z2, x3, z3, a, aa, b, bb, e, c, d, da, cb);
+  k.fill(0);
+
+  clear(LADDER);
 
   return out;
 }
@@ -326,11 +335,19 @@ const BASE_X = Uint8Array.of(
   0x5c, 0xdc, 0xd6, 0xfd, 0x31, 0xe2, 0xa4, 0xc0, 0xfe, 0x53, 0x6e, 0xcd, 0xd3, 0x36, 0x69, 0x21,
 );
 
-// The temporaries of the point formulas, shared since JavaScript runs one call at a time; x25519Base
-// clears them.
-const SCRATCH = Array.from({ length: 9 }, () => field());
+// The temporaries of the point formulas, and the sum, the table entry and the two coordinates of
+// x25519Base, shared since JavaScript runs one call at a time; x25519Base clears them.
+const SCRATCH = Array.from({ length: 18 }, () => field());
 
 const [TA, TB, TC, TD, TE, TF, TG, TH, NEGATED] = SCRATCH;
+
+const SUM: Point = { x: SCRATCH[9], y: SCRATCH[10], z: SCRATCH[11], t: SCRATCH[12] };
+
+const ENTRY: Affine = { yPlusX: SCRATCH[13], yMinusX: SCRATCH[14], xy2d: SCRATCH[15] };
+
+const [NUMERATOR, DENOMINATOR] = SCRATCH.slice(16);
+
+const DIGITS = new Int8Array(64);
 
 // The identity, (0 : 1 : 1 : 0).
 function point(): Point {
@@ -578,17 +595,11 @@ function select(out: Affine, table: Int32Array, row: number, digit: number): voi
 
 // X25519(scalar, 9): the u-coordinate of [k]B for the clamped scalar k.
 export function x25519Base(scalar: Uint8Array): Uint8Array {
-  const k = scalar.slice();
-
-  k[0] &= 248;
-
-  k[31] &= 127;
-
-  k[31] |= 64;
+  const k = clamp(scalar);
 
   // k = sum of digits[i] 16^i with every digit in [-8, 8]: each nibble above 7 becomes the nibble minus 16
   // and carries one into the next. The top digit stays at most 8 since bit 255 is clear.
-  const digits = new Int8Array(64);
+  const digits = DIGITS;
 
   for (let i = 0; i < 32; i++) {
     digits[2 * i] = k[i] & 15;
@@ -610,9 +621,21 @@ export function x25519Base(scalar: Uint8Array): Uint8Array {
 
   const table = (TABLE ??= edwardsTable());
 
-  const h = point();
+  const h = SUM;
 
-  const entry = affine();
+  const entry = ENTRY;
+
+  h.x.fill(0);
+
+  h.y.fill(0);
+
+  h.z.fill(0);
+
+  h.t.fill(0);
+
+  h.y[0] = 1;
+
+  h.z[0] = 1;
 
   for (let i = 1; i < 64; i += 2) {
     select(entry, table, i >> 1, digits[i]);
@@ -630,9 +653,9 @@ export function x25519Base(scalar: Uint8Array): Uint8Array {
     addAffine(h, h, entry);
   }
 
-  const numerator = field();
+  const numerator = NUMERATOR;
 
-  const denominator = field();
+  const denominator = DENOMINATOR;
 
   add(numerator, h.z, h.y);
 
@@ -644,7 +667,9 @@ export function x25519Base(scalar: Uint8Array): Uint8Array {
 
   const out = pack(numerator);
 
-  wipe(k, digits, h.x, h.y, h.z, h.t, entry.yPlusX, entry.yMinusX, entry.xy2d, numerator, denominator, ...SCRATCH);
+  wipe(k, digits);
+
+  clear(SCRATCH);
 
   return out;
 }

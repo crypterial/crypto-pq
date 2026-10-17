@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { STATEFUL_SIGNATURES } from "../src/families.ts";
 import * as hazmat from "../src/hazmat.ts";
 import * as pq from "../src/index.ts";
 import { leavesComputed } from "../src/merkle.ts";
@@ -374,6 +375,55 @@ test("tree cache rejections", () => {
   copy.fill(0);
 
   assert.deepEqual(key.exportTreeCache(), cache);
+});
+
+// A store that detaches or shrinks the buffer of the cache while the load reads the state: the load
+// reads the cache after the store, and the WebAssembly instance, which holds the trees of other keys,
+// stays. A cache without readable bytes is refused as INVALID_LENGTH; one that tracks the length of
+// its buffer is read cut, and refused as any damaged cache.
+test("tree cache changed by the store", () => {
+  const { state, cache } = exported(pq.HSS_LMS, TWO, range(40), 40n);
+
+  const core = STATEFUL_SIGNATURES.select();
+
+  const detached = cache.slice();
+
+  const fixedBuffer = new ArrayBuffer(cache.length, { maxByteLength: cache.length });
+
+  const fixed = new Uint8Array(fixedBuffer, 0, cache.length);
+
+  fixed.set(cache);
+
+  const trackingBuffer = new ArrayBuffer(cache.length, { maxByteLength: cache.length });
+
+  const tracking = new Uint8Array(trackingBuffer);
+
+  tracking.set(cache);
+
+  const changes: [Uint8Array, () => void, pq.ErrorCode][] = [
+    [detached, () => structuredClone(detached.buffer, { transfer: [detached.buffer] }), "INVALID_LENGTH"],
+    [fixed, () => fixedBuffer.resize(10), "INVALID_LENGTH"],
+    [tracking, () => trackingBuffer.resize(10), "INVALID_ENCODING"],
+  ];
+
+  for (const [treeCache, change, code] of changes) {
+    const store = new MemoryStore(state);
+
+    const changing: pq.StateStore = {
+      read() {
+        change();
+
+        return store.read();
+      },
+      update: (previous, next) => store.update(previous, next),
+    };
+
+    throwsCode(code, () => pq.HSS_LMS.loadPrivateKey(changing, { treeCache }), code);
+  }
+
+  assert.equal(STATEFUL_SIGNATURES.select(), core, "the WebAssembly instance was replaced");
+
+  assert.ok(core === null || core.live, "the WebAssembly instance was discarded");
 });
 
 // Changes sealed with the key's seed, which only the checks after the tag can catch.

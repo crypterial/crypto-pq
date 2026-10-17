@@ -1,4 +1,5 @@
 import { wipe } from "./bytes.ts";
+import { Keccak } from "./keccak.ts";
 import {
   ML_KEM_768,
   type PublicCache,
@@ -10,7 +11,7 @@ import {
   keygenInternal,
   publicCache,
 } from "./mlkem.ts";
-import { sha3, shake256 } from "./primitives.ts";
+import { shake256 } from "./primitives.ts";
 import { x25519, x25519Base } from "./x25519.ts";
 
 const LABEL = Uint8Array.of(0x5c, 0x2e, 0x2f, 0x2f, 0x5e, 0x5c);
@@ -52,33 +53,61 @@ export function expand(seed: Uint8Array): [Uint8Array, PrivateKey, PublicCache] 
   return [pk, { dk, secret: { s: null }, scalar, point }, publicCache(digestOf(dk, ML_KEM_768))];
 }
 
+// The SHA3-256 sponge of the combiner, reset before each use and left cleared, and the encapsulation
+// seed, read once and wiped after use.
+const COMBINER = new Keccak(136, 0x06);
+
+const ESEED = new Uint8Array(64);
+
+const ESK_X = ESEED.subarray(32);
+
 function combine(ssM: Uint8Array, ssX: Uint8Array, ctX: Uint8Array, pkX: Uint8Array): Uint8Array {
-  return sha3(32, ssM, ssX, ctX, pkX, LABEL);
+  const sponge = COMBINER;
+
+  sponge.reset();
+
+  sponge.update(ssM);
+
+  sponge.update(ssX);
+
+  sponge.update(ctX);
+
+  sponge.update(pkX);
+
+  sponge.update(LABEL);
+
+  const out = sponge.read(32);
+
+  sponge.reset();
+
+  return out;
 }
 
 export function checkPublicKey(pk: Uint8Array): boolean {
   return pk.length === PUBLIC_KEY_SIZE && checkEncapsulationKey(pk.subarray(0, 1184), ML_KEM_768);
 }
 
-// cache belongs to the ML-KEM part of pk.
+// cache belongs to the ML-KEM part of pk, whose ciphertext fills the start of the X-Wing one.
 export function encapsulate(pk: Uint8Array, cache: PublicCache, eseed: Uint8Array): [Uint8Array, Uint8Array] {
   const pkX = pk.subarray(1184);
 
-  const [ssM, ctM] = encapsInternal(pk.subarray(0, 1184), cache, eseed.subarray(0, 32), ML_KEM_768);
-
-  const ctX = x25519Base(eseed.subarray(32));
-
-  const ssX = x25519(eseed.subarray(32), pkX);
-
   const ciphertext = new Uint8Array(CIPHERTEXT_SIZE);
 
-  ciphertext.set(ctM);
+  for (let i = 0; i < 64; i++) {
+    ESEED[i] = eseed[i];
+  }
+
+  const ssM = encapsInternal(pk.subarray(0, 1184), cache, ESEED, ML_KEM_768, ciphertext)[0];
+
+  const ctX = x25519Base(ESK_X);
+
+  const ssX = x25519(ESK_X, pkX);
 
   ciphertext.set(ctX, 1088);
 
   const sharedSecret = combine(ssM, ssX, ctX, pkX);
 
-  wipe(ssM, ssX);
+  wipe(ssM, ssX, ESEED);
 
   return [sharedSecret, ciphertext];
 }

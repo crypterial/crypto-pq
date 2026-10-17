@@ -410,6 +410,10 @@ export class Core {
 
   #live = true;
 
+  // A dead instance whose memory is not zeroed yet: the handling of a fault, or a wipe, that a stack
+  // overflow cut short. The next look at the instance, through live, zeroes it.
+  #dirty = false;
+
   constructor(exports: Record<string, unknown>, names: readonly string[]) {
     for (const name of [...COMMON, ...names]) {
       if (typeof exports[name] !== "function") {
@@ -443,6 +447,10 @@ export class Core {
   }
 
   get live(): boolean {
+    if (this.#dirty) {
+      this.#zero();
+    }
+
     return this.#live;
   }
 
@@ -456,10 +464,10 @@ export class Core {
     return this.#view;
   }
 
-  // Regions are sized by the length that data reports, which its owner can change; the copy stays
-  // within that length whatever the array really holds.
+  // data is an array of this library's making (inputs pass through bytes()), whose built-in length
+  // sized its region.
   write(at: number, data: Uint8Array): void {
-    this.bytes().set(data.subarray(0, data.length), at);
+    this.bytes().set(data, at);
   }
 
   read(at: number, length: number): Uint8Array {
@@ -516,15 +524,18 @@ export class Core {
   }
 
   // Runs one operation on regions of the given lengths, each aligned to 16 bytes, and zeroes them
-  // afterwards, with the given depth of the stack. A call made while another runs, which only the
-  // platform's random source can start, gets a block of its own.
-  run<T>(stack: number, lengths: readonly number[], body: (at: number[]) => T): T {
-    const at: number[] = [];
+  // afterwards, with the given depth of the stack. The array of lengths, the call's own, becomes the
+  // regions' addresses, which body gets as its arguments. A call made while another runs, which only
+  // the platform's random source can start, gets a block of its own.
+  run<T>(stack: number, lengths: number[], body: (...at: number[]) => T): T {
+    const at = lengths;
 
     let total = 0;
 
-    for (const length of lengths) {
-      at.push(total);
+    for (let i = 0; i < at.length; i++) {
+      const length = at[i];
+
+      at[i] = total;
 
       total += (length + 15) & ~15;
     }
@@ -535,6 +546,12 @@ export class Core {
 
     this.#depth++;
 
+    // Set once the way out of the call is handled: a return, crypto-pq's own error, or a fault whose
+    // instance is discarded. Any other way out is a fault whose handling a stack overflow cut short,
+    // which may have stopped the library halfway: the finally block then marks the instance dead with
+    // plain stores, as any call there may fail as well.
+    let handled = false;
+
     try {
       base = own ? this.#allocate(total) : this.#reserve(total);
 
@@ -542,17 +559,31 @@ export class Core {
         at[i] += base;
       }
 
-      return body(at);
+      const result = body(...at);
+
+      handled = true;
+
+      return result;
     } catch (error) {
       if (error instanceof CryptoPQError || error instanceof Exhausted) {
+        handled = true;
+
         throw error;
       }
 
       this.#discard();
 
+      handled = true;
+
       throw new Error("crypto-pq's WebAssembly core failed; its instance was discarded", { cause: error });
     } finally {
       this.#depth--;
+
+      if (!handled) {
+        this.#live = false;
+
+        this.#dirty = true;
+      }
 
       if (this.#live) {
         this.#wipe(stack, base, total, own);
@@ -584,14 +615,20 @@ export class Core {
     }
   }
 
+  // The instance counts as dead and unzeroed until the wipe completes, so that a stack overflow that
+  // cuts the wipe short leaves no secret in an instance still in use.
   #wipe(stack: number, base: number, total: number, own: boolean): void {
+    this.#live = false;
+
+    this.#dirty = true;
+
     const view = this.bytes();
 
     if (base !== 0) {
       view.fill(0, base, base + total);
 
       if (own && this.x.cpq_free(base, total) !== OK) {
-        this.#discard();
+        this.#zero();
 
         return;
       }
@@ -601,9 +638,11 @@ export class Core {
       view.fill(0, Math.max(this.#stackLow, this.#stackHigh - stack), this.#stackHigh);
     }
 
-    if (this.#depth === 0 && this.#residents === 0 && this.bytes().length > MEMORY_LIMIT) {
-      this.#live = false;
-    }
+    const live = this.#depth > 0 || this.#residents > 0 || this.bytes().length <= MEMORY_LIMIT;
+
+    this.#dirty = false;
+
+    this.#live = live;
   }
 
   #reserve(total: number): number {
@@ -644,11 +683,18 @@ export class Core {
     return at;
   }
 
+  // Marks the instance dead with plain stores before it zeroes the memory.
   #discard(): void {
-    if (this.#live) {
-      this.#live = false;
+    this.#live = false;
 
-      new Uint8Array(this.#memory.buffer).fill(0);
-    }
+    this.#dirty = true;
+
+    this.#zero();
+  }
+
+  #zero(): void {
+    new Uint8Array(this.#memory.buffer).fill(0);
+
+    this.#dirty = false;
   }
 }

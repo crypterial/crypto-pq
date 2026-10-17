@@ -1,15 +1,27 @@
 import { concat, equal, readUint32, uint32, uint64, writeUint32 } from "./bytes.ts";
-import { type CachedLevels, type CachedTree, MerkleTree } from "./merkle.ts";
-import { type FixedHash, type PrefixedHash, fixedShake256, prefixedSha256, prefixedShake256 } from "./primitives.ts";
+import { type CachedLevels, type CachedTree, MerkleTree, type TreeHashes } from "./merkle.ts";
+import {
+  type FixedHash,
+  type PrefixedHash,
+  copyWords,
+  fixedShake256,
+  loadWords,
+  prefixedSha256,
+  prefixedShake256,
+  storeWords,
+} from "./primitives.ts";
 import { block256, block256x2 } from "./sha2-rounds.ts";
-import { IV_256 } from "./sha2.ts";
+import { IV_256, wipeSha2Lanes } from "./sha2.ts";
 
 const W = 16;
 
-// Chain bounds of key generation: every chain from step 0 to the end, for the largest key (n = 32).
+// Chain bounds of key generation: every chain from step 0 to the end, for the largest key (n = 32);
+// and the digits of a message, which are public.
 const ZEROS: readonly number[] = new Array(67).fill(0);
 
 const TOPS: readonly number[] = new Array(67).fill(W - 1);
+
+const DIGITS = new Uint8Array(67);
 
 const OTS = 0;
 
@@ -174,7 +186,8 @@ function xor(a: Uint8Array, b: Uint8Array): Uint8Array {
   return out;
 }
 
-// The tweakable hashes of one key: F, H and PRF keyed by PUB_SEED, and PRF_keygen keyed by SK_SEED.
+// The tweakable hashes of one key, F, H and PRF keyed by PUB_SEED and PRF_keygen keyed by SK_SEED, in
+// the forms that the trees and the signatures use.
 abstract class Hashes {
   readonly p: Parameters;
 
@@ -186,76 +199,43 @@ abstract class Hashes {
     this.pubSeed = pubSeed;
   }
 
-  abstract prf(adrs: Uint8Array): Uint8Array;
+  // The leaf at index of a tree, the l-tree of the WOTS+ public key, into out at offset.
+  abstract leaf(layer: number, tree: bigint, index: number, out: Uint8Array, offset: number): void;
 
-  abstract h(key: Uint8Array, left: Uint8Array, right: Uint8Array): Uint8Array;
+  // The count nodes from index first on at height z + 1 of a tree, from their children in order from
+  // children[from] on, into out from offset on.
+  abstract combine(
+    layer: number,
+    tree: bigint,
+    z: number,
+    first: number,
+    count: number,
+    children: Uint8Array,
+    from: number,
+    out: Uint8Array,
+    offset: number,
+  ): void;
 
-  // SP 800-208: the secret chain values of the WOTS+ key in adrs come from
-  // PRF_keygen(SK_SEED, PUB_SEED || ADRS) with the hash and key-and-mask words cleared.
-  abstract secrets(adrs: Uint8Array): Uint8Array[];
+  // The WOTS+ signature of the n-byte message by leaf index of a tree, into out at offset.
+  abstract wotsSign(
+    layer: number,
+    tree: bigint,
+    index: number,
+    message: Uint8Array,
+    out: Uint8Array,
+    offset: number,
+  ): void;
 
-  // RFC 8391 chain i of the WOTS+ key in adrs, x = F(KEY, x XOR BM) with KEY and BM from
-  // PRF(PUB_SEED, ADRS), from step from[i] to step to[i], starting at starts[i], for each i.
-  abstract chains(adrs: Uint8Array, starts: Uint8Array[], from: readonly number[], to: readonly number[]): Uint8Array[];
-
-  // RFC 8391 l-tree over the WOTS+ public key values, at the l-tree address in adrs.
-  ltree(values: Uint8Array[], adrs: Uint8Array): Uint8Array {
-    setWord(adrs, 5, 0);
-
-    for (let height = 0; values.length > 1; height++) {
-      const paired: Uint8Array[] = [];
-
-      for (let i = 0; i < values.length >>> 1; i++) {
-        setWord(adrs, 6, i);
-
-        paired.push(randHash(this, values[2 * i], values[2 * i + 1], adrs));
-      }
-
-      if (values.length % 2 === 1) {
-        paired.push(values[values.length - 1]);
-      }
-
-      values = paired;
-
-      setWord(adrs, 5, height + 1);
-    }
-
-    return values[0];
-  }
-
-  // The root of a tree from the node at index and its authentication path.
-  root(node: Uint8Array, index: number, auth: Uint8Array, layer: number, tree: bigint): Uint8Array {
-    const adrs = address(layer, tree, HASH_TREE);
-
-    const n = this.p.n;
-
-    for (let k = 0; k < this.p.treeHeight; k++) {
-      setWord(adrs, 5, k);
-
-      setWord(adrs, 6, index >>> (k + 1));
-
-      const sibling = auth.subarray(k * n, (k + 1) * n);
-
-      node = ((index >>> k) & 1) === 1 ? randHash(this, sibling, node, adrs) : randHash(this, node, sibling, adrs);
-    }
-
-    return node;
-  }
-
-  // The leaf at index of a tree: the l-tree of the WOTS+ public key.
-  leaf(layer: number, tree: bigint, index: number): Uint8Array {
-    const ots = address(layer, tree, OTS);
-
-    setWord(ots, 4, index);
-
-    const values = this.chains(ots, this.secrets(ots), ZEROS, TOPS);
-
-    const lt = address(layer, tree, LTREE);
-
-    setWord(lt, 4, index);
-
-    return this.ltree(values, lt);
-  }
+  // The root of a tree from the WOTS+ signature, at signature[offset], of the n-byte node by leaf
+  // index, and from the authentication path after it.
+  abstract rootFromSignature(
+    layer: number,
+    tree: bigint,
+    index: number,
+    node: Uint8Array,
+    signature: Uint8Array,
+    offset: number,
+  ): Uint8Array;
 }
 
 // The hashes on bytes, each keeping its constant prefix absorbed once; used for SHAKE256.
@@ -292,6 +272,8 @@ class ByteHashes extends Hashes {
     return this.#prf.digest(this.p.n, adrs);
   }
 
+  // SP 800-208: the secret chain values of the WOTS+ key in adrs come from
+  // PRF_keygen(SK_SEED, PUB_SEED || ADRS) with the hash and key-and-mask words cleared.
   secrets(adrs: Uint8Array): Uint8Array[] {
     const secrets: Uint8Array[] = [];
 
@@ -312,12 +294,130 @@ class ByteHashes extends Hashes {
     return this.#h.digest(this.p.n, key, left, right);
   }
 
-  chains(adrs: Uint8Array, starts: Uint8Array[], from: readonly number[], to: readonly number[]): Uint8Array[] {
+  // RFC 8391 chain i of the WOTS+ key in adrs, x = F(KEY, x XOR BM) with KEY and BM from
+  // PRF(PUB_SEED, ADRS), from step from[i] to step to[i], starting at starts[i], for each i.
+  chains(adrs: Uint8Array, starts: Uint8Array[], from: ArrayLike<number>, to: ArrayLike<number>): Uint8Array[] {
     return starts.map((start, i) => {
       setWord(adrs, 5, i);
 
       return this.#chain(start, from[i], to[i] - from[i], adrs);
     });
+  }
+
+  // RFC 8391 l-tree over the WOTS+ public key values, at the l-tree address in adrs.
+  ltree(values: Uint8Array[], adrs: Uint8Array): Uint8Array {
+    setWord(adrs, 5, 0);
+
+    for (let height = 0; values.length > 1; height++) {
+      const paired: Uint8Array[] = [];
+
+      for (let i = 0; i < values.length >>> 1; i++) {
+        setWord(adrs, 6, i);
+
+        paired.push(randHash(this, values[2 * i], values[2 * i + 1], adrs));
+      }
+
+      if (values.length % 2 === 1) {
+        paired.push(values[values.length - 1]);
+      }
+
+      values = paired;
+
+      setWord(adrs, 5, height + 1);
+    }
+
+    return values[0];
+  }
+
+  leaf(layer: number, tree: bigint, index: number, out: Uint8Array, offset: number): void {
+    const ots = address(layer, tree, OTS);
+
+    setWord(ots, 4, index);
+
+    const values = this.chains(ots, this.secrets(ots), ZEROS, TOPS);
+
+    const lt = address(layer, tree, LTREE);
+
+    setWord(lt, 4, index);
+
+    out.set(this.ltree(values, lt), offset);
+  }
+
+  combine(
+    layer: number,
+    tree: bigint,
+    z: number,
+    first: number,
+    count: number,
+    children: Uint8Array,
+    from: number,
+    out: Uint8Array,
+    offset: number,
+  ): void {
+    const n = this.p.n;
+
+    const adrs = address(layer, tree, HASH_TREE);
+
+    setWord(adrs, 5, z);
+
+    for (let j = 0; j < count; j++) {
+      const left = children.subarray(from + 2 * j * n, from + (2 * j + 1) * n);
+
+      const right = children.subarray(from + (2 * j + 1) * n, from + (2 * j + 2) * n);
+
+      setWord(adrs, 6, first + j);
+
+      out.set(randHash(this, left, right, adrs), offset + j * n);
+    }
+  }
+
+  wotsSign(layer: number, tree: bigint, index: number, message: Uint8Array, out: Uint8Array, offset: number): void {
+    const ots = address(layer, tree, OTS);
+
+    setWord(ots, 4, index);
+
+    wotsDigits(message, DIGITS);
+
+    this.chains(ots, this.secrets(ots), ZEROS, DIGITS).forEach((value, i) => out.set(value, offset + i * this.p.n));
+  }
+
+  rootFromSignature(
+    layer: number,
+    tree: bigint,
+    index: number,
+    node: Uint8Array,
+    signature: Uint8Array,
+    offset: number,
+  ): Uint8Array {
+    const { n, length } = this.p;
+
+    const ots = address(layer, tree, OTS);
+
+    setWord(ots, 4, index);
+
+    wotsDigits(node, DIGITS);
+
+    const starts = Array.from({ length }, (_, i) => signature.subarray(offset + i * n, offset + (i + 1) * n));
+
+    const lt = address(layer, tree, LTREE);
+
+    setWord(lt, 4, index);
+
+    let root = this.ltree(this.chains(ots, starts, DIGITS, TOPS), lt);
+
+    const adrs = address(layer, tree, HASH_TREE);
+
+    for (let k = 0; k < this.p.treeHeight; k++) {
+      setWord(adrs, 5, k);
+
+      setWord(adrs, 6, index >>> (k + 1));
+
+      const sibling = signature.subarray(offset + (length + k) * n, offset + (length + k + 1) * n);
+
+      root = ((index >>> k) & 1) === 1 ? randHash(this, sibling, root, adrs) : randHash(this, root, sibling, adrs);
+    }
+
+    return root;
   }
 
   // PRF writes the key straight into the F message, and F writes the new value over its own input.
@@ -501,192 +601,7 @@ class Sha256Hashes extends Hashes {
     this.#values = new Int32Array(p.length * (n >>> 2));
   }
 
-  prf(adrs: Uint8Array): Uint8Array {
-    const lane = this.#a;
-
-    putWords(lane.prf.w, this.#prfAt, adrs);
-
-    lane.prf.digest(lane.mask);
-
-    return this.#bytes(lane.mask);
-  }
-
-  h(key: Uint8Array, left: Uint8Array, right: Uint8Array): Uint8Array {
-    const lane = this.#a;
-
-    const n = this.p.n;
-
-    putWords(lane.h.w, this.p.padding >>> 2, key);
-
-    putWords(lane.h.w, this.#inputAt, left);
-
-    putWords(lane.h.w, this.#inputAt + (n >>> 2), right);
-
-    lane.h.digest(lane.value);
-
-    return this.#bytes(lane.value);
-  }
-
-  secrets(adrs: Uint8Array): Uint8Array[] {
-    const at = this.#secretAt;
-
-    const a = this.#a;
-
-    const b = this.#b;
-
-    const secrets: Uint8Array[] = [];
-
-    putWords(a.secret.w, at, adrs);
-
-    putWords(b.secret.w, at, adrs);
-
-    for (let c = 0; c < this.p.length; c += 2) {
-      const pair = c + 1 < this.p.length ? b : null;
-
-      for (const [lane, chain] of [
-        [a, c],
-        [b, c + 1],
-      ] as const) {
-        lane.secret.w[at + 5] = chain;
-
-        lane.secret.w[at + 6] = 0;
-
-        lane.secret.w[at + 7] = 0;
-      }
-
-      Message.pair(a.secret, a.value, pair && b.secret, b.value);
-
-      secrets.push(this.#bytes(a.value));
-
-      if (pair !== null) {
-        secrets.push(this.#bytes(b.value));
-      }
-    }
-
-    return secrets;
-  }
-
-  // Two lanes take the chains in turn: when the chain in one lane ends, the next waiting chain takes
-  // its place, so the lanes stay busy whatever the lengths.
-  chains(
-    adrs: Uint8Array,
-    starts: Uint8Array[],
-    from: readonly number[],
-    to: readonly number[],
-  ): Uint8Array[] {
-    const at = this.#prfAt;
-
-    const a = this.#a;
-
-    const b = this.#b;
-
-    const ends = starts.slice();
-
-    let next = 0;
-
-    // The chain in each lane, or -1, and its next step.
-    let i = -1;
-
-    let j = 0;
-
-    let k = -1;
-
-    let l = 0;
-
-    putWords(a.prf.w, at, adrs);
-
-    putWords(b.prf.w, at, adrs);
-
-    for (;;) {
-      for (; i < 0 && next < starts.length; next++) {
-        if (from[next] < to[next]) {
-          i = next;
-
-          j = from[next];
-
-          putWords(a.value, 0, starts[i]);
-
-          a.prf.w[at + 5] = i;
-        }
-      }
-
-      for (; k < 0 && next < starts.length; next++) {
-        if (from[next] < to[next]) {
-          k = next;
-
-          l = from[next];
-
-          putWords(b.value, 0, starts[k]);
-
-          b.prf.w[at + 5] = k;
-        }
-      }
-
-      if (i < 0 && k < 0) {
-        return ends;
-      }
-
-      if (i >= 0) {
-        this.#step(a, j, k >= 0 ? b : null, l);
-      } else {
-        this.#step(b, l, null, 0);
-      }
-
-      if (i >= 0 && ++j === to[i]) {
-        ends[i] = this.#bytes(a.value);
-
-        i = -1;
-      }
-
-      if (k >= 0 && ++l === to[k]) {
-        ends[k] = this.#bytes(b.value);
-
-        k = -1;
-      }
-    }
-  }
-
-  override root(node: Uint8Array, index: number, auth: Uint8Array, layer: number, tree: bigint): Uint8Array {
-    const n = this.p.n;
-
-    const a = this.#a;
-
-    const sibling = this.#sibling;
-
-    setAddress(a.prf.w, this.#prfAt, layer, Number(tree >> 32n), Number(tree & 0xffffffffn), HASH_TREE, 0);
-
-    putWords(a.value, 0, node);
-
-    for (let k = 0; k < this.p.treeHeight; k++) {
-      a.prf.w[this.#prfAt + 5] = k;
-
-      a.prf.w[this.#prfAt + 6] = index >>> (k + 1);
-
-      for (let i = 0; i < n >>> 2; i++) {
-        sibling[i] = readUint32(auth, k * n + 4 * i);
-      }
-
-      if (((index >>> k) & 1) === 1) {
-        this.#input(a, sibling, 0, a.value, 0);
-      } else {
-        this.#input(a, a.value, 0, sibling, 0);
-      }
-
-      this.#randHash(a, null);
-    }
-
-    return this.#bytes(a.value);
-  }
-
-  override ltree(values: Uint8Array[], adrs: Uint8Array): Uint8Array {
-    const count = this.p.n >>> 2;
-
-    values.forEach((value, i) => putWords(this.#values, i * count, value));
-
-    return this.#ltree(readUint32(adrs, 0), readUint32(adrs, 4), readUint32(adrs, 8), readUint32(adrs, 16));
-  }
-
-  override leaf(layer: number, tree: bigint, index: number): Uint8Array {
+  leaf(layer: number, tree: bigint, index: number, out: Uint8Array, offset: number): void {
     const { n, length } = this.p;
 
     const count = n >>> 2;
@@ -701,11 +616,7 @@ class Sha256Hashes extends Hashes {
 
     const values = this.#values;
 
-    for (const lane of [a, b]) {
-      setAddress(lane.secret.w, this.#secretAt, layer, high, low, OTS, index);
-
-      setAddress(lane.prf.w, this.#prfAt, layer, high, low, OTS, index);
-    }
+    this.#address(layer, high, low, OTS, index);
 
     for (let c = 0; c < length; c += 2) {
       const pair = c + 1 < length ? b : null;
@@ -724,14 +635,235 @@ class Sha256Hashes extends Hashes {
         this.#step(a, k, pair, k);
       }
 
-      values.set(a.value.subarray(0, count), c * count);
+      copyWords(a.value, 0, values, c * count, count);
 
       if (pair !== null) {
-        values.set(b.value.subarray(0, count), (c + 1) * count);
+        copyWords(b.value, 0, values, (c + 1) * count, count);
       }
     }
 
-    return this.#ltree(layer, high, low, index);
+    this.#ltree(layer, high, low, index);
+
+    storeWords(values, count, out, offset);
+  }
+
+  wotsSign(layer: number, tree: bigint, index: number, message: Uint8Array, out: Uint8Array, offset: number): void {
+    const { n, length } = this.p;
+
+    const count = n >>> 2;
+
+    const a = this.#a;
+
+    const b = this.#b;
+
+    this.#address(layer, Number(tree >> 32n), Number(tree & 0xffffffffn), OTS, index);
+
+    for (let c = 0; c < length; c += 2) {
+      const pair = c + 1 < length ? b : null;
+
+      a.secret.w[this.#secretAt + 5] = c;
+
+      b.secret.w[this.#secretAt + 5] = c + 1;
+
+      Message.pair(a.secret, a.value, pair && b.secret, b.value);
+
+      copyWords(a.value, 0, this.#values, c * count, count);
+
+      if (pair !== null) {
+        copyWords(b.value, 0, this.#values, (c + 1) * count, count);
+      }
+    }
+
+    wotsDigits(message, DIGITS);
+
+    this.#run(ZEROS, DIGITS);
+
+    storeWords(this.#values, length * count, out, offset);
+  }
+
+  rootFromSignature(
+    layer: number,
+    tree: bigint,
+    index: number,
+    node: Uint8Array,
+    signature: Uint8Array,
+    offset: number,
+  ): Uint8Array {
+    const { n, length } = this.p;
+
+    const count = n >>> 2;
+
+    const a = this.#a;
+
+    const high = Number(tree >> 32n);
+
+    const low = Number(tree & 0xffffffffn);
+
+    loadWords(signature, offset, length * count, this.#values);
+
+    wotsDigits(node, DIGITS);
+
+    this.#address(layer, high, low, OTS, index);
+
+    this.#run(DIGITS, TOPS);
+
+    this.#ltree(layer, high, low, index);
+
+    copyWords(this.#values, 0, a.value, 0, count);
+
+    setAddress(a.prf.w, this.#prfAt, layer, high, low, HASH_TREE, 0);
+
+    const sibling = this.#sibling;
+
+    for (let k = 0; k < this.p.treeHeight; k++) {
+      a.prf.w[this.#prfAt + 5] = k;
+
+      a.prf.w[this.#prfAt + 6] = index >>> (k + 1);
+
+      loadWords(signature, offset + (length + k) * n, count, sibling);
+
+      if (((index >>> k) & 1) === 1) {
+        this.#input(a, sibling, 0, a.value, 0);
+      } else {
+        this.#input(a, a.value, 0, sibling, 0);
+      }
+
+      this.#randHash(a, null);
+    }
+
+    return this.#bytes(a.value);
+  }
+
+  // Words 0 to 4 of an address in the PRF_keygen and PRF messages of both lanes.
+  #address(layer: number, high: number, low: number, type: number, word4: number): void {
+    setAddress(this.#a.secret.w, this.#secretAt, layer, high, low, type, word4);
+
+    setAddress(this.#b.secret.w, this.#secretAt, layer, high, low, type, word4);
+
+    setAddress(this.#a.prf.w, this.#prfAt, layer, high, low, type, word4);
+
+    setAddress(this.#b.prf.w, this.#prfAt, layer, high, low, type, word4);
+  }
+
+  // The chains of the WOTS+ key whose address the PRF messages hold, on #values in place: chain c from
+  // step from[c] to step to[c] - 1. Two lanes take the chains in turn: when the chain in one lane
+  // ends, the next waiting chain takes its place, so the lanes stay busy whatever the lengths.
+  #run(from: ArrayLike<number>, to: ArrayLike<number>): void {
+    const at = this.#prfAt;
+
+    const count = this.p.n >>> 2;
+
+    const length = this.p.length;
+
+    const values = this.#values;
+
+    const a = this.#a;
+
+    const b = this.#b;
+
+    let next = 0;
+
+    // The chain in each lane, or -1, and its next step.
+    let i = -1;
+
+    let j = 0;
+
+    let k = -1;
+
+    let l = 0;
+
+    for (;;) {
+      for (; i < 0 && next < length; next++) {
+        if (from[next] < to[next]) {
+          i = next;
+
+          j = from[next];
+
+          copyWords(values, i * count, a.value, 0, count);
+
+          a.prf.w[at + 5] = i;
+        }
+      }
+
+      for (; k < 0 && next < length; next++) {
+        if (from[next] < to[next]) {
+          k = next;
+
+          l = from[next];
+
+          copyWords(values, k * count, b.value, 0, count);
+
+          b.prf.w[at + 5] = k;
+        }
+      }
+
+      if (i < 0 && k < 0) {
+        return;
+      }
+
+      if (i >= 0) {
+        this.#step(a, j, k >= 0 ? b : null, l);
+      } else {
+        this.#step(b, l, null, 0);
+      }
+
+      if (i >= 0 && ++j === to[i]) {
+        copyWords(a.value, 0, values, i * count, count);
+
+        i = -1;
+      }
+
+      if (k >= 0 && ++l === to[k]) {
+        copyWords(b.value, 0, values, k * count, count);
+
+        k = -1;
+      }
+    }
+  }
+
+  // Two nodes of a level at a time, their inputs read straight from the children's bytes.
+  combine(
+    layer: number,
+    tree: bigint,
+    z: number,
+    first: number,
+    count: number,
+    children: Uint8Array,
+    from: number,
+    out: Uint8Array,
+    offset: number,
+  ): void {
+    const n = this.p.n;
+
+    const a = this.#a;
+
+    const b = this.#b;
+
+    this.#address(layer, Number(tree >> 32n), Number(tree & 0xffffffffn), HASH_TREE, 0);
+
+    for (let j = 0; j < count; j += 2) {
+      const pair = j + 1 < count ? b : null;
+
+      this.#prfWords(a, pair, 5, z);
+
+      a.prf.w[this.#prfAt + 6] = first + j;
+
+      b.prf.w[this.#prfAt + 6] = first + j + 1;
+
+      this.#inputBytes(a, children, from + 2 * j * n);
+
+      if (pair !== null) {
+        this.#inputBytes(b, children, from + 2 * (j + 1) * n);
+      }
+
+      this.#randHash(a, pair);
+
+      storeWords(a.value, n >>> 2, out, offset + j * n);
+
+      if (pair !== null) {
+        storeWords(b.value, n >>> 2, out, offset + (j + 1) * n);
+      }
+    }
   }
 
   // One chain step of lane a at hash address k, and of lane b, if given, at hash address l.
@@ -759,8 +891,9 @@ class Sha256Hashes extends Hashes {
     Message.pair(a.f, a.value, b && b.f, (b ?? a).value);
   }
 
-  // RFC 8391 l-tree over the chain ends in #values, in place, two nodes of a level at a time.
-  #ltree(layer: number, high: number, low: number, index: number): Uint8Array {
+  // RFC 8391 l-tree over the chain ends in #values, in place, two nodes of a level at a time: the root
+  // ends in its first words.
+  #ltree(layer: number, high: number, low: number, index: number): void {
     const count = this.p.n >>> 2;
 
     const values = this.#values;
@@ -793,10 +926,10 @@ class Sha256Hashes extends Hashes {
 
         this.#randHash(a, pair);
 
-        values.set(a.value.subarray(0, count), i * count);
+        copyWords(a.value, 0, values, i * count, count);
 
         if (pair !== null) {
-          values.set(b.value.subarray(0, count), (i + 1) * count);
+          copyWords(b.value, 0, values, (i + 1) * count, count);
         }
       }
 
@@ -804,8 +937,6 @@ class Sha256Hashes extends Hashes {
         values.copyWithin(half * count, (length - 1) * count, length * count);
       }
     }
-
-    return this.#bytes(values);
   }
 
   // RAND_HASH on the inputs in the H message of lane a, and of lane b if given, with words 0 to 6 of
@@ -846,6 +977,13 @@ class Sha256Hashes extends Hashes {
       lane.h.w[input + k] ^= lane.mask[k];
 
       lane.h.w[input + count + k] ^= lane.mask1[k];
+    }
+  }
+
+  // Puts the left and right inputs of RAND_HASH, the 2n bytes at data[at], into the H message of lane.
+  #inputBytes(lane: Lane, data: Uint8Array, at: number): void {
+    for (let k = 0; k < this.p.n >>> 1; k++) {
+      lane.h.w[this.#inputAt + k] = readUint32(data, at + 4 * k);
     }
   }
 
@@ -921,42 +1059,30 @@ function createHashes(p: Parameters, pubSeed: Uint8Array, skSeed: Uint8Array | n
   return p.shake ? new ByteHashes(p, pubSeed, skSeed) : new Sha256Hashes(p, pubSeed, skSeed);
 }
 
-function wotsDigits(message: Uint8Array): number[] {
-  const digits: number[] = [];
-
-  for (const byte of message) {
-    digits.push(byte >>> 4, byte & 0x0f);
-  }
+// The WOTS+ digits of the n-byte message, then of its checksum (RFC 8391, 3.1.5), into out.
+function wotsDigits(message: Uint8Array, out: Uint8Array): void {
+  const n = message.length;
 
   let checksum = 0;
 
-  for (const digit of digits) {
-    checksum += W - 1 - digit;
+  for (let i = 0; i < n; i++) {
+    out[2 * i] = message[i] >>> 4;
+
+    out[2 * i + 1] = message[i] & 0x0f;
+
+    checksum += 2 * (W - 1) - out[2 * i] - out[2 * i + 1];
   }
 
   checksum <<= 4;
 
-  return digits.concat([(checksum >>> 12) & 0x0f, (checksum >>> 8) & 0x0f, (checksum >>> 4) & 0x0f]);
+  out[2 * n] = (checksum >>> 12) & 0x0f;
+
+  out[2 * n + 1] = (checksum >>> 8) & 0x0f;
+
+  out[2 * n + 2] = (checksum >>> 4) & 0x0f;
 }
 
-function wotsSign(hashes: Hashes, message: Uint8Array, adrs: Uint8Array): Uint8Array[] {
-  return hashes.chains(adrs, hashes.secrets(adrs), ZEROS, wotsDigits(message));
-}
-
-function wotsPublicFromSignature(
-  hashes: Hashes,
-  signature: Uint8Array,
-  message: Uint8Array,
-  adrs: Uint8Array,
-): Uint8Array[] {
-  const n = hashes.p.n;
-
-  const starts = Array.from({ length: hashes.p.length }, (_, i) => signature.subarray(i * n, (i + 1) * n));
-
-  return hashes.chains(adrs, starts, wotsDigits(message), TOPS);
-}
-
-function randHash(hashes: Hashes, left: Uint8Array, right: Uint8Array, adrs: Uint8Array): Uint8Array {
+function randHash(hashes: ByteHashes, left: Uint8Array, right: Uint8Array, adrs: Uint8Array): Uint8Array {
   setWord(adrs, 7, 0);
 
   const key = hashes.prf(adrs);
@@ -973,17 +1099,13 @@ function randHash(hashes: Hashes, left: Uint8Array, right: Uint8Array, adrs: Uin
 }
 
 function subtree(hashes: Hashes, layer: number, tree: bigint, levels?: readonly Uint8Array[]): MerkleTree {
-  const combine = (z: number, j: number, left: Uint8Array, right: Uint8Array) => {
-    const adrs = address(layer, tree, HASH_TREE);
-
-    setWord(adrs, 5, z);
-
-    setWord(adrs, 6, j);
-
-    return randHash(hashes, left, right, adrs);
+  const nodes: TreeHashes = {
+    leaf: (index, out, offset) => hashes.leaf(layer, tree, index, out, offset),
+    combine: (z, first, count, children, from, out, offset) =>
+      hashes.combine(layer, tree, z, first, count, children, from, out, offset),
   };
 
-  return new MerkleTree(hashes.p.treeHeight, hashes.p.n, (index) => hashes.leaf(layer, tree, index), combine, levels);
+  return new MerkleTree(hashes.p.treeHeight, hashes.p.n, nodes, levels);
 }
 
 function messageDigest(p: Parameters, r: Uint8Array, root: Uint8Array, index: bigint, message: Uint8Array): Uint8Array {
@@ -1038,23 +1160,9 @@ export function verify(p: Parameters, publicKey: Uint8Array, message: Uint8Array
 
     index >>= BigInt(p.treeHeight);
 
-    const ots = address(layer, index, OTS);
+    node = hashes.rootFromSignature(layer, index, leafIndex, node, signature, offset);
 
-    setWord(ots, 4, leafIndex);
-
-    const values = wotsPublicFromSignature(hashes, signature.subarray(offset, offset + p.length * n), node, ots);
-
-    offset += p.length * n;
-
-    const lt = address(layer, index, LTREE);
-
-    setWord(lt, 4, leafIndex);
-
-    const auth = signature.subarray(offset, offset + p.treeHeight * n);
-
-    node = hashes.root(hashes.ltree(values, lt), leafIndex, auth, layer, index);
-
-    offset += p.treeHeight * n;
+    offset += (p.length + p.treeHeight) * n;
   }
 
   return equal(node, root);
@@ -1092,11 +1200,15 @@ export class Xmss {
 
     this.#hashes = createHashes(p, pubSeed, skSeed);
 
-    for (const [layer, [tree, levels]] of cached ?? []) {
-      this.#trees.set(layer, [tree, subtree(this.#hashes, layer, tree, levels)]);
-    }
+    try {
+      for (const [layer, [tree, levels]] of cached ?? []) {
+        this.#trees.set(layer, [tree, subtree(this.#hashes, layer, tree, levels)]);
+      }
 
-    this.root = this.#tree(p.d - 1, 0n).root;
+      this.root = this.#tree(p.d - 1, 0n).root;
+    } finally {
+      wipeSha2Lanes();
+    }
   }
 
   get publicKey(): Uint8Array {
@@ -1125,6 +1237,14 @@ export class Xmss {
   }
 
   sign(index: bigint, message: Uint8Array): Uint8Array {
+    try {
+      return this.#sign(index, message);
+    } finally {
+      wipeSha2Lanes();
+    }
+  }
+
+  #sign(index: bigint, message: Uint8Array): Uint8Array {
     const p = this.p;
 
     const indexBytes = new Uint8Array(32);
@@ -1153,11 +1273,13 @@ export class Xmss {
 
     const tree = at >> BigInt(p.treeHeight);
 
-    const ots = address(layer, tree, OTS);
+    const out = new Uint8Array((p.length + p.treeHeight) * p.n);
 
-    setWord(ots, 4, leafIndex);
+    this.#hashes.wotsSign(layer, tree, leafIndex, node, out, 0);
 
-    return concat(...wotsSign(this.#hashes, node, ots), this.#tree(layer, tree).authPath(leafIndex));
+    this.#tree(layer, tree).authPath(leafIndex, out, p.length * p.n);
+
+    return out;
   }
 
   // An upper layer's part, which signs the root of tree (at) on the layer below. Layers are visited

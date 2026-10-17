@@ -172,8 +172,9 @@ export function squeezeBytes(s: Uint32Array, rate: number, position: number, suf
   }
 }
 
-// The state of a one-shot digest, cleared after each: a digest runs to its end without calling
-// out, so one serves every call.
+// The state of a one-shot digest: a digest runs to its end without calling out, so one serves every
+// call. Each absorbs into it from zero, so it is cleared after every digest, also one that an
+// exception such as a stack overflow ends.
 const SPONGE = new Uint32Array(50);
 
 // The first length bytes of the output for a whole message, without a sponge object: the message
@@ -181,9 +182,11 @@ const SPONGE = new Uint32Array(50);
 export function keccakDigest(rate: number, suffix: number, data: Uint8Array, length: number): Uint8Array {
   const out = new Uint8Array(length);
 
-  squeezeBytes(SPONGE, rate, absorbBytes(SPONGE, rate, 0, data, 0, data.length), suffix, out);
-
-  SPONGE.fill(0);
+  try {
+    squeezeBytes(SPONGE, rate, absorbBytes(SPONGE, rate, 0, data, 0, data.length), suffix, out);
+  } finally {
+    SPONGE.fill(0);
+  }
 
   return out;
 }

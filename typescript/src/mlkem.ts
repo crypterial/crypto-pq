@@ -1,6 +1,6 @@
 import { equal, wipe } from "./bytes.ts";
-import { Keccak } from "./keccak.ts";
-import { sha3, shake256 } from "./primitives.ts";
+import { Keccak, absorbBytes, squeezeBytes } from "./keccak.ts";
+import { sha3 } from "./primitives.ts";
 
 const Q = 3329;
 
@@ -165,9 +165,7 @@ function prepare(f: Int16Array): Int16Array {
 // (-q, q), which inverseNtt and fqmul accept. Each group of four coefficients sums plain products over
 // the vector: every product is below q^2 in magnitude, so the at most eight of a sum stay below
 // q * 2^15, which one Montgomery reduction accepts.
-function multiplyAccumulate(f: Int16Array[], g: Int16Array[]): Int16Array {
-  const r = new Int16Array(256);
-
+function multiplyAccumulate(f: Int16Array[], g: Int16Array[], r: Int16Array): void {
   for (let j = 0; j < 64; j++) {
     const at = 4 * j;
 
@@ -213,8 +211,6 @@ function multiplyAccumulate(f: Int16Array[], g: Int16Array[]): Int16Array {
 
     r[at + 3] = montgomeryReduce(r3);
   }
-
-  return r;
 }
 
 // round(2^d * x / q) mod 2^d for x in [0, q), with an exact multiply-shift instead of a division.
@@ -246,9 +242,7 @@ function encode(values: ArrayLike<number>, d: number, out: Uint8Array, offset: n
   }
 }
 
-function decode(data: Uint8Array, offset: number, d: number): Int16Array {
-  const out = new Int16Array(256);
-
+function decode(data: Uint8Array, offset: number, d: number, out: Int16Array): Int16Array {
   const mask = (1 << d) - 1;
 
   let buffer = 0;
@@ -272,22 +266,18 @@ function decode(data: Uint8Array, offset: number, d: number): Int16Array {
   return out;
 }
 
-// ByteEncode12 of a polynomial whose coefficients lie in (-q, q).
+// ByteEncode12 of a polynomial whose coefficients lie in (-q, q), which it leaves canonical.
 function encode12(f: Int16Array, out: Uint8Array, offset: number): void {
-  const values = new Int16Array(256);
-
   for (let i = 0; i < 256; i++) {
-    values[i] = canonical(f[i]);
+    f[i] = canonical(f[i]);
   }
 
-  encode(values, 12, out, offset);
-
-  values.fill(0);
+  encode(f, 12, out, offset);
 }
 
 // ByteDecode12 followed by a reduction modulo q, as FIPS 203 specifies for decapsulation keys.
 function decode12(data: Uint8Array, offset: number): Int16Array {
-  const f = decode(data, offset, 12);
+  const f = decode(data, offset, 12, new Int16Array(256));
 
   for (let i = 0; i < 256; i++) {
     f[i] = reduceOnce(f[i]);
@@ -296,20 +286,17 @@ function decode12(data: Uint8Array, offset: number): Int16Array {
   return f;
 }
 
+// Compress_d, then ByteEncode_d, of a polynomial with coefficients in (-q, q), which it overwrites.
 function compressPolynomial(f: Int16Array, d: number, out: Uint8Array, offset: number): void {
-  const values = new Int16Array(256);
-
   for (let i = 0; i < 256; i++) {
-    values[i] = compress(canonical(f[i]), d);
+    f[i] = compress(canonical(f[i]), d);
   }
 
-  encode(values, d, out, offset);
-
-  values.fill(0);
+  encode(f, d, out, offset);
 }
 
-function decompressPolynomial(data: Uint8Array, offset: number, d: number): Int16Array {
-  const f = decode(data, offset, d);
+function decompressPolynomial(data: Uint8Array, offset: number, d: number, out: Int16Array): Int16Array {
+  const f = decode(data, offset, d, out);
 
   for (let i = 0; i < 256; i++) {
     f[i] = decompress(f[i], d);
@@ -324,14 +311,62 @@ const XOF128 = new Keccak(168, 0x1f);
 
 const XOF256 = new Keccak(136, 0x1f);
 
+// The noise stream of eta = 3 and of eta = 2, and the one-byte nonce.
 const NOISE = new Uint8Array(192);
 
-function sampleNtt(seed: Uint8Array): Int16Array {
+const NOISE2 = NOISE.subarray(0, 128);
+
+const NONCE = new Uint8Array(1);
+
+// The scratch of one encryption or decryption, which never nest: polynomials of a vector (y or u)
+// and two more, G's output (K, then the noise seed r), J's output, the message and a ciphertext. Each
+// is wiped after use.
+const VECTOR = Array.from({ length: 4 }, () => new Int16Array(256));
+
+const POLY = new Int16Array(256);
+
+const ERROR = new Int16Array(256);
+
+const G_OUT = new Uint8Array(64);
+
+const R = G_OUT.subarray(32);
+
+const REJECTED = new Uint8Array(32);
+
+const MESSAGE = new Uint8Array(32);
+
+const CIPHERTEXT = new Uint8Array(1568);
+
+// The state of G and J, which read their inputs where they are. Each absorbs into it from zero, so it
+// is cleared after every use, also one that an exception such as a stack overflow ends.
+const SPONGE = new Uint32Array(50);
+
+// G(a || b), SHA3-512 of the 32 bytes of a and the 32 from b[from], into G_OUT.
+function hashG(a: Uint8Array, b: Uint8Array, from: number): void {
+  try {
+    const position = absorbBytes(SPONGE, 72, absorbBytes(SPONGE, 72, 0, a, 0, 32), b, from, from + 32);
+
+    squeezeBytes(SPONGE, 72, position, 0x06, G_OUT);
+  } finally {
+    SPONGE.fill(0);
+  }
+}
+
+// J(z || c), SHAKE256 to 32 bytes of the 32 bytes from z[from] and of c, into REJECTED.
+function hashJ(z: Uint8Array, from: number, c: Uint8Array): void {
+  try {
+    const position = absorbBytes(SPONGE, 136, absorbBytes(SPONGE, 136, 0, z, from, from + 32), c, 0, c.length);
+
+    squeezeBytes(SPONGE, 136, position, 0x1f, REJECTED);
+  } finally {
+    SPONGE.fill(0);
+  }
+}
+
+function sampleNtt(seed: Uint8Array, a: Int16Array = new Int16Array(256)): Int16Array {
   XOF128.reset();
 
   XOF128.update(seed);
-
-  const a = new Int16Array(256);
 
   let count = 0;
 
@@ -356,11 +391,9 @@ function sampleNtt(seed: Uint8Array): Int16Array {
   return a;
 }
 
-// SamplePolyCBD: each coefficient is the difference of two eta-bit popcounts, computed with
+// SamplePolyCBD into f: each coefficient is the difference of two eta-bit popcounts, computed with
 // masks and additions so that no branch or index depends on the secret bits.
-function sampleCbd(data: Uint8Array, eta: number): Int16Array {
-  const f = new Int16Array(256);
-
+function sampleCbd(data: Uint8Array, eta: number, f: Int16Array): Int16Array {
   if (eta === 2) {
     for (let i = 0; i < 32; i++) {
       const t = data[4 * i] | (data[4 * i + 1] << 8) | (data[4 * i + 2] << 16) | (data[4 * i + 3] << 24);
@@ -386,18 +419,20 @@ function sampleCbd(data: Uint8Array, eta: number): Int16Array {
   return f;
 }
 
-function noise(seed: Uint8Array, nonce: number, eta: number): Int16Array {
-  const data = NOISE.subarray(0, 64 * eta);
+function noise(seed: Uint8Array, nonce: number, eta: number, f: Int16Array = new Int16Array(256)): Int16Array {
+  const data = eta === 2 ? NOISE2 : NOISE;
 
   XOF256.reset();
 
   XOF256.update(seed);
 
-  XOF256.update(Uint8Array.of(nonce));
+  NONCE[0] = nonce;
+
+  XOF256.update(NONCE);
 
   XOF256.readInto(data);
 
-  const f = sampleCbd(data, eta);
+  sampleCbd(data, eta, f);
 
   data.fill(0);
 
@@ -406,31 +441,23 @@ function noise(seed: Uint8Array, nonce: number, eta: number): Int16Array {
   return f;
 }
 
-// matrix[i][j] = SampleNTT(rho || j || i).
-function matrix(rho: Uint8Array, k: number): Int16Array[][] {
+// Row i of A, entry j being SampleNTT(rho || j || i), into row; or of A transposed, entry j being
+// A[j][i] = SampleNTT(rho || i || j).
+function matrixRow(rho: Uint8Array, k: number, i: number, transposed: boolean, row: Int16Array[]): void {
   const seed = new Uint8Array(34);
 
   seed.set(rho);
 
-  const rows: Int16Array[][] = [];
+  for (let j = 0; j < k; j++) {
+    seed[32] = transposed ? i : j;
 
-  for (let i = 0; i < k; i++) {
-    const row: Int16Array[] = [];
+    seed[33] = transposed ? j : i;
 
-    for (let j = 0; j < k; j++) {
-      seed[32] = j;
-
-      seed[33] = i;
-
-      row.push(sampleNtt(seed));
-    }
-
-    rows.push(row);
+    sampleNtt(seed, row[j]);
   }
-
-  return rows;
 }
 
+// Each row of A is sampled in turn into the scratch, as t needs it.
 function pkeKeygen(d: Uint8Array, p: Parameters): [Uint8Array, Uint8Array] {
   const k = p.k;
 
@@ -440,22 +467,12 @@ function pkeKeygen(d: Uint8Array, p: Parameters): [Uint8Array, Uint8Array] {
 
   const sigma = g.subarray(32);
 
-  const a = matrix(rho, k);
-
   const s: Int16Array[] = [];
-
-  const e: Int16Array[] = [];
 
   for (let i = 0; i < k; i++) {
     s.push(noise(sigma, i, p.eta1));
 
     ntt(s[i]);
-  }
-
-  for (let i = 0; i < k; i++) {
-    e.push(noise(sigma, k + i, p.eta1));
-
-    ntt(e[i]);
   }
 
   const sHat = s.map(prepare);
@@ -465,27 +482,35 @@ function pkeKeygen(d: Uint8Array, p: Parameters): [Uint8Array, Uint8Array] {
   const dk = new Uint8Array(384 * k);
 
   for (let i = 0; i < k; i++) {
-    const t = multiplyAccumulate(sHat, a[i]);
+    matrixRow(rho, k, i, false, VECTOR);
+
+    multiplyAccumulate(sHat, VECTOR, POLY);
+
+    noise(sigma, k + i, p.eta1, ERROR);
+
+    ntt(ERROR);
 
     for (let j = 0; j < 256; j++) {
-      t[j] = barrettReduce(fqmul(t[j], 1353) + e[i][j]);
+      POLY[j] = barrettReduce(fqmul(POLY[j], 1353) + ERROR[j]);
     }
 
-    encode12(t, ek, 384 * i);
+    encode12(POLY, ek, 384 * i);
+  }
 
+  for (let i = 0; i < k; i++) {
     encode12(s[i], dk, 384 * i);
   }
 
   ek.set(rho, 384 * k);
 
-  wipe(g, ...s, ...sHat, ...e);
+  wipe(g, ...s, ...sHat, POLY, ERROR);
 
   return [ek, dk];
 }
 
 // What encryption derives from an encapsulation key, kept with the key object and shared by a private
-// key with its public key: H(ek), and Â in the NTT domain with the decoded vector t̂, both prepared.
-// Each part is computed on first use unless the key's creator supplies it.
+// key with its public key: H(ek), and Â transposed in the NTT domain with the decoded vector t̂, both
+// prepared. Each part is computed on first use unless the key's creator supplies it.
 export interface PublicCache {
   digest: Uint8Array | null;
 
@@ -503,10 +528,10 @@ export function publicCache(digest: Uint8Array | null = null): PublicCache {
   return { digest, matrix: null, t: null };
 }
 
-// ByteDecode12 of the first k encoded polynomials of a key, prepared.
-function decodeVector(key: Uint8Array, k: number): Int16Array[] {
+// ByteDecode12 of the first k encoded polynomials from key[at], prepared.
+function decodeVector(key: Uint8Array, k: number, at = 0): Int16Array[] {
   return Array.from({ length: k }, (_, i) => {
-    const f = decode12(key, 384 * i);
+    const f = decode12(key, at + 384 * i);
 
     const prepared = prepare(f);
 
@@ -516,88 +541,91 @@ function decodeVector(key: Uint8Array, k: number): Int16Array[] {
   });
 }
 
-function pkeEncrypt(ek: Uint8Array, cache: PublicCache, m: Uint8Array, r: Uint8Array, p: Parameters): Uint8Array {
-  const k = p.k;
+function transposed(rho: Uint8Array, k: number): Int16Array[][] {
+  return Array.from({ length: k }, (_, i) => {
+    const row = Array.from({ length: k }, () => new Int16Array(256));
 
-  const a = (cache.matrix ??= matrix(ek.subarray(384 * k), k).map((row) => row.map(prepare)));
+    matrixRow(rho, k, i, true, row);
 
-  const t = (cache.t ??= decodeVector(ek, k));
-
-  const y: Int16Array[] = [];
-
-  for (let i = 0; i < k; i++) {
-    y.push(noise(r, i, p.eta1));
-
-    ntt(y[i]);
-  }
-
-  const c = new Uint8Array(p.ciphertextSize);
-
-  for (let i = 0; i < k; i++) {
-    const column: Int16Array[] = [];
-
-    for (let j = 0; j < k; j++) {
-      column.push(a[j][i]);
-    }
-
-    const u = multiplyAccumulate(column, y);
-
-    const e1 = noise(r, k + i, p.eta2);
-
-    inverseNtt(u);
-
-    for (let j = 0; j < 256; j++) {
-      u[j] = barrettReduce(u[j] + e1[j]);
-    }
-
-    compressPolynomial(u, p.du, c, 32 * p.du * i);
-
-    wipe(u, e1);
-  }
-
-  const v = multiplyAccumulate(t, y);
-
-  const e2 = noise(r, 2 * k, p.eta2);
-
-  inverseNtt(v);
-
-  for (let j = 0; j < 256; j++) {
-    v[j] = barrettReduce(v[j] + e2[j] + (-((m[j >> 3] >> (j & 7)) & 1) & 1665));
-  }
-
-  compressPolynomial(v, p.dv, c, 32 * p.du * k);
-
-  wipe(v, e2, ...y);
-
-  return c;
+    return row.map(prepare);
+  });
 }
 
-function pkeDecrypt(s: Int16Array[], c: Uint8Array, p: Parameters): Uint8Array {
+// Writes the ciphertext to c, whose first ciphertextSize bytes it fills, for the encapsulation key at
+// key[at], which only fills an empty cache; y lives in the scratch vector.
+function pkeEncrypt(
+  key: Uint8Array,
+  at: number,
+  cache: PublicCache,
+  m: Uint8Array,
+  r: Uint8Array,
+  p: Parameters,
+  c: Uint8Array,
+): void {
   const k = p.k;
 
-  const u: Int16Array[] = [];
+  const a = (cache.matrix ??= transposed(key.subarray(at + 384 * k, at + 384 * k + 32), k));
+
+  const t = (cache.t ??= decodeVector(key, k, at));
 
   for (let i = 0; i < k; i++) {
-    u.push(decompressPolynomial(c, 32 * p.du * i, p.du));
+    noise(r, i, p.eta1, VECTOR[i]);
 
-    ntt(u[i]);
+    ntt(VECTOR[i]);
   }
 
-  const w = multiplyAccumulate(s, u);
+  for (let i = 0; i < k; i++) {
+    multiplyAccumulate(a[i], VECTOR, POLY);
 
-  const v = decompressPolynomial(c, 32 * p.du * k, p.dv);
+    noise(r, k + i, p.eta2, ERROR);
 
-  inverseNtt(w);
+    inverseNtt(POLY);
 
-  const m = new Uint8Array(32);
+    for (let j = 0; j < 256; j++) {
+      POLY[j] = barrettReduce(POLY[j] + ERROR[j]);
+    }
+
+    compressPolynomial(POLY, p.du, c, 32 * p.du * i);
+  }
+
+  multiplyAccumulate(t, VECTOR, POLY);
+
+  noise(r, 2 * k, p.eta2, ERROR);
+
+  inverseNtt(POLY);
 
   for (let j = 0; j < 256; j++) {
-    m[j >> 3] |= compress(canonical(barrettReduce(v[j] - w[j])), 1) << (j & 7);
+    POLY[j] = barrettReduce(POLY[j] + ERROR[j] + (-((m[j >> 3] >> (j & 7)) & 1) & 1665));
   }
 
-  wipe(w);
+  compressPolynomial(POLY, p.dv, c, 32 * p.du * k);
 
-  return m;
+  wipe(POLY, ERROR, ...VECTOR);
+}
+
+// Writes the message to m; u lives in the scratch vector.
+function pkeDecrypt(s: Int16Array[], c: Uint8Array, p: Parameters, m: Uint8Array): void {
+  const k = p.k;
+
+  for (let i = 0; i < k; i++) {
+    decompressPolynomial(c, 32 * p.du * i, p.du, VECTOR[i]);
+
+    ntt(VECTOR[i]);
+  }
+
+  multiplyAccumulate(s, VECTOR, POLY);
+
+  const v = decompressPolynomial(c, 32 * p.du * k, p.dv, ERROR);
+
+  inverseNtt(POLY);
+
+  m.fill(0);
+
+  for (let j = 0; j < 256; j++) {
+    m[j >> 3] |= compress(canonical(barrettReduce(v[j] - POLY[j])), 1) << (j & 7);
+  }
+
+  POLY.fill(0);
 }
 
 export function keygenInternal(d: Uint8Array, z: Uint8Array, p: Parameters): [Uint8Array, Uint8Array] {
@@ -618,19 +646,27 @@ export function keygenInternal(d: Uint8Array, z: Uint8Array, p: Parameters): [Ui
   return [ek, dk];
 }
 
+// (K, r) = G(m || H(ek)) in the scratch, r being the noise seed of the encryption, from m read once
+// into the scratch. The ciphertext fills the first ciphertextSize bytes of the array given, or a new
+// one.
 export function encapsInternal(
   ek: Uint8Array,
   cache: PublicCache,
   m: Uint8Array,
   p: Parameters,
+  ciphertext: Uint8Array = new Uint8Array(p.ciphertextSize),
 ): [Uint8Array, Uint8Array] {
-  const g = sha3(64, m, (cache.digest ??= sha3(32, ek)));
+  for (let i = 0; i < 32; i++) {
+    MESSAGE[i] = m[i];
+  }
 
-  const ciphertext = pkeEncrypt(ek, cache, m, g.subarray(32), p);
+  hashG(MESSAGE, (cache.digest ??= sha3(32, ek)), 0);
 
-  const sharedSecret = g.slice(0, 32);
+  pkeEncrypt(ek, 0, cache, MESSAGE, R, p, ciphertext);
 
-  g.fill(0);
+  const sharedSecret = G_OUT.slice(0, 32);
+
+  wipe(G_OUT, MESSAGE);
 
   return [sharedSecret, ciphertext];
 }
@@ -647,18 +683,18 @@ export function decapsInternal(
 ): Uint8Array {
   const k = p.k;
 
-  const m = pkeDecrypt((secret.s ??= decodeVector(dk, k)), c, p);
+  pkeDecrypt((secret.s ??= decodeVector(dk, k)), c, p, MESSAGE);
 
-  const g = sha3(64, m, dk.subarray(768 * k + 32, 768 * k + 64));
+  hashG(MESSAGE, dk, 768 * k + 32);
 
-  const rejected = shake256(32, dk.subarray(768 * k + 64), c);
+  hashJ(dk, 768 * k + 64, c);
 
-  const reencrypted = pkeEncrypt(dk.subarray(384 * k, 768 * k + 32), cache, m, g.subarray(32), p);
+  pkeEncrypt(dk, 384 * k, cache, MESSAGE, R, p, CIPHERTEXT);
 
   let difference = 0;
 
   for (let i = 0; i < c.length; i++) {
-    difference |= c[i] ^ reencrypted[i];
+    difference |= c[i] ^ CIPHERTEXT[i];
   }
 
   const mask = -((difference | -difference) >>> 31);
@@ -666,10 +702,10 @@ export function decapsInternal(
   const sharedSecret = new Uint8Array(32);
 
   for (let i = 0; i < 32; i++) {
-    sharedSecret[i] = g[i] ^ (mask & (g[i] ^ rejected[i]));
+    sharedSecret[i] = G_OUT[i] ^ (mask & (G_OUT[i] ^ REJECTED[i]));
   }
 
-  wipe(m, g, rejected, reencrypted);
+  wipe(MESSAGE, G_OUT, REJECTED, CIPHERTEXT);
 
   return sharedSecret;
 }

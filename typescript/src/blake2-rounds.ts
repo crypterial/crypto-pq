@@ -2,6 +2,12 @@
 
 const TWO_32 = 0x100000000;
 
+// The working vector of blake2bCompress between its halves and the message words of its block, as
+// (low, high) pairs.
+const WORK = new Int32Array(32);
+
+const WORDS = new Int32Array(32);
+
 // The BLAKE2s compression of the 64-byte block at data[offset] into the chaining value h, with the
 // counter t (the bytes hashed so far, this block included, below 2^53) and last = -1 for the final
 // block, else 0.
@@ -2007,10 +2013,9 @@ export function blake2sCompress(h: Int32Array, data: Uint8Array, offset: number,
   h[7] ^= v7 ^ v15;
 }
 
-// The BLAKE2b compression of the 128-byte block at data[offset] into the chaining value h, whose
-// 64-bit words are (low, high) pairs of 32-bit halves, with the counter t (below 2^53) and last = -1
-// for the final block, else 0. The 64-bit additions carry with an unsigned comparison.
-export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number, counter: number, last: number): void {
+// Rounds 0 to 5 of blake2bCompress, which leave the working vector in WORK and the message words in
+// WORDS.
+function blake2bLow(h: Int32Array, data: Uint8Array, offset: number, counter: number, last: number): void {
   let v0h = h[1] | 0;
 
   let v0l = h[0] | 0;
@@ -2146,6 +2151,70 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
   const m15h = data[offset + 124] | (data[offset + 125] << 8) | (data[offset + 126] << 16) | (data[offset +
       127] << 24);
 
+  WORDS[0] = m0l;
+
+  WORDS[1] = m0h;
+
+  WORDS[2] = m1l;
+
+  WORDS[3] = m1h;
+
+  WORDS[4] = m2l;
+
+  WORDS[5] = m2h;
+
+  WORDS[6] = m3l;
+
+  WORDS[7] = m3h;
+
+  WORDS[8] = m4l;
+
+  WORDS[9] = m4h;
+
+  WORDS[10] = m5l;
+
+  WORDS[11] = m5h;
+
+  WORDS[12] = m6l;
+
+  WORDS[13] = m6h;
+
+  WORDS[14] = m7l;
+
+  WORDS[15] = m7h;
+
+  WORDS[16] = m8l;
+
+  WORDS[17] = m8h;
+
+  WORDS[18] = m9l;
+
+  WORDS[19] = m9h;
+
+  WORDS[20] = m10l;
+
+  WORDS[21] = m10h;
+
+  WORDS[22] = m11l;
+
+  WORDS[23] = m11h;
+
+  WORDS[24] = m12l;
+
+  WORDS[25] = m12h;
+
+  WORDS[26] = m13l;
+
+  WORDS[27] = m13h;
+
+  WORDS[28] = m14l;
+
+  WORDS[29] = m14h;
+
+  WORDS[30] = m15l;
+
+  WORDS[31] = m15h;
+
   let sum = 0;
 
   let x = 0;
@@ -2154,13 +2223,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m0l) | 0;
 
-  v0h = (v0h + m0h + ((sum >>> 0) < (m0l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m0h + (((v0l & m0l) | ((v0l | m0l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -2172,7 +2241,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -2186,13 +2255,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m1l) | 0;
 
-  v0h = (v0h + m1h + ((sum >>> 0) < (m1l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m1h + (((v0l & m1l) | ((v0l | m1l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -2206,7 +2275,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -2220,13 +2289,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m2l) | 0;
 
-  v1h = (v1h + m2h + ((sum >>> 0) < (m2l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m2h + (((v1l & m2l) | ((v1l | m2l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -2238,7 +2307,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -2252,13 +2321,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m3l) | 0;
 
-  v1h = (v1h + m3h + ((sum >>> 0) < (m3l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m3h + (((v1l & m3l) | ((v1l | m3l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -2272,7 +2341,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -2286,13 +2355,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m4l) | 0;
 
-  v2h = (v2h + m4h + ((sum >>> 0) < (m4l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m4h + (((v2l & m4l) | ((v2l | m4l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -2304,7 +2373,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -2318,13 +2387,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m5l) | 0;
 
-  v2h = (v2h + m5h + ((sum >>> 0) < (m5l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m5h + (((v2l & m5l) | ((v2l | m5l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -2338,7 +2407,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -2352,13 +2421,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m6l) | 0;
 
-  v3h = (v3h + m6h + ((sum >>> 0) < (m6l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m6h + (((v3l & m6l) | ((v3l | m6l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -2370,7 +2439,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -2384,13 +2453,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m7l) | 0;
 
-  v3h = (v3h + m7h + ((sum >>> 0) < (m7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m7h + (((v3l & m7l) | ((v3l | m7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -2404,7 +2473,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -2418,13 +2487,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m8l) | 0;
 
-  v0h = (v0h + m8h + ((sum >>> 0) < (m8l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m8h + (((v0l & m8l) | ((v0l | m8l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -2436,7 +2505,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -2450,13 +2519,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m9l) | 0;
 
-  v0h = (v0h + m9h + ((sum >>> 0) < (m9l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m9h + (((v0l & m9l) | ((v0l | m9l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -2470,7 +2539,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -2484,13 +2553,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m10l) | 0;
 
-  v1h = (v1h + m10h + ((sum >>> 0) < (m10l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m10h + (((v1l & m10l) | ((v1l | m10l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -2502,7 +2571,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -2516,13 +2585,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m11l) | 0;
 
-  v1h = (v1h + m11h + ((sum >>> 0) < (m11l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m11h + (((v1l & m11l) | ((v1l | m11l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -2536,7 +2605,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -2550,13 +2619,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m12l) | 0;
 
-  v2h = (v2h + m12h + ((sum >>> 0) < (m12l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m12h + (((v2l & m12l) | ((v2l | m12l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -2568,7 +2637,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -2582,13 +2651,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m13l) | 0;
 
-  v2h = (v2h + m13h + ((sum >>> 0) < (m13l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m13h + (((v2l & m13l) | ((v2l | m13l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -2602,7 +2671,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -2616,13 +2685,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m14l) | 0;
 
-  v3h = (v3h + m14h + ((sum >>> 0) < (m14l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m14h + (((v3l & m14l) | ((v3l | m14l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -2634,7 +2703,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -2648,13 +2717,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m15l) | 0;
 
-  v3h = (v3h + m15h + ((sum >>> 0) < (m15l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m15h + (((v3l & m15l) | ((v3l | m15l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -2668,7 +2737,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -2682,13 +2751,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m14l) | 0;
 
-  v0h = (v0h + m14h + ((sum >>> 0) < (m14l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m14h + (((v0l & m14l) | ((v0l | m14l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -2700,7 +2769,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -2714,13 +2783,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m10l) | 0;
 
-  v0h = (v0h + m10h + ((sum >>> 0) < (m10l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m10h + (((v0l & m10l) | ((v0l | m10l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -2734,7 +2803,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -2748,13 +2817,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m4l) | 0;
 
-  v1h = (v1h + m4h + ((sum >>> 0) < (m4l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m4h + (((v1l & m4l) | ((v1l | m4l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -2766,7 +2835,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -2780,13 +2849,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m8l) | 0;
 
-  v1h = (v1h + m8h + ((sum >>> 0) < (m8l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m8h + (((v1l & m8l) | ((v1l | m8l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -2800,7 +2869,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -2814,13 +2883,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m9l) | 0;
 
-  v2h = (v2h + m9h + ((sum >>> 0) < (m9l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m9h + (((v2l & m9l) | ((v2l | m9l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -2832,7 +2901,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -2846,13 +2915,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m15l) | 0;
 
-  v2h = (v2h + m15h + ((sum >>> 0) < (m15l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m15h + (((v2l & m15l) | ((v2l | m15l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -2866,7 +2935,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -2880,13 +2949,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m13l) | 0;
 
-  v3h = (v3h + m13h + ((sum >>> 0) < (m13l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m13h + (((v3l & m13l) | ((v3l | m13l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -2898,7 +2967,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -2912,13 +2981,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m6l) | 0;
 
-  v3h = (v3h + m6h + ((sum >>> 0) < (m6l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m6h + (((v3l & m6l) | ((v3l | m6l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -2932,7 +3001,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -2946,13 +3015,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m1l) | 0;
 
-  v0h = (v0h + m1h + ((sum >>> 0) < (m1l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m1h + (((v0l & m1l) | ((v0l | m1l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -2964,7 +3033,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -2978,13 +3047,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m12l) | 0;
 
-  v0h = (v0h + m12h + ((sum >>> 0) < (m12l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m12h + (((v0l & m12l) | ((v0l | m12l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -2998,7 +3067,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -3012,13 +3081,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m0l) | 0;
 
-  v1h = (v1h + m0h + ((sum >>> 0) < (m0l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m0h + (((v1l & m0l) | ((v1l | m0l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -3030,7 +3099,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -3044,13 +3113,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m2l) | 0;
 
-  v1h = (v1h + m2h + ((sum >>> 0) < (m2l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m2h + (((v1l & m2l) | ((v1l | m2l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -3064,7 +3133,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -3078,13 +3147,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m11l) | 0;
 
-  v2h = (v2h + m11h + ((sum >>> 0) < (m11l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m11h + (((v2l & m11l) | ((v2l | m11l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -3096,7 +3165,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -3110,13 +3179,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m7l) | 0;
 
-  v2h = (v2h + m7h + ((sum >>> 0) < (m7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m7h + (((v2l & m7l) | ((v2l | m7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -3130,7 +3199,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -3144,13 +3213,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m5l) | 0;
 
-  v3h = (v3h + m5h + ((sum >>> 0) < (m5l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m5h + (((v3l & m5l) | ((v3l | m5l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -3162,7 +3231,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -3176,13 +3245,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m3l) | 0;
 
-  v3h = (v3h + m3h + ((sum >>> 0) < (m3l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m3h + (((v3l & m3l) | ((v3l | m3l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -3196,7 +3265,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -3210,13 +3279,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m11l) | 0;
 
-  v0h = (v0h + m11h + ((sum >>> 0) < (m11l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m11h + (((v0l & m11l) | ((v0l | m11l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -3228,7 +3297,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -3242,13 +3311,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m8l) | 0;
 
-  v0h = (v0h + m8h + ((sum >>> 0) < (m8l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m8h + (((v0l & m8l) | ((v0l | m8l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -3262,7 +3331,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -3276,13 +3345,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m12l) | 0;
 
-  v1h = (v1h + m12h + ((sum >>> 0) < (m12l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m12h + (((v1l & m12l) | ((v1l | m12l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -3294,7 +3363,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -3308,13 +3377,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m0l) | 0;
 
-  v1h = (v1h + m0h + ((sum >>> 0) < (m0l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m0h + (((v1l & m0l) | ((v1l | m0l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -3328,7 +3397,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -3342,13 +3411,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m5l) | 0;
 
-  v2h = (v2h + m5h + ((sum >>> 0) < (m5l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m5h + (((v2l & m5l) | ((v2l | m5l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -3360,7 +3429,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -3374,13 +3443,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m2l) | 0;
 
-  v2h = (v2h + m2h + ((sum >>> 0) < (m2l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m2h + (((v2l & m2l) | ((v2l | m2l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -3394,7 +3463,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -3408,13 +3477,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m15l) | 0;
 
-  v3h = (v3h + m15h + ((sum >>> 0) < (m15l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m15h + (((v3l & m15l) | ((v3l | m15l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -3426,7 +3495,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -3440,13 +3509,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m13l) | 0;
 
-  v3h = (v3h + m13h + ((sum >>> 0) < (m13l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m13h + (((v3l & m13l) | ((v3l | m13l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -3460,7 +3529,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -3474,13 +3543,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m10l) | 0;
 
-  v0h = (v0h + m10h + ((sum >>> 0) < (m10l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m10h + (((v0l & m10l) | ((v0l | m10l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -3492,7 +3561,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -3506,13 +3575,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m14l) | 0;
 
-  v0h = (v0h + m14h + ((sum >>> 0) < (m14l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m14h + (((v0l & m14l) | ((v0l | m14l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -3526,7 +3595,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -3540,13 +3609,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m3l) | 0;
 
-  v1h = (v1h + m3h + ((sum >>> 0) < (m3l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m3h + (((v1l & m3l) | ((v1l | m3l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -3558,7 +3627,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -3572,13 +3641,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m6l) | 0;
 
-  v1h = (v1h + m6h + ((sum >>> 0) < (m6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m6h + (((v1l & m6l) | ((v1l | m6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -3592,7 +3661,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -3606,13 +3675,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m7l) | 0;
 
-  v2h = (v2h + m7h + ((sum >>> 0) < (m7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m7h + (((v2l & m7l) | ((v2l | m7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -3624,7 +3693,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -3638,13 +3707,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m1l) | 0;
 
-  v2h = (v2h + m1h + ((sum >>> 0) < (m1l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m1h + (((v2l & m1l) | ((v2l | m1l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -3658,7 +3727,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -3672,13 +3741,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m9l) | 0;
 
-  v3h = (v3h + m9h + ((sum >>> 0) < (m9l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m9h + (((v3l & m9l) | ((v3l | m9l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -3690,7 +3759,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -3704,13 +3773,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m4l) | 0;
 
-  v3h = (v3h + m4h + ((sum >>> 0) < (m4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m4h + (((v3l & m4l) | ((v3l | m4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -3724,7 +3793,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -3738,13 +3807,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m7l) | 0;
 
-  v0h = (v0h + m7h + ((sum >>> 0) < (m7l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m7h + (((v0l & m7l) | ((v0l | m7l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -3756,7 +3825,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -3770,13 +3839,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m9l) | 0;
 
-  v0h = (v0h + m9h + ((sum >>> 0) < (m9l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m9h + (((v0l & m9l) | ((v0l | m9l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -3790,7 +3859,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -3804,13 +3873,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m3l) | 0;
 
-  v1h = (v1h + m3h + ((sum >>> 0) < (m3l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m3h + (((v1l & m3l) | ((v1l | m3l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -3822,7 +3891,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -3836,13 +3905,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m1l) | 0;
 
-  v1h = (v1h + m1h + ((sum >>> 0) < (m1l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m1h + (((v1l & m1l) | ((v1l | m1l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -3856,7 +3925,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -3870,13 +3939,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m13l) | 0;
 
-  v2h = (v2h + m13h + ((sum >>> 0) < (m13l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m13h + (((v2l & m13l) | ((v2l | m13l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -3888,7 +3957,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -3902,13 +3971,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m12l) | 0;
 
-  v2h = (v2h + m12h + ((sum >>> 0) < (m12l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m12h + (((v2l & m12l) | ((v2l | m12l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -3922,7 +3991,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -3936,13 +4005,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m11l) | 0;
 
-  v3h = (v3h + m11h + ((sum >>> 0) < (m11l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m11h + (((v3l & m11l) | ((v3l | m11l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -3954,7 +4023,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -3968,13 +4037,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m14l) | 0;
 
-  v3h = (v3h + m14h + ((sum >>> 0) < (m14l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m14h + (((v3l & m14l) | ((v3l | m14l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -3988,7 +4057,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -4002,13 +4071,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m2l) | 0;
 
-  v0h = (v0h + m2h + ((sum >>> 0) < (m2l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m2h + (((v0l & m2l) | ((v0l | m2l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -4020,7 +4089,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -4034,13 +4103,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m6l) | 0;
 
-  v0h = (v0h + m6h + ((sum >>> 0) < (m6l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m6h + (((v0l & m6l) | ((v0l | m6l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -4054,7 +4123,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -4068,13 +4137,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m5l) | 0;
 
-  v1h = (v1h + m5h + ((sum >>> 0) < (m5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m5h + (((v1l & m5l) | ((v1l | m5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -4086,7 +4155,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -4100,13 +4169,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m10l) | 0;
 
-  v1h = (v1h + m10h + ((sum >>> 0) < (m10l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m10h + (((v1l & m10l) | ((v1l | m10l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -4120,7 +4189,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -4134,13 +4203,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m4l) | 0;
 
-  v2h = (v2h + m4h + ((sum >>> 0) < (m4l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m4h + (((v2l & m4l) | ((v2l | m4l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -4152,7 +4221,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -4166,13 +4235,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m0l) | 0;
 
-  v2h = (v2h + m0h + ((sum >>> 0) < (m0l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m0h + (((v2l & m0l) | ((v2l | m0l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -4186,7 +4255,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -4200,13 +4269,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m15l) | 0;
 
-  v3h = (v3h + m15h + ((sum >>> 0) < (m15l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m15h + (((v3l & m15l) | ((v3l | m15l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -4218,7 +4287,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -4232,13 +4301,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m8l) | 0;
 
-  v3h = (v3h + m8h + ((sum >>> 0) < (m8l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m8h + (((v3l & m8l) | ((v3l | m8l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -4252,7 +4321,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -4266,13 +4335,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m9l) | 0;
 
-  v0h = (v0h + m9h + ((sum >>> 0) < (m9l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m9h + (((v0l & m9l) | ((v0l | m9l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -4284,7 +4353,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -4298,13 +4367,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m0l) | 0;
 
-  v0h = (v0h + m0h + ((sum >>> 0) < (m0l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m0h + (((v0l & m0l) | ((v0l | m0l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -4318,7 +4387,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -4332,13 +4401,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m5l) | 0;
 
-  v1h = (v1h + m5h + ((sum >>> 0) < (m5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m5h + (((v1l & m5l) | ((v1l | m5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -4350,7 +4419,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -4364,13 +4433,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m7l) | 0;
 
-  v1h = (v1h + m7h + ((sum >>> 0) < (m7l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m7h + (((v1l & m7l) | ((v1l | m7l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -4384,7 +4453,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -4398,13 +4467,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m2l) | 0;
 
-  v2h = (v2h + m2h + ((sum >>> 0) < (m2l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m2h + (((v2l & m2l) | ((v2l | m2l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -4416,7 +4485,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -4430,13 +4499,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m4l) | 0;
 
-  v2h = (v2h + m4h + ((sum >>> 0) < (m4l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m4h + (((v2l & m4l) | ((v2l | m4l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -4450,7 +4519,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -4464,13 +4533,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m10l) | 0;
 
-  v3h = (v3h + m10h + ((sum >>> 0) < (m10l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m10h + (((v3l & m10l) | ((v3l | m10l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -4482,7 +4551,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -4496,13 +4565,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m15l) | 0;
 
-  v3h = (v3h + m15h + ((sum >>> 0) < (m15l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m15h + (((v3l & m15l) | ((v3l | m15l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -4516,7 +4585,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -4530,13 +4599,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m14l) | 0;
 
-  v0h = (v0h + m14h + ((sum >>> 0) < (m14l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m14h + (((v0l & m14l) | ((v0l | m14l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -4548,7 +4617,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -4562,13 +4631,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m1l) | 0;
 
-  v0h = (v0h + m1h + ((sum >>> 0) < (m1l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m1h + (((v0l & m1l) | ((v0l | m1l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -4582,7 +4651,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -4596,13 +4665,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m11l) | 0;
 
-  v1h = (v1h + m11h + ((sum >>> 0) < (m11l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m11h + (((v1l & m11l) | ((v1l | m11l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -4614,7 +4683,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -4628,13 +4697,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m12l) | 0;
 
-  v1h = (v1h + m12h + ((sum >>> 0) < (m12l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m12h + (((v1l & m12l) | ((v1l | m12l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -4648,7 +4717,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -4662,13 +4731,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m6l) | 0;
 
-  v2h = (v2h + m6h + ((sum >>> 0) < (m6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m6h + (((v2l & m6l) | ((v2l | m6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -4680,7 +4749,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -4694,13 +4763,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m8l) | 0;
 
-  v2h = (v2h + m8h + ((sum >>> 0) < (m8l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m8h + (((v2l & m8l) | ((v2l | m8l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -4714,7 +4783,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -4728,13 +4797,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m3l) | 0;
 
-  v3h = (v3h + m3h + ((sum >>> 0) < (m3l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m3h + (((v3l & m3l) | ((v3l | m3l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -4746,7 +4815,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -4760,13 +4829,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m13l) | 0;
 
-  v3h = (v3h + m13h + ((sum >>> 0) < (m13l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m13h + (((v3l & m13l) | ((v3l | m13l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -4780,7 +4849,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -4794,13 +4863,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m2l) | 0;
 
-  v0h = (v0h + m2h + ((sum >>> 0) < (m2l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m2h + (((v0l & m2l) | ((v0l | m2l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -4812,7 +4881,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -4826,13 +4895,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m12l) | 0;
 
-  v0h = (v0h + m12h + ((sum >>> 0) < (m12l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m12h + (((v0l & m12l) | ((v0l | m12l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -4846,7 +4915,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -4860,13 +4929,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m6l) | 0;
 
-  v1h = (v1h + m6h + ((sum >>> 0) < (m6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m6h + (((v1l & m6l) | ((v1l | m6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -4878,7 +4947,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -4892,13 +4961,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m10l) | 0;
 
-  v1h = (v1h + m10h + ((sum >>> 0) < (m10l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m10h + (((v1l & m10l) | ((v1l | m10l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -4912,7 +4981,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -4926,13 +4995,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m0l) | 0;
 
-  v2h = (v2h + m0h + ((sum >>> 0) < (m0l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m0h + (((v2l & m0l) | ((v2l | m0l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -4944,7 +5013,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -4958,13 +5027,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m11l) | 0;
 
-  v2h = (v2h + m11h + ((sum >>> 0) < (m11l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m11h + (((v2l & m11l) | ((v2l | m11l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -4978,7 +5047,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -4992,13 +5061,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m8l) | 0;
 
-  v3h = (v3h + m8h + ((sum >>> 0) < (m8l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m8h + (((v3l & m8l) | ((v3l | m8l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -5010,7 +5079,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -5024,13 +5093,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m3l) | 0;
 
-  v3h = (v3h + m3h + ((sum >>> 0) < (m3l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m3h + (((v3l & m3l) | ((v3l | m3l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -5044,7 +5113,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -5058,13 +5127,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m4l) | 0;
 
-  v0h = (v0h + m4h + ((sum >>> 0) < (m4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m4h + (((v0l & m4l) | ((v0l | m4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -5076,7 +5145,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -5090,13 +5159,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m13l) | 0;
 
-  v0h = (v0h + m13h + ((sum >>> 0) < (m13l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m13h + (((v0l & m13l) | ((v0l | m13l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -5110,7 +5179,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -5124,13 +5193,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m7l) | 0;
 
-  v1h = (v1h + m7h + ((sum >>> 0) < (m7l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m7h + (((v1l & m7l) | ((v1l | m7l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -5142,7 +5211,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -5156,13 +5225,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m5l) | 0;
 
-  v1h = (v1h + m5h + ((sum >>> 0) < (m5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m5h + (((v1l & m5l) | ((v1l | m5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -5176,7 +5245,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -5190,13 +5259,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m15l) | 0;
 
-  v2h = (v2h + m15h + ((sum >>> 0) < (m15l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m15h + (((v2l & m15l) | ((v2l | m15l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -5208,7 +5277,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -5222,13 +5291,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m14l) | 0;
 
-  v2h = (v2h + m14h + ((sum >>> 0) < (m14l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m14h + (((v2l & m14l) | ((v2l | m14l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -5242,7 +5311,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -5256,13 +5325,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m1l) | 0;
 
-  v3h = (v3h + m1h + ((sum >>> 0) < (m1l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m1h + (((v3l & m1l) | ((v3l | m1l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -5274,7 +5343,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -5288,13 +5357,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m9l) | 0;
 
-  v3h = (v3h + m9h + ((sum >>> 0) < (m9l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m9h + (((v3l & m9l) | ((v3l | m9l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -5308,7 +5377,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -5320,15 +5389,217 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   v4l = ((x >>> 31) | (y << 1));
 
+  WORK[0] = v0l;
+
+  WORK[1] = v0h;
+
+  WORK[2] = v1l;
+
+  WORK[3] = v1h;
+
+  WORK[4] = v2l;
+
+  WORK[5] = v2h;
+
+  WORK[6] = v3l;
+
+  WORK[7] = v3h;
+
+  WORK[8] = v4l;
+
+  WORK[9] = v4h;
+
+  WORK[10] = v5l;
+
+  WORK[11] = v5h;
+
+  WORK[12] = v6l;
+
+  WORK[13] = v6h;
+
+  WORK[14] = v7l;
+
+  WORK[15] = v7h;
+
+  WORK[16] = v8l;
+
+  WORK[17] = v8h;
+
+  WORK[18] = v9l;
+
+  WORK[19] = v9h;
+
+  WORK[20] = v10l;
+
+  WORK[21] = v10h;
+
+  WORK[22] = v11l;
+
+  WORK[23] = v11h;
+
+  WORK[24] = v12l;
+
+  WORK[25] = v12h;
+
+  WORK[26] = v13l;
+
+  WORK[27] = v13h;
+
+  WORK[28] = v14l;
+
+  WORK[29] = v14h;
+
+  WORK[30] = v15l;
+
+  WORK[31] = v15h;
+}
+
+// Rounds 6 to 11 of blake2bCompress from WORK and WORDS, then the new chaining value. Both are zeroed
+// with stores, which cost less here than fill, as they may hold a key block or a keyed state.
+function blake2bHigh(h: Int32Array): void {
+  let v0h = WORK[1];
+
+  let v0l = WORK[0];
+
+  let v1h = WORK[3];
+
+  let v1l = WORK[2];
+
+  let v2h = WORK[5];
+
+  let v2l = WORK[4];
+
+  let v3h = WORK[7];
+
+  let v3l = WORK[6];
+
+  let v4h = WORK[9];
+
+  let v4l = WORK[8];
+
+  let v5h = WORK[11];
+
+  let v5l = WORK[10];
+
+  let v6h = WORK[13];
+
+  let v6l = WORK[12];
+
+  let v7h = WORK[15];
+
+  let v7l = WORK[14];
+
+  let v8h = WORK[17];
+
+  let v8l = WORK[16];
+
+  let v9h = WORK[19];
+
+  let v9l = WORK[18];
+
+  let v10h = WORK[21];
+
+  let v10l = WORK[20];
+
+  let v11h = WORK[23];
+
+  let v11l = WORK[22];
+
+  let v12h = WORK[25];
+
+  let v12l = WORK[24];
+
+  let v13h = WORK[27];
+
+  let v13l = WORK[26];
+
+  let v14h = WORK[29];
+
+  let v14l = WORK[28];
+
+  let v15h = WORK[31];
+
+  let v15l = WORK[30];
+
+  const m0l = WORDS[0];
+
+  const m0h = WORDS[1];
+
+  const m1l = WORDS[2];
+
+  const m1h = WORDS[3];
+
+  const m2l = WORDS[4];
+
+  const m2h = WORDS[5];
+
+  const m3l = WORDS[6];
+
+  const m3h = WORDS[7];
+
+  const m4l = WORDS[8];
+
+  const m4h = WORDS[9];
+
+  const m5l = WORDS[10];
+
+  const m5h = WORDS[11];
+
+  const m6l = WORDS[12];
+
+  const m6h = WORDS[13];
+
+  const m7l = WORDS[14];
+
+  const m7h = WORDS[15];
+
+  const m8l = WORDS[16];
+
+  const m8h = WORDS[17];
+
+  const m9l = WORDS[18];
+
+  const m9h = WORDS[19];
+
+  const m10l = WORDS[20];
+
+  const m10h = WORDS[21];
+
+  const m11l = WORDS[22];
+
+  const m11h = WORDS[23];
+
+  const m12l = WORDS[24];
+
+  const m12h = WORDS[25];
+
+  const m13l = WORDS[26];
+
+  const m13h = WORDS[27];
+
+  const m14l = WORDS[28];
+
+  const m14h = WORDS[29];
+
+  const m15l = WORDS[30];
+
+  const m15h = WORDS[31];
+
+  let sum = 0;
+
+  let x = 0;
+
+  let y = 0;
+
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m12l) | 0;
 
-  v0h = (v0h + m12h + ((sum >>> 0) < (m12l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m12h + (((v0l & m12l) | ((v0l | m12l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -5340,7 +5611,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -5354,13 +5625,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m5l) | 0;
 
-  v0h = (v0h + m5h + ((sum >>> 0) < (m5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m5h + (((v0l & m5l) | ((v0l | m5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -5374,7 +5645,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -5388,13 +5659,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m1l) | 0;
 
-  v1h = (v1h + m1h + ((sum >>> 0) < (m1l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m1h + (((v1l & m1l) | ((v1l | m1l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -5406,7 +5677,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -5420,13 +5691,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m15l) | 0;
 
-  v1h = (v1h + m15h + ((sum >>> 0) < (m15l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m15h + (((v1l & m15l) | ((v1l | m15l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -5440,7 +5711,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -5454,13 +5725,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m14l) | 0;
 
-  v2h = (v2h + m14h + ((sum >>> 0) < (m14l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m14h + (((v2l & m14l) | ((v2l | m14l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -5472,7 +5743,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -5486,13 +5757,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m13l) | 0;
 
-  v2h = (v2h + m13h + ((sum >>> 0) < (m13l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m13h + (((v2l & m13l) | ((v2l | m13l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -5506,7 +5777,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -5520,13 +5791,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m4l) | 0;
 
-  v3h = (v3h + m4h + ((sum >>> 0) < (m4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m4h + (((v3l & m4l) | ((v3l | m4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -5538,7 +5809,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -5552,13 +5823,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m10l) | 0;
 
-  v3h = (v3h + m10h + ((sum >>> 0) < (m10l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m10h + (((v3l & m10l) | ((v3l | m10l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -5572,7 +5843,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -5586,13 +5857,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m0l) | 0;
 
-  v0h = (v0h + m0h + ((sum >>> 0) < (m0l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m0h + (((v0l & m0l) | ((v0l | m0l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -5604,7 +5875,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -5618,13 +5889,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m7l) | 0;
 
-  v0h = (v0h + m7h + ((sum >>> 0) < (m7l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m7h + (((v0l & m7l) | ((v0l | m7l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -5638,7 +5909,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -5652,13 +5923,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m6l) | 0;
 
-  v1h = (v1h + m6h + ((sum >>> 0) < (m6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m6h + (((v1l & m6l) | ((v1l | m6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -5670,7 +5941,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -5684,13 +5955,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m3l) | 0;
 
-  v1h = (v1h + m3h + ((sum >>> 0) < (m3l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m3h + (((v1l & m3l) | ((v1l | m3l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -5704,7 +5975,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -5718,13 +5989,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m9l) | 0;
 
-  v2h = (v2h + m9h + ((sum >>> 0) < (m9l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m9h + (((v2l & m9l) | ((v2l | m9l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -5736,7 +6007,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -5750,13 +6021,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m2l) | 0;
 
-  v2h = (v2h + m2h + ((sum >>> 0) < (m2l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m2h + (((v2l & m2l) | ((v2l | m2l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -5770,7 +6041,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -5784,13 +6055,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m8l) | 0;
 
-  v3h = (v3h + m8h + ((sum >>> 0) < (m8l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m8h + (((v3l & m8l) | ((v3l | m8l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -5802,7 +6073,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -5816,13 +6087,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m11l) | 0;
 
-  v3h = (v3h + m11h + ((sum >>> 0) < (m11l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m11h + (((v3l & m11l) | ((v3l | m11l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -5836,7 +6107,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -5850,13 +6121,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m13l) | 0;
 
-  v0h = (v0h + m13h + ((sum >>> 0) < (m13l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m13h + (((v0l & m13l) | ((v0l | m13l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -5868,7 +6139,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -5882,13 +6153,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m11l) | 0;
 
-  v0h = (v0h + m11h + ((sum >>> 0) < (m11l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m11h + (((v0l & m11l) | ((v0l | m11l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -5902,7 +6173,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -5916,13 +6187,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m7l) | 0;
 
-  v1h = (v1h + m7h + ((sum >>> 0) < (m7l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m7h + (((v1l & m7l) | ((v1l | m7l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -5934,7 +6205,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -5948,13 +6219,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m14l) | 0;
 
-  v1h = (v1h + m14h + ((sum >>> 0) < (m14l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m14h + (((v1l & m14l) | ((v1l | m14l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -5968,7 +6239,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -5982,13 +6253,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m12l) | 0;
 
-  v2h = (v2h + m12h + ((sum >>> 0) < (m12l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m12h + (((v2l & m12l) | ((v2l | m12l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -6000,7 +6271,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -6014,13 +6285,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m1l) | 0;
 
-  v2h = (v2h + m1h + ((sum >>> 0) < (m1l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m1h + (((v2l & m1l) | ((v2l | m1l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -6034,7 +6305,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -6048,13 +6319,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m3l) | 0;
 
-  v3h = (v3h + m3h + ((sum >>> 0) < (m3l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m3h + (((v3l & m3l) | ((v3l | m3l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -6066,7 +6337,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -6080,13 +6351,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m9l) | 0;
 
-  v3h = (v3h + m9h + ((sum >>> 0) < (m9l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m9h + (((v3l & m9l) | ((v3l | m9l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -6100,7 +6371,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -6114,13 +6385,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m5l) | 0;
 
-  v0h = (v0h + m5h + ((sum >>> 0) < (m5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m5h + (((v0l & m5l) | ((v0l | m5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -6132,7 +6403,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -6146,13 +6417,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m0l) | 0;
 
-  v0h = (v0h + m0h + ((sum >>> 0) < (m0l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m0h + (((v0l & m0l) | ((v0l | m0l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -6166,7 +6437,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -6180,13 +6451,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m15l) | 0;
 
-  v1h = (v1h + m15h + ((sum >>> 0) < (m15l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m15h + (((v1l & m15l) | ((v1l | m15l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -6198,7 +6469,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -6212,13 +6483,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m4l) | 0;
 
-  v1h = (v1h + m4h + ((sum >>> 0) < (m4l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m4h + (((v1l & m4l) | ((v1l | m4l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -6232,7 +6503,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -6246,13 +6517,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m8l) | 0;
 
-  v2h = (v2h + m8h + ((sum >>> 0) < (m8l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m8h + (((v2l & m8l) | ((v2l | m8l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -6264,7 +6535,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -6278,13 +6549,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m6l) | 0;
 
-  v2h = (v2h + m6h + ((sum >>> 0) < (m6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m6h + (((v2l & m6l) | ((v2l | m6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -6298,7 +6569,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -6312,13 +6583,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m2l) | 0;
 
-  v3h = (v3h + m2h + ((sum >>> 0) < (m2l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m2h + (((v3l & m2l) | ((v3l | m2l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -6330,7 +6601,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -6344,13 +6615,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m10l) | 0;
 
-  v3h = (v3h + m10h + ((sum >>> 0) < (m10l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m10h + (((v3l & m10l) | ((v3l | m10l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -6364,7 +6635,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -6378,13 +6649,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m6l) | 0;
 
-  v0h = (v0h + m6h + ((sum >>> 0) < (m6l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m6h + (((v0l & m6l) | ((v0l | m6l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -6396,7 +6667,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -6410,13 +6681,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m15l) | 0;
 
-  v0h = (v0h + m15h + ((sum >>> 0) < (m15l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m15h + (((v0l & m15l) | ((v0l | m15l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -6430,7 +6701,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -6444,13 +6715,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m14l) | 0;
 
-  v1h = (v1h + m14h + ((sum >>> 0) < (m14l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m14h + (((v1l & m14l) | ((v1l | m14l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -6462,7 +6733,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -6476,13 +6747,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m9l) | 0;
 
-  v1h = (v1h + m9h + ((sum >>> 0) < (m9l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m9h + (((v1l & m9l) | ((v1l | m9l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -6496,7 +6767,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -6510,13 +6781,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m11l) | 0;
 
-  v2h = (v2h + m11h + ((sum >>> 0) < (m11l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m11h + (((v2l & m11l) | ((v2l | m11l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -6528,7 +6799,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -6542,13 +6813,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m3l) | 0;
 
-  v2h = (v2h + m3h + ((sum >>> 0) < (m3l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m3h + (((v2l & m3l) | ((v2l | m3l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -6562,7 +6833,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -6576,13 +6847,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m0l) | 0;
 
-  v3h = (v3h + m0h + ((sum >>> 0) < (m0l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m0h + (((v3l & m0l) | ((v3l | m0l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -6594,7 +6865,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -6608,13 +6879,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m8l) | 0;
 
-  v3h = (v3h + m8h + ((sum >>> 0) < (m8l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m8h + (((v3l & m8l) | ((v3l | m8l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -6628,7 +6899,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -6642,13 +6913,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m12l) | 0;
 
-  v0h = (v0h + m12h + ((sum >>> 0) < (m12l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m12h + (((v0l & m12l) | ((v0l | m12l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -6660,7 +6931,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -6674,13 +6945,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m2l) | 0;
 
-  v0h = (v0h + m2h + ((sum >>> 0) < (m2l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m2h + (((v0l & m2l) | ((v0l | m2l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -6694,7 +6965,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -6708,13 +6979,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m13l) | 0;
 
-  v1h = (v1h + m13h + ((sum >>> 0) < (m13l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m13h + (((v1l & m13l) | ((v1l | m13l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -6726,7 +6997,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -6740,13 +7011,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m7l) | 0;
 
-  v1h = (v1h + m7h + ((sum >>> 0) < (m7l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m7h + (((v1l & m7l) | ((v1l | m7l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -6760,7 +7031,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -6774,13 +7045,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m1l) | 0;
 
-  v2h = (v2h + m1h + ((sum >>> 0) < (m1l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m1h + (((v2l & m1l) | ((v2l | m1l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -6792,7 +7063,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -6806,13 +7077,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m4l) | 0;
 
-  v2h = (v2h + m4h + ((sum >>> 0) < (m4l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m4h + (((v2l & m4l) | ((v2l | m4l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -6826,7 +7097,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -6840,13 +7111,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m10l) | 0;
 
-  v3h = (v3h + m10h + ((sum >>> 0) < (m10l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m10h + (((v3l & m10l) | ((v3l | m10l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -6858,7 +7129,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -6872,13 +7143,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m5l) | 0;
 
-  v3h = (v3h + m5h + ((sum >>> 0) < (m5l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m5h + (((v3l & m5l) | ((v3l | m5l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -6892,7 +7163,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -6906,13 +7177,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m10l) | 0;
 
-  v0h = (v0h + m10h + ((sum >>> 0) < (m10l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m10h + (((v0l & m10l) | ((v0l | m10l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -6924,7 +7195,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -6938,13 +7209,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m2l) | 0;
 
-  v0h = (v0h + m2h + ((sum >>> 0) < (m2l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m2h + (((v0l & m2l) | ((v0l | m2l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -6958,7 +7229,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -6972,13 +7243,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m8l) | 0;
 
-  v1h = (v1h + m8h + ((sum >>> 0) < (m8l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m8h + (((v1l & m8l) | ((v1l | m8l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -6990,7 +7261,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -7004,13 +7275,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m4l) | 0;
 
-  v1h = (v1h + m4h + ((sum >>> 0) < (m4l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m4h + (((v1l & m4l) | ((v1l | m4l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -7024,7 +7295,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -7038,13 +7309,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m7l) | 0;
 
-  v2h = (v2h + m7h + ((sum >>> 0) < (m7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m7h + (((v2l & m7l) | ((v2l | m7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -7056,7 +7327,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -7070,13 +7341,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m6l) | 0;
 
-  v2h = (v2h + m6h + ((sum >>> 0) < (m6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m6h + (((v2l & m6l) | ((v2l | m6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -7090,7 +7361,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -7104,13 +7375,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m1l) | 0;
 
-  v3h = (v3h + m1h + ((sum >>> 0) < (m1l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m1h + (((v3l & m1l) | ((v3l | m1l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -7122,7 +7393,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -7136,13 +7407,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m5l) | 0;
 
-  v3h = (v3h + m5h + ((sum >>> 0) < (m5l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m5h + (((v3l & m5l) | ((v3l | m5l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -7156,7 +7427,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -7170,13 +7441,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m15l) | 0;
 
-  v0h = (v0h + m15h + ((sum >>> 0) < (m15l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m15h + (((v0l & m15l) | ((v0l | m15l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -7188,7 +7459,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -7202,13 +7473,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m11l) | 0;
 
-  v0h = (v0h + m11h + ((sum >>> 0) < (m11l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m11h + (((v0l & m11l) | ((v0l | m11l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -7222,7 +7493,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -7236,13 +7507,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m9l) | 0;
 
-  v1h = (v1h + m9h + ((sum >>> 0) < (m9l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m9h + (((v1l & m9l) | ((v1l | m9l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -7254,7 +7525,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -7268,13 +7539,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m14l) | 0;
 
-  v1h = (v1h + m14h + ((sum >>> 0) < (m14l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m14h + (((v1l & m14l) | ((v1l | m14l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -7288,7 +7559,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -7302,13 +7573,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m3l) | 0;
 
-  v2h = (v2h + m3h + ((sum >>> 0) < (m3l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m3h + (((v2l & m3l) | ((v2l | m3l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -7320,7 +7591,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -7334,13 +7605,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m12l) | 0;
 
-  v2h = (v2h + m12h + ((sum >>> 0) < (m12l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m12h + (((v2l & m12l) | ((v2l | m12l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -7354,7 +7625,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -7368,13 +7639,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m13l) | 0;
 
-  v3h = (v3h + m13h + ((sum >>> 0) < (m13l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m13h + (((v3l & m13l) | ((v3l | m13l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -7386,7 +7657,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -7400,13 +7671,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m0l) | 0;
 
-  v3h = (v3h + m0h + ((sum >>> 0) < (m0l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m0h + (((v3l & m0l) | ((v3l | m0l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -7420,7 +7691,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -7434,13 +7705,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m0l) | 0;
 
-  v0h = (v0h + m0h + ((sum >>> 0) < (m0l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m0h + (((v0l & m0l) | ((v0l | m0l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -7452,7 +7723,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -7466,13 +7737,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m1l) | 0;
 
-  v0h = (v0h + m1h + ((sum >>> 0) < (m1l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m1h + (((v0l & m1l) | ((v0l | m1l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -7486,7 +7757,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -7500,13 +7771,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m2l) | 0;
 
-  v1h = (v1h + m2h + ((sum >>> 0) < (m2l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m2h + (((v1l & m2l) | ((v1l | m2l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -7518,7 +7789,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -7532,13 +7803,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m3l) | 0;
 
-  v1h = (v1h + m3h + ((sum >>> 0) < (m3l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m3h + (((v1l & m3l) | ((v1l | m3l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -7552,7 +7823,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -7566,13 +7837,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m4l) | 0;
 
-  v2h = (v2h + m4h + ((sum >>> 0) < (m4l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m4h + (((v2l & m4l) | ((v2l | m4l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -7584,7 +7855,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -7598,13 +7869,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m5l) | 0;
 
-  v2h = (v2h + m5h + ((sum >>> 0) < (m5l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m5h + (((v2l & m5l) | ((v2l | m5l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -7618,7 +7889,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -7632,13 +7903,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m6l) | 0;
 
-  v3h = (v3h + m6h + ((sum >>> 0) < (m6l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m6h + (((v3l & m6l) | ((v3l | m6l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -7650,7 +7921,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -7664,13 +7935,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m7l) | 0;
 
-  v3h = (v3h + m7h + ((sum >>> 0) < (m7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m7h + (((v3l & m7l) | ((v3l | m7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -7684,7 +7955,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -7698,13 +7969,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m8l) | 0;
 
-  v0h = (v0h + m8h + ((sum >>> 0) < (m8l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m8h + (((v0l & m8l) | ((v0l | m8l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -7716,7 +7987,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -7730,13 +8001,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m9l) | 0;
 
-  v0h = (v0h + m9h + ((sum >>> 0) < (m9l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m9h + (((v0l & m9l) | ((v0l | m9l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -7750,7 +8021,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -7764,13 +8035,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m10l) | 0;
 
-  v1h = (v1h + m10h + ((sum >>> 0) < (m10l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m10h + (((v1l & m10l) | ((v1l | m10l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -7782,7 +8053,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -7796,13 +8067,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m11l) | 0;
 
-  v1h = (v1h + m11h + ((sum >>> 0) < (m11l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m11h + (((v1l & m11l) | ((v1l | m11l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -7816,7 +8087,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -7830,13 +8101,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m12l) | 0;
 
-  v2h = (v2h + m12h + ((sum >>> 0) < (m12l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m12h + (((v2l & m12l) | ((v2l | m12l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -7848,7 +8119,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -7862,13 +8133,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m13l) | 0;
 
-  v2h = (v2h + m13h + ((sum >>> 0) < (m13l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m13h + (((v2l & m13l) | ((v2l | m13l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -7882,7 +8153,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -7896,13 +8167,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m14l) | 0;
 
-  v3h = (v3h + m14h + ((sum >>> 0) < (m14l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m14h + (((v3l & m14l) | ((v3l | m14l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -7914,7 +8185,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -7928,13 +8199,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m15l) | 0;
 
-  v3h = (v3h + m15h + ((sum >>> 0) < (m15l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m15h + (((v3l & m15l) | ((v3l | m15l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -7948,7 +8219,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -7962,13 +8233,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m14l) | 0;
 
-  v0h = (v0h + m14h + ((sum >>> 0) < (m14l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m14h + (((v0l & m14l) | ((v0l | m14l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -7980,7 +8251,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -7994,13 +8265,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v4l) | 0;
 
-  v0h = (v0h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v4h + (((v0l & v4l) | ((v0l | v4l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m10l) | 0;
 
-  v0h = (v0h + m10h + ((sum >>> 0) < (m10l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m10h + (((v0l & m10l) | ((v0l | m10l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -8014,7 +8285,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v12l) | 0;
 
-  v8h = (v8h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v12h + (((v8l & v12l) | ((v8l | v12l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -8028,13 +8299,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m4l) | 0;
 
-  v1h = (v1h + m4h + ((sum >>> 0) < (m4l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m4h + (((v1l & m4l) | ((v1l | m4l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -8046,7 +8317,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -8060,13 +8331,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v5l) | 0;
 
-  v1h = (v1h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v5h + (((v1l & v5l) | ((v1l | v5l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m8l) | 0;
 
-  v1h = (v1h + m8h + ((sum >>> 0) < (m8l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m8h + (((v1l & m8l) | ((v1l | m8l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -8080,7 +8351,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v13l) | 0;
 
-  v9h = (v9h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v13h + (((v9l & v13l) | ((v9l | v13l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -8094,13 +8365,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m9l) | 0;
 
-  v2h = (v2h + m9h + ((sum >>> 0) < (m9l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m9h + (((v2l & m9l) | ((v2l | m9l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -8112,7 +8383,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -8126,13 +8397,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v6l) | 0;
 
-  v2h = (v2h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v6h + (((v2l & v6l) | ((v2l | v6l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m15l) | 0;
 
-  v2h = (v2h + m15h + ((sum >>> 0) < (m15l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m15h + (((v2l & m15l) | ((v2l | m15l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -8146,7 +8417,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v14l) | 0;
 
-  v10h = (v10h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v14h + (((v10l & v14l) | ((v10l | v14l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -8160,13 +8431,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m13l) | 0;
 
-  v3h = (v3h + m13h + ((sum >>> 0) < (m13l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m13h + (((v3l & m13l) | ((v3l | m13l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -8178,7 +8449,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -8192,13 +8463,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v7l) | 0;
 
-  v3h = (v3h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v7h + (((v3l & v7l) | ((v3l | v7l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m6l) | 0;
 
-  v3h = (v3h + m6h + ((sum >>> 0) < (m6l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m6h + (((v3l & m6l) | ((v3l | m6l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -8212,7 +8483,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v15l) | 0;
 
-  v11h = (v11h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v15h + (((v11l & v15l) | ((v11l | v15l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -8226,13 +8497,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m1l) | 0;
 
-  v0h = (v0h + m1h + ((sum >>> 0) < (m1l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m1h + (((v0l & m1l) | ((v0l | m1l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -8244,7 +8515,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -8258,13 +8529,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v0l + v5l) | 0;
 
-  v0h = (v0h + v5h + ((sum >>> 0) < (v5l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + v5h + (((v0l & v5l) | ((v0l | v5l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
   sum = (v0l + m12l) | 0;
 
-  v0h = (v0h + m12h + ((sum >>> 0) < (m12l >>> 0) ? 1 : 0)) | 0;
+  v0h = (v0h + m12h + (((v0l & m12l) | ((v0l | m12l) & ~sum)) >>> 31)) | 0;
 
   v0l = sum;
 
@@ -8278,7 +8549,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v10l + v15l) | 0;
 
-  v10h = (v10h + v15h + ((sum >>> 0) < (v15l >>> 0) ? 1 : 0)) | 0;
+  v10h = (v10h + v15h + (((v10l & v15l) | ((v10l | v15l) & ~sum)) >>> 31)) | 0;
 
   v10l = sum;
 
@@ -8292,13 +8563,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m0l) | 0;
 
-  v1h = (v1h + m0h + ((sum >>> 0) < (m0l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m0h + (((v1l & m0l) | ((v1l | m0l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -8310,7 +8581,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -8324,13 +8595,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v1l + v6l) | 0;
 
-  v1h = (v1h + v6h + ((sum >>> 0) < (v6l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + v6h + (((v1l & v6l) | ((v1l | v6l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
   sum = (v1l + m2l) | 0;
 
-  v1h = (v1h + m2h + ((sum >>> 0) < (m2l >>> 0) ? 1 : 0)) | 0;
+  v1h = (v1h + m2h + (((v1l & m2l) | ((v1l | m2l) & ~sum)) >>> 31)) | 0;
 
   v1l = sum;
 
@@ -8344,7 +8615,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v11l + v12l) | 0;
 
-  v11h = (v11h + v12h + ((sum >>> 0) < (v12l >>> 0) ? 1 : 0)) | 0;
+  v11h = (v11h + v12h + (((v11l & v12l) | ((v11l | v12l) & ~sum)) >>> 31)) | 0;
 
   v11l = sum;
 
@@ -8358,13 +8629,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m11l) | 0;
 
-  v2h = (v2h + m11h + ((sum >>> 0) < (m11l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m11h + (((v2l & m11l) | ((v2l | m11l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -8376,7 +8647,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -8390,13 +8661,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v2l + v7l) | 0;
 
-  v2h = (v2h + v7h + ((sum >>> 0) < (v7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + v7h + (((v2l & v7l) | ((v2l | v7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
   sum = (v2l + m7l) | 0;
 
-  v2h = (v2h + m7h + ((sum >>> 0) < (m7l >>> 0) ? 1 : 0)) | 0;
+  v2h = (v2h + m7h + (((v2l & m7l) | ((v2l | m7l) & ~sum)) >>> 31)) | 0;
 
   v2l = sum;
 
@@ -8410,7 +8681,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v8l + v13l) | 0;
 
-  v8h = (v8h + v13h + ((sum >>> 0) < (v13l >>> 0) ? 1 : 0)) | 0;
+  v8h = (v8h + v13h + (((v8l & v13l) | ((v8l | v13l) & ~sum)) >>> 31)) | 0;
 
   v8l = sum;
 
@@ -8424,13 +8695,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m5l) | 0;
 
-  v3h = (v3h + m5h + ((sum >>> 0) < (m5l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m5h + (((v3l & m5l) | ((v3l | m5l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -8442,7 +8713,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -8456,13 +8727,13 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v3l + v4l) | 0;
 
-  v3h = (v3h + v4h + ((sum >>> 0) < (v4l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + v4h + (((v3l & v4l) | ((v3l | v4l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
   sum = (v3l + m3l) | 0;
 
-  v3h = (v3h + m3h + ((sum >>> 0) < (m3l >>> 0) ? 1 : 0)) | 0;
+  v3h = (v3h + m3h + (((v3l & m3l) | ((v3l | m3l) & ~sum)) >>> 31)) | 0;
 
   v3l = sum;
 
@@ -8476,7 +8747,7 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
 
   sum = (v9l + v14l) | 0;
 
-  v9h = (v9h + v14h + ((sum >>> 0) < (v14l >>> 0) ? 1 : 0)) | 0;
+  v9h = (v9h + v14h + (((v9l & v14l) | ((v9l | v14l) & ~sum)) >>> 31)) | 0;
 
   v9l = sum;
 
@@ -8519,4 +8790,143 @@ export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number,
   h[14] ^= v7l ^ v15l;
 
   h[15] ^= v7h ^ v15h;
+
+  WORK[0] = 0;
+
+  WORK[1] = 0;
+
+  WORK[2] = 0;
+
+  WORK[3] = 0;
+
+  WORK[4] = 0;
+
+  WORK[5] = 0;
+
+  WORK[6] = 0;
+
+  WORK[7] = 0;
+
+  WORK[8] = 0;
+
+  WORK[9] = 0;
+
+  WORK[10] = 0;
+
+  WORK[11] = 0;
+
+  WORK[12] = 0;
+
+  WORK[13] = 0;
+
+  WORK[14] = 0;
+
+  WORK[15] = 0;
+
+  WORK[16] = 0;
+
+  WORK[17] = 0;
+
+  WORK[18] = 0;
+
+  WORK[19] = 0;
+
+  WORK[20] = 0;
+
+  WORK[21] = 0;
+
+  WORK[22] = 0;
+
+  WORK[23] = 0;
+
+  WORK[24] = 0;
+
+  WORK[25] = 0;
+
+  WORK[26] = 0;
+
+  WORK[27] = 0;
+
+  WORK[28] = 0;
+
+  WORK[29] = 0;
+
+  WORK[30] = 0;
+
+  WORK[31] = 0;
+
+  WORDS[0] = 0;
+
+  WORDS[1] = 0;
+
+  WORDS[2] = 0;
+
+  WORDS[3] = 0;
+
+  WORDS[4] = 0;
+
+  WORDS[5] = 0;
+
+  WORDS[6] = 0;
+
+  WORDS[7] = 0;
+
+  WORDS[8] = 0;
+
+  WORDS[9] = 0;
+
+  WORDS[10] = 0;
+
+  WORDS[11] = 0;
+
+  WORDS[12] = 0;
+
+  WORDS[13] = 0;
+
+  WORDS[14] = 0;
+
+  WORDS[15] = 0;
+
+  WORDS[16] = 0;
+
+  WORDS[17] = 0;
+
+  WORDS[18] = 0;
+
+  WORDS[19] = 0;
+
+  WORDS[20] = 0;
+
+  WORDS[21] = 0;
+
+  WORDS[22] = 0;
+
+  WORDS[23] = 0;
+
+  WORDS[24] = 0;
+
+  WORDS[25] = 0;
+
+  WORDS[26] = 0;
+
+  WORDS[27] = 0;
+
+  WORDS[28] = 0;
+
+  WORDS[29] = 0;
+
+  WORDS[30] = 0;
+
+  WORDS[31] = 0;
+}
+
+// The BLAKE2b compression of the 128-byte block at data[offset] into the chaining value h, whose
+// 64-bit words are (low, high) pairs of 32-bit halves, with the counter t (below 2^53) and last = -1
+// for the final block, else 0. The rounds are unrolled in two halves, since one function would pass
+// the 60 KB of bytecode above which V8 stops optimizing it, and the 64-bit additions carry with
+// integer operations only: a comparison would compile to a branch on the data.
+export function blake2bCompress(h: Int32Array, data: Uint8Array, offset: number, counter: number, last: number): void {
+  blake2bLow(h, data, offset, counter, last);
+
+  blake2bHigh(h);
 }

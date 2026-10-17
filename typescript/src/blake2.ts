@@ -66,6 +66,8 @@ const LAST = new Uint8Array(128);
 
 // The digest of a whole message, its whole blocks compressed where they are: the key block (RFC 7693,
 // 3.3) first when there is a key, and the last block always with the final flag, padded with zeros.
+// The compression reads all of LAST, which must be zero past the bytes copied in, so they are
+// cleared after each use, by the finally block when an exception such as a stack overflow ends it.
 export function digest(variant: Blake2, h0: Int32Array, key: Uint8Array, data: Uint8Array, size: number): Uint8Array {
   const { block, compress } = variant;
 
@@ -73,53 +75,68 @@ export function digest(variant: Blake2, h0: Int32Array, key: Uint8Array, data: U
 
   const length = data.length;
 
-  h.set(h0);
-
-  h[0] ^= key.length << 8;
-
-  let counter = 0;
-
-  if (key.length > 0) {
-    LAST.set(key.subarray(0, key.length));
-
-    counter = block;
-
-    compress(h, LAST, 0, counter, length === 0 ? -1 : 0);
-
-    LAST.fill(0, 0, key.length);
-  }
-
-  if (length > 0 || key.length === 0) {
-    const rest = length === 0 ? 0 : length - block * Math.floor((length - 1) / block);
-
-    const whole = length - rest;
-
-    for (let offset = 0; offset < whole; offset += block) {
-      counter += block;
-
-      compress(h, data, offset, counter, 0);
-    }
-
-    counter += rest;
-
-    if (rest === block) {
-      compress(h, data, whole, counter, -1);
-    } else {
-      for (let i = 0; i < rest; i++) {
-        LAST[i] = data[whole + i];
-      }
-
-      compress(h, LAST, 0, counter, -1);
-
-      LAST.fill(0, 0, rest);
-    }
-  }
-
   const out = new Uint8Array(size);
 
-  store(h, out);
+  // The bytes at the start of LAST that may hold a key or the end of the message.
+  let held = 0;
 
-  h.fill(0);
+  try {
+    h.set(h0);
+
+    h[0] ^= key.length << 8;
+
+    let counter = 0;
+
+    if (key.length > 0) {
+      held = key.length;
+
+      for (let i = 0; i < key.length; i++) {
+        LAST[i] = key[i];
+      }
+
+      counter = block;
+
+      compress(h, LAST, 0, counter, length === 0 ? -1 : 0);
+
+      LAST.fill(0, 0, key.length);
+
+      held = 0;
+    }
+
+    if (length > 0 || key.length === 0) {
+      const rest = length === 0 ? 0 : length - block * Math.floor((length - 1) / block);
+
+      const whole = length - rest;
+
+      for (let offset = 0; offset < whole; offset += block) {
+        counter += block;
+
+        compress(h, data, offset, counter, 0);
+      }
+
+      counter += rest;
+
+      if (rest === block) {
+        compress(h, data, whole, counter, -1);
+      } else {
+        held = rest;
+
+        for (let i = 0; i < rest; i++) {
+          LAST[i] = data[whole + i];
+        }
+
+        compress(h, LAST, 0, counter, -1);
+      }
+    }
+
+    store(h, out);
+  } finally {
+    h.fill(0);
+
+    if (held > 0) {
+      LAST.fill(0, 0, held);
+    }
+  }
 
   return out;
 }
@@ -152,7 +169,7 @@ export class Blake2Engine {
     this.#size = size;
 
     if (key.length > 0) {
-      this.#buffer.set(key.subarray(0, key.length));
+      this.#buffer.set(key);
 
       this.#buffered = variant.block;
     }

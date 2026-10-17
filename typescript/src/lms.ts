@@ -1,28 +1,28 @@
-import { concat, equal, readUint32, uint32, writeUint32 } from "./bytes.ts";
-import { type CachedLevels, type CachedTree, MerkleTree } from "./merkle.ts";
+import { concat, readUint32, uint32, writeUint32 } from "./bytes.ts";
+import { Keccak } from "./keccak.ts";
+import { type CachedLevels, type CachedTree, MerkleTree, type TreeHashes } from "./merkle.ts";
 import {
   type FixedHash,
   blocks,
+  copyWords,
   fixedShake256,
   loadWords,
+  messageBytes,
   messageWords,
   sha256,
   shake256,
   storeWords,
 } from "./primitives.ts";
 import { block256, block256x2 } from "./sha2-rounds.ts";
-import { IV_256 } from "./sha2.ts";
+import { IV_256, Sha256, wipeSha2Lanes } from "./sha2.ts";
 
-const D_PBLC = Uint8Array.of(0x80, 0x80);
-
-// u16(D_PBLC) as it ends the 22-byte header of K in the high half of word 5.
+// The domain separators u16(D_PBLC), u16(D_LEAF) and u16(D_INTR) as they end the 22-byte header of a
+// SHA-256 message in the high half of word 5.
 const D_PBLC_WORD = 0x8080 << 16;
 
-const D_MESG = Uint8Array.of(0x81, 0x81);
+const D_LEAF_WORD = 0x8282 << 16;
 
-const D_LEAF = Uint8Array.of(0x82, 0x82);
-
-const D_INTR = Uint8Array.of(0x83, 0x83);
+const D_INTR_WORD = 0x8383 << 16;
 
 // Pseudorandom values derived from a tree's SEED (RFC 8554, Appendix A, and the convention of the
 // hash-sigs reference used by the RFC 8554 and RFC 9858 test cases): the signature randomizer C,
@@ -102,6 +102,16 @@ export const OTS_BY_NAME = new Map([...OTS_TYPES.values()].map((type) => [type.n
 
 export const LMS_BY_NAME = new Map([...LMS_TYPES.values()].map((type) => [type.name, type]));
 
+// Every chain's first step and, for each Winternitz parameter, its last, as many as the longest
+// LM-OTS signature has chains; and the digits of a message hash, which are public.
+const LONGEST = Math.max(...Array.from(OTS_TYPES.values(), (type) => type.p));
+
+const ZEROS = new Uint8Array(LONGEST);
+
+const TOPS = new Map([1, 2, 4, 8].map((w) => [w, new Uint8Array(LONGEST).fill((1 << w) - 1)] as const));
+
+const DIGITS = new Uint8Array(LONGEST);
+
 function uint16(value: number): Uint8Array {
   return Uint8Array.of(value >>> 8, value & 0xff);
 }
@@ -114,36 +124,80 @@ function derive(shake: boolean, n: number, id: Uint8Array, q: number, index: num
   return digest(shake, n, id, uint32(q), uint16(index), Uint8Array.of(0xff), seed);
 }
 
-function coefficients(t: OtsType, data: Uint8Array, count: number): number[] {
-  const mask = (1 << t.w) - 1;
+// H(I || u32(q) || u16(D_MESG) || C || message), C being the n bytes at c[at]; its first n bytes are
+// the message hash Q.
+function messageHash(
+  t: OtsType,
+  id: Uint8Array,
+  q: number,
+  c: Uint8Array,
+  at: number,
+  message: Uint8Array,
+): Uint8Array {
+  const head = new Uint8Array(22 + t.n);
 
-  const perByte = 8 / t.w;
+  head.set(id);
 
-  const out: number[] = [];
+  writeUint32(head, 16, q);
 
-  for (let i = 0; i < count; i++) {
-    out.push((data[Math.floor(i / perByte)] >>> (8 - t.w * ((i % perByte) + 1))) & mask);
+  head[20] = 0x81;
+
+  head[21] = 0x81;
+
+  for (let i = 0; i < t.n; i++) {
+    head[22 + i] = c[at + i];
   }
 
-  return out;
+  if (t.shake) {
+    const sponge = new Keccak(136, 0x1f);
+
+    sponge.update(head);
+
+    sponge.update(message);
+
+    return sponge.read(t.n);
+  }
+
+  const engine = new Sha256(IV_256, 32);
+
+  engine.update(head);
+
+  engine.update(message);
+
+  return engine.digest();
 }
 
-function digits(t: OtsType, qHash: Uint8Array): number[] {
-  const values = coefficients(t, qHash, (8 * t.n) / t.w);
+// The Winternitz digits of the message hash Q, then of its checksum (RFC 8554, 4.4), into out[0 .. p).
+function digits(t: OtsType, qHash: Uint8Array, out: Uint8Array): void {
+  const mask = (1 << t.w) - 1;
+
+  const u = (8 * t.n) / t.w;
 
   let checksum = 0;
 
-  for (const value of values) {
-    checksum += (1 << t.w) - 1 - value;
+  for (let i = 0; i < u; i++) {
+    const bit = i * t.w;
+
+    out[i] = (qHash[bit >>> 3] >>> (8 - (bit & 7) - t.w)) & mask;
+
+    checksum += mask - out[i];
   }
 
-  return coefficients(t, concat(qHash, uint16(checksum << t.ls)), t.p);
+  const tail = (checksum << t.ls) & 0xffff;
+
+  for (let i = u; i < t.p; i++) {
+    out[i] = (tail >>> (16 - (i - u + 1) * t.w)) & mask;
+  }
 }
 
-// The LM-OTS chains of every chain index of one leaf, for one tree (one I).
-interface Chains {
-  // Sets each chain's value to its start, H(I || u32(q) || u16(i) || u8(0xFF) || SEED).
-  derive(q: number, seed: Uint8Array): void;
+// The hashes of one tree (one I): the LM-OTS chains of one leaf at a time, and the nodes. Every hash
+// writes its n bytes where the caller wants them.
+interface Hashes {
+  // H(I || u32(q) || u16(i) || u8(0xFF) || SEED) into out at offset: a chain start, or C.
+  prf(q: number, i: number, seed: Uint8Array, out: Uint8Array, offset: number): void;
+
+  // Sets each chain's value to its start.
+  start(q: number, seed: Uint8Array): void;
 
   // Takes the chain values from data, n bytes each from offset on.
   load(data: Uint8Array, offset: number): void;
@@ -153,8 +207,13 @@ interface Chains {
 
   store(out: Uint8Array, offset: number): void;
 
-  // K = H(I || u32(q) || u16(D_PBLC) || the chain values).
-  publicKey(q: number): Uint8Array;
+  // K = H(I || u32(q) || u16(D_PBLC) || the chain values), then the leaf node r over it,
+  // H(I || u32(r) || u16(D_LEAF) || K), into out at offset.
+  leaf(r: number, q: number, out: Uint8Array, offset: number): void;
+
+  // The count interior nodes from r on, H(I || u32(r) || u16(D_INTR) || left || right), from their
+  // children in order from children[from] on, into out from offset on; out may hold the children.
+  combine(r: number, count: number, children: Uint8Array, from: number, out: Uint8Array, offset: number): void;
 }
 
 // Words 5 onward of a chain block: u16(i) and u8(j) in the top three bytes of prefix, then count words
@@ -169,15 +228,10 @@ function chainWords(w: Int32Array, prefix: number, x: Int32Array, count: number)
   w[5 + count] = (x[count - 1] << 8) | 0x80;
 }
 
-function copyWords(from: Int32Array, fromOffset: number, to: Int32Array, toOffset: number, count: number): void {
-  for (let k = 0; k < count; k++) {
-    to[toOffset + k] = from[fromOffset + k];
-  }
-}
-
-// Chains on SHA-256 words: every step and every chain start is one block, and two chains advance at
-// once through block256x2, the next waiting chain taking over a lane as soon as its chain ends.
-class Sha256Chains implements Chains {
+// The hashes on SHA-256 words: every chain step, chain start and leaf is one block and every interior
+// node two, and two chains, or two nodes, advance at once through block256x2, the next waiting chain
+// taking over a lane as soon as its chain ends.
+class Sha256Hashes implements Hashes {
   readonly #t: OtsType;
 
   readonly #a = new Int32Array(16);
@@ -194,16 +248,16 @@ class Sha256Chains implements Chains {
 
   readonly #k: Int32Array;
 
+  readonly #leaf: Int32Array;
+
+  readonly #nodeA: Int32Array;
+
+  readonly #nodeB: Int32Array;
+
   constructor(t: OtsType, id: Uint8Array) {
     const count = t.n >>> 2;
 
     this.#t = t;
-
-    for (const w of [this.#a, this.#b]) {
-      loadWords(id, 0, 4, w);
-
-      w[15] = 8 * (23 + t.n);
-    }
 
     this.#seed = new Int32Array(count);
 
@@ -211,10 +265,38 @@ class Sha256Chains implements Chains {
 
     this.#k = blocks(false, 0, t.p * t.n);
 
-    loadWords(id, 0, 4, this.#k);
+    this.#leaf = blocks(false, 0, t.n);
+
+    this.#nodeA = blocks(false, 0, 2 * t.n);
+
+    this.#nodeB = blocks(false, 0, 2 * t.n);
+
+    for (const w of [this.#a, this.#b, this.#k, this.#leaf, this.#nodeA, this.#nodeB]) {
+      loadWords(id, 0, 4, w);
+    }
+
+    this.#a[15] = 8 * (23 + t.n);
+
+    this.#b[15] = 8 * (23 + t.n);
   }
 
-  derive(q: number, seed: Uint8Array): void {
+  prf(q: number, i: number, seed: Uint8Array, out: Uint8Array, offset: number): void {
+    const count = this.#t.n >>> 2;
+
+    const a = this.#a;
+
+    loadWords(seed, 0, count, this.#seed);
+
+    a[4] = q;
+
+    chainWords(a, (i << 16) | 0xff00, this.#seed, count);
+
+    block256(IV_256, a, 0, this.#s);
+
+    storeWords(this.#s, count, out, offset);
+  }
+
+  start(q: number, seed: Uint8Array): void {
     const { p, n } = this.#t;
 
     const count = n >>> 2;
@@ -343,8 +425,12 @@ class Sha256Chains implements Chains {
     storeWords(this.#values, this.#values.length, out, offset);
   }
 
-  publicKey(q: number): Uint8Array {
+  leaf(r: number, q: number, out: Uint8Array, offset: number): void {
+    const count = this.#t.n >>> 2;
+
     const k = this.#k;
+
+    const leaf = this.#leaf;
 
     const s = this.#s;
 
@@ -354,63 +440,155 @@ class Sha256Chains implements Chains {
 
     block256(IV_256, k, 0, s);
 
-    for (let offset = 16; offset < k.length; offset += 16) {
-      block256(s, k, offset, s);
+    for (let at = 16; at < k.length; at += 16) {
+      block256(s, k, at, s);
     }
 
-    const out = new Uint8Array(this.#t.n);
+    leaf[4] = r;
 
-    storeWords(s, this.#t.n >>> 2, out, 0);
+    messageWords(leaf, D_LEAF_WORD, s, 0, count);
 
-    return out;
+    block256(IV_256, leaf, 0, s);
+
+    storeWords(s, count, out, offset);
+  }
+
+  combine(r: number, count: number, children: Uint8Array, from: number, out: Uint8Array, offset: number): void {
+    const n = this.#t.n;
+
+    const a = this.#nodeA;
+
+    const b = this.#nodeB;
+
+    const s = this.#s;
+
+    const u = this.#u;
+
+    for (let j = 0; j < count; j += 2) {
+      a[4] = r + j;
+
+      messageBytes(a, D_INTR_WORD, children, from + 2 * j * n, 2 * n);
+
+      if (j + 1 < count) {
+        b[4] = r + j + 1;
+
+        messageBytes(b, D_INTR_WORD, children, from + 2 * (j + 1) * n, 2 * n);
+
+        block256x2(IV_256, a, 0, s, IV_256, b, 0, u);
+
+        block256x2(s, a, 16, s, u, b, 16, u);
+
+        storeWords(u, n >>> 2, out, offset + (j + 1) * n);
+      } else {
+        block256(IV_256, a, 0, s);
+
+        block256(s, a, 16, s);
+      }
+
+      storeWords(s, n >>> 2, out, offset + j * n);
+    }
   }
 }
 
-// Chains on SHAKE256, whose 23-byte prefix leaves the values off the lane boundaries: one fixed-length
-// message rewritten in place.
-class ShakeChains implements Chains {
+// The hashes on SHAKE256, whose 22- or 23-byte prefixes leave the values off the lane boundaries: one
+// fixed-length message per shape, rewritten in place, I absorbed once. The chain values live in the
+// message of K, and K is written straight into the message of the leaf.
+class ShakeHashes implements Hashes {
   readonly #t: OtsType;
 
-  readonly #id: Uint8Array;
+  readonly #chain: FixedHash;
 
-  readonly #fixed: FixedHash;
+  readonly #k: FixedHash;
 
-  readonly #values: Uint8Array;
+  readonly #leaf: FixedHash;
+
+  readonly #node: FixedHash;
+
+  // The chain value x in the chain message, K in the leaf message, and the output of a node.
+  readonly #x: Uint8Array;
+
+  readonly #key: Uint8Array;
+
+  readonly #out: Uint8Array;
 
   constructor(t: OtsType, id: Uint8Array) {
+    const n = t.n;
+
     this.#t = t;
 
-    this.#id = id;
+    this.#chain = fixedShake256(23 + n, id);
 
-    this.#fixed = fixedShake256(23 + t.n, new Uint8Array());
+    this.#k = fixedShake256(22 + t.p * n, id);
 
-    this.#values = new Uint8Array(t.p * t.n);
+    this.#leaf = fixedShake256(22 + n, id);
+
+    this.#node = fixedShake256(22 + 2 * n, id);
+
+    this.#k.message.fill(0x80, 20, 22);
+
+    this.#leaf.message.fill(0x82, 20, 22);
+
+    this.#node.message.fill(0x83, 20, 22);
+
+    this.#x = this.#chain.message.subarray(23);
+
+    this.#key = this.#leaf.message.subarray(22);
+
+    this.#out = new Uint8Array(n);
   }
 
-  derive(q: number, seed: Uint8Array): void {
-    const { p, n } = this.#t;
+  prf(q: number, i: number, seed: Uint8Array, out: Uint8Array, offset: number): void {
+    const n = this.#t.n;
 
-    for (let i = 0; i < p; i++) {
-      this.#values.set(derive(true, n, this.#id, q, i, seed), i * n);
+    const message = this.#chain.message;
+
+    const x = this.#x;
+
+    writeUint32(message, 16, q);
+
+    message[20] = i >>> 8;
+
+    message[21] = i;
+
+    message[22] = 0xff;
+
+    for (let k = 0; k < n; k++) {
+      x[k] = seed[k];
+    }
+
+    this.#chain.digest(x);
+
+    for (let k = 0; k < n; k++) {
+      out[offset + k] = x[k];
+    }
+  }
+
+  start(q: number, seed: Uint8Array): void {
+    for (let i = 0; i < this.#t.p; i++) {
+      this.prf(q, i, seed, this.#k.message, 22 + i * this.#t.n);
     }
   }
 
   load(data: Uint8Array, offset: number): void {
-    this.#values.set(data.subarray(offset, offset + this.#values.length));
+    const values = this.#k.message;
+
+    for (let k = 22; k < values.length; k++) {
+      values[k] = data[offset + k - 22];
+    }
   }
 
   run(q: number, from: ArrayLike<number>, to: ArrayLike<number>): void {
     const { p, n } = this.#t;
 
-    const message = this.#fixed.message;
+    const message = this.#chain.message;
 
-    message.set(this.#id);
+    const values = this.#k.message;
+
+    const x = this.#x;
 
     writeUint32(message, 16, q);
 
     for (let i = 0; i < p; i++) {
-      const value = message.subarray(23, 23 + n);
-
       if (from[i] >= to[i]) {
         continue;
       }
@@ -419,80 +597,67 @@ class ShakeChains implements Chains {
 
       message[21] = i;
 
-      value.set(this.#values.subarray(i * n, (i + 1) * n));
+      for (let k = 0; k < n; k++) {
+        x[k] = values[22 + i * n + k];
+      }
 
       for (let j = from[i]; j < to[i]; j++) {
         message[22] = j;
 
-        this.#fixed.digest(value);
+        this.#chain.digest(x);
       }
 
-      this.#values.set(value, i * n);
+      for (let k = 0; k < n; k++) {
+        values[22 + i * n + k] = x[k];
+      }
     }
   }
 
   store(out: Uint8Array, offset: number): void {
-    out.set(this.#values, offset);
+    const values = this.#k.message;
+
+    for (let k = 22; k < values.length; k++) {
+      out[offset + k - 22] = values[k];
+    }
   }
 
-  publicKey(q: number): Uint8Array {
-    return digest(true, this.#t.n, this.#id, uint32(q), D_PBLC, this.#values);
+  leaf(r: number, q: number, out: Uint8Array, offset: number): void {
+    writeUint32(this.#k.message, 16, q);
+
+    this.#k.digest(this.#key);
+
+    writeUint32(this.#leaf.message, 16, r);
+
+    this.#emit(this.#leaf, out, offset);
+  }
+
+  combine(r: number, count: number, children: Uint8Array, from: number, out: Uint8Array, offset: number): void {
+    const n = this.#t.n;
+
+    const message = this.#node.message;
+
+    for (let j = 0; j < count; j++) {
+      writeUint32(message, 16, r + j);
+
+      for (let k = 0; k < 2 * n; k++) {
+        message[22 + k] = children[from + 2 * j * n + k];
+      }
+
+      this.#emit(this.#node, out, offset + j * n);
+    }
+  }
+
+  #emit(hash: FixedHash, out: Uint8Array, offset: number): void {
+    hash.digest(this.#out);
+
+    for (let k = 0; k < this.#t.n; k++) {
+      out[offset + k] = this.#out[k];
+    }
   }
 }
 
-function chains(t: OtsType, id: Uint8Array): Chains {
-  return t.shake ? new ShakeChains(t, id) : new Sha256Chains(t, id);
-}
-
-function otsPublicKey(chains: Chains, t: OtsType, q: number, seed: Uint8Array): Uint8Array {
-  chains.derive(q, seed);
-
-  chains.run(q, new Uint8Array(t.p), new Uint8Array(t.p).fill((1 << t.w) - 1));
-
-  return chains.publicKey(q);
-}
-
-function otsSign(
-  chains: Chains,
-  t: OtsType,
-  id: Uint8Array,
-  q: number,
-  seed: Uint8Array,
-  message: Uint8Array,
-): Uint8Array {
-  const c = derive(t.shake, t.n, id, q, RANDOMIZER, seed);
-
-  const qHash = digest(t.shake, t.n, id, uint32(q), D_MESG, c, message);
-
-  chains.derive(q, seed);
-
-  chains.run(q, new Uint8Array(t.p), digits(t, qHash));
-
-  const out = new Uint8Array(t.signatureSize);
-
-  writeUint32(out, 0, t.code);
-
-  out.set(c, 4);
-
-  chains.store(out, 4 + t.n);
-
-  return out;
-}
-
-function otsCandidate(t: OtsType, id: Uint8Array, q: number, signature: Uint8Array, message: Uint8Array): Uint8Array {
-  const n = t.n;
-
-  const c = signature.subarray(4, 4 + n);
-
-  const qHash = digest(t.shake, n, id, uint32(q), D_MESG, c, message);
-
-  const otsChains = chains(t, id);
-
-  otsChains.load(signature, 4 + n);
-
-  otsChains.run(q, digits(t, qHash), new Uint8Array(t.p).fill((1 << t.w) - 1));
-
-  return otsChains.publicKey(q);
+function hashes(t: OtsType, id: Uint8Array): Hashes {
+  return t.shake ? new ShakeHashes(t, id) : new Sha256Hashes(t, id);
 }
 
 export function lmsSignatureSize(lms: LmsType, ots: OtsType): number {
@@ -525,6 +690,8 @@ export function parsePublicKey(data: Uint8Array): LmsPublicKey | null {
   return data.length === lms.publicKeySize ? { lms, ots, id: data.subarray(8, 24), root: data.subarray(24) } : null;
 }
 
+// The candidate root climbs in pair, at the half its node's parity gives, the sibling from the
+// signature beside it.
 function lmsVerify(publicKey: Uint8Array, message: Uint8Array, signature: Uint8Array): boolean {
   const parsed = parsePublicKey(publicKey);
 
@@ -546,25 +713,41 @@ function lmsVerify(publicKey: Uint8Array, message: Uint8Array, signature: Uint8A
     return false;
   }
 
+  const n = ots.n;
+
+  const tree = hashes(ots, id);
+
+  digits(ots, messageHash(ots, id, q, signature, 8, message), DIGITS);
+
+  tree.load(signature, 8 + n);
+
+  tree.run(q, DIGITS, TOPS.get(ots.w) as Uint8Array);
+
+  const pair = new Uint8Array(2 * n);
+
   let node = 2 ** lms.h + q;
 
-  const leaf = otsCandidate(ots, id, q, signature.subarray(4, offset), message);
-
-  let candidate = digest(lms.shake, lms.m, id, uint32(node), D_LEAF, leaf);
+  tree.leaf(node, q, pair, (node & 1) * n);
 
   for (let i = 0; i < lms.h; i++) {
-    const sibling = signature.subarray(offset + 4 + i * lms.m, offset + 4 + (i + 1) * lms.m);
+    const sibling = (1 - (node & 1)) * n;
 
-    const odd = node % 2 === 1;
+    for (let k = 0; k < n; k++) {
+      pair[sibling + k] = signature[offset + 4 + i * n + k];
+    }
 
     node = Math.floor(node / 2);
 
-    const pair = odd ? [sibling, candidate] : [candidate, sibling];
-
-    candidate = digest(lms.shake, lms.m, id, uint32(node), D_INTR, ...pair);
+    tree.combine(node, 1, pair, 0, pair, (node & 1) * n);
   }
 
-  return equal(candidate, root);
+  let difference = 0;
+
+  for (let k = 0; k < n; k++) {
+    difference |= pair[n + k] ^ root[k];
+  }
+
+  return difference === 0;
 }
 
 export function checkPublicKey(data: Uint8Array): boolean {
@@ -629,8 +812,8 @@ function childKeys(lms: LmsType, id: Uint8Array, seed: Uint8Array, q: number): [
 }
 
 // One LMS tree of an HSS key: its I, SEED and the Merkle tree over its OTS public keys, built or
-// taken from the levels of a tree cache.
-class Tree {
+// taken from the levels of a tree cache, whose leaves and nodes its hashes compute.
+class Tree implements TreeHashes {
   readonly lms: LmsType;
 
   readonly ots: OtsType;
@@ -639,11 +822,13 @@ class Tree {
 
   readonly seed: Uint8Array;
 
+  readonly signatureSize: number;
+
   readonly merkle: MerkleTree;
 
   readonly publicKey: Uint8Array;
 
-  readonly #chains: Chains;
+  readonly #hashes: Hashes;
 
   constructor(lms: LmsType, ots: OtsType, id: Uint8Array, seed: Uint8Array, levels?: readonly Uint8Array[]) {
     this.lms = lms;
@@ -654,27 +839,59 @@ class Tree {
 
     this.seed = seed;
 
-    this.#chains = chains(ots, id);
+    this.signatureSize = lmsSignatureSize(lms, ots);
 
-    const leaf = (q: number) => {
-      const k = otsPublicKey(this.#chains, ots, q, seed);
+    this.#hashes = hashes(ots, id);
 
-      return digest(lms.shake, lms.m, id, uint32(2 ** lms.h + q), D_LEAF, k);
-    };
-
-    const combine = (z: number, j: number, left: Uint8Array, right: Uint8Array) => {
-      return digest(lms.shake, lms.m, id, uint32(2 ** (lms.h - z - 1) + j), D_INTR, left, right);
-    };
-
-    this.merkle = new MerkleTree(lms.h, lms.m, leaf, combine, levels);
+    this.merkle = new MerkleTree(lms.h, lms.m, this, levels);
 
     this.publicKey = concat(uint32(lms.code), uint32(ots.code), id, this.merkle.root);
   }
 
-  sign(q: number, message: Uint8Array): Uint8Array {
-    const otsSignature = otsSign(this.#chains, this.ots, this.id, q, this.seed, message);
+  leaf(q: number, out: Uint8Array, offset: number): void {
+    this.#hashes.start(q, this.seed);
 
-    return concat(uint32(q), otsSignature, uint32(this.lms.code), this.merkle.authPath(q));
+    this.#hashes.run(q, ZEROS, TOPS.get(this.ots.w) as Uint8Array);
+
+    this.#hashes.leaf(2 ** this.lms.h + q, q, out, offset);
+  }
+
+  combine(
+    z: number,
+    first: number,
+    count: number,
+    children: Uint8Array,
+    from: number,
+    out: Uint8Array,
+    offset: number,
+  ): void {
+    this.#hashes.combine(2 ** (this.lms.h - z - 1) + first, count, children, from, out, offset);
+  }
+
+  // The LMS signature of message with leaf q into out from offset on: u32(q), the LM-OTS signature
+  // (its type, C and the chain values), the LMS type and the authentication path.
+  sign(q: number, message: Uint8Array, out: Uint8Array, offset: number): void {
+    const { ots, lms, seed } = this;
+
+    const tree = this.#hashes;
+
+    writeUint32(out, offset, q);
+
+    writeUint32(out, offset + 4, ots.code);
+
+    tree.prf(q, RANDOMIZER, seed, out, offset + 8);
+
+    digits(ots, messageHash(ots, this.id, q, out, offset + 8, message), DIGITS);
+
+    tree.start(q, seed);
+
+    tree.run(q, ZEROS, DIGITS);
+
+    tree.store(out, offset + 8 + ots.n);
+
+    writeUint32(out, offset + 4 + ots.signatureSize, lms.code);
+
+    this.merkle.authPath(q, out, offset + 8 + ots.signatureSize);
   }
 
   child(lms: LmsType, ots: OtsType, q: number): Tree {
@@ -696,6 +913,12 @@ export class Hss {
 
   readonly #heights: number[];
 
+  // Entry level: the total height of the levels from level on, and the mask of one level's leaf
+  // index.
+  readonly #below: bigint[];
+
+  readonly #masks: bigint[];
+
   readonly #trees: Tree[];
 
   readonly #signed: Uint8Array[] = [];
@@ -709,12 +932,22 @@ export class Hss {
 
     this.#heights = levels.map(([lms]) => lms.h);
 
-    this.#trees = [new Tree(levels[0][0], levels[0][1], id, seed, cached?.get(0)?.[1])];
+    this.#below = [...this.#heights, 0].map((_, level) =>
+      BigInt(this.#heights.slice(level).reduce((total, h) => total + h, 0)),
+    );
 
-    for (const [level, [prefix, nodes]] of cached ?? []) {
-      if (level > 0) {
-        this.#restored.set(level, [prefix, this.#pathTree(level, prefix, nodes)]);
+    this.#masks = this.#heights.map((h) => (1n << BigInt(h)) - 1n);
+
+    try {
+      this.#trees = [new Tree(levels[0][0], levels[0][1], id, seed, cached?.get(0)?.[1])];
+
+      for (const [level, [prefix, nodes]] of cached ?? []) {
+        if (level > 0) {
+          this.#restored.set(level, [prefix, this.#pathTree(level, prefix, nodes)]);
+        }
       }
+    } finally {
+      wipeSha2Lanes();
     }
   }
 
@@ -722,12 +955,8 @@ export class Hss {
     return concat(uint32(this.levels.length), this.#trees[0].publicKey);
   }
 
-  #below(level: number): bigint {
-    return BigInt(this.#heights.slice(level).reduce((total, h) => total + h, 0));
-  }
-
   #leafIndex(index: bigint, level: number): number {
-    return Number((index >> this.#below(level + 1)) & ((1n << BigInt(this.#heights[level])) - 1n));
+    return Number((index >> this.#below[level + 1]) & this.#masks[level]);
   }
 
   // Tree `prefix` of a lower level: the leaves that sign it on the levels above follow from its
@@ -757,11 +986,21 @@ export class Hss {
     return [...held, ...waiting.map(([level, [prefix, tree]]) => ({ level, tree: prefix, merkle: tree.merkle }))];
   }
 
+  // The signature, written once: u32(levels - 1), each signed child public key, then the bottom
+  // tree's signature of the message.
   sign(index: bigint, message: Uint8Array): Uint8Array {
+    try {
+      return this.#sign(index, message);
+    } finally {
+      wipeSha2Lanes();
+    }
+  }
+
+  #sign(index: bigint, message: Uint8Array): Uint8Array {
     const trees = this.#trees;
 
     for (let level = 1; level < this.levels.length; level++) {
-      const prefix = index >> this.#below(level);
+      const prefix = index >> this.#below[level];
 
       if (level < trees.length && this.#prefixes[level] === prefix) {
         continue;
@@ -784,15 +1023,43 @@ export class Hss {
           ? restored[1]
           : trees[level - 1].child(this.levels[level][0], this.levels[level][1], q);
 
+      const parent = trees[level - 1];
+
+      const signed = new Uint8Array(parent.signatureSize + tree.publicKey.length);
+
+      parent.sign(q, tree.publicKey, signed, 0);
+
+      signed.set(tree.publicKey, parent.signatureSize);
+
       trees.push(tree);
 
-      this.#signed.push(concat(trees[level - 1].sign(q, tree.publicKey), tree.publicKey));
+      this.#signed.push(signed);
 
       this.#prefixes.push(prefix);
     }
 
-    const bottom = trees[trees.length - 1].sign(this.#leafIndex(index, this.levels.length - 1), message);
+    const bottom = trees[trees.length - 1];
 
-    return concat(uint32(this.levels.length - 1), ...this.#signed, bottom);
+    let length = 4 + bottom.signatureSize;
+
+    for (let level = 0; level < this.#signed.length; level++) {
+      length += this.#signed[level].length;
+    }
+
+    const out = new Uint8Array(length);
+
+    writeUint32(out, 0, this.levels.length - 1);
+
+    let offset = 4;
+
+    for (let level = 0; level < this.#signed.length; level++) {
+      out.set(this.#signed[level], offset);
+
+      offset += this.#signed[level].length;
+    }
+
+    bottom.sign(this.#leafIndex(index, this.levels.length - 1), message, out, offset);
+
+    return out;
   }
 }

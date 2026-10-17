@@ -108,7 +108,5 @@ export function configureCshake(
     throw new TypeError("algorithm must be an XofAlgorithm");
   }
 
-  const [name, custom] = [bytes(functionName, "functionName"), bytes(customization, "customization")];
-
-  return cshakeWith(algorithm, name.subarray(0, name.length), custom.subarray(0, custom.length));
+  return cshakeWith(algorithm, bytes(functionName, "functionName"), bytes(customization, "customization"));
 }

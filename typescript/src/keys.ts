@@ -58,9 +58,12 @@ export function requireKeyLength(key: Uint8Array, length: number, format: unknow
   return requireLength(key, length, name);
 }
 
+// Absent options read as one shared empty object, so that reading them allocates nothing.
+const NO_OPTIONS = Object.freeze({});
+
 export function readOptions<T extends object>(value: T | undefined): Partial<T> {
   if (value === undefined || value === null) {
-    return {};
+    return NO_OPTIONS;
   }
 
   if (typeof value !== "object") {

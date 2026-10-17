@@ -1,4 +1,17 @@
-import { bytes, concat, equal, readUint32, readUint64, uint32, uint64, wipe } from "./bytes.ts";
+import {
+  bytes,
+  checkBytes,
+  concat,
+  equal,
+  isBytes,
+  readUint32,
+  readUint64,
+  uint32,
+  uint64,
+  wipe,
+  writeUint32,
+  writeUint64,
+} from "./bytes.ts";
 import { type KeyFormat, invalid, objectIdentifier } from "./encoding.ts";
 import { CryptoPQError } from "./errors.ts";
 import { STATEFUL_SIGNATURES } from "./families.ts";
@@ -7,6 +20,7 @@ import * as lms from "./lms.ts";
 import { CACHED_HEIGHT, type CachedLevels, type CachedTree } from "./merkle.ts";
 import { hmac, sha256 } from "./primitives.ts";
 import { randomBytes } from "./rng.ts";
+import { IV_256, digest256, wipeSha2 } from "./sha2.ts";
 import { type Core, OK, PUBLIC, REJECTED, SECRET, check } from "./wasm.ts";
 import * as xmss from "./xmss.ts";
 
@@ -99,7 +113,7 @@ export interface StatefulBackend<P> {
 
   encode(parameters: P, seed: Uint8Array, index: bigint): Uint8Array;
 
-  decode(state: unknown): State<P>;
+  decode(state: Uint8Array): State<P>;
 
   signer(parameters: P, seed: Uint8Array, cached?: ReadonlyMap<number, CachedLevels>): Trees;
 
@@ -148,24 +162,36 @@ function synchronous(value: unknown): void {
 }
 
 // State blob: version, kind, the parameters, the secret seeds and the next index, closed by the
-// first 16 bytes of its SHA-256 so that a damaged state is refused rather than reused. The body is
-// a temporary copy of the seeds, so it is wiped once sealed.
-function seal(body: Uint8Array): Uint8Array {
-  const state = concat(body, sha256(body).subarray(0, 16));
+// first 16 bytes of its SHA-256 so that a damaged state is refused rather than reused. The fields
+// are written straight into the blob, whose last 16 bytes seal fills.
+function seal(state: Uint8Array): Uint8Array {
+  const length = state.length - 16;
 
-  wipe(body);
+  const digest = digest256(IV_256, 32, state.subarray(0, length));
+
+  wipeSha2(false);
+
+  for (let i = 0; i < 16; i++) {
+    state[length + i] = digest[i];
+  }
+
+  digest.fill(0);
 
   return state;
 }
 
-function unseal(state: unknown, kind: number): Uint8Array {
-  if (!(state instanceof Uint8Array) || state.length < 18) {
+function unseal(state: Uint8Array, kind: number): Uint8Array {
+  if (state.length < 18) {
     throw mismatch("the state store holds no valid key");
   }
 
   const body = state.subarray(0, state.length - 16);
 
-  if (!equal(sha256(body).subarray(0, 16), state.subarray(state.length - 16)) || body[0] !== VERSION) {
+  const digest = sha256(body);
+
+  wipeSha2(false);
+
+  if (!equal(digest.subarray(0, 16), state.subarray(state.length - 16)) || body[0] !== VERSION) {
     throw mismatch("the stored key state is damaged or unsupported");
   }
 
@@ -176,11 +202,20 @@ function unseal(state: unknown, kind: number): Uint8Array {
   return body.subarray(2);
 }
 
-// A copy, so that the caller cannot change the cache between its checks and its use.
+// The caller's array, checked here and read through bytes() only once the store has run, as the store
+// is caller code that may change it. The load reads it only into copies: WebAssembly checks and uses
+// its own, and the TypeScript backend copies each part as it parses the cache, so the caller cannot
+// change the cache between its checks and its use.
 function treeCacheOption(options: StatefulLoadOptions | undefined): Uint8Array | null {
   const { treeCache } = readOptions(options);
 
-  return treeCache === undefined ? null : bytes(treeCache, "treeCache").slice();
+  if (treeCache === undefined) {
+    return null;
+  }
+
+  checkBytes(treeCache, "treeCache");
+
+  return treeCache;
 }
 
 // The key of the tree cache tag: HKDF-Extract (RFC 5869) of the seed with the label as salt.
@@ -239,8 +274,12 @@ interface ParsedTree {
   readonly nodes: Uint8Array;
 }
 
+// Every part is a copy, made as it is read, and the body is the list of those copies, which the tag
+// covers: the nodes of a tree are then its own, with no other copy of the cache.
 function parseTreeCache(data: Uint8Array) {
   let position = 0;
+
+  const body: Uint8Array[] = [];
 
   const take = (size: number): Uint8Array => {
     if (size > data.length - position) {
@@ -249,15 +288,17 @@ function parseTreeCache(data: Uint8Array) {
 
     position += size;
 
-    return data.subarray(position - size, position);
+    const part = data.slice(position - size, position);
+
+    body.push(part);
+
+    return part;
   };
 
   const [version, kind] = take(2);
 
   // The parameters have the layout of the kind that the cache names: an HSS level count and a pair
   // of types per level, or an OID. A cache of no known kind cannot be read further.
-  const start = position;
-
   if (kind === HSS_KIND) {
     take(8 * take(1)[0]);
   } else if (kind === XMSS_KIND || kind === XMSS_MT_KIND) {
@@ -266,7 +307,7 @@ function parseTreeCache(data: Uint8Array) {
     throw invalid("the tree cache has an unknown kind");
   }
 
-  const section = data.subarray(start, position);
+  const section = concat(...body.slice(1));
 
   const publicKey = take(readUint32(take(4), 0));
 
@@ -284,9 +325,9 @@ function parseTreeCache(data: Uint8Array) {
     trees.push({ level: header[0], tree: readUint64(header, 1), low: header[9], height: header[10], n, count, nodes });
   }
 
-  const body = data.subarray(0, position);
-
   const tag = take(TAG_SIZE);
+
+  body.pop();
 
   if (position !== data.length) {
     throw invalid("the tree cache has trailing bytes");
@@ -336,7 +377,7 @@ function openTreeCache<P>(
 
   const key = treeCacheKey(seed);
 
-  const expected = hmac(32, key, body);
+  const expected = hmac(32, key, ...body);
 
   const authentic = equal(expected, tag);
 
@@ -395,6 +436,18 @@ function splitLevels(nodes: Uint8Array, low: number, height: number, n: number):
   return levels;
 }
 
+// The HSS parameters as the state blob and the tree cache encode them: the level count, then the LMS
+// and LM-OTS type codes of each level.
+function hssSection(levels: readonly lms.Level[], out: Uint8Array, offset: number): void {
+  out[offset] = levels.length;
+
+  for (let i = 0; i < levels.length; i++) {
+    writeUint32(out, offset + 1 + 8 * i, levels[i][0].code);
+
+    writeUint32(out, offset + 5 + 8 * i, levels[i][1].code);
+  }
+}
+
 const HSS_BACKEND: StatefulBackend<readonly lms.Level[]> = {
   kind: HSS_KIND,
   oid: objectIdentifier("1.2.840.113549.1.9.16.3.17"),
@@ -438,7 +491,21 @@ const HSS_BACKEND: StatefulBackend<readonly lms.Level[]> = {
   seedSize: (levels) => 16 + levels[0][0].m,
   capacity: (levels) => 1n << BigInt(levels.reduce((total, [tree]) => total + tree.h, 0)),
   encode(levels, seed, index) {
-    return seal(concat(Uint8Array.of(VERSION, HSS_KIND), HSS_BACKEND.parameterSection(levels), seed, uint64(index)));
+    const section = 1 + 8 * levels.length;
+
+    const state = new Uint8Array(2 + section + seed.length + 8 + 16);
+
+    state[0] = VERSION;
+
+    state[1] = HSS_KIND;
+
+    hssSection(levels, state, 2);
+
+    state.set(seed, 2 + section);
+
+    writeUint64(state, 2 + section + seed.length, index);
+
+    return seal(state);
   },
   decode(state) {
     const body = unseal(state, HSS_KIND);
@@ -494,9 +561,11 @@ const HSS_BACKEND: StatefulBackend<readonly lms.Level[]> = {
     return [before, tree.m, new Uint8Array()];
   },
   parameterSection(levels) {
-    const codes = levels.flatMap(([tree, ots]) => [uint32(tree.code), uint32(ots.code)]);
+    const out = new Uint8Array(1 + 8 * levels.length);
 
-    return concat(Uint8Array.of(levels.length), ...codes);
+    hssSection(levels, out, 0);
+
+    return out;
   },
   checkPublicKey: (key) => lms.checkPublicKey(key),
   verify: (key, message, signature) => lms.hssVerify(key, message, signature),
@@ -525,7 +594,21 @@ function xmssBackend(multi: boolean): StatefulBackend<xmss.Parameters> {
     },
     seedSize: (p) => 3 * p.n,
     capacity: (p) => 1n << BigInt(p.h),
-    encode: (p, seed, index) => seal(concat(Uint8Array.of(VERSION, kind), section(p), uint64(index), seed)),
+    encode(p, seed, index) {
+      const state = new Uint8Array(14 + seed.length + 16);
+
+      state[0] = VERSION;
+
+      state[1] = kind;
+
+      writeUint32(state, 2, p.oid);
+
+      writeUint64(state, 6, index);
+
+      state.set(seed, 14);
+
+      return seal(state);
+    },
     parameterSection: section,
     decode(state) {
       const body = unseal(state, kind);
@@ -642,7 +725,7 @@ function open(
   const lengths = [section.length, seed.length, STATE_LIMIT, state?.length ?? 0, cache?.length ?? 0, PUBLIC_LIMIT];
 
   try {
-    return core.run(SECRET, lengths, ([parameters, s, created, stored, c, publicKey]) => {
+    return core.run(SECRET, lengths, (parameters, s, created, stored, c, publicKey) => {
       core.write(parameters, section);
 
       check(core.x.cpq_stateful_info(kind, parameters, section.length, core.scratch));
@@ -754,7 +837,7 @@ class WasmSigner implements Signer {
 
     const length = this.#signatureSize;
 
-    return core.run(SECRET, [message.length, length], ([m, signature]) => {
+    return core.run(SECRET, [message.length, length], (m, signature) => {
       core.write(m, message);
 
       check(core.x.cpq_stateful_signer_sign(slot, size, index, m, message.length, signature, length));
@@ -774,7 +857,7 @@ class WasmSigner implements Signer {
       return Number(new DataView(core.bytes().buffer).getBigUint64(core.scratch, true));
     });
 
-    return core.run(SECRET, [length], ([out]) => {
+    return core.run(SECRET, [length], (out) => {
       check(core.x.cpq_stateful_signer_export_tree_cache(slot, size, out, length));
 
       return core.read(out, length);
@@ -803,7 +886,7 @@ class WasmSigner implements Signer {
 }
 
 function wasmVerify(core: Core, kind: number, key: Uint8Array, message: Uint8Array, signature: Uint8Array): boolean {
-  return core.run(PUBLIC, [key.length, message.length, signature.length], ([k, m, s]) => {
+  return core.run(PUBLIC, [key.length, message.length, signature.length], (k, m, s) => {
     core.write(k, key);
 
     core.write(m, message);
@@ -821,7 +904,7 @@ function wasmVerify(core: Core, kind: number, key: Uint8Array, message: Uint8Arr
 }
 
 function wasmCheck(core: Core, kind: number, key: Uint8Array): boolean {
-  return core.run(PUBLIC, [key.length], ([k]) => {
+  return core.run(PUBLIC, [key.length], (k) => {
     core.write(k, key);
 
     const status = core.x.cpq_stateful_check_public_key(kind, k, key.length);
@@ -990,17 +1073,20 @@ export class StatefulPrivateKey {
       throw new CryptoPQError("STATE_CONFLICT", "the key is signing in another call");
     }
 
+    checkBytes(message, "message");
+
     this.#busy = true;
 
     try {
-      return this.#sign(bytes(message, "message"));
+      return this.#sign(message);
     } finally {
       this.#busy = false;
     }
   }
 
   // An index is in the store before its signature exists, so a crash or a failed write can waste
-  // indices but never use one twice.
+  // indices but never use one twice. The message is read after the store has run, as the store is
+  // caller code that may change it.
   #sign(message: Uint8Array): Uint8Array {
     const index = this.#index;
 
@@ -1016,7 +1102,7 @@ export class StatefulPrivateKey {
 
     this.#index = index + 1n;
 
-    return this.#signer.sign(index, message);
+    return this.#signer.sign(index, bytes(message, "message"));
   }
 
   // Stores reserved as the next index. Every blob holds the seed, so the key wipes the copy it hands
@@ -1106,12 +1192,29 @@ export class StatefulSignatureAlgorithm {
 
     synchronous(state);
 
+    if (!isBytes(state)) {
+      throw mismatch("the state store holds no valid key");
+    }
+
+    // The library's own copy: the store's array, which the store may still change, is not read again.
+    const blob = bytes(state, "state").slice();
+
     const backend = this.#backend;
 
-    const { parameters, seed, index } = backend.decode(state);
+    let decoded: State<unknown>;
+
+    try {
+      decoded = backend.decode(blob);
+    } catch (error) {
+      wipe(blob);
+
+      throw error;
+    }
+
+    const { parameters, seed, index } = decoded;
 
     if (index > backend.capacity(parameters)) {
-      wipe(seed);
+      wipe(seed, blob);
 
       throw mismatch("the stored index is beyond the key's capacity");
     }
@@ -1119,16 +1222,14 @@ export class StatefulSignatureAlgorithm {
     let signer: Signer;
 
     try {
-      signer = this.#signer(parameters, seed, index, state as Uint8Array, cache);
+      signer = this.#signer(parameters, seed, index, blob, cache === null ? null : bytes(cache, "treeCache"));
     } catch (error) {
-      wipe(seed);
+      wipe(seed, blob);
 
       throw error;
     }
 
-    const copy = (state as Uint8Array).slice();
-
-    return new StatefulPrivateKey(this, parameters, seed, signer, store, copy, index, reserve);
+    return new StatefulPrivateKey(this, parameters, seed, signer, store, blob, index, reserve);
   }
 
   importPublicKey(data: Uint8Array | string, format: KeyFormat): StatefulPublicKey {

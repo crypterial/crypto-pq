@@ -1,7 +1,7 @@
-import { bytes, writeUint32 } from "./bytes.ts";
+import { bytes, checkBytes, writeUint32 } from "./bytes.ts";
 import { CryptoPQError } from "./errors.ts";
 import { X_WING_HASH } from "./families.ts";
-import { IV_256, IV_384, IV_512, compress256, compress512, digest256, digest512 } from "./sha2.ts";
+import { IV_256, IV_384, IV_512, compress256, compress512, digest256, digest512, wipeSha2 } from "./sha2.ts";
 import { HASHING, check } from "./wasm.ts";
 
 // HKDF (RFC 5869) over HMAC with SHA-256, SHA-384 or SHA-512. The key's pad blocks are compressed
@@ -44,7 +44,8 @@ const SHA_512: Sha2 = {
 };
 
 // The scratch of a derivation, cleared at its end: the chaining values after the inner and outer
-// pad blocks, the state of a hash, its block, the last T(i) and the counter byte.
+// pad blocks, the state of a hash, its block, the inner hash of an HMAC, the counter byte and the
+// pseudorandom key.
 const INNER = new Int32Array(16);
 
 const OUTER = new Int32Array(16);
@@ -57,7 +58,9 @@ const TAG = new Uint8Array(64);
 
 const COUNTER = new Uint8Array(1);
 
-function clear(): void {
+const PRK = new Uint8Array(64);
+
+function clear(hash: Sha2): void {
   INNER.fill(0);
 
   OUTER.fill(0);
@@ -67,23 +70,29 @@ function clear(): void {
   BLOCK.fill(0);
 
   TAG.fill(0);
+
+  PRK.fill(0);
+
+  wipeSha2(hash.block === 128);
 }
 
-// RFC 2104: the key, hashed first when it is longer than a block, zero-padded and XORed with ipad
-// and opad, each block compressed once into INNER and OUTER.
-function keyPads(hash: Sha2, key: Uint8Array): void {
+// RFC 2104: the first length bytes of the key, hashed first when they are longer than a block,
+// zero-padded and XORed with ipad and opad, each block compressed once into INNER and OUTER.
+function keyPads(hash: Sha2, key: Uint8Array, length: number): void {
   const pad = BLOCK;
 
   pad.fill(0);
 
-  if (key.length > hash.block) {
-    const hashed = hash.hash(key);
+  if (length > hash.block) {
+    const hashed = hash.hash(key.subarray(0, length));
 
     pad.set(hashed);
 
     hashed.fill(0);
   } else {
-    pad.set(key.subarray(0, key.length));
+    for (let i = 0; i < length; i++) {
+      pad[i] = key[i];
+    }
   }
 
   for (let i = 0; i < hash.block; i++) {
@@ -105,50 +114,54 @@ function keyPads(hash: Sha2, key: Uint8Array): void {
   pad.fill(0);
 }
 
-// The hash of a pad block, already compressed into STATE, then the parts: count bytes of it into out
-// at offset. Whole blocks of a part are compressed where they are.
-function finish(hash: Sha2, parts: readonly Uint8Array[], out: Uint8Array, offset: number, count: number): void {
+// Absorbs data[from .. from + length) into STATE after the used bytes of a block that BLOCK holds:
+// whole blocks are compressed where they are. Returns how many bytes BLOCK holds after it.
+function absorb(hash: Sha2, data: Uint8Array, from: number, length: number, used: number): number {
   const { block: size, compress } = hash;
 
   const block = BLOCK;
 
-  let used = 0;
+  const end = from + length;
 
-  let total = size;
+  let at = from;
 
-  for (const part of parts) {
-    let at = 0;
-
-    if (used === 0) {
-      for (; part.length - at >= size; at += size) {
-        compress(STATE, part, at);
-      }
+  if (used === 0) {
+    for (; end - at >= size; at += size) {
+      compress(STATE, data, at);
     }
-
-    while (at < part.length) {
-      const take = Math.min(size - used, part.length - at);
-
-      for (let i = 0; i < take; i++) {
-        block[used + i] = part[at + i];
-      }
-
-      used += take;
-
-      at += take;
-
-      if (used === size) {
-        compress(STATE, block, 0);
-
-        used = 0;
-
-        for (; part.length - at >= size; at += size) {
-          compress(STATE, part, at);
-        }
-      }
-    }
-
-    total += part.length;
   }
+
+  while (at < end) {
+    const take = Math.min(size - used, end - at);
+
+    for (let i = 0; i < take; i++) {
+      block[used + i] = data[at + i];
+    }
+
+    used += take;
+
+    at += take;
+
+    if (used === size) {
+      compress(STATE, block, 0);
+
+      used = 0;
+
+      for (; end - at >= size; at += size) {
+        compress(STATE, data, at);
+      }
+    }
+  }
+
+  return used;
+}
+
+// The padding of a message of total bytes, the pad block included, after the used bytes in BLOCK;
+// then count bytes of the hash into out at offset.
+function finish(hash: Sha2, used: number, total: number, out: Uint8Array, offset: number, count: number): void {
+  const { block: size, compress } = hash;
+
+  const block = BLOCK;
 
   block[used++] = 0x80;
 
@@ -173,29 +186,42 @@ function finish(hash: Sha2, parts: readonly Uint8Array[], out: Uint8Array, offse
   }
 }
 
-// HMAC of the parts with the key of keyPads: count bytes of the tag into out at offset.
-function hmac(hash: Sha2, parts: readonly Uint8Array[], out: Uint8Array, offset: number, count: number): void {
-  STATE.set(INNER);
-
-  finish(hash, parts, TAG, 0, hash.size);
+// Ends the inner hash of an HMAC, whose message has the used bytes in BLOCK and total bytes in all,
+// in TAG, then hashes it from OUTER: count bytes of the tag into out at offset.
+function outer(hash: Sha2, used: number, total: number, out: Uint8Array, offset: number, count: number): void {
+  finish(hash, used, total, TAG, 0, hash.size);
 
   STATE.set(OUTER);
 
-  finish(hash, [TAG.subarray(0, hash.size)], out, offset, count);
+  finish(hash, absorb(hash, TAG, 0, hash.size, 0), hash.block + hash.size, out, offset, count);
 }
 
-// RFC 5869, 2.3: T(i) = HMAC(PRK, T(i - 1) || info || i), T(0) empty, with the PRK's pads set.
+// HMAC of data with the key of keyPads: count bytes of the tag into out at offset.
+function hmac(hash: Sha2, data: Uint8Array, out: Uint8Array, offset: number, count: number): void {
+  STATE.set(INNER);
+
+  outer(hash, absorb(hash, data, 0, data.length, 0), hash.block + data.length, out, offset, count);
+}
+
+// RFC 5869, 2.3: T(i) = HMAC(PRK, T(i - 1) || info || i), T(0) empty, with the PRK's pads set; T(i - 1)
+// is read where it was written.
 function expandInto(hash: Sha2, info: Uint8Array, out: Uint8Array): void {
   const size = hash.size;
 
   for (let i = 1, offset = 0; offset < out.length; i++, offset += size) {
     COUNTER[0] = i;
 
-    const count = Math.min(size, out.length - offset);
+    STATE.set(INNER);
 
-    const parts = i === 1 ? [info, COUNTER] : [out.subarray(offset - size, offset), info, COUNTER];
+    const previous = i === 1 ? 0 : size;
 
-    hmac(hash, parts, out, offset, count);
+    let used = absorb(hash, out, offset - previous, previous, 0);
+
+    used = absorb(hash, info, 0, info.length, used);
+
+    used = absorb(hash, COUNTER, 0, 1, used);
+
+    outer(hash, used, hash.block + previous + info.length + 1, out, offset, Math.min(size, out.length - offset));
   }
 }
 
@@ -203,11 +229,11 @@ function hkdfExtract(hash: Sha2, salt: Uint8Array, ikm: Uint8Array): Uint8Array 
   const prk = new Uint8Array(hash.size);
 
   try {
-    keyPads(hash, salt);
+    keyPads(hash, salt, salt.length);
 
-    hmac(hash, [ikm], prk, 0, hash.size);
+    hmac(hash, ikm, prk, 0, hash.size);
   } finally {
-    clear();
+    clear(hash);
   }
 
   return prk;
@@ -217,36 +243,30 @@ function hkdfExpand(hash: Sha2, prk: Uint8Array, info: Uint8Array, length: numbe
   const okm = new Uint8Array(length);
 
   try {
-    keyPads(hash, prk);
+    keyPads(hash, prk, prk.length);
 
     expandInto(hash, info, okm);
   } finally {
-    clear();
+    clear(hash);
   }
 
   return okm;
 }
 
-// Extract then Expand; the PRK is cleared once its pads are made.
+// Extract then Expand, the PRK in the scratch.
 function hkdf(hash: Sha2, ikm: Uint8Array, salt: Uint8Array, info: Uint8Array, length: number): Uint8Array {
   const okm = new Uint8Array(length);
 
-  const prk = new Uint8Array(hash.size);
-
   try {
-    keyPads(hash, salt);
+    keyPads(hash, salt, salt.length);
 
-    hmac(hash, [ikm], prk, 0, hash.size);
+    hmac(hash, ikm, PRK, 0, hash.size);
 
-    keyPads(hash, prk);
-
-    prk.fill(0);
+    keyPads(hash, PRK, hash.size);
 
     expandInto(hash, info, okm);
   } finally {
-    prk.fill(0);
-
-    clear();
+    clear(hash);
   }
 
   return okm;
@@ -260,18 +280,21 @@ export interface KdfOptions {
 
 const EMPTY = new Uint8Array(0);
 
-function inputs(options: KdfOptions | undefined): [Uint8Array, Uint8Array] {
+// Absent options read as one shared empty object, so that reading them allocates nothing. A call
+// checks its arguments' types, then reads the options, whose getters are caller code that may change
+// an input, and reads the inputs with bytes() only then.
+const NO_OPTIONS: KdfOptions = Object.freeze({});
+
+function optionsOf(options: KdfOptions | undefined): KdfOptions {
   if (options === undefined || options === null) {
-    return [EMPTY, EMPTY];
+    return NO_OPTIONS;
   }
 
   if (typeof options !== "object") {
     throw new TypeError("options must be an object");
   }
 
-  const { salt, info } = options;
-
-  return [salt === undefined ? EMPTY : bytes(salt, "salt"), info === undefined ? EMPTY : bytes(info, "info")];
+  return options;
 }
 
 export class KdfAlgorithm {
@@ -310,9 +333,15 @@ export class KdfAlgorithm {
 
   // Expand(Extract(salt, ikm), info) of length bytes; an empty salt is HashLen zero bytes.
   derive(ikm: Uint8Array, length: number, options?: KdfOptions): Uint8Array {
+    checkBytes(ikm, "ikm");
+
+    const { salt: givenSalt = EMPTY, info: givenInfo = EMPTY } = optionsOf(options);
+
     const secret = bytes(ikm, "ikm");
 
-    const [salt, info] = inputs(options);
+    const salt = bytes(givenSalt, "salt");
+
+    const info = bytes(givenInfo, "info");
 
     this.#checkLength(length);
 
@@ -324,7 +353,7 @@ export class KdfAlgorithm {
 
     const lengths = [secret.length, salt.length, info.length, length];
 
-    return core.run(HASHING, lengths, ([k, s, i, out]) => {
+    return core.run(HASHING, lengths, (k, s, i, out) => {
       core.write(k, secret);
 
       core.write(s, salt);
@@ -339,9 +368,15 @@ export class KdfAlgorithm {
 
   // The pseudorandom key, prkSize bytes. Extract takes no info.
   extract(ikm: Uint8Array, options?: KdfOptions): Uint8Array {
+    checkBytes(ikm, "ikm");
+
+    const { salt: givenSalt = EMPTY, info: givenInfo = EMPTY } = optionsOf(options);
+
     const secret = bytes(ikm, "ikm");
 
-    const [salt, info] = inputs(options);
+    const salt = bytes(givenSalt, "salt");
+
+    const info = bytes(givenInfo, "info");
 
     if (info.length > 0) {
       throw new CryptoPQError("INVALID_OPTION", "HKDF-Extract takes no info");
@@ -355,7 +390,7 @@ export class KdfAlgorithm {
 
     const size = this.prkSize;
 
-    return core.run(HASHING, [secret.length, salt.length, size], ([k, s, out]) => {
+    return core.run(HASHING, [secret.length, salt.length, size], (k, s, out) => {
       core.write(k, secret);
 
       core.write(s, salt);
@@ -368,9 +403,15 @@ export class KdfAlgorithm {
 
   // length bytes from a pseudorandom key of at least prkSize bytes. Expand takes no salt.
   expand(prk: Uint8Array, length: number, options?: KdfOptions): Uint8Array {
+    checkBytes(prk, "prk");
+
+    const { salt: givenSalt = EMPTY, info: givenInfo = EMPTY } = optionsOf(options);
+
     const key = bytes(prk, "prk");
 
-    const [salt, info] = inputs(options);
+    const salt = bytes(givenSalt, "salt");
+
+    const info = bytes(givenInfo, "info");
 
     this.#checkLength(length);
 
@@ -388,7 +429,7 @@ export class KdfAlgorithm {
       return hkdfExpand(this.#hash, key, info, length);
     }
 
-    return core.run(HASHING, [key.length, info.length, length], ([k, i, out]) => {
+    return core.run(HASHING, [key.length, info.length, length], (k, i, out) => {
       core.write(k, key);
 
       core.write(i, info);
