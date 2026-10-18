@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 
+use crate::ct::declassify_value;
 use crate::encoding::{
     CONTEXT_0, OCTET_STRING, Reader, SEQUENCE, decode_private_key, decode_public_key, element,
     encode_private_key, encode_public_key, only, pem_decode, pem_encode,
@@ -161,10 +162,10 @@ pub(crate) fn decode_seed_choice(
     seed_size: usize,
     expanded_size: usize,
 ) -> Result<SeedChoice<'_>, Error> {
-    let choice = match octets.first() {
-        Some(&CONTEXT_0) => SeedChoice::Seed(only(octets, CONTEXT_0)?),
-        Some(&OCTET_STRING) => SeedChoice::Expanded(only(octets, OCTET_STRING)?),
-        Some(&SEQUENCE) => {
+    let choice = match octets.first().copied().map(declassify_value) {
+        Some(CONTEXT_0) => SeedChoice::Seed(only(octets, CONTEXT_0)?),
+        Some(OCTET_STRING) => SeedChoice::Expanded(only(octets, OCTET_STRING)?),
+        Some(SEQUENCE) => {
             let mut reader = Reader::new(only(octets, SEQUENCE)?);
 
             let seed = reader.read(OCTET_STRING)?;

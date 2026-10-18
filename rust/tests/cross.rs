@@ -958,7 +958,7 @@ fn loads_version_1((header, record): &(Fields, Fields)) -> bool {
 // Cases whose expected result predates a rule of SPEC 1.0 that the reference generator does not
 // apply yet, by case name, with the result under the rule. Remove them when the file is
 // regenerated (SPEC Appendix C.1 item 9).
-const PENDING: [(&str, &str); 17] = [
+const PENDING: [(&str, &str); 23] = [
     // 7.3: the options, the context included, are checked before the lengths.
     (
         "hazmat sign short randomness and long context",
@@ -980,6 +980,20 @@ const PENDING: [(&str, &str); 17] = [
     (
         "private key der public key with version 0 and other algorithm",
         "ALGORITHM_MISMATCH",
+    ),
+    // 10.4 item 3 [D-67]: each boundary line starts a line and holds nothing but the boundary,
+    // so neither whitespace before BEGIN on its line nor a body on a boundary line is accepted.
+    ("public key pem surrounding whitespace", "INVALID_ENCODING"),
+    ("public key pem no line breaks", "INVALID_ENCODING"),
+    ("private key pem surrounding whitespace", "INVALID_ENCODING"),
+    ("private key pem no line breaks", "INVALID_ENCODING"),
+    (
+        "private key with attributes pem surrounding whitespace",
+        "INVALID_ENCODING",
+    ),
+    (
+        "private key with attributes pem no line breaks",
+        "INVALID_ENCODING",
     ),
     // 10.4 item 3 [D-32]: text before the BEGIN line and after the END line is ignored.
     ("public key pem text before begin", "ok"),

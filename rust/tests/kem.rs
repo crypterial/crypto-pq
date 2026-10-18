@@ -607,11 +607,13 @@ fn strict_encodings() {
         .collect();
 
     // SPEC 10.4 item 3: text before the BEGIN line and after the END line is ignored, even
-    // non-ASCII text or a stray boundary that starts no block.
+    // non-ASCII text or a boundary that starts no line; whitespace may follow a boundary on its
+    // line (D-67).
     let accepted = [
         format!(" \t\r\n{pem}\n\n"),
         format!("Subject: test key\n\u{e9}\n{pem}-----END PUBLIC KEY-----\ntrailing \u{e9}"),
-        format!("see -----BEGIN PUBLIC KEY----- below\n  {pem}"),
+        format!("see -----BEGIN PUBLIC KEY----- below\n{pem}"),
+        pem.replacen("-----\n", "----- \t\x0b\x0c\n", 1),
         format!("{} \t\r\n", pem.trim_end()),
         format!(
             "{}\r\n{}\r\n{}",
@@ -640,6 +642,14 @@ fn strict_encodings() {
         format!("{pem}text\n-----BEGIN PUBLIC KEY-----\n"),
         format!("{}x\n", pem.trim_end()),
         pem.replacen("\n", "\nx\n", 1),
+        // D-67: a boundary starts its line and is all the line holds.
+        format!("  {pem}"),
+        format!("\x0b{pem}"),
+        pem.replacen("-----\n", "----- x\n", 1),
+        pem.replacen("-----\n", "-----", 1),
+        pem.replacen("\n-----END", "-----END", 1),
+        pem.replacen("\n-----END", "\n -----END", 1),
+        format!("{pem}-----BEGIN PUBLIC KEY-----\n"),
     ];
 
     for data in rejected {

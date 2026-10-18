@@ -1,5 +1,9 @@
 use alloc::vec::Vec;
 
+use core::hint::black_box;
+use core::ops::Range;
+
+use crate::ct::{declassify, declassify_value, equal_mask};
 use crate::error::Error;
 use crate::wipe::SecretBytes;
 
@@ -121,6 +125,10 @@ impl<'a> Reader<'a> {
             return Err(Error::InvalidEncoding);
         };
 
+        // Tags and lengths are the public structure of a key, also inside a secret encoding
+        // (SPEC D-67).
+        let (found, first) = (declassify_value(found), declassify_value(first));
+
         if found != tag {
             return Err(Error::InvalidEncoding);
         }
@@ -134,6 +142,7 @@ impl<'a> Reader<'a> {
 
             let bytes = rest
                 .get(2..2 + size)
+                .inspect(|bytes| declassify(bytes))
                 .filter(|bytes| (1..=4).contains(&size) && bytes[0] != 0)
                 .ok_or(Error::InvalidEncoding)?;
 
@@ -161,7 +170,7 @@ impl<'a> Reader<'a> {
     }
 
     pub(crate) fn peek(&self) -> Option<u8> {
-        self.data.get(self.offset).copied()
+        self.data.get(self.offset).copied().map(declassify_value)
     }
 
     pub(crate) fn finish(&self) -> Result<(), Error> {
@@ -183,11 +192,18 @@ pub(crate) fn only(data: &[u8], tag: u8) -> Result<&[u8], Error> {
     Ok(content)
 }
 
+// The algorithm identifier and the version are public as the structure is.
 fn read_algorithm<'a>(reader: &mut Reader<'a>) -> Result<&'a [u8], Error> {
-    only(reader.read(SEQUENCE)?, OBJECT_IDENTIFIER)
+    let oid = only(reader.read(SEQUENCE)?, OBJECT_IDENTIFIER)?;
+
+    declassify(oid);
+
+    Ok(oid)
 }
 
 fn unused_bits_free(bits: &[u8]) -> Result<&[u8], Error> {
+    declassify(&bits[..bits.len().min(1)]);
+
     match bits.split_first() {
         Some((0, key)) => Ok(key),
         _ => Err(Error::InvalidEncoding),
@@ -231,6 +247,8 @@ pub(crate) fn decode_private_key<'a>(
     let mut reader = Reader::new(only(data, SEQUENCE)?);
 
     let version = reader.read(INTEGER)?;
+
+    declassify(version);
 
     check_algorithm(&mut reader, expected)?;
 
@@ -317,10 +335,12 @@ fn base64_decode(text: &[u8]) -> Result<SecretBytes, Error> {
         return Err(Error::InvalidEncoding);
     }
 
-    let padding = if text.ends_with(b"==") {
-        2
-    } else {
-        usize::from(text.ends_with(b"="))
+    let padded = |back: usize| text.len() >= back && layout(text[text.len() - back]) == PAD;
+
+    let padding = match (padded(2), padded(1)) {
+        (true, true) => 2,
+        (_, true) => 1,
+        _ => 0,
     };
 
     let mut out = SecretBytes::zeroed(text.len() / 4 * 3 - padding);
@@ -358,16 +378,75 @@ fn base64_decode(text: &[u8]) -> Result<SecretBytes, Error> {
         out[start..end].copy_from_slice(&bytes[1..1 + end - start]);
     }
 
-    if invalid != 0 {
+    // Whether the encoding is valid is the result of the import, so it is public.
+    if declassify_value(invalid) != 0 {
         return Err(Error::InvalidEncoding);
     }
 
     Ok(out)
 }
 
-// ASCII whitespace, including the vertical tab that u8::is_ascii_whitespace leaves out.
-const fn is_space(character: u8) -> bool {
-    matches!(character, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+// The layout of PEM text (SPEC 10.4 and D-67): whether a byte is whitespace other than a line
+// end, a line end, a dash, padding, or anything else. It is computed with arithmetic and only then
+// made public, so that no branch or table index depends on the value of a base64 digit, which
+// only the arithmetic decoder reads.
+const SPACE: u8 = 1;
+
+const LINE_END: u8 = 2;
+
+const DASH: u8 = 4;
+
+const PAD: u8 = 8;
+
+// 1 when the bytes are equal, 0 otherwise.
+const fn same_byte(a: u8, b: u8) -> u8 {
+    ((((a ^ b) as u32).wrapping_sub(1)) >> 31) as u8
+}
+
+fn layout(c: u8) -> u8 {
+    let space = same_byte(c, b' ') | same_byte(c, b'\t') | same_byte(c, 0x0B) | same_byte(c, 0x0C);
+
+    let line_end = same_byte(c, b'\n') | same_byte(c, b'\r');
+
+    let class = space | (line_end << 1) | (same_byte(c, b'-') << 2) | (same_byte(c, b'=') << 3);
+
+    black_box(declassify_value(class))
+}
+
+// Whether text starts with these bytes, from a comparison that reads all of them.
+fn starts_with(text: &[u8], prefix: &[u8]) -> bool {
+    text.len() >= prefix.len() && declassify_value(equal_mask(&text[..prefix.len()], prefix)) != 0
+}
+
+// A boundary line holds the boundary and nothing else but trailing whitespace.
+fn is_boundary(line: &[u8], kind: &[u8], label: &[u8]) -> bool {
+    let size = kind.len() + label.len() + DASHES.len();
+
+    if line.len() < size || line[size..].iter().any(|&c| layout(c) != SPACE) {
+        return false;
+    }
+
+    let (kind_part, rest) = line.split_at(kind.len());
+
+    let (label_part, dashes) = rest[..size - kind.len()].split_at(label.len());
+
+    let mask =
+        equal_mask(kind_part, kind) & equal_mask(label_part, label) & equal_mask(dashes, DASHES);
+
+    declassify_value(mask) != 0
+}
+
+// The lines of text as ranges, split at every line end.
+fn lines(text: &[u8]) -> impl Iterator<Item = Range<usize>> {
+    let mut start = 0;
+
+    text.split(|&c| layout(c) == LINE_END).map(move |line| {
+        let range = start..start + line.len();
+
+        start = range.end + 1;
+
+        range
+    })
 }
 
 const BEGIN: &[u8] = b"-----BEGIN ";
@@ -407,73 +486,42 @@ pub(crate) fn pem_encode(label: &[u8], der: &[u8]) -> Vec<u8> {
     out
 }
 
-// RFC 7468: the one block with this label. Text before its BEGIN line and after its END line is
-// ignored (SPEC 10.4); between them only base64 and whitespace may appear. The branches here
-// depend on where the text has dashes and whitespace, its layout, never on the value of a base64
-// digit, which only the arithmetic decoder reads.
+// RFC 7468 and SPEC D-67: the one block with this label, whose BEGIN and END lines each start a
+// line and hold only the boundary and trailing whitespace. Lines before the first line that starts
+// with a BEGIN boundary, and after the END line, are ignored, except a second BEGIN line; between
+// them only base64 and whitespace may appear, and a line that starts with a dash must be the END
+// line. Every branch depends on the layout alone.
 pub(crate) fn pem_decode(label: &[u8], data: &[u8]) -> Result<SecretBytes, Error> {
-    let start = begin_line(data).ok_or(Error::InvalidEncoding)?;
+    let mut lines = lines(data);
 
-    let rest = data[start + BEGIN.len()..]
-        .strip_prefix(label)
-        .and_then(|rest| rest.strip_prefix(DASHES))
+    let begin = lines
+        .by_ref()
+        .find(|line| starts_with(&data[line.clone()], BEGIN))
         .ok_or(Error::InvalidEncoding)?;
 
-    let end = find(rest, END).ok_or(Error::InvalidEncoding)?;
-
-    let (body, footer) = rest.split_at(end);
-
-    let after = footer[END.len()..]
-        .strip_prefix(label)
-        .and_then(|after| after.strip_prefix(DASHES))
+    let end = lines
+        .by_ref()
+        .find(|line| data.get(line.start).is_some_and(|&c| layout(c) == DASH))
         .ok_or(Error::InvalidEncoding)?;
 
-    // The END line itself carries only whitespace after the boundary, and no second block
-    // follows.
-    let line_end = after
-        .iter()
-        .position(|&c| c == b'\n' || c == b'\r')
-        .unwrap_or(after.len());
-
-    if !after[..line_end].iter().all(|&c| is_space(c)) || find(after, BEGIN).is_some() {
+    if !is_boundary(&data[begin.clone()], BEGIN, label)
+        || !is_boundary(&data[end.clone()], END, label)
+        || lines.any(|line| starts_with(&data[line], BEGIN))
+    {
         return Err(Error::InvalidEncoding);
     }
 
-    let mut text = SecretBytes::zeroed(body.iter().filter(|&&c| !is_space(c)).count());
+    let body = &data[begin.end..end.start];
 
-    for (target, &c) in text.iter_mut().zip(body.iter().filter(|&&c| !is_space(c))) {
+    let digit = |c: &&u8| layout(**c) & (SPACE | LINE_END) == 0;
+
+    let mut text = SecretBytes::zeroed(body.iter().filter(digit).count());
+
+    for (target, &c) in text.iter_mut().zip(body.iter().filter(digit)) {
         *target = c;
     }
 
     base64_decode(&text)
-}
-
-fn find(data: &[u8], pattern: &[u8]) -> Option<usize> {
-    data.windows(pattern.len())
-        .position(|window| window == pattern)
-}
-
-// The first BEGIN boundary that starts a line, after any whitespace.
-fn begin_line(data: &[u8]) -> Option<usize> {
-    let mut offset = 0;
-
-    while let Some(found) = find(&data[offset..], BEGIN) {
-        let start = offset + found;
-
-        let line_start = data[..start]
-            .iter()
-            .rev()
-            .take_while(|&&c| c != b'\n' && c != b'\r')
-            .all(|&c| is_space(c));
-
-        if line_start {
-            return Some(start);
-        }
-
-        offset = start + 1;
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -496,6 +544,21 @@ mod tests {
             if !alphabet.contains(&character) {
                 assert_eq!(base64_value(character), -1, "{character}");
             }
+        }
+    }
+
+    #[test]
+    fn layout_classes() {
+        for c in 0..=255u8 {
+            let expected = match c {
+                b' ' | b'\t' | 0x0B | 0x0C => SPACE,
+                b'\n' | b'\r' => LINE_END,
+                b'-' => DASH,
+                b'=' => PAD,
+                _ => 0,
+            };
+
+            assert_eq!(layout(c), expected, "{c}");
         }
     }
 

@@ -191,7 +191,101 @@ fn slh_dsa() {
     }
 }
 
-// Each key also goes out and back in as DER; PEM is only exported.
+// SPEC 10.4 item 4 and D-67: a PEM private key from outside is secret as a whole, its boundary
+// lines included. The import declassifies its layout (line ends, whitespace, dashes, padding),
+// the comparison of each boundary line with the expected one and the DER structure (tags,
+// lengths, version, OID), nothing of a base64 digit. Each key comes in its exported layout and in
+// one with explanatory text, CRLF line ends and whitespace inside the body.
+fn pem_variants(key: &[u8]) -> [Vec<u8>; 2] {
+    let text = std::str::from_utf8(key).unwrap();
+
+    let spaced = text.replace('\n', " \t\r\n").replacen("\r\n", "\n", 1);
+
+    let mut lines: Vec<&str> = spaced.split('\n').collect();
+
+    let middle = lines.len() / 2;
+
+    lines.insert(middle, "\x0b \x0c");
+
+    let laid_out = format!("explanatory text\r\n{}trailing text\n", lines.join("\n"));
+
+    let variants = [key.to_vec(), laid_out.into_bytes()];
+
+    for variant in &variants {
+        secret(variant);
+    }
+
+    variants
+}
+
+#[test]
+fn imported_pem_kem_keys() {
+    let ml_kem = hazmat::generate_kem_key_pair(ML_KEM_768, &secret_bytes(64, 8)).unwrap();
+
+    let dk = first("acvp/ML-KEM-keyGen.txt", "ML-KEM-768", "dk");
+
+    secret(&dk);
+
+    let expanded = ML_KEM_768.import_private_key(&dk, KeyFormat::Raw).unwrap();
+
+    for key in [&ml_kem.private_key, &expanded] {
+        let pem = key.export_key(KeyFormat::Pem).unwrap();
+
+        declassify(&pem[..]);
+
+        for variant in pem_variants(&pem) {
+            let imported = ML_KEM_768
+                .import_private_key(&variant, KeyFormat::Pem)
+                .unwrap();
+
+            let encapsulation = key.public_key().encapsulate().unwrap();
+
+            let shared_secret = imported.decapsulate(&encapsulation.ciphertext).unwrap();
+
+            assert!(same(&shared_secret, &encapsulation.shared_secret));
+        }
+    }
+}
+
+#[test]
+fn imported_pem_signature_keys() {
+    let ml_dsa = hazmat::generate_signature_key_pair(ML_DSA_65, &secret_bytes(32, 9)).unwrap();
+
+    let sk = first("acvp/ML-DSA-keyGen.txt", "ML-DSA-65", "sk");
+
+    secret(&sk);
+
+    let expanded = ML_DSA_65.import_private_key(&sk, KeyFormat::Raw).unwrap();
+
+    let slh_dsa =
+        hazmat::generate_signature_key_pair(SLH_DSA_SHAKE_128F, &secret_bytes(48, 9)).unwrap();
+
+    for (algorithm, key) in [
+        (ML_DSA_65, &ml_dsa.private_key),
+        (ML_DSA_65, &expanded),
+        (SLH_DSA_SHAKE_128F, &slh_dsa.private_key),
+    ] {
+        let pem = key.export_key(KeyFormat::Pem).unwrap();
+
+        declassify(&pem[..]);
+
+        for variant in pem_variants(&pem) {
+            let imported = algorithm
+                .import_private_key(&variant, KeyFormat::Pem)
+                .unwrap();
+
+            let signed = imported.sign(MESSAGE, &SignOptions::default()).unwrap();
+
+            let verified = key
+                .public_key()
+                .verify(&signed, MESSAGE, &VerifyOptions::default());
+
+            assert!(verified);
+        }
+    }
+}
+
+// Each key also goes out and back in as DER; PEM is only exported here.
 fn reimported_kem(algorithm: KemAlgorithm, key: &KemPrivateKey, public_key: &KemPublicKey) {
     key.export_key(KeyFormat::Pem).unwrap();
 

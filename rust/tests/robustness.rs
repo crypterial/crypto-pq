@@ -2211,6 +2211,7 @@ fn pem_layouts() {
         pair.public_key
     );
 
+    // SPEC D-67: a body on a boundary line is text on that line.
     let wide = [
         &b"-----BEGIN PUBLIC KEY-----"[..],
         &body,
@@ -2219,10 +2220,8 @@ fn pem_layouts() {
     .concat();
 
     assert_eq!(
-        ML_KEM_768
-            .import_public_key(&wide, KeyFormat::Pem)
-            .expect("wide"),
-        pair.public_key
+        ML_KEM_768.import_public_key(&wide, KeyFormat::Pem).err(),
+        Some(Error::InvalidEncoding)
     );
 
     let huge = base64(&[&[0x30, 0x84, 0x00, 0xFF, 0xFF, 0xFF][..], &vec![0; 4 << 20]].concat());
