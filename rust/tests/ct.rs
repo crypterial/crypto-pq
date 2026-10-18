@@ -8,13 +8,15 @@
 use crypto_pq::ct_check::{aes_encrypt, declassify, secret, x25519, x25519_base};
 use crypto_pq::{
     ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_256, BLAKE2B_MAC, BLAKE2S_256, BLAKE2S_MAC,
-    CSHAKE128, CSHAKE256, Error, HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512, HMAC_SHA_256,
-    HMAC_SHA_384, HSS_LMS, HashOptions, KMAC128, KMAC256, KdfOptions, KemAlgorithm, KemPrivateKey,
-    KemPublicKey, KeyFormat, KeyGenOptions, ML_DSA_44, ML_DSA_65, ML_DSA_87, ML_KEM_512,
-    ML_KEM_768, ML_KEM_1024, MacAlgorithm, MacOptions, SLH_DSA_SHA2_192F, SLH_DSA_SHAKE_128F,
-    SignOptions, SignatureAlgorithm, SignaturePrivateKey, SignaturePublicKey, StateStore,
-    StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters, StatefulSignatureAlgorithm,
-    VerifyOptions, X_WING, XMSS_MT, XofOptions, hazmat,
+    CSHAKE128, CSHAKE256, EFRODOKEM_976_AES, EFRODOKEM_976_SHAKE, EFRODOKEM_1344_AES,
+    EFRODOKEM_1344_SHAKE, Error, FRODOKEM_976_AES, FRODOKEM_976_SHAKE, FRODOKEM_1344_AES,
+    FRODOKEM_1344_SHAKE, HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512, HMAC_SHA_256, HMAC_SHA_384,
+    HSS_LMS, HashOptions, KMAC128, KMAC256, KdfOptions, KemAlgorithm, KemPrivateKey, KemPublicKey,
+    KeyFormat, KeyGenOptions, ML_DSA_44, ML_DSA_65, ML_DSA_87, ML_KEM_512, ML_KEM_768, ML_KEM_1024,
+    MacAlgorithm, MacOptions, SLH_DSA_SHA2_192F, SLH_DSA_SHAKE_128F, SignOptions,
+    SignatureAlgorithm, SignaturePrivateKey, SignaturePublicKey, StateStore, StatefulKeyGenOptions,
+    StatefulLoadOptions, StatefulParameters, StatefulSignatureAlgorithm, VerifyOptions, X_WING,
+    XMSS_MT, XofOptions, hazmat,
 };
 
 const MESSAGE: &[u8] = b"crypto-pq constant-time check";
@@ -91,6 +93,49 @@ fn kems() {
     }
 
     kem(X_WING, 32, 64);
+}
+
+const FRODO: [(KemAlgorithm, usize, usize); 8] = [
+    (FRODOKEM_976_AES, 88, 72),
+    (FRODOKEM_976_SHAKE, 88, 72),
+    (FRODOKEM_1344_AES, 112, 96),
+    (FRODOKEM_1344_SHAKE, 112, 96),
+    (EFRODOKEM_976_AES, 64, 24),
+    (EFRODOKEM_976_SHAKE, 64, 24),
+    (EFRODOKEM_1344_AES, 80, 32),
+    (EFRODOKEM_1344_SHAKE, 80, 32),
+];
+
+// Sampling S and E, the products with the secret matrices, the re-encryption of decapsulation, its
+// comparison and the choice between k' and s; matrix A comes from the public seedA.
+#[test]
+fn frodokem() {
+    for (algorithm, seed_size, randomness_size) in FRODO {
+        kem(algorithm, seed_size, randomness_size);
+    }
+}
+
+// A FrodoKEM private key from outside is secret as a whole: the import declassifies only its public
+// key and pkh.
+#[test]
+fn imported_frodokem_keys() {
+    for (algorithm, seed_size, _) in FRODO {
+        let pair = hazmat::generate_kem_key_pair(algorithm, &secret_bytes(seed_size, 7)).unwrap();
+
+        let sk = pair.private_key.export_key(KeyFormat::Raw).unwrap();
+
+        secret(&sk);
+
+        let imported = algorithm.import_private_key(&sk, KeyFormat::Raw).unwrap();
+
+        for decapsulator in [&pair.private_key, &imported] {
+            let encapsulation = imported.public_key().encapsulate().unwrap();
+
+            let shared_secret = decapsulator.decapsulate(&encapsulation.ciphertext).unwrap();
+
+            assert!(same(&shared_secret, &encapsulation.shared_secret));
+        }
+    }
 }
 
 fn unhex(text: &str) -> Vec<u8> {

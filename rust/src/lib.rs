@@ -6,9 +6,6 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-// FrodoKEM-AES and AES-GCM are its callers; until they land only the tests and the
-// constant-time check use it.
-#[allow(dead_code)]
 mod aes;
 
 mod ascon;
@@ -22,6 +19,8 @@ mod ct;
 mod encoding;
 
 mod error;
+
+mod frodokem;
 
 mod hash;
 
@@ -79,8 +78,10 @@ pub use hash::{
 };
 pub use kdf::{HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512, KdfAlgorithm, KdfOptions};
 pub use kem::{
-    Encapsulation, KemAlgorithm, KemKeyPair, KemPrivateKey, KemPublicKey, ML_KEM_512, ML_KEM_768,
-    ML_KEM_1024, X_WING,
+    EFRODOKEM_976_AES, EFRODOKEM_976_SHAKE, EFRODOKEM_1344_AES, EFRODOKEM_1344_SHAKE,
+    Encapsulation, FRODOKEM_976_AES, FRODOKEM_976_SHAKE, FRODOKEM_1344_AES, FRODOKEM_1344_SHAKE,
+    KemAlgorithm, KemKeyPair, KemPrivateKey, KemPublicKey, ML_KEM_512, ML_KEM_768, ML_KEM_1024,
+    X_WING,
 };
 pub use keys::{KeyFormat, KeyGenOptions};
 pub use mac::{

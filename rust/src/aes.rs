@@ -24,6 +24,7 @@ impl Aes {
     }
 
     // The portable code alone, for the tests that compare it with the AES instructions.
+    #[cfg(any(test, crypto_pq_ct))]
     pub(crate) fn portable(key: &[u8]) -> Self {
         Self::with(key, false)
     }
@@ -89,6 +90,7 @@ impl Aes {
         self.hardware.then(|| &self.round_keys[..self.rounds + 1])
     }
 
+    #[cfg(test)]
     pub(crate) fn encrypt_block(&self, block: &mut [u8; 16]) {
         self.encrypt_blocks(core::slice::from_mut(block));
     }

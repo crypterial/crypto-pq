@@ -8,15 +8,17 @@ use std::cell::Cell;
 use std::sync::{Arc, Barrier, Mutex};
 
 use crypto_pq::{
-    Error, HMAC_SHA_256, HSS_LMS, HashAlgorithm, KemAlgorithm, KemPrivateKey, KemPublicKey,
-    KeyFormat, ML_DSA_44, ML_DSA_65, ML_DSA_87, ML_KEM_512, ML_KEM_768, ML_KEM_1024, PreHash,
-    SHA_224, SHA_256, SHA_384, SHA_512, SHA_512_224, SHA_512_256, SHA3_224, SHA3_256, SHA3_384,
-    SHA3_512, SHAKE128, SHAKE256, SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F,
-    SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F,
-    SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F,
-    SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, SignaturePrivateKey, SignaturePublicKey,
-    StateStore, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
-    StatefulSignatureAlgorithm, VerifyOptions, X_WING, XMSS, XMSS_MT, XofAlgorithm, hazmat,
+    EFRODOKEM_976_AES, EFRODOKEM_976_SHAKE, EFRODOKEM_1344_AES, EFRODOKEM_1344_SHAKE, Error,
+    FRODOKEM_976_AES, FRODOKEM_976_SHAKE, FRODOKEM_1344_AES, FRODOKEM_1344_SHAKE, HMAC_SHA_256,
+    HSS_LMS, HashAlgorithm, KemAlgorithm, KemPrivateKey, KemPublicKey, KeyFormat, ML_DSA_44,
+    ML_DSA_65, ML_DSA_87, ML_KEM_512, ML_KEM_768, ML_KEM_1024, PreHash, SHA_224, SHA_256, SHA_384,
+    SHA_512, SHA_512_224, SHA_512_256, SHA3_224, SHA3_256, SHA3_384, SHA3_512, SHAKE128, SHAKE256,
+    SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F,
+    SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F, SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F,
+    SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F, SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm,
+    SignaturePrivateKey, SignaturePublicKey, StateStore, StatefulKeyGenOptions,
+    StatefulLoadOptions, StatefulParameters, StatefulSignatureAlgorithm, VerifyOptions, X_WING,
+    XMSS, XMSS_MT, XofAlgorithm, hazmat,
 };
 
 // Counts the bytes that each thread holds, so that a test can bound what one call allocates.
@@ -401,7 +403,24 @@ fn expect_codes<T>(
 
 const FORMATS: [KeyFormat; 3] = [KeyFormat::Raw, KeyFormat::Der, KeyFormat::Pem];
 
-const KEMS: [KemAlgorithm; 4] = [ML_KEM_512, ML_KEM_768, ML_KEM_1024, X_WING];
+const KEMS: [KemAlgorithm; 12] = [
+    ML_KEM_512,
+    ML_KEM_768,
+    ML_KEM_1024,
+    X_WING,
+    FRODOKEM_976_AES,
+    FRODOKEM_976_SHAKE,
+    FRODOKEM_1344_AES,
+    FRODOKEM_1344_SHAKE,
+    EFRODOKEM_976_AES,
+    EFRODOKEM_976_SHAKE,
+    EFRODOKEM_1344_AES,
+    EFRODOKEM_1344_SHAKE,
+];
+
+fn is_frodo(algorithm: KemAlgorithm) -> bool {
+    algorithm.name().contains("FrodoKEM")
+}
 
 const SIGNATURES: [SignatureAlgorithm; 15] = [
     ML_DSA_44,
@@ -440,10 +459,13 @@ fn is_ml_dsa(algorithm: SignatureAlgorithm) -> bool {
 
 // The sizes of the deterministic inputs: seeds and randomness.
 fn kem_sizes(algorithm: KemAlgorithm) -> (usize, usize) {
-    if algorithm == X_WING {
-        (32, 64)
-    } else {
-        (64, 32)
+    let secret = algorithm.shared_secret_size();
+
+    match algorithm.name() {
+        "X-Wing" => (32, 64),
+        name if name.starts_with("eFrodoKEM") => (2 * secret + 16, secret),
+        name if name.starts_with("FrodoKEM") => (3 * secret + 16, 3 * secret),
+        _ => (64, 32),
     }
 }
 
@@ -486,7 +508,7 @@ fn strength(algorithm: SignatureAlgorithm) -> usize {
 fn kem_codes(algorithm: KemAlgorithm, format: KeyFormat, check: Error) -> Vec<Error> {
     match format {
         KeyFormat::Raw => vec![Error::InvalidLength, check],
-        _ if algorithm == X_WING => vec![Error::Unsupported],
+        _ if algorithm == X_WING || is_frodo(algorithm) => vec![Error::Unsupported],
         _ => vec![Error::InvalidEncoding, Error::AlgorithmMismatch, check],
     }
 }
@@ -642,7 +664,8 @@ fn check_kem_private(algorithm: KemAlgorithm, data: &[u8], format: KeyFormat) {
 
     // A key from a seed decapsulates what its public key encapsulates. FIPS 203 checks only the
     // hash of the public part of an expanded key, so one with another secret vector is accepted
-    // and gives the implicit rejection, SHAKE256(z || c).
+    // and gives the implicit rejection, SHAKE256(z || c); FrodoKEM checks pkh and gives
+    // SHAKE256(c || s) with another S^T.
     let (seed, randomness) = kem_sizes(algorithm);
 
     let encapsulation =
@@ -657,9 +680,15 @@ fn check_kem_private(algorithm: KemAlgorithm, data: &[u8], format: KeyFormat) {
 
         assert_ne!(raw.len(), seed);
 
-        let rejection = [&raw[raw.len() - 32..], &encapsulation.ciphertext].concat();
+        let size = algorithm.shared_secret_size();
 
-        assert_eq!(secret, SHAKE256.digest(&rejection, 32));
+        let rejection = if is_frodo(algorithm) {
+            [&encapsulation.ciphertext, &raw[..size]].concat()
+        } else {
+            [&raw[raw.len() - 32..], &encapsulation.ciphertext].concat()
+        };
+
+        assert_eq!(secret, SHAKE256.digest(&rejection, size));
     }
 }
 
@@ -719,7 +748,7 @@ fn kem_import() {
     for (algorithm, private_key, _, _) in kem_fixtures() {
         let public_key = private_key.public_key();
 
-        let expanded = (algorithm != X_WING).then(|| {
+        let expanded = (algorithm != X_WING && !is_frodo(algorithm)).then(|| {
             algorithm
                 .import_private_key(&expanded_key(algorithm), KeyFormat::Raw)
                 .expect("expanded key")
@@ -729,7 +758,9 @@ fn kem_import() {
             for format in FORMATS {
                 let mut seeds = vec![
                     match (private, format) {
-                        (_, KeyFormat::Der | KeyFormat::Pem) if algorithm == X_WING => {
+                        (_, KeyFormat::Der | KeyFormat::Pem)
+                            if algorithm == X_WING || is_frodo(algorithm) =>
+                        {
                             public_key.export_key(KeyFormat::Raw)
                         }
                         (true, _) => private_key.export_key(format),
@@ -1269,7 +1300,7 @@ fn decapsulation() {
                 Ok(shared) => {
                     assert_eq!(candidate.len(), size);
 
-                    assert_eq!(shared.len(), 32);
+                    assert_eq!(shared.len(), algorithm.shared_secret_size());
 
                     // Implicit rejection: any other ciphertext gives a different secret.
                     assert_eq!(
