@@ -93,7 +93,9 @@ jobs:
   # The official vector sets too slow for every push (SPEC 19.4): the full ACVP ML-KEM, ML-DSA and
   # SLH-DSA sets and the ACVP large-data hashes (1 to 8 GiB per test), the tests marked #[ignore].
   # The full sets are not in the repository: the fetch tool downloads them from their pinned URLs
-  # and checks every source and every file it writes against its SHA-256.
+  # and checks every source and every file it writes against its SHA-256. CRYPTO_PQ_SLOW adds the
+  # slow cases of the regular tests, such as the key of RFC 9858 A.4 with its tree of 2^20 leaves,
+  # so the regular tests run too.
   rust-full-vectors:
     name: rust full vector sets (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -106,6 +108,8 @@ jobs:
       run:
         shell: bash
         working-directory: rust
+    env:
+      CRYPTO_PQ_SLOW: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -115,7 +119,7 @@ jobs:
         run: python -I tools/fetch_vectors.py --full
       - run: rustup toolchain install stable --profile minimal
       - run: rustup override set stable
-      - run: cargo test --locked --release -- --ignored
+      - run: cargo test --locked --release -- --include-ignored
 
   # The pure backend hashes with its own Python engines, about 1 MB/s, so its long run (the 16 MiB
   # inputs and fifty times the fuzz rounds) takes most of an hour on its own.
