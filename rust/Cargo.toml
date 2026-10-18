@@ -1,15 +1,15 @@
 [package]
 name = "crypto-pq"
-version = "0.2.0-dev.0"
+version = "1.0.0-rc.1"
 edition = "2024"
 rust-version = "1.88"
-description = "Post-quantum cryptography in pure Rust, with no dependencies."
+description = "Fast, secure post-quantum cryptography in pure Rust, with no dependencies."
 license = "Apache-2.0 OR MIT"
 homepage = "https://crypterial.com"
 repository = "https://github.com/crypterial/crypto-pq"
-keywords = ["post-quantum", "cryptography", "ml-kem", "ml-dsa", "sha3"]
+keywords = ["post-quantum", "cryptography", "ml-kem", "ml-dsa", "slh-dsa"]
 categories = ["cryptography", "no-std"]
-include = ["/src", "/LICENSE-APACHE", "/LICENSE-MIT"]
+include = ["/src", "/benches", "/LICENSE-APACHE", "/LICENSE-MIT"]
 
 [[bench]]
 name = "bench"

@@ -429,7 +429,11 @@ jobs:
         working-directory: rust
         run: |
           cargo package --locked
-          cargo package --locked --list
+          cargo package --locked --list | tee "$RUNNER_TEMP/crate-files"
+          grep -qx LICENSE-APACHE "$RUNNER_TEMP/crate-files"
+          grep -qx LICENSE-MIT "$RUNNER_TEMP/crate-files"
+          cmp ../LICENSE-APACHE LICENSE-APACHE
+          cmp ../LICENSE-MIT LICENSE-MIT
       - name: npm package
         working-directory: typescript
         run: |

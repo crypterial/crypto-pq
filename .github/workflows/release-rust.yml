@@ -1,0 +1,266 @@
+name: release-rust
+
+# Publishes the crate to crates.io. Push a signed tag rust-vX.Y.Z (the version of rust/Cargo.toml)
+# on a commit of main whose ci run succeeded. Only GitHub's own actions are used, pinned to
+# commits; crates.io is reached through its trusted publishing (OIDC), so no token is stored.
+on:
+  push:
+    tags: ["rust-v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-rust
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUST_VERSION: "1.97.1"
+  CRATE: crypto-pq
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${TAG#rust-v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "tag $TAG is not rust-vX.Y.Z"; exit 1; }
+
+          manifest="$(sed -n 's/^version = "\(.*\)"$/\1/p' rust/Cargo.toml | head -n 1)"
+          lock="$(awk '$0 == "name = \"crypto-pq\"" { getline; print; exit }' rust/Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')"
+          [ "$manifest" = "$version" ] || { echo "Cargo.toml has $manifest, the tag has $version"; exit 1; }
+          [ "$lock" = "$version" ] || { echo "Cargo.lock has $lock, the tag has $version"; exit 1; }
+
+          # The tag must be annotated, signed with a key GitHub verifies, and point at this commit.
+          ref="$(gh api "repos/$REPO/git/ref/tags/$TAG")"
+          [ "$(jq -r .object.type <<< "$ref")" = tag ] || { echo "the tag is not annotated"; exit 1; }
+          tag_object="$(jq -r .object.sha <<< "$ref")"
+          tag="$(gh api "repos/$REPO/git/tags/$tag_object")"
+          [ "$(jq -r .verification.verified <<< "$tag")" = true ] || { echo "the tag signature is not verified"; exit 1; }
+          [ "$(jq -r .object.sha <<< "$tag")" = "$SHA" ] || { echo "the tag does not point at $SHA"; exit 1; }
+
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$SHA" FETCH_HEAD || { echo "$SHA is not on main"; exit 1; }
+
+          conclusion="$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&status=completed&per_page=100" \
+            --jq '[.workflow_runs[] | select(.event == "push" and .head_branch == "main")] | sort_by(.created_at) | last | .conclusion')"
+          [ "$conclusion" = success ] || { echo "the ci run of $SHA on main is: ${conclusion:-missing}"; exit 1; }
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.arch }})
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { arch: x64, os: ubuntu-latest }
+          - { arch: arm64, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$RUST_VERSION" --profile minimal
+      - run: rustup override set "$RUST_VERSION"
+      - name: package
+        working-directory: rust
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo package --locked
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "target/package/$CRATE-$VERSION.crate" "$RUNNER_TEMP/out/"
+          cd "$RUNNER_TEMP/out"
+          sha256sum "$CRATE-$VERSION.crate" | tee SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crate-${{ matrix.arch }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: error
+
+  compare:
+    name: the two builds are byte-equal
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crate-x64
+          path: x64
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crate-arm64
+          path: arm64
+      - name: compare
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          cmp "x64/$CRATE-$VERSION.crate" "arm64/$CRATE-$VERSION.crate"
+          cmp x64/SHA256SUMS arm64/SHA256SUMS
+          mkdir crate
+          cp "x64/$CRATE-$VERSION.crate" x64/SHA256SUMS crate/
+          (cd crate && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crate
+          path: crate
+          if-no-files-found: error
+
+  attest:
+    name: attest provenance
+    needs: [gate, compare]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crate
+          path: crate
+      - id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: crate/*.crate
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: attestation
+          path: ${{ steps.attest.outputs.bundle-path }}
+          if-no-files-found: error
+
+  publish:
+    name: publish to crates.io
+    needs: [gate, attest]
+    runs-on: ubuntu-latest
+    # Needs the owner's approval; the environment restricts the tags that may deploy.
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$RUST_VERSION" --profile minimal
+      - run: rustup override set "$RUST_VERSION"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crate
+          path: crate
+      - name: the attested crate is the one built from this commit
+        working-directory: rust
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          (cd ../crate && sha256sum -c SHA256SUMS)
+          gh attestation verify "../crate/$CRATE-$VERSION.crate" --repo "$REPO" \
+            --signer-workflow "$REPO/.github/workflows/release-rust.yml"
+          # cargo publish packages the tree itself, so the same bytes must come out here.
+          cargo package --locked
+          cmp "target/package/$CRATE-$VERSION.crate" "../crate/$CRATE-$VERSION.crate"
+      - name: publish
+        working-directory: rust
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          agent="release-rust (github.com/${{ github.repository }})"
+          oidc="$(curl -fsS -A "$agent" -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=crates.io" | jq -r .value)"
+          echo "::add-mask::$oidc"
+          token="$(curl -fsS -A "$agent" -X POST -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg jwt "$oidc" '{jwt: $jwt}')" \
+            https://crates.io/api/v1/trusted_publishing/tokens | jq -r .token)"
+          echo "::add-mask::$token"
+          revoke() {
+            curl -fsS -A "$agent" -X DELETE -H "Authorization: Bearer $token" \
+              https://crates.io/api/v1/trusted_publishing/tokens || true
+          }
+          trap revoke EXIT
+          CARGO_REGISTRY_TOKEN="$token" cargo publish --locked
+      - name: crates.io holds the attested hash
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          want="$(cut -d ' ' -f 1 crate/SHA256SUMS)"
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            got="$(curl -fsS -A "release-rust (github.com/${{ github.repository }})" \
+              "https://crates.io/api/v1/crates/$CRATE/$VERSION" | jq -r .version.checksum || true)"
+            [ "$got" = "$want" ] && { echo "crates.io checksum $got"; exit 0; }
+            sleep 10
+          done
+          echo "crates.io has ${got:-nothing}, the attested crate is $want"
+          exit 1
+
+  verify:
+    name: verify the published crate
+    needs: [gate, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crate
+          path: crate
+      - name: download from crates.io and compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            curl -fsS -A "release-rust (github.com/$REPO)" -o published.crate \
+              "https://static.crates.io/crates/$CRATE/$CRATE-$VERSION.crate" && break
+            sleep 10
+          done
+          cmp published.crate "crate/$CRATE-$VERSION.crate"
+          echo "$(cut -d ' ' -f 1 crate/SHA256SUMS)  published.crate" | sha256sum -c -
+          gh attestation verify published.crate --repo "$REPO" \
+            --signer-workflow "$REPO/.github/workflows/release-rust.yml"
+      - name: a consumer resolves it from the registry
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo new --lib "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          for _ in 1 2 3 4 5 6; do
+            cargo add "$CRATE@=$VERSION" && break
+            sleep 10
+          done
+          cargo build
