@@ -59,6 +59,16 @@ use x86_64 as arch;
 mod arch {
     // Nothing is accelerated: the portable build, and every other architecture.
     #[inline(always)]
+    pub(crate) fn aes_expand(_: &[u8], _: &mut [[u8; 16]; 15]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub(crate) fn aes_encrypt(_: &[[u8; 16]], _: &mut [[u8; 16]]) -> bool {
+        false
+    }
+
+    #[inline(always)]
     pub(crate) fn compress256(_: &mut [u32; 8], _: &[[u8; 64]], _: &[[u8; 64]]) -> bool {
         false
     }
@@ -366,12 +376,12 @@ mod arch {
 }
 
 pub(crate) use arch::{
-    absorb, ascon, ascon_digest, base_multiply_add, binomial, blake2b, blake2b_digest, blake2s,
-    blake2s_digest, blake2s_mac, bounded, compress256, compress256_lanes, compress256_pair,
-    compress512, compress512_pair, decode12, digest, encode12, finish256, finish512, hmac256,
-    hmac256_keyed, hmac512, hmac512_keyed, inverse_ntt, inverse_ntt16, keccak_group, mldsa_add,
-    mldsa_hints, mldsa_mask, mldsa_norm, mldsa_pack, mldsa_sub, mldsa_w1, mlkem_compress,
-    mlkem_decompress, mlkem_inner_product, mlkem_matrix_vector, mlkem_message,
+    absorb, aes_encrypt, aes_expand, ascon, ascon_digest, base_multiply_add, binomial, blake2b,
+    blake2b_digest, blake2s, blake2s_digest, blake2s_mac, bounded, compress256, compress256_lanes,
+    compress256_pair, compress512, compress512_pair, decode12, digest, encode12, finish256,
+    finish512, hmac256, hmac256_keyed, hmac512, hmac512_keyed, inverse_ntt, inverse_ntt16,
+    keccak_group, mldsa_add, mldsa_hints, mldsa_mask, mldsa_norm, mldsa_pack, mldsa_sub, mldsa_w1,
+    mlkem_compress, mlkem_decompress, mlkem_inner_product, mlkem_matrix_vector, mlkem_message,
     mlkem_multiply_cache, multiply, multiply_add, ntt, ntt16, permute_many, reduce, uniform12,
     uniform23,
 };

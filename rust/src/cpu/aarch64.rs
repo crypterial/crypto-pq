@@ -15,6 +15,8 @@ use crate::keccak::{self, ROUND_CONSTANTS};
 use crate::sha2::{K256, K512, last_bytes};
 use crate::wipe::wipe;
 
+mod aes;
+
 mod ascon;
 
 mod binomial;
@@ -62,6 +64,9 @@ const KECCAK: u32 = 1 << 2;
 
 const DIT: u32 = 1 << 3;
 
+// FEAT_AES: AESE and AESMC.
+const AES: u32 = 1 << 4;
+
 const READY: u32 = 1 << 31;
 
 // What the build guarantees needs no detection, and its check folds away. On Apple targets every
@@ -77,6 +82,7 @@ const fn guaranteed(feature: u32) -> bool {
         SHA3 => cfg!(target_feature = "sha3"),
         KECCAK => cfg!(all(target_vendor = "apple", target_feature = "sha3")),
         DIT => cfg!(target_feature = "dit"),
+        AES => cfg!(target_feature = "aes"),
         _ => false,
     }
 }
@@ -85,7 +91,7 @@ const fn guaranteed(feature: u32) -> bool {
 // instructions in every version, so its build leaves them out and checks the rest.
 const fn usable(feature: u32) -> bool {
     if cfg!(crypto_pq_ct) {
-        return feature == SHA2;
+        return feature == SHA2 || feature == AES;
     }
 
     true
@@ -125,6 +131,8 @@ fn probe() -> u32 {
 
     const AT_HWCAP: core::ffi::c_ulong = 16;
 
+    const HWCAP_AES: u64 = 1 << 3;
+
     const HWCAP_SHA2: u64 = 1 << 6;
 
     const HWCAP_CPUID: u64 = 1 << 11;
@@ -147,6 +155,10 @@ fn probe() -> u32 {
 
     if hwcap & HWCAP_SHA2 != 0 {
         found |= SHA2;
+    }
+
+    if hwcap & HWCAP_AES != 0 {
+        found |= AES;
     }
 
     if hwcap & (HWCAP_SHA3 | HWCAP_SHA512) == HWCAP_SHA3 | HWCAP_SHA512 {
@@ -187,8 +199,9 @@ fn implementer() -> u64 {
     (midr >> 24) & 0xFF
 }
 
-// winnt.h: PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE (with SHA-256), PF_ARM_SHA3_INSTRUCTIONS_AVAILABLE
-// and PF_ARM_SHA512_INSTRUCTIONS_AVAILABLE. Windows reports no core, so Keccak stays scalar.
+// winnt.h: PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE (AES and SHA-256),
+// PF_ARM_SHA3_INSTRUCTIONS_AVAILABLE and PF_ARM_SHA512_INSTRUCTIONS_AVAILABLE. Windows reports no
+// core, so Keccak stays scalar.
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn probe() -> u32 {
@@ -204,7 +217,7 @@ fn probe() -> u32 {
     let mut found = 0;
 
     if present(30) {
-        found |= SHA2;
+        found |= SHA2 | AES;
     }
 
     if present(64) && present(65) {
@@ -318,6 +331,30 @@ fn clear_dit() {
     unsafe {
         core::arch::asm!("msr s3_3_c4_c2_5, xzr", options(nostack, preserves_flags));
     }
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn aes_expand(key: &[u8], round_keys: &mut [[u8; 16]; 15]) -> bool {
+    if !has(AES) {
+        return false;
+    }
+
+    // SAFETY: the CPU has the AES instructions.
+    unsafe { aes::expand(key, round_keys) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn aes_encrypt(round_keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) -> bool {
+    if !has(AES) {
+        return false;
+    }
+
+    // SAFETY: as in aes_expand.
+    unsafe { aes::encrypt_blocks(round_keys, blocks) };
+
+    true
 }
 
 // The blocks and then the more blocks, as one stream: a one-shot hash passes its input and its

@@ -41,6 +41,8 @@ macro_rules! instruction {
     };
 }
 
+mod aes;
+
 mod ascon;
 
 mod blake2;
@@ -72,6 +74,9 @@ const AVX2: u32 = 1 << 1;
 // SSSE3 and SSE4.1.
 const SSE41: u32 = 1 << 2;
 
+// AES-NI, with SSE4.1 as on every CPU that has it.
+const AES: u32 = 1 << 3;
+
 const READY: u32 = 1 << 31;
 
 // What the build guarantees needs no detection, and its check folds away.
@@ -92,15 +97,16 @@ const fn guaranteed(feature: u32) -> bool {
             target_feature = "bmi2"
         )),
         SSE41 => cfg!(all(target_feature = "ssse3", target_feature = "sse4.1")),
+        AES => cfg!(all(target_feature = "aes", target_feature = "sse4.1")),
         _ => false,
     }
 }
 
 // The constant-time check runs under valgrind, which cannot execute the SHA extensions, so its
-// build leaves them out and checks the AVX2 and SSE4.1 paths.
+// build leaves them out and checks the AVX2, SSE4.1 and AES-NI paths.
 const fn usable(feature: u32) -> bool {
     if cfg!(crypto_pq_ct) {
-        return feature == AVX2 || feature == SSE41;
+        return feature != SHA;
     }
 
     true
@@ -130,8 +136,9 @@ fn has(feature: u32) -> bool {
     found & feature != 0
 }
 
-// CPUID leaf 1 ECX: SSSE3 bit 9, SSE4.1 bit 19, OSXSAVE bit 27, AVX bit 28; leaf 7 EBX: BMI1
-// bit 3, AVX2 bit 5, BMI2 bit 8, SHA bit 29. Newer Rust makes __cpuid safe, hence unused_unsafe.
+// CPUID leaf 1 ECX: SSSE3 bit 9, SSE4.1 bit 19, AES bit 25, OSXSAVE bit 27, AVX
+// bit 28; leaf 7 EBX: BMI1 bit 3, AVX2 bit 5, BMI2 bit 8, SHA bit 29. Newer Rust makes __cpuid
+// safe, hence unused_unsafe.
 // Out of line, as CPUID's registers made every kernel's caller save six, for the first call only.
 #[cold]
 #[inline(never)]
@@ -145,6 +152,10 @@ fn probe() -> u32 {
 
     if leaf1.ecx & (1 << 9) != 0 && leaf1.ecx & (1 << 19) != 0 {
         found |= SSE41;
+
+        if leaf1.ecx & (1 << 25) != 0 {
+            found |= AES;
+        }
     }
 
     if max < 7 {
@@ -747,6 +758,30 @@ pub(crate) fn ascon_digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) -> boo
 
     // SAFETY: as in ascon.
     unsafe { ascon::digest_bmi(start, data, out) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn aes_expand(key: &[u8], round_keys: &mut [[u8; 16]; 15]) -> bool {
+    if !has(AES) {
+        return false;
+    }
+
+    // SAFETY: the CPU has AES-NI and SSE4.1.
+    unsafe { aes::expand(key, round_keys) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn aes_encrypt(round_keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) -> bool {
+    if !has(AES) {
+        return false;
+    }
+
+    // SAFETY: as in aes_expand.
+    unsafe { aes::encrypt_blocks(round_keys, blocks) };
 
     true
 }

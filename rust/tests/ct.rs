@@ -5,7 +5,7 @@
 // public; results are declassified here before they are compared.
 #![cfg(crypto_pq_ct)]
 
-use crypto_pq::ct_check::{declassify, secret, x25519, x25519_base};
+use crypto_pq::ct_check::{aes_encrypt, declassify, secret, x25519, x25519_base};
 use crypto_pq::{
     ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_256, BLAKE2B_MAC, BLAKE2S_256, BLAKE2S_MAC,
     CSHAKE128, CSHAKE256, Error, HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512, HMAC_SHA_256,
@@ -459,6 +459,30 @@ fn xmss_mt() {
 
 // Every MAC under a secret key, one-shot and incremental, over a message that spans blocks, and
 // its verification of the right tag and of a changed one: the verdict is public, the tag is not.
+// AES-128 and AES-256 on a secret key and secret blocks, one to nine of them, through the AES
+// instructions where the CPU has them and through the bitsliced code.
+#[test]
+fn aes() {
+    for key_size in [16, 32] {
+        let key = secret_bytes(key_size, 4);
+
+        for count in 1..10 {
+            let data = secret_bytes(16 * count, 8);
+
+            let mut blocks: Vec<[u8; 16]> =
+                data.chunks(16).map(|b| b.try_into().unwrap()).collect();
+
+            let mut portable = blocks.clone();
+
+            aes_encrypt(&key, &mut blocks, true);
+
+            aes_encrypt(&key, &mut portable, false);
+
+            assert!(same(blocks.as_flattened(), portable.as_flattened()));
+        }
+    }
+}
+
 fn mac(algorithm: MacAlgorithm, key_size: usize) {
     let key = secret_bytes(key_size, 9);
 

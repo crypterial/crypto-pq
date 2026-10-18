@@ -35,6 +35,9 @@ SHA3 = ("SHA3_224", "SHA3_256", "SHA3_384", "SHA3_512")
 
 SHAKE = ("SHAKE128", "SHAKE256")
 
+# The AESAVS known answers for ECB, which is the block cipher alone, with the key sizes crypto-pq has.
+AES_KAT = tuple(f"ECB{kind}{bits}" for kind in ("GFSbox", "KeySbox", "VarKey", "VarTxt") for bits in (128, 256))
+
 ARCHIVES = (
     (
         f"{CAVP}/shs/shabytetestvectors.zip",
@@ -55,6 +58,11 @@ ARCHIVES = (
         f"{CAVP}/mac/hmactestvectors.zip",
         "418c3837d38f249d6668146bd0090db24dd3c02d2e6797e3de33860a387ae4bd",
         {"HMAC.rsp": "cavp/HMAC.rsp"},
+    ),
+    (
+        f"{CAVP}/aes/KAT_AES.zip",
+        "a203b16c9246b2ebae31dee5de21a606be80cf78ceabaca37150236fa098eb60",
+        {f"{name}.rsp": f"cavp/{name}.rsp" for name in AES_KAT},
     ),
 )
 

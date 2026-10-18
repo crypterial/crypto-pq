@@ -6,6 +6,11 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+// FrodoKEM-AES and AES-GCM are its callers; until they land only the tests and the
+// constant-time check use it.
+#[allow(dead_code)]
+mod aes;
+
 mod ascon;
 
 mod blake2;
@@ -107,5 +112,17 @@ pub mod ct_check {
 
     pub fn x25519_base(scalar: &[u8]) -> [u8; 32] {
         crate::x25519::x25519_base(scalar)
+    }
+
+    // The key expansion and the encryption of the blocks, in place, under the AES instructions
+    // where the CPU has them and in the portable code otherwise.
+    pub fn aes_encrypt(key: &[u8], blocks: &mut [[u8; 16]], hardware: bool) {
+        let aes = if hardware {
+            crate::aes::Aes::new(key)
+        } else {
+            crate::aes::Aes::portable(key)
+        };
+
+        aes.encrypt_blocks(blocks);
     }
 }
