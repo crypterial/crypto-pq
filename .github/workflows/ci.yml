@@ -569,6 +569,30 @@ jobs:
           binary=$(cargo test --locked --release --test ct --no-run --message-format=json | jq -r 'select(.executable != null) | .executable')
           valgrind --error-exitcode=1 -q "$binary" --test-threads=1
 
+  # The unsafe modules that Miri can run (SPEC 23.2 item 1): the one-time initialization of the key
+  # caches, the wipe and the entropy source, with the encoding tests, in the portable build, on the
+  # runner's target and on a big-endian one. Miri runs neither the CPU kernels nor inline assembly,
+  # so the wipe takes its volatile path there; the kernels are checked by the CPU models and
+  # valgrind.
+  rust-miri:
+    name: rust miri (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, s390x-unknown-linux-gnu]
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    env:
+      RUSTFLAGS: --cfg crypto_pq_portable
+      NIGHTLY: nightly-2026-10-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install "$NIGHTLY" --profile minimal --component miri,rust-src
+      - run: cargo "+$NIGHTLY" miri test --locked --lib --target ${{ matrix.target }} -- once:: rng:: wipe:: encoding::
+
   # Not a gate: the CPU-specific paths against the forced fallback on GitHub's x86-64 and arm64
   # runners, printed side by side with the CPU model, so that the x86-64 kernels are measured on
   # real hardware.
