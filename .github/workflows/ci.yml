@@ -593,6 +593,28 @@ jobs:
       - run: rustup toolchain install "$NIGHTLY" --profile minimal --component miri,rust-src
       - run: cargo "+$NIGHTLY" miri test --locked --lib --target ${{ matrix.target }} -- once:: rng:: wipe:: encoding::
 
+  # AddressSanitizer on the native build (SPEC 23.2 item 1): the unit tests, which run the CPU
+  # kernels against their portable twins, the wipe, the entropy source and the one-time
+  # initialization, on both runner architectures.
+  rust-asan:
+    name: rust asan (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+      NIGHTLY: nightly-2026-10-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install "$NIGHTLY" --profile minimal
+      - run: cargo "+$NIGHTLY" test --locked --lib --target "$(rustc "+$NIGHTLY" -vV | sed -n 's/^host: //p')"
+
   # Not a gate: the CPU-specific paths against the forced fallback on GitHub's x86-64 and arm64
   # runners, printed side by side with the CPU model, so that the x86-64 kernels are measured on
   # real hardware.
