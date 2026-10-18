@@ -1083,9 +1083,17 @@ fn state_record_layout() {
     )
     .unwrap();
 
+    // D-64 item 1: the generated record already holds the trees that the start index uses, so the
+    // first signature only reserves its index.
+    let generated = State::parse(&store.0.borrow().state.clone().unwrap());
+
+    assert_eq!(generated.next, 0x12345);
+
     let signature = pair.private_key.sign(b"crypto-pq").unwrap();
 
     let parts = State::parse(&store.0.borrow().state.clone().unwrap());
+
+    assert_eq!((store.writes(), &parts.levels), (2, &generated.levels));
 
     assert_eq!(
         (
@@ -1262,9 +1270,9 @@ fn exhaustion_erases_the_secrets() {
 
     let options = StatefulKeyGenOptions::default();
 
-    // The keys sign 1022 and 1023: update 1 stores the key, 2 and 3 claim and sign tree 31 of
-    // level 1, 4 reserves 1023 and 5 is the final write.
-    for failing in [0, 5] {
+    // The keys sign 1022 and 1023: update 1 stores the key with tree 31 of level 1 (D-64 item 1),
+    // 2 and 3 reserve 1022 and 1023, and 4 is the final write.
+    for failing in [0, 4] {
         let store = FailingStore::new(failing, Err(Error::Unsupported));
 
         let stored = Rc::clone(&store.inner);
@@ -1287,7 +1295,7 @@ fn exhaustion_erases_the_secrets() {
             Some(Error::KeyExhausted)
         );
 
-        if failing == 5 {
+        if failing == 4 {
             // The record still holds the secrets, and the next sign retries the final write.
             let kept = State::parse(&state());
 
@@ -1967,7 +1975,7 @@ const THREE: [(&str, &str); 3] = [
 const MT: StatefulParameters<'static> = StatefulParameters::Name("XMSSMT-SHA2_20/4_192");
 
 // The state that a key at `index` stored, its raw public key and the tree cache it exports, after
-// a signature there when `sign` is set, so that it holds a tree on every level.
+// a signature there when `sign` is set.
 struct Exported {
     state: Vec<u8>,
     public_key: Vec<u8>,
@@ -2297,7 +2305,8 @@ fn tree_cache_layout() {
         false,
     );
 
-    assert_eq!(Cache::parse(&fresh.cache).trees, parts.trees[..1]);
+    // A key holds the trees of its start index from its generation on (D-64 item 1).
+    assert_eq!(Cache::parse(&fresh.cache).trees, parts.trees);
 
     let mt = export_cache(XMSS_MT, MT, &seed, 0x12345, true);
 

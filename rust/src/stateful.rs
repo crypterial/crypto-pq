@@ -679,9 +679,10 @@ impl StatefulSignatureAlgorithm {
         }
     }
 
-    // SPEC 11.5.3: the top tree and tree 0 of every lower level, each signed by leaf 0 of the
-    // level above and verified, then the first record, stored into an empty store. The key starts
-    // at index, which is 0 except for the deterministic keys of hazmat.
+    // SPEC 11.5.3: the top tree and, on every lower level, the tree that index uses, each signed by
+    // its parent leaf and verified, then the first record, stored into an empty store. The key
+    // starts at index, which is 0 except for the deterministic keys of hazmat [D-64]; an exhausted
+    // one, at the capacity, has no tree in use and records trees 0.
     pub(crate) fn create<S: StateStore>(
         &self,
         parameters: Parameters,
@@ -727,13 +728,15 @@ impl StatefulSignatureAlgorithm {
 
         key.trees[0] = Some(tree);
 
-        let grown = key.grow(0, 1, fresh)?;
+        let exhausted = index == key.parameters.capacity();
+
+        let grown = key.grow(if exhausted { 0 } else { index }, 1, fresh)?;
 
         key.install(1, grown);
 
-        for level in 1..levels {
-            if !key.current(level, index) {
-                key.trees[level] = None;
+        if exhausted {
+            for tree in &mut key.trees[1..] {
+                *tree = None;
             }
         }
 
