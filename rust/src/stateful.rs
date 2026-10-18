@@ -1563,26 +1563,29 @@ impl<S: StateStore> StatefulPrivateKey<S> {
 
         self.index = index + 1;
 
-        let mut signature = self.sign_message(index, message)?;
+        let signature = self.sign_message(index, message).and_then(|mut signature| {
+            // SPEC 11.5.2 step 7: a faulty signature can reveal one-time secrets, so it is never
+            // released.
+            if self
+                .algorithm
+                .verifies(&self.public_key, message, &signature)
+            {
+                Ok(signature)
+            } else {
+                wipe(&mut signature);
 
-        // SPEC 11.5.2 step 7: a faulty signature can reveal one-time secrets, so it is never
-        // released.
-        if !self
-            .algorithm
-            .verifies(&self.public_key, message, &signature)
-        {
-            wipe(&mut signature);
+                Err(Error::SelfTestFailed)
+            }
+        });
 
-            return Err(Error::SelfTestFailed);
-        }
-
+        // SPEC 11.12 item 2, also when the last index failed to sign: it is spent either way.
         if self.index == capacity {
             self.erase();
 
             self.wipe_secrets();
         }
 
-        Ok(signature)
+        signature
     }
 
     // Stores `state` in place of the record that the key last read or stored, which the store is
