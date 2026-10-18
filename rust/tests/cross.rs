@@ -5,23 +5,30 @@ use std::rc::Rc;
 use std::sync::Mutex;
 
 use crypto_pq::{
-    Error, HSS_LMS, KemAlgorithm, KeyFormat, ML_DSA_44, ML_DSA_65, ML_DSA_87, ML_KEM_512,
-    ML_KEM_768, ML_KEM_1024, PreHash, SHA_224, SHA_256, SHA_384, SHA_512, SHA_512_224, SHA_512_256,
-    SHA3_224, SHA3_256, SHA3_384, SHA3_512, SHAKE128, SHAKE256, SLH_DSA_SHA2_128F,
-    SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S,
-    SLH_DSA_SHAKE_128F, SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S,
-    SLH_DSA_SHAKE_256F, SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, StateStore,
-    StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters, StatefulSignatureAlgorithm,
-    VerifyOptions, XMSS, XMSS_MT, hazmat,
+    Error, HASH_SLH_DSA_SHA2_128F_WITH_SHA256, HASH_SLH_DSA_SHA2_128S_WITH_SHA256,
+    HASH_SLH_DSA_SHA2_192F_WITH_SHA512, HASH_SLH_DSA_SHA2_192S_WITH_SHA512,
+    HASH_SLH_DSA_SHA2_256F_WITH_SHA512, HASH_SLH_DSA_SHA2_256S_WITH_SHA512,
+    HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128, HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128,
+    HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256, HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256,
+    HASH_SLH_DSA_SHAKE_256F_WITH_SHAKE256, HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256, HSS_LMS,
+    KemAlgorithm, KeyFormat, ML_DSA_44, ML_DSA_65, ML_DSA_87, ML_KEM_512, ML_KEM_768, ML_KEM_1024,
+    PreHash, SHA_224, SHA_256, SHA_384, SHA_512, SHA_512_224, SHA_512_256, SHA3_224, SHA3_256,
+    SHA3_384, SHA3_512, SHAKE128, SHAKE256, SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S,
+    SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F,
+    SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F,
+    SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, StateStore, StatefulKeyGenOptions,
+    StatefulLoadOptions, StatefulParameters, StatefulSignatureAlgorithm, VerifyOptions, XMSS,
+    XMSS_MT, hazmat,
 };
 use vectors::{Fields, der, parallel, records, unhex};
 
 // The vectors under vectors/cross were computed by the Python reference: keys and their
 // encodings, hazmat signatures with every pre-hash, implicit rejection, state blobs, and the
-// error code of every malformed input.
+// error code of every malformed input. The HashSLH-DSA values are listed for the sections that
+// the regenerated files will add (SPEC Appendix C.1 item 9).
 const KEMS: [KemAlgorithm; 3] = [ML_KEM_512, ML_KEM_768, ML_KEM_1024];
 
-const SIGNATURES: [SignatureAlgorithm; 15] = [
+const SIGNATURES: [SignatureAlgorithm; 27] = [
     ML_DSA_44,
     ML_DSA_65,
     ML_DSA_87,
@@ -37,6 +44,18 @@ const SIGNATURES: [SignatureAlgorithm; 15] = [
     SLH_DSA_SHAKE_192F,
     SLH_DSA_SHAKE_256S,
     SLH_DSA_SHAKE_256F,
+    HASH_SLH_DSA_SHA2_128S_WITH_SHA256,
+    HASH_SLH_DSA_SHA2_128F_WITH_SHA256,
+    HASH_SLH_DSA_SHA2_192S_WITH_SHA512,
+    HASH_SLH_DSA_SHA2_192F_WITH_SHA512,
+    HASH_SLH_DSA_SHA2_256S_WITH_SHA512,
+    HASH_SLH_DSA_SHA2_256F_WITH_SHA512,
+    HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128,
+    HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128,
+    HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256,
+    HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256,
+    HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256,
+    HASH_SLH_DSA_SHAKE_256F_WITH_SHAKE256,
 ];
 
 const STATEFUL: [StatefulSignatureAlgorithm; 3] = [HSS_LMS, XMSS, XMSS_MT];
