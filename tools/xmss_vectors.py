@@ -1,4 +1,6 @@
+import concurrent.futures
 import hashlib
+import os
 import pathlib
 import subprocess
 import sys
@@ -9,6 +11,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 # XMSS has no NIST test vectors, so they are produced by the RFC 8391 reference implementation
 # (CC0), which follows SP 800-208 key generation. Building needs a C compiler and OpenSSL.
+# xmss.txt holds the base sets and xmss-extra.txt the other sets whose trees have at most 2^16
+# leaves (see xmss_vectors.c); the extra sets take minutes each, so they run side by side.
 REFERENCE = "https://raw.githubusercontent.com/XMSS/xmss-reference/171ccbd26f098542a67eb5d2b128281c80bd71a6"
 
 FILES = {
@@ -57,13 +61,20 @@ def main():
 
         subprocess.run(["cc", "-O2", "-o", "vectors", *sources, "-lcrypto"], cwd=work, check=True)
 
-        output = subprocess.run([str(work / "vectors")], cwd=work, check=True, capture_output=True).stdout
+        def run(*arguments):
+            return subprocess.run([str(work / "vectors"), *arguments], cwd=work, check=True, capture_output=True).stdout
 
-    path = ROOT / "vectors" / "xmss" / "xmss.txt"
+        base = run()
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
+            extra = b"".join(pool.map(lambda i: run("extra", str(i)), range(16)))
 
-    path.write_bytes(output)
+    for name, output in [("xmss.txt", base), ("xmss-extra.txt", extra)]:
+        path = ROOT / "vectors" / "xmss" / name
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        path.write_bytes(output)
 
     vectors = ROOT / "vectors"
 

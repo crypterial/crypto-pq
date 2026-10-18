@@ -671,9 +671,20 @@ fn hss_formats() {
     );
 }
 
-#[test]
-fn xmss_reference_vectors() {
-    parallel(&records("xmss/xmss.txt", "signature"), |(_, record)| {
+// The vectors of the RFC 8391 reference implementation (tools/xmss_vectors.py): the base sets,
+// and the other SP 800-208 sets whose trees have at most 2^16 leaves. Every signature verifies;
+// a key is made again from its seed and signs the same bytes when its trees have at most 2^10
+// leaves here, and for the XMSS sets of height 16 in the weekly job (SPEC 19.4).
+fn xmss_vectors(tall: bool) {
+    let found = [
+        records("xmss/xmss.txt", "signature"),
+        records("xmss/xmss-extra.txt", "signature"),
+    ]
+    .concat();
+
+    assert_eq!(found.len(), 128);
+
+    parallel(&found, |(_, record)| {
         let name = record["name"].as_str();
 
         let algorithm = if name.starts_with("XMSSMT") {
@@ -689,6 +700,10 @@ fn xmss_reference_vectors() {
         let (public, signature) = (unhex(&record["publicKey"]), unhex(&record["signature"]));
 
         let context = format!("{name} index {index}");
+
+        if name.contains("_16_") != tall {
+            return;
+        }
 
         let public_key = algorithm
             .import_public_key(&public, KeyFormat::Raw)
@@ -724,6 +739,34 @@ fn xmss_reference_vectors() {
             "{context}"
         );
     });
+}
+
+#[test]
+fn xmss_reference_vectors() {
+    xmss_vectors(false);
+
+    // The XMSS sets of height 16 verify on every push.
+    for (_, record) in records("xmss/xmss-extra.txt", "signature") {
+        if record["name"].contains("_16_") {
+            let public_key = XMSS
+                .import_public_key(&unhex(&record["publicKey"]), KeyFormat::Raw)
+                .unwrap();
+
+            let (signature, message) = (unhex(&record["signature"]), unhex(&record["message"]));
+
+            assert!(
+                public_key.verify(&signature, &message),
+                "{}",
+                record["name"]
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "builds trees of 2^16 leaves; runs in the weekly job"]
+fn xmss_reference_vectors_of_height_16() {
+    xmss_vectors(true);
 }
 
 #[test]
