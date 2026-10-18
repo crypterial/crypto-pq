@@ -621,6 +621,11 @@ impl SignatureAlgorithm {
         }
     }
 
+    // A HashSLH-DSA value, whose keys sign only pre-hashed messages.
+    pub(crate) const fn has_fixed_pre_hash(&self) -> bool {
+        self.fixed.is_some()
+    }
+
     // A pre-hash must give at least the collision strength of the signature (FIPS 204, 5.4, and
     // FIPS 205, 10.2).
     fn too_weak(&self, pre_hash: Option<PreHash>, policy: bool) -> bool {
@@ -779,17 +784,20 @@ impl SignaturePublicKey {
 
         let representative = Representative::new(message, options.context, pre_hash);
 
-        let parts = representative.parts();
+        self.verify_representative(&representative.parts(), signature)
+    }
 
+    // FIPS 204 Algorithm 8 or FIPS 205 Algorithm 20 on M', given in parts.
+    pub(crate) fn verify_representative(&self, parts: &[&[u8]], signature: &[u8]) -> bool {
         let key = &self.public.key;
 
-        match (algorithm.scheme, &self.public.derived) {
+        match (self.algorithm.scheme, &self.public.derived) {
             (Scheme::MlDsa(p), Some(derived)) => {
                 let (matrix, verifying) = derived.for_verify(key, &p);
 
-                mldsa::verify_internal(matrix, verifying, &parts, signature, &p)
+                mldsa::verify_internal(matrix, verifying, parts, signature, &p)
             }
-            (Scheme::SlhDsa(p), _) => slhdsa::verify_internal(&parts, signature, key, &p),
+            (Scheme::SlhDsa(p), _) => slhdsa::verify_internal(parts, signature, key, &p),
             // Every ML-DSA key is made with its caches.
             (Scheme::MlDsa(_), None) => false,
         }
@@ -866,11 +874,14 @@ impl SignaturePrivateKey {
         context: &[u8],
         pre_hash: Option<PreHash>,
     ) -> Vec<u8> {
-        let _dit = Dit::new();
-
         let representative = Representative::new(message, context, pre_hash);
 
-        let parts = representative.parts();
+        self.sign_representative(&representative.parts(), randomness)
+    }
+
+    // FIPS 204 Algorithm 7 or FIPS 205 Algorithm 19 on M', given in parts.
+    pub(crate) fn sign_representative(&self, parts: &[&[u8]], randomness: &[u8]) -> Vec<u8> {
+        let _dit = Dit::new();
 
         let sk = &self.private;
 
@@ -880,9 +891,9 @@ impl SignaturePrivateKey {
 
                 let key = signing.get_or_init(|| mldsa::SigningKey::new(sk, &p));
 
-                mldsa::sign_internal(matrix, key, sk, &parts, randomness, &p)
+                mldsa::sign_internal(matrix, key, sk, parts, randomness, &p)
             }
-            (Scheme::SlhDsa(p), ..) => slhdsa::sign_internal(&parts, sk, randomness, &p),
+            (Scheme::SlhDsa(p), ..) => slhdsa::sign_internal(parts, sk, randomness, &p),
             (Scheme::MlDsa(_), ..) => unreachable!("every ML-DSA key is made with its caches"),
         }
     }

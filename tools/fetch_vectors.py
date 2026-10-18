@@ -177,6 +177,8 @@ GENERATED = ("acvp", "wycheproof", "xwing", "rfc", "nist-examples", "blake2", "b
 FULL = "acvp-full"
 
 FULL_SUMS = {
+    "ML-DSA-sigGen-internal.txt": "42038ec4a9b3dd160848008902eb7a7bea54b939d4c89b1bd6f8e0b6f8d343f5",
+    "ML-DSA-sigGen-v1-internal.txt": "e89fb2855c485bee4c26fdda3dbd90c0ad9cdc2ae55c3246961d9ccd27b8cd2d",
     "ML-DSA-sigGen-v1.txt": "95e1a17b2e0fbac70cc743fbea671f474ebb0ca33a12d12fb6f3b30e1b56d95c",
     "ML-DSA-sigGen.txt": "49d09b79d9da93b233629c11ee8caff8468865c5ed6b10c3c79d2e1f6b15abeb",
     "ML-KEM-encapDecap-v1.txt": "38996e5df6bb2ce8f82aa116f5fe67ba34cceedb4c408149e06ff9925f3fc15e",
@@ -286,7 +288,9 @@ def customization(group, test):
     return test["customizationHex"] if group["hexCustomization"] else test["customization"].encode("ascii").hex()
 
 
-def acvp(name, keep=lambda group: True, select=lambda group, tests: tests, drop=()):
+# A group that is left out but listed keeps its header and the numbers of its tests, so that the
+# runner counts and reports the omission (SPEC 19.4).
+def acvp(name, keep=lambda group: True, select=lambda group, tests: tests, drop=(), listed=lambda group: False):
     groups = []
 
     for group in json.loads(source(name))["testGroups"]:
@@ -296,10 +300,13 @@ def acvp(name, keep=lambda group: True, select=lambda group, tests: tests, drop=
 
         counted.update(test["tcId"] for test in group["tests"])
 
-        if not keep(group):
-            continue
-
         header = {k: v for k, v in group.items() if k not in ("tgId", "testType", "tests")}
+
+        if not keep(group):
+            if listed(group):
+                groups.append((header, [{"tcId": test["tcId"]} for test in group["tests"]]))
+
+            continue
 
         tests = [{k: v for k, v in t.items() if k != "deferred" and k not in drop} for t in group["tests"]]
 
@@ -310,6 +317,16 @@ def acvp(name, keep=lambda group: True, select=lambda group, tests: tests, drop=
 
 def external(group):
     return group.get("signatureInterface") == "external"
+
+
+# The internal interface, which hazmat signInternal and verifyInternal reach (SPEC D-65), except
+# the groups that hand the signer mu instead of M' (SPEC 9.1.5), which are listed instead.
+def internal(group):
+    return group.get("signatureInterface") == "internal" and not group.get("externalMu")
+
+
+def external_mu(group):
+    return bool(group.get("externalMu"))
 
 
 def ml_dsa_sig_gen(count):
@@ -351,7 +368,7 @@ def slh_dsa_sig_ver(group, tests):
     reasons = set()
 
     for test in tests:
-        key = test["reason"] if group["preHash"] == "pure" else test["testPassed"]
+        key = test["reason"] if group["preHash"] in ("pure", "none") else test["testPassed"]
 
         if key not in reasons:
             kept.append(test)
@@ -1171,18 +1188,16 @@ def frodokem():
     return groups
 
 
-def internal(group):
-    return group.get("signatureInterface") == "internal"
-
-
-# The ACVP sets whose tests the regular files cut down or leave out: every external ML-DSA signing
-# test (both key formats, and the older projection that has expanded keys only), the older ML-KEM
-# decapsulation tests that carry expanded keys only, and SLH-DSA with the external and the internal
-# interface. They run in the weekly job.
+# The ACVP sets whose tests the regular files cut down or leave out: every ML-DSA signing test of
+# the external and the internal interface (both key formats, and the older projection that has
+# expanded keys only), the older ML-KEM decapsulation tests that carry expanded keys only, and
+# SLH-DSA with the external and the internal interface. They run in the weekly job.
 def acvp_full():
     v1_sig_gen = acvp("ML-DSA-sigGen-v1", external, drop=("mu",))
 
-    for header, _ in v1_sig_gen:
+    v1_sig_gen_internal = acvp("ML-DSA-sigGen-v1", internal, drop=("mu",), listed=external_mu)
+
+    for header, _ in v1_sig_gen + v1_sig_gen_internal:
         header["keyFormat"] = "expanded"
 
     v1_encap_decap = acvp("ML-KEM-encapDecap-v1")
@@ -1195,6 +1210,8 @@ def acvp_full():
     return {
         "ML-DSA-sigGen.txt": acvp("ML-DSA-sigGen", external, ml_dsa_sig_gen(None), ("mu",)),
         "ML-DSA-sigGen-v1.txt": v1_sig_gen,
+        "ML-DSA-sigGen-internal.txt": acvp("ML-DSA-sigGen", internal, ml_dsa_sig_gen(None), ("mu",), external_mu),
+        "ML-DSA-sigGen-v1-internal.txt": v1_sig_gen_internal,
         "ML-KEM-encapDecap-v1.txt": v1_encap_decap,
         "SLH-DSA-sigGen.txt": acvp("SLH-DSA-sigGen", external),
         "SLH-DSA-sigVer.txt": acvp("SLH-DSA-sigVer", external, drop=sig_ver_drop),
@@ -1582,11 +1599,19 @@ def main():
 
     write("acvp/ML-DSA-sigVer.txt", render(acvp("ML-DSA-sigVer", external, drop=("sk", "mu"))))
 
+    write("acvp/ML-DSA-sigGen-internal.txt", render(acvp("ML-DSA-sigGen", internal, ml_dsa_sig_gen(4), ("mu",), external_mu)))
+
+    write("acvp/ML-DSA-sigVer-internal.txt", render(acvp("ML-DSA-sigVer", internal, drop=("sk", "mu"), listed=external_mu)))
+
     write("acvp/SLH-DSA-keyGen.txt", render(acvp("SLH-DSA-keyGen")))
 
     write("acvp/SLH-DSA-sigGen.txt", render(acvp("SLH-DSA-sigGen", external, slh_dsa_sig_gen())))
 
     write("acvp/SLH-DSA-sigVer.txt", render(acvp("SLH-DSA-sigVer", external, slh_dsa_sig_ver, ("sk", "additionalRandomness"))))
+
+    write("acvp/SLH-DSA-sigGen-internal.txt", render(acvp("SLH-DSA-sigGen", internal, lambda group, tests: tests[:1])))
+
+    write("acvp/SLH-DSA-sigVer-internal.txt", render(acvp("SLH-DSA-sigVer", internal, slh_dsa_sig_ver, ("sk", "additionalRandomness"))))
 
     write("acvp/LMS-keyGen.txt", render(acvp("LMS-keyGen")))
 

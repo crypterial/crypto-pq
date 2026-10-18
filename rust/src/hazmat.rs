@@ -81,6 +81,42 @@ pub fn verify(
     public_key.verify_with(signature, message, options, false)
 }
 
+// SPEC D-65: ML-DSA.Sign_internal (FIPS 204 Algorithm 7) or slh_sign_internal (FIPS 205 Algorithm
+// 19) on a caller-supplied message representative M', for the internal groups of ACVP. M' skips
+// the domain separation of the pure and pre-hash interfaces, so a HashSLH-DSA key, which signs
+// pre-hashed messages alone, refuses it with INVALID_OPTION. The randomness is rnd for ML-DSA
+// (32 zero bytes for the deterministic variant) and opt_rand for SLH-DSA (PK.seed for the
+// deterministic variant).
+pub fn sign_internal(
+    private_key: &SignaturePrivateKey,
+    message_representative: &[u8],
+    randomness: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let algorithm = private_key.algorithm();
+
+    if algorithm.has_fixed_pre_hash() {
+        return Err(Error::InvalidOption);
+    }
+
+    require_length(randomness, algorithm.randomness_size())?;
+
+    Ok(private_key.sign_representative(&[message_representative], randomness))
+}
+
+// ML-DSA.Verify_internal (FIPS 204 Algorithm 8) or slh_verify_internal (FIPS 205 Algorithm 20);
+// false for a HashSLH-DSA key, as sign_internal refuses it.
+pub fn verify_internal(
+    public_key: &SignaturePublicKey,
+    signature: &[u8],
+    message_representative: &[u8],
+) -> bool {
+    let algorithm = public_key.algorithm();
+
+    !algorithm.has_fixed_pre_hash()
+        && signature.len() == algorithm.signature_size()
+        && public_key.verify_representative(&[message_representative], signature)
+}
+
 // SPEC 11.14: a key whose top secrets are the seed, I || SEED of the top LMS tree or
 // S_XMSS || SK_PRF || SEED, which derives its child trees and randomizers as the reference
 // implementations do, so that it reproduces their test vectors; it starts at index, which may be

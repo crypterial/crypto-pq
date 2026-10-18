@@ -114,14 +114,163 @@ fn acvp_signature_verification() {
     check_signature_verification("acvp/SLH-DSA-sigVer.txt");
 }
 
-// Every external test of ACVP. Its internal groups (acvp-full/SLH-DSA-sig*-internal.txt) need
-// signing and verification of a raw M' through hazmat, which the crate does not have yet.
+#[test]
+fn acvp_internal_signature_generation() {
+    check_internal_signature_generation("acvp/SLH-DSA-sigGen-internal.txt");
+}
+
+#[test]
+fn acvp_internal_signature_verification() {
+    check_internal_signature_verification("acvp/SLH-DSA-sigVer-internal.txt");
+}
+
+// Every test of ACVP, external and internal.
 #[test]
 #[ignore = "weekly (fuzz.yml): the full ACVP set"]
 fn acvp_full_signatures() {
     check_signature_generation("acvp-full/SLH-DSA-sigGen.txt");
 
     check_signature_verification("acvp-full/SLH-DSA-sigVer.txt");
+
+    check_internal_signature_generation("acvp-full/SLH-DSA-sigGen-internal.txt");
+
+    check_internal_signature_verification("acvp-full/SLH-DSA-sigVer-internal.txt");
+}
+
+fn internal_records(name: &str) -> Vec<(Fields, Fields)> {
+    let found = records(name, "signature");
+
+    assert!(
+        found
+            .iter()
+            .all(|(header, _)| header["signatureInterface"] == "internal"),
+        "{name}: a test of another interface"
+    );
+
+    eprintln!("{name}: {} internal tests run", found.len());
+
+    found
+}
+
+// opt_rand is PK.seed for the deterministic variant (FIPS 205, Algorithm 19).
+fn check_internal_signature_generation(name: &str) {
+    parallel(&internal_records(name), |(header, record)| {
+        let algorithm = algorithm(&header["parameterSet"]);
+
+        let context = format!("tcId {} {}", record["tcId"], header["parameterSet"]);
+
+        let sk = unhex(&record["sk"]);
+
+        let private_key = algorithm.import_private_key(&sk, KeyFormat::Raw).unwrap();
+
+        let n = sk.len() / 4;
+
+        let randomness = if header["deterministic"] == "true" {
+            sk[2 * n..3 * n].to_vec()
+        } else {
+            unhex(&record["additionalRandomness"])
+        };
+
+        let message = unhex(&record["message"]);
+
+        let signature = hazmat::sign_internal(&private_key, &message, &randomness).unwrap();
+
+        assert_eq!(signature, unhex(&record["signature"]), "{context}");
+
+        let public_key = private_key.public_key();
+
+        assert!(
+            hazmat::verify_internal(&public_key, &signature, &message),
+            "{context}"
+        );
+    });
+}
+
+fn check_internal_signature_verification(name: &str) {
+    parallel(&internal_records(name), |(header, record)| {
+        let public_key = algorithm(&header["parameterSet"])
+            .import_public_key(&unhex(&record["pk"]), KeyFormat::Raw)
+            .unwrap();
+
+        let result = hazmat::verify_internal(
+            &public_key,
+            &unhex(&record["signature"]),
+            &unhex(&record["message"]),
+        );
+
+        let expected = record["testPassed"] == "true";
+
+        assert_eq!(
+            result, expected,
+            "tcId {} {} {}",
+            record["tcId"], header["parameterSet"], record["reason"]
+        );
+    });
+}
+
+// M' = 0 || |ctx| || ctx || M is the pure interface (FIPS 205, Algorithm 22), so the internal
+// one gives the same signature; a HashSLH-DSA key, which signs pre-hashed messages alone, refuses
+// it.
+#[test]
+fn internal_interface() {
+    for (hashed, pure, _, _) in hash_slh_dsa() {
+        if !hashed.name().contains("128f") {
+            continue;
+        }
+
+        let n = pure.public_key_size() / 2;
+
+        let seed = vec![7; 3 * n];
+
+        let pair = hazmat::generate_signature_key_pair(pure, &seed).unwrap();
+
+        let (private_key, public_key) = (&pair.private_key, &pair.public_key);
+
+        let representative = [&[0, 7][..], b"context", b"message"].concat();
+
+        let options = SignOptions::default().with_context(b"context");
+
+        let randomness = vec![9; n];
+
+        let signature = hazmat::sign(private_key, b"message", &randomness, &options).unwrap();
+
+        assert_eq!(
+            hazmat::sign_internal(private_key, &representative, &randomness).unwrap(),
+            signature
+        );
+
+        assert!(hazmat::verify_internal(
+            public_key,
+            &signature,
+            &representative
+        ));
+
+        assert!(!hazmat::verify_internal(public_key, &signature, b"message"));
+
+        assert!(!hazmat::verify_internal(
+            public_key,
+            &signature[1..],
+            &representative
+        ));
+
+        assert_eq!(
+            hazmat::sign_internal(private_key, &representative, &randomness[1..]).err(),
+            Some(Error::InvalidLength)
+        );
+
+        let hashed_pair = hazmat::generate_signature_key_pair(hashed, &seed).unwrap();
+
+        assert_eq!(
+            hazmat::sign_internal(&hashed_pair.private_key, &representative, &randomness).err(),
+            Some(Error::InvalidOption)
+        );
+
+        assert!(!hazmat::verify_internal(
+            &hashed_pair.public_key,
+            &signature,
+            &representative
+        ));
+    }
 }
 
 fn check_signature_generation(name: &str) {

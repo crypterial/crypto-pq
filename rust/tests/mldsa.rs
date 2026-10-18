@@ -156,33 +156,49 @@ fn acvp_full_signature_generation() {
     check_signature_generation("acvp-full/ML-DSA-sigGen.txt");
 
     check_signature_generation("acvp-full/ML-DSA-sigGen-v1.txt");
+
+    check_internal_signature_generation("acvp-full/ML-DSA-sigGen-internal.txt");
+
+    check_internal_signature_generation("acvp-full/ML-DSA-sigGen-v1-internal.txt");
+}
+
+// The key of an ACVP signing test, from its seed or its expanded form, checked against pk.
+fn signing_key(header: &Fields, record: &Fields) -> SignaturePrivateKey {
+    let algorithm = algorithm(&header["parameterSet"]);
+
+    let private_key = if header["keyFormat"] == "seed" {
+        hazmat::generate_signature_key_pair(algorithm, &unhex(&record["seed"]))
+            .unwrap()
+            .private_key
+    } else {
+        algorithm
+            .import_private_key(&unhex(&record["sk"]), KeyFormat::Raw)
+            .unwrap()
+    };
+
+    let pk = private_key.public_key().export_key(KeyFormat::Raw).unwrap();
+
+    assert_eq!(pk, unhex(&record["pk"]), "tcId {}", record["tcId"]);
+
+    private_key
+}
+
+// rnd, which the deterministic variant fixes to zero (FIPS 204, Algorithm 2).
+fn signing_randomness(header: &Fields, record: &Fields) -> Vec<u8> {
+    if header["deterministic"] == "true" {
+        vec![0; 32]
+    } else {
+        unhex(&record["rnd"])
+    }
 }
 
 fn check_signature_generation(name: &str) {
     parallel(&records(name, "signature"), |(header, record)| {
-        let algorithm = algorithm(&header["parameterSet"]);
-
         let context = format!("tcId {}", record["tcId"]);
 
-        let private_key = if header["keyFormat"] == "seed" {
-            hazmat::generate_signature_key_pair(algorithm, &unhex(&record["seed"]))
-                .unwrap()
-                .private_key
-        } else {
-            algorithm
-                .import_private_key(&unhex(&record["sk"]), KeyFormat::Raw)
-                .unwrap()
-        };
+        let private_key = signing_key(header, record);
 
-        let pk = private_key.public_key().export_key(KeyFormat::Raw).unwrap();
-
-        assert_eq!(pk, unhex(&record["pk"]), "{context}");
-
-        let randomness = if header["deterministic"] == "true" {
-            vec![0; 32]
-        } else {
-            unhex(&record["rnd"])
-        };
+        let randomness = signing_randomness(header, record);
 
         let (message, context_bytes) = (unhex(&record["message"]), unhex(&record["context"]));
 
@@ -205,6 +221,129 @@ fn check_signature_generation(name: &str) {
             "{context}"
         );
     });
+}
+
+// The groups of the internal interface that take M' (SPEC D-65); those that take mu are listed by
+// their test numbers only, and counted as the omission SPEC 19.4 permits.
+fn internal_records(name: &str) -> Vec<(Fields, Fields)> {
+    let (omitted, run): (Vec<_>, Vec<_>) = records(name, "signature")
+        .into_iter()
+        .partition(|(header, _)| header["externalMu"] == "true");
+
+    assert!(
+        omitted.iter().all(|(_, record)| record.len() == 1),
+        "{name}: an external-mu test carries data"
+    );
+
+    assert!(
+        run.iter()
+            .all(|(header, _)| header["signatureInterface"] == "internal"),
+        "{name}: a test of another interface"
+    );
+
+    eprintln!(
+        "{name}: {} internal tests run, {} external-mu tests left out (SPEC 19.4)",
+        run.len(),
+        omitted.len()
+    );
+
+    run
+}
+
+#[test]
+fn acvp_internal_signature_generation() {
+    check_internal_signature_generation("acvp/ML-DSA-sigGen-internal.txt");
+}
+
+fn check_internal_signature_generation(name: &str) {
+    parallel(&internal_records(name), |(header, record)| {
+        let context = format!("tcId {}", record["tcId"]);
+
+        let private_key = signing_key(header, record);
+
+        let randomness = signing_randomness(header, record);
+
+        let message = unhex(&record["message"]);
+
+        let signature = hazmat::sign_internal(&private_key, &message, &randomness).unwrap();
+
+        assert_eq!(signature, unhex(&record["signature"]), "{context}");
+
+        let public_key = private_key.public_key();
+
+        assert!(
+            hazmat::verify_internal(&public_key, &signature, &message),
+            "{context}"
+        );
+    });
+}
+
+#[test]
+fn acvp_internal_signature_verification() {
+    parallel(
+        &internal_records("acvp/ML-DSA-sigVer-internal.txt"),
+        |(header, record)| {
+            let public_key = algorithm(&header["parameterSet"])
+                .import_public_key(&unhex(&record["pk"]), KeyFormat::Raw)
+                .unwrap();
+
+            let result = hazmat::verify_internal(
+                &public_key,
+                &unhex(&record["signature"]),
+                &unhex(&record["message"]),
+            );
+
+            let expected = record["testPassed"] == "true";
+
+            assert_eq!(
+                result, expected,
+                "tcId {} {}",
+                record["tcId"], record["reason"]
+            );
+        },
+    );
+}
+
+// M' = 0 || |ctx| || ctx || M is the pure interface (FIPS 204, Algorithm 2), so the internal one
+// gives the same signature; it checks the lengths as hazmat::sign does.
+#[test]
+fn internal_interface() {
+    for (_, algorithm) in ALGORITHMS {
+        let pair = hazmat::generate_signature_key_pair(algorithm, &[7; 32]).unwrap();
+
+        let (private_key, public_key) = (&pair.private_key, &pair.public_key);
+
+        let representative = [&[0, 7][..], b"context", b"message"].concat();
+
+        let options = SignOptions::default().with_context(b"context");
+
+        let rnd = [9; 32];
+
+        let pure = hazmat::sign(private_key, b"message", &rnd, &options).unwrap();
+
+        let internal = hazmat::sign_internal(private_key, &representative, &rnd).unwrap();
+
+        assert_eq!(pure, internal);
+
+        assert!(hazmat::verify_internal(
+            public_key,
+            &internal,
+            &representative
+        ));
+
+        assert!(!hazmat::verify_internal(public_key, &internal, b"message"));
+
+        assert!(!hazmat::verify_internal(
+            public_key,
+            &internal[1..],
+            &representative
+        ));
+
+        assert_eq!(
+            hazmat::sign_internal(private_key, &representative, &rnd[1..]).err(),
+            Some(Error::InvalidLength)
+        );
+    }
 }
 
 #[test]
