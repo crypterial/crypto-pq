@@ -46,6 +46,54 @@ def cases():
                     yield name, function, digest, pattern(key, 0x00), pattern(salt, 0x40), pattern(person, 0x80), pattern(size, 0xC0)
 
 
+# derived/blake2-large.txt: inputs past 2^32 bytes, where the 64-bit counter of BLAKE2s carries
+# into its high word and a 32-bit length would wrap. The content repeats until the length, as in
+# the ACVP large-data tests. Header hash; fields digestLength, key (empty: the unkeyed hash),
+# content, length (bytes) and out.
+LARGE_LENGTH = (1 << 32) + 65
+
+LARGE = (("BLAKE2b", hashlib.blake2b, 64, 0), ("BLAKE2s", hashlib.blake2s, 32, 0), ("BLAKE2s", hashlib.blake2s, 32, 32))
+
+
+def large_digest(function, digest, key, content, length):
+    state = function(digest_size=digest, key=key)
+
+    chunk = content * ((1 << 20) // len(content))
+
+    left = length
+
+    while left > 0:
+        state.update(chunk[: min(left, len(chunk))])
+
+        left -= min(left, len(chunk))
+
+    return state.hexdigest()
+
+
+def large(work):
+    content = pattern(1000, 0xC0)
+
+    entries = [(name, function, digest, pattern(key, 0x00)) for name, function, digest, key in LARGE]
+
+    expected = [large_digest(function, digest, key, content, LARGE_LENGTH) for _, function, digest, key in entries]
+
+    lines = [" ".join([name[-1].lower(), str(digest), key.hex() or "-", "-", "-", content.hex(), str(LARGE_LENGTH)]) for name, _, digest, key in entries]
+
+    output = subprocess.run([str(work / "vectors"), "large"], input="".join(f"{line}\n" for line in lines).encode(), check=True, capture_output=True).stdout
+
+    if output.decode().split() != expected:
+        sys.exit("the BLAKE2 reference implementation and hashlib disagree on the large inputs")
+
+    groups = {}
+
+    for (name, _, digest, key), out in zip(entries, expected):
+        groups.setdefault(name, []).append({"digestLength": digest, "key": key.hex(), "content": content.hex(), "length": LARGE_LENGTH, "out": out})
+
+    provenance = f"# Derived: Python hashlib and the BLAKE2 reference implementation {REFERENCE.split('/')[-2]} (ref/) agree on each digest; tools/blake2_vectors.py\n\n"
+
+    write("derived/blake2-large.txt", provenance.encode() + render([({"hash": name}, tests) for name, tests in groups.items()]))
+
+
 def main():
     entries = list(cases())
 
@@ -64,6 +112,8 @@ def main():
         subprocess.run(["cc", "-O2", "-std=c99", "-o", "vectors", "vectors.c", "blake2b-ref.c", "blake2s-ref.c"], cwd=work, check=True)
 
         output = subprocess.run([str(work / "vectors")], input="".join(f"{line}\n" for line in lines).encode(), check=True, capture_output=True).stdout
+
+        large(work)
 
     if output.decode().split() != expected:
         sys.exit("the BLAKE2 reference implementation and hashlib disagree")

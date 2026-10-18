@@ -15,6 +15,7 @@ typedef struct {
     size_t personal_length;
     unsigned char message[2048];
     size_t message_length;
+    unsigned long long total_length;
 } blake2_case;
 
 static size_t unhex(const char *text, unsigned char *out, size_t capacity)
@@ -72,7 +73,13 @@ static int blake2b_case(unsigned char *out, const blake2_case *c)
         blake2b_update(&state, block, sizeof block);
     }
 
-    blake2b_update(&state, c->message, c->message_length);
+    for (unsigned long long left = c->total_length; left > 0;) {
+        size_t size = left < c->message_length ? (size_t)left : c->message_length;
+
+        blake2b_update(&state, c->message, size);
+
+        left -= size;
+    }
 
     return blake2b_final(&state, out, c->digest_length) != 0;
 }
@@ -109,15 +116,28 @@ static int blake2s_case(unsigned char *out, const blake2_case *c)
         blake2s_update(&state, block, sizeof block);
     }
 
-    blake2s_update(&state, c->message, c->message_length);
+    for (unsigned long long left = c->total_length; left > 0;) {
+        size_t size = left < c->message_length ? (size_t)left : c->message_length;
+
+        blake2s_update(&state, c->message, size);
+
+        left -= size;
+    }
 
     return blake2s_final(&state, out, c->digest_length) != 0;
 }
 
 // One case per input line: "b" or "s", the digest length, then the key, salt, personalization
 // and message in hexadecimal ("-" when empty). Prints the digest of each case on its own line.
-int main(void)
+// With "large", each line ends with a total length too, and the message repeats until it.
+int main(int argc, char **argv)
 {
+    int large = argc == 2 && strcmp(argv[1], "large") == 0;
+
+    if (argc != 1 && !large) {
+        return 2;
+    }
+
     static char line[8192], function[8], key[256], salt[64], personal[64], message[4096];
 
     static blake2_case c;
@@ -127,12 +147,14 @@ int main(void)
     unsigned int digest_length;
 
     while (fgets(line, sizeof line, stdin)) {
-        int fields = sscanf(line, "%7s %u %255s %63s %63s %4095s", function, &digest_length, key, salt,
-                            personal, message);
+        unsigned long long total_length = 0;
+
+        int fields = sscanf(line, "%7s %u %255s %63s %63s %4095s %llu", function, &digest_length, key,
+                            salt, personal, message, &total_length);
 
         int b = strcmp(function, "b") == 0;
 
-        if (fields != 6 || (!b && strcmp(function, "s") != 0)) {
+        if (fields != (large ? 7 : 6) || (!b && strcmp(function, "s") != 0)) {
             return 1;
         }
 
@@ -149,6 +171,12 @@ int main(void)
         c.personal_length = unhex(personal, c.personal, b ? BLAKE2B_PERSONALBYTES : BLAKE2S_PERSONALBYTES);
 
         c.message_length = unhex(message, c.message, sizeof c.message);
+
+        c.total_length = large ? total_length : c.message_length;
+
+        if (c.total_length > 0 && c.message_length == 0) {
+            return 1;
+        }
 
         if (b ? blake2b_case(out, &c) : blake2s_case(out, &c)) {
             return 1;

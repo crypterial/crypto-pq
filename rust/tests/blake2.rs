@@ -5,7 +5,7 @@ use crypto_pq::{
     BLAKE2S_224, BLAKE2S_256, BLAKE2S_MAC, Error, HashAlgorithm, HashOptions, MacAlgorithm,
     MacOptions, SHA_256,
 };
-use vectors::{pieces, records, unhex};
+use vectors::{parallel, pieces, records, unhex};
 
 const HASHES: [HashAlgorithm; 8] = [
     BLAKE2B_160,
@@ -210,6 +210,57 @@ fn reference_kats() {
 
         assert_eq!((unkeyed, keyed), (256, 256), "{file}");
     }
+}
+
+// Inputs past 2^32 bytes (derived/blake2-large.txt, hashlib's values, which the BLAKE2 reference
+// code confirms), where the 64-bit counter of BLAKE2s carries into its high word: the content
+// repeats until the length, streamed in pieces of about 1 MiB that end inside a block.
+#[test]
+#[ignore = "weekly (fuzz.yml): hashes 12 GiB"]
+fn large_inputs() {
+    let found = records("derived/blake2-large.txt", "out");
+
+    assert_eq!(found.len(), 3);
+
+    parallel(&found, |(header, record)| {
+        let length: usize = record["digestLength"].parse().expect("digestLength");
+
+        let total: u64 = record["length"].parse().expect("length");
+
+        assert!(total > 1 << 32);
+
+        let (key, content, expected) = (
+            unhex(&record["key"]),
+            unhex(&record["content"]),
+            unhex(&record["out"]),
+        );
+
+        let chunk = content.repeat((1 << 20) / content.len());
+
+        let pieces = (0..total.div_ceil(chunk.len() as u64)).map(|i| {
+            let start = i * chunk.len() as u64;
+
+            &chunk[..(total - start).min(chunk.len() as u64) as usize]
+        });
+
+        let name = &header["hash"];
+
+        if key.is_empty() {
+            let mut hasher = hash(name, length).create();
+
+            pieces.for_each(|piece| hasher.update(piece));
+
+            assert_eq!(hasher.digest(), expected, "{name}");
+        } else {
+            let mut mac = mac(name).create(&key).unwrap();
+
+            pieces.for_each(|piece| mac.update(piece));
+
+            assert_eq!(mac.digest(), expected, "{name}-MAC");
+
+            assert!(mac.verify(&expected), "{name}-MAC verify");
+        }
+    });
 }
 
 // Salt and personalization, which no standard covers: hashlib's values, which the BLAKE2
