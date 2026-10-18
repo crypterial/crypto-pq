@@ -1,9 +1,11 @@
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
 use crate::ascon;
 use crate::blake2;
+use crate::blake3;
 use crate::error::Error;
 use crate::keccak::Keccak;
 use crate::sha2::{
@@ -24,6 +26,7 @@ pub(crate) enum Kind {
     Blake2b([u64; 8]),
     Blake2s([u32; 8]),
     Ascon,
+    Blake3,
 }
 
 #[derive(Clone)]
@@ -34,6 +37,8 @@ pub(crate) enum Engine {
     Blake2b(blake2::Engine<u64>),
     Blake2s(blake2::Engine<u32>),
     Ascon(ascon::Sponge),
+    // Boxed: with its stack of chaining values it is ten times the size of the others.
+    Blake3(Box<blake3::Hasher>),
 }
 
 impl Engine {
@@ -45,6 +50,7 @@ impl Engine {
             Self::Blake2b(engine) => engine.update(data),
             Self::Blake2s(engine) => engine.update(data),
             Self::Ascon(sponge) => sponge.update(data),
+            Self::Blake3(hasher) => hasher.update(data),
         }
     }
 
@@ -56,6 +62,7 @@ impl Engine {
             Self::Blake2b(engine) => engine.finish(out),
             Self::Blake2s(engine) => engine.finish(out),
             Self::Ascon(sponge) => sponge.clone().read(out),
+            Self::Blake3(hasher) => hasher.finish(out),
         }
     }
 }
@@ -155,6 +162,7 @@ impl HashAlgorithm {
             Kind::Blake2b(h) => blake2::digest(h, data, out),
             Kind::Blake2s(h) => blake2::digest(h, data, out),
             Kind::Ascon => ascon::digest(&ascon::HASH256, data, out),
+            Kind::Blake3 => blake3::digest(data, out),
         }
     }
 
@@ -166,6 +174,7 @@ impl HashAlgorithm {
             Kind::Blake2b(h) => Engine::Blake2b(blake2::Engine::new(h)),
             Kind::Blake2s(h) => Engine::Blake2s(blake2::Engine::new(h)),
             Kind::Ascon => Engine::Ascon(ascon::Sponge::new(&ascon::HASH256)),
+            Kind::Blake3 => Engine::Blake3(Box::new(blake3::Hasher::hash())),
         };
 
         Hasher {
@@ -177,7 +186,7 @@ impl HashAlgorithm {
     // The block size of HMAC's key blocks, and the rate of SHA-3.
     pub(crate) const fn block_size(&self) -> usize {
         match self.kind {
-            Kind::Sha256(_) | Kind::Blake2s(_) => 64,
+            Kind::Sha256(_) | Kind::Blake2s(_) | Kind::Blake3 => 64,
             Kind::Sha512(_) | Kind::Blake2b(_) => 128,
             Kind::Sha3 => 200 - 2 * self.digest_size,
             Kind::Ascon => 8,
@@ -219,6 +228,7 @@ enum XofKind {
     AsconXof,
     // The state after the customization string.
     AsconCxof([u64; 5]),
+    Blake3,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -300,6 +310,7 @@ impl XofAlgorithm {
             }
             XofKind::AsconXof => ascon::digest(&ascon::XOF128, data, out),
             XofKind::AsconCxof(start) => ascon::digest(start, data, out),
+            XofKind::Blake3 => blake3::digest(data, out),
         }
     }
 
@@ -313,6 +324,7 @@ impl XofAlgorithm {
             }
             XofKind::AsconXof => Engine::Ascon(ascon::Sponge::new(&ascon::XOF128)),
             XofKind::AsconCxof(start) => Engine::Ascon(ascon::Sponge::new(start)),
+            XofKind::Blake3 => Engine::Blake3(Box::new(blake3::Hasher::hash())),
         };
 
         Xof { engine }
@@ -340,7 +352,8 @@ impl Xof {
         match &mut self.engine {
             Engine::Keccak(engine) => engine.read(out),
             Engine::Ascon(sponge) => sponge.read(out),
-            _ => unreachable!("an XOF is a Keccak or Ascon sponge"),
+            Engine::Blake3(hasher) => hasher.read(out),
+            _ => unreachable!("an XOF is a Keccak or Ascon sponge or BLAKE3"),
         }
     }
 }
@@ -457,6 +470,13 @@ pub const ASCON_HASH256: HashAlgorithm = HashAlgorithm {
     oid_arc: 0,
 };
 
+pub const BLAKE3_256: HashAlgorithm = HashAlgorithm {
+    name: "BLAKE3-256",
+    digest_size: 32,
+    kind: Kind::Blake3,
+    oid_arc: 0,
+};
+
 pub const SHAKE128: XofAlgorithm = XofAlgorithm {
     name: "SHAKE128",
     rate: 168,
@@ -496,5 +516,12 @@ pub const ASCON_CXOF128: XofAlgorithm = XofAlgorithm {
     name: "Ascon-CXOF128",
     rate: 8,
     kind: XofKind::AsconCxof(ascon::customize(&[])),
+    oid_arc: 0,
+};
+
+pub const BLAKE3: XofAlgorithm = XofAlgorithm {
+    name: "BLAKE3",
+    rate: 64,
+    kind: XofKind::Blake3,
     oid_arc: 0,
 };

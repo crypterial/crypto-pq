@@ -71,6 +71,10 @@ SYMMETRIC = {
         crypto_pq.HKDF_SHA_256,
         crypto_pq.HKDF_SHA_384,
         crypto_pq.HKDF_SHA_512,
+        crypto_pq.BLAKE3_256,
+        crypto_pq.BLAKE3,
+        crypto_pq.BLAKE3_MAC,
+        crypto_pq.BLAKE3_KDF,
     )
 }
 
@@ -464,7 +468,7 @@ class CrossTest(unittest.TestCase):
                         self.assertEqual(remaining, int(record["remaining"]))
 
     def test_symmetric(self):
-        found = records("cross/symmetric.txt", "result")
+        found = records("cross/symmetric.txt", "result") + records("cross/blake3.txt", "result")
 
         for header, record in found:
             algorithm = SYMMETRIC[header["algorithm"]]
@@ -477,7 +481,7 @@ class CrossTest(unittest.TestCase):
                 if "output" in record:
                     self.assertEqual(output, unhex(record["output"]))
 
-        self.assertEqual(len(found), 505)
+        self.assertEqual(len(found), 505 + 110)
 
 
 if __name__ == "__main__":

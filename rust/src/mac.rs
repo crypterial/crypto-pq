@@ -1,8 +1,10 @@
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
 use crate::blake2;
+use crate::blake3;
 use crate::cpu::Dit;
 use crate::ct;
 use crate::error::Error;
@@ -27,6 +29,8 @@ enum MacKind {
     // length is added.
     Blake2b([u64; 8]),
     Blake2s([u32; 8]),
+    // keyed_hash, under a key of exactly 32 bytes.
+    Blake3,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -127,8 +131,10 @@ impl MacAlgorithm {
         } = *options;
 
         let (size, kind) = match self.kind {
-            MacKind::Hmac(_) if *options == MacOptions::default() => return Ok(*self),
-            MacKind::Hmac(_) => return Err(Error::InvalidOption),
+            MacKind::Hmac(_) | MacKind::Blake3 if *options == MacOptions::default() => {
+                return Ok(*self);
+            }
+            MacKind::Hmac(_) | MacKind::Blake3 => return Err(Error::InvalidOption),
             MacKind::Kmac { rate, .. } => {
                 // SP 800-185, 8.4.2: a tag shall not be shorter than 32 bits.
                 let size = length.unwrap_or(if rate == 168 { 32 } else { 64 });
@@ -173,32 +179,33 @@ impl MacAlgorithm {
         })
     }
 
-    // RFC 7693, 2.1: a BLAKE2 key has 1 to 64 (BLAKE2b) or 32 (BLAKE2s) bytes. HMAC and KMAC take
-    // keys of any length.
-    const fn maximum_key(&self) -> usize {
+    // RFC 7693, 2.1: a BLAKE2 key has 1 to 64 (BLAKE2b) or 32 (BLAKE2s) bytes, and a BLAKE3 key
+    // exactly 32. HMAC and KMAC take keys of any length.
+    const fn key_sizes(&self) -> (usize, usize) {
         match self.kind {
-            MacKind::Blake2b(_) => 64,
-            MacKind::Blake2s(_) => 32,
-            _ => usize::MAX,
+            MacKind::Blake2b(_) => (1, 64),
+            MacKind::Blake2s(_) => (1, 32),
+            MacKind::Blake3 => (blake3::KEY, blake3::KEY),
+            _ => (0, usize::MAX),
         }
     }
 
     const fn key_fits(&self, key: &[u8]) -> bool {
-        match self.kind {
-            MacKind::Blake2b(_) | MacKind::Blake2s(_) => {
-                !key.is_empty() && key.len() <= self.maximum_key()
-            }
-            _ => true,
-        }
+        let (minimum, maximum) = self.key_sizes();
+
+        key.len() >= minimum && key.len() <= maximum
     }
 
     // The methods without an error result refuse a key of another length as a programming error.
     fn check_key(&self, key: &[u8]) {
+        let (minimum, maximum) = self.key_sizes();
+
         assert!(
             self.key_fits(key),
-            "INVALID_LENGTH: the key of {} must be 1 to {} bytes",
+            "INVALID_LENGTH: the key of {} must be {} to {} bytes",
             self.name,
-            self.maximum_key()
+            minimum,
+            maximum
         );
     }
 
@@ -233,6 +240,7 @@ impl MacAlgorithm {
             },
             MacKind::Blake2b(h) => MacEngine::Blake2b(blake2::Engine::keyed(h, key)),
             MacKind::Blake2s(h) => MacEngine::Blake2s(blake2::Engine::keyed(h, key)),
+            MacKind::Blake3 => MacEngine::Blake3(Box::new(blake3::Hasher::keyed(key))),
         };
 
         Mac {
@@ -279,6 +287,7 @@ impl MacAlgorithm {
             }
             MacKind::Blake2b(h) => blake2::mac(h, key, data, out),
             MacKind::Blake2s(h) => blake2::mac(h, key, data, out),
+            MacKind::Blake3 => blake3::keyed_hash(key, data, out),
         }
     }
 }
@@ -343,6 +352,7 @@ enum MacEngine {
     Kmac { engine: Keccak, xof: bool },
     Blake2b(blake2::Engine<u64>),
     Blake2s(blake2::Engine<u32>),
+    Blake3(Box<blake3::Hasher>),
 }
 
 pub struct Mac {
@@ -359,6 +369,7 @@ impl Mac {
             MacEngine::Kmac { engine, .. } => engine.update(data),
             MacEngine::Blake2b(engine) => engine.update(data),
             MacEngine::Blake2s(engine) => engine.update(data),
+            MacEngine::Blake3(hasher) => hasher.update(data),
         }
     }
 
@@ -431,6 +442,7 @@ impl Mac {
             }
             MacEngine::Blake2b(engine) => engine.finish(out),
             MacEngine::Blake2s(engine) => engine.finish(out),
+            MacEngine::Blake3(hasher) => hasher.finish(out),
         }
     }
 }
@@ -481,4 +493,10 @@ pub const BLAKE2S_MAC: MacAlgorithm = MacAlgorithm {
     name: "BLAKE2s-MAC",
     size: 32,
     kind: MacKind::Blake2s(blake2::start32(32, &[], &[])),
+};
+
+pub const BLAKE3_MAC: MacAlgorithm = MacAlgorithm {
+    name: "BLAKE3-MAC",
+    size: 32,
+    kind: MacKind::Blake3,
 };

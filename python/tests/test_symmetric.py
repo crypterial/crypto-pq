@@ -17,9 +17,9 @@ KMACS = {"KMAC128": crypto_pq.KMAC128, "KMAC256": crypto_pq.KMAC256}
 
 HKDFS = {"HKDF-SHA-256": crypto_pq.HKDF_SHA_256, "HKDF-SHA-384": crypto_pq.HKDF_SHA_384, "HKDF-SHA-512": crypto_pq.HKDF_SHA_512}
 
-HASHES = (*BLAKE2B.values(), *BLAKE2S.values(), crypto_pq.ASCON_HASH256)
+HASHES = (*BLAKE2B.values(), *BLAKE2S.values(), crypto_pq.ASCON_HASH256, crypto_pq.BLAKE3_256)
 
-XOFS = (crypto_pq.CSHAKE128, crypto_pq.CSHAKE256, crypto_pq.ASCON_XOF128, crypto_pq.ASCON_CXOF128)
+XOFS = (crypto_pq.CSHAKE128, crypto_pq.CSHAKE256, crypto_pq.ASCON_XOF128, crypto_pq.ASCON_CXOF128, crypto_pq.BLAKE3)
 
 MACS = (crypto_pq.KMAC128, crypto_pq.KMAC256, crypto_pq.BLAKE2B_MAC, crypto_pq.BLAKE2S_MAC)
 
@@ -435,14 +435,126 @@ class AsconTest(Case):
         self.assertCode(ErrorCode.INVALID_OPTION, crypto_pq.ASCON_CXOF128.configure, customization=bytes(257))
 
 
+class Blake3Test(Case):
+    # Every case of the BLAKE3 team's vectors: the 131-byte extended output of each mode, and its
+    # first 32 bytes as the default output.
+    def test_vectors(self):
+        found = records("blake3/test_vectors.txt", "hash")
+
+        for header, record in found:
+            key, context = unhex(header["key"]), unhex(header["context_string"])
+
+            size = int(record["input_len"])
+
+            with self.subTest(size=size):
+                data = bytes(i % 251 for i in range(size))
+
+                full = unhex(record["hash"])
+
+                self.check_hash(crypto_pq.BLAKE3_256, data, full[:32])
+
+                self.check_xof(crypto_pq.BLAKE3, data, full)
+
+                self.check_mac(crypto_pq.BLAKE3_MAC, key, data, unhex(record["keyed_hash"])[:32])
+
+                derived = unhex(record["derive_key"])
+
+                self.assertEqual(crypto_pq.BLAKE3_KDF.derive(data, len(derived), info=context), derived)
+
+                self.assertEqual(crypto_pq.BLAKE3_KDF.derive(data, 32, info=context), derived[:32])
+
+        self.assertEqual(len(found), 35)
+
+    # An output read from any offset, across the 64-byte blocks of the root.
+    def test_reads(self):
+        data = bytes(range(200)) * 11
+
+        whole = crypto_pq.BLAKE3.digest(data, 700)
+
+        for sizes in ((0, 1, 63, 64, 65, 507), (64, 64, 572), (700,), (3, 61, 128, 1, 507)):
+            xof = crypto_pq.BLAKE3.create()
+
+            xof.update(data)
+
+            self.assertEqual(b"".join(xof.read(n) for n in sizes), whole)
+
+        self.assertEqual(crypto_pq.BLAKE3_256.digest(data), whole[:32])
+
+        self.assertEqual(crypto_pq.BLAKE3.digest(data, 0), b"")
+
+    def test_mac(self):
+        key, data = bytes(range(32)), b"data"
+
+        tag = crypto_pq.BLAKE3_MAC.digest(key, data)
+
+        self.assertEqual((crypto_pq.BLAKE3_MAC.name, crypto_pq.BLAKE3_MAC.digest_size, len(tag)), ("BLAKE3-MAC", 32, 32))
+
+        for size in (0, 1, 31, 33, 64):
+            self.assertCode(ErrorCode.INVALID_LENGTH, crypto_pq.BLAKE3_MAC.digest, bytes(size), data)
+
+            self.assertCode(ErrorCode.INVALID_LENGTH, crypto_pq.BLAKE3_MAC.create, bytes(size))
+
+            self.assertFalse(crypto_pq.BLAKE3_MAC.verify(bytes(size), data, tag))
+
+        mac = crypto_pq.BLAKE3_MAC.create(key)
+
+        mac.update(b"da")
+
+        self.assertEqual(mac.digest(), crypto_pq.BLAKE3_MAC.digest(key, b"da"))
+
+        mac.update(b"ta")
+
+        self.assertTrue(mac.verify(tag))
+
+        self.assertFalse(mac.verify(tag[:-1]))
+
+        self.assertFalse(crypto_pq.BLAKE3_MAC.verify(key, data, tag + b"\x00"))
+
+        self.assertIs(crypto_pq.BLAKE3_MAC.configure(), crypto_pq.BLAKE3_MAC)
+
+        for options in ({"length": 32}, {"length": 16}, {"customization": b"c"}, {"xof": True}, {"salt": b"s"}, {"personalization": b"p"}):
+            self.assertCode(ErrorCode.INVALID_OPTION, crypto_pq.BLAKE3_MAC.configure, **options)
+
+    def test_kdf(self):
+        kdf = crypto_pq.BLAKE3_KDF
+
+        self.assertEqual((kdf.name, repr(kdf)), ("BLAKE3-KDF", "<KdfAlgorithm BLAKE3-KDF>"))
+
+        okm = kdf.derive(b"key material", 1000, info=b"context")
+
+        self.assertEqual(kdf.derive(bytearray(b"key material"), 33, info=memoryview(b"context")), okm[:33])
+
+        self.assertNotEqual(kdf.derive(b"key material", 32), okm[:32])
+
+        self.assertEqual(len(kdf.derive(b"", 1)), 1)
+
+        for length in (0, -1):
+            self.assertCode(ErrorCode.INVALID_LENGTH, kdf.derive, b"ikm", length, info=b"c")
+
+        self.assertCode(ErrorCode.INVALID_OPTION, kdf.derive, b"ikm", 32, salt=b"s", info=b"c")
+
+        self.assertCode(ErrorCode.UNSUPPORTED, kdf.extract, b"ikm")
+
+        self.assertCode(ErrorCode.UNSUPPORTED, kdf.expand, bytes(32), 32, info=b"c")
+
+    def test_options(self):
+        self.assertCode(ErrorCode.INVALID_OPTION, crypto_pq.BLAKE3_256.configure, salt=b"s")
+
+        self.assertCode(ErrorCode.INVALID_OPTION, crypto_pq.BLAKE3_256.configure, personalization=b"p")
+
+        self.assertCode(ErrorCode.INVALID_OPTION, crypto_pq.BLAKE3.configure, customization=b"c")
+
+        self.assertCode(ErrorCode.INVALID_OPTION, hazmat.configure_cshake, crypto_pq.BLAKE3, b"N", b"")
+
+
 class ConfigureTest(Case):
     def test_properties(self):
-        names = ("BLAKE2b-160", "BLAKE2b-256", "BLAKE2b-384", "BLAKE2b-512", "BLAKE2s-128", "BLAKE2s-160", "BLAKE2s-224", "BLAKE2s-256", "Ascon-Hash256")
+        names = ("BLAKE2b-160", "BLAKE2b-256", "BLAKE2b-384", "BLAKE2b-512", "BLAKE2s-128", "BLAKE2s-160", "BLAKE2s-224", "BLAKE2s-256", "Ascon-Hash256", "BLAKE3-256")
 
-        for algorithm, name, size in zip(HASHES, names, (20, 32, 48, 64, 16, 20, 28, 32, 32), strict=True):
+        for algorithm, name, size in zip(HASHES, names, (20, 32, 48, 64, 16, 20, 28, 32, 32, 32), strict=True):
             self.assertEqual((algorithm.name, algorithm.digest_size, len(algorithm.digest(b""))), (name, size, size))
 
-        for algorithm, name in zip(XOFS, ("cSHAKE128", "cSHAKE256", "Ascon-XOF128", "Ascon-CXOF128"), strict=True):
+        for algorithm, name in zip(XOFS, ("cSHAKE128", "cSHAKE256", "Ascon-XOF128", "Ascon-CXOF128", "BLAKE3"), strict=True):
             self.assertEqual(algorithm.name, name)
 
         for algorithm, name, size in zip(MACS, ("KMAC128", "KMAC256", "BLAKE2b-MAC", "BLAKE2s-MAC"), (32, 64, 64, 32), strict=True):

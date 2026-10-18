@@ -25,6 +25,8 @@ EXAMPLES = "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Standards-an
 
 BLAKE2 = "https://raw.githubusercontent.com/BLAKE2/BLAKE2/ed1974ea83433eba7b2d95c5dcd9ac33cb847913/testvectors"
 
+BLAKE3 = "https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/f55849f89cd85083c1c9daa2c5de20766f309c00/test_vectors"
+
 ASCON = "https://raw.githubusercontent.com/ascon/ascon-c/446347f21b209f3921c65ece70027c366cbe1693"
 
 FRODOKEM = "https://raw.githubusercontent.com/microsoft/PQCrypto-LWEKE/e1edeb3af1fae0d5727683bd2f5465280ec2437a"
@@ -118,6 +120,7 @@ SOURCES = {
     "kmac256_no_customization_test": (f"{WYCHEPROOF}/kmac256_no_customization_test.json", "950b9e8f64bd4e614aa3d825f0cd0570ec33c6cdfc81cbd043c429265149a671"),
     "rfc7693": (f"{RFC}/rfc7693.txt", "c943754888364fe29bbd0bb3c71c6658ef392371497eaa4a9d9dde015b0721e5"),
     "blake2-kat": (f"{BLAKE2}/blake2-kat.json", "5031ac14800798ae15cee79c04d65e326a575f2c968c7e2846a79bd07a1c0e61"),
+    "blake3": (f"{BLAKE3}/test_vectors.json", "dcb91ea8accc77e6d6e632af7cdc1a99a9f3ae78cf648da595c7d064db32f624"),
     "LWC_HASH_KAT_128_256": (f"{ASCON}/crypto_hash/asconhash256/LWC_HASH_KAT_128_256.txt", "b7d6fbc51362f0d62bc7e57b21f3e83242983434a7c92320a4956d915749df17"),
     "LWC_XOF_KAT_128_512": (f"{ASCON}/crypto_hash/asconxof128/LWC_XOF_KAT_128_512.txt", "d7f5a23f37fc969896e48246700bc859fa324f2d309164043361376068e30852"),
     "LWC_CXOF_KAT_128_512": (f"{ASCON}/crypto_cxof/asconcxof128/LWC_CXOF_KAT_128_512.txt", "abcbb0cc851a7f9cfc5ea2bcaf3eba5b2056e37fcb8ce541ceda1d1b960fc9dc"),
@@ -134,7 +137,7 @@ SOURCES = {
     "eFrodoKEM-1344-SHAKE": (f"{FRODOKEM}/eFrodoKEM/KAT/PQCkemKAT_43088_shake.rsp", "591adc09a718afbc0ac36e1f57a191e557fe4eec7899e078104b9706b75e2f96"),
 }
 
-GENERATED = ("acvp", "wycheproof", "xwing", "rfc", "nist-examples", "blake2", "ascon", "frodokem")
+GENERATED = ("acvp", "wycheproof", "xwing", "rfc", "nist-examples", "blake2", "blake3", "ascon", "frodokem")
 
 
 def fetch(url, expected):
@@ -892,6 +895,20 @@ def blake2_kat(entries, name):
     return [({}, [{k: entry[k] for k in ("in", "key", "out")} for entry in entries if entry["hash"] == name])]
 
 
+# blake3/test_vectors.txt: the BLAKE3 team's test vectors, every case: input_len (the input is that
+# many bytes of 0, 1, ..., 250, 0, 1, ...) and the 131-byte extended outputs of hash, keyed_hash
+# under the header's key and derive_key with its context_string, both given as hex. Each output's
+# first 32 bytes are the default-length output.
+def blake3():
+    data = json.loads(source("blake3"))
+
+    header = {"key": data["key"].encode().hex(), "context_string": data["context_string"].encode().hex()}
+
+    fields = ("input_len", "hash", "keyed_hash", "derive_key")
+
+    return [(header, [{field: case[field] for field in fields} for case in data["cases"]])]
+
+
 # acvp/Ascon.txt: the ACVP SP 800-232 tests whose lengths are whole bytes: 12 of Ascon-Hash256's
 # 60, 3 of Ascon-XOF128's 60 and 1 of Ascon-CXOF128's 60 (dropped: the others, with bit lengths).
 # Header parameterSet; fields tcId, msg, cs (the CXOF128 customization) and md, whose length is the
@@ -1171,6 +1188,8 @@ def main():
     write("blake2/blake2b.txt", render(blake2_kat(kat, "blake2b")))
 
     write("blake2/blake2s.txt", render(blake2_kat(kat, "blake2s")))
+
+    write("blake3/test_vectors.txt", render(blake3()))
 
     # The designers' Ascon KATs are already in this format, so they are kept as published: fields
     # Count, Msg, Z (the CXOF128 customization) and MD, whose length is the output length.

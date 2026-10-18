@@ -21,6 +21,10 @@ from crypto_pq import (
     BLAKE2S_224,
     BLAKE2S_256,
     BLAKE2S_MAC,
+    BLAKE3,
+    BLAKE3_256,
+    BLAKE3_KDF,
+    BLAKE3_MAC,
     CSHAKE128,
     CSHAKE256,
     HKDF_SHA_256,
@@ -2577,6 +2581,86 @@ def symmetric_kdfs():
     return groups
 
 
+# vectors/cross/blake3.txt, in the format of symmetric.txt. BLAKE3: messages and outputs around the
+# block and chunk sizes and the subtrees they complete, MAC keys of 32 bytes and of other lengths
+# (INVALID_LENGTH; verify is false), derive_key with empty, short and long contexts (info) and key
+# material, and what BLAKE3 refuses: options, a salt, an empty output, and the extract and expand
+# steps that it does not have.
+def symmetric_blake3():
+    stream = Stream(504)
+
+    groups = []
+
+    sizes = (0, 1, 63, 64, 65, 1023, 1024, 1025, 2048, 2049, 3072, 3073, 4097, 8193)
+
+    table = Table(BLAKE3_256, symmetric_execute)
+
+    for size in sizes:
+        table.add(f"{size}-byte message", "digest", "ok", message=stream.bytes(size))
+
+    table.add("empty options", "digest", "ok", message=b"abc", salt=b"", personalization=b"")
+
+    table.add("salt", "digest", "INVALID_OPTION", message=b"abc", salt=b"s")
+
+    table.add("personalization", "digest", "INVALID_OPTION", message=b"abc", personalization=b"p")
+
+    groups.append(table.group())
+
+    table = Table(BLAKE3, symmetric_execute)
+
+    for size in (0, 1025, 4097):
+        message = stream.bytes(size)
+
+        for length in (0, 1, 32, 63, 64, 65, 1000):
+            table.add(f"{size}-byte message, {length}-byte output", "digest", "ok", message=message, outputLength=length)
+
+    table.add("customization", "digest", "INVALID_OPTION", message=b"abc", customization=b"c", outputLength=32)
+
+    table.add("hazmat function name", "digest", "INVALID_OPTION", message=b"abc", functionName=b"KMAC", outputLength=32)
+
+    groups.append(table.group())
+
+    table = Table(BLAKE3_MAC, symmetric_execute)
+
+    key = stream.bytes(32)
+
+    for size in (0, 64, 1025, 3073):
+        mac_records(table, key, stream.bytes(size), {"name": f"{size}-byte message"})
+
+    for name, options in (("length", {"length": 32}), ("customization", {"customization": b"c"}), ("xof", {"xof": True}), ("salt", {"salt": b"s"})):
+        mac_records(table, key, b"message", {"name": name, **options}, "INVALID_OPTION")
+
+    for size in (0, 1, 31, 33, 64):
+        table.add(f"{size}-byte key", "digest", "INVALID_LENGTH", key=stream.bytes(size), message=b"message")
+
+        table.add(f"{size}-byte key, verify", "verify", "false", key=stream.bytes(size), message=b"message", tag=bytes(32))
+
+    groups.append(table.group())
+
+    table = Table(BLAKE3_KDF, symmetric_execute)
+
+    contexts = {"empty": b"", "short": b"crypto-pq 2026-10-18 cross vectors", "long": stream.bytes(1025)}
+
+    for name, context in contexts.items():
+        for size in (0, 32, 1025):
+            ikm = stream.bytes(size)
+
+            for length in (1, 32, 65, 1000):
+                table.add(f"{name} context, {size}-byte ikm, {length} bytes", "derive", "ok", ikm=ikm, info=context, outputLength=length)
+
+    table.add("derive 0 bytes", "derive", "INVALID_LENGTH", ikm=b"ikm", info=b"context", outputLength=0)
+
+    table.add("derive with a salt", "derive", "INVALID_OPTION", ikm=b"ikm", salt=b"s", info=b"context", outputLength=32)
+
+    table.add("extract", "extract", "UNSUPPORTED", ikm=b"ikm")
+
+    table.add("expand", "expand", "UNSUPPORTED", prk=bytes(32), info=b"context", outputLength=32)
+
+    groups.append(table.group())
+
+    return groups
+
+
 JOBS = {
     "kem": [(kem, ())],
     "mldsa": [(mldsa, ())],
@@ -2593,6 +2677,7 @@ JOBS = {
     ],
     "treecache": [(tree_cache_hss, ()), (tree_cache_xmss_mt, ()), (tree_cache_xmss, ())],
     "symmetric": [(symmetric_hashes, ()), (symmetric_xofs, ()), (symmetric_macs, ()), (symmetric_kdfs, ())],
+    "blake3": [(symmetric_blake3, ())],
 }
 
 

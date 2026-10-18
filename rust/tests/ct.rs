@@ -8,15 +8,15 @@
 use crypto_pq::ct_check::{aes_encrypt, declassify, secret, x25519, x25519_base};
 use crypto_pq::{
     ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_256, BLAKE2B_MAC, BLAKE2S_256, BLAKE2S_MAC,
-    CSHAKE128, CSHAKE256, EFRODOKEM_976_AES, EFRODOKEM_976_SHAKE, EFRODOKEM_1344_AES,
-    EFRODOKEM_1344_SHAKE, Error, FRODOKEM_976_AES, FRODOKEM_976_SHAKE, FRODOKEM_1344_AES,
-    FRODOKEM_1344_SHAKE, HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512, HMAC_SHA_256, HMAC_SHA_384,
-    HSS_LMS, HashOptions, KMAC128, KMAC256, KdfOptions, KemAlgorithm, KemPrivateKey, KemPublicKey,
-    KeyFormat, KeyGenOptions, ML_DSA_44, ML_DSA_65, ML_DSA_87, ML_KEM_512, ML_KEM_768, ML_KEM_1024,
-    MacAlgorithm, MacOptions, SLH_DSA_SHA2_192F, SLH_DSA_SHAKE_128F, SignOptions,
-    SignatureAlgorithm, SignaturePrivateKey, SignaturePublicKey, StateStore, StatefulKeyGenOptions,
-    StatefulLoadOptions, StatefulParameters, StatefulSignatureAlgorithm, VerifyOptions, X_WING,
-    XMSS_MT, XofOptions, hazmat,
+    BLAKE3, BLAKE3_256, BLAKE3_KDF, BLAKE3_MAC, CSHAKE128, CSHAKE256, EFRODOKEM_976_AES,
+    EFRODOKEM_976_SHAKE, EFRODOKEM_1344_AES, EFRODOKEM_1344_SHAKE, Error, FRODOKEM_976_AES,
+    FRODOKEM_976_SHAKE, FRODOKEM_1344_AES, FRODOKEM_1344_SHAKE, HKDF_SHA_256, HKDF_SHA_384,
+    HKDF_SHA_512, HMAC_SHA_256, HMAC_SHA_384, HSS_LMS, HashOptions, KMAC128, KMAC256, KdfOptions,
+    KemAlgorithm, KemPrivateKey, KemPublicKey, KeyFormat, KeyGenOptions, ML_DSA_44, ML_DSA_65,
+    ML_DSA_87, ML_KEM_512, ML_KEM_768, ML_KEM_1024, MacAlgorithm, MacOptions, SLH_DSA_SHA2_192F,
+    SLH_DSA_SHAKE_128F, SignOptions, SignatureAlgorithm, SignaturePrivateKey, SignaturePublicKey,
+    StateStore, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
+    StatefulSignatureAlgorithm, VerifyOptions, X_WING, XMSS_MT, XofOptions, hazmat,
 };
 
 const MESSAGE: &[u8] = b"crypto-pq constant-time check";
@@ -567,6 +567,7 @@ fn macs() {
         (KMAC256, 64),
         (BLAKE2B_MAC, 64),
         (BLAKE2S_MAC, 32),
+        (BLAKE3_MAC, 32),
     ] {
         mac(algorithm, key_size);
     }
@@ -638,6 +639,61 @@ fn hkdf() {
 
             assert!(same(&expanded, &okm));
         }
+    }
+}
+
+// BLAKE3: keyed_hash under a secret key and derive_key from secret key material, over more than
+// two chunks, whose chaining values merge into parents, and over a partial block; the hash and
+// the XOF of the same secret input.
+#[test]
+fn blake3() {
+    let key = secret_bytes(32, 5);
+
+    let long = secret_bytes(2100, 6);
+
+    for data in [&long[..], &long[..10]] {
+        let tag = BLAKE3_MAC.digest(&key, data);
+
+        let mut incremental = BLAKE3_MAC.create(&key);
+
+        incremental.update(&data[..data.len() / 3]);
+
+        incremental.update(&data[data.len() / 3..]);
+
+        assert!(same(&incremental.digest(), &tag));
+
+        assert!(BLAKE3_MAC.verify(&key, data, &tag));
+
+        assert!(incremental.verify(&tag));
+
+        let options = KdfOptions {
+            info: b"context",
+            ..KdfOptions::default()
+        };
+
+        let okm = BLAKE3_KDF.derive(data, 300, &options).unwrap();
+
+        let short = BLAKE3_KDF.derive(data, 32, &options).unwrap();
+
+        assert!(same(&short, &okm[..32]));
+
+        let output = BLAKE3.digest(data, 130);
+
+        let mut xof = BLAKE3.create();
+
+        xof.update(data);
+
+        let mut read = xof.read(1);
+
+        read.extend(xof.read(129));
+
+        assert!(same(&read, &output));
+
+        let mut hasher = BLAKE3_256.create();
+
+        hasher.update(data);
+
+        assert!(same(&hasher.digest(), &BLAKE3_256.digest(data)));
     }
 }
 

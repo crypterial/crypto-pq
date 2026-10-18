@@ -12,6 +12,8 @@ mod ascon;
 
 mod blake2;
 
+mod blake3;
+
 mod cpu;
 
 mod ct;
@@ -72,11 +74,12 @@ pub use cpu::enable_data_independent_timing;
 pub use error::Error;
 pub use hash::{
     ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_160, BLAKE2B_256, BLAKE2B_384, BLAKE2B_512,
-    BLAKE2S_128, BLAKE2S_160, BLAKE2S_224, BLAKE2S_256, CSHAKE128, CSHAKE256, HashAlgorithm,
-    HashOptions, Hasher, SHA_224, SHA_256, SHA_384, SHA_512, SHA_512_224, SHA_512_256, SHA3_224,
-    SHA3_256, SHA3_384, SHA3_512, SHAKE128, SHAKE256, Xof, XofAlgorithm, XofOptions,
+    BLAKE2S_128, BLAKE2S_160, BLAKE2S_224, BLAKE2S_256, BLAKE3, BLAKE3_256, CSHAKE128, CSHAKE256,
+    HashAlgorithm, HashOptions, Hasher, SHA_224, SHA_256, SHA_384, SHA_512, SHA_512_224,
+    SHA_512_256, SHA3_224, SHA3_256, SHA3_384, SHA3_512, SHAKE128, SHAKE256, Xof, XofAlgorithm,
+    XofOptions,
 };
-pub use kdf::{HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512, KdfAlgorithm, KdfOptions};
+pub use kdf::{BLAKE3_KDF, HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512, KdfAlgorithm, KdfOptions};
 pub use kem::{
     EFRODOKEM_976_AES, EFRODOKEM_976_SHAKE, EFRODOKEM_1344_AES, EFRODOKEM_1344_SHAKE,
     Encapsulation, FRODOKEM_976_AES, FRODOKEM_976_SHAKE, FRODOKEM_1344_AES, FRODOKEM_1344_SHAKE,
@@ -85,8 +88,8 @@ pub use kem::{
 };
 pub use keys::{KeyFormat, KeyGenOptions};
 pub use mac::{
-    BLAKE2B_MAC, BLAKE2S_MAC, HMAC_SHA_224, HMAC_SHA_256, HMAC_SHA_384, HMAC_SHA_512, KMAC128,
-    KMAC256, Mac, MacAlgorithm, MacOptions,
+    BLAKE2B_MAC, BLAKE2S_MAC, BLAKE3_MAC, HMAC_SHA_224, HMAC_SHA_256, HMAC_SHA_384, HMAC_SHA_512,
+    KMAC128, KMAC256, Mac, MacAlgorithm, MacOptions,
 };
 pub use signature::{
     ML_DSA_44, ML_DSA_65, ML_DSA_87, PreHash, SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S,

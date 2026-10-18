@@ -2,6 +2,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::blake3;
 use crate::cpu::Dit;
 use crate::error::Error;
 use crate::hash::{HashAlgorithm, Kind, SHA_256, SHA_384, SHA_512};
@@ -9,12 +10,20 @@ use crate::mac::{block_key, hmac};
 use crate::sha2::{self, Sha256, Sha512, finish256, finish512};
 use crate::wipe::wipe;
 
-// HKDF (RFC 5869) over HMAC with SHA-2. The PRK, every T(i) and the keyed states are secret and
-// wiped; one keyed DIT guard covers each public call.
+// HKDF (RFC 5869) over HMAC with SHA-2, and BLAKE3's derive_key, whose context string is info.
+// The PRK, every T(i) and the keyed states are secret and wiped; one keyed DIT guard covers each
+// public call.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct KdfAlgorithm {
     name: &'static str,
-    hash: HashAlgorithm,
+    kind: KdfKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KdfKind {
+    Hkdf(HashAlgorithm),
+    // No extract or expand step of its own, and no salt.
+    Blake3,
 }
 
 impl fmt::Debug for KdfAlgorithm {
@@ -35,14 +44,30 @@ impl KdfAlgorithm {
         self.name
     }
 
-    // The size of a pseudorandom key, HashLen.
+    // The size of a pseudorandom key, HashLen; BLAKE3's key size for BLAKE3-KDF.
     pub const fn prk_size(&self) -> usize {
-        self.hash.digest_size()
+        match self.kind {
+            KdfKind::Hkdf(hash) => hash.digest_size(),
+            KdfKind::Blake3 => blake3::KEY,
+        }
     }
 
-    // RFC 5869, 2.3: L is at most 255 HashLen; an empty output is refused as well.
+    // HKDF's hash; BLAKE3-KDF has no extract and expand steps.
+    const fn hkdf(&self) -> Result<HashAlgorithm, Error> {
+        match self.kind {
+            KdfKind::Hkdf(hash) => Ok(hash),
+            KdfKind::Blake3 => Err(Error::Unsupported),
+        }
+    }
+
+    // RFC 5869, 2.3: L is at most 255 HashLen. Every KDF refuses an empty output.
     fn check_output(&self, length: usize) -> Result<(), Error> {
-        if length == 0 || length > 255 * self.prk_size() {
+        let limit = match self.kind {
+            KdfKind::Hkdf(hash) => 255 * hash.digest_size(),
+            KdfKind::Blake3 => usize::MAX,
+        };
+
+        if length == 0 || length > limit {
             Err(Error::InvalidLength)
         } else {
             Ok(())
@@ -73,15 +98,27 @@ impl KdfAlgorithm {
     ) -> Result<(), Error> {
         self.check_output(out.len())?;
 
+        let hash = match self.kind {
+            KdfKind::Hkdf(hash) => hash,
+            KdfKind::Blake3 if options.salt.is_empty() => {
+                let _dit = Dit::keyed();
+
+                blake3::derive_key(options.info, ikm, out);
+
+                return Ok(());
+            }
+            KdfKind::Blake3 => return Err(Error::InvalidOption),
+        };
+
         let _dit = Dit::keyed();
 
         let mut prk = [0; 64];
 
         let size = self.prk_size();
 
-        hmac(&self.hash, options.salt, ikm, &mut prk[..size]);
+        hmac(&hash, options.salt, ikm, &mut prk[..size]);
 
-        self.expand_unchecked(&prk[..size], options.info, out);
+        expand_unchecked(&hash, &prk[..size], options.info, out);
 
         wipe(&mut prk);
 
@@ -103,6 +140,8 @@ impl KdfAlgorithm {
         out: &mut [u8],
         options: &KdfOptions,
     ) -> Result<(), Error> {
+        let hash = self.hkdf()?;
+
         if !options.info.is_empty() {
             return Err(Error::InvalidOption);
         }
@@ -113,7 +152,7 @@ impl KdfAlgorithm {
 
         let _dit = Dit::keyed();
 
-        hmac(&self.hash, options.salt, ikm, out);
+        hmac(&hash, options.salt, ikm, out);
 
         Ok(())
     }
@@ -124,6 +163,8 @@ impl KdfAlgorithm {
         length: usize,
         options: &KdfOptions,
     ) -> Result<Vec<u8>, Error> {
+        self.hkdf()?;
+
         self.check_output(length)?;
 
         let mut out = vec![0; length];
@@ -140,6 +181,8 @@ impl KdfAlgorithm {
         out: &mut [u8],
         options: &KdfOptions,
     ) -> Result<(), Error> {
+        let hash = self.hkdf()?;
+
         if !options.salt.is_empty() {
             return Err(Error::InvalidOption);
         }
@@ -152,79 +195,79 @@ impl KdfAlgorithm {
 
         let _dit = Dit::keyed();
 
-        self.expand_unchecked(prk, options.info, out);
+        expand_unchecked(&hash, prk, options.info, out);
 
         Ok(())
     }
+}
 
-    // T(i) = HMAC(PRK, T(i - 1) || info || i), from T(0) empty, until out is full. T(1) alone is
-    // a single HMAC call; otherwise the key blocks are compressed once, and each message is built
-    // in a buffer that holds info from the start and takes T(i - 1) and i before each call.
-    fn expand_unchecked(&self, prk: &[u8], info: &[u8], out: &mut [u8]) {
-        let size = self.prk_size();
+// T(i) = HMAC(PRK, T(i - 1) || info || i), from T(0) empty, until out is full. T(1) alone is a
+// single HMAC call; otherwise the key blocks are compressed once, and each message is built in a
+// buffer that holds info from the start and takes T(i - 1) and i before each call.
+fn expand_unchecked(hash: &HashAlgorithm, prk: &[u8], info: &[u8], out: &mut [u8]) {
+    let size = hash.digest_size();
 
-        let mut message = [0; MESSAGE];
+    let mut message = [0; MESSAGE];
 
-        let length = info.len();
+    let length = info.len();
 
-        if out.len() <= size && length < MESSAGE {
-            message[..length].copy_from_slice(info);
+    if out.len() <= size && length < MESSAGE {
+        message[..length].copy_from_slice(info);
 
-            message[length] = 1;
-
-            let mut t = [0; 64];
-
-            hmac(&self.hash, prk, &message[..length + 1], &mut t[..size]);
-
-            out.copy_from_slice(&t[..out.len()]);
-
-            wipe(&mut t);
-
-            return;
-        }
-
-        let mut hashed = [0; 64];
-
-        let keyed = Keyed::new(&self.hash, block_key(&self.hash, prk, &mut hashed));
-
-        wipe(&mut hashed);
-
-        let fits = size + length < MESSAGE;
-
-        if fits {
-            message[size..size + length].copy_from_slice(info);
-        }
+        message[length] = 1;
 
         let mut t = [0; 64];
 
-        for (i, chunk) in out.chunks_mut(size).enumerate() {
-            let counter = i as u8 + 1;
+        hmac(hash, prk, &message[..length + 1], &mut t[..size]);
 
-            let previous = if i == 0 { 0 } else { size };
-
-            if fits {
-                message[size + length] = counter;
-
-                keyed.mac(&message[size - previous..size + length + 1], &mut t[..size]);
-
-                message[..size].copy_from_slice(&t[..size]);
-            } else {
-                let mut next = [0; 64];
-
-                keyed.stream(&[&t[..previous], info, &[counter]], &mut next[..size]);
-
-                t = next;
-
-                wipe(&mut next);
-            }
-
-            chunk.copy_from_slice(&t[..chunk.len()]);
-        }
+        out.copy_from_slice(&t[..out.len()]);
 
         wipe(&mut t);
 
-        wipe(&mut message);
+        return;
     }
+
+    let mut hashed = [0; 64];
+
+    let keyed = Keyed::new(hash, block_key(hash, prk, &mut hashed));
+
+    wipe(&mut hashed);
+
+    let fits = size + length < MESSAGE;
+
+    if fits {
+        message[size..size + length].copy_from_slice(info);
+    }
+
+    let mut t = [0; 64];
+
+    for (i, chunk) in out.chunks_mut(size).enumerate() {
+        let counter = i as u8 + 1;
+
+        let previous = if i == 0 { 0 } else { size };
+
+        if fits {
+            message[size + length] = counter;
+
+            keyed.mac(&message[size - previous..size + length + 1], &mut t[..size]);
+
+            message[..size].copy_from_slice(&t[..size]);
+        } else {
+            let mut next = [0; 64];
+
+            keyed.stream(&[&t[..previous], info, &[counter]], &mut next[..size]);
+
+            t = next;
+
+            wipe(&mut next);
+        }
+
+        chunk.copy_from_slice(&t[..chunk.len()]);
+    }
+
+    wipe(&mut t);
+
+    wipe(&mut message);
 }
 
 // The messages of expand: T(i - 1), info and the counter byte together, when they fit.
@@ -299,15 +342,20 @@ impl Drop for Keyed {
 
 pub const HKDF_SHA_256: KdfAlgorithm = KdfAlgorithm {
     name: "HKDF-SHA-256",
-    hash: SHA_256,
+    kind: KdfKind::Hkdf(SHA_256),
 };
 
 pub const HKDF_SHA_384: KdfAlgorithm = KdfAlgorithm {
     name: "HKDF-SHA-384",
-    hash: SHA_384,
+    kind: KdfKind::Hkdf(SHA_384),
 };
 
 pub const HKDF_SHA_512: KdfAlgorithm = KdfAlgorithm {
     name: "HKDF-SHA-512",
-    hash: SHA_512,
+    kind: KdfKind::Hkdf(SHA_512),
+};
+
+pub const BLAKE3_KDF: KdfAlgorithm = KdfAlgorithm {
+    name: "BLAKE3-KDF",
+    kind: KdfKind::Blake3,
 };

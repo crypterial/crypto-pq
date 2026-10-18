@@ -2,7 +2,7 @@ import operator
 import threading
 from functools import partial
 
-from . import _ascon, _blake2, _native, _primitives, _sp800_185
+from . import _ascon, _blake2, _blake3, _native, _primitives, _sp800_185
 from ._bytes import equal, immutable, readable, require_bytes, require_output_length, view, wipe
 from ._errors import CryptoPQError, ErrorCode
 from ._keccak import Keccak
@@ -237,13 +237,17 @@ class MacAlgorithm:
         return f"<MacAlgorithm {self._name}>"
 
 
+# `limit` is the longest output, None for no limit. A KDF without extract and expand steps of its
+# own, BLAKE3's derive_key, has None for both, and calls of them are UNSUPPORTED.
 class KdfAlgorithm:
-    __slots__ = ("_name", "_size", "_derive", "_extract", "_expand")
+    __slots__ = ("_name", "_size", "_limit", "_derive", "_extract", "_expand")
 
-    def __init__(self, name: str, size: int, derive, extract, expand) -> None:
+    def __init__(self, name: str, size: int, limit: int | None, derive, extract=None, expand=None) -> None:
         self._name = name
 
         self._size = size
+
+        self._limit = limit
 
         self._derive = derive
 
@@ -260,9 +264,15 @@ class KdfAlgorithm:
 
     # The pseudorandom key, of the hash's size. An empty salt is HashLen zero bytes (RFC 5869, 2.2).
     def extract(self, ikm: _Bytes, *, salt: _Bytes = b"") -> bytes:
+        if self._extract is None:
+            raise CryptoPQError(ErrorCode.UNSUPPORTED, f"{self._name} has no extract step")
+
         return self._extract(ikm, salt)
 
     def expand(self, prk: _Bytes, length: int, *, info: _Bytes = b"") -> bytes:
+        if self._expand is None:
+            raise CryptoPQError(ErrorCode.UNSUPPORTED, f"{self._name} has no expand step")
+
         prk = view(prk)
 
         if len(prk) < self._size:
@@ -270,12 +280,15 @@ class KdfAlgorithm:
 
         return self._expand(prk, info, self._output_length(length))
 
-    # RFC 5869, 2.3: L is at most 255 HashLen; an empty output is refused as well.
+    # RFC 5869, 2.3: L is at most 255 HashLen. Every KDF refuses an empty output.
     def _output_length(self, length):
         length = operator.index(length)
 
-        if not 0 < length <= 255 * self._size:
-            raise CryptoPQError(ErrorCode.INVALID_LENGTH, f"the output of {self._name} is 1 to {255 * self._size} bytes")
+        if self._limit is None:
+            if length < 1:
+                raise CryptoPQError(ErrorCode.INVALID_LENGTH, f"the output of {self._name} has at least 1 byte")
+        elif not 0 < length <= self._limit:
+            raise CryptoPQError(ErrorCode.INVALID_LENGTH, f"the output of {self._name} is 1 to {self._limit} bytes")
 
         return length
 
@@ -362,6 +375,30 @@ class _Blake2Mac:
         return equal(self._hash.digest(), tag)
 
 
+# keyed_hash (the BLAKE3 specification, 2.3) under a key of exactly 32 bytes.
+def _blake3_key(key):
+    if len(key) != _blake3.KEY:
+        raise CryptoPQError(ErrorCode.INVALID_LENGTH, "a BLAKE3-MAC key has 32 bytes")
+
+    return key
+
+
+class _Blake3Mac:
+    __slots__ = ("_hash",)
+
+    def __init__(self, key):
+        self._hash = _blake3.keyed(_blake3_key(key))
+
+    def update(self, data):
+        self._hash.update(data)
+
+    def digest(self):
+        return self._hash.digest()
+
+    def verify(self, tag):
+        return equal(self._hash.digest(), tag)
+
+
 # The pure one-shots read every input at their start, before any state of theirs exists, so that a
 # caller's __index__ or __buffer__ runs once and finds nothing of theirs half done.
 def _pure_digest(engine, data):
@@ -399,6 +436,41 @@ def _blake2_mac_digest(variant, h0, size, maximum, key, data):
     key, data = readable(key), readable(data)
 
     return _blake2.digest(variant, h0, _blake2_key(key, maximum), data, size)
+
+
+def _blake3_digest(data):
+    return _blake3.digest(readable(data))
+
+
+def _blake3_xof_digest(data, length):
+    length, data = require_output_length(length), readable(data)
+
+    return _blake3.digest(data, length)
+
+
+def _blake3_mac_digest(key, data):
+    key, data = readable(key), readable(data)
+
+    return _blake3.keyed_hash(_blake3_key(key), data)
+
+
+def _blake3_mac_verify(key, data, tag):
+    key, data, tag = readable(key), readable(data), readable(tag)
+
+    if len(key) != _blake3.KEY:
+        return False
+
+    return equal(_blake3.keyed_hash(key, data), tag)
+
+
+# derive_key with info as the context string; BLAKE3 takes no salt.
+def _blake3_derive(ikm, salt, info, length):
+    ikm, salt, info = readable(ikm), readable(salt), immutable(info)
+
+    if salt:
+        raise _invalid_option("BLAKE3-KDF takes no salt; info is its context string")
+
+    return _blake3.derive_key(info, ikm, length)
 
 
 # Ascon-Hash256 and the Ascon XOFs in one pass from their initial `state`.
@@ -710,7 +782,7 @@ def _pure_blake2_mac(name, maximum, field, variant):
 
 def _hkdf(name, size, number, hmac):
     if NATIVE:
-        return KdfAlgorithm(name, size, *_native.kdf_functions(number, size))
+        return KdfAlgorithm(name, size, 255 * size, *_native.kdf_functions(number, size))
 
     return _pure_hkdf(name, size, hmac)
 
@@ -719,7 +791,40 @@ def _hkdf(name, size, number, hmac):
 def _pure_hkdf(name, size, hmac):
     function = hmac._digest
 
-    return KdfAlgorithm(name, size, partial(_pure_derive, function, size), partial(_pure_extract, function), partial(_pure_expand, function, size))
+    return KdfAlgorithm(name, size, 255 * size, partial(_pure_derive, function, size), partial(_pure_extract, function), partial(_pure_expand, function, size))
+
+
+# BLAKE3 on the pure backend alone until the native library has it.
+def _blake3_hash():
+    return _pure_blake3_hash()
+
+
+def _pure_blake3_hash():
+    return HashAlgorithm("BLAKE3-256", 32, _blake3.hasher, _blake3_digest)
+
+
+def _blake3_xof():
+    return _pure_blake3_xof()
+
+
+def _pure_blake3_xof():
+    return XofAlgorithm("BLAKE3", _blake3.hasher, _blake3_xof_digest)
+
+
+def _blake3_mac():
+    return _pure_blake3_mac()
+
+
+def _pure_blake3_mac():
+    return MacAlgorithm("BLAKE3-MAC", 32, _Blake3Mac, _blake3_mac_digest, _blake3_mac_verify)
+
+
+def _blake3_kdf():
+    return _pure_blake3_kdf()
+
+
+def _pure_blake3_kdf():
+    return KdfAlgorithm("BLAKE3-KDF", 32, None, _blake3_derive)
 
 
 SHA_224 = _hash("SHA-224", 28, 0, "sha224")
@@ -760,6 +865,8 @@ BLAKE2S_256 = _blake2_hash("BLAKE2s-256", 32, 17, 8, _blake2.BLAKE2S)
 
 ASCON_HASH256 = _ascon_hash()
 
+BLAKE3_256 = _blake3_hash()
+
 SHAKE128 = _xof("SHAKE128", 0, 168, "shake_128")
 
 SHAKE256 = _xof("SHAKE256", 1, 136, "shake_256")
@@ -771,6 +878,8 @@ CSHAKE256 = _cshake("cSHAKE256", 3, 136, SHAKE256)
 ASCON_XOF128 = _ascon_xof()
 
 ASCON_CXOF128 = _ascon_cxof()
+
+BLAKE3 = _blake3_xof()
 
 HMAC_SHA_224 = _hmac("HMAC-SHA-224", 28, 0, "sha224")
 
@@ -788,8 +897,12 @@ BLAKE2B_MAC = _blake2_mac("BLAKE2b-MAC", 64, 6, 16, _blake2.BLAKE2B)
 
 BLAKE2S_MAC = _blake2_mac("BLAKE2s-MAC", 32, 7, 8, _blake2.BLAKE2S)
 
+BLAKE3_MAC = _blake3_mac()
+
 HKDF_SHA_256 = _hkdf("HKDF-SHA-256", 32, 0, HMAC_SHA_256)
 
 HKDF_SHA_384 = _hkdf("HKDF-SHA-384", 48, 1, HMAC_SHA_384)
 
 HKDF_SHA_512 = _hkdf("HKDF-SHA-512", 64, 2, HMAC_SHA_512)
+
+BLAKE3_KDF = _blake3_kdf()
