@@ -14,7 +14,6 @@ use crate::mlkem::{self, Parameters};
 use crate::once::{OnceBox, Shared};
 use crate::rng::random_bytes;
 use crate::wipe::{SecretBytes, wipe};
-use crate::xwing;
 
 const ML_KEM_SEED_SIZE: usize = 64;
 
@@ -29,7 +28,6 @@ const fn oid(arc: u8) -> [u8; 9] {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Scheme {
     MlKem(Parameters, [u8; 9]),
-    XWing,
     Frodo(frodokem::Parameters),
 }
 
@@ -52,11 +50,6 @@ pub const ML_KEM_768: KemAlgorithm = KemAlgorithm {
 pub const ML_KEM_1024: KemAlgorithm = KemAlgorithm {
     name: "ML-KEM-1024",
     scheme: Scheme::MlKem(mlkem::ML_KEM_1024, oid(3)),
-};
-
-pub const X_WING: KemAlgorithm = KemAlgorithm {
-    name: "X-Wing",
-    scheme: Scheme::XWing,
 };
 
 pub const FRODOKEM_976_AES: KemAlgorithm = KemAlgorithm {
@@ -108,7 +101,6 @@ impl KemAlgorithm {
     pub const fn public_key_size(&self) -> usize {
         match self.scheme {
             Scheme::MlKem(p, _) => p.encapsulation_key_size(),
-            Scheme::XWing => xwing::PUBLIC_KEY_SIZE,
             Scheme::Frodo(p) => p.public_key_size(),
         }
     }
@@ -116,7 +108,6 @@ impl KemAlgorithm {
     pub const fn ciphertext_size(&self) -> usize {
         match self.scheme {
             Scheme::MlKem(p, _) => p.ciphertext_size(),
-            Scheme::XWing => xwing::CIPHERTEXT_SIZE,
             Scheme::Frodo(p) => p.ciphertext_size(),
         }
     }
@@ -168,7 +159,6 @@ impl KemAlgorithm {
 
         let valid = match self.scheme {
             Scheme::MlKem(p, _) => mlkem::check_encapsulation_key(&key, &p),
-            Scheme::XWing => xwing::check_public_key(&key),
             // Every bit pattern of the right length is a FrodoKEM public key.
             Scheme::Frodo(_) => true,
         };
@@ -277,17 +267,6 @@ impl KemAlgorithm {
 
                 self.private_key(public, secret)
             }
-            Scheme::XWing => {
-                let expanded = xwing::expand(seed);
-
-                let secret = Secret::XWing {
-                    seed: SecretBytes::concat(&[seed]),
-                    dk: expanded.dk,
-                    scalar: expanded.scalar,
-                };
-
-                self.private_key(expanded.public, secret)
-            }
             Scheme::Frodo(p) => self.frodo_key(p, frodokem::keygen(&p, seed)),
         }
     }
@@ -317,7 +296,6 @@ impl KemAlgorithm {
     pub(crate) const fn seed_size(&self) -> usize {
         match self.scheme {
             Scheme::MlKem(..) => ML_KEM_SEED_SIZE,
-            Scheme::XWing => xwing::SEED_SIZE,
             Scheme::Frodo(p) => p.seed_size(),
         }
     }
@@ -325,7 +303,6 @@ impl KemAlgorithm {
     pub(crate) const fn randomness_size(&self) -> usize {
         match self.scheme {
             Scheme::MlKem(..) => ML_KEM_RANDOMNESS_SIZE,
-            Scheme::XWing => xwing::RANDOMNESS_SIZE,
             Scheme::Frodo(p) => p.randomness_size(),
         }
     }
@@ -333,7 +310,7 @@ impl KemAlgorithm {
     fn oid(&self) -> Option<&[u8]> {
         match &self.scheme {
             Scheme::MlKem(_, oid) => Some(oid),
-            Scheme::XWing | Scheme::Frodo(_) => None,
+            Scheme::Frodo(_) => None,
         }
     }
 }
@@ -353,8 +330,7 @@ struct PublicPart {
     expanded: OnceBox<Form>,
 }
 
-// The ML-KEM form of a key, X-Wing's ML-KEM part included, or the pkh of a FrodoKEM key, which never
-// keeps its matrix.
+// The ML-KEM form of a key, or the pkh of a FrodoKEM key, which never keeps its matrix.
 #[derive(Clone)]
 enum Form {
     MlKem(mlkem::EncapsulationKey),
@@ -382,12 +358,10 @@ impl PublicPart {
     }
 }
 
-// For a valid public key: the ML-KEM form of it, for X-Wing of its ML-KEM part, and pkh for
-// FrodoKEM.
+// For a valid public key: the ML-KEM form of it, and pkh for FrodoKEM.
 fn expand(scheme: Scheme, key: &[u8]) -> Form {
     match scheme {
         Scheme::MlKem(p, _) => Form::MlKem(mlkem::EncapsulationKey::new(key, &p)),
-        Scheme::XWing => Form::MlKem(xwing::encapsulation_key(key)),
         Scheme::Frodo(p) => Form::Frodo(frodokem::public_key_hash(&p, key)),
     }
 }
@@ -441,7 +415,9 @@ impl KemPublicKey {
                 randomness,
             ),
             (Scheme::MlKem(p, _), _) => mlkem::encaps_internal(form.mlkem(), randomness, &p),
-            _ => xwing::encapsulate(form.mlkem(), &self.public.key, randomness),
+            (Scheme::Frodo(_), Form::MlKem(_)) => {
+                unreachable!("a FrodoKEM scheme has a FrodoKEM form")
+            }
         };
 
         let encapsulation = Encapsulation {
@@ -487,22 +463,16 @@ enum Secret {
         seed: Option<SecretBytes>,
         dk: SecretBytes,
     },
-    XWing {
-        seed: SecretBytes,
-        dk: SecretBytes,
-        scalar: SecretBytes,
-    },
     Frodo {
         sk: SecretBytes,
     },
 }
 
 impl Secret {
-    // The form of the ML-KEM decapsulation key, X-Wing's included, that decapsulation uses.
+    // The form of the ML-KEM decapsulation key that decapsulation uses.
     fn decode(&self) -> mlkem::DecapsulationKey {
         match self {
             Self::MlKem { params, dk, .. } => mlkem::DecapsulationKey::new(dk, params),
-            Self::XWing { dk, .. } => xwing::decapsulation_key(dk),
             Self::Frodo { .. } => unreachable!("FrodoKEM keys decode nothing"),
         }
     }
@@ -544,24 +514,14 @@ impl KemPrivateKey {
 
                 frodokem::decapsulate(&p, sk, ciphertext)
             }
-            (secret, Some(decoded)) => {
+            (Secret::MlKem { params, dk, .. }, Some(decoded)) => {
                 let public = self.public.expanded(self.algorithm.scheme).mlkem();
 
-                let decoded = decoded.get_or_init(|| secret.decode());
+                let decoded = decoded.get_or_init(|| self.secret.decode());
 
-                match secret {
-                    Secret::MlKem { params, dk, .. } => {
-                        mlkem::decaps_internal(public, decoded, dk, ciphertext, params)
-                    }
-                    Secret::XWing { dk, scalar, .. } => {
-                        let pk_x = xwing::public_point(&self.public.key);
-
-                        xwing::decapsulate(public, decoded, dk, scalar, pk_x, ciphertext)
-                    }
-                    Secret::Frodo { .. } => unreachable!("handled above"),
-                }
+                mlkem::decaps_internal(public, decoded, dk, ciphertext, params)
             }
-            (_, None) => unreachable!("ML-KEM and X-Wing keys decode their secret"),
+            (Secret::MlKem { .. }, None) => unreachable!("ML-KEM keys decode their secret"),
         };
 
         let out = shared_secret[..self.algorithm.shared_secret_size()].to_vec();
@@ -579,8 +539,7 @@ impl KemPrivateKey {
         match &self.secret {
             Secret::MlKem {
                 seed: Some(seed), ..
-            }
-            | Secret::XWing { seed, .. } => export_private(format, oid, &encode_seed(seed), seed),
+            } => export_private(format, oid, &encode_seed(seed), seed),
             Secret::MlKem { seed: None, dk, .. } => {
                 export_private(format, oid, &encode_expanded(dk), dk)
             }
@@ -621,7 +580,7 @@ mod tests {
     // shares one public part.
     #[test]
     fn caches_fill_on_first_use_and_are_shared() {
-        for algorithm in [ML_KEM_512, ML_KEM_768, ML_KEM_1024, X_WING] {
+        for algorithm in [ML_KEM_512, ML_KEM_768, ML_KEM_1024] {
             let seed = [7; 64];
 
             let pair = hazmat::generate_kem_key_pair(algorithm, &seed[..algorithm.seed_size()])

@@ -64,11 +64,7 @@ mod stateful;
 
 mod wipe;
 
-mod x25519;
-
 mod xmss;
-
-mod xwing;
 
 pub use cpu::enable_data_independent_timing;
 pub use error::Error;
@@ -84,7 +80,6 @@ pub use kem::{
     EFRODOKEM_976_AES, EFRODOKEM_976_SHAKE, EFRODOKEM_1344_AES, EFRODOKEM_1344_SHAKE,
     Encapsulation, FRODOKEM_976_AES, FRODOKEM_976_SHAKE, FRODOKEM_1344_AES, FRODOKEM_1344_SHAKE,
     KemAlgorithm, KemKeyPair, KemPrivateKey, KemPublicKey, ML_KEM_512, ML_KEM_768, ML_KEM_1024,
-    X_WING,
 };
 pub use keys::{KeyFormat, KeyGenOptions};
 pub use mac::{
@@ -109,14 +104,6 @@ pub use stateful::{
 #[doc(hidden)]
 pub mod ct_check {
     pub use crate::ct::{declassify, secret};
-
-    pub fn x25519(scalar: &[u8], u: &[u8]) -> [u8; 32] {
-        crate::x25519::x25519(scalar, u)
-    }
-
-    pub fn x25519_base(scalar: &[u8]) -> [u8; 32] {
-        crate::x25519::x25519_base(scalar)
-    }
 
     // The key expansion and the encryption of the blocks, in place, under the AES instructions
     // where the CPU has them and in the portable code otherwise.

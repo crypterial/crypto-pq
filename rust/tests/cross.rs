@@ -12,14 +12,14 @@ use crypto_pq::{
     SLH_DSA_SHAKE_128F, SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S,
     SLH_DSA_SHAKE_256F, SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, StateStore,
     StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters, StatefulSignatureAlgorithm,
-    VerifyOptions, X_WING, XMSS, XMSS_MT, hazmat,
+    VerifyOptions, XMSS, XMSS_MT, hazmat,
 };
 use vectors::{Fields, der, parallel, records, unhex};
 
 // The vectors under vectors/cross were computed by the Python reference: keys and their
 // encodings, hazmat signatures with every pre-hash, implicit rejection, state blobs, and the
 // error code of every malformed input.
-const KEMS: [KemAlgorithm; 4] = [ML_KEM_512, ML_KEM_768, ML_KEM_1024, X_WING];
+const KEMS: [KemAlgorithm; 3] = [ML_KEM_512, ML_KEM_768, ML_KEM_1024];
 
 const SIGNATURES: [SignatureAlgorithm; 15] = [
     ML_DSA_44,
@@ -178,9 +178,20 @@ impl StateStore for MemoryStore {
     }
 }
 
+// TEMPORARY: the shared cross files keep their X-Wing groups until every language has removed
+// X-Wing. SPEC section 4 (Scope, 4.2) excludes it from crypto-pq 1.0 and the Rust crate no longer
+// has it, so these runners skip exactly those groups; delete this when the files drop them.
+fn in_scope(name: &str, field: &str) -> Vec<(Fields, Fields)> {
+    let mut found = records(name, field);
+
+    found.retain(|(header, _)| header.get("algorithm").map(String::as_str) != Some("X-Wing"));
+
+    found
+}
+
 #[test]
 fn kem() {
-    parallel(&records("cross/kem.txt", "seed"), |(header, record)| {
+    parallel(&in_scope("cross/kem.txt", "seed"), |(header, record)| {
         let algorithm = kem_algorithm(&header["algorithm"]);
 
         let context = format!("{} tcId {}", algorithm.name(), record["tcId"]);
@@ -872,7 +883,7 @@ fn execute(header: &Fields, record: &Fields) -> Outcome {
 fn errors() {
     let failures = Mutex::new(Vec::new());
 
-    let cases = records("cross/errors.txt", "result");
+    let cases = in_scope("cross/errors.txt", "result");
 
     parallel(&cases, |(header, record)| {
         let outcome = execute(header, record);

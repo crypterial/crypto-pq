@@ -17,8 +17,8 @@ use crypto_pq::{
     SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F, SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F,
     SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F, SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm,
     SignaturePrivateKey, SignaturePublicKey, StateStore, StatefulKeyGenOptions,
-    StatefulLoadOptions, StatefulParameters, StatefulSignatureAlgorithm, VerifyOptions, X_WING,
-    XMSS, XMSS_MT, XofAlgorithm, hazmat,
+    StatefulLoadOptions, StatefulParameters, StatefulSignatureAlgorithm, VerifyOptions, XMSS,
+    XMSS_MT, XofAlgorithm, hazmat,
 };
 
 // Counts the bytes that each thread holds, so that a test can bound what one call allocates.
@@ -403,11 +403,10 @@ fn expect_codes<T>(
 
 const FORMATS: [KeyFormat; 3] = [KeyFormat::Raw, KeyFormat::Der, KeyFormat::Pem];
 
-const KEMS: [KemAlgorithm; 12] = [
+const KEMS: [KemAlgorithm; 11] = [
     ML_KEM_512,
     ML_KEM_768,
     ML_KEM_1024,
-    X_WING,
     FRODOKEM_976_AES,
     FRODOKEM_976_SHAKE,
     FRODOKEM_1344_AES,
@@ -462,7 +461,6 @@ fn kem_sizes(algorithm: KemAlgorithm) -> (usize, usize) {
     let secret = algorithm.shared_secret_size();
 
     match algorithm.name() {
-        "X-Wing" => (32, 64),
         name if name.starts_with("eFrodoKEM") => (2 * secret + 16, secret),
         name if name.starts_with("FrodoKEM") => (3 * secret + 16, 3 * secret),
         _ => (64, 32),
@@ -508,7 +506,7 @@ fn strength(algorithm: SignatureAlgorithm) -> usize {
 fn kem_codes(algorithm: KemAlgorithm, format: KeyFormat, check: Error) -> Vec<Error> {
     match format {
         KeyFormat::Raw => vec![Error::InvalidLength, check],
-        _ if algorithm == X_WING || is_frodo(algorithm) => vec![Error::Unsupported],
+        _ if is_frodo(algorithm) => vec![Error::Unsupported],
         _ => vec![Error::InvalidEncoding, Error::AlgorithmMismatch, check],
     }
 }
@@ -748,7 +746,7 @@ fn kem_import() {
     for (algorithm, private_key, _, _) in kem_fixtures() {
         let public_key = private_key.public_key();
 
-        let expanded = (algorithm != X_WING && !is_frodo(algorithm)).then(|| {
+        let expanded = (!is_frodo(algorithm)).then(|| {
             algorithm
                 .import_private_key(&expanded_key(algorithm), KeyFormat::Raw)
                 .expect("expanded key")
@@ -758,9 +756,7 @@ fn kem_import() {
             for format in FORMATS {
                 let mut seeds = vec![
                     match (private, format) {
-                        (_, KeyFormat::Der | KeyFormat::Pem)
-                            if algorithm == X_WING || is_frodo(algorithm) =>
-                        {
+                        (_, KeyFormat::Der | KeyFormat::Pem) if is_frodo(algorithm) => {
                             public_key.export_key(KeyFormat::Raw)
                         }
                         (true, _) => private_key.export_key(format),
@@ -2300,10 +2296,12 @@ const TRANSCRIPT_ROUNDS: usize = 96;
 
 const TRANSCRIPT_BUDGET: u64 = 1 << 14;
 
-const TRANSCRIPTS: [&str; 11] = [
+// Each case is known by its number, which also seeds its generator.
+const TRANSCRIPT_CASES: [u64; 10] = [0, 1, 3, 4, 5, 6, 7, 8, 9, 10];
+
+const TRANSCRIPTS: [&str; 10] = [
     "4d454f3aca564e383f51723ee3814f1fe105a61b1fd38c536e2ea675d78fabe7",
     "db3f28b7c8f7949f104d15d6de629e0dea7fca38f38c970d520278617dc99474",
-    "aafe47ac9480c88402b7974385fac0547b2f4d611f36ec692ca2748e5dec949e",
     "ce9fd19a166b8a384fab4dafffed98c85dd9fb7f3e2ab789f33c832cda8b199d",
     "14d657260a5c207db5e73e9dbaac6d3458b0ba16e507f256bea8fac9fd0f2a0a",
     "19d93bae7a287d14492808654d0580f1043443ad3cf6710e043ea34c462b3307",
@@ -2445,8 +2443,6 @@ fn transcripts() {
     let encapsulation =
         hazmat::encapsulate(&kem.public_key, &pattern(32, 0x80)).expect("encapsulation");
 
-    let xwing = hazmat::generate_kem_key_pair(X_WING, &pattern(32, 0)).expect("key");
-
     let dsa = hazmat::generate_signature_key_pair(ML_DSA_44, &pattern(32, 0)).expect("key");
 
     let options = SignOptions {
@@ -2485,18 +2481,6 @@ fn transcripts() {
 
     let kem_private = |data: &[u8], format| {
         ML_KEM_768
-            .import_private_key(data, format)
-            .map(|key| key.export_key(raw).expect("export"))
-    };
-
-    let xwing_public = |data: &[u8], format| {
-        X_WING
-            .import_public_key(data, format)
-            .map(|key| key.export_key(raw).expect("export"))
-    };
-
-    let xwing_private = |data: &[u8], format| {
-        X_WING
             .import_private_key(data, format)
             .map(|key| key.export_key(raw).expect("export"))
     };
@@ -2560,9 +2544,10 @@ fn transcripts() {
 
     slh_seeds.extend(exports(|format| slh.private_key.export_key(format), 1));
 
-    let digests: Vec<String> = (0..11)
-        .map(|case| {
-            let mut rng = Random(101 + case as u64);
+    let digests: Vec<String> = TRANSCRIPT_CASES
+        .iter()
+        .map(|&case| {
+            let mut rng = Random(101 + case);
 
             let mut transcript = Transcript::new();
 
@@ -2581,14 +2566,6 @@ fn transcripts() {
                     &exports(|format| kem.private_key.export_key(format), 0),
                     &[&kem_private],
                 ),
-                2 => {
-                    let seeds = [
-                        (xwing.public_key.export_key(raw).expect("export"), 0, 0),
-                        (xwing.private_key.export_key(raw).expect("export"), 1, 0),
-                    ];
-
-                    import_case(&mut rng, t, &seeds, &[&xwing_public, &xwing_private]);
-                }
                 3 => import_case(
                     &mut rng,
                     t,

@@ -1,8 +1,7 @@
 mod vectors;
 
 use crypto_pq::{
-    Error, KemAlgorithm, KeyFormat, KeyGenOptions, ML_KEM_512, ML_KEM_768, ML_KEM_1024, X_WING,
-    hazmat,
+    Error, KemAlgorithm, KeyFormat, KeyGenOptions, ML_KEM_512, ML_KEM_768, ML_KEM_1024, hazmat,
 };
 use vectors::{der, parallel, records, unhex};
 
@@ -265,7 +264,7 @@ fn wycheproof_expanded_decapsulation() {
 
 #[test]
 fn round_trip() {
-    for algorithm in [ML_KEM_512, ML_KEM_768, ML_KEM_1024, X_WING] {
+    for algorithm in [ML_KEM_512, ML_KEM_768, ML_KEM_1024] {
         let pair = algorithm
             .generate_key_pair(&KeyGenOptions::default())
             .unwrap();
@@ -586,90 +585,6 @@ fn strict_encodings() {
 }
 
 #[test]
-fn x_wing() {
-    for (_, record) in records("xwing/test-vectors.txt", "seed") {
-        let pair = hazmat::generate_kem_key_pair(X_WING, &unhex(&record["seed"])).unwrap();
-
-        let context = format!("seed {}", &record["seed"][..16]);
-
-        let pk = pair.public_key.export_key(KeyFormat::Raw).unwrap();
-
-        assert_eq!(pk, unhex(&record["pk"]), "{context}");
-
-        let sk = pair.private_key.export_key(KeyFormat::Raw).unwrap();
-
-        assert_eq!(sk, unhex(&record["sk"]), "{context}");
-
-        let result = hazmat::encapsulate(&pair.public_key, &unhex(&record["eseed"])).unwrap();
-
-        assert_eq!(result.ciphertext, unhex(&record["ct"]), "{context}");
-
-        assert_eq!(result.shared_secret, unhex(&record["ss"]), "{context}");
-
-        let shared_secret = pair.private_key.decapsulate(&result.ciphertext).unwrap();
-
-        assert_eq!(shared_secret, result.shared_secret, "{context}");
-    }
-
-    let pair = X_WING.generate_key_pair(&KeyGenOptions::default()).unwrap();
-
-    for format in [KeyFormat::Der, KeyFormat::Pem] {
-        assert_eq!(
-            pair.public_key.export_key(format).err(),
-            Some(Error::Unsupported)
-        );
-
-        assert_eq!(
-            pair.private_key.export_key(format).err(),
-            Some(Error::Unsupported)
-        );
-
-        assert_eq!(
-            X_WING.import_private_key(b"", format).err(),
-            Some(Error::Unsupported)
-        );
-
-        assert_eq!(
-            X_WING.import_public_key(b"", format).err(),
-            Some(Error::Unsupported)
-        );
-    }
-
-    let raw = pair.private_key.export_key(KeyFormat::Raw).unwrap();
-
-    let imported = X_WING.import_private_key(&raw, KeyFormat::Raw).unwrap();
-
-    assert_eq!(imported.public_key(), pair.public_key);
-
-    assert_eq!(
-        X_WING.import_private_key(&raw[1..], KeyFormat::Raw).err(),
-        Some(Error::InvalidLength)
-    );
-
-    let pk = pair.public_key.export_key(KeyFormat::Raw).unwrap();
-
-    assert_eq!(
-        X_WING.import_public_key(&pk[1..], KeyFormat::Raw).err(),
-        Some(Error::InvalidLength)
-    );
-
-    let mut overflow = pk.clone();
-
-    overflow[0] = 0xFF;
-
-    overflow[1] |= 0x0F;
-
-    assert_eq!(
-        X_WING.import_public_key(&overflow, KeyFormat::Raw).err(),
-        Some(Error::InvalidPublicKey)
-    );
-
-    let hazmat_result = hazmat::encapsulate(&pair.public_key, &[0; 32]);
-
-    assert_eq!(hazmat_result.err(), Some(Error::InvalidLength));
-}
-
-#[test]
 fn errors_and_debug() {
     assert_eq!(Error::InvalidLength.code(), "INVALID_LENGTH");
 
@@ -687,11 +602,9 @@ fn errors_and_debug() {
 
     assert_eq!(ML_KEM_768.name(), "ML-KEM-768");
 
-    assert_eq!(X_WING.name(), "X-Wing");
-
     assert_eq!(
-        (X_WING.public_key_size(), X_WING.ciphertext_size()),
-        (1216, 1120)
+        (ML_KEM_768.public_key_size(), ML_KEM_768.ciphertext_size()),
+        (1184, 1088)
     );
 
     assert_eq!(
@@ -710,54 +623,53 @@ fn concurrent_first_use() {
 
     shareable::<crypto_pq::KemPrivateKey>();
 
-    for (algorithm, seed_size) in [(ML_KEM_768, 64), (X_WING, 32)] {
-        let pair = hazmat::generate_kem_key_pair(algorithm, &vec![8; seed_size]).unwrap();
+    let algorithm = ML_KEM_768;
 
-        let encapsulations: Vec<_> = (0..4)
-            .map(|_| pair.public_key.encapsulate().unwrap())
-            .collect();
+    let pair = hazmat::generate_kem_key_pair(algorithm, &[8; 64]).unwrap();
 
-        let public = pair.public_key.export_key(KeyFormat::Raw).unwrap();
+    let encapsulations: Vec<_> = (0..4)
+        .map(|_| pair.public_key.encapsulate().unwrap())
+        .collect();
 
-        let private = pair.private_key.export_key(KeyFormat::Raw).unwrap();
+    let public = pair.public_key.export_key(KeyFormat::Raw).unwrap();
 
-        for _ in 0..20 {
-            let public_key = algorithm
-                .import_public_key(&public, KeyFormat::Raw)
-                .unwrap();
+    let private = pair.private_key.export_key(KeyFormat::Raw).unwrap();
 
-            let private_key = algorithm
-                .import_private_key(&private, KeyFormat::Raw)
-                .unwrap();
+    for _ in 0..20 {
+        let public_key = algorithm
+            .import_public_key(&public, KeyFormat::Raw)
+            .unwrap();
 
-            let barrier = std::sync::Barrier::new(8);
+        let private_key = algorithm
+            .import_private_key(&private, KeyFormat::Raw)
+            .unwrap();
 
-            std::thread::scope(|scope| {
-                for thread in 0..8 {
-                    let (public_key, private_key, barrier) = (&public_key, &private_key, &barrier);
+        let barrier = std::sync::Barrier::new(8);
 
-                    let (encapsulation, original) =
-                        (&encapsulations[thread % 4], &pair.private_key);
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let (public_key, private_key, barrier) = (&public_key, &private_key, &barrier);
 
-                    scope.spawn(move || {
-                        barrier.wait();
+                let (encapsulation, original) = (&encapsulations[thread % 4], &pair.private_key);
 
-                        if thread % 2 == 0 {
-                            let fresh = public_key.encapsulate().unwrap();
+                scope.spawn(move || {
+                    barrier.wait();
 
-                            assert_eq!(
-                                original.decapsulate(&fresh.ciphertext).unwrap(),
-                                fresh.shared_secret
-                            );
-                        } else {
-                            assert_eq!(
-                                private_key.decapsulate(&encapsulation.ciphertext).unwrap(),
-                                encapsulation.shared_secret
-                            );
-                        }
-                    });
-                }
-            });
-        }
+                    if thread % 2 == 0 {
+                        let fresh = public_key.encapsulate().unwrap();
+
+                        assert_eq!(
+                            original.decapsulate(&fresh.ciphertext).unwrap(),
+                            fresh.shared_secret
+                        );
+                    } else {
+                        assert_eq!(
+                            private_key.decapsulate(&encapsulation.ciphertext).unwrap(),
+                            encapsulation.shared_secret
+                        );
+                    }
+                });
+            }
+        });
     }
 }

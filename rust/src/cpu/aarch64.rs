@@ -265,7 +265,7 @@ impl Drop for Dit {
 
 // MAC and KDF calls take DIT only after enable_data_independent_timing(): it costs 30-54 ns a call
 // on an Apple M3, the whole gap on short MACs, and the prefetcher attacks it stops (GoFetch) need
-// intermediates that a small key guess predicts, which ML-KEM, ML-DSA and X25519 have and keyed
+// intermediates that a small key guess predicts, which ML-KEM and ML-DSA have and keyed
 // SHA-2, Keccak and BLAKE2 states, each a function of the whole key, do not.
 static KEYED: AtomicBool = AtomicBool::new(false);
 

@@ -5,7 +5,7 @@
 // public; results are declassified here before they are compared.
 #![cfg(crypto_pq_ct)]
 
-use crypto_pq::ct_check::{aes_encrypt, declassify, secret, x25519, x25519_base};
+use crypto_pq::ct_check::{aes_encrypt, declassify, secret};
 use crypto_pq::{
     ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_256, BLAKE2B_MAC, BLAKE2S_256, BLAKE2S_MAC,
     BLAKE3, BLAKE3_256, BLAKE3_KDF, BLAKE3_MAC, CSHAKE128, CSHAKE256, EFRODOKEM_976_AES,
@@ -16,7 +16,7 @@ use crypto_pq::{
     ML_DSA_87, ML_KEM_512, ML_KEM_768, ML_KEM_1024, MacAlgorithm, MacOptions, SLH_DSA_SHA2_192F,
     SLH_DSA_SHAKE_128F, SignOptions, SignatureAlgorithm, SignaturePrivateKey, SignaturePublicKey,
     StateStore, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
-    StatefulSignatureAlgorithm, VerifyOptions, X_WING, XMSS_MT, XofOptions, hazmat,
+    StatefulSignatureAlgorithm, VerifyOptions, XMSS_MT, XofOptions, hazmat,
 };
 
 const MESSAGE: &[u8] = b"crypto-pq constant-time check";
@@ -91,8 +91,6 @@ fn kems() {
     for algorithm in [ML_KEM_512, ML_KEM_768, ML_KEM_1024] {
         kem(algorithm, 64, 32);
     }
-
-    kem(X_WING, 32, 64);
 }
 
 const FRODO: [(KemAlgorithm, usize, usize); 8] = [
@@ -143,66 +141,6 @@ fn unhex(text: &str) -> Vec<u8> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
         .collect()
-}
-
-// RFC 7748, section 6.1, with both private keys secret.
-#[test]
-fn x25519_alone() {
-    let alice = unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
-
-    let bob = unhex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
-
-    secret(&alice);
-
-    secret(&bob);
-
-    let mut base = [0; 32];
-
-    base[0] = 9;
-
-    let alice_public = x25519(&alice, &base);
-
-    declassify(&alice_public);
-
-    let shared = x25519(&bob, &alice_public);
-
-    declassify(&shared);
-
-    assert_eq!(
-        shared.to_vec(),
-        unhex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
-    );
-}
-
-// The fixed-base path selects table entries by the secret digits of the scalar: every entry is
-// read and masked, so no branch or index depends on them. The filled scalars have digits 0, -8
-// and 8, the ends of the selection.
-#[test]
-fn x25519_base_alone() {
-    let alice = unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
-
-    secret(&alice);
-
-    let public = x25519_base(&alice);
-
-    declassify(&public);
-
-    assert_eq!(
-        public.to_vec(),
-        unhex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
-    );
-
-    let mut base = [0; 32];
-
-    base[0] = 9;
-
-    for fill in [0x00, 0x88, 0xFF] {
-        let scalar = [fill; 32];
-
-        secret(&scalar);
-
-        assert!(same(&x25519_base(&scalar), &x25519(&scalar, &base)));
-    }
 }
 
 fn signature(algorithm: SignatureAlgorithm, seed_size: usize, randomness_size: usize) {

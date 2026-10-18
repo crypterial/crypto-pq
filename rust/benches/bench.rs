@@ -11,7 +11,7 @@ use crypto_pq::{
     SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F,
     SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, StateStore, StatefulKeyGenOptions,
     StatefulLoadOptions, StatefulParameters, StatefulPrivateKey, StatefulSignatureAlgorithm,
-    VerifyOptions, X_WING, XMSS, XMSS_MT, XofAlgorithm, XofOptions, hazmat,
+    VerifyOptions, XMSS, XMSS_MT, XofAlgorithm, XofOptions, hazmat,
 };
 
 const MIN_TIME: Duration = Duration::from_secs(1);
@@ -582,8 +582,6 @@ fn main() {
     for algorithm in [ML_KEM_512, ML_KEM_768, ML_KEM_1024] {
         kem(&runner, algorithm, 64, 32);
     }
-
-    kem(&runner, X_WING, 32, 64);
 
     for algorithm in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
         signature(&runner, algorithm, 32, true);

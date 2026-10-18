@@ -9,8 +9,7 @@ use core::sync::atomic::{Ordering, compiler_fence};
 // buffer, so no store can be dropped as dead. (Volatile stores of whole arrays were each built in
 // a temporary first and copied, a store-to-load dependency per sixteen bytes.) Up to eight values
 // of at most a word get a volatile store each instead: an address given to the assembly pins a
-// variable to memory for its whole life, and the X25519 ladder's, kept there, made X-Wing 2.5%
-// slower.
+// variable to memory for its whole life, which slows the loops that would keep it in registers.
 #[cfg(any(
     target_arch = "aarch64",
     target_arch = "arm",
