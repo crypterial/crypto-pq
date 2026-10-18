@@ -14,7 +14,9 @@ pub enum KeyFormat {
     Pem,
 }
 
+// self_test: the pairwise consistency test of SPEC 14.4, on by default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct KeyGenOptions {
     pub self_test: bool,
 }
@@ -22,6 +24,15 @@ pub struct KeyGenOptions {
 impl Default for KeyGenOptions {
     fn default() -> Self {
         Self { self_test: true }
+    }
+}
+
+impl KeyGenOptions {
+    #[must_use]
+    pub const fn with_self_test(mut self, self_test: bool) -> Self {
+        self.self_test = self_test;
+
+        self
     }
 }
 
@@ -72,13 +83,7 @@ pub(crate) fn import_public(
         data
     };
 
-    let (found, key) = decode_public_key(data)?;
-
-    if found != expected {
-        return Err(Error::AlgorithmMismatch);
-    }
-
-    Ok(key.to_vec())
+    Ok(decode_public_key(data, expected)?.to_vec())
 }
 
 pub(crate) fn export_private(
@@ -86,12 +91,15 @@ pub(crate) fn export_private(
     oid: Option<&[u8]>,
     octets: &[u8],
     raw: &[u8],
-) -> Result<Vec<u8>, Error> {
+) -> Result<SecretBytes, Error> {
     match (format, oid) {
-        (KeyFormat::Raw, _) => Ok(raw.to_vec()),
+        (KeyFormat::Raw, _) => Ok(SecretBytes::concat(&[raw])),
         (_, None) => Err(Error::Unsupported),
-        (KeyFormat::Der, Some(oid)) => Ok(encode_private_key(oid, octets).to_vec()),
-        (KeyFormat::Pem, Some(oid)) => Ok(pem_encode(PRIVATE, &encode_private_key(oid, octets))),
+        (KeyFormat::Der, Some(oid)) => Ok(encode_private_key(oid, octets)),
+        (KeyFormat::Pem, Some(oid)) => Ok(SecretBytes::from_vec(pem_encode(
+            PRIVATE,
+            &encode_private_key(oid, octets),
+        ))),
     }
 }
 
@@ -124,11 +132,7 @@ pub(crate) fn import_private(
         data
     };
 
-    let info = decode_private_key(data)?;
-
-    if info.oid != expected {
-        return Err(Error::AlgorithmMismatch);
-    }
+    let info = decode_private_key(data, expected)?;
 
     Ok(PrivateInput::Pkcs8 {
         key: SecretBytes::concat(&[info.key]),

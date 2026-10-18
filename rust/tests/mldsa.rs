@@ -104,8 +104,8 @@ fn acvp_key_generation() {
             );
 
             assert_eq!(
-                pair.private_key.export_key(KeyFormat::Raw).unwrap(),
-                seed,
+                *pair.private_key.export_key(KeyFormat::Raw).unwrap(),
+                *seed,
                 "{context}"
             );
 
@@ -114,8 +114,8 @@ fn acvp_key_generation() {
             assert_eq!(expanded.public_key(), pair.public_key, "{context}");
 
             assert_eq!(
-                expanded.export_key(KeyFormat::Raw).unwrap(),
-                sk,
+                *expanded.export_key(KeyFormat::Raw).unwrap(),
+                *sk,
                 "{context}"
             );
 
@@ -127,8 +127,8 @@ fn acvp_key_generation() {
             let imported = algorithm.import_private_key(&both, KeyFormat::Der).unwrap();
 
             assert_eq!(
-                imported.export_key(KeyFormat::Raw).unwrap(),
-                seed,
+                *imported.export_key(KeyFormat::Raw).unwrap(),
+                *seed,
                 "{context}"
             );
 
@@ -186,20 +186,17 @@ fn check_signature_generation(name: &str) {
 
         let (message, context_bytes) = (unhex(&record["message"]), unhex(&record["context"]));
 
-        let options = SignOptions {
-            context: &context_bytes,
-            pre_hash: pre_hash(header, record),
-            ..SignOptions::default()
-        };
+        let mut options = SignOptions::default().with_context(&context_bytes);
+
+        options.pre_hash = pre_hash(header, record);
 
         let signature = hazmat::sign(&private_key, &message, &randomness, &options).unwrap();
 
         assert_eq!(signature, unhex(&record["signature"]), "{context}");
 
-        let options = VerifyOptions {
-            context: &context_bytes,
-            pre_hash: pre_hash(header, record),
-        };
+        let mut options = VerifyOptions::default().with_context(&context_bytes);
+
+        options.pre_hash = pre_hash(header, record);
 
         let public_key = private_key.public_key();
 
@@ -221,10 +218,9 @@ fn acvp_signature_verification() {
 
             let context = unhex(&record["context"]);
 
-            let options = VerifyOptions {
-                context: &context,
-                pre_hash: pre_hash(header, record),
-            };
+            let mut options = VerifyOptions::default().with_context(&context);
+
+            options.pre_hash = pre_hash(header, record);
 
             let result = hazmat::verify(
                 &public_key,
@@ -275,10 +271,7 @@ fn wycheproof_verification() {
 
             let context_bytes = unhex(record.get("ctx").map_or("", String::as_str));
 
-            let options = VerifyOptions {
-                context: &context_bytes,
-                ..VerifyOptions::default()
-            };
+            let options = VerifyOptions::default().with_context(&context_bytes);
 
             let result =
                 public_key.verify(&unhex(&record["sig"]), &unhex(&record["msg"]), &options);
@@ -288,14 +281,37 @@ fn wycheproof_verification() {
     );
 }
 
+// The tests that give only mu are external-mu signing, which crypto-pq does not expose (SPEC
+// 9.1.5); SPEC 19.4 permits leaving them out if they are counted and reported.
+fn without_external_mu<'a>(
+    name: &str,
+    found: &'a [(Fields, Fields)],
+    expected: usize,
+) -> Vec<&'a (Fields, Fields)> {
+    let (signing, external_mu): (Vec<_>, Vec<_>) = found
+        .iter()
+        .partition(|(_, record)| record.contains_key("msg"));
+
+    println!("{name}: {} external-mu tests left out", external_mu.len());
+
+    assert_eq!(external_mu.len(), expected, "{name}");
+
+    assert!(
+        external_mu
+            .iter()
+            .all(|(_, record)| record.contains_key("mu"))
+    );
+
+    signing
+}
+
 #[test]
 fn wycheproof_deterministic_signing() {
-    let found = records("wycheproof/mldsa_sign_seed.txt", "tcId");
+    let name = "wycheproof/mldsa_sign_seed.txt";
 
-    let signing: Vec<_> = found
-        .iter()
-        .filter(|(_, record)| record.contains_key("msg"))
-        .collect();
+    let found = records(name, "tcId");
+
+    let signing = without_external_mu(name, &found, 42);
 
     parallel(&signing, |(header, record)| {
         let algorithm = algorithm(&header["parameterSet"]);
@@ -328,20 +344,14 @@ fn wycheproof_deterministic_signing() {
     });
 }
 
-// Signing with expanded private keys. The tests that give only mu are external-mu signing, which
-// crypto-pq does not expose (SPEC 9.1.5); they are counted and left out.
+// Signing with expanded private keys.
 #[test]
 fn wycheproof_expanded_key_signing() {
-    let found = records("wycheproof/mldsa_sign_noseed.txt", "tcId");
+    let name = "wycheproof/mldsa_sign_noseed.txt";
 
-    let (signing, external_mu): (Vec<_>, Vec<_>) = found
-        .iter()
-        .partition(|(_, record)| record.contains_key("msg"));
+    let found = records(name, "tcId");
 
-    println!(
-        "wycheproof/mldsa_sign_noseed.txt: {} external-mu tests left out",
-        external_mu.len()
-    );
+    let signing = without_external_mu(name, &found, 27);
 
     parallel(&signing, |(header, record)| {
         let algorithm = algorithm(&header["parameterSet"]);
@@ -391,19 +401,13 @@ fn check_wycheproof_signing(
     let flags = record.get("flags").map_or("", String::as_str);
 
     if flags.contains("InvalidContext") {
-        let options = SignOptions {
-            context: &context_bytes,
-            ..SignOptions::default()
-        };
+        let options = SignOptions::default().with_context(&context_bytes);
 
         let result = private_key.sign(&message, &options);
 
         assert_eq!(result.err(), Some(Error::InvalidContext), "{context}");
     } else if flags.contains("Randomized") {
-        let options = VerifyOptions {
-            context: &context_bytes,
-            ..VerifyOptions::default()
-        };
+        let options = VerifyOptions::default().with_context(&context_bytes);
 
         assert!(
             private_key
@@ -412,11 +416,9 @@ fn check_wycheproof_signing(
             "{context}"
         );
     } else {
-        let options = SignOptions {
-            context: &context_bytes,
-            deterministic: true,
-            ..SignOptions::default()
-        };
+        let options = SignOptions::default()
+            .with_context(&context_bytes)
+            .with_deterministic(true);
 
         let signature = private_key.sign(&message, &options).unwrap();
 
@@ -428,7 +430,7 @@ fn check_wycheproof_signing(
 // inconsistent seed and expanded keys of C.4 must be refused.
 #[test]
 fn rfc9881_example_keys() {
-    example_keys("rfc/mldsa_keys.txt", &[], |record, data, format| {
+    example_keys("rfc/mldsa_keys.txt", |record, data, format| {
         let algorithm = algorithm(&record["algorithm"]);
 
         if record["kind"] == "public" {
@@ -443,7 +445,7 @@ fn rfc9881_example_keys() {
 
             Ok((
                 key.public_key().export_key(KeyFormat::Raw)?,
-                key.export_key(KeyFormat::Der)?,
+                key.export_key(KeyFormat::Der)?.to_vec(),
             ))
         }
     });
@@ -460,15 +462,9 @@ fn round_trip() {
 
         let message = b"message";
 
-        let with_context = SignOptions {
-            context: b"context",
-            ..SignOptions::default()
-        };
+        let with_context = SignOptions::default().with_context(b"context");
 
-        let verify_context = VerifyOptions {
-            context: b"context",
-            ..VerifyOptions::default()
-        };
+        let verify_context = VerifyOptions::default().with_context(b"context");
 
         let plain = VerifyOptions::default();
 
@@ -488,27 +484,18 @@ fn round_trip() {
 
         let long = [0; 256];
 
-        let long_context = VerifyOptions {
-            context: &long,
-            ..VerifyOptions::default()
-        };
+        let long_context = VerifyOptions::default().with_context(&long);
 
         assert!(!public_key.verify(&signature, message, &long_context));
 
-        let long_signing = SignOptions {
-            context: &long,
-            ..SignOptions::default()
-        };
+        let long_signing = SignOptions::default().with_context(&long);
 
         assert_eq!(
             private_key.sign(message, &long_signing).err(),
             Some(Error::InvalidContext)
         );
 
-        let deterministic = SignOptions {
-            deterministic: true,
-            ..SignOptions::default()
-        };
+        let deterministic = SignOptions::default().with_deterministic(true);
 
         let first = private_key.sign(message, &deterministic).unwrap();
 
@@ -521,37 +508,26 @@ fn round_trip() {
             private_key.sign(message, &randomized).unwrap()
         );
 
-        let hashed_options = SignOptions {
-            pre_hash: Some(SHA_512.into()),
-            ..SignOptions::default()
-        };
+        let hashed_options = SignOptions::default().with_pre_hash(SHA_512);
 
         let hashed = private_key.sign(message, &hashed_options).unwrap();
 
-        let verify_hashed = VerifyOptions {
-            pre_hash: Some(SHA_512.into()),
-            ..VerifyOptions::default()
-        };
+        let verify_hashed = VerifyOptions::default().with_pre_hash(SHA_512);
 
         assert!(public_key.verify(&hashed, message, &verify_hashed));
 
         assert!(!public_key.verify(&hashed, message, &plain));
 
-        let weak = SignOptions {
-            pre_hash: Some(SHA_224.into()),
-            ..SignOptions::default()
-        };
+        let weak = SignOptions::default().with_pre_hash(SHA_224);
 
         assert_eq!(
             private_key.sign(message, &weak).err(),
             Some(Error::InvalidOption)
         );
 
-        let weak_and_long = SignOptions {
-            context: &long,
-            pre_hash: Some(SHA_224.into()),
-            ..SignOptions::default()
-        };
+        let weak_and_long = SignOptions::default()
+            .with_context(&long)
+            .with_pre_hash(SHA_224);
 
         assert_eq!(
             private_key.sign(message, &weak_and_long).err(),
@@ -592,15 +568,9 @@ fn pre_hash_strength() {
         let public_key = private_key.public_key();
 
         for label in PRE_HASHES {
-            let sign_options = SignOptions {
-                pre_hash: Some(named_pre_hash(label)),
-                ..SignOptions::default()
-            };
+            let sign_options = SignOptions::default().with_pre_hash(named_pre_hash(label));
 
-            let verify_options = VerifyOptions {
-                pre_hash: Some(named_pre_hash(label)),
-                ..VerifyOptions::default()
-            };
+            let verify_options = VerifyOptions::default().with_pre_hash(named_pre_hash(label));
 
             if permitted.contains(&label) {
                 let signature = private_key.sign(b"m", &sign_options).unwrap();
@@ -634,7 +604,7 @@ fn pre_hash_strength() {
 fn formats() {
     for (name, algorithm) in ALGORITHMS {
         let pair = algorithm
-            .generate_key_pair(&KeyGenOptions { self_test: false })
+            .generate_key_pair(&KeyGenOptions::default().with_self_test(false))
             .unwrap();
 
         for format in [KeyFormat::Raw, KeyFormat::Der, KeyFormat::Pem] {
@@ -649,8 +619,8 @@ fn formats() {
             let private_key = algorithm.import_private_key(&exported, format).unwrap();
 
             assert_eq!(
-                private_key.export_key(KeyFormat::Raw).unwrap(),
-                pair.private_key.export_key(KeyFormat::Raw).unwrap(),
+                *private_key.export_key(KeyFormat::Raw).unwrap(),
+                *pair.private_key.export_key(KeyFormat::Raw).unwrap(),
                 "{name}"
             );
         }
@@ -701,17 +671,14 @@ fn expanded_keys() {
         .import_private_key(&expanded_der, KeyFormat::Der)
         .unwrap();
 
-    assert_eq!(expanded.export_key(KeyFormat::Der).unwrap(), expanded_der);
+    assert_eq!(*expanded.export_key(KeyFormat::Der).unwrap(), *expanded_der);
 
     assert_eq!(
         expanded.public_key().export_key(KeyFormat::Raw).unwrap(),
         unhex(&record["pk"])
     );
 
-    let deterministic = SignOptions {
-        deterministic: true,
-        ..SignOptions::default()
-    };
+    let deterministic = SignOptions::default().with_deterministic(true);
 
     let from_seed = hazmat::generate_signature_key_pair(algorithm, &seed)
         .unwrap()
@@ -831,10 +798,7 @@ fn concurrent_first_use() {
 
     shareable::<crypto_pq::SignaturePrivateKey>();
 
-    let options = SignOptions {
-        deterministic: true,
-        ..SignOptions::default()
-    };
+    let options = SignOptions::default().with_deterministic(true);
 
     for algorithm in [ML_DSA_44, ML_DSA_87] {
         let pair = hazmat::generate_signature_key_pair(algorithm, &[9; 32]).unwrap();

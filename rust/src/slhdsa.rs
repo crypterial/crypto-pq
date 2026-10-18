@@ -1079,9 +1079,9 @@ fn prf_msg(p: &Parameters, sk_prf: &[u8], opt_rand: &[u8], message: &[&[u8]]) ->
         engine.read(&mut out[..p.n]);
     } else {
         let mut hmac = if p.n == 16 {
-            HMAC_SHA_256.create(sk_prf)
+            HMAC_SHA_256.create_unchecked(sk_prf)
         } else {
-            HMAC_SHA_512.create(sk_prf)
+            HMAC_SHA_512.create_unchecked(sk_prf)
         };
 
         hmac.update(opt_rand);

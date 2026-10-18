@@ -422,7 +422,12 @@ impl Hasher {
         self.output().root(0, out);
     }
 
-    // The next out.len() bytes of the output; no update follows.
+    // How many more bytes read can give: the output of one hasher ends after 2^64 - 1 bytes.
+    pub(crate) const fn output_left(&self) -> u64 {
+        u64::MAX - self.offset
+    }
+
+    // The next out.len() bytes of the output, at most output_left(); no update follows.
     pub(crate) fn read(&mut self, out: &mut [u8]) {
         if self.root.is_none() {
             self.root = Some(self.output());
@@ -432,7 +437,7 @@ impl Hasher {
             root.root(self.offset, out);
         }
 
-        self.offset = self.offset.wrapping_add(out.len() as u64);
+        self.offset += out.len() as u64;
     }
 }
 

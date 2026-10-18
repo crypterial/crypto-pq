@@ -9,7 +9,7 @@ use crate::cpu::Dit;
 use crate::ct;
 use crate::error::Error;
 use crate::hash::{
-    Engine, HashAlgorithm, Kind, SHA_224, SHA_256, SHA_384, SHA_512, check_length, field,
+    Engine, HashAlgorithm, Kind, SHA_224, SHA_256, SHA_384, SHA_512, check_length, field, fits_u32,
 };
 use crate::keccak::Keccak;
 use crate::sha2::{self, Sha256, Sha512, finish256, finish512};
@@ -18,6 +18,7 @@ use crate::wipe::wipe;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MacKind {
+    // The tag is the leftmost `size` bytes of the hash output (FIPS 198-1, 5).
     Hmac(HashAlgorithm),
     // The state after cSHAKE's prefix for the function name "KMAC" and the customization.
     Kmac {
@@ -46,15 +47,54 @@ impl fmt::Debug for MacAlgorithm {
     }
 }
 
-// length: the tag size in bytes, None for the default (KMAC128 32, KMAC256 64, BLAKE2b 64,
-// BLAKE2s 32). KMAC takes a customization and xof (KMACXOF); BLAKE2 a salt and personalization.
+// length: the tag size in bytes, None for the default (the hash output for HMAC, KMAC128 32,
+// KMAC256 64, BLAKE2b 64, BLAKE2s 32). KMAC takes a customization and xof (KMACXOF); BLAKE2 a
+// salt and personalization.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MacOptions<'a> {
     pub length: Option<usize>,
     pub customization: &'a [u8],
     pub xof: bool,
     pub salt: &'a [u8],
     pub personalization: &'a [u8],
+}
+
+impl<'a> MacOptions<'a> {
+    #[must_use]
+    pub const fn with_length(mut self, length: usize) -> Self {
+        self.length = Some(length);
+
+        self
+    }
+
+    #[must_use]
+    pub const fn with_customization(mut self, customization: &'a [u8]) -> Self {
+        self.customization = customization;
+
+        self
+    }
+
+    #[must_use]
+    pub const fn with_xof(mut self, xof: bool) -> Self {
+        self.xof = xof;
+
+        self
+    }
+
+    #[must_use]
+    pub const fn with_salt(mut self, salt: &'a [u8]) -> Self {
+        self.salt = salt;
+
+        self
+    }
+
+    #[must_use]
+    pub const fn with_personalization(mut self, personalization: &'a [u8]) -> Self {
+        self.personalization = personalization;
+
+        self
+    }
 }
 
 // RFC 2104: a key longer than a block is replaced by its hash, which `hashed` then holds.
@@ -69,7 +109,7 @@ pub(crate) fn block_key<'a>(
 
     let hashed = &mut hashed[..hash.digest_size];
 
-    hash.digest_into(key, hashed);
+    hash.digest_unchecked(key, hashed);
 
     hashed
 }
@@ -120,7 +160,7 @@ impl MacAlgorithm {
         self.size
     }
 
-    // The algorithm with these options in place of any set before. HMAC takes no options.
+    // The algorithm with these options in place of any set before. HMAC takes a length alone.
     pub fn configure(&self, options: &MacOptions) -> Result<Self, Error> {
         let MacOptions {
             length,
@@ -131,15 +171,28 @@ impl MacAlgorithm {
         } = *options;
 
         let (size, kind) = match self.kind {
-            MacKind::Hmac(_) | MacKind::Blake3 if *options == MacOptions::default() => {
-                return Ok(*self);
+            MacKind::Blake3 if *options == MacOptions::default() => return Ok(*self),
+            MacKind::Blake3 => return Err(Error::InvalidOption),
+            // The 32-bit minimum is KMAC's (SP 800-185, 8.4.2).
+            MacKind::Hmac(hash) => {
+                let size = length.unwrap_or(hash.digest_size);
+
+                let others = MacOptions {
+                    length: None,
+                    ..*options
+                };
+
+                if !(4..=hash.digest_size).contains(&size) || others != MacOptions::default() {
+                    return Err(Error::InvalidOption);
+                }
+
+                (size, MacKind::Hmac(hash))
             }
-            MacKind::Hmac(_) | MacKind::Blake3 => return Err(Error::InvalidOption),
             MacKind::Kmac { rate, .. } => {
                 // SP 800-185, 8.4.2: a tag shall not be shorter than 32 bits.
                 let size = length.unwrap_or(if rate == 168 { 32 } else { 64 });
 
-                if size < 4 || !salt.is_empty() || !personalization.is_empty() {
+                if size < 4 || !fits_u32(size) || !salt.is_empty() || !personalization.is_empty() {
                     return Err(Error::InvalidOption);
                 }
 
@@ -196,42 +249,48 @@ impl MacAlgorithm {
         key.len() >= minimum && key.len() <= maximum
     }
 
-    // The methods without an error result refuse a key of another length as a programming error.
-    fn check_key(&self, key: &[u8]) {
-        let (minimum, maximum) = self.key_sizes();
-
-        assert!(
-            self.key_fits(key),
-            "INVALID_LENGTH: the key of {} must be {} to {} bytes",
-            self.name,
-            minimum,
-            maximum
-        );
+    const fn check_key(&self, key: &[u8]) -> Result<(), Error> {
+        if self.key_fits(key) {
+            Ok(())
+        } else {
+            Err(Error::InvalidLength)
+        }
     }
 
-    pub fn digest(&self, key: &[u8], data: &[u8]) -> Vec<u8> {
+    pub fn digest(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
+        self.check_key(key)?;
+
         let mut out = vec![0; self.size];
 
-        self.digest_into(key, data, &mut out);
+        let _dit = Dit::keyed();
 
-        out
+        self.mac(key, data, &mut out);
+
+        Ok(out)
     }
 
-    pub fn digest_into(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
-        check_length(out.len(), self.size);
+    pub fn digest_into(&self, key: &[u8], data: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        self.check_key(key)?;
 
-        self.check_key(key);
+        check_length(out.len(), self.size)?;
 
         let _dit = Dit::keyed();
 
         self.mac(key, data, out);
+
+        Ok(())
     }
 
-    pub fn create(&self, key: &[u8]) -> Mac {
-        self.check_key(key);
+    pub fn create(&self, key: &[u8]) -> Result<Mac, Error> {
+        self.check_key(key)?;
 
         let _dit = Dit::keyed();
 
+        Ok(self.create_unchecked(key))
+    }
+
+    // create for a key of an accepted length, under the caller's DIT guard.
+    pub(crate) fn create_unchecked(&self, key: &[u8]) -> Mac {
         let engine = match &self.kind {
             MacKind::Hmac(hash) => keyed_hmac(hash, key),
             MacKind::Kmac { prefix, rate, xof } => MacEngine::Kmac {
@@ -249,8 +308,8 @@ impl MacAlgorithm {
         }
     }
 
-    // Constant time over the whole tag, which must have the full length. A key of a length the
-    // algorithm does not take verifies nothing.
+    // Constant time over the whole tag, which must have digest_size() bytes. A key of a length
+    // the algorithm does not take verifies nothing.
     pub fn verify(&self, key: &[u8], data: &[u8], tag: &[u8]) -> bool {
         if !self.key_fits(key) || tag.len() != self.size {
             return false;
@@ -279,9 +338,19 @@ impl MacAlgorithm {
         ct::declassify_value(equal)
     }
 
+    // The tag into out, which has digest_size() bytes.
     fn mac(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
         match &self.kind {
-            MacKind::Hmac(hash) => hmac(hash, key, data, out),
+            MacKind::Hmac(hash) if out.len() == hash.digest_size => hmac(hash, key, data, out),
+            MacKind::Hmac(hash) => {
+                let mut full = [0; 64];
+
+                hmac(hash, key, data, &mut full[..hash.digest_size]);
+
+                out.copy_from_slice(&full[..out.len()]);
+
+                wipe(&mut full);
+            }
             MacKind::Kmac { prefix, rate, xof } => {
                 sp800_185::kmac(prefix, *rate, key, data, *xof, out);
             }
@@ -328,7 +397,11 @@ fn keyed_hmac(hash: &HashAlgorithm, key: &[u8]) -> MacEngine {
 
     wipe(&mut hashed);
 
-    MacEngine::Hmac { inner, outer }
+    MacEngine::Hmac {
+        inner,
+        outer,
+        digest_size: hash.digest_size,
+    }
 }
 
 // HMAC's state after the outer key block, wiped when dropped.
@@ -348,8 +421,15 @@ impl Drop for Outer {
 
 enum MacEngine {
     // The inner engine has absorbed the inner key block and the data so far.
-    Hmac { inner: Engine, outer: Outer },
-    Kmac { engine: Keccak, xof: bool },
+    Hmac {
+        inner: Engine,
+        outer: Outer,
+        digest_size: usize,
+    },
+    Kmac {
+        engine: Keccak,
+        xof: bool,
+    },
     Blake2b(blake2::Engine<u64>),
     Blake2s(blake2::Engine<u32>),
     Blake3(Box<blake3::Hasher>),
@@ -376,17 +456,21 @@ impl Mac {
     pub fn digest(&self) -> Vec<u8> {
         let mut out = vec![0; self.size];
 
-        self.digest_into(&mut out);
+        let _dit = Dit::keyed();
+
+        self.finish(&mut out);
 
         out
     }
 
-    pub fn digest_into(&self, out: &mut [u8]) {
-        check_length(out.len(), self.size);
+    pub fn digest_into(&self, out: &mut [u8]) -> Result<(), Error> {
+        check_length(out.len(), self.size)?;
 
         let _dit = Dit::keyed();
 
         self.finish(out);
+
+        Ok(())
     }
 
     pub fn verify(&self, tag: &[u8]) -> bool {
@@ -419,19 +503,29 @@ impl Mac {
     // itself. The engines that finish here are copies, which their drops wipe.
     fn finish(&self, out: &mut [u8]) {
         match &self.engine {
-            MacEngine::Hmac { inner, outer } => {
+            MacEngine::Hmac {
+                inner,
+                outer,
+                digest_size,
+            } => {
                 let mut digest = [0; 64];
 
-                let inner_digest = &mut digest[..self.size];
+                let mut full = [0; 64];
+
+                let (inner_digest, tag) = (&mut digest[..*digest_size], &mut full[..*digest_size]);
 
                 inner.digest_into(inner_digest);
 
                 match outer {
-                    Outer::Sha256(state) => finish256(state, 64, inner_digest, out),
-                    Outer::Sha512(state) => finish512(state, 128, inner_digest, out),
+                    Outer::Sha256(state) => finish256(state, 64, inner_digest, tag),
+                    Outer::Sha512(state) => finish512(state, 128, inner_digest, tag),
                 }
 
+                out.copy_from_slice(&tag[..out.len()]);
+
                 wipe(&mut digest);
+
+                wipe(&mut full);
             }
             MacEngine::Kmac { engine, xof } => {
                 let mut engine = engine.clone();

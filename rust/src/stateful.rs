@@ -609,10 +609,10 @@ impl StatefulSignatureAlgorithm {
             return Err(Error::InvalidEncoding);
         }
 
-        let key = SecretBytes::from_vec(HMAC_SHA_256.digest(TREE_CACHE_LABEL, seed));
+        let key = SecretBytes::from_vec(HMAC_SHA_256.digest(TREE_CACHE_LABEL, seed)?);
 
         // Whether the cache is authentic is public: loading fails on it.
-        if !ct::declassify_value(ct::equal(&HMAC_SHA_256.digest(&key, body), tag)) {
+        if !ct::declassify_value(ct::equal(&HMAC_SHA_256.digest(&key, body)?, tag)) {
             return Err(Error::InvalidEncoding);
         }
 
@@ -879,9 +879,9 @@ impl<S> StatefulPrivateKey<S> {
         }
 
         // The key of the tag is HKDF-Extract (RFC 5869) of the seed with the label as salt.
-        let key = SecretBytes::from_vec(HMAC_SHA_256.digest(TREE_CACHE_LABEL, &self.seed));
+        let key = SecretBytes::from_vec(HMAC_SHA_256.digest(TREE_CACHE_LABEL, &self.seed)?);
 
-        let tag = HMAC_SHA_256.digest(&key, &cache);
+        let tag = HMAC_SHA_256.digest(&key, &cache)?;
 
         cache.extend_from_slice(&tag);
 

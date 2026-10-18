@@ -1,5 +1,6 @@
 use alloc::vec;
 use alloc::vec::Vec;
+use core::hint::black_box;
 
 use crate::cpu::{self, Field, Field16, Prepare};
 use crate::ct::{self, declassify};
@@ -1120,6 +1121,8 @@ pub(crate) fn check_encapsulation_key(ek: &[u8], p: &Parameters) -> bool {
         })
 }
 
+// SPEC 8.1.4, checks (1) to (3) of an expanded key: H(ek) is the stored h, ek passes the modulus
+// check, and so does the encoding of the secret vector, which is checked without a branch on it.
 pub(crate) fn check_decapsulation_key(dk: &[u8], p: &Parameters) -> bool {
     let k = p.k;
 
@@ -1130,11 +1133,32 @@ pub(crate) fn check_decapsulation_key(dk: &[u8], p: &Parameters) -> bool {
     // dk carries the encapsulation key and its hash, which are public.
     declassify(&dk[384 * k..768 * k + 64]);
 
-    check_encapsulation_key(public_key_of(dk, p), p)
-        && ct::equal(
-            &sha3_256(&[public_key_of(dk, p)]),
-            &dk[768 * k + 32..768 * k + 64],
-        )
+    let ek = public_key_of(dk, p);
+
+    ct::equal(&sha3_256(&[ek]), &dk[768 * k + 32..768 * k + 64])
+        && check_encapsulation_key(ek, p)
+        && canonical_secret(&dk[..384 * k])
+}
+
+// Whether every 12-bit coefficient of the encoded secret vector is below q: q - 1 - d wraps to a
+// value with its top bit set exactly for d >= q. Only the outcome is declassified, as the import
+// fails on it.
+fn canonical_secret(s: &[u8]) -> bool {
+    let mut high = 0;
+
+    for polynomial in s.as_chunks::<384>().0 {
+        for chunk in polynomial.as_chunks::<3>().0 {
+            let d1 = u32::from(chunk[0]) | (u32::from(chunk[1] & 0x0F) << 8);
+
+            let d2 = u32::from(chunk[1] >> 4) | (u32::from(chunk[2]) << 4);
+
+            high |= (Q - 1).wrapping_sub(d1) | (Q - 1).wrapping_sub(d2);
+        }
+
+        high = black_box(high);
+    }
+
+    ct::declassify_value(high >> 31) == 0
 }
 
 pub(crate) fn public_key_of<'a>(dk: &'a [u8], p: &Parameters) -> &'a [u8] {

@@ -207,8 +207,8 @@ fn kem() {
         );
 
         assert_eq!(
-            pair.private_key.export_key(KeyFormat::Raw).unwrap(),
-            seed,
+            *pair.private_key.export_key(KeyFormat::Raw).unwrap(),
+            *seed,
             "{context}"
         );
 
@@ -237,16 +237,16 @@ fn kem() {
                 let encoded = field(record, &format!("privateKey{suffix}"));
 
                 assert_eq!(
-                    pair.private_key.export_key(format).unwrap(),
-                    encoded,
+                    *pair.private_key.export_key(format).unwrap(),
+                    *encoded,
                     "{context}"
                 );
 
                 let imported = algorithm.import_private_key(&encoded, format).unwrap();
 
                 assert_eq!(
-                    imported.export_key(KeyFormat::Raw).unwrap(),
-                    seed,
+                    *imported.export_key(KeyFormat::Raw).unwrap(),
+                    *seed,
                     "{context}"
                 );
             }
@@ -263,8 +263,8 @@ fn kem() {
                 .unwrap();
 
             assert_eq!(
-                key.export_key(KeyFormat::Raw).unwrap(),
-                expanded,
+                *key.export_key(KeyFormat::Raw).unwrap(),
+                *expanded,
                 "{context}"
             );
 
@@ -273,13 +273,13 @@ fn kem() {
             for (format, suffix) in ENCODINGS {
                 let encoded = field(record, &format!("expandedKey{suffix}"));
 
-                assert_eq!(key.export_key(format).unwrap(), encoded, "{context}");
+                assert_eq!(*key.export_key(format).unwrap(), *encoded, "{context}");
 
                 let imported = algorithm.import_private_key(&encoded, format).unwrap();
 
                 assert_eq!(
-                    imported.export_key(KeyFormat::Raw).unwrap(),
-                    expanded,
+                    *imported.export_key(KeyFormat::Raw).unwrap(),
+                    *expanded,
                     "{context}"
                 );
             }
@@ -289,8 +289,8 @@ fn kem() {
                 .unwrap();
 
             assert_eq!(
-                both.export_key(KeyFormat::Der).unwrap(),
-                private_der,
+                *both.export_key(KeyFormat::Der).unwrap(),
+                *private_der,
                 "{context}"
             );
 
@@ -308,20 +308,20 @@ fn kem() {
 
         let shared_secret = field(record, "sharedSecret");
 
-        assert_eq!(encapsulation.shared_secret, shared_secret, "{context}");
+        assert_eq!(*encapsulation.shared_secret, *shared_secret, "{context}");
 
         keys.push(pair.private_key);
 
         for key in &keys {
             let decapsulated = key.decapsulate(&encapsulation.ciphertext).unwrap();
 
-            assert_eq!(decapsulated, shared_secret, "{context}");
+            assert_eq!(*decapsulated, *shared_secret, "{context}");
 
             let rejected = key
                 .decapsulate(&field(record, "tamperedCiphertext"))
                 .unwrap();
 
-            assert_eq!(rejected, field(record, "rejectedSecret"), "{context}");
+            assert_eq!(*rejected, *field(record, "rejectedSecret"), "{context}");
         }
     });
 }
@@ -351,11 +351,11 @@ fn check_signatures(name: &str) {
 
         let pre_hash = pre_hash(&record["preHash"]);
 
-        let options = SignOptions {
-            context: &context_bytes,
-            deterministic: true,
-            pre_hash,
-        };
+        let mut options = SignOptions::default()
+            .with_context(&context_bytes)
+            .with_deterministic(true);
+
+        options.pre_hash = pre_hash;
 
         let signature = if record["mode"] == "hazmat" {
             let randomness = field(record, "randomness");
@@ -367,10 +367,9 @@ fn check_signatures(name: &str) {
 
         assert_eq!(signature, field(record, "signature"), "{context}");
 
-        let options = VerifyOptions {
-            context: &context_bytes,
-            pre_hash,
-        };
+        let mut options = VerifyOptions::default().with_context(&context_bytes);
+
+        options.pre_hash = pre_hash;
 
         assert!(
             hazmat::verify(&pair.public_key, &signature, &message, &options),
@@ -411,8 +410,8 @@ fn check_signature_key(
         .map_or_else(|| seed.to_vec(), |value| unhex(value));
 
     assert_eq!(
-        pair.private_key.export_key(KeyFormat::Raw).unwrap(),
-        private,
+        *pair.private_key.export_key(KeyFormat::Raw).unwrap(),
+        *private,
         "{context}"
     );
 
@@ -438,16 +437,16 @@ fn check_signature_key(
         let encoded = field(record, &format!("privateKey{suffix}"));
 
         assert_eq!(
-            pair.private_key.export_key(format).unwrap(),
-            encoded,
+            *pair.private_key.export_key(format).unwrap(),
+            *encoded,
             "{context}"
         );
 
         let imported = algorithm.import_private_key(&encoded, format).unwrap();
 
         assert_eq!(
-            imported.export_key(KeyFormat::Raw).unwrap(),
-            private,
+            *imported.export_key(KeyFormat::Raw).unwrap(),
+            *private,
             "{context}"
         );
     }
@@ -467,8 +466,8 @@ fn check_signature_key(
         .unwrap();
 
     assert_eq!(
-        key.export_key(KeyFormat::Raw).unwrap(),
-        expanded,
+        *key.export_key(KeyFormat::Raw).unwrap(),
+        *expanded,
         "{context}"
     );
 
@@ -477,13 +476,13 @@ fn check_signature_key(
     for (format, suffix) in ENCODINGS {
         let encoded = field(record, &format!("expandedKey{suffix}"));
 
-        assert_eq!(key.export_key(format).unwrap(), encoded, "{context}");
+        assert_eq!(*key.export_key(format).unwrap(), *encoded, "{context}");
 
         let imported = algorithm.import_private_key(&encoded, format).unwrap();
 
         assert_eq!(
-            imported.export_key(KeyFormat::Raw).unwrap(),
-            expanded,
+            *imported.export_key(KeyFormat::Raw).unwrap(),
+            *expanded,
             "{context}"
         );
     }
@@ -493,8 +492,8 @@ fn check_signature_key(
         .unwrap();
 
     assert_eq!(
-        both.export_key(KeyFormat::Der).unwrap(),
-        private_der,
+        *both.export_key(KeyFormat::Der).unwrap(),
+        *private_der,
         "{context}"
     );
 }
@@ -754,16 +753,15 @@ fn execute(header: &Fields, record: &Fields) -> Outcome {
 
     let pre_hash = record.get("preHash").and_then(|name| pre_hash(name));
 
-    let sign_options = SignOptions {
-        context: &context,
-        deterministic: true,
-        pre_hash,
-    };
+    let mut sign_options = SignOptions::default()
+        .with_context(&context)
+        .with_deterministic(true);
 
-    let verify_options = VerifyOptions {
-        context: &context,
-        pre_hash,
-    };
+    sign_options.pre_hash = pre_hash;
+
+    let mut verify_options = VerifyOptions::default().with_context(&context);
+
+    verify_options.pre_hash = pre_hash;
 
     match (algorithm(&header["algorithm"]), operation) {
         (Algorithm::Kem(a), "importPublicKey") => finished(
@@ -778,7 +776,9 @@ fn execute(header: &Fields, record: &Fields) -> Outcome {
             hazmat::generate_kem_key_pair(a, &key).and_then(|p| p.public_key.export_key(format())),
         ),
         (Algorithm::Kem(a), "exportPrivateKey") => finished(
-            hazmat::generate_kem_key_pair(a, &key).and_then(|p| p.private_key.export_key(format())),
+            hazmat::generate_kem_key_pair(a, &key)
+                .and_then(|p| p.private_key.export_key(format()))
+                .map(|k| k.to_vec()),
         ),
         (Algorithm::Kem(a), "generate") => finished(
             hazmat::generate_kem_key_pair(a, &data)
@@ -787,11 +787,12 @@ fn execute(header: &Fields, record: &Fields) -> Outcome {
         (Algorithm::Kem(a), "encapsulate") => finished(
             a.import_public_key(&key, KeyFormat::Raw)
                 .and_then(|k| hazmat::encapsulate(&k, &randomness))
-                .map(|e| [e.shared_secret, e.ciphertext].concat()),
+                .map(|e| [&e.shared_secret[..], &e.ciphertext].concat()),
         ),
         (Algorithm::Kem(a), "decapsulate") => finished(
             a.import_private_key(&key, KeyFormat::Raw)
-                .and_then(|k| k.decapsulate(&data)),
+                .and_then(|k| k.decapsulate(&data))
+                .map(|k| k.to_vec()),
         ),
         (Algorithm::Signature(a), "importPublicKey") => finished(
             a.import_public_key(&data, format())
@@ -878,33 +879,114 @@ fn execute(header: &Fields, record: &Fields) -> Outcome {
     }
 }
 
+// Cases whose expected result predates a rule of SPEC 1.0 that the reference generator does not
+// apply yet, by case name, with the result under the rule. Remove them when the file is
+// regenerated (SPEC Appendix C.1 item 9).
+const PENDING: [(&str, &str); 17] = [
+    // 7.3: the options, the context included, are checked before the lengths.
+    (
+        "hazmat sign short randomness and long context",
+        "INVALID_CONTEXT",
+    ),
+    // 10.6 item 4: the OID is checked before the rest of the structure.
+    (
+        "public key der other algorithm and unused bits",
+        "ALGORITHM_MISMATCH",
+    ),
+    (
+        "public key der other algorithm and trailing data inside",
+        "ALGORITHM_MISMATCH",
+    ),
+    (
+        "private key der other algorithm and trailing data inside",
+        "ALGORITHM_MISMATCH",
+    ),
+    (
+        "private key der public key with version 0 and other algorithm",
+        "ALGORITHM_MISMATCH",
+    ),
+    // 10.4 item 3 [D-32]: text before the BEGIN line and after the END line is ignored.
+    ("public key pem text before begin", "ok"),
+    ("public key pem text after end", "ok"),
+    ("public key pem high byte after end", "ok"),
+    ("private key pem text before begin", "ok"),
+    ("private key pem text after end", "ok"),
+    ("private key pem high byte after end", "ok"),
+    ("private key with attributes pem text before begin", "ok"),
+    ("private key with attributes pem text after end", "ok"),
+    ("private key with attributes pem high byte after end", "ok"),
+    // 8.1.4 check (3) [D-61]: every coefficient of the secret vector is below q.
+    (
+        "private key raw secret coefficient 4095",
+        "INVALID_PRIVATE_KEY",
+    ),
+    (
+        "decapsulate with secret coefficients 4095",
+        "INVALID_PRIVATE_KEY",
+    ),
+    (
+        "decapsulate with a secret coefficient stored as c + q",
+        "INVALID_PRIVATE_KEY",
+    ),
+];
+
 // Every disagreement is collected, so that one run lists them all.
 #[test]
 fn errors() {
     let failures = Mutex::new(Vec::new());
+
+    let pending = Mutex::new(Vec::new());
 
     let cases = in_scope("cross/errors.txt", "result");
 
     parallel(&cases, |(header, record)| {
         let outcome = execute(header, record);
 
-        let expected_output = record.get("output").map(|value| unhex(value));
+        let mut expected = record["result"].as_str();
+
+        let mut expected_output = record.get("output").map(|value| unhex(value));
+
+        if let Some((name, now)) = PENDING.iter().find(|(name, _)| *name == record["name"]) {
+            pending.lock().unwrap().push(*name);
+
+            expected = now;
+
+            expected_output = None;
+        }
 
         let expected_remaining = record.get("remaining").map(|value| value.parse().unwrap());
 
-        let mismatched = outcome.result != record["result"]
+        let mismatched = outcome.result != expected
             || expected_output.is_some_and(|output| outcome.output.as_ref() != Some(&output))
             || expected_remaining.is_some_and(|remaining| outcome.remaining != Some(remaining));
 
         if mismatched {
             failures.lock().unwrap().push(format!(
-                "{}: {}: got {}, expected {}",
-                header["algorithm"], record["name"], outcome.result, record["result"]
+                "{}: {}: got {}, expected {expected}",
+                header["algorithm"], record["name"], outcome.result
             ));
         }
     });
 
     let failures = failures.into_inner().unwrap();
+
+    let mut pending = pending.into_inner().unwrap();
+
+    println!("{} cases with a pending regeneration", pending.len());
+
+    pending.sort_unstable();
+
+    pending.dedup();
+
+    let unused: Vec<_> = PENDING
+        .iter()
+        .filter(|(name, _)| !pending.contains(name))
+        .collect();
+
+    assert!(
+        unused.is_empty(),
+        "pending cases not in the file: {unused:?}"
+    );
 
     assert!(
         failures.is_empty(),

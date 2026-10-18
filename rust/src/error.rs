@@ -36,11 +36,30 @@ impl Error {
             Self::Unsupported => "UNSUPPORTED",
         }
     }
+
+    // A short English description of the code, which never carries caller or secret data.
+    const fn message(&self) -> &'static str {
+        match self {
+            Self::InvalidLength => "a length is not accepted",
+            Self::InvalidEncoding => "the encoding is malformed",
+            Self::AlgorithmMismatch => "the encoding names another algorithm",
+            Self::InvalidPublicKey => "the public key is not valid",
+            Self::InvalidPrivateKey => "the private key is not valid",
+            Self::InvalidContext => "the context is longer than 255 bytes",
+            Self::InvalidOption => "an option is not accepted",
+            Self::RngFailure => "the entropy source failed",
+            Self::SelfTestFailed => "a self-test failed",
+            Self::KeyExhausted => "every signature of the key has been used",
+            Self::StatePersistFailed => "the state store failed",
+            Self::StateConflict => "the state changed or the key is in use",
+            Self::Unsupported => "the algorithm does not have this operation",
+        }
+    }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.code())
+        write!(f, "{}: {}", self.code(), self.message())
     }
 }
 

@@ -1,11 +1,17 @@
 mod vectors;
 
 use crypto_pq::{
-    Error, KeyFormat, KeyGenOptions, PreHash, SHA_224, SHA_256, SHA_384, SHA_512, SHA_512_224,
-    SHA_512_256, SHA3_224, SHA3_256, SHA3_384, SHA3_512, SHAKE128, SHAKE256, SLH_DSA_SHA2_128F,
-    SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S,
-    SLH_DSA_SHAKE_128F, SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S,
-    SLH_DSA_SHAKE_256F, SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, VerifyOptions, hazmat,
+    Error, HASH_SLH_DSA_SHA2_128F_WITH_SHA256, HASH_SLH_DSA_SHA2_128S_WITH_SHA256,
+    HASH_SLH_DSA_SHA2_192F_WITH_SHA512, HASH_SLH_DSA_SHA2_192S_WITH_SHA512,
+    HASH_SLH_DSA_SHA2_256F_WITH_SHA512, HASH_SLH_DSA_SHA2_256S_WITH_SHA512,
+    HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128, HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128,
+    HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256, HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256,
+    HASH_SLH_DSA_SHAKE_256F_WITH_SHAKE256, HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256, KeyFormat,
+    KeyGenOptions, PreHash, SHA_224, SHA_256, SHA_384, SHA_512, SHA_512_224, SHA_512_256, SHA3_224,
+    SHA3_256, SHA3_384, SHA3_512, SHAKE128, SHAKE256, SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S,
+    SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F,
+    SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F,
+    SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, VerifyOptions, hazmat,
 };
 use vectors::{Fields, der, parallel, records, unhex};
 
@@ -78,8 +84,8 @@ fn acvp_key_generation() {
             assert_eq!(pk, unhex(&record["pk"]), "{context}");
 
             assert_eq!(
-                pair.private_key.export_key(KeyFormat::Raw).unwrap(),
-                sk,
+                *pair.private_key.export_key(KeyFormat::Raw).unwrap(),
+                *sk,
                 "{context}"
             );
 
@@ -138,11 +144,9 @@ fn check_signature_generation(name: &str) {
 
         let (message, context_bytes) = (unhex(&record["message"]), unhex(&record["context"]));
 
-        let options = SignOptions {
-            context: &context_bytes,
-            pre_hash: pre_hash(header, record),
-            ..SignOptions::default()
-        };
+        let mut options = SignOptions::default().with_context(&context_bytes);
+
+        options.pre_hash = pre_hash(header, record);
 
         let signature = hazmat::sign(&private_key, &message, &randomness, &options).unwrap();
 
@@ -158,10 +162,9 @@ fn check_signature_verification(name: &str) {
 
         let context = unhex(&record["context"]);
 
-        let options = VerifyOptions {
-            context: &context,
-            pre_hash: pre_hash(header, record),
-        };
+        let mut options = VerifyOptions::default().with_context(&context);
+
+        options.pre_hash = pre_hash(header, record);
 
         let result = hazmat::verify(
             &public_key,
@@ -185,14 +188,12 @@ fn round_trip() {
     let algorithm = SLH_DSA_SHAKE_128F;
 
     let pair = algorithm
-        .generate_key_pair(&KeyGenOptions { self_test: false })
+        .generate_key_pair(&KeyGenOptions::default().with_self_test(false))
         .unwrap();
 
-    let options = SignOptions {
-        context: b"context",
-        deterministic: true,
-        ..SignOptions::default()
-    };
+    let options = SignOptions::default()
+        .with_context(b"context")
+        .with_deterministic(true);
 
     let signature = pair.private_key.sign(b"message", &options).unwrap();
 
@@ -201,10 +202,7 @@ fn round_trip() {
         pair.private_key.sign(b"message", &options).unwrap()
     );
 
-    let with_context = VerifyOptions {
-        context: b"context",
-        ..VerifyOptions::default()
-    };
+    let with_context = VerifyOptions::default().with_context(b"context");
 
     assert!(
         pair.public_key
@@ -233,8 +231,8 @@ fn round_trip() {
         let private_key = algorithm.import_private_key(&exported, format).unwrap();
 
         assert_eq!(
-            private_key.export_key(KeyFormat::Raw).unwrap(),
-            pair.private_key.export_key(KeyFormat::Raw).unwrap()
+            *private_key.export_key(KeyFormat::Raw).unwrap(),
+            *pair.private_key.export_key(KeyFormat::Raw).unwrap()
         );
     }
 
@@ -242,27 +240,18 @@ fn round_trip() {
 
     assert_eq!(raw.len(), 64);
 
-    let weak = SignOptions {
-        pre_hash: Some(SHA_224.into()),
-        ..SignOptions::default()
-    };
+    let weak = SignOptions::default().with_pre_hash(SHA_224);
 
     assert_eq!(
         pair.private_key.sign(b"m", &weak).err(),
         Some(Error::InvalidOption)
     );
 
-    let strong = SignOptions {
-        pre_hash: Some(SHAKE128.into()),
-        ..SignOptions::default()
-    };
+    let strong = SignOptions::default().with_pre_hash(SHAKE128);
 
     let hashed = pair.private_key.sign(b"m", &strong).unwrap();
 
-    let verify_hashed = VerifyOptions {
-        pre_hash: Some(SHAKE128.into()),
-        ..VerifyOptions::default()
-    };
+    let verify_hashed = VerifyOptions::default().with_pre_hash(SHAKE128);
 
     assert!(pair.public_key.verify(&hashed, b"m", &verify_hashed));
 
@@ -291,8 +280,8 @@ fn encodings() {
     };
 
     assert_eq!(
-        pair.private_key.export_key(KeyFormat::Der).unwrap(),
-        pkcs8(&raw)
+        *pair.private_key.export_key(KeyFormat::Der).unwrap(),
+        *pkcs8(&raw)
     );
 
     assert_eq!(
@@ -309,7 +298,7 @@ fn encodings() {
         Some(Error::InvalidLength)
     );
 
-    let mut wrong_root = raw.clone();
+    let mut wrong_root = raw.to_vec();
 
     wrong_root[63] ^= 1;
 
@@ -378,8 +367,8 @@ fn rfc9909_private_key() {
         .unwrap();
 
     assert_eq!(
-        private_key.export_key(KeyFormat::Pem).unwrap(),
-        pem.as_bytes()
+        *private_key.export_key(KeyFormat::Pem).unwrap(),
+        *pem.as_bytes()
     );
 }
 
@@ -404,5 +393,290 @@ fn rfc9909_certificate() {
         *altered.last_mut().unwrap() ^= 1;
 
         assert!(!public_key.verify(&signature, &altered, &VerifyOptions::default()));
+    }
+}
+
+// RFC 9909: each HashSLH-DSA value, the pure value of its set, its fixed pre-hash and the last arc
+// of its OID 2.16.840.1.101.3.4.3.x.
+fn hash_slh_dsa() -> [(SignatureAlgorithm, SignatureAlgorithm, PreHash, u8); 12] {
+    [
+        (
+            HASH_SLH_DSA_SHA2_128S_WITH_SHA256,
+            SLH_DSA_SHA2_128S,
+            SHA_256.into(),
+            35,
+        ),
+        (
+            HASH_SLH_DSA_SHA2_128F_WITH_SHA256,
+            SLH_DSA_SHA2_128F,
+            SHA_256.into(),
+            36,
+        ),
+        (
+            HASH_SLH_DSA_SHA2_192S_WITH_SHA512,
+            SLH_DSA_SHA2_192S,
+            SHA_512.into(),
+            37,
+        ),
+        (
+            HASH_SLH_DSA_SHA2_192F_WITH_SHA512,
+            SLH_DSA_SHA2_192F,
+            SHA_512.into(),
+            38,
+        ),
+        (
+            HASH_SLH_DSA_SHA2_256S_WITH_SHA512,
+            SLH_DSA_SHA2_256S,
+            SHA_512.into(),
+            39,
+        ),
+        (
+            HASH_SLH_DSA_SHA2_256F_WITH_SHA512,
+            SLH_DSA_SHA2_256F,
+            SHA_512.into(),
+            40,
+        ),
+        (
+            HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128,
+            SLH_DSA_SHAKE_128S,
+            SHAKE128.into(),
+            41,
+        ),
+        (
+            HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128,
+            SLH_DSA_SHAKE_128F,
+            SHAKE128.into(),
+            42,
+        ),
+        (
+            HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256,
+            SLH_DSA_SHAKE_192S,
+            SHAKE256.into(),
+            43,
+        ),
+        (
+            HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256,
+            SLH_DSA_SHAKE_192F,
+            SHAKE256.into(),
+            44,
+        ),
+        (
+            HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256,
+            SLH_DSA_SHAKE_256S,
+            SHAKE256.into(),
+            45,
+        ),
+        (
+            HASH_SLH_DSA_SHAKE_256F_WITH_SHAKE256,
+            SLH_DSA_SHAKE_256F,
+            SHAKE256.into(),
+            46,
+        ),
+    ]
+}
+
+// SPEC 9.4: the keys, sizes and raw formats of the pure set, the OIDs of RFC 9909 in DER, and the
+// fixed pre-hash, which the preHash option may only name again, in the public and hazmat sign
+// and verify alike.
+#[test]
+fn hash_slh_dsa_values() {
+    for (hashed, pure, fixed, arc) in hash_slh_dsa() {
+        let name = hashed.name();
+
+        assert!(name.starts_with("HashSLH-DSA-") && name.contains(&pure.name()[8..]));
+
+        assert_eq!(hashed.public_key_size(), pure.public_key_size());
+
+        assert_eq!(hashed.signature_size(), pure.signature_size());
+
+        let n = pure.public_key_size() / 2;
+
+        let seed: Vec<u8> = (0..3 * n as u8).collect();
+
+        let pair = hazmat::generate_signature_key_pair(hashed, &seed).unwrap();
+
+        let reference = hazmat::generate_signature_key_pair(pure, &seed).unwrap();
+
+        let raw = pair.public_key.export_key(KeyFormat::Raw).unwrap();
+
+        assert_eq!(
+            raw,
+            reference.public_key.export_key(KeyFormat::Raw).unwrap()
+        );
+
+        assert_eq!(
+            *pair.private_key.export_key(KeyFormat::Raw).unwrap(),
+            *reference.private_key.export_key(KeyFormat::Raw).unwrap()
+        );
+
+        let oid = der(0x06, &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, arc]);
+
+        let public_der = pair.public_key.export_key(KeyFormat::Der).unwrap();
+
+        let private_der = pair.private_key.export_key(KeyFormat::Der).unwrap();
+
+        for der in [&public_der[..], &private_der] {
+            assert!(der.windows(oid.len()).any(|window| window == oid), "{name}");
+        }
+
+        for format in [KeyFormat::Der, KeyFormat::Pem] {
+            let public = pair.public_key.export_key(format).unwrap();
+
+            let private = pair.private_key.export_key(format).unwrap();
+
+            assert_eq!(
+                hashed.import_public_key(&public, format).unwrap(),
+                pair.public_key
+            );
+
+            assert_eq!(
+                hashed
+                    .import_private_key(&private, format)
+                    .unwrap()
+                    .public_key(),
+                pair.public_key
+            );
+
+            let pure_public = reference.public_key.export_key(format).unwrap();
+
+            let pure_private = reference.private_key.export_key(format).unwrap();
+
+            for (algorithm, public, private) in [
+                (hashed, &pure_public, &pure_private[..]),
+                (pure, &public, &private[..]),
+            ] {
+                assert_eq!(
+                    algorithm.import_public_key(public, format).err(),
+                    Some(Error::AlgorithmMismatch),
+                    "{name}"
+                );
+
+                assert_eq!(
+                    algorithm.import_private_key(private, format).err(),
+                    Some(Error::AlgorithmMismatch),
+                    "{name}"
+                );
+            }
+        }
+
+        // Any other pre-hash, even one the strength rule allows, is refused.
+        let other: PreHash = if fixed == SHA_512.into() {
+            SHA3_512.into()
+        } else {
+            SHA_512.into()
+        };
+
+        let randomness = vec![1; n];
+
+        let refused = SignOptions::default().with_pre_hash(other);
+
+        assert_eq!(
+            pair.private_key.sign(b"message", &refused).err(),
+            Some(Error::InvalidOption),
+            "{name}"
+        );
+
+        assert_eq!(
+            hazmat::sign(&pair.private_key, b"message", &randomness, &refused).err(),
+            Some(Error::InvalidOption),
+            "{name}"
+        );
+
+        let signature = vec![0; hashed.signature_size()];
+
+        let other = VerifyOptions::default().with_pre_hash(other);
+
+        assert!(!pair.public_key.verify(&signature, b"message", &other));
+
+        assert!(!hazmat::verify(
+            &pair.public_key,
+            &signature,
+            b"message",
+            &other
+        ));
+    }
+}
+
+// A HashSLH-DSA signature is the HashSLH-DSA signature of the pure value with the fixed pre-hash,
+// whether the option is absent or names the same function, and verifies only as such.
+#[test]
+fn hash_slh_dsa_signatures() {
+    for (hashed, pure, fixed, _) in hash_slh_dsa() {
+        if !hashed.name().contains("128") && !hashed.name().ends_with("f-with-SHAKE256") {
+            continue;
+        }
+
+        let n = pure.public_key_size() / 2;
+
+        let seed = vec![7; 3 * n];
+
+        let pair = hazmat::generate_signature_key_pair(hashed, &seed).unwrap();
+
+        let reference = hazmat::generate_signature_key_pair(pure, &seed).unwrap();
+
+        let deterministic = SignOptions::default()
+            .with_context(b"context")
+            .with_deterministic(true);
+
+        let signature = pair.private_key.sign(b"message", &deterministic).unwrap();
+
+        let named = deterministic.with_pre_hash(fixed);
+
+        assert_eq!(
+            pair.private_key.sign(b"message", &named).unwrap(),
+            signature
+        );
+
+        assert_eq!(
+            reference.private_key.sign(b"message", &named).unwrap(),
+            signature
+        );
+
+        let randomness = vec![3; n];
+
+        assert_eq!(
+            hazmat::sign(&pair.private_key, b"message", &randomness, &deterministic).unwrap(),
+            hazmat::sign(&reference.private_key, b"message", &randomness, &named).unwrap()
+        );
+
+        let context = VerifyOptions::default().with_context(b"context");
+
+        for options in [context, context.with_pre_hash(fixed)] {
+            assert!(pair.public_key.verify(&signature, b"message", &options));
+
+            assert!(hazmat::verify(
+                &pair.public_key,
+                &signature,
+                b"message",
+                &options
+            ));
+        }
+
+        assert!(
+            !reference
+                .public_key
+                .verify(&signature, b"message", &context)
+        );
+
+        assert!(
+            reference
+                .public_key
+                .verify(&signature, b"message", &context.with_pre_hash(fixed))
+        );
+
+        if hashed.name().contains("128f") {
+            let generated = hashed.generate_key_pair(&KeyGenOptions::default()).unwrap();
+
+            let hedged = generated
+                .private_key
+                .sign(b"message", &SignOptions::default())
+                .unwrap();
+
+            assert!(
+                generated
+                    .public_key
+                    .verify(&hedged, b"message", &VerifyOptions::default())
+            );
+        }
     }
 }

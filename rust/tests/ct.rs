@@ -5,6 +5,8 @@
 // public; results are declassified here before they are compared.
 #![cfg(crypto_pq_ct)]
 
+mod vectors;
+
 use crypto_pq::ct_check::{aes_encrypt, declassify, secret};
 use crypto_pq::{
     ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_256, BLAKE2B_MAC, BLAKE2S_256, BLAKE2S_MAC,
@@ -18,6 +20,7 @@ use crypto_pq::{
     StateStore, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
     StatefulSignatureAlgorithm, VerifyOptions, XMSS_MT, XofOptions, hazmat,
 };
+use vectors::first;
 
 const MESSAGE: &[u8] = b"crypto-pq constant-time check";
 
@@ -136,13 +139,6 @@ fn imported_frodokem_keys() {
     }
 }
 
-fn unhex(text: &str) -> Vec<u8> {
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
-        .collect()
-}
-
 fn signature(algorithm: SignatureAlgorithm, seed_size: usize, randomness_size: usize) {
     let pair = hazmat::generate_signature_key_pair(algorithm, &secret_bytes(seed_size, 3)).unwrap();
 
@@ -167,18 +163,13 @@ fn signature(algorithm: SignatureAlgorithm, seed_size: usize, randomness_size: u
         .unwrap();
 
     for deterministic in [false, true] {
-        let options = SignOptions {
-            context: b"context",
-            deterministic,
-            ..SignOptions::default()
-        };
+        let options = SignOptions::default()
+            .with_context(b"context")
+            .with_deterministic(deterministic);
 
         let signed = generated.private_key.sign(MESSAGE, &options).unwrap();
 
-        let options = VerifyOptions {
-            context: b"context",
-            ..VerifyOptions::default()
-        };
+        let options = VerifyOptions::default().with_context(b"context");
 
         assert!(generated.public_key.verify(&signed, MESSAGE, &options));
     }
@@ -198,26 +189,6 @@ fn slh_dsa() {
 
         signature(algorithm, 3 * n, n);
     }
-}
-
-// The first value of `key` under the parameter set's header of an ACVP vector file.
-fn vector(file: &str, parameter_set: &str, key: &str) -> Vec<u8> {
-    let path = format!("{}/../vectors/acvp/{file}", env!("CARGO_MANIFEST_DIR"));
-
-    let text = std::fs::read_to_string(&path).unwrap();
-
-    let start = text
-        .find(&format!("[parameterSet = {parameter_set}]"))
-        .unwrap();
-
-    let prefix = format!("{key} = ");
-
-    let line = text[start..]
-        .lines()
-        .find(|line| line.starts_with(&prefix))
-        .unwrap();
-
-    unhex(&line[prefix.len()..])
 }
 
 // Each key also goes out and back in as DER; PEM is only exported.
@@ -244,11 +215,11 @@ fn reimported_kem(algorithm: KemAlgorithm, key: &KemPrivateKey, public_key: &Kem
 #[test]
 fn imported_kem_keys() {
     for algorithm in [ML_KEM_512, ML_KEM_768, ML_KEM_1024] {
-        let expanded = vector("ML-KEM-keyGen.txt", algorithm.name(), "dk");
+        let expanded = first("acvp/ML-KEM-keyGen.txt", algorithm.name(), "dk");
 
         let public_key = algorithm
             .import_public_key(
-                &vector("ML-KEM-keyGen.txt", algorithm.name(), "ek"),
+                &first("acvp/ML-KEM-keyGen.txt", algorithm.name(), "ek"),
                 KeyFormat::Raw,
             )
             .unwrap();
@@ -290,11 +261,11 @@ fn reimported_signature(
 #[test]
 fn imported_signature_keys() {
     for algorithm in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
-        let expanded = vector("ML-DSA-keyGen.txt", algorithm.name(), "sk");
+        let expanded = first("acvp/ML-DSA-keyGen.txt", algorithm.name(), "sk");
 
         let public_key = algorithm
             .import_public_key(
-                &vector("ML-DSA-keyGen.txt", algorithm.name(), "pk"),
+                &first("acvp/ML-DSA-keyGen.txt", algorithm.name(), "pk"),
                 KeyFormat::Raw,
             )
             .unwrap();
@@ -471,9 +442,9 @@ fn mac(algorithm: MacAlgorithm, key_size: usize) {
 
     let message: Vec<u8> = (0..300).map(|i| i as u8).collect();
 
-    let tag = algorithm.digest(&key, &message);
+    let tag = algorithm.digest(&key, &message).unwrap();
 
-    let mut incremental = algorithm.create(&key);
+    let mut incremental = algorithm.create(&key).unwrap();
 
     incremental.update(&message[..77]);
 
@@ -512,25 +483,28 @@ fn macs() {
 
     // KMACXOF with a customization and a tag longer than a comparison chunk, and BLAKE2 with a
     // short key, salt and personalization.
-    let options = MacOptions {
-        length: Some(100),
-        customization: b"ct",
-        xof: true,
-        ..MacOptions::default()
-    };
+    let options = MacOptions::default()
+        .with_length(100)
+        .with_customization(b"ct")
+        .with_xof(true);
 
     mac(KMAC128.configure(&options).unwrap(), 16);
 
-    let options = MacOptions {
-        length: Some(20),
-        salt: b"salt",
-        personalization: b"person",
-        ..MacOptions::default()
-    };
+    let options = MacOptions::default()
+        .with_length(20)
+        .with_salt(b"salt")
+        .with_personalization(b"person");
 
     mac(BLAKE2B_MAC.configure(&options).unwrap(), 5);
 
     mac(BLAKE2S_MAC.configure(&options).unwrap(), 1);
+
+    // HMAC tags truncated to their leftmost bytes, one-shot and streaming.
+    for (algorithm, length) in [(HMAC_SHA_256, 16), (HMAC_SHA_384, 4)] {
+        let options = MacOptions::default().with_length(length);
+
+        mac(algorithm.configure(&options).unwrap(), 40);
+    }
 }
 
 // HKDF from a secret IKM, and Expand from the secret PRK, with outputs of one block and of several,
@@ -543,10 +517,7 @@ fn hkdf() {
         let long_info = vec![7; 300];
 
         for info in [&b"info"[..], &long_info] {
-            let options = KdfOptions {
-                salt: b"salt",
-                info,
-            };
+            let options = KdfOptions::default().with_salt(b"salt").with_info(info);
 
             let okm = kdf.derive(&ikm, 200, &options).unwrap();
 
@@ -555,24 +526,11 @@ fn hkdf() {
             assert!(same(&short, &okm[..16]));
 
             let prk = kdf
-                .extract(
-                    &ikm,
-                    &KdfOptions {
-                        salt: b"salt",
-                        ..KdfOptions::default()
-                    },
-                )
+                .extract(&ikm, &KdfOptions::default().with_salt(b"salt"))
                 .unwrap();
 
             let expanded = kdf
-                .expand(
-                    &prk,
-                    200,
-                    &KdfOptions {
-                        info,
-                        ..KdfOptions::default()
-                    },
-                )
+                .expand(&prk, 200, &KdfOptions::default().with_info(info))
                 .unwrap();
 
             assert!(same(&expanded, &okm));
@@ -590,9 +548,9 @@ fn blake3() {
     let long = secret_bytes(2100, 6);
 
     for data in [&long[..], &long[..10]] {
-        let tag = BLAKE3_MAC.digest(&key, data);
+        let tag = BLAKE3_MAC.digest(&key, data).unwrap();
 
-        let mut incremental = BLAKE3_MAC.create(&key);
+        let mut incremental = BLAKE3_MAC.create(&key).unwrap();
 
         incremental.update(&data[..data.len() / 3]);
 
@@ -604,10 +562,7 @@ fn blake3() {
 
         assert!(incremental.verify(&tag));
 
-        let options = KdfOptions {
-            info: b"context",
-            ..KdfOptions::default()
-        };
+        let options = KdfOptions::default().with_info(b"context");
 
         let okm = BLAKE3_KDF.derive(data, 300, &options).unwrap();
 
@@ -615,15 +570,15 @@ fn blake3() {
 
         assert!(same(&short, &okm[..32]));
 
-        let output = BLAKE3.digest(data, 130);
+        let output = BLAKE3.digest(data, 130).unwrap();
 
         let mut xof = BLAKE3.create();
 
-        xof.update(data);
+        xof.update(data).unwrap();
 
-        let mut read = xof.read(1);
+        let mut read = xof.read(1).unwrap();
 
-        read.extend(xof.read(129));
+        read.extend(xof.read(129).unwrap());
 
         assert!(same(&read, &output));
 
@@ -641,10 +596,9 @@ fn blake3() {
 fn hashes_of_secrets() {
     let data = secret_bytes(300, 11);
 
-    let options = HashOptions {
-        salt: b"salt",
-        personalization: b"me",
-    };
+    let options = HashOptions::default()
+        .with_salt(b"salt")
+        .with_personalization(b"me");
 
     for algorithm in [
         BLAKE2B_256,
@@ -663,9 +617,7 @@ fn hashes_of_secrets() {
         assert!(same(&hasher.digest(), &digest));
     }
 
-    let customized = XofOptions {
-        customization: b"ct",
-    };
+    let customized = XofOptions::default().with_customization(b"ct");
 
     for algorithm in [
         CSHAKE128.configure(&customized).unwrap(),
@@ -673,12 +625,12 @@ fn hashes_of_secrets() {
         ASCON_XOF128,
         ASCON_CXOF128.configure(&customized).unwrap(),
     ] {
-        let output = algorithm.digest(&data, 70);
+        let output = algorithm.digest(&data, 70).unwrap();
 
         let mut xof = algorithm.create();
 
-        xof.update(&data);
+        xof.update(&data).unwrap();
 
-        assert!(same(&xof.read(70), &output));
+        assert!(same(&xof.read(70).unwrap(), &output));
     }
 }

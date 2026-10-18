@@ -2,9 +2,9 @@ mod vectors;
 
 use crypto_pq::{
     BLAKE3, BLAKE3_256, BLAKE3_KDF, BLAKE3_MAC, Error, HashOptions, KdfOptions, MacOptions,
-    XofOptions, hazmat,
+    XofOptions,
 };
-use vectors::{Fields, pieces, records, unhex};
+use vectors::{pieces, records, unhex};
 
 // Uneven sizes reach every buffering path: empty updates, partial blocks, whole blocks and chunks.
 const PIECES: [usize; 9] = [0, 1, 63, 64, 65, 1024, 7, 1025, 200];
@@ -32,7 +32,11 @@ fn official_vectors() {
 
         assert_eq!(BLAKE3_256.digest(&data), hash[..32], "{length}");
 
-        assert_eq!(BLAKE3.digest(&data, hash.len()), hash, "{length} xof");
+        assert_eq!(
+            BLAKE3.digest(&data, hash.len()).unwrap(),
+            hash,
+            "{length} xof"
+        );
 
         let mut hasher = BLAKE3_256.create();
 
@@ -41,30 +45,30 @@ fn official_vectors() {
         for piece in pieces(&data, &PIECES) {
             hasher.update(piece);
 
-            xof.update(piece);
+            xof.update(piece).unwrap();
         }
 
         assert_eq!(hasher.digest(), hash[..32], "{length} streamed");
 
-        let mut read = xof.read(1);
+        let mut read = xof.read(1).unwrap();
 
-        read.extend(xof.read(64));
+        read.extend(xof.read(64).unwrap());
 
-        read.extend(xof.read(hash.len() - 65));
+        read.extend(xof.read(hash.len() - 65).unwrap());
 
         assert_eq!(read, hash, "{length} read");
 
         let keyed = unhex(&record["keyed_hash"]);
 
         assert_eq!(
-            BLAKE3_MAC.digest(&key, &data),
+            BLAKE3_MAC.digest(&key, &data).unwrap(),
             keyed[..32],
             "{length} keyed"
         );
 
         assert!(BLAKE3_MAC.verify(&key, &data, &keyed[..32]));
 
-        let mut mac = BLAKE3_MAC.create(&key);
+        let mut mac = BLAKE3_MAC.create(&key).unwrap();
 
         for piece in pieces(&data, &PIECES) {
             mac.update(piece);
@@ -84,14 +88,14 @@ fn official_vectors() {
 
         let derived = unhex(&record["derive_key"]);
 
-        let options = KdfOptions {
-            info: &context,
-            ..KdfOptions::default()
-        };
+        let options = KdfOptions::default().with_info(&context);
 
         assert_eq!(
-            BLAKE3_KDF.derive(&data, derived.len(), &options),
-            Ok(derived.clone()),
+            BLAKE3_KDF
+                .derive(&data, derived.len(), &options)
+                .ok()
+                .map(|s| s.to_vec()),
+            Some(derived.clone().to_vec()),
             "{length} derive_key"
         );
 
@@ -109,7 +113,7 @@ fn official_vectors() {
 fn reads_from_any_offset() {
     let data = input(2200);
 
-    let whole = BLAKE3.digest(&data, 700);
+    let whole = BLAKE3.digest(&data, 700).unwrap();
 
     for sizes in [
         &[0, 1, 63, 64, 65, 507][..],
@@ -119,18 +123,18 @@ fn reads_from_any_offset() {
     ] {
         let mut xof = BLAKE3.create();
 
-        xof.update(&data);
+        xof.update(&data).unwrap();
 
         let mut read = Vec::new();
 
         for &size in sizes {
-            read.extend(xof.read(size));
+            read.extend(xof.read(size).unwrap());
         }
 
         assert_eq!(read, whole);
     }
 
-    assert!(BLAKE3.digest(&data, 0).is_empty());
+    assert!(BLAKE3.digest(&data, 0).unwrap().is_empty());
 }
 
 #[test]
@@ -154,38 +158,21 @@ fn options() {
         Ok(BLAKE3_256)
     );
 
-    let salt = HashOptions {
-        salt: b"s",
-        ..HashOptions::default()
-    };
+    let salt = HashOptions::default().with_salt(b"s");
 
     assert_eq!(BLAKE3_256.configure(&salt), Err(Error::InvalidOption));
 
-    let customization = XofOptions {
-        customization: b"c",
-    };
+    let customization = XofOptions::default().with_customization(b"c");
 
     assert_eq!(BLAKE3.configure(&customization), Err(Error::InvalidOption));
 
     assert_eq!(BLAKE3_MAC.configure(&MacOptions::default()), Ok(BLAKE3_MAC));
 
     for options in [
-        MacOptions {
-            length: Some(32),
-            ..MacOptions::default()
-        },
-        MacOptions {
-            customization: b"c",
-            ..MacOptions::default()
-        },
-        MacOptions {
-            salt: b"s",
-            ..MacOptions::default()
-        },
-        MacOptions {
-            xof: true,
-            ..MacOptions::default()
-        },
+        MacOptions::default().with_length(32),
+        MacOptions::default().with_customization(b"c"),
+        MacOptions::default().with_salt(b"s"),
+        MacOptions::default().with_xof(true),
     ] {
         assert_eq!(BLAKE3_MAC.configure(&options), Err(Error::InvalidOption));
     }
@@ -193,7 +180,7 @@ fn options() {
 
 #[test]
 fn mac_keys() {
-    let tag = BLAKE3_MAC.digest(&[7; 32], b"data");
+    let tag = BLAKE3_MAC.digest(&[7; 32], b"data").unwrap();
 
     for size in [0, 1, 31, 33, 64] {
         assert!(!BLAKE3_MAC.verify(&vec![7; size], b"data", &tag));
@@ -203,61 +190,59 @@ fn mac_keys() {
 }
 
 #[test]
-#[should_panic(expected = "INVALID_LENGTH")]
-fn mac_short_key() {
-    BLAKE3_MAC.digest(&[0; 31], b"data");
-}
+fn mac_key_lengths() {
+    for key in [&[0; 31][..], &[0; 33], &[]] {
+        assert_eq!(BLAKE3_MAC.digest(key, b"data"), Err(Error::InvalidLength));
 
-#[test]
-#[should_panic(expected = "INVALID_LENGTH")]
-fn mac_long_key_create() {
-    BLAKE3_MAC.create(&[0; 33]);
+        assert_eq!(
+            BLAKE3_MAC.digest_into(key, b"data", &mut [0; 32]),
+            Err(Error::InvalidLength)
+        );
+
+        assert!(BLAKE3_MAC.create(key).is_err());
+
+        assert!(!BLAKE3_MAC.verify(key, b"data", &[0; 32]));
+    }
 }
 
 #[test]
 fn kdf() {
-    let context = KdfOptions {
-        info: b"context",
-        ..KdfOptions::default()
-    };
+    let context = KdfOptions::default().with_info(b"context");
 
     let okm = BLAKE3_KDF.derive(b"key material", 1000, &context).unwrap();
 
     assert_eq!(
-        BLAKE3_KDF.derive(b"key material", 33, &context).unwrap(),
+        *BLAKE3_KDF.derive(b"key material", 33, &context).unwrap(),
         okm[..33]
     );
 
     assert_ne!(
-        BLAKE3_KDF
+        *BLAKE3_KDF
             .derive(b"key material", 32, &KdfOptions::default())
             .unwrap(),
         okm[..32]
     );
 
     assert_eq!(
-        BLAKE3_KDF.derive(b"ikm", 0, &context),
-        Err(Error::InvalidLength)
+        BLAKE3_KDF.derive(b"ikm", 0, &context).err(),
+        Some(Error::InvalidLength)
     );
 
-    let salted = KdfOptions {
-        salt: b"s",
-        info: b"context",
-    };
+    let salted = KdfOptions::default().with_salt(b"s").with_info(b"context");
 
     assert_eq!(
-        BLAKE3_KDF.derive(b"ikm", 32, &salted),
-        Err(Error::InvalidOption)
+        BLAKE3_KDF.derive(b"ikm", 32, &salted).err(),
+        Some(Error::InvalidOption)
     );
 
     assert_eq!(
-        BLAKE3_KDF.extract(b"ikm", &KdfOptions::default()),
-        Err(Error::Unsupported)
+        BLAKE3_KDF.extract(b"ikm", &KdfOptions::default()).err(),
+        Some(Error::Unsupported)
     );
 
     assert_eq!(
-        BLAKE3_KDF.expand(&[0; 32], 32, &context),
-        Err(Error::Unsupported)
+        BLAKE3_KDF.expand(&[0; 32], 32, &context).err(),
+        Some(Error::Unsupported)
     );
 
     let mut out = [0; 32];
@@ -274,127 +259,10 @@ fn kdf() {
 }
 
 #[test]
-#[should_panic(expected = "UNSUPPORTED")]
 fn update_after_read() {
     let mut xof = BLAKE3.create();
 
-    xof.read(1);
+    xof.read(1).unwrap();
 
-    xof.update(b"more");
-}
-
-// One record of the BLAKE3 groups of vectors/cross/blake3.txt (its format is described in
-// tools/cross_vectors.py): the result and the output. A MAC key of another length is a programming
-// error for digest, which panics; the record names it INVALID_LENGTH.
-fn cross(name: &str, record: &Fields) -> (String, Option<Vec<u8>>) {
-    let get = |key: &str| {
-        record
-            .get(key)
-            .map(|value| unhex(value))
-            .unwrap_or_default()
-    };
-
-    let length = || record["outputLength"].parse().expect("outputLength");
-
-    let done = |result: Result<Vec<u8>, Error>| match result {
-        Ok(output) => ("ok".to_owned(), Some(output)),
-        Err(error) => (error.code().to_owned(), None),
-    };
-
-    let (salt, personalization, customization) =
-        (get("salt"), get("personalization"), get("customization"));
-
-    let (message, key) = (get("message"), get("key"));
-
-    match name {
-        "BLAKE3-256" => {
-            let options = HashOptions {
-                salt: &salt,
-                personalization: &personalization,
-            };
-
-            done(
-                BLAKE3_256
-                    .configure(&options)
-                    .map(|algorithm| algorithm.digest(&message)),
-            )
-        }
-        "BLAKE3" => {
-            let configured = if record.contains_key("functionName") {
-                hazmat::configure_cshake(BLAKE3, &get("functionName"), &customization)
-            } else {
-                BLAKE3.configure(&XofOptions {
-                    customization: &customization,
-                })
-            };
-
-            done(configured.map(|algorithm| algorithm.digest(&message, length())))
-        }
-        "BLAKE3-MAC" => {
-            let options = MacOptions {
-                length: record
-                    .get("length")
-                    .map(|value| value.parse().expect("length")),
-                customization: &customization,
-                xof: record.get("xof").is_some_and(|value| value == "true"),
-                salt: &salt,
-                personalization: &personalization,
-            };
-
-            let algorithm = match BLAKE3_MAC.configure(&options) {
-                Ok(algorithm) => algorithm,
-                Err(error) => return (error.code().to_owned(), None),
-            };
-
-            if record["operation"] == "verify" {
-                return (
-                    algorithm.verify(&key, &message, &get("tag")).to_string(),
-                    None,
-                );
-            }
-
-            if key.len() != 32 {
-                return ("INVALID_LENGTH".to_owned(), None);
-            }
-
-            done(Ok(algorithm.digest(&key, &message)))
-        }
-        "BLAKE3-KDF" => {
-            let (ikm, info) = (get("ikm"), get("info"));
-
-            let options = KdfOptions {
-                salt: &salt,
-                info: &info,
-            };
-
-            done(match record["operation"].as_str() {
-                "derive" => BLAKE3_KDF.derive(&ikm, length(), &options),
-                "extract" => BLAKE3_KDF.extract(&ikm, &options),
-                "expand" => BLAKE3_KDF.expand(&get("prk"), length(), &options),
-                operation => panic!("unknown operation {operation}"),
-            })
-        }
-        _ => panic!("unknown algorithm {name}"),
-    }
-}
-
-// The cross-language agreement: the Python reference computed these records, every port checks
-// them.
-#[test]
-fn cross_vectors() {
-    let found = records("cross/blake3.txt", "result");
-
-    assert_eq!(found.len(), 110);
-
-    for (header, record) in &found {
-        let name = header["algorithm"].as_str();
-
-        let (result, output) = cross(name, record);
-
-        assert_eq!(result, record["result"], "{name}: {}", record["name"]);
-
-        if let Some(expected) = record.get("output") {
-            assert_eq!(output, Some(unhex(expected)), "{name}: {}", record["name"]);
-        }
-    }
+    assert_eq!(xof.update(b"more"), Err(Error::Unsupported));
 }

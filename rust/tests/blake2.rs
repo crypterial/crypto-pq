@@ -51,7 +51,7 @@ fn check_hash(algorithm: HashAlgorithm, data: &[u8], expected: &[u8], context: &
 
     let mut out = vec![0; algorithm.digest_size()];
 
-    algorithm.digest_into(data, &mut out);
+    algorithm.digest_into(data, &mut out).unwrap();
 
     assert_eq!(out, expected, "{context} into");
 
@@ -65,11 +65,11 @@ fn check_hash(algorithm: HashAlgorithm, data: &[u8], expected: &[u8], context: &
 }
 
 fn check_mac(algorithm: MacAlgorithm, key: &[u8], data: &[u8], expected: &[u8], context: &str) {
-    assert_eq!(algorithm.digest(key, data), expected, "{context}");
+    assert_eq!(algorithm.digest(key, data).unwrap(), expected, "{context}");
 
     assert!(algorithm.verify(key, data, expected), "{context} verify");
 
-    let mut mac = algorithm.create(key);
+    let mut mac = algorithm.create(key).unwrap();
 
     for piece in pieces(data, &PIECES) {
         mac.update(piece);
@@ -155,10 +155,7 @@ fn rfc7693_self_test() {
 
         for digest_length in list("digestLengths") {
             let keyed = mac(name)
-                .configure(&MacOptions {
-                    length: Some(digest_length),
-                    ..MacOptions::default()
-                })
+                .configure(&MacOptions::default().with_length(digest_length))
                 .unwrap();
 
             for input_length in list("inputLengths") {
@@ -168,7 +165,7 @@ fn rfc7693_self_test() {
 
                 let key = selftest_seq(digest_length, digest_length as u32);
 
-                grand.update(&keyed.digest(&key, &data));
+                grand.update(&keyed.digest(&key, &data).unwrap());
             }
         }
 
@@ -242,10 +239,11 @@ fn derived_salt_and_personalization() {
 
         if key.is_empty() {
             let algorithm = hash(name, length)
-                .configure(&HashOptions {
-                    salt: &salt,
-                    personalization: &personalization,
-                })
+                .configure(
+                    &HashOptions::default()
+                        .with_salt(&salt)
+                        .with_personalization(&personalization),
+                )
                 .unwrap();
 
             check_hash(algorithm, &data, &expected, &context);
@@ -253,12 +251,12 @@ fn derived_salt_and_personalization() {
             unkeyed += 1;
         } else {
             let algorithm = mac(name)
-                .configure(&MacOptions {
-                    length: Some(length),
-                    salt: &salt,
-                    personalization: &personalization,
-                    ..MacOptions::default()
-                })
+                .configure(
+                    &MacOptions::default()
+                        .with_length(length)
+                        .with_salt(&salt)
+                        .with_personalization(&personalization),
+                )
                 .unwrap();
 
             assert_eq!(algorithm.digest_size(), length, "{context}");
@@ -277,10 +275,11 @@ fn derived_salt_and_personalization() {
 fn short_fields_are_zero_padded() {
     for (algorithm, size) in [(BLAKE2B_512, 16), (BLAKE2S_256, 8)] {
         let short = algorithm
-            .configure(&HashOptions {
-                salt: b"salt",
-                personalization: b"me",
-            })
+            .configure(
+                &HashOptions::default()
+                    .with_salt(b"salt")
+                    .with_personalization(b"me"),
+            )
             .unwrap();
 
         let mut salt = vec![0; size];
@@ -292,10 +291,11 @@ fn short_fields_are_zero_padded() {
         personalization[..2].copy_from_slice(b"me");
 
         let padded = algorithm
-            .configure(&HashOptions {
-                salt: &salt,
-                personalization: &personalization,
-            })
+            .configure(
+                &HashOptions::default()
+                    .with_salt(&salt)
+                    .with_personalization(&personalization),
+            )
             .unwrap();
 
         assert_eq!(short, padded);
@@ -313,9 +313,10 @@ fn configure_rejects_invalid_options() {
     let long = &LONG;
 
     for (algorithm, size) in [(BLAKE2B_256, 16), (BLAKE2S_128, 8)] {
-        let options = |salt: &'static [u8], personalization: &'static [u8]| HashOptions {
-            salt,
-            personalization,
+        let options = |salt: &'static [u8], personalization: &'static [u8]| {
+            HashOptions::default()
+                .with_salt(salt)
+                .with_personalization(personalization)
         };
 
         assert!(
@@ -341,10 +342,7 @@ fn configure_rejects_invalid_options() {
     }
 
     assert_eq!(
-        SHA_256.configure(&HashOptions {
-            salt: b"salt",
-            ..HashOptions::default()
-        }),
+        SHA_256.configure(&HashOptions::default().with_salt(b"salt")),
         Err(Error::InvalidOption)
     );
 
@@ -352,31 +350,16 @@ fn configure_rejects_invalid_options() {
 
     for (algorithm, maximum, field) in [(BLAKE2B_MAC, 64, 16), (BLAKE2S_MAC, 32, 8)] {
         for length in [0, maximum + 1] {
-            let options = MacOptions {
-                length: Some(length),
-                ..MacOptions::default()
-            };
+            let options = MacOptions::default().with_length(length);
 
             assert_eq!(algorithm.configure(&options), Err(Error::InvalidOption));
         }
 
         for options in [
-            MacOptions {
-                customization: b"x",
-                ..MacOptions::default()
-            },
-            MacOptions {
-                xof: true,
-                ..MacOptions::default()
-            },
-            MacOptions {
-                salt: &long[..field + 1],
-                ..MacOptions::default()
-            },
-            MacOptions {
-                personalization: &long[..field + 1],
-                ..MacOptions::default()
-            },
+            MacOptions::default().with_customization(b"x"),
+            MacOptions::default().with_xof(true),
+            MacOptions::default().with_salt(&long[..field + 1]),
+            MacOptions::default().with_personalization(&long[..field + 1]),
         ] {
             assert_eq!(algorithm.configure(&options), Err(Error::InvalidOption));
         }
@@ -413,13 +396,14 @@ fn properties() {
     assert_eq!(BLAKE2S_MAC.digest_size(), 32);
 
     // A tag of another length never verifies.
-    let tag = BLAKE2S_MAC.digest(b"key", b"data");
+    let tag = BLAKE2S_MAC.digest(b"key", b"data").unwrap();
 
     assert!(!BLAKE2S_MAC.verify(b"key", b"data", &tag[..31]));
 
     assert!(
         !BLAKE2S_MAC
             .create(b"key")
+            .unwrap()
             .verify(&[tag.as_slice(), &[0]].concat())
     );
 }
@@ -427,13 +411,13 @@ fn properties() {
 // verify has a result for it: a key of another length verifies nothing.
 #[test]
 fn verify_refuses_other_key_lengths() {
-    let tag = BLAKE2B_MAC.digest(&[1; 64], b"data");
+    let tag = BLAKE2B_MAC.digest(&[1; 64], b"data").unwrap();
 
     for key in [&[][..], &[1; 65]] {
         assert!(!BLAKE2B_MAC.verify(key, b"data", &tag));
     }
 
-    let tag = BLAKE2S_MAC.digest(&[1; 32], b"data");
+    let tag = BLAKE2S_MAC.digest(&[1; 32], b"data").unwrap();
 
     for key in [&[][..], &[1; 33]] {
         assert!(!BLAKE2S_MAC.verify(key, b"data", &tag));
@@ -441,13 +425,24 @@ fn verify_refuses_other_key_lengths() {
 }
 
 #[test]
-#[should_panic(expected = "INVALID_LENGTH")]
-fn empty_key_is_refused() {
-    BLAKE2B_MAC.digest(b"", b"data");
-}
+fn key_lengths_are_refused() {
+    for (algorithm, key) in [
+        (BLAKE2B_MAC, &[][..]),
+        (BLAKE2B_MAC, &[0; 65]),
+        (BLAKE2S_MAC, &[]),
+        (BLAKE2S_MAC, &[0; 33]),
+    ] {
+        let size = algorithm.digest_size();
 
-#[test]
-#[should_panic(expected = "INVALID_LENGTH")]
-fn long_key_is_refused() {
-    BLAKE2S_MAC.create(&[0; 33]);
+        assert_eq!(algorithm.digest(key, b"data"), Err(Error::InvalidLength));
+
+        assert_eq!(
+            algorithm.digest_into(key, b"data", &mut vec![0; size]),
+            Err(Error::InvalidLength)
+        );
+
+        assert!(algorithm.create(key).is_err());
+
+        assert!(!algorithm.verify(key, b"data", &vec![0; size]));
+    }
 }

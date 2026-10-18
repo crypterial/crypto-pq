@@ -67,12 +67,18 @@ impl Engine {
     }
 }
 
-// An output buffer of another size is a programming error, as in copy_from_slice.
-pub(crate) fn check_length(actual: usize, expected: usize) {
-    assert!(
-        actual == expected,
-        "INVALID_LENGTH: the output must be exactly the digest size"
-    );
+// A caller buffer of another length fails, and is left as it was.
+pub(crate) const fn check_length(actual: usize, expected: usize) -> Result<(), Error> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(Error::InvalidLength)
+    }
+}
+
+// The largest output of one XOF call, and of a KMAC tag, on every platform (SPEC 12.8).
+pub(crate) const fn fits_u32(length: usize) -> bool {
+    length <= u32::MAX as usize
 }
 
 // A BLAKE2 salt or personalization of at most `size` bytes, which the parameter block zero-pads.
@@ -102,9 +108,26 @@ impl fmt::Debug for HashAlgorithm {
 
 // BLAKE2's salt and personalization, at most 16 bytes each for BLAKE2b and 8 for BLAKE2s.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HashOptions<'a> {
     pub salt: &'a [u8],
     pub personalization: &'a [u8],
+}
+
+impl<'a> HashOptions<'a> {
+    #[must_use]
+    pub const fn with_salt(mut self, salt: &'a [u8]) -> Self {
+        self.salt = salt;
+
+        self
+    }
+
+    #[must_use]
+    pub const fn with_personalization(mut self, personalization: &'a [u8]) -> Self {
+        self.personalization = personalization;
+
+        self
+    }
 }
 
 impl HashAlgorithm {
@@ -146,15 +169,22 @@ impl HashAlgorithm {
     pub fn digest(&self, data: &[u8]) -> Vec<u8> {
         let mut out = vec![0; self.digest_size];
 
-        self.digest_into(data, &mut out);
+        self.digest_unchecked(data, &mut out);
 
         out
     }
 
     // The same digest written into out, which must be digest_size() bytes, without allocating.
-    pub fn digest_into(&self, data: &[u8], out: &mut [u8]) {
-        check_length(out.len(), self.digest_size);
+    pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        check_length(out.len(), self.digest_size)?;
 
+        self.digest_unchecked(data, out);
+
+        Ok(())
+    }
+
+    // digest_into for an out of digest_size bytes.
+    pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
         match &self.kind {
             Kind::Sha256(iv) => finish256(iv, 0, data, out),
             Kind::Sha512(iv) => finish512(iv, 0, data, out),
@@ -212,10 +242,12 @@ impl Hasher {
         out
     }
 
-    pub fn digest_into(&self, out: &mut [u8]) {
-        check_length(out.len(), self.size);
+    pub fn digest_into(&self, out: &mut [u8]) -> Result<(), Error> {
+        check_length(out.len(), self.size)?;
 
         self.engine.digest_into(out);
+
+        Ok(())
     }
 }
 
@@ -247,8 +279,18 @@ impl fmt::Debug for XofAlgorithm {
 
 // The customization string S of cSHAKE (any length) and of Ascon-CXOF128 (at most 256 bytes).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct XofOptions<'a> {
     pub customization: &'a [u8],
+}
+
+impl<'a> XofOptions<'a> {
+    #[must_use]
+    pub const fn with_customization(mut self, customization: &'a [u8]) -> Self {
+        self.customization = customization;
+
+        self
+    }
 }
 
 impl XofAlgorithm {
@@ -291,16 +333,37 @@ impl XofAlgorithm {
         }
     }
 
-    pub fn digest(&self, data: &[u8], length: usize) -> Vec<u8> {
+    // SP 800-232, 5.2 and 5.3: the Ascon XOFs take an output length L > 0.
+    const fn check_output(&self, length: usize) -> Result<(), Error> {
+        let ascon = matches!(self.kind, XofKind::AsconXof | XofKind::AsconCxof(_));
+
+        if !fits_u32(length) || (ascon && length == 0) {
+            Err(Error::InvalidLength)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn digest(&self, data: &[u8], length: usize) -> Result<Vec<u8>, Error> {
+        self.check_output(length)?;
+
         let mut out = vec![0; length];
 
-        self.digest_into(data, &mut out);
+        self.digest_unchecked(data, &mut out);
 
-        out
+        Ok(out)
     }
 
     // out.len() bytes of output, without allocating.
-    pub fn digest_into(&self, data: &[u8], out: &mut [u8]) {
+    pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        self.check_output(out.len())?;
+
+        self.digest_unchecked(data, out);
+
+        Ok(())
+    }
+
+    pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
         match &self.kind {
             XofKind::Shake | XofKind::CShake(None) => {
                 Keccak::digest_into(self.rate, SHAKE_SUFFIX, data, out);
@@ -317,43 +380,89 @@ impl XofAlgorithm {
     pub fn create(&self) -> Xof {
         let engine = match &self.kind {
             XofKind::Shake | XofKind::CShake(None) => {
-                Engine::Keccak(Keccak::new(self.rate, SHAKE_SUFFIX))
+                XofEngine::Keccak(Keccak::new(self.rate, SHAKE_SUFFIX))
             }
             XofKind::CShake(Some(start)) => {
-                Engine::Keccak(Keccak::resume(*start, self.rate, sp800_185::SUFFIX))
+                XofEngine::Keccak(Keccak::resume(*start, self.rate, sp800_185::SUFFIX))
             }
-            XofKind::AsconXof => Engine::Ascon(ascon::Sponge::new(&ascon::XOF128)),
-            XofKind::AsconCxof(start) => Engine::Ascon(ascon::Sponge::new(start)),
-            XofKind::Blake3 => Engine::Blake3(Box::new(blake3::Hasher::hash())),
+            XofKind::AsconXof => XofEngine::Ascon(ascon::Sponge::new(&ascon::XOF128)),
+            XofKind::AsconCxof(start) => XofEngine::Ascon(ascon::Sponge::new(start)),
+            XofKind::Blake3 => XofEngine::Blake3(Box::new(blake3::Hasher::hash())),
         };
 
-        Xof { engine }
+        Xof {
+            engine,
+            squeezing: false,
+        }
     }
 }
 
+enum XofEngine {
+    Keccak(Keccak),
+    Ascon(ascon::Sponge),
+    Blake3(Box<blake3::Hasher>),
+}
+
+// Absorbing until the first read, of any length, and squeezing from then on (SPEC 12.2).
 pub struct Xof {
-    engine: Engine,
+    engine: XofEngine,
+    squeezing: bool,
 }
 
 impl Xof {
-    pub fn update(&mut self, data: &[u8]) {
-        self.engine.update(data);
+    pub fn update(&mut self, data: &[u8]) -> Result<(), Error> {
+        if self.squeezing {
+            return Err(Error::Unsupported);
+        }
+
+        match &mut self.engine {
+            XofEngine::Keccak(engine) => engine.update(data),
+            XofEngine::Ascon(sponge) => sponge.update(data),
+            XofEngine::Blake3(hasher) => hasher.update(data),
+        }
+
+        Ok(())
     }
 
-    pub fn read(&mut self, length: usize) -> Vec<u8> {
+    pub fn read(&mut self, length: usize) -> Result<Vec<u8>, Error> {
+        self.check_read(length)?;
+
         let mut out = vec![0; length];
 
-        self.read_into(&mut out);
+        self.read_unchecked(&mut out);
 
-        out
+        Ok(out)
     }
 
-    pub fn read_into(&mut self, out: &mut [u8]) {
+    pub fn read_into(&mut self, out: &mut [u8]) -> Result<(), Error> {
+        self.check_read(out.len())?;
+
+        self.read_unchecked(out);
+
+        Ok(())
+    }
+
+    // At most 2^32 - 1 bytes a call, and BLAKE3 ends after 2^64 - 1 bytes in all.
+    fn check_read(&self, length: usize) -> Result<(), Error> {
+        let fits = match &self.engine {
+            XofEngine::Blake3(hasher) => length as u64 <= hasher.output_left(),
+            _ => true,
+        };
+
+        if fits_u32(length) && fits {
+            Ok(())
+        } else {
+            Err(Error::InvalidLength)
+        }
+    }
+
+    fn read_unchecked(&mut self, out: &mut [u8]) {
+        self.squeezing = true;
+
         match &mut self.engine {
-            Engine::Keccak(engine) => engine.read(out),
-            Engine::Ascon(sponge) => sponge.read(out),
-            Engine::Blake3(hasher) => hasher.read(out),
-            _ => unreachable!("an XOF is a Keccak or Ascon sponge or BLAKE3"),
+            XofEngine::Keccak(engine) => engine.read(out),
+            XofEngine::Ascon(sponge) => sponge.read(out),
+            XofEngine::Blake3(hasher) => hasher.read(out),
         }
     }
 }

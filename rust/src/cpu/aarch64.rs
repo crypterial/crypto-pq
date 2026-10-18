@@ -2159,7 +2159,7 @@ mod tests {
 
         assert!(!dit_is_set());
 
-        HMAC_SHA_256.digest(b"key", b"data");
+        HMAC_SHA_256.digest(b"key", b"data").unwrap();
 
         assert!(!dit_is_set());
     }
@@ -2177,20 +2177,20 @@ mod tests {
             BLAKE2S_MAC,
         ] {
             let (tag, empty) = (
-                algorithm.digest(b"key", b"data"),
-                algorithm.digest(b"key", b""),
+                algorithm.digest(b"key", b"data").unwrap(),
+                algorithm.digest(b"key", b"").unwrap(),
             );
 
             let (updated, digested, verified) = (
-                RefCell::new(algorithm.create(b"key")),
-                algorithm.create(b"key"),
-                algorithm.create(b"key"),
+                RefCell::new(algorithm.create(b"key").unwrap()),
+                algorithm.create(b"key").unwrap(),
+                algorithm.create(b"key").unwrap(),
             );
 
             let expected = tag.clone();
 
             calls.push(Box::new(move || {
-                assert_eq!(algorithm.digest(b"key", b"data"), expected)
+                assert_eq!(algorithm.digest(b"key", b"data"), Ok(expected.clone()))
             }));
 
             calls.push(Box::new(move || {

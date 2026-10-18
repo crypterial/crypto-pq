@@ -1,6 +1,7 @@
 // Deterministic operations for test vectors. Production code must not call them: reusing a seed
 // or randomness value with a different key, message or ciphertext breaks the scheme, and the
-// signing functions skip the pre-hash strength policy of the public API.
+// signing functions skip the pre-hash strength policy of the public API (but not the fixed
+// pre-hash of the HashSLH-DSA values).
 
 use alloc::vec::Vec;
 
@@ -56,18 +57,19 @@ pub fn encapsulate(public_key: &KemPublicKey, randomness: &[u8]) -> Result<Encap
     Ok(public_key.encapsulate_with(randomness))
 }
 
-// options.deterministic is ignored: the randomness argument decides.
+// options.deterministic is ignored: the randomness argument decides. The options are checked
+// before the length of the randomness (SPEC 7.3).
 pub fn sign(
     private_key: &SignaturePrivateKey,
     message: &[u8],
     randomness: &[u8],
     options: &SignOptions,
 ) -> Result<Vec<u8>, Error> {
+    let pre_hash = private_key.check_options(options, false)?;
+
     require_length(randomness, private_key.algorithm().randomness_size())?;
 
-    private_key.check_options(options, false)?;
-
-    Ok(private_key.sign_with(message, randomness, options))
+    Ok(private_key.sign_with(message, randomness, options.context, pre_hash))
 }
 
 pub fn verify(

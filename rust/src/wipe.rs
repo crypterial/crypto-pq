@@ -1,5 +1,6 @@
 use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{Ordering, compiler_fence};
 
@@ -82,9 +83,11 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
     compiler_fence(Ordering::SeqCst);
 }
 
-// Secret bytes on the heap, wiped when dropped. The buffer never grows after creation, so no
-// reallocation leaves an unwiped copy behind.
-pub(crate) struct SecretBytes(Vec<u8>);
+// Secret bytes on the heap, wiped when dropped: the type of every secret output (shared secrets,
+// derived keys, exported private keys). The buffer never grows after creation, so no reallocation
+// leaves an unwiped copy behind. There is no Clone, so that every copy is one the caller makes, and
+// no PartialEq: compare secrets in constant time, never with ==.
+pub struct SecretBytes(Vec<u8>);
 
 impl SecretBytes {
     pub(crate) fn zeroed(length: usize) -> Self {
@@ -117,6 +120,18 @@ impl Deref for SecretBytes {
 impl DerefMut for SecretBytes {
     fn deref_mut(&mut self) -> &mut [u8] {
         &mut self.0
+    }
+}
+
+impl AsRef<[u8]> for SecretBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SecretBytes({} bytes, redacted)", self.0.len())
     }
 }
 

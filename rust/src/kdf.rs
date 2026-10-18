@@ -1,14 +1,12 @@
-use alloc::vec;
-use alloc::vec::Vec;
 use core::fmt;
 
 use crate::blake3;
 use crate::cpu::Dit;
 use crate::error::Error;
-use crate::hash::{HashAlgorithm, Kind, SHA_256, SHA_384, SHA_512};
+use crate::hash::{HashAlgorithm, Kind, SHA_256, SHA_384, SHA_512, fits_u32};
 use crate::mac::{block_key, hmac};
 use crate::sha2::{self, Sha256, Sha512, finish256, finish512};
-use crate::wipe::wipe;
+use crate::wipe::{SecretBytes, wipe};
 
 // HKDF (RFC 5869) over HMAC with SHA-2, and BLAKE3's derive_key, whose context string is info.
 // The PRK, every T(i) and the keyed states are secret and wiped; one keyed DIT guard covers each
@@ -34,9 +32,26 @@ impl fmt::Debug for KdfAlgorithm {
 
 // An empty salt is HashLen zero bytes (RFC 5869, 2.2). Extract takes no info and Expand no salt.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KdfOptions<'a> {
     pub salt: &'a [u8],
     pub info: &'a [u8],
+}
+
+impl<'a> KdfOptions<'a> {
+    #[must_use]
+    pub const fn with_salt(mut self, salt: &'a [u8]) -> Self {
+        self.salt = salt;
+
+        self
+    }
+
+    #[must_use]
+    pub const fn with_info(mut self, info: &'a [u8]) -> Self {
+        self.info = info;
+
+        self
+    }
 }
 
 impl KdfAlgorithm {
@@ -60,14 +75,15 @@ impl KdfAlgorithm {
         }
     }
 
-    // RFC 5869, 2.3: L is at most 255 HashLen. Every KDF refuses an empty output.
-    fn check_output(&self, length: usize) -> Result<(), Error> {
-        let limit = match self.kind {
-            KdfKind::Hkdf(hash) => 255 * hash.digest_size(),
-            KdfKind::Blake3 => usize::MAX,
+    // RFC 5869, 2.3: L is at most 255 HashLen, and BLAKE3-KDF's at most 2^32 - 1 (SPEC 12.8).
+    // Every KDF refuses an empty output.
+    const fn check_output(&self, length: usize) -> Result<(), Error> {
+        let fits = match self.kind {
+            KdfKind::Hkdf(hash) => length <= 255 * hash.digest_size(),
+            KdfKind::Blake3 => fits_u32(length),
         };
 
-        if length == 0 || length > limit {
+        if length == 0 || !fits {
             Err(Error::InvalidLength)
         } else {
             Ok(())
@@ -79,12 +95,14 @@ impl KdfAlgorithm {
         ikm: &[u8],
         length: usize,
         options: &KdfOptions,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<SecretBytes, Error> {
+        self.check_derive(options)?;
+
         self.check_output(length)?;
 
-        let mut out = vec![0; length];
+        let mut out = SecretBytes::zeroed(length);
 
-        self.derive_into(ikm, &mut out, options)?;
+        self.derive_unchecked(ikm, &mut out, options);
 
         Ok(out)
     }
@@ -96,18 +114,33 @@ impl KdfAlgorithm {
         out: &mut [u8],
         options: &KdfOptions,
     ) -> Result<(), Error> {
+        self.check_derive(options)?;
+
         self.check_output(out.len())?;
 
+        self.derive_unchecked(ikm, out, options);
+
+        Ok(())
+    }
+
+    // BLAKE3-KDF has no salt.
+    const fn check_derive(&self, options: &KdfOptions) -> Result<(), Error> {
+        match self.kind {
+            KdfKind::Blake3 if !options.salt.is_empty() => Err(Error::InvalidOption),
+            _ => Ok(()),
+        }
+    }
+
+    fn derive_unchecked(&self, ikm: &[u8], out: &mut [u8], options: &KdfOptions) {
         let hash = match self.kind {
             KdfKind::Hkdf(hash) => hash,
-            KdfKind::Blake3 if options.salt.is_empty() => {
+            KdfKind::Blake3 => {
                 let _dit = Dit::keyed();
 
                 blake3::derive_key(options.info, ikm, out);
 
-                return Ok(());
+                return;
             }
-            KdfKind::Blake3 => return Err(Error::InvalidOption),
         };
 
         let _dit = Dit::keyed();
@@ -121,12 +154,10 @@ impl KdfAlgorithm {
         expand_unchecked(&hash, &prk[..size], options.info, out);
 
         wipe(&mut prk);
-
-        Ok(())
     }
 
-    pub fn extract(&self, ikm: &[u8], options: &KdfOptions) -> Result<Vec<u8>, Error> {
-        let mut out = vec![0; self.prk_size()];
+    pub fn extract(&self, ikm: &[u8], options: &KdfOptions) -> Result<SecretBytes, Error> {
+        let mut out = SecretBytes::zeroed(self.prk_size());
 
         self.extract_into(ikm, &mut out, options)?;
 
@@ -162,25 +193,40 @@ impl KdfAlgorithm {
         prk: &[u8],
         length: usize,
         options: &KdfOptions,
-    ) -> Result<Vec<u8>, Error> {
-        self.hkdf()?;
+    ) -> Result<SecretBytes, Error> {
+        let hash = self.check_expand(prk, length, options)?;
 
-        self.check_output(length)?;
+        let mut out = SecretBytes::zeroed(length);
 
-        let mut out = vec![0; length];
+        let _dit = Dit::keyed();
 
-        self.expand_into(prk, &mut out, options)?;
+        expand_unchecked(&hash, prk, options.info, &mut out);
 
         Ok(out)
     }
 
-    // RFC 5869, 2.3: a PRK of at least HashLen bytes.
     pub fn expand_into(
         &self,
         prk: &[u8],
         out: &mut [u8],
         options: &KdfOptions,
     ) -> Result<(), Error> {
+        let hash = self.check_expand(prk, out.len(), options)?;
+
+        let _dit = Dit::keyed();
+
+        expand_unchecked(&hash, prk, options.info, out);
+
+        Ok(())
+    }
+
+    // RFC 5869, 2.3: a PRK of at least HashLen bytes, after the options (SPEC 12.7.1).
+    fn check_expand(
+        &self,
+        prk: &[u8],
+        length: usize,
+        options: &KdfOptions,
+    ) -> Result<HashAlgorithm, Error> {
         let hash = self.hkdf()?;
 
         if !options.salt.is_empty() {
@@ -191,13 +237,9 @@ impl KdfAlgorithm {
             return Err(Error::InvalidLength);
         }
 
-        self.check_output(out.len())?;
+        self.check_output(length)?;
 
-        let _dit = Dit::keyed();
-
-        expand_unchecked(&hash, prk, options.info, out);
-
-        Ok(())
+        Ok(hash)
     }
 }
 
