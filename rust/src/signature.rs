@@ -429,14 +429,8 @@ impl SignatureAlgorithm {
 
         let public_key = private_key.public_key();
 
-        // SPEC 9.1.7: a fixed message in the pure, hedged mode. A HashSLH-DSA value signs every
-        // message pre-hashed, with its fixed function.
         if options.self_test {
-            let signature = private_key.sign(SELF_TEST_MESSAGE, &SignOptions::default())?;
-
-            if !public_key.verify(&signature, SELF_TEST_MESSAGE, &VerifyOptions::default()) {
-                return Err(Error::SelfTestFailed);
-            }
+            self_test(&private_key, &public_key)?;
         }
 
         Ok(SignatureKeyPair {
@@ -655,6 +649,22 @@ impl SignatureAlgorithm {
         }
 
         Ok(pre_hash)
+    }
+}
+
+// SPEC 9.1.7 and D-69: a fixed message, signed hedged in the algorithm's own mode and verified:
+// pure for ML-DSA and SLH-DSA, and pre-hashed with the fixed function for HashSLH-DSA, which the
+// default options select. Returns the signature, for the tests.
+fn self_test(
+    private_key: &SignaturePrivateKey,
+    public_key: &SignaturePublicKey,
+) -> Result<Vec<u8>, Error> {
+    let signature = private_key.sign(SELF_TEST_MESSAGE, &SignOptions::default())?;
+
+    if public_key.verify(&signature, SELF_TEST_MESSAGE, &VerifyOptions::default()) {
+        Ok(signature)
+    } else {
+        Err(Error::SelfTestFailed)
     }
 }
 
@@ -1006,6 +1016,50 @@ mod tests {
 
             assert_eq!(filled(&untested.private_key), (false, false, false));
         }
+    }
+
+    // D-69: the self-test signature of a HashSLH-DSA key is a pre-hash signature with its fixed
+    // function, hedged, and that of an SLH-DSA key a pure one.
+    #[test]
+    fn self_test_in_the_algorithm_mode() {
+        let seed = [6; 48];
+
+        let hashed =
+            hazmat::generate_signature_key_pair(HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128, &seed)
+                .expect("key");
+
+        let pure = hazmat::generate_signature_key_pair(SLH_DSA_SHAKE_128F, &seed).expect("key");
+
+        let pre_hashed = VerifyOptions::default().with_pre_hash(SHAKE128);
+
+        let signature = self_test(&hashed.private_key, &hashed.public_key).expect("self-test");
+
+        assert!(
+            pure.public_key
+                .verify(&signature, SELF_TEST_MESSAGE, &pre_hashed)
+        );
+
+        assert!(
+            !pure
+                .public_key
+                .verify(&signature, SELF_TEST_MESSAGE, &VerifyOptions::default())
+        );
+
+        let signature = self_test(&pure.private_key, &pure.public_key).expect("self-test");
+
+        assert!(
+            pure.public_key
+                .verify(&signature, SELF_TEST_MESSAGE, &VerifyOptions::default())
+        );
+
+        let deterministic = SignOptions::default().with_deterministic(true);
+
+        let fixed = pure
+            .private_key
+            .sign(SELF_TEST_MESSAGE, &deterministic)
+            .expect("signature");
+
+        assert_ne!(signature, fixed);
     }
 
     #[test]
