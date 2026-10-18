@@ -70,8 +70,8 @@ fn acvp_key_generation() {
         );
 
         assert_eq!(
-            pair.private_key.export_key(KeyFormat::Raw).unwrap(),
-            seed,
+            *pair.private_key.export_key(KeyFormat::Raw).unwrap(),
+            *seed,
             "{context}"
         );
 
@@ -84,8 +84,8 @@ fn acvp_key_generation() {
         );
 
         assert_eq!(
-            expanded.export_key(KeyFormat::Raw).unwrap(),
-            dk,
+            *expanded.export_key(KeyFormat::Raw).unwrap(),
+            *dk,
             "{context}"
         );
 
@@ -97,8 +97,8 @@ fn acvp_key_generation() {
         let imported = algorithm.import_private_key(&both, KeyFormat::Der).unwrap();
 
         assert_eq!(
-            imported.export_key(KeyFormat::Raw).unwrap(),
-            seed,
+            *imported.export_key(KeyFormat::Raw).unwrap(),
+            *seed,
             "{context}"
         );
     }
@@ -132,7 +132,7 @@ fn check_encapsulation_and_decapsulation(name: &str) {
 
                 assert_eq!(result.ciphertext, unhex(&record["c"]), "{context}");
 
-                assert_eq!(result.shared_secret, unhex(&record["k"]), "{context}");
+                assert_eq!(*result.shared_secret, *unhex(&record["k"]), "{context}");
             }
             "decapsulation" => {
                 let private_key = if header["keyFormat"] == "seed" {
@@ -149,7 +149,7 @@ fn check_encapsulation_and_decapsulation(name: &str) {
 
                 let shared_secret = private_key.decapsulate(&unhex(&record["c"])).unwrap();
 
-                assert_eq!(shared_secret, unhex(&record["k"]), "{context}");
+                assert_eq!(*shared_secret, *unhex(&record["k"]), "{context}");
             }
             "encapsulationKeyCheck" => {
                 let result = algorithm.import_public_key(&unhex(&record["ek"]), KeyFormat::Raw);
@@ -233,7 +233,7 @@ fn wycheproof_decapsulation() {
 
                 let shared_secret = pair.private_key.decapsulate(&c).unwrap();
 
-                assert_eq!(shared_secret, unhex(&record["K"]), "{context}");
+                assert_eq!(*shared_secret, *unhex(&record["K"]), "{context}");
             } else if seed.len() != 64 {
                 let result = hazmat::generate_kem_key_pair(algorithm, &seed);
 
@@ -267,7 +267,7 @@ fn wycheproof_encapsulation() {
 
                 assert_eq!(result.ciphertext, unhex(&record["c"]), "{context}");
 
-                assert_eq!(result.shared_secret, unhex(&record["K"]), "{context}");
+                assert_eq!(*result.shared_secret, *unhex(&record["K"]), "{context}");
             } else {
                 let code = if ek.len() != algorithm.public_key_size() {
                     Error::InvalidLength
@@ -304,8 +304,8 @@ fn wycheproof_expanded_decapsulation() {
             assert_eq!(ek, unhex(&record["ek"]), "{context}");
 
             assert_eq!(
-                private_key.decapsulate(&c).unwrap(),
-                unhex(&record["K"]),
+                *private_key.decapsulate(&c).unwrap(),
+                *unhex(&record["K"]),
                 "{context}"
             );
         } else if flags.contains("IncorrectCiphertextLength") {
@@ -339,8 +339,8 @@ fn round_trip() {
         );
 
         assert_eq!(
-            pair.private_key.decapsulate(ciphertext).unwrap(),
-            encapsulation.shared_secret
+            *pair.private_key.decapsulate(ciphertext).unwrap(),
+            *encapsulation.shared_secret
         );
 
         let mut tampered = ciphertext.clone();
@@ -348,8 +348,8 @@ fn round_trip() {
         tampered[0] ^= 1;
 
         assert_ne!(
-            pair.private_key.decapsulate(&tampered).unwrap(),
-            encapsulation.shared_secret
+            *pair.private_key.decapsulate(&tampered).unwrap(),
+            *encapsulation.shared_secret
         );
 
         let truncated = pair
@@ -363,7 +363,7 @@ fn round_trip() {
         assert_eq!(raw.len(), algorithm.public_key_size());
 
         let unchecked = algorithm
-            .generate_key_pair(&KeyGenOptions { self_test: false })
+            .generate_key_pair(&KeyGenOptions::default().with_self_test(false))
             .unwrap();
 
         assert_eq!(unchecked.public_key.algorithm(), algorithm);
@@ -516,9 +516,9 @@ fn strict_encodings() {
 
     assert_eq!(expanded.public_key(), public_key);
 
-    assert_eq!(expanded.export_key(KeyFormat::Raw).unwrap(), dk);
+    assert_eq!(*expanded.export_key(KeyFormat::Raw).unwrap(), *dk);
 
-    assert_eq!(expanded.export_key(KeyFormat::Der).unwrap(), expanded_der);
+    assert_eq!(*expanded.export_key(KeyFormat::Der).unwrap(), *expanded_der);
 
     let seed_der = pkcs8(algorithm, &der(0x80, &seed));
 
@@ -526,7 +526,7 @@ fn strict_encodings() {
         .import_private_key(&seed_der, KeyFormat::Der)
         .unwrap();
 
-    assert_eq!(seeded.export_key(KeyFormat::Der).unwrap(), seed_der);
+    assert_eq!(*seeded.export_key(KeyFormat::Der).unwrap(), *seed_der);
 
     let mut other_seed = seed.clone();
 
@@ -606,8 +606,13 @@ fn strict_encodings() {
         .map(|chunk| std::str::from_utf8(chunk).unwrap())
         .collect();
 
+    // SPEC 10.4 item 3: text before the BEGIN line and after the END line is ignored, even
+    // non-ASCII text or a stray boundary that starts no block.
     let accepted = [
         format!(" \t\r\n{pem}\n\n"),
+        format!("Subject: test key\n\u{e9}\n{pem}-----END PUBLIC KEY-----\ntrailing \u{e9}"),
+        format!("see -----BEGIN PUBLIC KEY----- below\n  {pem}"),
+        format!("{} \t\r\n", pem.trim_end()),
         format!(
             "{}\r\n{}\r\n{}",
             lines[0],
@@ -630,6 +635,11 @@ fn strict_encodings() {
         pem[..pem.len() - 2].to_owned(),
         format!("x{pem}"),
         pem.replace("PUBLIC", "PRIVATE"),
+        pem.replacen("END PUBLIC", "END PRIVATE", 1),
+        format!("{pem}{pem}"),
+        format!("{pem}text\n-----BEGIN PUBLIC KEY-----\n"),
+        format!("{}x\n", pem.trim_end()),
+        pem.replacen("\n", "\nx\n", 1),
     ];
 
     for data in rejected {
@@ -642,13 +652,76 @@ fn strict_encodings() {
     }
 }
 
+// SPEC 10.6 item 4: the structure up to the algorithm identifier, then the OID, then the rest:
+// an encoding of another algorithm is a mismatch even when its later fields are malformed too.
+#[test]
+fn import_order() {
+    let pair = hazmat::generate_kem_key_pair(ML_KEM_768, &[5; 64]).unwrap();
+
+    let raw = pair.public_key.export_key(KeyFormat::Raw).unwrap();
+
+    let seed = pair.private_key.export_key(KeyFormat::Raw).unwrap();
+
+    let bits = [&[0][..], &raw].concat();
+
+    let other_public = spki(ML_KEM_512, &[&[1][..], &raw].concat());
+
+    let other_private = der(
+        0x30,
+        &[
+            der(0x02, &[2]),
+            der(0x30, &oid(ML_KEM_512)),
+            der(0x04, &der(0x80, &seed)),
+        ]
+        .concat(),
+    );
+
+    let same_private = der(
+        0x30,
+        &[
+            der(0x02, &[2]),
+            der(0x30, &oid(ML_KEM_768)),
+            der(0x04, &der(0x80, &seed)),
+        ]
+        .concat(),
+    );
+
+    assert_eq!(
+        ML_KEM_768
+            .import_public_key(&other_public, KeyFormat::Der)
+            .err(),
+        Some(Error::AlgorithmMismatch)
+    );
+
+    assert_eq!(
+        ML_KEM_768
+            .import_public_key(&[spki(ML_KEM_768, &bits), vec![0]].concat(), KeyFormat::Der)
+            .err(),
+        Some(Error::InvalidEncoding)
+    );
+
+    assert_eq!(
+        ML_KEM_768
+            .import_private_key(&other_private, KeyFormat::Der)
+            .err(),
+        Some(Error::AlgorithmMismatch)
+    );
+
+    assert_eq!(
+        ML_KEM_768
+            .import_private_key(&same_private, KeyFormat::Der)
+            .err(),
+        Some(Error::InvalidEncoding)
+    );
+}
+
 #[test]
 fn errors_and_debug() {
     assert_eq!(Error::InvalidLength.code(), "INVALID_LENGTH");
 
     assert_eq!(
         Error::StatePersistFailed.to_string(),
-        "STATE_PERSIST_FAILED"
+        "STATE_PERSIST_FAILED: the state store failed"
     );
 
     let pair = hazmat::generate_kem_key_pair(ML_KEM_768, &[1; 64]).unwrap();
@@ -657,6 +730,16 @@ fn errors_and_debug() {
         format!("{:?}", pair.private_key),
         "KemPrivateKey { algorithm: KemAlgorithm(\"ML-KEM-768\"), .. }"
     );
+
+    // SecretBytes prints its length alone (SPEC 6.7 item 3, 23.1 item 6).
+    let encapsulation = pair.public_key.encapsulate().unwrap();
+
+    assert_eq!(
+        format!("{:?}", encapsulation.shared_secret),
+        "SecretBytes(32 bytes, redacted)"
+    );
+
+    assert!(!format!("{encapsulation:?}").contains("SecretBytes"));
 
     assert_eq!(ML_KEM_768.name(), "ML-KEM-768");
 
@@ -717,13 +800,13 @@ fn concurrent_first_use() {
                         let fresh = public_key.encapsulate().unwrap();
 
                         assert_eq!(
-                            original.decapsulate(&fresh.ciphertext).unwrap(),
-                            fresh.shared_secret
+                            *original.decapsulate(&fresh.ciphertext).unwrap(),
+                            *fresh.shared_secret
                         );
                     } else {
                         assert_eq!(
-                            private_key.decapsulate(&encapsulation.ciphertext).unwrap(),
-                            encapsulation.shared_secret
+                            *private_key.decapsulate(&encapsulation.ciphertext).unwrap(),
+                            *encapsulation.shared_secret
                         );
                     }
                 });
@@ -732,37 +815,28 @@ fn concurrent_first_use() {
     }
 }
 
-// The C.4 example that only the pairwise consistency test of SPEC 8.1.4 check (4) refuses: an
-// expanded key with a mutated secret vector and a valid H(ek). That import check is pending
-// (SPEC Appendix C.2 item 6); run the example again when it lands.
-const PENDING_PAIRWISE_TEST: &str =
-    "C.4.1 ML-KEM Inconsistent Seed and Expanded Private Keys example 2";
-
 // RFC 9935, Appendix C: every example key, its public key and what it exports as; the
-// inconsistent seed and expanded keys of C.4 must be refused.
+// inconsistent seed and expanded keys of C.4 must be refused, example 2 (a changed secret vector
+// under a valid H(ek)) by the pairwise test of SPEC 8.1.4 check (4).
 #[test]
 fn rfc9935_example_keys() {
-    example_keys(
-        "rfc/mlkem_keys.txt",
-        &[PENDING_PAIRWISE_TEST],
-        |record, data, format| {
-            let algorithm = algorithm(&record["algorithm"]);
+    example_keys("rfc/mlkem_keys.txt", |record, data, format| {
+        let algorithm = algorithm(&record["algorithm"]);
 
-            if record["kind"] == "public" {
-                let key = algorithm.import_public_key(data, format)?;
+        if record["kind"] == "public" {
+            let key = algorithm.import_public_key(data, format)?;
 
-                Ok((
-                    key.export_key(KeyFormat::Raw)?,
-                    key.export_key(KeyFormat::Der)?,
-                ))
-            } else {
-                let key = algorithm.import_private_key(data, format)?;
+            Ok((
+                key.export_key(KeyFormat::Raw)?,
+                key.export_key(KeyFormat::Der)?,
+            ))
+        } else {
+            let key = algorithm.import_private_key(data, format)?;
 
-                Ok((
-                    key.public_key().export_key(KeyFormat::Raw)?,
-                    key.export_key(KeyFormat::Der)?,
-                ))
-            }
-        },
-    );
+            Ok((
+                key.public_key().export_key(KeyFormat::Raw)?,
+                key.export_key(KeyFormat::Der)?.to_vec(),
+            ))
+        }
+    });
 }

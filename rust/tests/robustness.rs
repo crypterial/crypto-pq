@@ -3,6 +3,8 @@
 // nothing may panic or allocate what a length field claims before checking it. A deterministic
 // generator keeps every run reproducible; CRYPTO_PQ_FUZZ=1 runs many more rounds.
 
+mod vectors;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::{Arc, Barrier, Mutex};
@@ -518,28 +520,20 @@ fn signature_codes(format: KeyFormat, check: Error) -> Vec<Error> {
     }
 }
 
-// The DER inside a PEM input, so that encodings that differ only in whitespace compare equal;
-// the PEM decoder is internal, so this one is written out here.
+// The DER inside a PEM input, so that encodings that differ only in whitespace or in the text
+// around the block compare equal; the PEM decoder is internal, so this one is written out here.
 fn pem_body(data: &[u8]) -> Vec<u8> {
-    let text: Vec<u8> = data
-        .iter()
-        .copied()
-        .filter(|byte| !byte.is_ascii_whitespace() && *byte != 0x0B)
-        .collect();
+    let find = |data: &[u8], pattern: &[u8]| {
+        data.windows(pattern.len())
+            .position(|window| window == pattern)
+            .expect("an imported PEM block")
+    };
 
-    let start = text
-        .iter()
-        .skip(5)
-        .position(|&byte| byte == b'-')
-        .map_or(0, |i| i + 10);
+    let rest = &data[find(data, b"-----BEGIN ") + 11..];
 
-    let end = text.len()
-        - text
-            .iter()
-            .rev()
-            .skip(5)
-            .position(|&byte| byte == b'-')
-            .map_or(0, |i| i + 10);
+    let rest = &rest[find(rest, b"-----") + 5..];
+
+    let text = &rest[..find(rest, b"-----END ")];
 
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -549,7 +543,7 @@ fn pem_body(data: &[u8]) -> Vec<u8> {
 
     let mut out = Vec::new();
 
-    for &byte in &text[start..end] {
+    for &byte in text {
         if let Some(value) = alphabet.iter().position(|&c| c == byte) {
             bits = (bits << 6) | value as u32;
 
@@ -593,7 +587,7 @@ fn kem_fixtures() -> Vec<(KemAlgorithm, KemPrivateKey, Vec<u8>, Vec<u8>)> {
                 algorithm,
                 pair.private_key,
                 encapsulation.ciphertext,
-                encapsulation.shared_secret,
+                encapsulation.shared_secret.to_vec(),
             )
         })
         .collect()
@@ -644,7 +638,7 @@ fn check_kem_private(algorithm: KemAlgorithm, data: &[u8], format: KeyFormat) {
     };
 
     if format == KeyFormat::Raw {
-        assert_eq!(key.export_key(format).expect("export"), data);
+        assert_eq!(*key.export_key(format).expect("export"), *data);
     }
 
     for format in FORMATS {
@@ -654,8 +648,8 @@ fn check_kem_private(algorithm: KemAlgorithm, data: &[u8], format: KeyFormat) {
                 .expect("re-import");
 
             assert_eq!(
-                again.export_key(KeyFormat::Raw),
-                key.export_key(KeyFormat::Raw)
+                *again.export_key(KeyFormat::Raw).expect("export"),
+                *key.export_key(KeyFormat::Raw).expect("export")
             );
         }
     }
@@ -673,7 +667,7 @@ fn check_kem_private(algorithm: KemAlgorithm, data: &[u8], format: KeyFormat) {
         .decapsulate(&encapsulation.ciphertext)
         .expect("decapsulation");
 
-    if secret != encapsulation.shared_secret {
+    if *secret != *encapsulation.shared_secret {
         let raw = key.export_key(KeyFormat::Raw).expect("export");
 
         assert_ne!(raw.len(), seed);
@@ -686,35 +680,17 @@ fn check_kem_private(algorithm: KemAlgorithm, data: &[u8], format: KeyFormat) {
             [&raw[raw.len() - 32..], &encapsulation.ciphertext].concat()
         };
 
-        assert_eq!(secret, SHAKE256.digest(&rejection, size));
+        assert_eq!(*secret, *SHAKE256.digest(&rejection, size).unwrap());
     }
 }
 
 // The expanded private key of the first ACVP key generation record of an ML-KEM parameter set.
 fn expanded_key(algorithm: KemAlgorithm) -> Vec<u8> {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../vectors/acvp/ML-KEM-keyGen.txt");
-
-    let text = std::fs::read_to_string(path).expect("vectors");
-
-    let section = text
-        .split(&format!("[parameterSet = {}]", algorithm.name()))
-        .nth(1)
-        .expect("parameter set");
-
-    let line = section
-        .lines()
-        .find_map(|line| line.strip_prefix("dk = "))
-        .expect("dk");
-
-    (0..line.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&line[i..i + 2], 16).expect("hex"))
-        .collect()
+    vectors::first("acvp/ML-KEM-keyGen.txt", algorithm.name(), "dk")
 }
 
 // FIPS 203 checks only the hash of the public part of an expanded key, so one whose secret vector
-// was changed is accepted and decapsulates to the implicit rejection, SHAKE256(z || c).
+// was changed passes them; the pairwise test of the import refuses it (SPEC 8.1.4 check (4)).
 #[test]
 fn inconsistent_expanded_kem_key() {
     for algorithm in [ML_KEM_512, ML_KEM_768, ML_KEM_1024] {
@@ -722,19 +698,9 @@ fn inconsistent_expanded_kem_key() {
 
         dk[0] ^= 1;
 
-        let key = algorithm
-            .import_private_key(&dk, KeyFormat::Raw)
-            .expect("accepted");
-
-        let encapsulation =
-            hazmat::encapsulate(&key.public_key(), &pattern(32, 0x80)).expect("encapsulation");
-
-        let rejection = [&dk[dk.len() - 32..], &encapsulation.ciphertext].concat();
-
         assert_eq!(
-            key.decapsulate(&encapsulation.ciphertext)
-                .expect("decapsulation"),
-            SHAKE256.digest(&rejection, 32)
+            algorithm.import_private_key(&dk, KeyFormat::Raw).err(),
+            Some(Error::InvalidPrivateKey)
         );
     }
 }
@@ -759,14 +725,14 @@ fn kem_import() {
                         (_, KeyFormat::Der | KeyFormat::Pem) if is_frodo(algorithm) => {
                             public_key.export_key(KeyFormat::Raw)
                         }
-                        (true, _) => private_key.export_key(format),
+                        (true, _) => private_key.export_key(format).map(|key| key.to_vec()),
                         (false, _) => public_key.export_key(format),
                     }
                     .expect("export"),
                 ];
 
                 if let (true, Some(expanded)) = (private, &expanded) {
-                    seeds.push(expanded.export_key(format).expect("export"));
+                    seeds.push(expanded.export_key(format).expect("export").to_vec());
                 }
 
                 for data in inputs(&mut rng, &seeds, 25 * scale()) {
@@ -822,7 +788,7 @@ fn check_signature_private(algorithm: SignatureAlgorithm, data: &[u8], format: K
     };
 
     if format == KeyFormat::Raw {
-        assert_eq!(key.export_key(format).expect("export"), data);
+        assert_eq!(*key.export_key(format).expect("export"), *data);
     }
 
     for format in FORMATS {
@@ -833,8 +799,8 @@ fn check_signature_private(algorithm: SignatureAlgorithm, data: &[u8], format: K
             .expect("re-import");
 
         assert_eq!(
-            again.export_key(KeyFormat::Raw),
-            key.export_key(KeyFormat::Raw)
+            *again.export_key(KeyFormat::Raw).expect("export"),
+            *key.export_key(KeyFormat::Raw).expect("export")
         );
     }
 
@@ -884,7 +850,7 @@ fn signature_import() {
         for private in [false, true] {
             for format in FORMATS {
                 let encoded = if private {
-                    pair.private_key.export_key(format)
+                    pair.private_key.export_key(format).map(|key| key.to_vec())
                 } else {
                     pair.public_key.export_key(format)
                 };
@@ -912,9 +878,15 @@ fn pem_import() {
 
     let seeds = [
         kem.public_key.export_key(KeyFormat::Pem).expect("export"),
-        kem.private_key.export_key(KeyFormat::Pem).expect("export"),
+        kem.private_key
+            .export_key(KeyFormat::Pem)
+            .expect("export")
+            .to_vec(),
         dsa.public_key.export_key(KeyFormat::Pem).expect("export"),
-        dsa.private_key.export_key(KeyFormat::Pem).expect("export"),
+        dsa.private_key
+            .export_key(KeyFormat::Pem)
+            .expect("export")
+            .to_vec(),
     ];
 
     for _ in 0..300 * scale() {
@@ -1038,10 +1010,7 @@ fn signature_fixtures() -> Vec<SignatureFixture> {
 
             let message = b"crypto-pq robustness".to_vec();
 
-            let options = SignOptions {
-                context: b"context",
-                ..SignOptions::default()
-            };
+            let options = SignOptions::default().with_context(b"context");
 
             let signature = hazmat::sign(&pair.private_key, &message, &pattern(32, 0x60), &options)
                 .expect("signature");
@@ -1105,10 +1074,9 @@ fn verify_signatures() {
 
             let policy = rng.below(4) != 0;
 
-            let options = VerifyOptions {
-                context: &context,
-                pre_hash,
-            };
+            let mut options = VerifyOptions::default().with_context(&context);
+
+            options.pre_hash = pre_hash;
 
             let valid = if policy {
                 public_key.verify(&candidate, &text, &options)
@@ -1300,7 +1268,7 @@ fn decapsulation() {
 
                     // Implicit rejection: any other ciphertext gives a different secret.
                     assert_eq!(
-                        shared == secret,
+                        shared[..] == secret[..],
                         candidate == ciphertext,
                         "{}",
                         hex(&candidate)
@@ -2056,12 +2024,12 @@ fn large_hashes() {
 
     for (algorithm, expected) in xofs {
         assert_eq!(
-            hex(&algorithm.digest(&message, expected.len() / 2)),
+            hex(&algorithm.digest(&message, expected.len() / 2).unwrap()),
             expected
         );
     }
 
-    let tag = HMAC_SHA_256.digest(&pattern(32, 0), &message);
+    let tag = HMAC_SHA_256.digest(&pattern(32, 0), &message).unwrap();
 
     assert_eq!(
         hex(&tag),
@@ -2097,15 +2065,17 @@ fn large_and_empty_messages() {
         ];
 
         for (text, context, pre_hash) in cases {
-            let options = SignOptions {
-                context,
-                deterministic: true,
-                pre_hash,
-            };
+            let mut options = SignOptions::default()
+                .with_context(context)
+                .with_deterministic(true);
+
+            options.pre_hash = pre_hash;
 
             let signature = private_key.sign(text, &options).expect("signature");
 
-            let verify = VerifyOptions { context, pre_hash };
+            let mut verify = VerifyOptions::default().with_context(context);
+
+            verify.pre_hash = pre_hash;
 
             assert!(public_key.verify(&signature, text, &verify));
 
@@ -2117,20 +2087,12 @@ fn large_and_empty_messages() {
 
             let longer = [context, b"\x00"].concat();
 
-            assert!(!public_key.verify(
-                &signature,
-                text,
-                &VerifyOptions {
-                    context: &longer,
-                    pre_hash
-                }
-            ));
+            verify.context = &longer;
+
+            assert!(!public_key.verify(&signature, text, &verify));
         }
 
-        let long = SignOptions {
-            context: &[0; 256],
-            ..SignOptions::default()
-        };
+        let long = SignOptions::default().with_context(&[0; 256]);
 
         assert_eq!(
             private_key.sign(b"", &long).err(),
@@ -2512,15 +2474,18 @@ const TRANSCRIPT_ROUNDS: usize = 96;
 
 const TRANSCRIPT_BUDGET: u64 = 1 << 14;
 
-// Each case is known by its number, which also seeds its generator.
+// Each case is known by its number, which also seeds its generator. Cases 0, 1, 3 and 5 follow the
+// import rules of SPEC 1.0 (the text around a PEM block, the OID before the rest of the DER, the
+// ML-KEM secret-vector check and pairwise test); the other implementations reach these digests as
+// they apply the same rules.
 const TRANSCRIPT_CASES: [u64; 10] = [0, 1, 3, 4, 5, 6, 7, 8, 9, 10];
 
 const TRANSCRIPTS: [&str; 10] = [
-    "4d454f3aca564e383f51723ee3814f1fe105a61b1fd38c536e2ea675d78fabe7",
-    "db3f28b7c8f7949f104d15d6de629e0dea7fca38f38c970d520278617dc99474",
-    "ce9fd19a166b8a384fab4dafffed98c85dd9fb7f3e2ab789f33c832cda8b199d",
+    "ed99902d3b962fb9924d9607f9b14de5865d906cd1e005bd84b548c9b35dd398",
+    "8f4fc6ce6187f007b6a52ae1709492f85558a06b89df5368b4f2bedca8b2266e",
+    "439c5953c821ec35d4f8c6dee1acc2f1b63b724e911d0ce69765cf6f171069fc",
     "14d657260a5c207db5e73e9dbaac6d3458b0ba16e507f256bea8fac9fd0f2a0a",
-    "19d93bae7a287d14492808654d0580f1043443ad3cf6710e043ea34c462b3307",
+    "083bba1bf00d26e73459e61b0ad4ea59a28a0e7eacd1b4826c85a315bfcc0c4e",
     "38a35f3547d4414788484ce0b4b836a27f72fba19931a9f3680cbcadd6d5d97a",
     "7b468ce2966d2edd458ed4a62183bf6d4c06e182509a7773c505a3cb2ae12e58",
     "b2ecff951172fdfdd464c3b4bed07055c3041b64d0c11dc6c9bc62eae7cc0b0e",
@@ -2661,10 +2626,7 @@ fn transcripts() {
 
     let dsa = hazmat::generate_signature_key_pair(ML_DSA_44, &pattern(32, 0)).expect("key");
 
-    let options = SignOptions {
-        context: b"context",
-        ..SignOptions::default()
-    };
+    let options = SignOptions::default().with_context(b"context");
 
     let signature =
         hazmat::sign(&dsa.private_key, message, &pattern(32, 0x60), &options).expect("signature");
@@ -2698,7 +2660,7 @@ fn transcripts() {
     let kem_private = |data: &[u8], format| {
         ML_KEM_768
             .import_private_key(data, format)
-            .map(|key| key.export_key(raw).expect("export"))
+            .map(|key| key.export_key(raw).expect("export").to_vec())
     };
 
     let dsa_public = |data: &[u8], format| {
@@ -2710,7 +2672,7 @@ fn transcripts() {
     let dsa_private = |data: &[u8], format| {
         ML_DSA_44
             .import_private_key(data, format)
-            .map(|key| key.export_key(raw).expect("export"))
+            .map(|key| key.export_key(raw).expect("export").to_vec())
     };
 
     let slh_public = |data: &[u8], format| {
@@ -2722,7 +2684,7 @@ fn transcripts() {
     let slh_private = |data: &[u8], format| {
         SLH_DSA_SHA2_128F
             .import_private_key(data, format)
-            .map(|key| key.export_key(raw).expect("export"))
+            .map(|key| key.export_key(raw).expect("export").to_vec())
     };
 
     let stateful = [HSS_LMS, XMSS, XMSS_MT];
@@ -2758,7 +2720,10 @@ fn transcripts() {
 
     let mut slh_seeds = exports(|format| slh.public_key.export_key(format), 0);
 
-    slh_seeds.extend(exports(|format| slh.private_key.export_key(format), 1));
+    slh_seeds.extend(exports(
+        |format| slh.private_key.export_key(format).map(|key| key.to_vec()),
+        1,
+    ));
 
     let digests: Vec<String> = TRANSCRIPT_CASES
         .iter()
@@ -2779,7 +2744,10 @@ fn transcripts() {
                 1 => import_case(
                     &mut rng,
                     t,
-                    &exports(|format| kem.private_key.export_key(format), 0),
+                    &exports(
+                        |format| kem.private_key.export_key(format).map(|key| key.to_vec()),
+                        0,
+                    ),
                     &[&kem_private],
                 ),
                 3 => import_case(
@@ -2791,7 +2759,10 @@ fn transcripts() {
                 4 => import_case(
                     &mut rng,
                     t,
-                    &exports(|format| dsa.private_key.export_key(format), 0),
+                    &exports(
+                        |format| dsa.private_key.export_key(format).map(|key| key.to_vec()),
+                        0,
+                    ),
                     &[&dsa_private],
                 ),
                 5 => import_case(&mut rng, t, &slh_seeds, &[&slh_public, &slh_private]),
@@ -2809,10 +2780,7 @@ fn transcripts() {
                     dsa.public_key.verify(
                         data,
                         message,
-                        &VerifyOptions {
-                            context,
-                            pre_hash: None,
-                        },
+                        &VerifyOptions::default().with_context(context),
                     )
                 }),
                 8 => {
@@ -2823,7 +2791,11 @@ fn transcripts() {
 
                         let data = resized(&mut rng, data, ciphertext.len());
 
-                        let (code, secret) = outcome(kem.private_key.decapsulate(&data));
+                        let (code, secret) = outcome(
+                            kem.private_key
+                                .decapsulate(&data)
+                                .map(|secret| secret.to_vec()),
+                        );
 
                         t.add(&data, 0, code, &secret.unwrap_or_default());
                     }

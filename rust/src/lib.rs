@@ -87,8 +87,14 @@ pub use mac::{
     KMAC128, KMAC256, Mac, MacAlgorithm, MacOptions,
 };
 pub use signature::{
-    ML_DSA_44, ML_DSA_65, ML_DSA_87, PreHash, SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S,
-    SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F,
+    HASH_SLH_DSA_SHA2_128F_WITH_SHA256, HASH_SLH_DSA_SHA2_128S_WITH_SHA256,
+    HASH_SLH_DSA_SHA2_192F_WITH_SHA512, HASH_SLH_DSA_SHA2_192S_WITH_SHA512,
+    HASH_SLH_DSA_SHA2_256F_WITH_SHA512, HASH_SLH_DSA_SHA2_256S_WITH_SHA512,
+    HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128, HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128,
+    HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256, HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256,
+    HASH_SLH_DSA_SHAKE_256F_WITH_SHAKE256, HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256, ML_DSA_44,
+    ML_DSA_65, ML_DSA_87, PreHash, SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F,
+    SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F,
     SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F,
     SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, SignatureKeyPair, SignaturePrivateKey,
     SignaturePublicKey, VerifyOptions,
@@ -98,6 +104,7 @@ pub use stateful::{
     StatefulParameters, StatefulPrivateKey, StatefulPublicKey, StatefulSignatureAlgorithm, XMSS,
     XMSS_MT,
 };
+pub use wipe::SecretBytes;
 
 // What the constant-time check of tests/ct.rs needs; it exists only under the crypto_pq_ct cfg.
 #[cfg(crypto_pq_ct)]

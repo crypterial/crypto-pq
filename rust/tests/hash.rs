@@ -136,7 +136,7 @@ fn digest_into_matches_digest() {
         for (_, _, algorithm) in HASHES {
             let mut out = vec![0; algorithm.digest_size()];
 
-            algorithm.digest_into(message, &mut out);
+            algorithm.digest_into(message, &mut out).unwrap();
 
             assert_eq!(out, algorithm.digest(message));
 
@@ -146,7 +146,7 @@ fn digest_into_matches_digest() {
 
             let mut streamed = vec![0; algorithm.digest_size()];
 
-            hasher.digest_into(&mut streamed);
+            hasher.digest_into(&mut streamed).unwrap();
 
             assert_eq!(streamed, out);
         }
@@ -154,19 +154,19 @@ fn digest_into_matches_digest() {
         for (_, algorithm) in XOFS {
             let mut out = [0; 200];
 
-            algorithm.digest_into(message, &mut out);
+            algorithm.digest_into(message, &mut out).unwrap();
 
-            assert_eq!(out.as_slice(), algorithm.digest(message, 200));
+            assert_eq!(out.as_slice(), algorithm.digest(message, 200).unwrap());
 
             let mut xof = algorithm.create();
 
-            xof.update(message);
+            xof.update(message).unwrap();
 
             let mut read = [0; 200];
 
-            xof.read_into(&mut read[..77]);
+            xof.read_into(&mut read[..77]).unwrap();
 
-            xof.read_into(&mut read[77..]);
+            xof.read_into(&mut read[77..]).unwrap();
 
             assert_eq!(read, out);
         }
@@ -174,33 +174,51 @@ fn digest_into_matches_digest() {
         for (_, _, algorithm) in HMACS {
             let mut out = vec![0; algorithm.digest_size()];
 
-            algorithm.digest_into(b"key", message, &mut out);
+            algorithm.digest_into(b"key", message, &mut out).unwrap();
 
-            assert_eq!(out, algorithm.digest(b"key", message));
+            assert_eq!(out, algorithm.digest(b"key", message).unwrap());
 
-            let mut hmac = algorithm.create(b"key");
+            let mut hmac = algorithm.create(b"key").unwrap();
 
             hmac.update(message);
 
             let mut streamed = vec![0; algorithm.digest_size()];
 
-            hmac.digest_into(&mut streamed);
+            hmac.digest_into(&mut streamed).unwrap();
 
             assert_eq!(streamed, out);
         }
     }
 }
 
+// A buffer of another size is an error, not a panic, and is left as it was.
 #[test]
-#[should_panic(expected = "INVALID_LENGTH")]
 fn digest_into_rejects_another_size() {
-    SHA_256.digest_into(b"abc", &mut [0; 31]);
-}
+    for size in [0, 31, 33] {
+        let mut out = vec![7; size];
 
-#[test]
-#[should_panic(expected = "INVALID_LENGTH")]
-fn hmac_digest_into_rejects_another_size() {
-    HMAC_SHA_512.digest_into(b"key", b"abc", &mut [0; 65]);
+        assert_eq!(
+            SHA_256.digest_into(b"abc", &mut out),
+            Err(Error::InvalidLength)
+        );
+
+        assert_eq!(
+            SHA_256.create().digest_into(&mut out),
+            Err(Error::InvalidLength)
+        );
+
+        assert_eq!(
+            HMAC_SHA_256.digest_into(b"key", b"abc", &mut out),
+            Err(Error::InvalidLength)
+        );
+
+        assert_eq!(
+            HMAC_SHA_256.create(b"key").unwrap().digest_into(&mut out),
+            Err(Error::InvalidLength)
+        );
+
+        assert_eq!(out, vec![7; size]);
+    }
 }
 
 #[test]
@@ -227,7 +245,7 @@ fn xof_vectors() {
                 );
 
                 assert_eq!(
-                    algorithm.digest(&data, expected.len()),
+                    algorithm.digest(&data, expected.len()).unwrap(),
                     expected,
                     "{prefix}{kind} Len = {}",
                     record["Len"]
@@ -236,12 +254,12 @@ fn xof_vectors() {
                 let mut xof = algorithm.create();
 
                 for piece in pieces(&data, &PIECES) {
-                    xof.update(piece);
+                    xof.update(piece).unwrap();
                 }
 
-                let mut out = xof.read(1);
+                let mut out = xof.read(1).unwrap();
 
-                out.extend(xof.read(expected.len() - 1));
+                out.extend(xof.read(expected.len() - 1).unwrap());
 
                 assert_eq!(
                     out, expected,
@@ -260,7 +278,9 @@ fn xof_vectors() {
             );
 
             assert_eq!(
-                algorithm.digest(&unhex(&record["Msg"]), expected.len()),
+                algorithm
+                    .digest(&unhex(&record["Msg"]), expected.len())
+                    .unwrap(),
                 expected,
                 "{prefix}VariableOut COUNT = {}",
                 record["COUNT"]
@@ -301,25 +321,55 @@ fn xof_streaming_read() {
     for (_, algorithm) in XOFS {
         let mut xof = algorithm.create();
 
-        xof.update(b"abc");
+        xof.update(b"abc").unwrap();
 
         let out: Vec<u8> = [0, 1, 135, 1, 167, 200, 496]
             .iter()
-            .flat_map(|&n| xof.read(n))
+            .flat_map(|&n| xof.read(n).unwrap())
             .collect();
 
-        assert_eq!(out, algorithm.digest(b"abc", 1000));
+        assert_eq!(out, algorithm.digest(b"abc", 1000).unwrap());
     }
 }
 
+// Any read ends absorbing, even of no bytes (SPEC 12.2); a later update fails and changes
+// nothing.
 #[test]
-#[should_panic(expected = "UNSUPPORTED")]
 fn xof_update_after_read() {
-    let mut xof = SHAKE128.create();
+    for (_, algorithm) in XOFS {
+        let mut xof = algorithm.create();
 
-    xof.read(1);
+        xof.update(b"abc").unwrap();
 
-    xof.update(b"x");
+        assert_eq!(xof.read(0), Ok(Vec::new()));
+
+        assert_eq!(xof.update(b"x"), Err(Error::Unsupported));
+
+        let mut out = xof.read(10).unwrap();
+
+        assert_eq!(xof.update(b"x"), Err(Error::Unsupported));
+
+        out.extend(xof.read(10).unwrap());
+
+        assert_eq!(out, algorithm.digest(b"abc", 20).unwrap());
+    }
+}
+
+// SPEC 12.8: at most 2^32 - 1 bytes per call, refused before anything is allocated.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn xof_output_limit() {
+    let beyond = u32::MAX as usize + 1;
+
+    for (_, algorithm) in XOFS {
+        assert_eq!(algorithm.digest(b"", beyond), Err(Error::InvalidLength));
+
+        let mut xof = algorithm.create();
+
+        assert_eq!(xof.read(beyond), Err(Error::InvalidLength));
+
+        assert_eq!(xof.update(b"abc"), Ok(()));
+    }
 }
 
 #[test]
@@ -328,7 +378,7 @@ fn xof_properties() {
 
     assert_eq!(SHAKE256.name(), "SHAKE256");
 
-    assert_eq!(SHAKE256.digest(b"", 0), Vec::<u8>::new());
+    assert_eq!(SHAKE256.digest(b"", 0).unwrap(), Vec::<u8>::new());
 }
 
 #[test]
@@ -365,11 +415,11 @@ fn hmac_vectors() {
             "{context}"
         );
 
-        let tag = algorithm.digest(&key, &data);
+        let tag = algorithm.digest(&key, &data).unwrap();
 
         assert_eq!(tag[..mac.len()], mac, "{context}");
 
-        let mut hmac = algorithm.create(&key);
+        let mut hmac = algorithm.create(&key).unwrap();
 
         for piece in pieces(&data, &PIECES) {
             hmac.update(piece);
@@ -389,7 +439,7 @@ fn hmac_vectors() {
 
 #[test]
 fn hmac_verify_rejects() {
-    let tag = HMAC_SHA_256.digest(b"key", b"data");
+    let tag = HMAC_SHA_256.digest(b"key", b"data").unwrap();
 
     assert!(!HMAC_SHA_256.verify(b"key", b"data", &tag[..tag.len() - 1]));
 
@@ -411,33 +461,61 @@ fn hmac_properties() {
     for (_, name, algorithm) in HMACS {
         assert_eq!(algorithm.name(), name);
 
-        assert_eq!(algorithm.digest(b"k", b"").len(), algorithm.digest_size());
+        assert_eq!(
+            algorithm.digest(b"k", b"").unwrap().len(),
+            algorithm.digest_size()
+        );
     }
 }
 
-// HMAC takes no options, and none leave it as it is.
+// HMAC takes a length alone (SPEC 6.5): 4 bytes to the hash output, the leftmost bytes of the
+// full tag (FIPS 198-1, 5), which verify compares in full.
 #[test]
 fn hmac_configure() {
     for (_, _, algorithm) in HMACS {
+        let size = algorithm.digest_size();
+
         assert_eq!(algorithm.configure(&MacOptions::default()), Ok(algorithm));
 
+        let full = algorithm.digest(b"key", b"data").unwrap();
+
+        for length in [4, 16, size - 1, size] {
+            let truncated = algorithm
+                .configure(&MacOptions::default().with_length(length))
+                .unwrap();
+
+            assert_eq!(truncated.digest_size(), length);
+
+            let tag = truncated.digest(b"key", b"data").unwrap();
+
+            assert_eq!(tag, full[..length]);
+
+            let mut mac = truncated.create(b"key").unwrap();
+
+            mac.update(b"da");
+
+            mac.update(b"ta");
+
+            assert_eq!(mac.digest(), tag);
+
+            assert!(mac.verify(&tag) && truncated.verify(b"key", b"data", &tag));
+
+            if length < size {
+                assert!(!truncated.verify(b"key", b"data", &full));
+            }
+
+            assert!(!truncated.verify(b"key", b"data", &full[..length - 1]));
+
+            assert_eq!(truncated.configure(&MacOptions::default()), Ok(algorithm));
+        }
+
         for options in [
-            MacOptions {
-                length: Some(algorithm.digest_size()),
-                ..MacOptions::default()
-            },
-            MacOptions {
-                customization: b"x",
-                ..MacOptions::default()
-            },
-            MacOptions {
-                xof: true,
-                ..MacOptions::default()
-            },
-            MacOptions {
-                salt: b"x",
-                ..MacOptions::default()
-            },
+            MacOptions::default().with_length(3),
+            MacOptions::default().with_length(size + 1),
+            MacOptions::default().with_customization(b"x"),
+            MacOptions::default().with_xof(true),
+            MacOptions::default().with_salt(b"x"),
+            MacOptions::default().with_personalization(b"x"),
         ] {
             assert_eq!(algorithm.configure(&options), Err(Error::InvalidOption));
         }
@@ -446,10 +524,7 @@ fn hmac_configure() {
     for (_, _, algorithm) in HASHES {
         assert_eq!(algorithm.configure(&HashOptions::default()), Ok(algorithm));
 
-        let options = HashOptions {
-            personalization: b"x",
-            ..HashOptions::default()
-        };
+        let options = HashOptions::default().with_personalization(b"x");
 
         assert_eq!(algorithm.configure(&options), Err(Error::InvalidOption));
     }
@@ -467,9 +542,7 @@ fn unapproved_pre_hashes_are_refused() {
         let pair = hazmat::generate_signature_key_pair(algorithm, seed).unwrap();
 
         let customized = CSHAKE256
-            .configure(&XofOptions {
-                customization: b"x",
-            })
+            .configure(&XofOptions::default().with_customization(b"x"))
             .unwrap();
 
         let refused: [PreHash; 7] = [
@@ -485,10 +558,7 @@ fn unapproved_pre_hashes_are_refused() {
         let randomness = vec![1; if algorithm == ML_DSA_65 { 32 } else { 16 }];
 
         for pre_hash in refused {
-            let options = SignOptions {
-                pre_hash: Some(pre_hash),
-                ..SignOptions::default()
-            };
+            let options = SignOptions::default().with_pre_hash(pre_hash);
 
             assert_eq!(
                 pair.private_key.sign(b"message", &options),
@@ -505,19 +575,10 @@ fn unapproved_pre_hashes_are_refused() {
             // A signature over the pre-hash of an approved function never verifies under it.
             let signed = pair
                 .private_key
-                .sign(
-                    b"message",
-                    &SignOptions {
-                        pre_hash: Some(SHA_512.into()),
-                        ..SignOptions::default()
-                    },
-                )
+                .sign(b"message", &SignOptions::default().with_pre_hash(SHA_512))
                 .unwrap();
 
-            let options = VerifyOptions {
-                pre_hash: Some(pre_hash),
-                ..VerifyOptions::default()
-            };
+            let options = VerifyOptions::default().with_pre_hash(pre_hash);
 
             assert!(!pair.public_key.verify(&signed, b"message", &options));
         }
@@ -525,17 +586,11 @@ fn unapproved_pre_hashes_are_refused() {
         // An approved function configured with no options is that function.
         let same = SHA_512.configure(&HashOptions::default()).unwrap();
 
-        let options = SignOptions {
-            pre_hash: Some(same.into()),
-            ..SignOptions::default()
-        };
+        let options = SignOptions::default().with_pre_hash(same);
 
         let signed = pair.private_key.sign(b"message", &options).unwrap();
 
-        let options = VerifyOptions {
-            pre_hash: Some(same.into()),
-            ..VerifyOptions::default()
-        };
+        let options = VerifyOptions::default().with_pre_hash(same);
 
         assert!(pair.public_key.verify(&signed, b"message", &options));
     }
@@ -649,7 +704,7 @@ fn shake_monte_carlo(
 
             message[..used].copy_from_slice(&output[..used]);
 
-            output = algorithm.digest(&message, length);
+            output = algorithm.digest(&message, length).unwrap();
 
             let last = u16::from_be_bytes([output[output.len() - 2], output[output.len() - 1]]);
 
@@ -731,7 +786,7 @@ fn acvp_xofs() {
                 assert_eq!(length, 8 * expected.len(), "{context}");
 
                 assert_eq!(
-                    algorithm.digest(&message, expected.len()),
+                    algorithm.digest(&message, expected.len()).unwrap(),
                     expected,
                     "{context}"
                 );
@@ -739,12 +794,12 @@ fn acvp_xofs() {
                 let mut xof = algorithm.create();
 
                 for piece in pieces(&message, &PIECES) {
-                    xof.update(piece);
+                    xof.update(piece).unwrap();
                 }
 
-                let mut output = xof.read(expected.len() / 3);
+                let mut output = xof.read(expected.len() / 3).unwrap();
 
-                output.extend(xof.read(expected.len() - output.len()));
+                output.extend(xof.read(expected.len() - output.len()).unwrap());
 
                 assert_eq!(output, expected, "{context} streamed");
             }
@@ -785,11 +840,11 @@ fn check_hmac(header: &Fields, record: &Fields, context: &str) {
         unhex(&record["mac"]),
     );
 
-    let tag = algorithm.digest(&key, &message);
+    let tag = algorithm.digest(&key, &message).unwrap();
 
     assert_eq!(tag[..expected.len()], expected[..], "{context}");
 
-    let mut mac = algorithm.create(&key);
+    let mut mac = algorithm.create(&key).unwrap();
 
     for piece in pieces(&message, &PIECES) {
         mac.update(piece);

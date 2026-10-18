@@ -126,7 +126,9 @@ fn hashes(runner: &Runner) {
         let mut out = [0; 32];
 
         timed(count, || {
-            SHA_256.digest_into(black_box(&data[..64]), &mut out);
+            SHA_256
+                .digest_into(black_box(&data[..64]), &mut out)
+                .unwrap();
 
             black_box(&out);
         })
@@ -136,7 +138,7 @@ fn hashes(runner: &Runner) {
         let mut out = [0; 32];
 
         timed(count, || {
-            SHA_256.digest_into(black_box(&data), &mut out);
+            SHA_256.digest_into(black_box(&data), &mut out).unwrap();
 
             black_box(&out);
         })
@@ -146,7 +148,7 @@ fn hashes(runner: &Runner) {
         let mut out = [0; 64];
 
         timed(count, || {
-            SHA_512.digest_into(black_box(&data), &mut out);
+            SHA_512.digest_into(black_box(&data), &mut out).unwrap();
 
             black_box(&out);
         })
@@ -156,7 +158,7 @@ fn hashes(runner: &Runner) {
         let mut out = [0; 32];
 
         timed(count, || {
-            SHA3_256.digest_into(black_box(&data), &mut out);
+            SHA3_256.digest_into(black_box(&data), &mut out).unwrap();
 
             black_box(&out);
         })
@@ -166,7 +168,7 @@ fn hashes(runner: &Runner) {
         let mut out = [0; 32];
 
         timed(count, || {
-            SHAKE128.digest_into(black_box(&data), &mut out);
+            SHAKE128.digest_into(black_box(&data), &mut out).unwrap();
 
             black_box(&out);
         })
@@ -176,7 +178,7 @@ fn hashes(runner: &Runner) {
         let mut out = [0; 64];
 
         timed(count, || {
-            SHAKE256.digest_into(black_box(&data), &mut out);
+            SHAKE256.digest_into(black_box(&data), &mut out).unwrap();
 
             black_box(&out);
         })
@@ -197,9 +199,7 @@ fn hashes(runner: &Runner) {
         }
     }
 
-    let options = XofOptions {
-        customization: b"crypto-pq benchmark",
-    };
+    let options = XofOptions::default().with_customization(b"crypto-pq benchmark");
 
     for (name, algorithm, size) in [
         ("cshake128/1KiB", CSHAKE128.configure(&options).unwrap(), 32),
@@ -220,7 +220,7 @@ fn hash(runner: &Runner, name: &str, algorithm: HashAlgorithm, data: &[u8]) {
         let mut out = vec![0; algorithm.digest_size()];
 
         timed(count, || {
-            algorithm.digest_into(black_box(data), &mut out);
+            algorithm.digest_into(black_box(data), &mut out).unwrap();
 
             black_box(&out);
         })
@@ -232,7 +232,7 @@ fn xof(runner: &Runner, name: &str, algorithm: XofAlgorithm, data: &[u8], size: 
         let mut out = vec![0; size];
 
         timed(count, || {
-            algorithm.digest_into(black_box(data), &mut out);
+            algorithm.digest_into(black_box(data), &mut out).unwrap();
 
             black_box(&out);
         })
@@ -245,10 +245,7 @@ fn macs(runner: &Runner) {
 
     let key = bytes(32);
 
-    let options = MacOptions {
-        customization: b"crypto-pq benchmark",
-        ..MacOptions::default()
-    };
+    let options = MacOptions::default().with_customization(b"crypto-pq benchmark");
 
     for (name, algorithm) in [
         ("hmac-sha-256", HMAC_SHA_256),
@@ -274,7 +271,9 @@ fn mac(runner: &Runner, name: &str, algorithm: MacAlgorithm, key: &[u8], data: &
         let mut out = vec![0; algorithm.digest_size()];
 
         timed(count, || {
-            algorithm.digest_into(black_box(key), black_box(data), &mut out);
+            algorithm
+                .digest_into(black_box(key), black_box(data), &mut out)
+                .unwrap();
 
             black_box(&out);
         })
@@ -287,10 +286,9 @@ fn kdfs(runner: &Runner) {
 
     let salt = bytes(32);
 
-    let options = KdfOptions {
-        salt: &salt,
-        info: b"crypto-pq hkdf 1",
-    };
+    let options = KdfOptions::default()
+        .with_salt(&salt)
+        .with_info(b"crypto-pq hkdf 1");
 
     for (name, algorithm) in [
         ("hkdf-sha-256", HKDF_SHA_256),
@@ -395,10 +393,7 @@ fn signature(runner: &Runner, algorithm: SignatureAlgorithm, seed_size: usize, r
         messages.truncate(1);
     }
 
-    let options = SignOptions {
-        deterministic: true,
-        ..SignOptions::default()
-    };
+    let options = SignOptions::default().with_deterministic(true);
 
     let mut next = 0;
 

@@ -1055,7 +1055,7 @@ impl<S> StatefulPrivateKey<S> {
             merkle.write_nodes(n, &mut cache);
         }
 
-        cache.extend_from_slice(&self.tag(&cache));
+        cache.extend_from_slice(&self.tag(&cache)?);
 
         ct::declassify(&cache);
 
@@ -1064,8 +1064,8 @@ impl<S> StatefulPrivateKey<S> {
 
     // The tag of a tree cache body: HMAC-SHA-256 under HKDF-Extract (RFC 5869) of the top secrets
     // with the label as salt.
-    fn tag(&self, body: &[u8]) -> Vec<u8> {
-        let key = SecretBytes::from_vec(HMAC_SHA_256.digest(TREE_CACHE_LABEL, &self.top));
+    fn tag(&self, body: &[u8]) -> Result<Vec<u8>, Error> {
+        let key = SecretBytes::from_vec(HMAC_SHA_256.digest(TREE_CACHE_LABEL, &self.top)?);
 
         HMAC_SHA_256.digest(&key, body)
     }
@@ -1292,7 +1292,7 @@ impl<S> StatefulPrivateKey<S> {
         }
 
         // Whether the cache is authentic is public: loading fails on it.
-        if !ct::declassify_value(ct::equal(&self.tag(body), tag)) {
+        if !ct::declassify_value(ct::equal(&self.tag(body)?, tag)) {
             return Err(Error::InvalidEncoding);
         }
 

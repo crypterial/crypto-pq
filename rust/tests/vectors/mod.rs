@@ -79,6 +79,18 @@ pub fn records(name: &str, field: &str) -> Vec<(Fields, Fields)> {
     found
 }
 
+// The field `key` of the first record of a parameter set in a vector file.
+pub fn first(name: &str, parameter_set: &str, key: &str) -> Vec<u8> {
+    let found = records(name, key);
+
+    let (_, record) = found
+        .iter()
+        .find(|(header, _)| header["parameterSet"] == parameter_set)
+        .unwrap_or_else(|| panic!("{name}: no {parameter_set}"));
+
+    unhex(&record[key])
+}
+
 pub fn unhex(text: &str) -> Vec<u8> {
     assert_eq!(text.len() % 2, 0, "odd hex length");
 
@@ -142,17 +154,12 @@ pub fn pieces<'a>(data: &'a [u8], sizes: &[usize]) -> Vec<&'a [u8]> {
 
 // The example keys of an RFC appendix (RFC 9935, RFC 9881), each in DER and PEM. `import` imports
 // one as the algorithm and kind of its record and gives the raw public key and the DER export;
-// the keys marked reject must fail with INVALID_PRIVATE_KEY. `skip` names records left out.
+// the keys marked reject must fail with INVALID_PRIVATE_KEY.
 pub fn example_keys(
     name: &str,
-    skip: &[&str],
     import: impl Fn(&Fields, &[u8], KeyFormat) -> Result<(Vec<u8>, Vec<u8>), Error>,
 ) {
     for (_, record) in records(name, "der") {
-        if skip.contains(&record["name"].as_str()) {
-            continue;
-        }
-
         let context = format!("{name}: {}", record["name"]);
 
         let pem_key = pem(&record["label"], &record["pem"]);

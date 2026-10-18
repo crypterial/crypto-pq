@@ -194,37 +194,49 @@ fn unused_bits_free(bits: &[u8]) -> Result<&[u8], Error> {
     }
 }
 
-// SubjectPublicKeyInfo: returns the algorithm OID and the key bytes.
-pub(crate) fn decode_public_key(data: &[u8]) -> Result<(&[u8], &[u8]), Error> {
+// The algorithm identifier of an encoding read so far, which must be `expected` (SPEC 10.6: the
+// structure up to it, then the OID, then the rest).
+fn check_algorithm(reader: &mut Reader<'_>, expected: &[u8]) -> Result<(), Error> {
+    if read_algorithm(reader)? == expected {
+        Ok(())
+    } else {
+        Err(Error::AlgorithmMismatch)
+    }
+}
+
+// SubjectPublicKeyInfo of the algorithm `expected`: returns the key bytes.
+pub(crate) fn decode_public_key<'a>(data: &'a [u8], expected: &[u8]) -> Result<&'a [u8], Error> {
     let mut reader = Reader::new(only(data, SEQUENCE)?);
 
-    let oid = read_algorithm(&mut reader)?;
+    check_algorithm(&mut reader, expected)?;
 
     let bits = reader.read(BIT_STRING)?;
 
     reader.finish()?;
 
-    Ok((oid, unused_bits_free(bits)?))
+    unused_bits_free(bits)
 }
 
 pub(crate) struct PrivateKeyInfo<'a> {
-    pub(crate) oid: &'a [u8],
     pub(crate) key: &'a [u8],
     pub(crate) public_key: Option<&'a [u8]>,
 }
 
-// PKCS#8 OneAsymmetricKey (RFC 5958): version 0 or 1, attributes ignored, and the optional
-// public key returned so that the caller can check that it matches.
-pub(crate) fn decode_private_key(data: &[u8]) -> Result<PrivateKeyInfo<'_>, Error> {
+// PKCS#8 OneAsymmetricKey (RFC 5958) of the algorithm `expected`: version 0 or 1, attributes
+// ignored, and the optional public key returned so that the caller can check that it matches.
+pub(crate) fn decode_private_key<'a>(
+    data: &'a [u8],
+    expected: &[u8],
+) -> Result<PrivateKeyInfo<'a>, Error> {
     let mut reader = Reader::new(only(data, SEQUENCE)?);
 
     let version = reader.read(INTEGER)?;
 
+    check_algorithm(&mut reader, expected)?;
+
     if version != [0] && version != [1] {
         return Err(Error::InvalidEncoding);
     }
-
-    let oid = read_algorithm(&mut reader)?;
 
     let key = reader.read(OCTET_STRING)?;
 
@@ -244,11 +256,7 @@ pub(crate) fn decode_private_key(data: &[u8]) -> Result<PrivateKeyInfo<'_>, Erro
 
     reader.finish()?;
 
-    Ok(PrivateKeyInfo {
-        oid,
-        key,
-        public_key,
-    })
+    Ok(PrivateKeyInfo { key, public_key })
 }
 
 // Arithmetic instead of table lookups, so that private keys never index memory with secret
@@ -399,34 +407,35 @@ pub(crate) fn pem_encode(label: &[u8], der: &[u8]) -> Vec<u8> {
     out
 }
 
+// RFC 7468: the one block with this label. Text before its BEGIN line and after its END line is
+// ignored (SPEC 10.4); between them only base64 and whitespace may appear. The branches here
+// depend on where the text has dashes and whitespace, its layout, never on the value of a base64
+// digit, which only the arithmetic decoder reads.
 pub(crate) fn pem_decode(label: &[u8], data: &[u8]) -> Result<SecretBytes, Error> {
-    let start = data
+    let start = begin_line(data).ok_or(Error::InvalidEncoding)?;
+
+    let rest = data[start + BEGIN.len()..]
+        .strip_prefix(label)
+        .and_then(|rest| rest.strip_prefix(DASHES))
+        .ok_or(Error::InvalidEncoding)?;
+
+    let end = find(rest, END).ok_or(Error::InvalidEncoding)?;
+
+    let (body, footer) = rest.split_at(end);
+
+    let after = footer[END.len()..]
+        .strip_prefix(label)
+        .and_then(|after| after.strip_prefix(DASHES))
+        .ok_or(Error::InvalidEncoding)?;
+
+    // The END line itself carries only whitespace after the boundary, and no second block
+    // follows.
+    let line_end = after
         .iter()
-        .position(|&c| !is_space(c))
-        .unwrap_or(data.len());
+        .position(|&c| c == b'\n' || c == b'\r')
+        .unwrap_or(after.len());
 
-    let end = data
-        .iter()
-        .rposition(|&c| !is_space(c))
-        .map_or(start, |last| last + 1);
-
-    let data = &data[start..end];
-
-    let header = BEGIN.len() + label.len() + DASHES.len();
-
-    let footer = END.len() + label.len() + DASHES.len();
-
-    let framed = data.len() >= header + footer
-        && data[..header] == [BEGIN, label, DASHES].concat()
-        && data[data.len() - footer..] == [END, label, DASHES].concat();
-
-    if !framed {
-        return Err(Error::InvalidEncoding);
-    }
-
-    let body = &data[header..data.len() - footer];
-
-    if body.iter().fold(0, |high, &c| high | c) & 0x80 != 0 {
+    if !after[..line_end].iter().all(|&c| is_space(c)) || find(after, BEGIN).is_some() {
         return Err(Error::InvalidEncoding);
     }
 
@@ -437,6 +446,34 @@ pub(crate) fn pem_decode(label: &[u8], data: &[u8]) -> Result<SecretBytes, Error
     }
 
     base64_decode(&text)
+}
+
+fn find(data: &[u8], pattern: &[u8]) -> Option<usize> {
+    data.windows(pattern.len())
+        .position(|window| window == pattern)
+}
+
+// The first BEGIN boundary that starts a line, after any whitespace.
+fn begin_line(data: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+
+    while let Some(found) = find(&data[offset..], BEGIN) {
+        let start = offset + found;
+
+        let line_start = data[..start]
+            .iter()
+            .rev()
+            .take_while(|&&c| c != b'\n' && c != b'\r')
+            .all(|&c| is_space(c));
+
+        if line_start {
+            return Some(start);
+        }
+
+        offset = start + 1;
+    }
+
+    None
 }
 
 #[cfg(test)]

@@ -2037,9 +2037,11 @@ fn flipped(data: &[u8], position: usize, mask: u8) -> Vec<u8> {
 
 // A cache body closed by its tag under the key derived from `seed`, as only the key's holder can.
 fn seal_cache(body: &[u8], seed: &[u8]) -> Vec<u8> {
-    let key = HMAC_SHA_256.digest(b"crypto-pq tree cache v1", seed);
+    let key = HMAC_SHA_256
+        .digest(b"crypto-pq tree cache v1", seed)
+        .unwrap();
 
-    [body, &HMAC_SHA_256.digest(&key, body)].concat()
+    [body, &HMAC_SHA_256.digest(&key, body).unwrap()].concat()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

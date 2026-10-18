@@ -21,11 +21,11 @@ fn check_derive(
     okm: &[u8],
     context: &str,
 ) {
-    let options = KdfOptions { salt, info };
+    let options = KdfOptions::default().with_salt(salt).with_info(info);
 
     assert_eq!(
-        kdf.derive(ikm, okm.len(), &options).unwrap(),
-        okm,
+        *kdf.derive(ikm, okm.len(), &options).unwrap(),
+        *okm,
         "{context}"
     );
 
@@ -36,27 +36,14 @@ fn check_derive(
     assert_eq!(out, okm, "{context} into");
 
     let prk = kdf
-        .extract(
-            ikm,
-            &KdfOptions {
-                salt,
-                ..KdfOptions::default()
-            },
-        )
+        .extract(ikm, &KdfOptions::default().with_salt(salt))
         .unwrap();
 
     let expanded = kdf
-        .expand(
-            &prk,
-            okm.len(),
-            &KdfOptions {
-                info,
-                ..KdfOptions::default()
-            },
-        )
+        .expand(&prk, okm.len(), &KdfOptions::default().with_info(info))
         .unwrap();
 
-    assert_eq!(expanded, okm, "{context} extract and expand");
+    assert_eq!(*expanded, *okm, "{context} extract and expand");
 }
 
 // RFC 5869, A.1 to A.3, with the PRK of each.
@@ -77,30 +64,17 @@ fn rfc5869() {
         );
 
         let prk = kdf
-            .extract(
-                &ikm,
-                &KdfOptions {
-                    salt: &salt,
-                    ..KdfOptions::default()
-                },
-            )
+            .extract(&ikm, &KdfOptions::default().with_salt(&salt))
             .unwrap();
 
-        assert_eq!(prk, field("prk"), "{}", record["name"]);
+        assert_eq!(*prk, *field("prk"), "{}", record["name"]);
 
         let mut into = vec![0; kdf.prk_size()];
 
-        kdf.extract_into(
-            &ikm,
-            &mut into,
-            &KdfOptions {
-                salt: &salt,
-                ..KdfOptions::default()
-            },
-        )
-        .unwrap();
+        kdf.extract_into(&ikm, &mut into, &KdfOptions::default().with_salt(&salt))
+            .unwrap();
 
-        assert_eq!(into, prk, "{} into", record["name"]);
+        assert_eq!(*into, *prk, "{} into", record["name"]);
 
         check_derive(kdf, &ikm, &salt, &info, &okm, &record["name"]);
 
@@ -139,14 +113,11 @@ fn wycheproof() {
             "invalid" => {
                 assert!(size > 255 * kdf.prk_size(), "{context}");
 
-                let options = KdfOptions {
-                    salt: &salt,
-                    info: &info,
-                };
+                let options = KdfOptions::default().with_salt(&salt).with_info(&info);
 
                 assert_eq!(
-                    kdf.derive(&ikm, size, &options),
-                    Err(Error::InvalidLength),
+                    kdf.derive(&ikm, size, &options).err(),
+                    Some(Error::InvalidLength),
                     "{context}"
                 );
 
@@ -178,13 +149,7 @@ fn acvp() {
         );
 
         let prk = kdf
-            .extract(
-                &ikm,
-                &KdfOptions {
-                    salt: &salt,
-                    ..KdfOptions::default()
-                },
-            )
+            .extract(&ikm, &KdfOptions::default().with_salt(&salt))
             .unwrap();
 
         for (info, okm) in record["info"].split(',').zip(record["okm"].split(',')) {
@@ -192,25 +157,19 @@ fn acvp() {
 
             assert_eq!(okm.len(), length, "{context}");
 
-            let options = KdfOptions {
-                info: &info,
-                ..KdfOptions::default()
-            };
+            let options = KdfOptions::default().with_info(&info);
 
             assert_eq!(
-                kdf.expand(&prk, length, &options).unwrap(),
-                okm,
+                *kdf.expand(&prk, length, &options).unwrap(),
+                *okm,
                 "{context}"
             );
 
-            let options = KdfOptions {
-                salt: &salt,
-                info: &info,
-            };
+            let options = KdfOptions::default().with_salt(&salt).with_info(&info);
 
             assert_eq!(
-                kdf.derive(&ikm, length, &options).unwrap(),
-                okm,
+                *kdf.derive(&ikm, length, &options).unwrap(),
+                *okm,
                 "{context}"
             );
         }
@@ -230,20 +189,18 @@ fn limits() {
     for kdf in [HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512] {
         let size = kdf.prk_size();
 
-        let options = KdfOptions {
-            salt: b"salt",
-            info: b"info",
-        };
+        let options = KdfOptions::default().with_salt(b"salt").with_info(b"info");
 
         for length in [0, 255 * size + 1] {
             assert_eq!(
-                kdf.derive(b"ikm", length, &options),
-                Err(Error::InvalidLength)
+                kdf.derive(b"ikm", length, &options).err(),
+                Some(Error::InvalidLength)
             );
 
             assert_eq!(
-                kdf.expand(&[1; 64][..size], length, &KdfOptions::default()),
-                Err(Error::InvalidLength)
+                kdf.expand(&[1; 64][..size], length, &KdfOptions::default())
+                    .err(),
+                Some(Error::InvalidLength)
             );
         }
 
@@ -257,7 +214,7 @@ fn limits() {
 
         for length in [1, size - 1, size, size + 1, 3 * size + 5] {
             assert_eq!(
-                kdf.derive(b"ikm", length, &options).unwrap(),
+                *kdf.derive(b"ikm", length, &options).unwrap(),
                 longest[..length]
             );
         }
@@ -267,14 +224,11 @@ fn limits() {
 
         assert_eq!(prk.len(), size);
 
-        let info = KdfOptions {
-            info: b"info",
-            ..KdfOptions::default()
-        };
+        let info = KdfOptions::default().with_info(b"info");
 
         assert_eq!(
-            kdf.expand(&prk[..size - 1], 32, &info),
-            Err(Error::InvalidLength)
+            kdf.expand(&prk[..size - 1], 32, &info).err(),
+            Some(Error::InvalidLength)
         );
 
         for long in [&[9; 100][..], &[9; 300]] {
@@ -284,9 +238,15 @@ fn limits() {
         }
 
         // Extract takes no info and Expand no salt.
-        assert_eq!(kdf.extract(b"ikm", &options), Err(Error::InvalidOption));
+        assert_eq!(
+            kdf.extract(b"ikm", &options).err(),
+            Some(Error::InvalidOption)
+        );
 
-        assert_eq!(kdf.expand(&prk, 32, &options), Err(Error::InvalidOption));
+        assert_eq!(
+            kdf.expand(&prk, 32, &options).err(),
+            Some(Error::InvalidOption)
+        );
 
         assert_eq!(
             kdf.extract_into(b"ikm", &mut vec![0; size + 1], &KdfOptions::default()),
@@ -296,24 +256,18 @@ fn limits() {
         // RFC 5869, 2.2: a missing salt is HashLen zero bytes, as is an empty one.
         let zeros = vec![0; size];
 
-        let zero_salt = KdfOptions {
-            salt: &zeros,
-            ..KdfOptions::default()
-        };
+        let zero_salt = KdfOptions::default().with_salt(&zeros);
 
-        assert_eq!(kdf.extract(b"ikm", &zero_salt).unwrap(), prk);
+        assert_eq!(*kdf.extract(b"ikm", &zero_salt).unwrap(), *prk);
 
         // A long info goes through the general path, which must agree with derive's.
         let info = vec![0x42; 300];
 
-        let long = KdfOptions {
-            salt: b"salt",
-            info: &info,
-        };
+        let long = KdfOptions::default().with_salt(b"salt").with_info(&info);
 
         let okm = kdf.derive(b"ikm", size, &long).unwrap();
 
-        assert_eq!(kdf.derive(b"ikm", 2 * size, &long).unwrap()[..size], okm);
+        assert_eq!(kdf.derive(b"ikm", 2 * size, &long).unwrap()[..size], *okm);
     }
 }
 

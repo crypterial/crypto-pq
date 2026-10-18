@@ -6,7 +6,7 @@ use core::hash::{Hash, Hasher};
 use crate::cpu::Dit;
 use crate::ct::{self, declassify};
 use crate::error::Error;
-use crate::hash::{HashAlgorithm, SHAKE128, XofAlgorithm};
+use crate::hash::{HashAlgorithm, SHA_256, SHA_512, SHAKE128, SHAKE256, XofAlgorithm};
 use crate::keys::{
     KeyFormat, KeyGenOptions, PrivateInput, SeedChoice, check_size, decode_seed_choice,
     encode_expanded, encode_seed, export_private, export_public, import_private, import_public,
@@ -98,22 +98,91 @@ impl PreHash {
     fn digest(&self, message: &[u8]) -> Vec<u8> {
         match self.0 {
             PreHashKind::Hash(algorithm) => algorithm.digest(message),
-            PreHashKind::Xof(algorithm) => algorithm.digest(message, self.output_size()),
+            PreHashKind::Xof(algorithm) => {
+                let mut out = vec![0; self.output_size()];
+
+                algorithm.digest_unchecked(message, &mut out);
+
+                out
+            }
         }
     }
 }
 
+// The pre-hash that RFC 9909 fixes for each HashSLH-DSA value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Fixed {
+    Sha256,
+    Sha512,
+    Shake128,
+    Shake256,
+}
+
+impl Fixed {
+    const fn pre_hash(self) -> PreHash {
+        PreHash(match self {
+            Self::Sha256 => PreHashKind::Hash(SHA_256),
+            Self::Sha512 => PreHashKind::Hash(SHA_512),
+            Self::Shake128 => PreHashKind::Xof(SHAKE128),
+            Self::Shake256 => PreHashKind::Xof(SHAKE256),
+        })
+    }
+}
+
+// context: 0 to 255 bytes; deterministic: the deterministic variant instead of hedged signing;
+// pre_hash: HashML-DSA or HashSLH-DSA with this function instead of the pure mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SignOptions<'a> {
     pub context: &'a [u8],
     pub deterministic: bool,
     pub pre_hash: Option<PreHash>,
 }
 
+impl<'a> SignOptions<'a> {
+    #[must_use]
+    pub const fn with_context(mut self, context: &'a [u8]) -> Self {
+        self.context = context;
+
+        self
+    }
+
+    #[must_use]
+    pub const fn with_deterministic(mut self, deterministic: bool) -> Self {
+        self.deterministic = deterministic;
+
+        self
+    }
+
+    #[must_use]
+    pub fn with_pre_hash(mut self, pre_hash: impl Into<PreHash>) -> Self {
+        self.pre_hash = Some(pre_hash.into());
+
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VerifyOptions<'a> {
     pub context: &'a [u8],
     pub pre_hash: Option<PreHash>,
+}
+
+impl<'a> VerifyOptions<'a> {
+    #[must_use]
+    pub const fn with_context(mut self, context: &'a [u8]) -> Self {
+        self.context = context;
+
+        self
+    }
+
+    #[must_use]
+    pub fn with_pre_hash(mut self, pre_hash: impl Into<PreHash>) -> Self {
+        self.pre_hash = Some(pre_hash.into());
+
+        self
+    }
 }
 
 // FIPS 204 and FIPS 205: M' = 0 || |ctx| || ctx || M, or 1 || |ctx| || ctx || OID || PH(M). The
@@ -155,11 +224,13 @@ enum Scheme {
     SlhDsa(slhdsa::Parameters),
 }
 
+// fixed: the pre-hash of a HashSLH-DSA value, which every signature under it uses.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SignatureAlgorithm {
     name: &'static str,
     scheme: Scheme,
     oid: [u8; 9],
+    fixed: Option<Fixed>,
 }
 
 const fn oid(arc: u8) -> [u8; 9] {
@@ -171,6 +242,7 @@ const fn ml_dsa(name: &'static str, parameters: mldsa::Parameters, arc: u8) -> S
         name,
         scheme: Scheme::MlDsa(parameters),
         oid: oid(arc),
+        fixed: None,
     }
 }
 
@@ -183,6 +255,23 @@ const fn slh_dsa(
         name,
         scheme: Scheme::SlhDsa(parameters),
         oid: oid(arc),
+        fixed: None,
+    }
+}
+
+// RFC 9909, 3 and 4: HashSLH-DSA with the pre-hash of its identifier, which keys, sizes and raw
+// formats share with the pure value of the same set.
+const fn hash_slh_dsa(
+    name: &'static str,
+    parameters: slhdsa::Parameters,
+    arc: u8,
+    fixed: Fixed,
+) -> SignatureAlgorithm {
+    SignatureAlgorithm {
+        name,
+        scheme: Scheme::SlhDsa(parameters),
+        oid: oid(arc),
+        fixed: Some(fixed),
     }
 }
 
@@ -228,6 +317,90 @@ pub const SLH_DSA_SHAKE_256S: SignatureAlgorithm =
 pub const SLH_DSA_SHAKE_256F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-256f", slhdsa::SHAKE_256F, 31);
 
+pub const HASH_SLH_DSA_SHA2_128S_WITH_SHA256: SignatureAlgorithm = hash_slh_dsa(
+    "HashSLH-DSA-SHA2-128s-with-SHA256",
+    slhdsa::SHA2_128S,
+    35,
+    Fixed::Sha256,
+);
+
+pub const HASH_SLH_DSA_SHA2_128F_WITH_SHA256: SignatureAlgorithm = hash_slh_dsa(
+    "HashSLH-DSA-SHA2-128f-with-SHA256",
+    slhdsa::SHA2_128F,
+    36,
+    Fixed::Sha256,
+);
+
+pub const HASH_SLH_DSA_SHA2_192S_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
+    "HashSLH-DSA-SHA2-192s-with-SHA512",
+    slhdsa::SHA2_192S,
+    37,
+    Fixed::Sha512,
+);
+
+pub const HASH_SLH_DSA_SHA2_192F_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
+    "HashSLH-DSA-SHA2-192f-with-SHA512",
+    slhdsa::SHA2_192F,
+    38,
+    Fixed::Sha512,
+);
+
+pub const HASH_SLH_DSA_SHA2_256S_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
+    "HashSLH-DSA-SHA2-256s-with-SHA512",
+    slhdsa::SHA2_256S,
+    39,
+    Fixed::Sha512,
+);
+
+pub const HASH_SLH_DSA_SHA2_256F_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
+    "HashSLH-DSA-SHA2-256f-with-SHA512",
+    slhdsa::SHA2_256F,
+    40,
+    Fixed::Sha512,
+);
+
+pub const HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128: SignatureAlgorithm = hash_slh_dsa(
+    "HashSLH-DSA-SHAKE-128s-with-SHAKE128",
+    slhdsa::SHAKE_128S,
+    41,
+    Fixed::Shake128,
+);
+
+pub const HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128: SignatureAlgorithm = hash_slh_dsa(
+    "HashSLH-DSA-SHAKE-128f-with-SHAKE128",
+    slhdsa::SHAKE_128F,
+    42,
+    Fixed::Shake128,
+);
+
+pub const HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256: SignatureAlgorithm = hash_slh_dsa(
+    "HashSLH-DSA-SHAKE-192s-with-SHAKE256",
+    slhdsa::SHAKE_192S,
+    43,
+    Fixed::Shake256,
+);
+
+pub const HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256: SignatureAlgorithm = hash_slh_dsa(
+    "HashSLH-DSA-SHAKE-192f-with-SHAKE256",
+    slhdsa::SHAKE_192F,
+    44,
+    Fixed::Shake256,
+);
+
+pub const HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256: SignatureAlgorithm = hash_slh_dsa(
+    "HashSLH-DSA-SHAKE-256s-with-SHAKE256",
+    slhdsa::SHAKE_256S,
+    45,
+    Fixed::Shake256,
+);
+
+pub const HASH_SLH_DSA_SHAKE_256F_WITH_SHAKE256: SignatureAlgorithm = hash_slh_dsa(
+    "HashSLH-DSA-SHAKE-256f-with-SHAKE256",
+    slhdsa::SHAKE_256F,
+    46,
+    Fixed::Shake256,
+);
+
 impl SignatureAlgorithm {
     pub const fn name(&self) -> &'static str {
         self.name
@@ -256,13 +429,10 @@ impl SignatureAlgorithm {
 
         let public_key = private_key.public_key();
 
+        // SPEC 9.1.7: a fixed message in the pure, hedged mode. A HashSLH-DSA value signs every
+        // message pre-hashed, with its fixed function.
         if options.self_test {
-            let options = SignOptions {
-                deterministic: true,
-                ..SignOptions::default()
-            };
-
-            let signature = private_key.sign(SELF_TEST_MESSAGE, &options)?;
+            let signature = private_key.sign(SELF_TEST_MESSAGE, &SignOptions::default())?;
 
             if !public_key.verify(&signature, SELF_TEST_MESSAGE, &VerifyOptions::default()) {
                 return Err(Error::SelfTestFailed);
@@ -373,7 +543,7 @@ impl SignatureAlgorithm {
             SeedChoice::Both { seed, expanded } => {
                 let key = self.key_from_seed(seed);
 
-                if !ct::equal(&key.private, expanded) {
+                if !ct::declassify_value(ct::equal(&key.private, expanded)) {
                     return Err(Error::InvalidPrivateKey);
                 }
 
@@ -462,9 +632,24 @@ impl SignatureAlgorithm {
         policy && pre_hash.is_some_and(|pre_hash| pre_hash.strength() < strength)
     }
 
-    // A pre-hash that is not approved, or too weak where the policy applies (hazmat skips it).
-    fn refuses(&self, pre_hash: Option<PreHash>, policy: bool) -> bool {
-        pre_hash.is_some_and(|pre_hash| !pre_hash.approved()) || self.too_weak(pre_hash, policy)
+    // The pre-hash that a signature uses: the option, or the fixed function of a HashSLH-DSA
+    // value, which the option may only name again (SPEC 9.4). INVALID_OPTION for a pre-hash that
+    // is not approved, or too weak where the policy applies (hazmat skips it).
+    fn pre_hash(&self, option: Option<PreHash>, policy: bool) -> Result<Option<PreHash>, Error> {
+        let pre_hash = match (self.fixed, option) {
+            (Some(fixed), None) => Some(fixed.pre_hash()),
+            (Some(fixed), Some(option)) if option != fixed.pre_hash() => {
+                return Err(Error::InvalidOption);
+            }
+            (_, option) => option,
+        };
+
+        if pre_hash.is_some_and(|pre_hash| !pre_hash.approved()) || self.too_weak(pre_hash, policy)
+        {
+            return Err(Error::InvalidOption);
+        }
+
+        Ok(pre_hash)
     }
 }
 
@@ -583,14 +768,16 @@ impl SignaturePublicKey {
     ) -> bool {
         let algorithm = self.algorithm;
 
-        if algorithm.refuses(options.pre_hash, policy)
-            || options.context.len() > MAX_CONTEXT_SIZE
-            || signature.len() != algorithm.signature_size()
+        let Ok(pre_hash) = algorithm.pre_hash(options.pre_hash, policy) else {
+            return false;
+        };
+
+        if options.context.len() > MAX_CONTEXT_SIZE || signature.len() != algorithm.signature_size()
         {
             return false;
         }
 
-        let representative = Representative::new(message, options.context, options.pre_hash);
+        let representative = Representative::new(message, options.context, pre_hash);
 
         let parts = representative.parts();
 
@@ -646,7 +833,7 @@ impl SignaturePrivateKey {
     pub fn sign(&self, message: &[u8], options: &SignOptions) -> Result<Vec<u8>, Error> {
         let _dit = Dit::new();
 
-        self.check_options(options, true)?;
+        let pre_hash = self.check_options(options, true)?;
 
         let randomness = match (options.deterministic, self.algorithm.scheme) {
             (true, Scheme::MlDsa(_)) => SecretBytes::zeroed(ML_DSA_RANDOMNESS_SIZE),
@@ -654,30 +841,34 @@ impl SignaturePrivateKey {
             (false, _) => random_bytes(self.algorithm.randomness_size())?,
         };
 
-        Ok(self.sign_with(message, &randomness, options))
+        Ok(self.sign_with(message, &randomness, options.context, pre_hash))
     }
 
-    pub(crate) fn check_options(&self, options: &SignOptions, policy: bool) -> Result<(), Error> {
-        if self.algorithm.refuses(options.pre_hash, policy) {
-            return Err(Error::InvalidOption);
-        }
+    // The pre-hash that the signature uses, after the checks of the options (SPEC 7.3).
+    pub(crate) fn check_options(
+        &self,
+        options: &SignOptions,
+        policy: bool,
+    ) -> Result<Option<PreHash>, Error> {
+        let pre_hash = self.algorithm.pre_hash(options.pre_hash, policy)?;
 
         if options.context.len() > MAX_CONTEXT_SIZE {
             return Err(Error::InvalidContext);
         }
 
-        Ok(())
+        Ok(pre_hash)
     }
 
     pub(crate) fn sign_with(
         &self,
         message: &[u8],
         randomness: &[u8],
-        options: &SignOptions,
+        context: &[u8],
+        pre_hash: Option<PreHash>,
     ) -> Vec<u8> {
         let _dit = Dit::new();
 
-        let representative = Representative::new(message, options.context, options.pre_hash);
+        let representative = Representative::new(message, context, pre_hash);
 
         let parts = representative.parts();
 
@@ -696,7 +887,7 @@ impl SignaturePrivateKey {
         }
     }
 
-    pub fn export_key(&self, format: KeyFormat) -> Result<Vec<u8>, Error> {
+    pub fn export_key(&self, format: KeyFormat) -> Result<SecretBytes, Error> {
         let _dit = Dit::new();
 
         let oid = Some(&self.algorithm.oid[..]);
@@ -747,10 +938,7 @@ mod tests {
     // shares one public part. Signing needs Â but not t̂1.
     #[test]
     fn caches_fill_on_first_use_and_are_shared() {
-        let options = SignOptions {
-            deterministic: true,
-            ..SignOptions::default()
-        };
+        let options = SignOptions::default().with_deterministic(true);
 
         for algorithm in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
             let pair = hazmat::generate_signature_key_pair(algorithm, &[5; 32]).expect("key pair");
@@ -802,7 +990,7 @@ mod tests {
             assert_eq!(filled(&generated.private_key), (true, true, true));
 
             let untested = algorithm
-                .generate_key_pair(&KeyGenOptions { self_test: false })
+                .generate_key_pair(&KeyGenOptions::default().with_self_test(false))
                 .expect("key pair");
 
             assert_eq!(filled(&untested.private_key), (false, false, false));

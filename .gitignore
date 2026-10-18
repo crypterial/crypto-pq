@@ -6,3 +6,4 @@ __pycache__/
 /typescript/node_modules/
 /zig/.zig-cache/
 /zig/zig-out/
+/vectors/acvp-full/

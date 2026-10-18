@@ -8,7 +8,7 @@ const PIECES: [usize; 7] = [0, 1, 7, 8, 9, 3, 16];
 
 fn check_xof(algorithm: XofAlgorithm, data: &[u8], expected: &[u8], context: &str) {
     assert_eq!(
-        algorithm.digest(data, expected.len()),
+        algorithm.digest(data, expected.len()).unwrap(),
         expected,
         "{context}"
     );
@@ -16,13 +16,13 @@ fn check_xof(algorithm: XofAlgorithm, data: &[u8], expected: &[u8], context: &st
     let mut xof = algorithm.create();
 
     for piece in pieces(data, &PIECES) {
-        xof.update(piece);
+        xof.update(piece).unwrap();
     }
 
     let mut out = Vec::new();
 
     for piece in pieces(expected, &PIECES) {
-        out.extend(xof.read(piece.len()));
+        out.extend(xof.read(piece.len()).unwrap());
     }
 
     assert_eq!(out, expected, "{context} streamed");
@@ -69,9 +69,7 @@ fn designers_kats() {
         let customization = unhex(&record["Z"]);
 
         let algorithm = ASCON_CXOF128
-            .configure(&XofOptions {
-                customization: &customization,
-            })
+            .configure(&XofOptions::default().with_customization(&customization))
             .unwrap();
 
         check_xof(
@@ -114,9 +112,7 @@ fn acvp() {
                 let customization = unhex(&record["cs"]);
 
                 let algorithm = ASCON_CXOF128
-                    .configure(&XofOptions {
-                        customization: &customization,
-                    })
+                    .configure(&XofOptions::default().with_customization(&customization))
                     .unwrap();
 
                 check_xof(algorithm, &data, &expected, &context);
@@ -136,15 +132,16 @@ fn customization_limit() {
     let z = [0x5A; 257];
 
     let at_limit = ASCON_CXOF128
-        .configure(&XofOptions {
-            customization: &z[..256],
-        })
+        .configure(&XofOptions::default().with_customization(&z[..256]))
         .unwrap();
 
-    assert_ne!(at_limit.digest(b"", 32), ASCON_CXOF128.digest(b"", 32));
+    assert_ne!(
+        at_limit.digest(b"", 32).unwrap(),
+        ASCON_CXOF128.digest(b"", 32).unwrap()
+    );
 
     assert_eq!(
-        ASCON_CXOF128.configure(&XofOptions { customization: &z }),
+        ASCON_CXOF128.configure(&XofOptions::default().with_customization(&z)),
         Err(Error::InvalidOption)
     );
 
@@ -154,9 +151,7 @@ fn customization_limit() {
     );
 
     assert_eq!(
-        ASCON_XOF128.configure(&XofOptions {
-            customization: b"x"
-        }),
+        ASCON_XOF128.configure(&XofOptions::default().with_customization(b"x")),
         Err(Error::InvalidOption)
     );
 
@@ -176,12 +171,11 @@ fn properties() {
 
     assert_eq!(ASCON_CXOF128.name(), "Ascon-CXOF128");
 
-    // XOF outputs are prefixes of one another, and an empty one is allowed.
-    assert_eq!(ASCON_XOF128.digest(b"abc", 0), Vec::<u8>::new());
+    // XOF outputs are prefixes of one another.
 
     assert_eq!(
-        ASCON_XOF128.digest(b"abc", 100)[..33],
-        ASCON_XOF128.digest(b"abc", 33)
+        ASCON_XOF128.digest(b"abc", 100).unwrap()[..33],
+        ASCON_XOF128.digest(b"abc", 33).unwrap()
     );
 
     let mut hasher = ASCON_HASH256.create();
@@ -198,11 +192,28 @@ fn properties() {
 }
 
 #[test]
-#[should_panic(expected = "UNSUPPORTED")]
 fn update_after_read() {
     let mut xof = ASCON_XOF128.create();
 
-    xof.read(1);
+    assert_eq!(xof.read(0), Ok(Vec::new()));
 
-    xof.update(b"x");
+    assert_eq!(xof.update(b"x"), Err(Error::Unsupported));
+
+    assert_eq!(xof.read(16), ASCON_XOF128.digest(b"", 16));
+}
+
+// SP 800-232, 5.2 and 5.3: the one-shot Ascon XOFs need L > 0 (SPEC 12.2 item 5); streaming
+// reads of no bytes are allowed.
+#[test]
+fn zero_length_is_refused() {
+    for algorithm in [ASCON_XOF128, ASCON_CXOF128] {
+        assert_eq!(algorithm.digest(b"data", 0), Err(Error::InvalidLength));
+
+        assert_eq!(
+            algorithm.digest_into(b"data", &mut []),
+            Err(Error::InvalidLength)
+        );
+
+        assert_eq!(algorithm.create().read_into(&mut []), Ok(()));
+    }
 }

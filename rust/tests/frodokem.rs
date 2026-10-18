@@ -26,7 +26,9 @@ fn sha256(data: &[u8]) -> Vec<u8> {
 
 // The rejection secret SHAKE256(c1 || c2 || salt || s) of a ciphertext under sk.
 fn rejection(ciphertext: &[u8], sk: &[u8], size: usize) -> Vec<u8> {
-    SHAKE256.digest(&[ciphertext, &sk[..size]].concat(), size)
+    SHAKE256
+        .digest(&[ciphertext, &sk[..size]].concat(), size)
+        .unwrap()
 }
 
 // Every KAT entry of the reference implementation for the eight ISO sets: the key pair from the
@@ -81,14 +83,17 @@ fn known_answers() {
             "{context} ct"
         );
 
-        assert_eq!(encapsulation.shared_secret, ss, "{context} encapsulated ss");
+        assert_eq!(
+            *encapsulation.shared_secret, *ss,
+            "{context} encapsulated ss"
+        );
 
         let decapsulated = pair
             .private_key
             .decapsulate(&encapsulation.ciphertext)
             .expect("decaps");
 
-        assert_eq!(decapsulated, ss, "{context} decapsulated ss");
+        assert_eq!(*decapsulated, *ss, "{context} decapsulated ss");
 
         let mut changed = encapsulation.ciphertext.clone();
 
@@ -99,8 +104,8 @@ fn known_answers() {
         let rejected = pair.private_key.decapsulate(&changed).expect("decaps");
 
         assert_eq!(
-            rejected,
-            rejection(&changed, &sk, ss.len()),
+            *rejected,
+            *rejection(&changed, &sk, ss.len()),
             "{context} rejection"
         );
     });
@@ -142,7 +147,10 @@ fn api() {
         for format in [KeyFormat::Der, KeyFormat::Pem] {
             assert_eq!(pair.public_key.export_key(format), Err(Error::Unsupported));
 
-            assert_eq!(pair.private_key.export_key(format), Err(Error::Unsupported));
+            assert_eq!(
+                pair.private_key.export_key(format).err(),
+                Some(Error::Unsupported)
+            );
 
             assert_eq!(
                 algorithm.import_public_key(&pk, format).err(),
@@ -165,15 +173,17 @@ fn api() {
 
         assert!(public == pair.public_key && private.public_key() == pair.public_key);
 
-        assert_eq!(private.export_key(KeyFormat::Raw).expect("export"), sk);
+        assert_eq!(*private.export_key(KeyFormat::Raw).expect("export"), *sk);
 
         let encapsulation = public.encapsulate().expect("encaps");
 
         assert_eq!(encapsulation.ciphertext.len(), ciphertext_size);
 
         assert_eq!(
-            private.decapsulate(&encapsulation.ciphertext),
-            Ok(encapsulation.shared_secret.clone())
+            *private
+                .decapsulate(&encapsulation.ciphertext)
+                .expect("decaps"),
+            *encapsulation.shared_secret
         );
 
         for size in [0, seed_size, private_size - 1, private_size + 1] {
@@ -194,8 +204,15 @@ fn api() {
             );
         }
 
-        for position in [secret_size, secret_size + public_size - 1, private_size - 1] {
-            let mut changed = sk.clone();
+        // A changed public key fails the pkh check, and a changed S^T, which passes it, the
+        // pairwise test (SPEC 8.2.4 item 3).
+        for position in [
+            secret_size,
+            secret_size + public_size - 1,
+            private_size - 1,
+            secret_size + public_size,
+        ] {
+            let mut changed = sk.to_vec();
 
             changed[position] ^= 1;
 
@@ -205,23 +222,10 @@ fn api() {
             );
         }
 
-        let mut changed = sk.clone();
-
-        changed[secret_size + public_size] ^= 1;
-
-        let altered = algorithm
-            .import_private_key(&changed, KeyFormat::Raw)
-            .expect("import");
-
-        assert_eq!(
-            altered.decapsulate(&encapsulation.ciphertext),
-            Ok(rejection(&encapsulation.ciphertext, &sk, secret_size))
-        );
-
         for size in [0, ciphertext_size - 1, ciphertext_size + 1] {
             assert_eq!(
-                pair.private_key.decapsulate(&vec![0; size]),
-                Err(Error::InvalidLength)
+                pair.private_key.decapsulate(&vec![0; size]).err(),
+                Some(Error::InvalidLength)
             );
         }
 

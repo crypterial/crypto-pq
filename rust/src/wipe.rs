@@ -1,5 +1,6 @@
 use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{Ordering, compiler_fence};
 
@@ -10,14 +11,17 @@ use core::sync::atomic::{Ordering, compiler_fence};
 // a temporary first and copied, a store-to-load dependency per sixteen bytes.) Up to eight values
 // of at most a word get a volatile store each instead: an address given to the assembly pins a
 // variable to memory for its whole life, which slows the loops that would keep it in registers.
-#[cfg(any(
-    target_arch = "aarch64",
-    target_arch = "arm",
-    target_arch = "x86",
-    target_arch = "x86_64",
-    target_arch = "riscv32",
-    target_arch = "riscv64",
-    target_arch = "loongarch64",
+#[cfg(all(
+    any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+    ),
+    not(miri)
 ))]
 #[allow(unsafe_code)]
 pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
@@ -47,17 +51,20 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
     compiler_fence(Ordering::SeqCst);
 }
 
-// Targets without stable inline assembly in Rust: volatile writes, which survive dead-store
-// elimination, in groups of sixteen and then eight values.
-#[cfg(not(any(
-    target_arch = "aarch64",
-    target_arch = "arm",
-    target_arch = "x86",
-    target_arch = "x86_64",
-    target_arch = "riscv32",
-    target_arch = "riscv64",
-    target_arch = "loongarch64",
-)))]
+// Targets without stable inline assembly in Rust, and Miri, which cannot run it: volatile writes,
+// which survive dead-store elimination, in groups of sixteen and then eight values.
+#[cfg(any(
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+    )),
+    miri
+))]
 #[allow(unsafe_code)]
 pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
     let (wide, rest) = values.as_chunks_mut::<16>();
@@ -82,9 +89,11 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
     compiler_fence(Ordering::SeqCst);
 }
 
-// Secret bytes on the heap, wiped when dropped. The buffer never grows after creation, so no
-// reallocation leaves an unwiped copy behind.
-pub(crate) struct SecretBytes(Vec<u8>);
+// Secret bytes on the heap, wiped when dropped: the type of every secret output (shared secrets,
+// derived keys, exported private keys). The buffer never grows after creation, so no reallocation
+// leaves an unwiped copy behind. There is no Clone, so that every copy is one the caller makes, and
+// no PartialEq: compare secrets in constant time, never with ==.
+pub struct SecretBytes(Vec<u8>);
 
 impl SecretBytes {
     pub(crate) fn zeroed(length: usize) -> Self {
@@ -120,8 +129,65 @@ impl DerefMut for SecretBytes {
     }
 }
 
+impl AsRef<[u8]> for SecretBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SecretBytes({} bytes, redacted)", self.0.len())
+    }
+}
+
 impl Drop for SecretBytes {
     fn drop(&mut self) {
         wipe(&mut self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Every length around the grouping of each path, for elements of one to sixteen bytes.
+    #[test]
+    fn wipes_every_element() {
+        for length in [0, 1, 7, 8, 9, 15, 16, 17, 24, 33, 100] {
+            let mut bytes = vec![0xA5u8; length];
+
+            wipe(&mut bytes);
+
+            assert!(bytes.iter().all(|&b| b == 0));
+
+            let mut words = vec![u64::MAX; length];
+
+            wipe(&mut words);
+
+            assert!(words.iter().all(|&w| w == 0));
+
+            let mut wide = vec![u128::MAX; length];
+
+            wipe(&mut wide);
+
+            assert!(wide.iter().all(|&w| w == 0));
+        }
+    }
+
+    #[test]
+    fn secret_bytes() {
+        let secret = SecretBytes::concat(&[b"abc", b"", b"de"]);
+
+        assert_eq!(&*secret, b"abcde");
+
+        assert_eq!(secret.as_ref(), b"abcde");
+
+        assert_eq!(
+            alloc::format!("{secret:?}"),
+            "SecretBytes(5 bytes, redacted)"
+        );
+
+        assert_eq!(&*SecretBytes::zeroed(3), &[0; 3]);
     }
 }

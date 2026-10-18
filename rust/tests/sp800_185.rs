@@ -27,26 +27,26 @@ fn kmac(name: &str) -> MacAlgorithm {
 
 fn check_xof(algorithm: XofAlgorithm, data: &[u8], expected: &[u8], context: &str) {
     assert_eq!(
-        algorithm.digest(data, expected.len()),
+        algorithm.digest(data, expected.len()).unwrap(),
         expected,
         "{context}"
     );
 
     let mut out = vec![0; expected.len()];
 
-    algorithm.digest_into(data, &mut out);
+    algorithm.digest_into(data, &mut out).unwrap();
 
     assert_eq!(out, expected, "{context} into");
 
     let mut xof = algorithm.create();
 
     for piece in pieces(data, &PIECES) {
-        xof.update(piece);
+        xof.update(piece).unwrap();
     }
 
-    let mut out = xof.read(1.min(expected.len()));
+    let mut out = xof.read(1.min(expected.len())).unwrap();
 
-    out.extend(xof.read(expected.len() - out.len()));
+    out.extend(xof.read(expected.len() - out.len()).unwrap());
 
     assert_eq!(out, expected, "{context} streamed");
 }
@@ -54,21 +54,21 @@ fn check_xof(algorithm: XofAlgorithm, data: &[u8], expected: &[u8], context: &st
 // A KMAC of the tag's length, with the record's customization and mode.
 fn configured(name: &str, customization: &[u8], xof: bool, length: usize) -> MacAlgorithm {
     kmac(name)
-        .configure(&MacOptions {
-            length: Some(length),
-            customization,
-            xof,
-            ..MacOptions::default()
-        })
+        .configure(
+            &MacOptions::default()
+                .with_length(length)
+                .with_customization(customization)
+                .with_xof(xof),
+        )
         .unwrap()
 }
 
 fn check_mac(algorithm: MacAlgorithm, key: &[u8], data: &[u8], expected: &[u8], context: &str) {
-    assert_eq!(algorithm.digest(key, data), expected, "{context}");
+    assert_eq!(algorithm.digest(key, data).unwrap(), expected, "{context}");
 
     assert!(algorithm.verify(key, data, expected), "{context} verify");
 
-    let mut mac = algorithm.create(key);
+    let mut mac = algorithm.create(key).unwrap();
 
     for piece in pieces(data, &PIECES) {
         mac.update(piece);
@@ -100,9 +100,7 @@ fn nist_examples() {
         let customization = unhex(&record["customization"]);
 
         let algorithm = cshake(&header["parameterSet"])
-            .configure(&XofOptions {
-                customization: &customization,
-            })
+            .configure(&XofOptions::default().with_customization(&customization))
             .unwrap();
 
         check_xof(
@@ -197,7 +195,11 @@ fn acvp_kmac() {
             "false" => {
                 assert!(!algorithm.verify(&key, &data, &expected), "{context}");
 
-                assert_ne!(algorithm.digest(&key, &data), expected, "{context}");
+                assert_ne!(
+                    algorithm.digest(&key, &data).unwrap(),
+                    expected,
+                    "{context}"
+                );
 
                 failed += 1;
             }
@@ -235,7 +237,10 @@ fn wycheproof_kmac() {
             "invalid" => {
                 assert!(!algorithm.verify(&key, &data, &tag), "{context}");
 
-                assert!(!algorithm.create(&key).verify(&tag), "{context} streamed");
+                assert!(
+                    !algorithm.create(&key).unwrap().verify(&tag),
+                    "{context} streamed"
+                );
 
                 invalid += 1;
             }
@@ -250,27 +255,32 @@ fn wycheproof_kmac() {
 #[test]
 fn empty_cshake_is_shake() {
     for (cshake, shake) in [(CSHAKE128, SHAKE128), (CSHAKE256, SHAKE256)] {
-        assert_eq!(cshake.digest(b"abc", 200), shake.digest(b"abc", 200));
+        assert_eq!(
+            cshake.digest(b"abc", 200).unwrap(),
+            shake.digest(b"abc", 200).unwrap()
+        );
 
         let empty = hazmat::configure_cshake(cshake, b"", b"").unwrap();
 
-        assert_eq!(empty.digest(b"abc", 50), shake.digest(b"abc", 50));
+        assert_eq!(
+            empty.digest(b"abc", 50).unwrap(),
+            shake.digest(b"abc", 50).unwrap()
+        );
 
         let configured = cshake
-            .configure(&XofOptions {
-                customization: b"Email Signature",
-            })
+            .configure(&XofOptions::default().with_customization(b"Email Signature"))
             .unwrap();
 
-        assert_ne!(configured.digest(b"abc", 32), shake.digest(b"abc", 32));
+        assert_ne!(
+            configured.digest(b"abc", 32).unwrap(),
+            shake.digest(b"abc", 32).unwrap()
+        );
 
         // Options replace those set before.
         assert_eq!(configured.configure(&XofOptions::default()), Ok(cshake));
 
         assert_eq!(
-            shake.configure(&XofOptions {
-                customization: b"x"
-            }),
+            shake.configure(&XofOptions::default().with_customization(b"x")),
             Err(Error::InvalidOption)
         );
 
@@ -290,14 +300,12 @@ fn long_customization() {
 
     for algorithm in [CSHAKE128, CSHAKE256] {
         let configured = algorithm
-            .configure(&XofOptions {
-                customization: &customization,
-            })
+            .configure(&XofOptions::default().with_customization(&customization))
             .unwrap();
 
         let data: Vec<u8> = (0..500).map(|i| i as u8).collect();
 
-        let expected = configured.digest(&data, 300);
+        let expected = configured.digest(&data, 300).unwrap();
 
         check_xof(configured, &data, &expected, algorithm.name());
     }
@@ -312,32 +320,34 @@ fn kmac_options() {
 
         // SP 800-185, 8.4.2: no tag under 32 bits.
         for length in [0, 3] {
-            let options = MacOptions {
-                length: Some(length),
-                ..MacOptions::default()
-            };
+            let options = MacOptions::default().with_length(length);
 
             assert_eq!(algorithm.configure(&options), Err(Error::InvalidOption));
         }
 
+        // SPEC 12.6 item 2 [D-02]: at most 2^32 - 1 bytes, on every platform.
+        let longest = MacOptions::default().with_length(u32::MAX as usize);
+
+        assert_eq!(
+            algorithm.configure(&longest).map(|kmac| kmac.digest_size()),
+            Ok(u32::MAX as usize)
+        );
+
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            algorithm.configure(&MacOptions::default().with_length(u32::MAX as usize + 1)),
+            Err(Error::InvalidOption)
+        );
+
         let short = algorithm
-            .configure(&MacOptions {
-                length: Some(4),
-                ..MacOptions::default()
-            })
+            .configure(&MacOptions::default().with_length(4))
             .unwrap();
 
-        assert_eq!(short.digest(b"key", b"data").len(), 4);
+        assert_eq!(short.digest(b"key", b"data").unwrap().len(), 4);
 
         for options in [
-            MacOptions {
-                salt: b"x",
-                ..MacOptions::default()
-            },
-            MacOptions {
-                personalization: b"x",
-                ..MacOptions::default()
-            },
+            MacOptions::default().with_salt(b"x"),
+            MacOptions::default().with_personalization(b"x"),
         ] {
             assert_eq!(algorithm.configure(&options), Err(Error::InvalidOption));
         }
@@ -345,41 +355,34 @@ fn kmac_options() {
         // KMACXOF outputs are prefixes of one another; KMAC binds the length.
         let xof = |length| {
             algorithm
-                .configure(&MacOptions {
-                    length: Some(length),
-                    xof: true,
-                    ..MacOptions::default()
-                })
+                .configure(&MacOptions::default().with_length(length).with_xof(true))
                 .unwrap()
         };
 
-        let long = xof(200).digest(b"key", b"data");
+        let long = xof(200).digest(b"key", b"data").unwrap();
 
-        assert_eq!(xof(40).digest(b"key", b"data"), long[..40]);
+        assert_eq!(xof(40).digest(b"key", b"data").unwrap(), long[..40]);
 
         let fixed = |length| {
             algorithm
-                .configure(&MacOptions {
-                    length: Some(length),
-                    ..MacOptions::default()
-                })
+                .configure(&MacOptions::default().with_length(length))
                 .unwrap()
         };
 
         assert_ne!(
-            fixed(40).digest(b"key", b"data"),
-            fixed(200).digest(b"key", b"data")[..40]
+            fixed(40).digest(b"key", b"data").unwrap(),
+            fixed(200).digest(b"key", b"data").unwrap()[..40]
         );
 
         // Keys of any length, an empty one and one longer than a block included.
         for key in [&[][..], &[7; 1000]] {
-            let tag = algorithm.digest(key, b"data");
+            let tag = algorithm.digest(key, b"data").unwrap();
 
             assert!(algorithm.verify(key, b"data", &tag));
         }
 
         // A long tag is compared in chunks.
-        let tag = fixed(200).digest(b"key", b"data");
+        let tag = fixed(200).digest(b"key", b"data").unwrap();
 
         check_mac(fixed(200), b"key", b"data", &tag, "200-byte tag");
     }
@@ -395,7 +398,7 @@ fn properties() {
 
     assert_eq!(KMAC256.name(), "KMAC256");
 
-    let tag = KMAC128.digest(b"key", b"data");
+    let tag = KMAC128.digest(b"key", b"data").unwrap();
 
     assert!(!KMAC128.verify(b"key", b"data", &tag[..31]));
 
