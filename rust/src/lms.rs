@@ -816,9 +816,12 @@ impl Tree {
 
         out.extend_from_slice(&q.to_be_bytes());
 
-        out.extend_from_slice(&ots_sign(
-            &self.ots, &self.lms, &self.i, q, &self.seed, c, message,
-        ));
+        let mut ots = ots_sign(&self.ots, &self.lms, &self.i, q, &self.seed, c, message);
+
+        out.extend_from_slice(&ots);
+
+        // The caller verifies the signature before it is released and wipes it if it is faulty.
+        wipe(&mut ots);
 
         out.extend_from_slice(&self.lms.code.to_be_bytes());
 

@@ -487,6 +487,14 @@ struct Record {
     signature: Vec<u8>,
 }
 
+// A signature goes with its record, wiped, so that the new child-root signatures of a call that
+// fails leave no copy (SPEC 11.5.2 step 3.5).
+impl Drop for Record {
+    fn drop(&mut self) {
+        wipe(&mut self.signature);
+    }
+}
+
 impl Record {
     const fn claimed(tree: u64) -> Self {
         Self {
@@ -1494,7 +1502,6 @@ impl<S> StatefulPrivateKey<S> {
 
             let tree = p.build(pub_seed, level, number, &secrets, None)?;
 
-            #[allow(unused_mut)]
             let mut signature = parent.sign(pub_seed, leaf, &randomizer, tree.key());
 
             #[cfg(test)]
@@ -1502,7 +1509,10 @@ impl<S> StatefulPrivateKey<S> {
 
             let address = (level, number);
 
+            // A faulty one-time signature can reveal one-time secrets (SPEC 11.5.2 step 3.5).
             if !p.verifies_child(pub_seed, address, parent.key(), tree.key(), &signature) {
+                wipe(&mut signature);
+
                 return Err(Error::SelfTestFailed);
             }
 
@@ -1736,13 +1746,15 @@ impl<S: StateStore> StatefulPrivateKey<S> {
                     signature.extend_from_slice(&p.tree_key(level, &self.public_key, Some(record)));
                 }
 
-                #[allow(unused_mut)]
                 let mut bottom = tree.sign(pub_seed, leaf, &randomizer, message);
 
                 #[cfg(test)]
                 tests::inject(tests::Fault::Message, &mut bottom);
 
                 signature.extend_from_slice(&bottom);
+
+                // Only the copy in the signature remains, which sign wipes if it does not verify.
+                wipe(&mut bottom);
             }
             Parameters::Xmss(xp) => {
                 let n = xp.n;
@@ -1752,6 +1764,11 @@ impl<S: StateStore> StatefulPrivateKey<S> {
                 let digest =
                     xmss::message_digest(xp, &r[..n], p.top_root(&self.public_key), index, message);
 
+                // The whole signature, so that no reallocation leaves a copy of the unverified
+                // layer behind.
+                signature
+                    .reserve_exact(xp.index_size() + n + xp.d as usize * xp.layer_signature_size());
+
                 signature.extend_from_slice(&index.to_be_bytes()[8 - xp.index_size()..]);
 
                 signature.extend_from_slice(&r[..n]);
@@ -1760,13 +1777,14 @@ impl<S: StateStore> StatefulPrivateKey<S> {
                     .as_mut()
                     .expect("the bottom level is current");
 
-                #[allow(unused_mut)]
                 let mut bottom = tree.sign(pub_seed, leaf, &[], &digest[..n]);
 
                 #[cfg(test)]
                 tests::inject(tests::Fault::Message, &mut bottom);
 
                 signature.extend_from_slice(&bottom);
+
+                wipe(&mut bottom);
 
                 for record in self.records.iter().rev() {
                     signature.extend_from_slice(&record.signature);
