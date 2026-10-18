@@ -100,72 +100,84 @@ fn acvp_key_generation() {
 
 #[test]
 fn acvp_signature_generation() {
-    parallel(
-        &records("acvp/SLH-DSA-sigGen.txt", "signature"),
-        |(header, record)| {
-            let algorithm = algorithm(&header["parameterSet"]);
-
-            let context = format!("tcId {} {}", record["tcId"], header["parameterSet"]);
-
-            let sk = unhex(&record["sk"]);
-
-            let private_key = algorithm.import_private_key(&sk, KeyFormat::Raw).unwrap();
-
-            let n = sk.len() / 4;
-
-            let randomness = if header["deterministic"] == "true" {
-                sk[2 * n..3 * n].to_vec()
-            } else {
-                unhex(&record["additionalRandomness"])
-            };
-
-            let (message, context_bytes) = (unhex(&record["message"]), unhex(&record["context"]));
-
-            let options = SignOptions {
-                context: &context_bytes,
-                pre_hash: pre_hash(header, record),
-                ..SignOptions::default()
-            };
-
-            let signature = hazmat::sign(&private_key, &message, &randomness, &options).unwrap();
-
-            assert_eq!(signature, unhex(&record["signature"]), "{context}");
-        },
-    );
+    check_signature_generation("acvp/SLH-DSA-sigGen.txt");
 }
 
 #[test]
 fn acvp_signature_verification() {
-    parallel(
-        &records("acvp/SLH-DSA-sigVer.txt", "signature"),
-        |(header, record)| {
-            let public_key = algorithm(&header["parameterSet"])
-                .import_public_key(&unhex(&record["pk"]), KeyFormat::Raw)
-                .unwrap();
+    check_signature_verification("acvp/SLH-DSA-sigVer.txt");
+}
 
-            let context = unhex(&record["context"]);
+// Every external test of ACVP. Its internal groups (acvp-full/SLH-DSA-sig*-internal.txt) need
+// signing and verification of a raw M' through hazmat, which the crate does not have yet.
+#[test]
+#[ignore = "weekly (fuzz.yml): the full ACVP set"]
+fn acvp_full_signatures() {
+    check_signature_generation("acvp-full/SLH-DSA-sigGen.txt");
 
-            let options = VerifyOptions {
-                context: &context,
-                pre_hash: pre_hash(header, record),
-            };
+    check_signature_verification("acvp-full/SLH-DSA-sigVer.txt");
+}
 
-            let result = hazmat::verify(
-                &public_key,
-                &unhex(&record["signature"]),
-                &unhex(&record["message"]),
-                &options,
-            );
+fn check_signature_generation(name: &str) {
+    parallel(&records(name, "signature"), |(header, record)| {
+        let algorithm = algorithm(&header["parameterSet"]);
 
-            let expected = record["testPassed"] == "true";
+        let context = format!("tcId {} {}", record["tcId"], header["parameterSet"]);
 
-            assert_eq!(
-                result, expected,
-                "tcId {} {}",
-                record["tcId"], record["reason"]
-            );
-        },
-    );
+        let sk = unhex(&record["sk"]);
+
+        let private_key = algorithm.import_private_key(&sk, KeyFormat::Raw).unwrap();
+
+        let n = sk.len() / 4;
+
+        let randomness = if header["deterministic"] == "true" {
+            sk[2 * n..3 * n].to_vec()
+        } else {
+            unhex(&record["additionalRandomness"])
+        };
+
+        let (message, context_bytes) = (unhex(&record["message"]), unhex(&record["context"]));
+
+        let options = SignOptions {
+            context: &context_bytes,
+            pre_hash: pre_hash(header, record),
+            ..SignOptions::default()
+        };
+
+        let signature = hazmat::sign(&private_key, &message, &randomness, &options).unwrap();
+
+        assert_eq!(signature, unhex(&record["signature"]), "{context}");
+    });
+}
+
+fn check_signature_verification(name: &str) {
+    parallel(&records(name, "signature"), |(header, record)| {
+        let public_key = algorithm(&header["parameterSet"])
+            .import_public_key(&unhex(&record["pk"]), KeyFormat::Raw)
+            .unwrap();
+
+        let context = unhex(&record["context"]);
+
+        let options = VerifyOptions {
+            context: &context,
+            pre_hash: pre_hash(header, record),
+        };
+
+        let result = hazmat::verify(
+            &public_key,
+            &unhex(&record["signature"]),
+            &unhex(&record["message"]),
+            &options,
+        );
+
+        let expected = record["testPassed"] == "true";
+
+        assert_eq!(
+            result, expected,
+            "tcId {} {}",
+            record["tcId"], record["reason"]
+        );
+    });
 }
 
 #[test]
@@ -369,4 +381,28 @@ fn rfc9909_private_key() {
         private_key.export_key(KeyFormat::Pem).unwrap(),
         pem.as_bytes()
     );
+}
+
+// RFC 9909, Appendix C.1 and C.3: the example public key, and the self-signed certificate whose
+// signature it verifies over the TBSCertificate.
+#[test]
+fn rfc9909_certificate() {
+    for (_, record) in records("rfc/slhdsa_certificate.txt", "spki") {
+        let public_key = algorithm(&record["name"])
+            .import_public_key(&unhex(&record["spki"]), KeyFormat::Der)
+            .unwrap();
+
+        let (tbs, signature) = (unhex(&record["tbs"]), unhex(&record["signature"]));
+
+        assert!(
+            public_key.verify(&signature, &tbs, &VerifyOptions::default()),
+            "RFC 9909 C.3"
+        );
+
+        let mut altered = tbs.clone();
+
+        *altered.last_mut().unwrap() ^= 1;
+
+        assert!(!public_key.verify(&signature, &altered, &VerifyOptions::default()));
+    }
 }

@@ -108,3 +108,11 @@ pub fn der(tag: u8, content: &[u8]) -> Vec<u8> {
 
     out
 }
+
+// A PEM document from a label and the base64 lines of a vector file, which joins them with '|'.
+pub fn pem(label: &str, lines: &str) -> String {
+    format!(
+        "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+        lines.replace('|', "\n")
+    )
+}

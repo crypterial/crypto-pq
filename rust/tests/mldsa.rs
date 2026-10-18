@@ -5,7 +5,7 @@ use crypto_pq::{
     SHA_384, SHA_512, SHA_512_224, SHA_512_256, SHA3_224, SHA3_256, SHA3_384, SHA3_512, SHAKE128,
     SHAKE256, SignOptions, SignatureAlgorithm, VerifyOptions, hazmat,
 };
-use vectors::{Fields, der, parallel, records, unhex};
+use vectors::{Fields, der, parallel, pem, records, unhex};
 
 const ALGORITHMS: [(&str, SignatureAlgorithm); 3] = [
     ("ML-DSA-44", ML_DSA_44),
@@ -145,58 +145,69 @@ fn acvp_key_generation() {
 
 #[test]
 fn acvp_signature_generation() {
-    parallel(
-        &records("acvp/ML-DSA-sigGen.txt", "signature"),
-        |(header, record)| {
-            let algorithm = algorithm(&header["parameterSet"]);
+    check_signature_generation("acvp/ML-DSA-sigGen.txt");
+}
 
-            let context = format!("tcId {}", record["tcId"]);
+// Every external signing test of ACVP, in both key formats, and the older projection, whose keys
+// are expanded only.
+#[test]
+#[ignore = "weekly (fuzz.yml): the full ACVP set"]
+fn acvp_full_signature_generation() {
+    check_signature_generation("acvp-full/ML-DSA-sigGen.txt");
 
-            let private_key = if header["keyFormat"] == "seed" {
-                hazmat::generate_signature_key_pair(algorithm, &unhex(&record["seed"]))
-                    .unwrap()
-                    .private_key
-            } else {
-                algorithm
-                    .import_private_key(&unhex(&record["sk"]), KeyFormat::Raw)
-                    .unwrap()
-            };
+    check_signature_generation("acvp-full/ML-DSA-sigGen-v1.txt");
+}
 
-            let pk = private_key.public_key().export_key(KeyFormat::Raw).unwrap();
+fn check_signature_generation(name: &str) {
+    parallel(&records(name, "signature"), |(header, record)| {
+        let algorithm = algorithm(&header["parameterSet"]);
 
-            assert_eq!(pk, unhex(&record["pk"]), "{context}");
+        let context = format!("tcId {}", record["tcId"]);
 
-            let randomness = if header["deterministic"] == "true" {
-                vec![0; 32]
-            } else {
-                unhex(&record["rnd"])
-            };
+        let private_key = if header["keyFormat"] == "seed" {
+            hazmat::generate_signature_key_pair(algorithm, &unhex(&record["seed"]))
+                .unwrap()
+                .private_key
+        } else {
+            algorithm
+                .import_private_key(&unhex(&record["sk"]), KeyFormat::Raw)
+                .unwrap()
+        };
 
-            let (message, context_bytes) = (unhex(&record["message"]), unhex(&record["context"]));
+        let pk = private_key.public_key().export_key(KeyFormat::Raw).unwrap();
 
-            let options = SignOptions {
-                context: &context_bytes,
-                pre_hash: pre_hash(header, record),
-                ..SignOptions::default()
-            };
+        assert_eq!(pk, unhex(&record["pk"]), "{context}");
 
-            let signature = hazmat::sign(&private_key, &message, &randomness, &options).unwrap();
+        let randomness = if header["deterministic"] == "true" {
+            vec![0; 32]
+        } else {
+            unhex(&record["rnd"])
+        };
 
-            assert_eq!(signature, unhex(&record["signature"]), "{context}");
+        let (message, context_bytes) = (unhex(&record["message"]), unhex(&record["context"]));
 
-            let options = VerifyOptions {
-                context: &context_bytes,
-                pre_hash: pre_hash(header, record),
-            };
+        let options = SignOptions {
+            context: &context_bytes,
+            pre_hash: pre_hash(header, record),
+            ..SignOptions::default()
+        };
 
-            let public_key = private_key.public_key();
+        let signature = hazmat::sign(&private_key, &message, &randomness, &options).unwrap();
 
-            assert!(
-                hazmat::verify(&public_key, &signature, &message, &options),
-                "{context}"
-            );
-        },
-    );
+        assert_eq!(signature, unhex(&record["signature"]), "{context}");
+
+        let options = VerifyOptions {
+            context: &context_bytes,
+            pre_hash: pre_hash(header, record),
+        };
+
+        let public_key = private_key.public_key();
+
+        assert!(
+            hazmat::verify(&public_key, &signature, &message, &options),
+            "{context}"
+        );
+    });
 }
 
 #[test]
@@ -354,6 +365,147 @@ fn wycheproof_deterministic_signing() {
             assert_eq!(signature, unhex(&record["sig"]), "{context}");
         }
     });
+}
+
+// Signing with expanded private keys. The tests that give only mu are external-mu signing, which
+// crypto-pq does not expose (SPEC 9.1.5); they are counted and left out.
+#[test]
+fn wycheproof_expanded_key_signing() {
+    let found = records("wycheproof/mldsa_sign_noseed.txt", "tcId");
+
+    let (signing, external_mu): (Vec<_>, Vec<_>) = found
+        .iter()
+        .partition(|(_, record)| record.contains_key("msg"));
+
+    println!(
+        "wycheproof/mldsa_sign_noseed.txt: {} external-mu tests left out",
+        external_mu.len()
+    );
+
+    parallel(&signing, |(header, record)| {
+        let algorithm = algorithm(&header["parameterSet"]);
+
+        let key = unhex(&header["privateKey"]);
+
+        let flags = record.get("flags").map_or("", String::as_str);
+
+        let context = format!("tcId {} {}", record["tcId"], header["parameterSet"]);
+
+        let imported = algorithm.import_private_key(&key, KeyFormat::Raw);
+
+        if flags.contains("IncorrectPrivateKeyLength") {
+            assert_eq!(imported.err(), Some(Error::InvalidLength), "{context}");
+
+            return;
+        }
+
+        if flags.contains("InvalidPrivateKey") {
+            assert_eq!(imported.err(), Some(Error::InvalidPrivateKey), "{context}");
+
+            return;
+        }
+
+        let private_key = imported.unwrap_or_else(|error| panic!("{context}: {error}"));
+
+        let pk = private_key.public_key().export_key(KeyFormat::Raw).unwrap();
+
+        assert_eq!(pk, unhex(&header["publicKey"]), "{context}");
+
+        let message = unhex(&record["msg"]);
+
+        let context_bytes = unhex(record.get("ctx").map_or("", String::as_str));
+
+        if flags.contains("InvalidContext") {
+            let options = SignOptions {
+                context: &context_bytes,
+                ..SignOptions::default()
+            };
+
+            let result = private_key.sign(&message, &options);
+
+            assert_eq!(result.err(), Some(Error::InvalidContext), "{context}");
+        } else if flags.contains("Randomized") {
+            let options = VerifyOptions {
+                context: &context_bytes,
+                ..VerifyOptions::default()
+            };
+
+            assert!(
+                private_key
+                    .public_key()
+                    .verify(&unhex(&record["sig"]), &message, &options),
+                "{context}"
+            );
+        } else {
+            let options = SignOptions {
+                context: &context_bytes,
+                deterministic: true,
+                ..SignOptions::default()
+            };
+
+            let signature = private_key.sign(&message, &options).unwrap();
+
+            assert_eq!(signature, unhex(&record["sig"]), "{context}");
+        }
+    });
+}
+
+// RFC 9881, Appendix C: every example key in DER and PEM, its public key and what it exports as;
+// the inconsistent seed and expanded keys of C.4 must be refused.
+#[test]
+fn rfc9881_example_keys() {
+    for (_, record) in records("rfc/mldsa_keys.txt", "der") {
+        let algorithm = algorithm(&record["algorithm"]);
+
+        let context = format!("RFC 9881 {}", record["name"]);
+
+        let der_key = unhex(&record["der"]);
+
+        let pem_key = pem(&record["label"], &record["pem"]);
+
+        let public = unhex(&record["public"]);
+
+        for (data, format) in [
+            (&der_key[..], KeyFormat::Der),
+            (pem_key.as_bytes(), KeyFormat::Pem),
+        ] {
+            if record["kind"] == "public" {
+                let key = algorithm.import_public_key(data, format).unwrap();
+
+                assert_eq!(key.export_key(KeyFormat::Raw).unwrap(), public, "{context}");
+
+                assert_eq!(
+                    key.export_key(KeyFormat::Der).unwrap(),
+                    unhex(&record["exportDer"]),
+                    "{context}"
+                );
+
+                continue;
+            }
+
+            let result = algorithm.import_private_key(data, format);
+
+            if record["expect"] == "reject" {
+                assert_eq!(result.err(), Some(Error::InvalidPrivateKey), "{context}");
+
+                continue;
+            }
+
+            let key = result.unwrap_or_else(|error| panic!("{context}: {error}"));
+
+            assert_eq!(
+                key.public_key().export_key(KeyFormat::Raw).unwrap(),
+                public,
+                "{context}"
+            );
+
+            assert_eq!(
+                key.export_key(KeyFormat::Der).unwrap(),
+                unhex(&record["exportDer"]),
+                "{context}"
+            );
+        }
+    }
 }
 
 #[test]

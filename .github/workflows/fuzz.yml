@@ -90,6 +90,26 @@ jobs:
       - working-directory: zig
         run: zig build test -Doptimize=ReleaseSafe --summary all
 
+  # The official vector sets too slow for every push (SPEC 19.4): the full ACVP ML-KEM, ML-DSA and
+  # SLH-DSA sets and the ACVP large-data hashes (1 to 8 GiB per test), the tests marked #[ignore].
+  rust-full-vectors:
+    name: rust full vector sets (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup override set stable
+      - run: cargo test --locked --release -- --ignored
+
   # The pure backend hashes with its own Python engines, about 1 MB/s, so its long run (the 16 MiB
   # inputs and fifty times the fuzz rounds) takes most of an hour on its own.
   long-python:

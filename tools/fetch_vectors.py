@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import io
 import json
@@ -15,7 +16,7 @@ CAVP = "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Valida
 
 ACVP = "https://raw.githubusercontent.com/usnistgov/ACVP-Server/975de31eb83d87039ec88934fdc47d8c312b892d/gen-val/json-files"
 
-WYCHEPROOF = "https://raw.githubusercontent.com/C2SP/wycheproof/3fa63dd0344abb611f1fb1d77e119938603ea230/testvectors_v1"
+WYCHEPROOF = "https://raw.githubusercontent.com/C2SP/wycheproof/7a325932231bd7a724c791c8b0d65ea4d6d2f435/testvectors_v1"
 
 XWING = "https://raw.githubusercontent.com/dconnolly/draft-connolly-cfrg-xwing-kem/984c2f7a93b8f8d8f8073ebb53f9f4ce50b5babd/spec"
 
@@ -92,12 +93,43 @@ SOURCES = {
     "mlkem_1024_test": (f"{WYCHEPROOF}/mlkem_1024_test.json", "17c5b764d78c05522f1980fcb41d82add573f11de5d13004ae0b83bf46d9c43a"),
     "mlkem_1024_encaps_test": (f"{WYCHEPROOF}/mlkem_1024_encaps_test.json", "da41e8daf57e40a6b334a722e3f56067817352f5583fdb2434da1a2cd611358e"),
     "mlkem_1024_semi_expanded_decaps_test": (f"{WYCHEPROOF}/mlkem_1024_semi_expanded_decaps_test.json", "a4a7c88152df3d8d4b3f33aad584167dfaff67195cfde08aac4b981030b4d05c"),
-    "mldsa_44_verify_test": (f"{WYCHEPROOF}/mldsa_44_verify_test.json", "0ca1b5df4575263e29b31fae7569a3da41df9a3b6fee56720a992d0cd1153b68"),
-    "mldsa_65_verify_test": (f"{WYCHEPROOF}/mldsa_65_verify_test.json", "49ac366d76115eab56b7116f10d06e288e6f23fe6cfb90b26bfb2d731a8d1e02"),
-    "mldsa_87_verify_test": (f"{WYCHEPROOF}/mldsa_87_verify_test.json", "e9e04216d4217265a5affba2568476d35742dbd8ffc9d4c23b3441334a08a224"),
-    "mldsa_44_sign_seed_test": (f"{WYCHEPROOF}/mldsa_44_sign_seed_test.json", "b29b0dcca2e52c988e1b9c06f8b521889ffbaadfc6a9dbf52f0f0f8f4c5b6b92"),
-    "mldsa_65_sign_seed_test": (f"{WYCHEPROOF}/mldsa_65_sign_seed_test.json", "d72e9c2f514c9f7490c33785ae0027d942ba2c45a9b8ebfc8fb1802b4913bf38"),
-    "mldsa_87_sign_seed_test": (f"{WYCHEPROOF}/mldsa_87_sign_seed_test.json", "e83c292318134faa6af777e86c619c4643e2705dba91dfa5adcd1fddfd4f40ce"),
+    "mldsa_44_verify_test": (f"{WYCHEPROOF}/mldsa_44_verify_test.json", "f70759c95146ff3057ae9708438f6e8d25ba822e3af11d2e87bb20d9a9c39d0e"),
+    "mldsa_65_verify_test": (f"{WYCHEPROOF}/mldsa_65_verify_test.json", "1ca235f61928421a173a171780beb00264ae9155dc33c52a11e1766cc7979034"),
+    "mldsa_87_verify_test": (f"{WYCHEPROOF}/mldsa_87_verify_test.json", "54adffe10f6dad7941ffd97f77ad4e5c85cb3a54d44cf5ce1c95cb1757b9ba14"),
+    "mldsa_44_sign_seed_test": (f"{WYCHEPROOF}/mldsa_44_sign_seed_test.json", "cc12df1c6c7dd5591195151ed2ae98708bf5de2df24bb06dc00b031f7c60b8cd"),
+    "mldsa_65_sign_seed_test": (f"{WYCHEPROOF}/mldsa_65_sign_seed_test.json", "e26b2bb9ab8d45ed570ba6828c7e40b6fa3e1545bb8bc2c449c77531760133e0"),
+    "mldsa_87_sign_seed_test": (f"{WYCHEPROOF}/mldsa_87_sign_seed_test.json", "6e801c2916fee64e71cd845928513726cdbfe688ef41be4544e472e4d8742c8e"),
+    "mlkem_512_keygen_seed_test": (f"{WYCHEPROOF}/mlkem_512_keygen_seed_test.json", "877ae6f5550d0e802086e5812bdbd23c16afa31cd3bff9669cd9661d3fbf2d85"),
+    "mlkem_768_keygen_seed_test": (f"{WYCHEPROOF}/mlkem_768_keygen_seed_test.json", "fde5abe284396f4cb3c4610b90d680f0b57782e94c3365c97aee59e24881ebe4"),
+    "mlkem_1024_keygen_seed_test": (f"{WYCHEPROOF}/mlkem_1024_keygen_seed_test.json", "cd9241bf5d65a78e005866ea2c660615c17f50caa9afc2b96fd1573cc65617b5"),
+    "mldsa_44_sign_noseed_test": (f"{WYCHEPROOF}/mldsa_44_sign_noseed_test.json", "82191a3caf22c00a2c0686ca7e29dbf45b91b6d1c361bdd5687fb228d423d442"),
+    "mldsa_65_sign_noseed_test": (f"{WYCHEPROOF}/mldsa_65_sign_noseed_test.json", "a83aa58a50bad259d34e0ad626e7eacd095ee7ae80d9717c4cbe1c765edd7223"),
+    "mldsa_87_sign_noseed_test": (f"{WYCHEPROOF}/mldsa_87_sign_noseed_test.json", "911e90bfc5a40e1ebed21580c079bb5e7233e6bd87a35fa285af5870ecfb79ad"),
+    "ML-KEM-encapDecap-v1": (f"{ACVP}/ML-KEM-encapDecap-FIPS203/internalProjection.json", "a556952ce869bb89c3a3196a701dad89647c193a34c86eafb61a9d710d5b810f"),
+    "ML-DSA-sigGen-v1": (f"{ACVP}/ML-DSA-sigGen-FIPS204/internalProjection.json", "72dcaf5f69853ca267ccd16af9cb40949786aca0fcfbf05d1ebeba132b93af22"),
+    "rfc9935": (f"{RFC}/rfc9935.txt", "9a369bca93a613d0b89b8f4ed119ba9ded91c00acd97ae5b9a2f9b3f02e49b4f"),
+    "rfc9881": (f"{RFC}/rfc9881.txt", "20ae3b519bc69e32989fa6e625ab8746453eddf457e20ddbfd79d841a44237a2"),
+    "rfc9909": (f"{RFC}/rfc9909.txt", "2c77519a6eeff691a2931a86643b0c9346ce7018303316d864cad1e585a5a50b"),
+    "rfc9802": (f"{RFC}/rfc9802.txt", "6c38403a3c6c14149a9f44c979320d7d26451e13148c5d760e604d002ba23d2a"),
+    "rfc4231": (f"{RFC}/rfc4231.txt", "72178527ce93500e730bc8eb182b857e583096d652b64ece0879c52ba1df973b"),
+    "SHA2-224-1.0": (f"{ACVP}/SHA2-224-1.0/internalProjection.json", "288d0a4dbec49759c63462ca9e4bd82b794e27f50605c8fca7fad0a415649ca9"),
+    "SHA2-256-1.0": (f"{ACVP}/SHA2-256-1.0/internalProjection.json", "a7e0bf4f5c661f1787b343bf3ae1a809b1e62f8fb2c8a627791510d03a570a6c"),
+    "SHA2-384-1.0": (f"{ACVP}/SHA2-384-1.0/internalProjection.json", "b22d80da99444af78feecaaae49493ee6189f1e6675e49db8764fb77bf16e847"),
+    "SHA2-512-1.0": (f"{ACVP}/SHA2-512-1.0/internalProjection.json", "2b514c517a2ef150d240efc52fdb2c4127925f0b4291b5a5b9153515e0ec7478"),
+    "SHA2-512-224-1.0": (f"{ACVP}/SHA2-512-224-1.0/internalProjection.json", "b596a90659713c52091ea9946e80145aae016ef730c956e5ee4850cf112709a9"),
+    "SHA2-512-256-1.0": (f"{ACVP}/SHA2-512-256-1.0/internalProjection.json", "fb813c4f42c748931978c4b5e6192d52ea156ff4e0797cbbebdf95458c816e5b"),
+    "SHA3-224-2.0": (f"{ACVP}/SHA3-224-2.0/internalProjection.json", "9ae4b1480d15526b29498d442125dfcfe80d74fe74c1b56fa840b1fae702ae34"),
+    "SHA3-256-2.0": (f"{ACVP}/SHA3-256-2.0/internalProjection.json", "dba4689436c7e440e61dc517210def3e8e09e50c0e9eff29ea66d89bdd0f2c63"),
+    "SHA3-384-2.0": (f"{ACVP}/SHA3-384-2.0/internalProjection.json", "e9eae46bd676dc82e911dcc3af92ef0093e0118615b62ab431086fce47574396"),
+    "SHA3-512-2.0": (f"{ACVP}/SHA3-512-2.0/internalProjection.json", "b0521468a178f7fd362d63319aa69b708885d08f0c71cee99ac70729f5bdf64b"),
+    "SHAKE-128-1.0": (f"{ACVP}/SHAKE-128-1.0/internalProjection.json", "ec2f9da6b146ae58fde2b73e552d3b29753fdfce7e05fbbb66329a075fa5d103"),
+    "SHAKE-256-1.0": (f"{ACVP}/SHAKE-256-1.0/internalProjection.json", "94d0992ed2acbebe45f359cb1ffaceaf881a170339935ba9d2d36c8388005d26"),
+    "SHAKE-128-FIPS202": (f"{ACVP}/SHAKE-128-FIPS202/internalProjection.json", "1cbebb33db1f7e86ca265f89705dfac95cf90e8e0807b378e088af42cd0ae5db"),
+    "SHAKE-256-FIPS202": (f"{ACVP}/SHAKE-256-FIPS202/internalProjection.json", "a9348d17e009cad62a2baa70160353f5bca936a27116f60dd5811f39b91c6991"),
+    "HMAC-SHA2-224-2.0": (f"{ACVP}/HMAC-SHA2-224-2.0/internalProjection.json", "d67857c153e8005418171e06a32e10c28432f76d70ab291eb4a60b3bb39c3b79"),
+    "HMAC-SHA2-256-2.0": (f"{ACVP}/HMAC-SHA2-256-2.0/internalProjection.json", "a9d0734b93aee71bc6f30b47daab782fd96b39688afe4fbddb009e99402ec989"),
+    "HMAC-SHA2-384-2.0": (f"{ACVP}/HMAC-SHA2-384-2.0/internalProjection.json", "0ffa9332b9430ae94cfac0f23b3843293903fa34a3ac9c11a8af2bfdf7276ed3"),
+    "HMAC-SHA2-512-2.0": (f"{ACVP}/HMAC-SHA2-512-2.0/internalProjection.json", "ea6e03f012d5237b95421b7d50c504f8ab010c4f7f18cd46fe61d8912d3442a0"),
     "xwing": (f"{XWING}/test-vectors.json", "409efe197550b22985b4a0419418a0c5f2c2b193426c55bd998399ec8d3e614d"),
     "rfc7748": (f"{RFC}/rfc7748.txt", "279ca0ecc5e92e2962e27b846986aeb74729d9dd34bd4a04a362f80dcb596ad3"),
     "rfc8554": (f"{RFC}/rfc8554.txt", "d5bfdbd457dfe7bc5f67cc1f62482999c2f55bf8033f2af56da323f2ffc2c055"),
@@ -137,7 +169,7 @@ SOURCES = {
     "eFrodoKEM-1344-SHAKE": (f"{FRODOKEM}/eFrodoKEM/KAT/PQCkemKAT_43088_shake.rsp", "591adc09a718afbc0ac36e1f57a191e557fe4eec7899e078104b9706b75e2f96"),
 }
 
-GENERATED = ("acvp", "wycheproof", "xwing", "rfc", "nist-examples", "blake2", "blake3", "ascon", "frodokem")
+GENERATED = ("acvp", "acvp-full", "wycheproof", "xwing", "rfc", "nist-examples", "blake2", "blake3", "ascon", "frodokem")
 
 
 def fetch(url, expected):
@@ -252,10 +284,13 @@ def external(group):
     return group.get("signatureInterface") == "external"
 
 
-def ml_dsa_sig_gen(group, tests):
-    seed = group["keyFormat"] == "seed"
+def ml_dsa_sig_gen(count):
+    def select(group, tests):
+        seed = group["keyFormat"] == "seed"
 
-    return [{k: v for k, v in t.items() if k != ("sk" if seed else "seed")} for t in tests[:8]]
+        return [{k: v for k, v in t.items() if k != ("sk" if seed else "seed")} for t in tests[:count]]
+
+    return select
 
 
 # SLH-DSA signatures are large, so only part of each group is kept: two tests per pure group and,
@@ -1108,6 +1143,397 @@ def frodokem():
     return groups
 
 
+def internal(group):
+    return group.get("signatureInterface") == "internal"
+
+
+# The ACVP sets whose tests the regular files cut down or leave out: every external ML-DSA signing
+# test (both key formats, and the older projection that has expanded keys only), the older ML-KEM
+# decapsulation tests that carry expanded keys only, and SLH-DSA with the external and the internal
+# interface. They run in the weekly job.
+def acvp_full():
+    v1_sig_gen = acvp("ML-DSA-sigGen-v1", external, drop=("mu",))
+
+    for header, _ in v1_sig_gen:
+        header["keyFormat"] = "expanded"
+
+    v1_encap_decap = acvp("ML-KEM-encapDecap-v1")
+
+    for header, _ in v1_encap_decap:
+        header["keyFormat"] = "expanded" if header["function"].startswith("decapsulation") else "none"
+
+    sig_ver_drop = ("sk", "additionalRandomness")
+
+    return {
+        "ML-DSA-sigGen.txt": acvp("ML-DSA-sigGen", external, ml_dsa_sig_gen(None), ("mu",)),
+        "ML-DSA-sigGen-v1.txt": v1_sig_gen,
+        "ML-KEM-encapDecap-v1.txt": v1_encap_decap,
+        "SLH-DSA-sigGen.txt": acvp("SLH-DSA-sigGen", external),
+        "SLH-DSA-sigVer.txt": acvp("SLH-DSA-sigVer", external, drop=sig_ver_drop),
+        "SLH-DSA-sigGen-internal.txt": acvp("SLH-DSA-sigGen", internal),
+        "SLH-DSA-sigVer-internal.txt": acvp("SLH-DSA-sigVer", internal, drop=("sk",)),
+    }
+
+
+DIGESTS = {
+    "SHA2": ("SHA2-224-1.0", "SHA2-256-1.0", "SHA2-384-1.0", "SHA2-512-1.0", "SHA2-512-224-1.0", "SHA2-512-256-1.0"),
+    "SHA3": ("SHA3-224-2.0", "SHA3-256-2.0", "SHA3-384-2.0", "SHA3-512-2.0"),
+    "SHAKE": ("SHAKE-128-1.0", "SHAKE-128-FIPS202", "SHAKE-256-1.0", "SHAKE-256-FIPS202"),
+    "HMAC": ("HMAC-SHA2-224-2.0", "HMAC-SHA2-256-2.0", "HMAC-SHA2-384-2.0", "HMAC-SHA2-512-2.0"),
+}
+
+
+def digest_test(algorithm, kind, test):
+    if algorithm.startswith("HMAC"):
+        if not aligned(test["keyLen"], test["msgLen"], test["macLen"]):
+            return None
+
+        return {
+            "tcId": test["tcId"],
+            "key": whole(test["key"], test["keyLen"]),
+            "msg": whole(test["msg"], test["msgLen"]),
+            "mac": whole(test["mac"], test["macLen"]),
+        }
+
+    shake = algorithm.startswith("SHAKE")
+
+    if kind == "MCT":
+        results = [f"{r['md'].lower()}:{r['outLen']}" if shake else r["md"].lower() for r in test["resultsArray"]]
+
+        return {"tcId": test["tcId"], "msg": whole(test["msg"], test["len"]), "results": results}
+
+    if not aligned(test["len"], test.get("outLen", 0)):
+        return None
+
+    record = {"tcId": test["tcId"], "msg": whole(test["msg"], test["len"])}
+
+    if shake:
+        record["outLen"] = test["outLen"]
+
+        record["md"] = whole(test["md"], test["outLen"])
+    else:
+        record["md"] = test["md"]
+
+    return record
+
+
+# The SHA-2, SHA-3, SHAKE and HMAC tests of ACVP whose lengths are whole bytes, the only ones a
+# byte API can run: AFT and VOT answers, and the Monte Carlo chains (MCT) with their 100 outputs.
+def acvp_digests(names):
+    groups = []
+
+    for name in names:
+        data = json.loads(source(name))
+
+        for group in data["testGroups"]:
+            if group["testType"] == "LDT":
+                continue
+
+            header = {"algorithm": data["algorithm"], "revision": data["revision"], "testType": group["testType"]}
+
+            header.update({k: group[k] for k in ("mctVersion", "minOutLen", "maxOutLen") if k in group})
+
+            tests = [digest_test(data["algorithm"], group["testType"], t) for t in group["tests"]]
+
+            groups.append((header, [t for t in tests if t]))
+
+    return [(header, tests) for header, tests in groups if tests]
+
+
+# The large-data tests: the content repeats until fullLength bytes, which the tests hash in pieces.
+def acvp_large_data():
+    groups = []
+
+    for names in (DIGESTS["SHA2"], DIGESTS["SHA3"]):
+        for name in names:
+            data = json.loads(source(name))
+
+            for group in data["testGroups"]:
+                if group["testType"] != "LDT":
+                    continue
+
+                tests = []
+
+                for test in group["tests"]:
+                    large = test["largeMsg"]
+
+                    if large["expansionTechnique"] != "repeating" or not aligned(large["contentLength"], large["fullLength"]):
+                        sys.exit(f"{name}: unexpected large-data test {test['tcId']}")
+
+                    tests.append({"tcId": test["tcId"], "content": whole(large["content"], large["contentLength"]), "length": large["fullLength"] // 8, "md": test["md"]})
+
+                groups.append(({"algorithm": data["algorithm"]}, tests))
+
+    return groups
+
+
+# RFC 4231, Section 4: test cases 1 to 7 for HMAC-SHA-224/256/384/512 (case 5 is a tag truncated to
+# 128 bits), in the layout of the ACVP HMAC tests.
+def rfc4231():
+    lines = rfc_text("rfc4231")
+
+    names = {"HMAC-SHA-224": "HMAC-SHA2-224", "HMAC-SHA-256": "HMAC-SHA2-256", "HMAC-SHA-384": "HMAC-SHA2-384", "HMAC-SHA-512": "HMAC-SHA2-512"}
+
+    starts = [i for i, line in enumerate(lines) if re.match(r"4\.\d\.  Test Case \d", line)]
+
+    end = next(i for i, line in enumerate(lines) if line.startswith("5.  Security Considerations"))
+
+    groups = {name: [] for name in names.values()}
+
+    for start, stop in zip(starts, starts[1:] + [end]):
+        number = int(re.match(r"4\.\d\.  Test Case (\d)", lines[start]).group(1))
+
+        fields = {}
+
+        current = None
+
+        for line in lines[start:stop]:
+            match = re.match(r"   (Key|Data|HMAC-SHA-\d+) +=? +([0-9a-f]+)", line)
+
+            if match:
+                current = match.group(1)
+
+                fields[current] = match.group(2)
+
+                continue
+
+            match = re.match(r" {18}([0-9a-f]+)", line)
+
+            if match and current:
+                fields[current] += match.group(1)
+            elif line.strip():
+                current = None
+
+        for label, name in names.items():
+            tag = fields[label]
+
+            if len(tag) != (32 if number == 5 else int(label[-3:]) // 4):
+                sys.exit(f"RFC 4231 case {number} {label}: {len(tag)} hexadecimal digits")
+
+            groups[name].append({"tcId": number, "key": fields["Key"], "msg": fields["Data"], "mac": tag})
+
+    return [({"algorithm": name}, tests) for name, tests in groups.items()]
+
+
+def pem_blocks(name):
+    lines = rfc_text(name)
+
+    blocks = []
+
+    section = ""
+
+    for index, line in enumerate(lines):
+        match = re.match(r"^(C\.\d(?:\.\d)*)\.\s+(.*)$", line)
+
+        if match:
+            section = f"{match.group(1)} {match.group(2).strip()}"
+
+        if line.strip().startswith("-----BEGIN "):
+            label = line.strip()[11:-5]
+
+            body = []
+
+            for following in lines[index + 1 :]:
+                if following.strip().startswith("-----END "):
+                    break
+
+                if following.strip():
+                    body.append(following.strip())
+
+            blocks.append((section, label, body))
+
+    return blocks
+
+
+def der_read(data, offset=0):
+    tag = data[offset]
+
+    length = data[offset + 1]
+
+    start = offset + 2
+
+    if length & 0x80:
+        size = length & 0x7F
+
+        length = int.from_bytes(data[start : start + size], "big")
+
+        start += size
+
+    return tag, data[start : start + length], start + length
+
+
+def key_info(der, private):
+    _, content, _ = der_read(der)
+
+    if private:
+        _, _, offset = der_read(content)
+
+        _, algorithm, offset = der_read(content, offset)
+    else:
+        _, algorithm, offset = der_read(content)
+
+    _, oid, _ = der_read(algorithm)
+
+    _, body, _ = der_read(content, offset)
+
+    return oid, body if private else body[1:]
+
+
+KEY_OIDS = {
+    "608648016503040401": "ML-KEM-512",
+    "608648016503040402": "ML-KEM-768",
+    "608648016503040403": "ML-KEM-1024",
+    "608648016503040311": "ML-DSA-44",
+    "608648016503040312": "ML-DSA-65",
+    "608648016503040313": "ML-DSA-87",
+}
+
+
+# The example keys of RFC 9935 (ML-KEM) and RFC 9881 (ML-DSA), Appendix C: private keys in seed,
+# expanded and both forms, public keys, and the invalid private keys of C.4 that must be refused.
+# exportDer is what a private key exports as: the seed form (the seed is 00 01 02 ... in every
+# example), or the key itself when it has no seed.
+def rfc_keys(name):
+    publics = {}
+
+    for _, label, body in pem_blocks(name):
+        if label == "PUBLIC KEY":
+            oid, key = key_info(base64.b64decode("".join(body)), False)
+
+            publics[KEY_OIDS[oid.hex()]] = key.hex()
+
+    records = []
+
+    invalid = 0
+
+    for section, label, body in pem_blocks(name):
+        if label != "PRIVATE KEY" and label != "PUBLIC KEY":
+            continue
+
+        der = base64.b64decode("".join(body))
+
+        record = {"name": section, "label": label, "pem": "|".join(body), "der": der.hex()}
+
+        if label == "PUBLIC KEY":
+            oid, key = key_info(der, False)
+
+            record.update({"algorithm": KEY_OIDS[oid.hex()], "kind": "public", "expect": "ok", "public": key.hex(), "exportDer": der.hex()})
+        else:
+            oid, _ = key_info(der, True)
+
+            algorithm = KEY_OIDS[oid.hex()]
+
+            record.update({"algorithm": algorithm, "kind": "private", "public": publics[algorithm]})
+
+            if section.startswith("C.4"):
+                invalid += 1
+
+                record.update({"name": f"{section} example {invalid}", "expect": "reject"})
+            else:
+                record["expect"] = "ok"
+
+                if "Expanded" in section:
+                    record.update({"form": "expanded", "exportDer": der.hex()})
+                else:
+                    size = 64 if algorithm.startswith("ML-KEM") else 32
+
+                    inner = bytes([0x80, size]) + bytes(range(size))
+
+                    body_der = bytes([0x02, 0x01, 0x00, 0x30, 0x0B, 0x06, 0x09]) + oid + bytes([0x04, len(inner)]) + inner
+
+                    record.update({"form": "seed" if "Seed" in section else "both", "exportDer": (bytes([0x30, len(body_der)]) + body_der).hex()})
+
+        records.append(record)
+
+    return [({}, records)]
+
+
+def pem_after(lines, label, start):
+    begin = next(i for i in range(start, len(lines)) if lines[i].strip() == f"-----BEGIN {label}-----")
+
+    end = next(i for i in range(begin, len(lines)) if lines[i].strip() == f"-----END {label}-----")
+
+    return base64.b64decode("".join(line.strip() for line in lines[begin + 1 : end])), end
+
+
+def der_span(data, offset):
+    _, content, end = der_read(data, offset)
+
+    return end - len(content), end
+
+
+# A certificate is SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue BIT STRING }; the
+# signature is over the TBSCertificate bytes, which are returned as encoded.
+def certificate_parts(der):
+    start, stop = der_span(der, 0)
+
+    tbs_end = der_span(der, start)[1]
+
+    algorithm_end = der_span(der, tbs_end)[1]
+
+    signature_start, signature_end = der_span(der, algorithm_end)
+
+    if stop != len(der) or der[algorithm_end] != 0x03 or der[signature_start] != 0:
+        sys.exit("unexpected certificate layout")
+
+    return der[start:tbs_end], der[signature_start + 1 : signature_end]
+
+
+# TBSCertificate: [0] version, serial, signature, issuer, validity, subject, subjectPublicKeyInfo.
+def subject_public_key_info(tbs):
+    offset = der_span(tbs, 0)[0]
+
+    spans = []
+
+    while len(spans) < 7:
+        end = der_span(tbs, offset)[1]
+
+        spans.append((offset, end))
+
+        offset = end
+
+    if tbs[spans[0][0]] != 0xA0:
+        sys.exit("TBSCertificate without a version")
+
+    return tbs[spans[6][0] : spans[6][1]]
+
+
+# RFC 9909, Appendix C: the public key (C.1) and the self-signed certificate (C.3) of an
+# SLH-DSA-SHA2-128s key; the signature covers the TBSCertificate, which holds the public key.
+def rfc9909():
+    lines = rfc_text("rfc9909")
+
+    spki, _ = pem_after(lines, "PUBLIC KEY", lines.index("C.1.  Example Public Key"))
+
+    der, _ = pem_after(lines, "CERTIFICATE", lines.index("C.3.  Example Certificate"))
+
+    tbs, signature = certificate_parts(der)
+
+    if subject_public_key_info(tbs) != spki:
+        sys.exit("RFC 9909: the C.1 key is not the key of the C.3 certificate")
+
+    return [({}, [{"name": "SLH-DSA-SHA2-128s", "spki": spki.hex(), "tbs": tbs.hex(), "signature": signature.hex()}])]
+
+
+# RFC 9802, Appendices A to C: self-signed certificates with an HSS/LMS, an XMSS and an XMSS^MT key.
+def rfc9802():
+    lines = rfc_text("rfc9802")
+
+    tests = []
+
+    position = 0
+
+    for name in ("HSS-LMS", "XMSS", "XMSS-MT"):
+        der, position = pem_after(lines, "CERTIFICATE", position)
+
+        tbs, signature = certificate_parts(der)
+
+        tests.append({"name": name, "spki": subject_public_key_info(tbs).hex(), "tbs": tbs.hex(), "signature": signature.hex()})
+
+    return [({}, tests)]
+
+
+
 def main():
     for url, expected, members in ARCHIVES:
         archive = zipfile.ZipFile(io.BytesIO(fetch(url, expected)))
@@ -1124,7 +1550,7 @@ def main():
 
     write("acvp/ML-DSA-keyGen.txt", render(acvp("ML-DSA-keyGen")))
 
-    write("acvp/ML-DSA-sigGen.txt", render(acvp("ML-DSA-sigGen", external, ml_dsa_sig_gen, ("mu",))))
+    write("acvp/ML-DSA-sigGen.txt", render(acvp("ML-DSA-sigGen", external, ml_dsa_sig_gen(8), ("mu",))))
 
     write("acvp/ML-DSA-sigVer.txt", render(acvp("ML-DSA-sigVer", external, drop=("sk", "mu"))))
 
@@ -1135,6 +1561,24 @@ def main():
     write("acvp/SLH-DSA-sigVer.txt", render(acvp("SLH-DSA-sigVer", external, slh_dsa_sig_ver, ("sk", "additionalRandomness"))))
 
     write("acvp/LMS-keyGen.txt", render(acvp("LMS-keyGen")))
+
+    for family, names in DIGESTS.items():
+        write(f"acvp/{family}.txt", render(acvp_digests(names)))
+
+    for relative, groups in acvp_full().items():
+        write(f"acvp-full/{relative}", render(groups))
+
+    write("acvp-full/large-data.txt", render(acvp_large_data()))
+
+    write("rfc/hmac.txt", render(rfc4231()))
+
+    write("rfc/mlkem_keys.txt", render(rfc_keys("rfc9935")))
+
+    write("rfc/mldsa_keys.txt", render(rfc_keys("rfc9881")))
+
+    write("rfc/slhdsa_certificate.txt", render(rfc9909()))
+
+    write("rfc/stateful_certificates.txt", render(rfc9802()))
 
     write("acvp/LMS-sigVer.txt", render(lms()))
 
@@ -1153,6 +1597,10 @@ def main():
     write("wycheproof/mldsa_verify.txt", render(wycheproof([f"mldsa_{k}_verify_test" for k in levels], ("msg", "ctx", "sig"), ("publicKey", "publicKeyDer"))))
 
     write("wycheproof/mldsa_sign_seed.txt", render(wycheproof([f"mldsa_{k}_sign_seed_test" for k in levels], ("msg", "mu", "ctx", "sig"), ("privateSeed", "privateKeyPkcs8", "publicKey"))))
+
+    write("wycheproof/mldsa_sign_noseed.txt", render(wycheproof([f"mldsa_{k}_sign_noseed_test" for k in levels], ("msg", "mu", "ctx", "sig"), ("privateKey", "publicKey"))))
+
+    write("wycheproof/mlkem_keygen_seed.txt", render(wycheproof([f"mlkem_{k}_keygen_seed_test" for k in sizes], ("seed", "ek", "dk"))))
 
     write("xwing/test-vectors.txt", render(xwing()))
 

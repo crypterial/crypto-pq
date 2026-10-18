@@ -3,7 +3,7 @@ mod vectors;
 use crypto_pq::{
     Error, KemAlgorithm, KeyFormat, KeyGenOptions, ML_KEM_512, ML_KEM_768, ML_KEM_1024, hazmat,
 };
-use vectors::{der, parallel, records, unhex};
+use vectors::{der, parallel, pem, records, unhex};
 
 const ALGORITHMS: [(&str, KemAlgorithm); 3] = [
     ("ML-KEM-512", ML_KEM_512),
@@ -106,7 +106,18 @@ fn acvp_key_generation() {
 
 #[test]
 fn acvp_encapsulation_and_decapsulation() {
-    for (header, record) in records("acvp/ML-KEM-encapDecap.txt", "tcId") {
+    check_encapsulation_and_decapsulation("acvp/ML-KEM-encapDecap.txt");
+}
+
+// The older ACVP projection, whose decapsulation tests carry expanded keys only.
+#[test]
+#[ignore = "weekly (fuzz.yml): the full ACVP set"]
+fn acvp_full_encapsulation_and_decapsulation() {
+    check_encapsulation_and_decapsulation("acvp-full/ML-KEM-encapDecap-v1.txt");
+}
+
+fn check_encapsulation_and_decapsulation(name: &str) {
+    for (header, record) in records(name, "tcId") {
         let algorithm = algorithm(&header["parameterSet"]);
 
         let context = format!("tcId {} {}", record["tcId"], header["function"]);
@@ -153,6 +164,53 @@ fn acvp_encapsulation_and_decapsulation() {
             function => panic!("unknown function {function}"),
         }
     }
+}
+
+// The key pair of each seed, and its expanded decapsulation key, which must agree with the seed
+// when both come in one private key.
+#[test]
+fn wycheproof_key_generation_from_seed() {
+    parallel(
+        &records("wycheproof/mlkem_keygen_seed.txt", "tcId"),
+        |(header, record)| {
+            let algorithm = algorithm(&header["parameterSet"]);
+
+            let (seed, ek, dk) = (
+                unhex(&record["seed"]),
+                unhex(&record["ek"]),
+                unhex(&record["dk"]),
+            );
+
+            let context = format!("tcId {} {}", record["tcId"], header["parameterSet"]);
+
+            assert_eq!(record["result"], "valid", "{context}");
+
+            let pair = hazmat::generate_kem_key_pair(algorithm, &seed).unwrap();
+
+            assert_eq!(
+                pair.public_key.export_key(KeyFormat::Raw).unwrap(),
+                ek,
+                "{context}"
+            );
+
+            let expanded = algorithm.import_private_key(&dk, KeyFormat::Raw).unwrap();
+
+            assert_eq!(
+                expanded.public_key().export_key(KeyFormat::Raw).unwrap(),
+                ek,
+                "{context}"
+            );
+
+            let both = pkcs8(
+                algorithm,
+                &der(0x30, &[der(0x04, &seed), der(0x04, &dk)].concat()),
+            );
+
+            algorithm
+                .import_private_key(&both, KeyFormat::Der)
+                .unwrap_or_else(|error| panic!("{context}: {error}"));
+        },
+    );
 }
 
 #[test]
@@ -671,5 +729,78 @@ fn concurrent_first_use() {
                 });
             }
         });
+    }
+}
+
+// The C.4 example that only the pairwise consistency test of SPEC 8.1.4 check (4) refuses: an
+// expanded key with a mutated secret vector and a valid H(ek). That import check is pending
+// (SPEC Appendix C.2 item 6); run the example again when it lands.
+const PENDING_PAIRWISE_TEST: &str =
+    "C.4.1 ML-KEM Inconsistent Seed and Expanded Private Keys example 2";
+
+// RFC 9935, Appendix C: every example key in DER and PEM, its public key and what it exports as;
+// the inconsistent seed and expanded keys of C.4 must be refused.
+#[test]
+fn rfc9935_example_keys() {
+    for (_, record) in records("rfc/mlkem_keys.txt", "der") {
+        if record["name"] == PENDING_PAIRWISE_TEST {
+            continue;
+        }
+
+        let algorithm = algorithm(&record["algorithm"]);
+
+        let context = format!("RFC 9935 {}", record["name"]);
+
+        let der_key = unhex(&record["der"]);
+
+        let pem_key = pem(&record["label"], &record["pem"]);
+
+        let public = unhex(&record["public"]);
+
+        if record["kind"] == "public" {
+            for (data, format) in [
+                (&der_key[..], KeyFormat::Der),
+                (pem_key.as_bytes(), KeyFormat::Pem),
+            ] {
+                let key = algorithm.import_public_key(data, format).unwrap();
+
+                assert_eq!(key.export_key(KeyFormat::Raw).unwrap(), public, "{context}");
+
+                assert_eq!(
+                    key.export_key(KeyFormat::Der).unwrap(),
+                    unhex(&record["exportDer"]),
+                    "{context}"
+                );
+            }
+
+            continue;
+        }
+
+        for (data, format) in [
+            (&der_key[..], KeyFormat::Der),
+            (pem_key.as_bytes(), KeyFormat::Pem),
+        ] {
+            let result = algorithm.import_private_key(data, format);
+
+            if record["expect"] == "reject" {
+                assert_eq!(result.err(), Some(Error::InvalidPrivateKey), "{context}");
+
+                continue;
+            }
+
+            let key = result.unwrap_or_else(|error| panic!("{context}: {error}"));
+
+            assert_eq!(
+                key.public_key().export_key(KeyFormat::Raw).unwrap(),
+                public,
+                "{context}"
+            );
+
+            assert_eq!(
+                key.export_key(KeyFormat::Der).unwrap(),
+                unhex(&record["exportDer"]),
+                "{context}"
+            );
+        }
     }
 }

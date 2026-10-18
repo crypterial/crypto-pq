@@ -2120,3 +2120,40 @@ fn tree_cache_random_sealed_changes() {
 
     assert!(loads > 0);
 }
+
+// RFC 9802, Appendices A to C: the self-signed certificates of an HSS/LMS, an XMSS and an XMSS^MT
+// key; each public key, imported from its SubjectPublicKeyInfo, verifies the TBSCertificate.
+#[test]
+fn rfc9802_certificates() {
+    let found = records("rfc/stateful_certificates.txt", "spki");
+
+    assert_eq!(found.len(), 3);
+
+    for (_, record) in found {
+        let algorithm = match record["name"].as_str() {
+            "HSS-LMS" => HSS_LMS,
+            "XMSS" => XMSS,
+            "XMSS-MT" => XMSS_MT,
+            name => panic!("unknown algorithm {name}"),
+        };
+
+        let context = format!("RFC 9802 {}", record["name"]);
+
+        let public_key = algorithm
+            .import_public_key(&unhex(&record["spki"]), KeyFormat::Der)
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+
+        let (tbs, signature) = (unhex(&record["tbs"]), unhex(&record["signature"]));
+
+        assert!(public_key.verify(&signature, &tbs), "{context}");
+
+        let mut altered = tbs.clone();
+
+        *altered.last_mut().unwrap() ^= 1;
+
+        assert!(
+            !public_key.verify(&signature, &altered),
+            "{context} altered"
+        );
+    }
+}
