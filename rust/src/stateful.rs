@@ -1491,7 +1491,11 @@ impl<S> StatefulPrivateKey<S> {
 
             let tree = p.build(pub_seed, level, number, &secrets, None)?;
 
-            let signature = parent.sign(pub_seed, leaf, &randomizer, tree.key());
+            #[allow(unused_mut)]
+            let mut signature = parent.sign(pub_seed, leaf, &randomizer, tree.key());
+
+            #[cfg(test)]
+            tests::inject(tests::Fault::ChildRoot, &mut signature);
 
             let address = (level, number);
 
@@ -1564,12 +1568,11 @@ impl<S: StateStore> StatefulPrivateKey<S> {
         self.index = index + 1;
 
         let signature = self.sign_message(index, message).and_then(|mut signature| {
-            // SPEC 11.5.2 step 7: a faulty signature can reveal one-time secrets, so it is never
-            // released.
-            if self
-                .algorithm
-                .verifies(&self.public_key, message, &signature)
-            {
+            // SPEC 11.5.2 step 7 [D-63]: a faulty one-time signature can reveal one-time secrets,
+            // so the one that this call computed is never released unverified. The child-root
+            // signatures that a transition computed were verified before the signed write, and
+            // the stored ones are copied as they were verified.
+            if self.verifies_message(index, message, &signature) {
                 Ok(signature)
             } else {
                 wipe(&mut signature);
@@ -1730,7 +1733,13 @@ impl<S: StateStore> StatefulPrivateKey<S> {
                     signature.extend_from_slice(&p.tree_key(level, &self.public_key, Some(record)));
                 }
 
-                signature.extend_from_slice(&tree.sign(pub_seed, leaf, &randomizer, message));
+                #[allow(unused_mut)]
+                let mut bottom = tree.sign(pub_seed, leaf, &randomizer, message);
+
+                #[cfg(test)]
+                tests::inject(tests::Fault::Message, &mut bottom);
+
+                signature.extend_from_slice(&bottom);
             }
             Parameters::Xmss(xp) => {
                 let n = xp.n;
@@ -1748,7 +1757,13 @@ impl<S: StateStore> StatefulPrivateKey<S> {
                     .as_mut()
                     .expect("the bottom level is current");
 
-                signature.extend_from_slice(&tree.sign(pub_seed, leaf, &[], &digest[..n]));
+                #[allow(unused_mut)]
+                let mut bottom = tree.sign(pub_seed, leaf, &[], &digest[..n]);
+
+                #[cfg(test)]
+                tests::inject(tests::Fault::Message, &mut bottom);
+
+                signature.extend_from_slice(&bottom);
 
                 for record in self.records.iter().rev() {
                     signature.extend_from_slice(&record.signature);
@@ -1759,6 +1774,63 @@ impl<S: StateStore> StatefulPrivateKey<S> {
         ct::declassify(&signature);
 
         Ok(signature)
+    }
+
+    // Whether the message signature at the end (HSS) or the start (XMSS) of `signature` is the
+    // one-time signature of message by the leaf that index uses, under the bottom tree's key: the
+    // LMS signature of RFC 8554 Algorithm 6a, or the bottom layer of RFC 8391 Algorithm 14 with
+    // the digest computed again from the signature's r.
+    fn verifies_message(&self, index: u64, message: &[u8], signature: &[u8]) -> bool {
+        let p = &self.parameters;
+
+        let bottom = p.levels() - 1;
+
+        let leaf = p.leaf(index, bottom);
+
+        let Some(tree) = self.trees[bottom].as_ref() else {
+            return false;
+        };
+
+        match p {
+            Parameters::Hss(levels) => {
+                let (lms, ots) = &levels[bottom];
+
+                let Some(part) = signature
+                    .len()
+                    .checked_sub(lms.signature_size(ots))
+                    .map(|start| &signature[start..])
+                else {
+                    return false;
+                };
+
+                part[..4] == leaf.to_be_bytes() && lms::verify(tree.key(), message, part)
+            }
+            Parameters::Xmss(xp) => {
+                let (n, size) = (xp.n, xp.index_size());
+
+                let Some(layer) = signature.get(size + n..size + n + xp.layer_signature_size())
+                else {
+                    return false;
+                };
+
+                let r = &signature[size..size + n];
+
+                let digest =
+                    xmss::message_digest(xp, r, p.top_root(&self.public_key), index, message);
+
+                let address = (0, p.tree_number(index, bottom), leaf);
+
+                signature[..size] == index.to_be_bytes()[8 - size..]
+                    && xmss::verify_root(
+                        xp,
+                        p.public_seed(&self.public_key),
+                        address,
+                        &digest[..n],
+                        layer,
+                        tree.root(),
+                    )
+            }
+        }
     }
 }
 
@@ -1799,15 +1871,37 @@ mod tests {
     use crate::hazmat::generate_stateful_key_pair;
     use crate::merkle::{LEAVES_COMPUTED, ONE_TIME_SIGNATURES};
 
+    // The faults that a test can inject into the next one-time signature of its kind: one byte of
+    // it flipped after it is computed, before it is verified (SPEC 11.5.2 steps 3.3 and 7).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Fault {
+        Message,
+        ChildRoot,
+    }
+
+    std::thread_local! {
+        static ARMED: Cell<Option<Fault>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn inject(kind: Fault, signature: &mut [u8]) {
+        if ARMED.with(|armed| armed.get()) == Some(kind) {
+            ARMED.with(|armed| armed.set(None));
+
+            signature[signature.len() / 2] ^= 1;
+        }
+    }
+
     // A store shared by every key object of a run, as a file is by processes. Its write number
     // `crash` fails as a crash on one side of the durable write would: lost, or stored and then
-    // reported as failed. Every write before and after it succeeds.
+    // reported as failed. Every write before and after it succeeds. `fault` injects a fault into
+    // the sign call of that number.
     #[derive(Clone, Default)]
     struct CrashingStore {
         state: Rc<RefCell<Option<Vec<u8>>>>,
         writes: Rc<Cell<usize>>,
         crash: usize,
         stored: bool,
+        fault: Option<(usize, Fault)>,
     }
 
     impl StateStore for CrashingStore {
@@ -1900,10 +1994,39 @@ mod tests {
 
         let mut failures = 0;
 
+        let mut calls = 0;
+
         while released.len() < count {
             let message = released.len().to_be_bytes();
 
-            match key.sign(&message) {
+            let fault = store
+                .fault
+                .filter(|&(call, _)| call == calls)
+                .map(|(_, kind)| kind);
+
+            ARMED.with(|armed| armed.set(fault));
+
+            calls += 1;
+
+            let result = key.sign(&message);
+
+            // A fault that fired is refused as SELF_TEST_FAILED, and the index stays spent; a
+            // child-root fault fires only in a call that moves to new trees.
+            let fired = fault.is_some() && ARMED.with(|armed| armed.take()).is_none();
+
+            assert_eq!(fired, result == Err(Error::SelfTestFailed), "{result:?}");
+
+            if fired {
+                if reload {
+                    drop(key);
+
+                    key = load().unwrap();
+                }
+
+                continue;
+            }
+
+            match result {
                 Ok(signature) => {
                     assert!(public_key.verify(&signature, &message));
 
@@ -1955,10 +2078,11 @@ mod tests {
         (released, store.writes.get())
     }
 
-    // SPEC 11.5 and 11.9: across key generation, loads, signatures and a crash at every write
-    // point, on either side of the durable write, no one-time key signs twice. Every one-time
-    // signature that the library computes is counted by its key, whether it was released, stored
-    // or lost in the crash, and no index is released twice.
+    // SPEC 11.5 and 11.9: across key generation, loads, signatures, a crash at every write point,
+    // on either side of the durable write, and a fault in the new one-time signature of every
+    // call, no one-time key signs twice. Every one-time signature that the library computes is
+    // counted by its key, whether it was released, stored, refused or lost in the crash, and no
+    // index is released twice.
     #[test]
     fn no_one_time_key_signs_twice() {
         let two = [
@@ -2042,6 +2166,120 @@ mod tests {
 
                 assert_eq!(distinct.len(), released.len(), "{context}");
             }
+        }
+
+        // A fault in the new one-time signature of every call, with and without a reload after
+        // it: never released, and the one-time key that computed it signs nothing else.
+        for call in 0..count {
+            for kind in [Fault::Message, Fault::ChildRoot] {
+                for reload in [true, false] {
+                    ONE_TIME_SIGNATURES.with(|signatures| signatures.borrow_mut().clear());
+
+                    let store = CrashingStore {
+                        fault: Some((call, kind)),
+                        ..CrashingStore::default()
+                    };
+
+                    let (released, _) = run(algorithm, parameters, start, count, &store, reload);
+
+                    let context = std::format!("{} {call} {kind:?} {reload}", algorithm.name());
+
+                    let signed = ONE_TIME_SIGNATURES.with(|signatures| signatures.take());
+
+                    let keys: HashSet<&Vec<u8>> = signed.iter().collect();
+
+                    assert_eq!(keys.len(), signed.len(), "{context}");
+
+                    let distinct: HashSet<&Vec<u8>> = released.iter().collect();
+
+                    assert_eq!(distinct.len(), released.len(), "{context}");
+                }
+            }
+        }
+    }
+
+    // SPEC 11.5.2 steps 3.3, 3.5 and 7 [D-63]: a fault in the message signature fails the call
+    // with SELF_TEST_FAILED and spends its index; a fault in the signature of a new child root
+    // fails it too, after the claim, and the key moves past the claimed subtree as a load does.
+    // The key signs on correctly after either.
+    #[test]
+    fn a_faulty_new_signature_is_never_released() {
+        let two = [
+            ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W4"),
+            ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W2"),
+        ];
+
+        let mt = StatefulParameters::Name("XMSSMT-SHA2_20/4_192");
+
+        let xmss = StatefulParameters::Name("XMSS-SHA2_10_192");
+
+        for (algorithm, parameters, capacity, skip) in [
+            (HSS_LMS, StatefulParameters::Levels(&two), 1 << 10, Some(64)),
+            (XMSS_MT, mt, 1 << 20, Some(64)),
+            (XMSS, xmss, 1 << 10, None),
+        ] {
+            ONE_TIME_SIGNATURES.with(|signatures| signatures.borrow_mut().clear());
+
+            let seed: Vec<u8> = (0..algorithm.parameters(parameters).unwrap().seed_size())
+                .map(|i| i as u8)
+                .collect();
+
+            let store = CrashingStore::default();
+
+            let pair = generate_stateful_key_pair(
+                algorithm,
+                &seed,
+                30,
+                parameters,
+                store.clone(),
+                &StatefulKeyGenOptions::default(),
+            )
+            .unwrap();
+
+            let (public_key, mut key) = (pair.public_key, pair.private_key);
+
+            let sign = |key: &mut StatefulPrivateKey<CrashingStore>, fault| {
+                ARMED.with(|armed| armed.set(fault));
+
+                let result = key.sign(b"m");
+
+                assert_eq!(ARMED.with(|armed| armed.take()), None);
+
+                result.inspect(|signature| assert!(public_key.verify(signature, b"m")))
+            };
+
+            // Index 30.
+            assert_eq!(
+                sign(&mut key, Some(Fault::Message)).err(),
+                Some(Error::SelfTestFailed)
+            );
+
+            assert_eq!(key.remaining_signatures(), capacity - 31);
+
+            // Index 31, then 32 moves the lower levels to their next trees.
+            sign(&mut key, None).unwrap();
+
+            if let Some(skip) = skip {
+                let result = sign(&mut key, Some(Fault::ChildRoot));
+
+                assert_eq!(result.err(), Some(Error::SelfTestFailed));
+
+                assert_eq!(key.remaining_signatures(), capacity - skip);
+
+                let loaded = algorithm
+                    .load_private_key(store.clone(), &StatefulLoadOptions::default())
+                    .unwrap();
+
+                assert_eq!(loaded.remaining_signatures(), capacity - skip);
+            }
+
+            sign(&mut key, None).unwrap();
+
+            let signed = ONE_TIME_SIGNATURES.with(|signatures| signatures.take());
+
+            let keys: HashSet<&Vec<u8>> = signed.iter().collect();
+
+            assert_eq!(keys.len(), signed.len(), "{}", algorithm.name());
         }
     }
 
