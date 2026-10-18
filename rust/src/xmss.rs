@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 
 use crate::ct::declassify;
 use crate::error::Error;
-use crate::merkle::{CachedTree, HeldTree, MerkleTree, Node, TreeHasher};
+use crate::merkle::{MerkleTree, Node, TreeHasher};
 use crate::primitives::TruncatedHash;
 use crate::sha2::{IV_256, Sha256};
 use crate::wipe::{SecretBytes, wipe};
@@ -139,7 +139,7 @@ impl Parameters {
         2 * self.n + 3
     }
 
-    const fn index_size(&self) -> usize {
+    pub(crate) const fn index_size(&self) -> usize {
         if self.multi {
             self.h.div_ceil(8) as usize
         } else {
@@ -152,11 +152,12 @@ impl Parameters {
     }
 
     const fn signature_size(&self) -> usize {
-        self.index_size() + self.n + (self.d as usize * self.len() + self.h as usize) * self.n
+        self.index_size() + self.n + self.d as usize * self.layer_signature_size()
     }
 
-    pub(crate) const fn capacity(&self) -> u64 {
-        1 << self.h
+    // What one layer adds to a signature: a WOTS+ signature and an authentication path.
+    pub(crate) const fn layer_signature_size(&self) -> usize {
+        (self.len() + self.tree_height() as usize) * self.n
     }
 }
 
@@ -511,16 +512,21 @@ impl<'a> Hashes<'a> {
     fn wots_sign(&self, message: &[u8], adrs: &Adrs, out: &mut Vec<u8>) {
         let len = self.p.len();
 
+        #[cfg(test)]
+        crate::merkle::one_time_signature(&[b"X", self.sk_seed, self.pub_seed, &adrs[..20]]);
+
         let mut values = [[0; 32]; MAX_LEN];
 
         for (first, group) in (0..len).step_by(LANES).zip(values.chunks_mut(LANES)) {
             let chains = core::array::from_fn(|lane| first + lane);
 
-            let secrets = self.wots_secrets(&mut [*adrs; LANES], chains);
+            let mut secrets = self.wots_secrets(&mut [*adrs; LANES], chains);
 
-            for (value, secret) in group.iter_mut().zip(secrets) {
-                *value = secret;
+            for (value, secret) in group.iter_mut().zip(&secrets) {
+                *value = *secret;
             }
+
+            wipe(&mut secrets);
         }
 
         self.chains(
@@ -735,6 +741,35 @@ fn read_index(bytes: &[u8]) -> u64 {
         .fold(0, |value, &byte| (value << 8) | u64::from(byte))
 }
 
+// The root of the tree `tree` of a layer that one layer of a signature gives for an n-byte message
+// signed at leaf: the WOTS+ public key from the signature, its L-tree, then the path upwards.
+fn layer_root(
+    hashes: &Hashes,
+    layer: u32,
+    tree: u64,
+    leaf: u32,
+    message: &[u8],
+    signature: &[u8],
+) -> Node {
+    let p = hashes.p;
+
+    let (wots, auth) = signature.split_at(p.len() * p.n);
+
+    let mut ots = address(layer, tree, OTS);
+
+    set_word(&mut ots, 4, leaf);
+
+    let values = hashes.wots_public_from_signature(wots, message, &ots);
+
+    let mut lt = address(layer, tree, LTREE);
+
+    set_word(&mut lt, 4, leaf);
+
+    let [leaf_node] = hashes.ltree_lanes(&mut [values], core::array::from_mut(&mut lt));
+
+    hashes.compute_root(leaf_node, leaf, auth, layer, tree)
+}
+
 pub(crate) fn verify(p: &Parameters, public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
     let n = p.n;
 
@@ -756,224 +791,143 @@ pub(crate) fn verify(p: &Parameters, public_key: &[u8], message: &[u8], signatur
         return false;
     }
 
-    let (r, mut rest) = signature[p.index_size()..].split_at(n);
+    let (r, layers) = signature[p.index_size()..].split_at(n);
 
     let mut node = hashes.message_digest(r, root, index, message);
 
     let height = p.tree_height();
 
-    for layer in 0..p.d {
+    for (layer, part) in (0..p.d).zip(layers.chunks_exact(p.layer_signature_size())) {
         let leaf = (index & ((1 << height) - 1)) as u32;
 
         index >>= height;
 
-        let (wots, after) = rest.split_at(p.len() * n);
-
-        let (auth, after) = after.split_at(height as usize * n);
-
-        rest = after;
-
-        let mut ots = address(layer, index, OTS);
-
-        set_word(&mut ots, 4, leaf);
-
-        let values = hashes.wots_public_from_signature(wots, &node[..n], &ots);
-
-        let mut lt = address(layer, index, LTREE);
-
-        set_word(&mut lt, 4, leaf);
-
-        let [leaf_node] = hashes.ltree_lanes(&mut [values], core::array::from_mut(&mut lt));
-
-        node = hashes.compute_root(leaf_node, leaf, auth, layer, index);
+        node = layer_root(&hashes, layer, index, leaf, &node[..n], part);
     }
 
     node[..n] == *root
 }
 
-// What a layer above the bottom adds to a signature: the WOTS+ signature of the root of the tree
-// below and the authentication path. Both depend on prefix = index >> (layer * h') alone, so they
-// are kept until the index leaves the subtree, as HSS keeps its signed child keys, with the root
-// of the layer's tree that the next layer signs.
-struct SignedRoot {
-    prefix: u64,
-    part: Vec<u8>,
-    root: Node,
-}
-
-// The signing side of an XMSS or XMSS^MT key, with one cached tree and one signed root per layer.
-// `cached` holds the trees of a verified tree cache that the next index signs with; each replaces
-// the build of its layer, checked against its own nodes.
-pub(crate) struct Xmss {
-    p: &'static Parameters,
-    sk_seed: SecretBytes,
-    sk_prf: SecretBytes,
-    pub_seed: Vec<u8>,
-    trees: Vec<Option<(u64, MerkleTree)>>,
-    signed: Vec<Option<SignedRoot>>,
-    root: Node,
-}
-
-fn cached_tree<'t>(
-    trees: &'t mut [Option<(u64, MerkleTree)>],
-    hashes: &Hashes,
-    layer: u32,
-    tree: u64,
-) -> &'t mut MerkleTree {
-    let slot = &mut trees[layer as usize];
-
-    if slot.as_ref().is_some_and(|(cached, _)| *cached != tree) {
-        *slot = None;
-    }
-
-    let (_, merkle) = slot.get_or_insert_with(|| {
-        let subtree = Subtree {
-            hashes,
+// Whether the signature of one layer, by leaf `leaf` of tree `tree` at `layer`, signs the n-byte
+// root of the tree below under the root of its own tree (RFC 8391, Algorithm 17, one layer).
+pub(crate) fn verify_root(
+    p: &Parameters,
+    pub_seed: &[u8],
+    (layer, tree, leaf): (u32, u64, u32),
+    message: &[u8],
+    signature: &[u8],
+    root: &[u8],
+) -> bool {
+    signature.len() == p.layer_signature_size()
+        && layer_root(
+            &Hashes::new(p, pub_seed, &[]),
             layer,
             tree,
-        };
-
-        let merkle = MerkleTree::new(hashes.p.tree_height(), &subtree);
-
-        // Each root is the public key or what the layer above signs.
-        declassify(merkle.root());
-
-        (tree, merkle)
-    });
-
-    merkle
+            leaf,
+            message,
+            signature,
+        )[..p.n]
+            == *root
 }
 
-impl Xmss {
+// The randomizer r = PRF(SK_PRF, toByte(index, 32)) of the message signature at index, which is
+// part of the signature.
+pub(crate) fn randomizer(p: &Parameters, sk_prf: &[u8], index: u64) -> Node {
+    let r = Hashes::new(p, &[], &[]).hash(PRF, sk_prf, &[&to_byte(index, 32)]);
+
+    declassify(&r[..p.n]);
+
+    r
+}
+
+// H_msg(r || root || toByte(index, n), message), which the bottom layer signs.
+pub(crate) fn message_digest(
+    p: &Parameters,
+    r: &[u8],
+    root: &[u8],
+    index: u64,
+    message: &[u8],
+) -> Node {
+    Hashes::new(p, &[], &[]).message_digest(r, root, index, message)
+}
+
+// One XMSS tree of a key: its layer, its number there, its S_XMSS, and its Merkle tree. Every tree
+// of a key shares PUB_SEED, which the key passes in.
+pub(crate) struct Tree {
+    p: &'static Parameters,
+    layer: u32,
+    number: u64,
+    s_xmss: SecretBytes,
+    merkle: MerkleTree,
+}
+
+impl Tree {
+    // The tree built from its leaves, or from the nodes of a tree cache that every parent there
+    // agrees with.
     pub(crate) fn new(
         p: &'static Parameters,
-        seed: &[u8],
-        cached: &[CachedTree<'_>],
+        pub_seed: &[u8],
+        s_xmss: &[u8],
+        (layer, number): (u32, u64),
+        nodes: Option<&[u8]>,
     ) -> Result<Self, Error> {
-        let n = p.n;
+        let s_xmss = SecretBytes::concat(&[s_xmss]);
 
-        // PUB_SEED is part of the public key.
-        declassify(&seed[2 * n..]);
+        let hashes = Hashes::new(p, pub_seed, &s_xmss);
 
-        let mut xmss = Self {
-            p,
-            sk_seed: SecretBytes::concat(&[&seed[..n]]),
-            sk_prf: SecretBytes::concat(&[&seed[n..2 * n]]),
-            pub_seed: seed[2 * n..].to_vec(),
-            trees: (0..p.d).map(|_| None).collect(),
-            signed: (0..p.d).map(|_| None).collect(),
-            root: [0; 32],
+        let subtree = Subtree {
+            hashes: &hashes,
+            layer,
+            tree: number,
         };
 
-        let hashes = Hashes::new(p, &xmss.pub_seed, &xmss.sk_seed);
+        let merkle = match nodes {
+            Some(nodes) => MerkleTree::restore(p.tree_height(), p.n, nodes, &subtree)?,
+            None => MerkleTree::new(p.tree_height(), &subtree),
+        };
 
-        for tree in cached {
-            let subtree = Subtree {
-                hashes: &hashes,
-                layer: u32::from(tree.level),
-                tree: tree.tree,
-            };
+        // The root is the public key or what the layer above signs.
+        declassify(merkle.root());
 
-            let merkle = MerkleTree::restore(p.tree_height(), n, tree.nodes, &subtree)?;
-
-            xmss.trees[usize::from(tree.level)] = Some((tree.tree, merkle));
-        }
-
-        xmss.root = *cached_tree(&mut xmss.trees, &hashes, p.d - 1, 0).root();
-
-        Ok(xmss)
-    }
-
-    // Every tree the key holds, top first, as a tree cache lists it.
-    pub(crate) fn cached_trees(&self) -> Vec<HeldTree<'_>> {
-        let held = self.trees.iter().enumerate().rev();
-
-        held.filter_map(|(layer, slot)| {
-            slot.as_ref().map(|(tree, merkle)| HeldTree {
-                level: layer as u8,
-                tree: *tree,
-                n: self.p.n,
-                merkle,
-            })
+        Ok(Self {
+            p,
+            layer,
+            number,
+            s_xmss,
+            merkle,
         })
-        .collect()
     }
 
-    pub(crate) fn public_key(&self) -> Vec<u8> {
-        [
-            &self.p.oid.to_be_bytes()[..],
-            &self.root[..self.p.n],
-            &self.pub_seed,
-        ]
-        .concat()
+    pub(crate) fn root(&self) -> &[u8] {
+        &self.merkle.root()[..self.p.n]
     }
 
-    pub(crate) fn sign(&mut self, index: u64, message: &[u8]) -> Vec<u8> {
+    pub(crate) const fn merkle(&self) -> &MerkleTree {
+        &self.merkle
+    }
+
+    // The WOTS+ signature of an n-byte message by leaf, followed by the leaf's authentication
+    // path.
+    pub(crate) fn sign(&mut self, pub_seed: &[u8], leaf: u32, message: &[u8]) -> Vec<u8> {
         let p = self.p;
 
-        let n = p.n;
+        let hashes = Hashes::new(p, pub_seed, &self.s_xmss);
 
-        let hashes = Hashes::new(p, &self.pub_seed, &self.sk_seed);
+        let mut ots = address(self.layer, self.number, OTS);
 
-        let r = hashes.hash(PRF, &self.sk_prf, &[&to_byte(index, 32)]);
+        set_word(&mut ots, 4, leaf);
 
-        // R is part of the signature, so the message digest is public as well.
-        declassify(&r[..n]);
+        let mut out = Vec::with_capacity(p.layer_signature_size());
 
-        let mut node = hashes.message_digest(&r[..n], &self.root[..n], index, message);
+        hashes.wots_sign(message, &ots, &mut out);
 
-        let mut out = Vec::with_capacity(p.signature_size());
+        let subtree = Subtree {
+            hashes: &hashes,
+            layer: self.layer,
+            tree: self.number,
+        };
 
-        out.extend_from_slice(&index.to_be_bytes()[8 - p.index_size()..]);
-
-        out.extend_from_slice(&r[..n]);
-
-        let height = p.tree_height();
-
-        for layer in 0..p.d {
-            let prefix = index >> (layer * height);
-
-            let signed = &mut self.signed[layer as usize];
-
-            if let Some(kept) = signed.as_ref().filter(|kept| kept.prefix == prefix) {
-                out.extend_from_slice(&kept.part);
-
-                node = kept.root;
-
-                continue;
-            }
-
-            let (leaf, tree) = ((prefix & ((1 << height) - 1)) as u32, prefix >> height);
-
-            let start = out.len();
-
-            let mut ots = address(layer, tree, OTS);
-
-            set_word(&mut ots, 4, leaf);
-
-            hashes.wots_sign(&node[..n], &ots, &mut out);
-
-            let merkle = cached_tree(&mut self.trees, &hashes, layer, tree);
-
-            let subtree = Subtree {
-                hashes: &hashes,
-                layer,
-                tree,
-            };
-
-            out.extend_from_slice(&merkle.auth_path(leaf, n, &subtree));
-
-            node = *merkle.root();
-
-            // The bottom layer signs the message, which changes every time.
-            if layer > 0 {
-                *signed = Some(SignedRoot {
-                    prefix,
-                    part: out[start..].to_vec(),
-                    root: node,
-                });
-            }
-        }
+        out.extend_from_slice(&self.merkle.auth_path(leaf, p.n, &subtree));
 
         declassify(&out);
 

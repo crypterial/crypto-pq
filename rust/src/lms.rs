@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use crate::ct::declassify;
 use crate::error::Error;
-use crate::merkle::{CachedTree, HeldTree, MerkleTree, Node, TreeHasher};
+use crate::merkle::{MerkleTree, Node, TreeHasher};
 use crate::primitives::TruncatedHash;
 use crate::sha2::{IV_256, Sha256};
 use crate::wipe::{SecretBytes, wipe};
@@ -15,9 +15,9 @@ const D_LEAF: [u8; 2] = [0x82, 0x82];
 
 const D_INTR: [u8; 2] = [0x83, 0x83];
 
-// Pseudorandom values derived from a tree's SEED (RFC 8554, Appendix A, and the convention of
-// the hash-sigs reference used by the RFC 8554 and RFC 9858 test cases): the signature
-// randomizer C, and the SEED and I of a child tree. Chain indices are below 0xFFFD.
+// The values that the deterministic mode of SPEC 11.14 derives from a tree's I and SEED, as the
+// hash-sigs reference of the RFC 8554 and RFC 9858 test cases does: the signature randomizer C,
+// and the SEED and I of a child tree. Chain indices are below 0xFFFD.
 const RANDOMIZER: u16 = 0xFFFD;
 
 const CHILD_SEED: u16 = 0xFFFE;
@@ -156,11 +156,11 @@ impl OtsType {
 }
 
 impl LmsType {
-    const fn public_key_size(&self) -> usize {
+    pub(crate) const fn public_key_size(&self) -> usize {
         24 + self.m
     }
 
-    const fn signature_size(&self, ots: &OtsType) -> usize {
+    pub(crate) const fn signature_size(&self, ots: &OtsType) -> usize {
         8 + ots.signature_size() + self.h as usize * self.m
     }
 }
@@ -432,35 +432,43 @@ fn secret_values(t: &OtsType, lms: &LmsType, i: &[u8], q: u32, seed: &[u8]) -> [
     for (first, group) in (0..t.p()).step_by(LANES).zip(values.chunks_mut(LANES)) {
         let j = core::array::from_fn(|lane| first + lane);
 
-        let starts = chain_starts::<LANES>(lms, i, [q; LANES], j, seed);
+        let mut starts = chain_starts::<LANES>(lms, i, [q; LANES], j, seed);
 
-        for (value, start) in group.iter_mut().zip(starts) {
-            *value = start;
+        for (value, start) in group.iter_mut().zip(&starts) {
+            *value = *start;
         }
+
+        wipe(&mut starts);
     }
 
     values
 }
 
-fn ots_sign(t: &OtsType, lms: &LmsType, i: &[u8], q: u32, seed: &[u8], message: &[u8]) -> Vec<u8> {
+// The LM-OTS signature of key q with the randomizer C, which the caller draws or derives.
+fn ots_sign(
+    t: &OtsType,
+    lms: &LmsType,
+    i: &[u8],
+    q: u32,
+    seed: &[u8],
+    c: &[u8],
+    message: &[u8],
+) -> Vec<u8> {
     let (n, p) = (t.n, t.p());
 
-    let c = derive(lms, i, q, RANDOMIZER, seed);
+    #[cfg(test)]
+    crate::merkle::one_time_signature(&[b"L", i, &q.to_be_bytes()]);
 
     // C is part of the signature, so the digits of Q are public as well.
-    declassify(&c[..n]);
+    declassify(c);
 
-    let q_hash = digest(
-        t.shake,
-        n,
-        &[i, &q.to_be_bytes(), &D_MESG, &c[..n], message],
-    );
+    let q_hash = digest(t.shake, n, &[i, &q.to_be_bytes(), &D_MESG, c, message]);
 
     let mut out = Vec::with_capacity(t.signature_size());
 
     out.extend_from_slice(&t.code.to_be_bytes());
 
-    out.extend_from_slice(&c[..n]);
+    out.extend_from_slice(c);
 
     let digits = digits(t, &q_hash).map(u32::from);
 
@@ -471,6 +479,8 @@ fn ots_sign(t: &OtsType, lms: &LmsType, i: &[u8], q: u32, seed: &[u8], message: 
     for value in &values[..p] {
         out.extend_from_slice(&value[..n]);
     }
+
+    wipe(&mut values[p..]);
 
     out
 }
@@ -590,6 +600,11 @@ fn lms_verify(public_key: &LmsPublicKey, message: &[u8], signature: &[u8]) -> bo
     candidate[..m] == **root
 }
 
+// RFC 8554, Algorithm 6a, under an LMS public key u32(type) || u32(otstype) || I || T[1].
+pub(crate) fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    parse_public_key(public_key).is_some_and(|key| lms_verify(&key, message, signature))
+}
+
 pub(crate) fn check_public_key(data: &[u8]) -> bool {
     matches!(read_u32(data, 0), Some(1..=8)) && parse_public_key(&data[4..]).is_some()
 }
@@ -701,8 +716,9 @@ impl TreeHasher for TreeKey<'_> {
     }
 }
 
-// One LMS tree of an HSS key: its I, SEED and the Merkle tree over its OTS public keys.
-struct Tree {
+// One LMS tree of an HSS key: its types, I and SEED, the Merkle tree over its LM-OTS public keys,
+// and its public key u32(type) || u32(otstype) || I || T[1].
+pub(crate) struct Tree {
     lms: LmsType,
     ots: OtsType,
     i: [u8; 16],
@@ -712,90 +728,96 @@ struct Tree {
 }
 
 impl Tree {
-    fn new(lms: LmsType, ots: OtsType, i: &[u8], seed: SecretBytes) -> Self {
-        let merkle = MerkleTree::new(
-            lms.h,
-            &TreeKey {
-                lms: &lms,
-                ots: &ots,
-                i,
-                seed: &seed,
-            },
-        );
-
-        Self::with_merkle(lms, ots, i, seed, merkle)
-    }
-
-    // The tree from the nodes of a tree cache, checked against I; the nodes are public, and so is
-    // I, part of the tree's public key.
-    fn restore(
+    // The tree of the secrets I || SEED, built from its leaves, or from the nodes of a tree cache
+    // that every parent there agrees with.
+    pub(crate) fn new(
         lms: LmsType,
         ots: OtsType,
-        i: &[u8],
-        seed: SecretBytes,
-        nodes: &[u8],
+        secrets: &[u8],
+        nodes: Option<&[u8]>,
     ) -> Result<Self, Error> {
-        let mut identifier = [0; 16];
+        let mut i = [0; 16];
 
-        identifier.copy_from_slice(i);
+        i.copy_from_slice(&secrets[..16]);
 
-        declassify(&identifier);
+        // I is part of the tree's public key.
+        declassify(&i);
+
+        let seed = SecretBytes::concat(&[&secrets[16..]]);
 
         let key = TreeKey {
             lms: &lms,
             ots: &ots,
-            i: &identifier,
+            i: &i,
             seed: &seed,
         };
 
-        let merkle = MerkleTree::restore(lms.h, lms.m, nodes, &key)?;
+        let merkle = match nodes {
+            Some(nodes) => MerkleTree::restore(lms.h, lms.m, nodes, &key)?,
+            None => MerkleTree::new(lms.h, &key),
+        };
 
-        Ok(Self::with_merkle(lms, ots, &identifier, seed, merkle))
-    }
-
-    fn with_merkle(
-        lms: LmsType,
-        ots: OtsType,
-        i: &[u8],
-        seed: SecretBytes,
-        merkle: MerkleTree,
-    ) -> Self {
-        let mut identifier = [0; 16];
-
-        identifier.copy_from_slice(i);
-
-        let mut public_key = Vec::with_capacity(lms.public_key_size());
-
-        public_key.extend_from_slice(&lms.code.to_be_bytes());
-
-        public_key.extend_from_slice(&ots.code.to_be_bytes());
-
-        public_key.extend_from_slice(i);
-
-        public_key.extend_from_slice(&merkle.root()[..lms.m]);
-
-        // I and the root form the tree's public key.
-        declassify(&identifier);
+        let public_key = [
+            &lms.code.to_be_bytes()[..],
+            &ots.code.to_be_bytes(),
+            &i,
+            &merkle.root()[..lms.m],
+        ]
+        .concat();
 
         declassify(&public_key);
 
-        Self {
+        Ok(Self {
             lms,
             ots,
-            i: identifier,
+            i,
             seed,
             merkle,
             public_key,
-        }
+        })
     }
 
-    fn sign(&mut self, q: u32, message: &[u8]) -> Vec<u8> {
+    pub(crate) fn public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+
+    pub(crate) fn root(&self) -> &[u8] {
+        &self.public_key[24..]
+    }
+
+    pub(crate) const fn merkle(&self) -> &MerkleTree {
+        &self.merkle
+    }
+
+    // The randomizer C of a signature by leaf q in the deterministic mode.
+    pub(crate) fn derived_randomizer(&self, q: u32) -> Node {
+        derive(&self.lms, &self.i, q, RANDOMIZER, &self.seed)
+    }
+
+    // The I || SEED of the child tree under leaf q in the deterministic mode.
+    pub(crate) fn derived_child(&self, q: u32) -> SecretBytes {
+        let m = self.lms.m;
+
+        let mut child_seed = derive(&self.lms, &self.i, q, CHILD_SEED, &self.seed);
+
+        let child_i = derive(&self.lms, &self.i, q, CHILD_I, &self.seed);
+
+        let child = SecretBytes::concat(&[&child_i[..16], &child_seed[..m]]);
+
+        wipe(&mut child_seed);
+
+        child
+    }
+
+    // RFC 8554, Algorithm 3 and section 5.4.1: the LMS signature of message by leaf q with the
+    // randomizer C.
+    pub(crate) fn sign(&mut self, q: u32, c: &[u8], message: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.lms.signature_size(&self.ots));
 
         out.extend_from_slice(&q.to_be_bytes());
 
         out.extend_from_slice(&ots_sign(
-            &self.ots, &self.lms, &self.i, q, &self.seed, message,
+            &self.ots, &self.lms, &self.i, q, &self.seed, c, message,
         ));
 
         out.extend_from_slice(&self.lms.code.to_be_bytes());
@@ -809,196 +831,8 @@ impl Tree {
 
         out.extend_from_slice(&self.merkle.auth_path(q, self.lms.m, &key));
 
+        declassify(&out);
+
         out
-    }
-
-    fn child(&self, lms: LmsType, ots: OtsType, q: u32) -> Self {
-        let (i, seed) = child_keys(&self.lms, &self.i, &self.seed, q);
-
-        Self::new(lms, ots, &i, seed)
-    }
-}
-
-// The I and SEED of the child tree under leaf q of the tree with I `i` and SEED `seed`.
-fn child_keys(lms: &LmsType, i: &[u8], seed: &[u8], q: u32) -> ([u8; 16], SecretBytes) {
-    let mut child_seed = derive(lms, i, q, CHILD_SEED, seed);
-
-    let child = SecretBytes::concat(&[&child_seed[..lms.m]]);
-
-    wipe(&mut child_seed);
-
-    let mut identifier = [0; 16];
-
-    identifier.copy_from_slice(&derive(lms, i, q, CHILD_I, seed)[..16]);
-
-    (identifier, child)
-}
-
-// The signing side of an HSS key: the trees on the path to the next leaf, rebuilt when the
-// index leaves a tree, and each child public key signed by its parent.
-//
-// `cached` holds the trees of a verified tree cache that the next index signs with, top first.
-// The top one replaces the build. A lower one is checked now, so that a bad cache fails the load,
-// and waits in `restored`, with its level and number, until the first signature takes it instead
-// of building its level.
-pub(crate) struct Hss {
-    levels: Vec<(LmsType, OtsType)>,
-    trees: Vec<Tree>,
-    signed: Vec<Vec<u8>>,
-    prefixes: Vec<u64>,
-    restored: Vec<(usize, u64, Tree)>,
-}
-
-impl Hss {
-    pub(crate) fn new(
-        levels: &[(LmsType, OtsType)],
-        i: &[u8],
-        seed: &[u8],
-        cached: &[CachedTree<'_>],
-    ) -> Result<Self, Error> {
-        let (lms, ots) = levels[0];
-
-        let seed = SecretBytes::concat(&[seed]);
-
-        let top = match cached.first().filter(|tree| tree.level == 0) {
-            Some(tree) => Tree::restore(lms, ots, i, seed, tree.nodes)?,
-            None => Tree::new(lms, ots, i, seed),
-        };
-
-        let mut hss = Self {
-            levels: levels.to_vec(),
-            trees: alloc::vec![top],
-            signed: Vec::new(),
-            prefixes: alloc::vec![0],
-            restored: Vec::new(),
-        };
-
-        for tree in cached.iter().filter(|tree| tree.level > 0) {
-            let level = usize::from(tree.level);
-
-            let (i, seed) = hss.path_keys(level, tree.tree);
-
-            let (lms, ots) = hss.levels[level];
-
-            let restored = Tree::restore(lms, ots, &i, seed, tree.nodes)?;
-
-            hss.restored.push((level, tree.tree, restored));
-        }
-
-        Ok(hss)
-    }
-
-    // The I and SEED of tree `prefix` of `level`: the leaves that sign it on the levels above
-    // follow from its number.
-    fn path_keys(&self, level: usize, prefix: u64) -> ([u8; 16], SecretBytes) {
-        let top = &self.trees[0];
-
-        let mut i = top.i;
-
-        let mut seed = SecretBytes::concat(&[&top.seed]);
-
-        for upper in 0..level {
-            let between: u32 = self.levels[upper + 1..level]
-                .iter()
-                .map(|(lms, _)| lms.h)
-                .sum();
-
-            let q = ((prefix >> between) & ((1 << self.levels[upper].0.h) - 1)) as u32;
-
-            (i, seed) = child_keys(&top.lms, &i, &seed, q);
-        }
-
-        (i, seed)
-    }
-
-    // Every tree the key holds, top first, as a tree cache lists it: the trees on the path of the
-    // last signature, then the restored ones that no signature has taken yet.
-    pub(crate) fn cached_trees(&self) -> Vec<HeldTree<'_>> {
-        let held = self.trees.iter().zip(&self.prefixes).enumerate();
-
-        let waiting = self
-            .restored
-            .iter()
-            .map(|(level, prefix, tree)| (*level, (tree, prefix)));
-
-        held.chain(waiting)
-            .map(|(level, (tree, &prefix))| HeldTree {
-                level: level as u8,
-                tree: prefix,
-                n: tree.lms.m,
-                merkle: &tree.merkle,
-            })
-            .collect()
-    }
-
-    pub(crate) fn public_key(&self) -> Vec<u8> {
-        let levels = self.levels.len() as u32;
-
-        [&levels.to_be_bytes()[..], &self.trees[0].public_key].concat()
-    }
-
-    fn height_below(&self, level: usize) -> u32 {
-        self.levels[level..].iter().map(|(lms, _)| lms.h).sum()
-    }
-
-    fn leaf_index(&self, index: u64, level: usize) -> u32 {
-        let below = self.height_below(level + 1);
-
-        ((index >> below) & ((1 << self.levels[level].0.h) - 1)) as u32
-    }
-
-    pub(crate) fn sign(&mut self, index: u64, message: &[u8]) -> Vec<u8> {
-        for level in 1..self.levels.len() {
-            let prefix = index >> self.height_below(level);
-
-            if level < self.trees.len() && self.prefixes[level] == prefix {
-                continue;
-            }
-
-            self.trees.truncate(level);
-
-            self.signed.truncate(level - 1);
-
-            self.prefixes.truncate(level);
-
-            let q = self.leaf_index(index, level - 1);
-
-            let (lms, ots) = self.levels[level];
-
-            let parent = &mut self.trees[level - 1];
-
-            let restored = self
-                .restored
-                .iter()
-                .position(|(entry, _, _)| *entry == level)
-                .map(|position| self.restored.remove(position));
-
-            let tree = match restored {
-                Some((_, number, tree)) if number == prefix => tree,
-                _ => parent.child(lms, ots, q),
-            };
-
-            let signed = [parent.sign(q, &tree.public_key), tree.public_key.clone()].concat();
-
-            self.signed.push(signed);
-
-            self.trees.push(tree);
-
-            self.prefixes.push(prefix);
-        }
-
-        let last = self.levels.len() - 1;
-
-        let q = self.leaf_index(index, last);
-
-        let bottom = self.trees[last].sign(q, message);
-
-        let count = (self.levels.len() as u32 - 1).to_be_bytes();
-
-        let signature = [&count[..], &self.signed.concat(), &bottom].concat();
-
-        declassify(&signature);
-
-        signature
     }
 }

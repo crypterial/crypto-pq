@@ -79,13 +79,15 @@ pub fn verify(
     public_key.verify_with(signature, message, options, false)
 }
 
-// Stateful seeds are I || SEED of the top LMS tree, or SK_SEED || SK_PRF || PUB_SEED for XMSS.
-// The index may be the capacity itself, which gives an exhausted key.
+// SPEC 11.14: a key whose top secrets are the seed, I || SEED of the top LMS tree or
+// S_XMSS || SK_PRF || SEED, which derives its child trees and randomizers as the reference
+// implementations do, so that it reproduces their test vectors; it starts at index, which may be
+// the capacity itself for an exhausted key.
 pub fn generate_stateful_key_pair<S: StateStore>(
     algorithm: StatefulSignatureAlgorithm,
-    parameters: StatefulParameters,
     seed: &[u8],
     index: u64,
+    parameters: StatefulParameters,
     store: S,
     options: &StatefulKeyGenOptions,
 ) -> Result<StatefulKeyPair<S>, Error> {
@@ -99,13 +101,9 @@ pub fn generate_stateful_key_pair<S: StateStore>(
         return Err(Error::InvalidOption);
     }
 
-    algorithm.create(
-        parameters,
-        SecretBytes::concat(&[seed]),
-        index,
-        reserve,
-        store,
-    )
+    let seed = SecretBytes::concat(&[seed]);
+
+    algorithm.create(parameters, seed, true, index, reserve, store)
 }
 
 // cSHAKE128 or cSHAKE256 with a function name N as well as a customization S, as the ACVP vectors

@@ -106,17 +106,15 @@ impl StateStore for MemoryStore {
 struct SharedStore(Rc<RefCell<MemoryStore>>);
 
 impl SharedStore {
-    // The next index of the stored HSS state, which ends with u64 index and the checksum.
+    // The bound `next` of the stored record.
     fn index(&self) -> u64 {
         let store = self.0.borrow();
 
         let state = store.state.as_deref().expect("a stored state");
 
-        u64::from_be_bytes(
-            state[state.len() - 24..state.len() - 16]
-                .try_into()
-                .unwrap(),
-        )
+        let at = next_offset(state);
+
+        u64::from_be_bytes(state[at..at + 8].try_into().unwrap())
     }
 
     fn writes(&self) -> usize {
@@ -157,6 +155,18 @@ impl StateStore for BrokenStore {
 
         Err(Error::Unsupported)
     }
+}
+
+// Where a state record (SPEC 11.7) holds `next`: after the version, the kind, the parameters (an HSS
+// level count and 8 bytes per level, or an OID) and the flags.
+fn next_offset(state: &[u8]) -> usize {
+    let parameters = if state[1] == 1 {
+        1 + 8 * usize::from(state[2])
+    } else {
+        4
+    };
+
+    3 + parameters
 }
 
 fn read_u32(data: &[u8], offset: usize) -> u32 {
@@ -230,9 +240,9 @@ fn hss_acvp_key_generation() {
 
             let pair = hazmat::generate_stateful_key_pair(
                 HSS_LMS,
-                StatefulParameters::Levels(&levels),
                 &seed,
                 0,
+                StatefulParameters::Levels(&levels),
                 MemoryStore::default(),
                 &StatefulKeyGenOptions::default(),
             )
@@ -316,9 +326,9 @@ fn hss_rfc_vectors() {
 
         let mut pair = hazmat::generate_stateful_key_pair(
             HSS_LMS,
-            StatefulParameters::Levels(&names),
             &seed,
             index,
+            StatefulParameters::Levels(&names),
             MemoryStore::default(),
             &StatefulKeyGenOptions::default(),
         )
@@ -528,9 +538,9 @@ fn hss_parameters() {
     assert_eq!(
         hazmat::generate_stateful_key_pair(
             HSS_LMS,
-            small,
             &seed[..39],
             0,
+            small,
             &mut store,
             &StatefulKeyGenOptions::default()
         )
@@ -541,9 +551,9 @@ fn hss_parameters() {
     assert_eq!(
         hazmat::generate_stateful_key_pair(
             HSS_LMS,
-            small,
             &seed,
             33,
+            small,
             &mut store,
             &StatefulKeyGenOptions::default()
         )
@@ -555,9 +565,9 @@ fn hss_parameters() {
 
     let mut exhausted = hazmat::generate_stateful_key_pair(
         HSS_LMS,
-        small,
         &seed,
         32,
+        small,
         store,
         &StatefulKeyGenOptions::default(),
     )
@@ -577,9 +587,9 @@ fn hss_tree_boundary() {
 
     let mut pair = hazmat::generate_stateful_key_pair(
         HSS_LMS,
-        StatefulParameters::Levels(&levels),
         &[0; 40],
         31,
+        StatefulParameters::Levels(&levels),
         MemoryStore::default(),
         &StatefulKeyGenOptions::default(),
     )
@@ -694,9 +704,9 @@ fn xmss_reference_vectors() {
 
         let mut pair = hazmat::generate_stateful_key_pair(
             algorithm,
-            StatefulParameters::Name(name),
             &unhex(&record["seed"]),
             index,
+            StatefulParameters::Name(name),
             MemoryStore::default(),
             &StatefulKeyGenOptions::default(),
         )
@@ -794,119 +804,797 @@ fn xmss_state_handling() {
     assert_eq!((XMSS.name(), XMSS_MT.name()), ("XMSS", "XMSS^MT"));
 }
 
-// State blobs computed with the Python reference: every implementation must write the same bytes.
-#[test]
-fn cross_language_state() {
-    let hss_seed: Vec<u8> = (0..40).collect();
+// A level record of a state record (SPEC 11.7); the last three are empty while it is claimed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LevelRecord {
+    tree: u64,
+    status: u8,
+    secrets: Vec<u8>,
+    root: Vec<u8>,
+    signature: Vec<u8>,
+}
 
-    let mut store = MemoryStore::default();
+// A state record taken apart, so that a test can read or change a field and seal it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct State {
+    version: u8,
+    kind: u8,
+    parameters: Vec<u8>,
+    flags: u8,
+    next: u64,
+    top: Vec<u8>,
+    public_key: Vec<u8>,
+    levels: Vec<LevelRecord>,
+}
+
+// (n, h, d) of the XMSS and XMSS^MT sets.
+fn xmss_shape(kind: u8, oid: u32) -> (usize, u32, u32) {
+    const MT: [(u32, u32); 8] = [
+        (20, 2),
+        (20, 4),
+        (40, 2),
+        (40, 4),
+        (40, 8),
+        (60, 3),
+        (60, 6),
+        (60, 12),
+    ];
+
+    match (kind, oid) {
+        (2, 0x01..=0x03 | 0x10..=0x12) => (32, [10, 16, 20][(oid as usize - 1) % 3], 1),
+        (2, 0x0D..=0x0F | 0x13..=0x15) => (24, [10, 16, 20][(oid as usize - 0x0D) % 3], 1),
+        (3, 0x01..=0x08) => (32, MT[oid as usize - 1].0, MT[oid as usize - 1].1),
+        (3, 0x21..=0x28) => (24, MT[oid as usize - 0x21].0, MT[oid as usize - 0x21].1),
+        (3, 0x29..=0x30) => (32, MT[oid as usize - 0x29].0, MT[oid as usize - 0x29].1),
+        (3, 0x31..=0x38) => (24, MT[oid as usize - 0x31].0, MT[oid as usize - 0x31].1),
+        _ => panic!("unknown set {kind} {oid}"),
+    }
+}
+
+impl State {
+    fn parse(data: &[u8]) -> Self {
+        let (body, checksum) = data.split_at(data.len() - 16);
+
+        assert_eq!(SHA_256.digest(body)[..16], *checksum);
+
+        let kind = body[1];
+
+        let end = next_offset(body) - 1;
+
+        let parameters = body[2..end].to_vec();
+
+        let mut at = end + 9;
+
+        let mut take = |size: usize| {
+            at += size;
+
+            body[at - size..at].to_vec()
+        };
+
+        // The sizes of the top secrets, the public key, a child's secrets and root, and the
+        // signature of the key of level l by level l - 1.
+        let (top, public, child, node, signatures): (usize, usize, usize, usize, Vec<usize>) =
+            if kind == 1 {
+                let levels: Vec<Level> = parameters[1..]
+                    .chunks(8)
+                    .map(|chunk| (lms_type(read_u32(chunk, 0)), ots_type(read_u32(chunk, 4))))
+                    .collect();
+
+                let m = levels[0].0.2;
+
+                let signatures = levels.iter().map(lms_signature_size).collect();
+
+                (16 + m, 28 + m, 16 + m, m, signatures)
+            } else {
+                let (n, h, d) = xmss_shape(kind, read_u32(&parameters, 0));
+
+                let layer = (2 * n + 3 + (h / d) as usize) * n;
+
+                (3 * n, 4 + 2 * n, n, n, vec![layer; d as usize])
+            };
+
+        let top = take(top);
+
+        let public_key = take(public);
+
+        let mut levels = Vec::new();
+
+        for signature in &signatures[..signatures.len() - 1] {
+            let tree = u64::from_be_bytes(take(8).try_into().unwrap());
+
+            let status = take(1)[0];
+
+            let signed = status == 1;
+
+            let mut part = |size| if signed { take(size) } else { Vec::new() };
+
+            levels.push(LevelRecord {
+                tree,
+                status,
+                secrets: part(child),
+                root: part(node),
+                signature: part(*signature),
+            });
+        }
+
+        assert_eq!(at, body.len());
+
+        Self {
+            version: body[0],
+            kind,
+            parameters,
+            flags: body[end],
+            next: u64::from_be_bytes(body[end + 1..end + 9].try_into().unwrap()),
+            top,
+            public_key,
+            levels,
+        }
+    }
+
+    fn seal(&self) -> Vec<u8> {
+        let mut body = vec![self.version, self.kind];
+
+        body.extend_from_slice(&self.parameters);
+
+        body.push(self.flags);
+
+        body.extend_from_slice(&self.next.to_be_bytes());
+
+        body.extend_from_slice(&self.top);
+
+        body.extend_from_slice(&self.public_key);
+
+        for level in &self.levels {
+            body.extend_from_slice(&level.tree.to_be_bytes());
+
+            body.push(level.status);
+
+            body.extend_from_slice(&level.secrets);
+
+            body.extend_from_slice(&level.root);
+
+            body.extend_from_slice(&level.signature);
+        }
+
+        let checksum = SHA_256.digest(&body);
+
+        [&body[..], &checksum[..16]].concat()
+    }
+}
+
+// SHA-256 truncated to 24 bytes, the hash of the M24 types.
+fn sha256_192(parts: &[&[u8]]) -> Vec<u8> {
+    SHA_256.digest(&parts.concat())[..24].to_vec()
+}
+
+// SPEC 11.7, field by field: an HSS key at index 40 that has signed there holds tree 1 at level 1,
+// with the I and SEED that the deterministic mode derives for leaf 1 of the top tree (SPEC 11.14
+// item 2), and the root and parent signature that its signature carries.
+#[test]
+fn state_record_layout() {
+    let seed: Vec<u8> = (0..40).collect();
+
+    let store = SharedStore::default();
 
     let mut pair = hazmat::generate_stateful_key_pair(
         HSS_LMS,
-        StatefulParameters::Levels(&SMALL),
-        &hss_seed,
-        3,
-        &mut store,
+        &seed,
+        40,
+        StatefulParameters::Levels(&TWO),
+        store.clone(),
         &StatefulKeyGenOptions::default(),
     )
     .unwrap();
 
-    let hss_state = unhex(concat!(
+    let signature = pair.private_key.sign(b"crypto-pq").unwrap();
+
+    let state = store.0.borrow().state.clone().unwrap();
+
+    let (i, top_seed) = (&seed[..16], &seed[16..]);
+
+    let child = |tag: [u8; 2]| sha256_192(&[i, &1u32.to_be_bytes(), &tag, &[0xFF], top_seed]);
+
+    let child_secrets = [&child([0xFF, 0xFF])[..16], &child([0xFF, 0xFE])].concat();
+
+    // u32(L - 1), the top LMS signature of the child's key, the child's key, the bottom signature.
+    let top_signature = lms_signature_size(&(lms_type(10), ots_type(7)));
+
+    let child_key = &signature[4 + top_signature..4 + top_signature + 48];
+
+    assert_eq!(child_key[8..24], child_secrets[..16]);
+
+    let expected = State {
+        version: 2,
+        kind: 1,
+        parameters: unhex("020000000a000000070000000a00000006"),
+        flags: 1,
+        next: 41,
+        top: seed.clone(),
+        public_key: pair.public_key.export_key(KeyFormat::Raw).unwrap(),
+        levels: vec![LevelRecord {
+            tree: 1,
+            status: 1,
+            secrets: child_secrets,
+            root: child_key[24..].to_vec(),
+            signature: signature[4..4 + top_signature].to_vec(),
+        }],
+    };
+
+    assert_eq!(State::parse(&state), expected);
+
+    assert_eq!(expected.seal(), state);
+
+    // XMSS^MT at 0x12345: the trees 0x12345 >> 15, >> 10 and >> 5 of levels 1 to 3, each with the
+    // top S_XMSS (SPEC 11.14 item 3) and the layer of the signature that signs its root.
+    let seed: Vec<u8> = (0..72).collect();
+
+    let store = SharedStore::default();
+
+    let mut pair = hazmat::generate_stateful_key_pair(
+        XMSS_MT,
+        &seed,
+        0x12345,
+        MT,
+        store.clone(),
+        &StatefulKeyGenOptions::default(),
+    )
+    .unwrap();
+
+    let signature = pair.private_key.sign(b"crypto-pq").unwrap();
+
+    let parts = State::parse(&store.0.borrow().state.clone().unwrap());
+
+    assert_eq!(
+        (
+            parts.version,
+            parts.kind,
+            &parts.parameters[..],
+            parts.flags
+        ),
+        (2, 3, &[0, 0, 0, 0x22][..], 1)
+    );
+
+    assert_eq!((parts.next, &parts.top), (0x12346, &seed));
+
+    let layer = (51 + 5) * 24;
+
+    for (level, record) in (1..).zip(&parts.levels) {
+        assert_eq!(record.tree, 0x12345 >> (5 * (4 - level)));
+
+        assert_eq!((record.status, &record.secrets[..]), (1, &seed[..24]));
+
+        let at = 3 + 24 + (4 - level) * layer;
+
+        assert_eq!(record.signature, signature[at..at + layer]);
+    }
+
+    assert_eq!(parts.levels.len(), 3);
+
+    // XMSS has no level records.
+    let state = xmss_state(XMSS, "XMSS-SHA2_10_256", 3);
+
+    let parts = State::parse(&state);
+
+    assert_eq!((parts.kind, parts.next, parts.levels.len()), (2, 3, 0));
+}
+
+// SPEC 11.8: a version 1 record, as crypto-pq wrote before 1.0, is refused and left as it is; so is
+// every other version.
+#[test]
+fn version_1_records_are_refused() {
+    // A version 1 HSS record written by the Python reference before 1.0.
+    let version_1 = unhex(concat!(
         "0101010000000a00000005000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c",
         "1d1e1f2021222324252627000000000000000332b414e1d42dc2866aeed26f724a5be7",
     ));
 
-    let hss_public = unhex(concat!(
-        "000000010000000a00000005000102030405060708090a0b0c0d0e0f224f2491ed07b8b55134c2b6",
-        "ea3163d0e60e423ce46b051b",
-    ));
+    let state = xmss_state(XMSS_MT, "XMSSMT-SHAKE256_20/4_192", 3);
 
-    assert_eq!(
-        pair.public_key.export_key(KeyFormat::Raw).unwrap(),
-        hss_public
-    );
+    let mut records = vec![(HSS_LMS, version_1)];
 
-    let signature = pair.private_key.sign(b"crypto-pq").unwrap();
+    for version in [0, 1, 3, 0xFF] {
+        let mut parts = State::parse(&state);
 
-    assert!(pair.public_key.verify(&signature, b"crypto-pq"));
+        parts.version = version;
 
-    drop(pair);
+        records.push((XMSS_MT, parts.seal()));
+    }
 
-    let next_state = unhex(concat!(
-        "0101010000000a00000005000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c",
-        "1d1e1f202122232425262700000000000000047bc402dcf96640ca1c7126fe316fef60",
-    ));
-
-    assert_eq!(store.state.as_deref(), Some(&next_state[..]));
-
-    assert_eq!(
-        SHA_256.digest(&signature),
-        unhex("07cb93b630cdd6b575402bcdbce2024b6a88bfdb419d9c7b920c250d7273a5a6")
-    );
-
-    for state in [&hss_state, &next_state] {
-        let loaded = HSS_LMS
-            .load_private_key(MemoryStore::holding(state), &StatefulLoadOptions::default())
-            .unwrap();
+    for (algorithm, record) in records {
+        let mut store = MemoryStore::holding(&record);
 
         assert_eq!(
-            loaded.public_key().export_key(KeyFormat::Raw).unwrap(),
-            hss_public
+            algorithm
+                .load_private_key(&mut store, &StatefulLoadOptions::default())
+                .err(),
+            Some(Error::InvalidPrivateKey)
+        );
+
+        assert_eq!(
+            (store.state.as_deref(), store.writes),
+            (Some(&record[..]), 0)
+        );
+    }
+}
+
+// Fails the update numbered `failing` with `failure`, without storing it; every other one works.
+struct FailingStore {
+    inner: Rc<RefCell<MemoryStore>>,
+    updates: usize,
+    failing: usize,
+    failure: Result<bool, Error>,
+}
+
+impl FailingStore {
+    fn new(failing: usize, failure: Result<bool, Error>) -> Self {
+        Self {
+            inner: Rc::default(),
+            updates: 0,
+            failing,
+            failure,
+        }
+    }
+}
+
+impl StateStore for FailingStore {
+    fn read(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        self.inner.borrow_mut().read()
+    }
+
+    fn update(&mut self, previous: Option<&[u8]>, next: &[u8]) -> Result<bool, Error> {
+        self.updates += 1;
+
+        if self.updates == self.failing {
+            return self.failure;
+        }
+
+        self.inner.borrow_mut().update(previous, next)
+    }
+}
+
+// A record whose secrets are all zero and which otherwise equals `before` at next = N.
+fn assert_erased(state: &[u8], before: &[u8], capacity: u64) {
+    let (erased, before) = (State::parse(state), State::parse(before));
+
+    assert_eq!(erased.next, capacity);
+
+    assert!(erased.top.iter().all(|&byte| byte == 0));
+
+    for (record, kept) in erased.levels.iter().zip(&before.levels) {
+        assert!(record.secrets.iter().all(|&byte| byte == 0));
+
+        assert_eq!(record.secrets.len(), kept.secrets.len());
+
+        assert_eq!(
+            (record.tree, record.status, &record.root, &record.signature),
+            (kept.tree, kept.status, &kept.root, &kept.signature)
         );
     }
 
-    let xmss_seed: Vec<u8> = (0..72).collect();
+    assert_eq!(
+        (
+            erased.kind,
+            &erased.parameters,
+            erased.flags,
+            &erased.public_key
+        ),
+        (
+            before.kind,
+            &before.parameters,
+            before.flags,
+            &before.public_key
+        )
+    );
+}
 
+// The record that a deterministic key of a named XMSS or XMSS^MT set stores at index.
+fn xmss_state(algorithm: StatefulSignatureAlgorithm, name: &str, index: u64) -> Vec<u8> {
     let mut store = MemoryStore::default();
 
-    let pair = hazmat::generate_stateful_key_pair(
-        XMSS_MT,
-        StatefulParameters::Name("XMSSMT-SHAKE256_20/4_192"),
-        &xmss_seed,
-        5,
+    let seed: Vec<u8> = (0..96).collect();
+
+    let size = if name.ends_with("_192") { 72 } else { 96 };
+
+    hazmat::generate_stateful_key_pair(
+        algorithm,
+        &seed[..size],
+        index,
+        StatefulParameters::Name(name),
         &mut store,
         &StatefulKeyGenOptions::default(),
     )
     .unwrap();
 
-    let xmss_state = unhex(concat!(
-        "0103000000320000000000000005000102030405060708090a0b0c0d0e0f10111213141516171819",
-        "1a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f4041",
-        "424344454647e0dc0d3f343f3dbd989a24e2ad453440",
-    ));
+    store.state.unwrap()
+}
 
-    let xmss_public = unhex(concat!(
-        "00000032296d594ddd9688b47a9c461c70e3d9f29e901b8cedcaaa4c303132333435363738393a3b",
-        "3c3d3e3f4041424344454647",
-    ));
+// SPEC 11.12: the signature that exhausts a key stores a final record without its secrets; the key
+// refuses to sign or export a cache, and the public key still verifies. A failed final write
+// does not fail the signature and is retried by the next sign or load.
+#[test]
+fn exhaustion_erases_the_secrets() {
+    let seed: Vec<u8> = (0..40).collect();
 
-    let public_key = pair.public_key.clone();
+    let two = StatefulParameters::Levels(&TWO);
 
-    drop(pair);
+    let options = StatefulKeyGenOptions::default();
 
-    assert_eq!(public_key.export_key(KeyFormat::Raw).unwrap(), xmss_public);
+    // The keys sign 1022 and 1023: update 1 stores the key, 2 and 3 claim and sign tree 31 of
+    // level 1, 4 reserves 1023 and 5 is the final write.
+    for failing in [0, 5] {
+        let store = FailingStore::new(failing, Err(Error::Unsupported));
 
-    assert_eq!(store.state.as_deref(), Some(&xmss_state[..]));
+        let stored = Rc::clone(&store.inner);
 
-    let loaded = XMSS_MT
+        let state = || stored.borrow().state.clone().unwrap();
+
+        let mut pair =
+            hazmat::generate_stateful_key_pair(HSS_LMS, &seed, 1022, two, store, &options).unwrap();
+
+        let first = pair.private_key.sign(b"a").unwrap();
+
+        let before = state();
+
+        let last = pair.private_key.sign(b"b").unwrap();
+
+        assert_eq!(pair.private_key.remaining_signatures(), 0);
+
+        assert_eq!(
+            pair.private_key.export_tree_cache().err(),
+            Some(Error::KeyExhausted)
+        );
+
+        if failing == 5 {
+            // The record still holds the secrets, and the next sign retries the final write.
+            let kept = State::parse(&state());
+
+            assert_eq!((kept.next, &kept.top), (1024, &seed));
+
+            assert_eq!(pair.private_key.sign(b"c").err(), Some(Error::KeyExhausted));
+        }
+
+        assert_erased(&state(), &before, 1024);
+
+        assert!(pair.public_key.verify(&first, b"a"));
+
+        assert!(pair.public_key.verify(&last, b"b"));
+
+        let mut loaded = HSS_LMS
+            .load_private_key(
+                MemoryStore::holding(&state()),
+                &StatefulLoadOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(loaded.remaining_signatures(), 0);
+
+        assert_eq!(loaded.public_key(), pair.public_key);
+
+        assert_eq!(loaded.sign(b"c").err(), Some(Error::KeyExhausted));
+
+        assert_eq!(loaded.export_tree_cache().err(), Some(Error::KeyExhausted));
+    }
+
+    // A load that finds next = N with the secrets stores the final record, or retries it at the
+    // next sign when that write fails.
+    let mut at_capacity = State::parse(&xmss_state(XMSS, "XMSS-SHA2_10_256", 3));
+
+    at_capacity.next = 1024;
+
+    let record = at_capacity.seal();
+
+    for failing in [0, 1] {
+        let store = FailingStore::new(failing, Ok(false));
+
+        *store.inner.borrow_mut() = MemoryStore::holding(&record);
+
+        let stored = Rc::clone(&store.inner);
+
+        let state = || stored.borrow().state.clone().unwrap();
+
+        let mut key = XMSS
+            .load_private_key(store, &StatefulLoadOptions::default())
+            .unwrap();
+
+        assert_eq!(key.remaining_signatures(), 0);
+
+        if failing == 1 {
+            assert_eq!(state(), record);
+
+            assert_eq!(key.sign(b"m").err(), Some(Error::KeyExhausted));
+        }
+
+        assert_erased(&state(), &record, 1024);
+    }
+}
+
+// SPEC 11.9 item 4: a level that a crash left claimed for the tree that the index uses is skipped
+// with its subtree; a record ahead of the index, or signed under a level that is not current, is
+// refused.
+#[test]
+fn a_claimed_level_is_skipped() {
+    let seed: Vec<u8> = (0..48).collect();
+
+    let store = SharedStore::default();
+
+    let mut pair = hazmat::generate_stateful_key_pair(
+        HSS_LMS,
+        &seed,
+        40,
+        StatefulParameters::Levels(&THREE),
+        store.clone(),
+        &StatefulKeyGenOptions::default(),
+    )
+    .unwrap();
+
+    pair.private_key.sign(b"m").unwrap();
+
+    drop(pair.private_key);
+
+    let state = State::parse(&store.0.borrow().state.clone().unwrap());
+
+    assert_eq!(
+        (state.next, state.levels[0].tree, state.levels[1].tree),
+        (41, 0, 1)
+    );
+
+    let load = |state: &State| {
+        HSS_LMS
+            .load_private_key(
+                MemoryStore::holding(&state.seal()),
+                &StatefulLoadOptions::default(),
+            )
+            .map(|key| key.remaining_signatures())
+    };
+
+    let capacity = 1 << 15;
+
+    // Level 2 claimed for tree 2, as a crash between the claim and the signed write at index 64
+    // leaves it: the key resumes at the next tree of level 2, index 96.
+    let mut claimed = state.clone();
+
+    claimed.next = 64;
+
+    claimed.levels[1] = LevelRecord {
+        tree: 2,
+        status: 0,
+        secrets: Vec::new(),
+        root: Vec::new(),
+        signature: Vec::new(),
+    };
+
+    assert_eq!(load(&claimed), Ok(capacity - 96));
+
+    let mut key = HSS_LMS
         .load_private_key(
-            MemoryStore::holding(&xmss_state),
+            MemoryStore::holding(&claimed.seal()),
             &StatefulLoadOptions::default(),
         )
         .unwrap();
 
-    assert_eq!(loaded.public_key(), public_key);
+    let signature = key.sign(b"m").unwrap();
+
+    assert!(pair.public_key.verify(&signature, b"m"));
+
+    // Level 1 claimed for tree 1 at index 1024: the subtree of tree 1, to index 2048, is skipped.
+    let mut upper = claimed.clone();
+
+    upper.next = 1024;
+
+    upper.levels[0] = LevelRecord {
+        tree: 1,
+        ..claimed.levels[1].clone()
+    };
+
+    assert_eq!(load(&upper), Ok(capacity - 2048));
+
+    // A claim for a tree that the index has passed is not skipped.
+    let mut passed = claimed.clone();
+
+    passed.next = 96;
+
+    assert_eq!(load(&passed), Ok(capacity - 96));
+
+    // A claim, or a signed record, ahead of the index.
+    let mut ahead = claimed.clone();
+
+    ahead.next = 63;
+
+    assert_eq!(load(&ahead), Err(Error::InvalidPrivateKey));
+
+    let mut ahead = state.clone();
+
+    ahead.levels[1].tree = 2;
+
+    assert_eq!(load(&ahead), Err(Error::InvalidPrivateKey));
+
+    // Level 2 signed for the tree that index 1056 uses, under a level 1 still at tree 0.
+    let mut orphan = state.clone();
+
+    orphan.next = 1056;
+
+    orphan.levels[1].tree = 33;
+
+    assert_eq!(load(&orphan), Err(Error::InvalidPrivateKey));
+
+    // The claim of the last subtree leaves the key exhausted, and the load erases its secrets.
+    let mut last = claimed.clone();
+
+    last.next = capacity - 1;
+
+    last.levels[0].tree = 31;
+
+    last.levels[1].tree = 1023;
+
+    let mut store = MemoryStore::holding(&last.seal());
+
+    let key = HSS_LMS
+        .load_private_key(&mut store, &StatefulLoadOptions::default())
+        .unwrap();
+
+    assert_eq!(key.remaining_signatures(), 0);
+
+    drop(key);
+
+    assert_erased(store.state.as_deref().unwrap(), &last.seal(), capacity);
+}
+
+// SPEC 11.5.2 step 3.5: when the signed write fails after the claim, the key object moves past
+// the subtree of the claimed level, to the index that a load of the claim gives, and both sign the
+// same way from there.
+#[test]
+fn a_failure_after_the_claim_skips_the_subtree() {
+    let seed: Vec<u8> = (0..40).collect();
+
+    // Index 31 is signed with update 2; index 32 claims tree 1 of level 1 with update 3 and
+    // stores it signed with update 4.
+    for failure in [Ok(false), Err(Error::Unsupported)] {
+        let store = FailingStore::new(4, failure);
+
+        let stored = Rc::clone(&store.inner);
+
+        let mut pair = hazmat::generate_stateful_key_pair(
+            HSS_LMS,
+            &seed,
+            31,
+            StatefulParameters::Levels(&TWO),
+            store,
+            &StatefulKeyGenOptions::default(),
+        )
+        .unwrap();
+
+        pair.private_key.sign(b"31").unwrap();
+
+        let expected = if failure.is_ok() {
+            Error::StateConflict
+        } else {
+            Error::StatePersistFailed
+        };
+
+        assert_eq!(pair.private_key.sign(b"32").err(), Some(expected));
+
+        assert_eq!(pair.private_key.remaining_signatures(), 1024 - 64);
+
+        let claim = stored.borrow().state.clone().unwrap();
+
+        let parts = State::parse(&claim);
+
+        assert_eq!(
+            (parts.next, parts.levels[0].tree, parts.levels[0].status),
+            (32, 1, 0)
+        );
+
+        let mut loaded = HSS_LMS
+            .load_private_key(
+                MemoryStore::holding(&claim),
+                &StatefulLoadOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(loaded.remaining_signatures(), 1024 - 64);
+
+        let from_load = loaded.sign(b"64").unwrap();
+
+        assert_eq!(pair.private_key.sign(b"64").unwrap(), from_load);
+
+        // Index 64 uses leaf 2 of the top tree; leaf 1, which the claim covered, signed nothing
+        // that was kept.
+        assert_eq!(read_u32(&from_load, 4), 2);
+    }
+}
+
+// SPEC 11.4: a key from generate_key_pair draws a fresh I and SEED for each child tree, a fresh
+// randomizer C for each LMS signature, and a fresh S_XMSS for each XMSS^MT tree; none of them is
+// the value that the deterministic mode derives.
+#[test]
+fn fresh_randomness() {
+    let store = SharedStore::default();
+
+    let mut pair = HSS_LMS
+        .generate_key_pair(
+            StatefulParameters::Levels(&TWO),
+            store.clone(),
+            &StatefulKeyGenOptions::default(),
+        )
+        .unwrap();
+
+    let signatures: Vec<Vec<u8>> = (0..3u8)
+        .map(|i| pair.private_key.sign(&[i]).unwrap())
+        .collect();
+
+    let state = State::parse(&store.0.borrow().state.clone().unwrap());
+
+    assert_eq!(state.flags, 0);
+
+    let (i, seed) = (&state.top[..16], &state.top[16..]);
+
+    let derived = |q: u32, tag: [u8; 2]| sha256_192(&[i, &q.to_be_bytes(), &tag, &[0xFF], seed]);
+
+    let child = &state.levels[0].secrets;
+
+    assert_ne!(child[..16], derived(0, [0xFF, 0xFF])[..16]);
+
+    assert_ne!(child[16..], derived(0, [0xFF, 0xFE]));
+
+    let top_signature = lms_signature_size(&(lms_type(10), ots_type(7)));
+
+    // C of the signature of the child's key by leaf 0, then C of each bottom signature.
+    let parent_c = &state.levels[0].signature[8..32];
+
+    assert_ne!(parent_c, &derived(0, [0xFF, 0xFD])[..]);
+
+    let bottom = 4 + top_signature + 48;
+
+    let randomizers: Vec<&[u8]> = signatures
+        .iter()
+        .map(|signature| &signature[bottom + 8..bottom + 32])
+        .collect();
+
+    let (child_i, child_seed) = (&child[..16], &child[16..]);
+
+    for (q, c) in (0u32..).zip(&randomizers) {
+        let derived_c = sha256_192(&[
+            child_i,
+            &q.to_be_bytes(),
+            &[0xFF, 0xFD],
+            &[0xFF],
+            child_seed,
+        ]);
+
+        assert_ne!(*c, &derived_c[..]);
+    }
+
+    assert!(randomizers[0] != randomizers[1] && randomizers[1] != randomizers[2]);
+
+    let store = SharedStore::default();
+
+    XMSS_MT
+        .generate_key_pair(MT, store.clone(), &StatefulKeyGenOptions::default())
+        .unwrap();
+
+    let state = State::parse(&store.0.borrow().state.clone().unwrap());
+
+    let mut seeds: Vec<&[u8]> = state
+        .levels
+        .iter()
+        .map(|level| &level.secrets[..])
+        .collect();
+
+    seeds.push(&state.top[..24]);
+
+    seeds.sort();
+
+    seeds.dedup();
+
+    assert_eq!((state.flags, seeds.len()), (0, 4));
 }
 
 fn generating(reserve: u64) -> StatefulKeyGenOptions {
-    StatefulKeyGenOptions { reserve }
+    StatefulKeyGenOptions::default().with_reserve(reserve)
 }
 
 fn loading(reserve: u64) -> StatefulLoadOptions<'static> {
-    StatefulLoadOptions {
-        reserve,
-        tree_cache: None,
-    }
+    StatefulLoadOptions::default().with_reserve(reserve)
 }
 
 // The LMS leaf index q of a one-level HSS signature.
@@ -1028,9 +1716,9 @@ fn reserve_keeps_the_signatures() {
         let signatures = |reserve| {
             let mut key = hazmat::generate_stateful_key_pair(
                 algorithm,
-                parameters,
                 seed,
                 first,
+                parameters,
                 MemoryStore::default(),
                 &generating(reserve),
             )
@@ -1069,7 +1757,8 @@ fn reserve_stops_at_the_capacity() {
 
         assert_eq!(key.sign(b"m").err(), Some(Error::KeyExhausted));
 
-        assert_eq!((store.index(), store.writes()), (32, 2));
+        // The key, the reservation of every index, and the final record of SPEC 11.12.
+        assert_eq!((store.index(), store.writes()), (32, 3));
 
         let loaded = HSS_LMS
             .load_private_key(store, &StatefulLoadOptions::default())
@@ -1093,7 +1782,7 @@ fn reserve_must_be_positive() {
     );
 
     assert_eq!(
-        hazmat::generate_stateful_key_pair(HSS_LMS, small, &[0; 40], 0, &mut store, &generating(0))
+        hazmat::generate_stateful_key_pair(HSS_LMS, &[0; 40], 0, small, &mut store, &generating(0))
             .err(),
         Some(Error::InvalidOption)
     );
@@ -1194,9 +1883,9 @@ fn xmss_mt_kept_layers_match_fresh_keys() {
     let fresh = |index| {
         hazmat::generate_stateful_key_pair(
             XMSS_MT,
-            parameters,
             &seed,
             index,
+            parameters,
             MemoryStore::default(),
             &options,
         )
@@ -1255,9 +1944,9 @@ fn export_cache(
 
     let mut pair = hazmat::generate_stateful_key_pair(
         algorithm,
-        parameters,
         seed,
         index,
+        parameters,
         store.clone(),
         &options,
     )
@@ -1282,7 +1971,7 @@ fn export_cache(
 fn with_index(state: &[u8], index: u64) -> Vec<u8> {
     let mut out = state.to_vec();
 
-    let at = if out[1] == 1 { out.len() - 24 } else { 6 };
+    let at = next_offset(&out);
 
     out[at..at + 8].copy_from_slice(&index.to_be_bytes());
 
@@ -1417,10 +2106,7 @@ fn load_cached(
     state: &[u8],
     cache: &[u8],
 ) -> Result<StatefulPrivateKey<MemoryStore>, Error> {
-    let options = StatefulLoadOptions {
-        tree_cache: Some(cache),
-        ..StatefulLoadOptions::default()
-    };
+    let options = StatefulLoadOptions::default().with_tree_cache(cache);
 
     algorithm.load_private_key(MemoryStore::holding(state), &options)
 }
@@ -1467,9 +2153,9 @@ fn tree_cache_round_trip() {
 
         let mut pair = hazmat::generate_stateful_key_pair(
             algorithm,
-            parameters,
             &seed[..size],
             index,
+            parameters,
             store.clone(),
             &options,
         )
@@ -1643,7 +2329,10 @@ fn tree_cache_rejections() {
         assert_eq!(refusal(HSS_LMS, &state, data), Some(Error::InvalidEncoding));
     }
 
-    for length in 0..cache.len() {
+    // An empty cache is no cache (SPEC 6.3 item 2).
+    assert_loads(HSS_LMS, &state, &[]);
+
+    for length in 1..cache.len() {
         assert_eq!(
             refusal(HSS_LMS, &state, &cache[..length]),
             Some(Error::InvalidEncoding),
@@ -1835,16 +2524,19 @@ fn tree_cache_sealed_changes() {
         );
     }
 
-    // The top tree numbered 1 is stale even at the capacity; numbered 0 there it is checked.
-    assert_eq!(refused(&capacity, &changed(&node(0, 5))), invalid);
-
+    // A top tree numbered 1 is stale. At the capacity no tree is built and the cache is ignored
+    // (SPEC 11.9 item 5).
     let stale_top = |parts: &mut Cache| {
         parts.trees[0].nodes[5] ^= 1;
 
         parts.trees[0].tree = 1;
     };
 
-    assert_loads(HSS_LMS, &capacity, &changed(&stale_top));
+    assert_loads(HSS_LMS, &hss.state, &changed(&stale_top));
+
+    assert_loads(HSS_LMS, &capacity, &changed(&node(0, 5)));
+
+    assert_loads(HSS_LMS, &capacity, b"not a cache");
 
     // The public key and the parameters are checked against the state.
     let root = |parts: &mut Cache| *parts.public_key.last_mut().unwrap() ^= 1;

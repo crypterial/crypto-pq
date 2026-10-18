@@ -453,9 +453,9 @@ fn stateful(
     let generate = || {
         hazmat::generate_stateful_key_pair(
             algorithm,
-            parameters,
             &seed,
             0,
+            parameters,
             MemoryStore::default(),
             &StatefulKeyGenOptions::default(),
         )
@@ -545,20 +545,17 @@ fn load(
 
     let cache = hazmat::generate_stateful_key_pair(
         algorithm,
-        parameters,
         &bytes(seed_size),
         0,
+        parameters,
         &mut store,
         &StatefulKeyGenOptions::default(),
     )
     .and_then(|pair| pair.private_key.export_tree_cache())
     .unwrap();
 
-    for (name, tree_cache) in [(plain, None), (cached, Some(&cache[..]))] {
-        let options = StatefulLoadOptions {
-            tree_cache,
-            ..StatefulLoadOptions::default()
-        };
+    for (name, tree_cache) in [(plain, &[][..]), (cached, &cache[..])] {
+        let options = StatefulLoadOptions::default().with_tree_cache(tree_cache);
 
         runner.case(&name, |count| {
             timed(count, || {

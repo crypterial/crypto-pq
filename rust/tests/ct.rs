@@ -345,10 +345,16 @@ impl StateStore for Store {
     }
 }
 
+// The deterministic key starts at `start`: at 31 its second signature moves the lower levels to
+// their next trees, with the claim and signed writes, a child tree built from derived secrets and
+// signed by its parent, and the verification before release; at 28 for one tree of height 5 its
+// fourth signature exhausts it and erases its secrets. The public key generation draws the child
+// secrets and randomizers from the entropy source.
 fn stateful(
     algorithm: StatefulSignatureAlgorithm,
     parameters: StatefulParameters,
     seed_size: usize,
+    start: u64,
 ) {
     let mut store = Store::default();
 
@@ -357,22 +363,25 @@ fn stateful(
     let public_key = {
         let mut pair = hazmat::generate_stateful_key_pair(
             algorithm,
-            parameters,
             &seed,
-            0,
+            start,
+            parameters,
             &mut store,
             &StatefulKeyGenOptions::default(),
         )
         .unwrap();
 
-        let signed = pair.private_key.sign(MESSAGE).unwrap();
+        for _ in 0..2 {
+            let signed = pair.private_key.sign(MESSAGE).unwrap();
 
-        assert!(pair.public_key.verify(&signed, MESSAGE));
+            assert!(pair.public_key.verify(&signed, MESSAGE));
+        }
 
         pair.public_key
     };
 
-    // Loading rebuilds the trees from the seeds in the stored state.
+    // Loading checks the record against its checksum and the public key, rebuilds the current
+    // trees from the secrets in it and verifies the signatures that it holds.
     let mut loaded = algorithm
         .load_private_key(&mut store, &StatefulLoadOptions::default())
         .unwrap();
@@ -381,16 +390,13 @@ fn stateful(
 
     assert!(public_key.verify(&signed, MESSAGE));
 
-    // A tree cache is public, and its tag key comes from the seeds: loading with it checks the tag
-    // and the nodes, and restores the trees that the stored index still signs with.
+    // A tree cache is public, and its tag key comes from the top secrets: loading with it checks
+    // the tag and the nodes, and restores the trees that the stored index still signs with.
     let cache = loaded.export_tree_cache().unwrap();
 
     drop(loaded);
 
-    let options = StatefulLoadOptions {
-        tree_cache: Some(&cache),
-        ..StatefulLoadOptions::default()
-    };
+    let options = StatefulLoadOptions::default().with_tree_cache(&cache);
 
     let mut restored = algorithm.load_private_key(&mut store, &options).unwrap();
 
@@ -418,11 +424,11 @@ fn hss_lms() {
         ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W2"),
     ];
 
-    stateful(HSS_LMS, StatefulParameters::Levels(&levels), 16 + 24);
+    stateful(HSS_LMS, StatefulParameters::Levels(&levels), 16 + 24, 31);
 
     let levels = [("LMS_SHAKE_M32_H5", "LMOTS_SHAKE_N32_W4")];
 
-    stateful(HSS_LMS, StatefulParameters::Levels(&levels), 16 + 32);
+    stateful(HSS_LMS, StatefulParameters::Levels(&levels), 16 + 32, 28);
 }
 
 #[test]
@@ -431,12 +437,14 @@ fn xmss_mt() {
         XMSS_MT,
         StatefulParameters::Name("XMSSMT-SHA2_20/4_256"),
         3 * 32,
+        31,
     );
 
     stateful(
         XMSS_MT,
         StatefulParameters::Name("XMSSMT-SHAKE256_20/4_192"),
         3 * 24,
+        31,
     );
 }
 

@@ -146,6 +146,25 @@ fn parameters<'a>(record: &'a Fields, levels: &'a [(&'a str, &'a str)]) -> State
     }
 }
 
+// Temporary, until the cross files are generated again (SPEC Appendix C.1 item 9): their stateful
+// records hold state records of version 1, which crypto-pq 1.0 refuses (SPEC 11.8), and the states
+// that the Python reference computed under the rules of version 1. The runner skips every check
+// of such a state, and the cases that load one, and keeps the rest: keys, encodings, signatures,
+// tree cache exports, generation and verification.
+fn version_1_state(data: &[u8]) -> bool {
+    sealed_state(data) && data[0] == 1
+}
+
+// An intact record of any version. The files' records of version 2 are version 1 layouts with
+// another version byte, which version 1 refused as an unknown version.
+fn sealed_state(data: &[u8]) -> bool {
+    data.len() >= 18 && {
+        let (body, checksum) = data.split_at(data.len() - 16);
+
+        SHA_256.digest(body)[..16] == *checksum
+    }
+}
+
 // A store that the test keeps a handle to, to read the state the key wrote.
 #[derive(Clone, Default)]
 struct MemoryStore(Rc<RefCell<Option<Vec<u8>>>>);
@@ -519,7 +538,9 @@ fn check_stateful(name: &str) {
 
         let (public, message) = (field(record, "publicKey"), field(record, "message"));
 
-        let (signature, state) = (field(record, "signature"), field(record, "state"));
+        let signature = field(record, "signature");
+
+        assert!(version_1_state(&field(record, "state")), "{context}");
 
         let index: u64 = record["index"].parse().unwrap();
 
@@ -531,15 +552,13 @@ fn check_stateful(name: &str) {
 
         let mut pair = hazmat::generate_stateful_key_pair(
             algorithm,
-            parameters(record, &levels),
             &seed,
             index,
+            parameters(record, &levels),
             store.clone(),
             &StatefulKeyGenOptions::default(),
         )
         .unwrap();
-
-        assert_eq!(store.state(), Some(state.clone()), "{context}");
 
         assert_eq!(
             pair.public_key.export_key(KeyFormat::Raw).unwrap(),
@@ -579,9 +598,7 @@ fn check_stateful(name: &str) {
             "{context}"
         );
 
-        let after = field(record, "stateAfter");
-
-        assert_eq!(store.state(), Some(after.clone()), "{context}");
+        assert!(version_1_state(&field(record, "stateAfter")), "{context}");
 
         assert_eq!(
             pair.private_key.remaining_signatures(),
@@ -591,22 +608,33 @@ fn check_stateful(name: &str) {
 
         assert!(pair.public_key.verify(&signature, &message), "{context}");
 
-        // The key loaded from the first state signs at the same index, the same way.
-        let store = MemoryStore::holding(&state);
-
+        // The key loaded from the record it stored signs the next index as a key generated there.
         let mut loaded = algorithm
             .load_private_key(store.clone(), &StatefulLoadOptions::default())
             .unwrap();
 
         assert_eq!(loaded.public_key(), pair.public_key, "{context}");
 
-        assert_eq!(loaded.remaining_signatures(), remaining, "{context}");
-
-        assert_eq!(loaded.sign(&message).unwrap(), signature, "{context}");
-
-        assert_eq!(store.state(), Some(after), "{context}");
-
         assert_eq!(loaded.remaining_signatures(), remaining - 1, "{context}");
+
+        if remaining > 1 {
+            let next = loaded.sign(&message).unwrap();
+
+            let fresh = hazmat::generate_stateful_key_pair(
+                algorithm,
+                &seed,
+                index + 1,
+                parameters(record, &levels),
+                MemoryStore::default(),
+                &StatefulKeyGenOptions::default(),
+            )
+            .unwrap()
+            .private_key
+            .sign(&message)
+            .unwrap();
+
+            assert_eq!(next, fresh, "{context}");
+        }
     });
 }
 
@@ -620,84 +648,102 @@ fn xmss() {
     check_stateful("cross/xmss.txt");
 }
 
-// Each export is made again, and every cache loads, or fails to, as the reference decided; a key
-// that loads signs as the reference did.
+// Each export is made again, and loads with the record that the key stored as the reference
+// decided; a key that loads signs as the reference did. The load cases are skipped while their
+// states have version 1 (see version_1_state).
 #[test]
 fn tree_cache() {
-    parallel(
-        &records("cross/treecache.txt", "treeCache"),
-        |(header, record)| {
-            let algorithm = stateful_algorithm(&header["algorithm"]);
+    let found = records("cross/treecache.txt", "treeCache");
 
-            let context = format!("{}: {}", algorithm.name(), record["name"]);
+    let exports = found
+        .iter()
+        .filter(|(_, record)| record["operation"] == "export")
+        .count();
 
-            let (state, cache) = (field(record, "state"), field(record, "treeCache"));
+    assert_eq!(exports, 9);
 
-            let message = field(record, "message");
+    parallel(&found, |(header, record)| {
+        let algorithm = stateful_algorithm(&header["algorithm"]);
 
-            if record["operation"] == "export" {
-                let levels = levels(record);
+        let context = format!("{}: {}", algorithm.name(), record["name"]);
 
-                let store = MemoryStore::default();
+        let (state, cache) = (field(record, "state"), field(record, "treeCache"));
 
-                let mut pair = hazmat::generate_stateful_key_pair(
-                    algorithm,
-                    parameters(record, &levels),
-                    &field(record, "seed"),
-                    record["index"].parse().unwrap(),
-                    store.clone(),
-                    &StatefulKeyGenOptions::default(),
-                )
-                .unwrap();
+        let message = field(record, "message");
 
-                if record["signed"] == "true" {
-                    pair.private_key.sign(&message).unwrap();
-                }
+        if record["operation"] == "load" {
+            // A state that is not a version 1 record is refused as it was.
+            if !version_1_state(&state) {
+                let options = StatefulLoadOptions::default().with_tree_cache(&cache);
+
+                let result = algorithm.load_private_key(MemoryStore::holding(&state), &options);
 
                 assert_eq!(
-                    pair.private_key.export_tree_cache().unwrap(),
-                    cache,
-                    "{context}"
+                    result.err().map(|error| error.code()),
+                    Some(record["result"].as_str())
                 );
-
-                assert_eq!(store.state(), Some(state.clone()), "{context}");
             }
 
-            let options = StatefulLoadOptions {
-                tree_cache: Some(&cache),
-                ..StatefulLoadOptions::default()
-            };
+            return;
+        }
 
-            let mut key = match algorithm.load_private_key(MemoryStore::holding(&state), &options) {
-                Ok(key) => key,
-                Err(error) => {
-                    assert_eq!(error.code(), record["result"], "{context}");
+        assert!(version_1_state(&state), "{context}");
 
-                    return;
-                }
-            };
+        let levels = levels(record);
 
-            assert_eq!(record["result"], "ok", "{context}");
+        let store = MemoryStore::default();
 
+        let mut pair = hazmat::generate_stateful_key_pair(
+            algorithm,
+            &field(record, "seed"),
+            record["index"].parse().unwrap(),
+            parameters(record, &levels),
+            store.clone(),
+            &StatefulKeyGenOptions::default(),
+        )
+        .unwrap();
+
+        // Before its first signature, a key of version 1 held only its top tree; one of version 2
+        // holds the tree of every current level (SPEC 11.10 item 1), so only the exports after a
+        // signature are the same.
+        let cache = if record["signed"] == "true" {
+            pair.private_key.sign(&message).unwrap();
+
+            let exported = pair.private_key.export_tree_cache().unwrap();
+
+            assert_eq!(exported, cache, "{context}");
+
+            exported
+        } else {
+            pair.private_key.export_tree_cache().unwrap()
+        };
+
+        drop(pair);
+
+        let options = StatefulLoadOptions::default().with_tree_cache(&cache);
+
+        let mut key = algorithm.load_private_key(store, &options).unwrap();
+
+        assert_eq!(record["result"], "ok", "{context}");
+
+        assert_eq!(
+            key.public_key().export_key(KeyFormat::Raw).unwrap(),
+            field(record, "publicKey"),
+            "{context}"
+        );
+
+        let remaining: u64 = record["remaining"].parse().unwrap();
+
+        assert_eq!(key.remaining_signatures(), remaining, "{context}");
+
+        if record.contains_key("signature") {
             assert_eq!(
-                key.public_key().export_key(KeyFormat::Raw).unwrap(),
-                field(record, "publicKey"),
+                key.sign(&message).unwrap(),
+                field(record, "signature"),
                 "{context}"
             );
-
-            let remaining: u64 = record["remaining"].parse().unwrap();
-
-            assert_eq!(key.remaining_signatures(), remaining, "{context}");
-
-            if record.contains_key("signature") {
-                assert_eq!(
-                    key.sign(&message).unwrap(),
-                    field(record, "signature"),
-                    "{context}"
-                );
-            }
-        },
-    );
+        }
+    });
 }
 
 // The result of one error-table record: "ok", "true", "false" or an error code, with the output
@@ -842,9 +888,9 @@ fn execute(header: &Fields, record: &Fields) -> Outcome {
             counted(
                 hazmat::generate_stateful_key_pair(
                     a,
-                    parameters(record, &levels),
                     &data,
                     index,
+                    parameters(record, &levels),
                     store,
                     &StatefulKeyGenOptions::default(),
                 )
@@ -878,12 +924,27 @@ fn execute(header: &Fields, record: &Fields) -> Outcome {
     }
 }
 
+// A stateful load or sign of a record that the files hold in the layout of version 1.
+fn loads_version_1((header, record): &(Fields, Fields)) -> bool {
+    matches!(algorithm(&header["algorithm"]), Algorithm::Stateful(_))
+        && matches!(record["operation"].as_str(), "loadPrivateKey" | "sign")
+        && {
+            let input = field(record, "input");
+
+            sealed_state(&input) && matches!(input[0], 1 | 2)
+        }
+}
+
 // Every disagreement is collected, so that one run lists them all.
 #[test]
 fn errors() {
     let failures = Mutex::new(Vec::new());
 
     let cases = in_scope("cross/errors.txt", "result");
+
+    let (skipped, cases): (Vec<_>, Vec<_>) = cases.into_iter().partition(loads_version_1);
+
+    assert_eq!(skipped.len(), 48);
 
     parallel(&cases, |(header, record)| {
         let outcome = execute(header, record);

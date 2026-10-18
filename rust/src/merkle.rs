@@ -19,28 +19,22 @@ pub(crate) trait TreeHasher {
     fn combine(&self, height: u32, index: u32, left: &Node, right: &Node) -> Node;
 }
 
-// A tree as a tree cache holds it: its level or layer, its number there, and its nodes from height
-// low up, level by level, left to right.
-pub(crate) struct CachedTree<'a> {
-    pub(crate) level: u8,
-    pub(crate) tree: u64,
-    pub(crate) nodes: &'a [u8],
-}
-
-// A tree that a key holds, with its level or layer, its number there and its node size, as a tree
-// cache lists it.
-pub(crate) struct HeldTree<'a> {
-    pub(crate) level: u8,
-    pub(crate) tree: u64,
-    pub(crate) n: usize,
-    pub(crate) merkle: &'a MerkleTree,
-}
-
 // The leaves that this thread has computed, which tests read to see that a restored tree computes
 // none.
 #[cfg(test)]
 std::thread_local! {
     pub(crate) static LEAVES_COMPUTED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+
+    // Every one-time signature that this thread computed, by its one-time key: an HSS tree's I
+    // and leaf, or an XMSS tree's S_XMSS, PUB_SEED and OTS address. The stateful tests count
+    // the uses of each key.
+    pub(crate) static ONE_TIME_SIGNATURES: core::cell::RefCell<Vec<Vec<u8>>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn one_time_signature(key: &[&[u8]]) {
+    ONE_TIME_SIGNATURES.with(|signatures| signatures.borrow_mut().push(key.concat()));
 }
 
 // A Merkle tree that keeps its nodes from height low = max(0, h - 15) upwards. Building it

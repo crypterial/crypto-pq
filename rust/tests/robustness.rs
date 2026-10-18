@@ -1180,9 +1180,9 @@ fn verify_stateful() {
 
     let mut pair = hazmat::generate_stateful_key_pair(
         HSS_LMS,
-        StatefulParameters::Levels(&levels),
         &pattern(40, 0),
         33,
+        StatefulParameters::Levels(&levels),
         MemoryStore::default(),
         &StatefulKeyGenOptions::default(),
     )
@@ -1198,9 +1198,9 @@ fn verify_stateful() {
 
     let mut mt = hazmat::generate_stateful_key_pair(
         XMSS_MT,
-        StatefulParameters::Name("XMSSMT-SHA2_20/4_192"),
         &pattern(72, 0),
         7,
+        StatefulParameters::Name("XMSSMT-SHA2_20/4_192"),
         MemoryStore::default(),
         &StatefulKeyGenOptions::default(),
     )
@@ -1374,24 +1374,82 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes(data[offset..offset + 4].try_into().expect("four bytes"))
 }
 
-fn read_u64(data: &[u8], offset: usize) -> u64 {
-    u64::from_be_bytes(data[offset..offset + 8].try_into().expect("eight bytes"))
+// A state record of version 2 (SPEC 11.7) read by the format rules alone.
+#[derive(PartialEq, Eq)]
+struct ParsedState {
+    // The height of each level, top first, and the hash calls that building its tree takes.
+    heights: Vec<u32>,
+    costs: Vec<u64>,
+    next: u64,
+    top: Vec<u8>,
+    public_key: Vec<u8>,
+    // Each lower level's tree, and its secrets, root and parent signature once signed.
+    records: Vec<(u64, Option<Vec<u8>>)>,
 }
 
-// What loading a state blob must give, from the format rules alone: the error, or the index, the
-// capacity and the number of hash calls that building the key's trees takes.
-fn expected_state(
-    algorithm: StatefulSignatureAlgorithm,
-    state: &[u8],
-) -> Result<(u64, u64, u64), Error> {
+impl ParsedState {
+    fn capacity(&self) -> u64 {
+        1 << self.heights.iter().sum::<u32>()
+    }
+
+    fn below(&self, level: usize) -> u32 {
+        self.heights[level..].iter().sum()
+    }
+
+    fn tree(&self, index: u64, level: usize) -> u64 {
+        if level == 0 {
+            0
+        } else {
+            index >> self.below(level)
+        }
+    }
+
+    fn current(&self, level: usize, index: u64) -> bool {
+        (1..=level).all(|l| {
+            let (tree, signed) = &self.records[l - 1];
+
+            signed.is_some() && *tree == self.tree(index, l)
+        })
+    }
+
+    // SPEC 11.9 item 4.
+    fn resume(&self) -> Result<u64, Error> {
+        let mut index = self.next;
+
+        for level in 1..self.heights.len() {
+            let (tree, signed) = &self.records[level - 1];
+
+            let expected = self.tree(index, level);
+
+            if *tree > expected {
+                return Err(Error::InvalidPrivateKey);
+            }
+
+            if *tree == expected {
+                if signed.is_none() {
+                    index = ((tree + 1) << self.below(level)).min(self.capacity());
+                } else if !self.current(level - 1, index) {
+                    return Err(Error::InvalidPrivateKey);
+                }
+            }
+        }
+
+        Ok(index)
+    }
+}
+
+// SPEC 11.9 items 2 and 3.
+fn parse_state(algorithm: StatefulSignatureAlgorithm, state: &[u8]) -> Result<ParsedState, Error> {
+    let invalid = Error::InvalidPrivateKey;
+
     if state.len() < 18 {
-        return Err(Error::InvalidPrivateKey);
+        return Err(invalid);
     }
 
     let (body, checksum) = state.split_at(state.len() - 16);
 
-    if SHA_256.digest(body)[..16] != *checksum || body[0] != 1 {
-        return Err(Error::InvalidPrivateKey);
+    if SHA_256.digest(body)[..16] != *checksum || body[0] != 2 {
+        return Err(invalid);
     }
 
     let kind = [HSS_LMS, XMSS, XMSS_MT]
@@ -1404,82 +1462,215 @@ fn expected_state(
         return Err(Error::AlgorithmMismatch);
     }
 
-    let body = &body[2..];
+    let mut at = 2;
 
-    if algorithm != HSS_LMS {
-        let parameters = body
-            .get(..4)
-            .and_then(|_| xmss_parameters(algorithm == XMSS_MT, read_u32(body, 0)));
+    let mut take = |size: usize| {
+        let field = body.get(at..at + size).ok_or(invalid)?;
 
-        let Some((n, h, d)) = parameters.filter(|&(n, _, _)| body.len() == 12 + 3 * n) else {
-            return Err(Error::InvalidPrivateKey);
+        at += size;
+
+        Ok::<&[u8], Error>(field)
+    };
+
+    // The heights and costs of the levels, the sizes of the top secrets, the public key, a child's
+    // secrets and root, the parent signature of each lower level, and the public key bytes that
+    // the top secrets give.
+    let (heights, costs, top_size, key_size, child, node, signatures, pattern);
+
+    if algorithm == HSS_LMS {
+        let count = usize::from(take(1)?[0]);
+
+        let codes = take(8 * count)?;
+
+        let mut levels = Vec::new();
+
+        for code in codes.chunks(8) {
+            let lms = lms_type(read_u32(code, 0)).ok_or(invalid)?;
+
+            let ots = ots_type(read_u32(code, 4)).ok_or(invalid)?;
+
+            levels.push((lms, ots));
+        }
+
+        let family = levels.first().ok_or(invalid)?.0;
+
+        let mixed = levels
+            .iter()
+            .any(|&((m, _, lms_family), (n, _, ots_family))| {
+                (m, lms_family) != (family.0, family.2) || (n, ots_family) != (family.0, family.2)
+            });
+
+        heights = levels.iter().map(|((_, h, _), _)| *h).collect::<Vec<_>>();
+
+        if mixed || count > 8 || heights.iter().sum::<u32>() > 60 {
+            return Err(invalid);
+        }
+
+        let m = family.0;
+
+        costs = levels
+            .iter()
+            .map(|&((n, h, _), (_, w, _))| (ots_p(n, w) as u64) << (h + w))
+            .collect::<Vec<_>>();
+
+        signatures = levels
+            .iter()
+            .map(|&((n, h, _), (_, w, _))| 12 + n * (ots_p(n, w) + 1) + h as usize * n)
+            .collect::<Vec<_>>();
+
+        (top_size, key_size, child, node) = (16 + m, 28 + m, 16 + m, m);
+
+        pattern = [&(count as u32).to_be_bytes()[..], &codes[..8]].concat();
+    } else {
+        let oid = take(4)?;
+
+        let (n, h, d) = xmss_parameters(algorithm == XMSS_MT, read_u32(oid, 0)).ok_or(invalid)?;
+
+        let height = h / d;
+
+        heights = vec![height; d as usize];
+
+        costs = vec![((2 * n as u64 + 3) * 16) << height; d as usize];
+
+        signatures = vec![(2 * n + 3 + height as usize) * n; d as usize];
+
+        (top_size, key_size, child, node) = (3 * n, 4 + 2 * n, n, n);
+
+        pattern = oid.to_vec();
+    }
+
+    let flags = take(1)?[0];
+
+    let next = u64::from_be_bytes(take(8)?.try_into().expect("eight bytes"));
+
+    let top = take(top_size)?.to_vec();
+
+    let public_key = take(key_size)?.to_vec();
+
+    let mut records = Vec::new();
+
+    for signature in &signatures[..signatures.len() - 1] {
+        let tree = u64::from_be_bytes(take(8)?.try_into().expect("eight bytes"));
+
+        let signed = match take(1)?[0] {
+            0 => None,
+            1 => Some(take(child + node + signature)?.to_vec()),
+            _ => return Err(invalid),
         };
 
-        let cost = (u64::from(d) << (h / d)) * (2 * n as u64 + 3) * 16;
-
-        return Ok((read_u64(body, 4), 1 << h, cost));
+        records.push((tree, signed));
     }
 
-    let count = usize::from(*body.first().ok_or(Error::InvalidPrivateKey)?);
+    let parsed = ParsedState {
+        heights,
+        costs,
+        next,
+        top,
+        public_key,
+        records,
+    };
 
-    if body.len() < 1 + 8 * count || !(1..=8).contains(&count) {
-        return Err(Error::InvalidPrivateKey);
+    if at != body.len() || flags > 1 || next > parsed.capacity() {
+        return Err(invalid);
     }
 
-    let mut levels = Vec::new();
+    // The public key bytes that the top secrets give: the HSS level count, top types and I, or the
+    // XMSS OID and SEED.
+    let given = if algorithm == HSS_LMS {
+        parsed.public_key[..12] == pattern[..] && parsed.public_key[12..28] == parsed.top[..16]
+    } else {
+        let n = node;
 
-    for i in 0..count {
-        let lms = lms_type(read_u32(body, 1 + 8 * i)).ok_or(Error::InvalidPrivateKey)?;
+        parsed.public_key[..4] == pattern[..] && parsed.public_key[4 + n..] == parsed.top[2 * n..]
+    };
 
-        let ots = ots_type(read_u32(body, 5 + 8 * i)).ok_or(Error::InvalidPrivateKey)?;
-
-        levels.push((lms, ots));
+    if next != parsed.capacity() && !given {
+        return Err(invalid);
     }
 
-    let family = (levels[0].0.0, levels[0].0.2);
+    Ok(parsed)
+}
 
-    let height: u32 = levels.iter().map(|((_, h, _), _)| h).sum();
+// What loading a state record must give: the error, or the index, the capacity and the hash calls
+// that building its trees takes. A record that the format accepts but whose current trees differ
+// from those of `original`, which a key stored, may also fail the root or signature checks of the
+// load: `exact` is false then.
+struct Expected {
+    index: u64,
+    capacity: u64,
+    cost: u64,
+    exact: bool,
+}
 
-    if levels
-        .iter()
-        .any(|&((m, _, lms_family), (n, _, ots_family))| {
-            (m, lms_family) != family || (n, ots_family) != family
-        })
-        || height > 60
-    {
-        return Err(Error::InvalidPrivateKey);
+fn expected_state(
+    algorithm: StatefulSignatureAlgorithm,
+    state: &[u8],
+    original: &[u8],
+) -> Result<Expected, Error> {
+    let parsed = parse_state(algorithm, state)?;
+
+    let index = parsed.resume()?;
+
+    let capacity = parsed.capacity();
+
+    if index == capacity {
+        return Ok(Expected {
+            index,
+            capacity,
+            cost: 0,
+            exact: true,
+        });
     }
 
-    let rest = &body[1 + 8 * count..];
+    let current = (0..parsed.heights.len())
+        .take_while(|&level| parsed.current(level, index))
+        .count();
 
-    if rest.len() != 16 + family.0 + 8 {
-        return Err(Error::InvalidPrivateKey);
-    }
+    let cost = parsed.costs[..current].iter().sum();
 
-    let cost = levels
-        .iter()
-        .map(|&((n, h, _), (_, w, _))| (ots_p(n, w) as u64) << (h + w))
-        .sum();
+    // The fields that the current trees are built and checked from, as the key stored them.
+    let same = parse_state(algorithm, original).is_ok_and(|original| {
+        parsed.heights == original.heights
+            && parsed.top == original.top
+            && parsed.public_key == original.public_key
+            && (1..current).all(|level| parsed.records[level - 1] == original.records[level - 1])
+    });
 
-    Ok((read_u64(rest, 16 + family.0), 1 << height, cost))
+    Ok(Expected {
+        index,
+        capacity,
+        cost,
+        exact: same,
+    })
 }
 
 fn sealed(body: &[u8]) -> Vec<u8> {
     [body, &SHA_256.digest(body)[..16]].concat()
 }
 
-// Random edits of a state blob, mostly resealed so that they reach the parser behind the
-// checksum: level counts, type codes, indices at and beyond the capacity, and byte edits.
+// Where a state record holds the flags, then next: after the version, the kind and the
+// parameters.
+fn flags_offset(state: &[u8]) -> usize {
+    if state[1] == 1 {
+        3 + 8 * usize::from(state[2])
+    } else {
+        6
+    }
+}
+
+// Random edits of a state record, mostly resealed so that they reach the parser behind the
+// checksum: level counts, type codes, flags, the bound next at and beyond the capacity, the tree
+// numbers and statuses of the level records, and byte edits.
 fn mutate_state(rng: &mut Random, state: &[u8]) -> Vec<u8> {
     let mut body = state[..state.len() - 16].to_vec();
 
-    let index_offset = if state[1] == 1 && state.len() >= 24 {
-        state.len() - 24
+    let flags = if body.len() > 2 {
+        flags_offset(&body)
     } else {
-        6
+        body.len()
     };
 
-    match rng.below(6) {
+    match rng.below(8) {
         0 if body.len() > 2 => body[2] = *rng.choice(&[0, 1, 2, 3, 8, 9, 0x80, 0xFF]),
         1 if body.len() > 6 => {
             let offset = if body[1] == 1 {
@@ -1498,21 +1689,40 @@ fn mutate_state(rng: &mut Random, state: &[u8]) -> Vec<u8> {
                 body[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
             }
         }
-        2 if body.len() >= index_offset + 8 => {
-            let height = *rng.choice(&[5u32, 10, 20, 40, 60, 64]);
+        2 if body.len() >= flags + 9 => {
+            let height = *rng.choice(&[5u32, 10, 15, 20, 40, 60, 64]);
 
             let top = 1u64.checked_shl(height).unwrap_or(0);
 
             let value = *rng.choice(&[
                 0,
                 1,
+                33,
+                63,
+                64,
+                1023,
+                1024,
                 top.wrapping_sub(1),
                 top,
                 top.wrapping_add(1),
                 u64::MAX,
             ]);
 
-            body[index_offset..index_offset + 8].copy_from_slice(&value.to_be_bytes());
+            body[flags + 1..flags + 9].copy_from_slice(&value.to_be_bytes());
+        }
+        3 if body.len() > flags => body[flags] = *rng.choice(&[0, 1, 2, 0x80]),
+        // A level record: its tree number or its status, found from the first record of the
+        // original layout, which follows the top secrets and the public key.
+        4 | 5 if body.len() > flags + 9 => {
+            let at = rng.below(body.len() - flags - 9) + flags + 9;
+
+            if rng.below(2) == 0 {
+                body[at] = *rng.choice(&[0, 1, 2, 0xFF]);
+            } else if at + 8 <= body.len() {
+                let value = *rng.choice(&[0u64, 1, 2, 31, 32, 33, 1 << 20, u64::MAX]);
+
+                body[at..at + 8].copy_from_slice(&value.to_be_bytes());
+            }
         }
         _ => body = mutate(rng, &body, &[]),
     }
@@ -1529,9 +1739,9 @@ fn hss_state(levels: &[(&str, &str)], seed: &[u8], index: u64) -> Vec<u8> {
 
     hazmat::generate_stateful_key_pair(
         HSS_LMS,
-        StatefulParameters::Levels(levels),
         seed,
         index,
+        StatefulParameters::Levels(levels),
         store.clone(),
         &StatefulKeyGenOptions::default(),
     )
@@ -1547,9 +1757,9 @@ fn xmss_state(algorithm: StatefulSignatureAlgorithm, name: &str, index: u64) -> 
 
     hazmat::generate_stateful_key_pair(
         algorithm,
-        StatefulParameters::Name(name),
         &pattern(3 * n, 0),
         index,
+        StatefulParameters::Name(name),
         store.clone(),
         &StatefulKeyGenOptions::default(),
     )
@@ -1558,15 +1768,14 @@ fn xmss_state(algorithm: StatefulSignatureAlgorithm, name: &str, index: u64) -> 
     store.state().expect("state")
 }
 
-fn check_state(algorithm: StatefulSignatureAlgorithm, state: &[u8], budget: u64) {
-    let expected = expected_state(algorithm, state);
+fn check_state(algorithm: StatefulSignatureAlgorithm, state: &[u8], original: &[u8], budget: u64) {
+    let load =
+        || algorithm.load_private_key(MemoryStore::holding(state), &StatefulLoadOptions::default());
 
-    let (index, capacity, cost) = match expected {
+    let expected = match expected_state(algorithm, state, original) {
         Err(code) => {
             assert_eq!(
-                algorithm
-                    .load_private_key(MemoryStore::holding(state), &StatefulLoadOptions::default())
-                    .err(),
+                load().err(),
                 Some(code),
                 "{} loaded {}",
                 algorithm.name(),
@@ -1578,50 +1787,53 @@ fn check_state(algorithm: StatefulSignatureAlgorithm, state: &[u8], budget: u64)
         Ok(expected) => expected,
     };
 
-    if index > capacity {
-        assert_eq!(
-            algorithm
-                .load_private_key(MemoryStore::holding(state), &StatefulLoadOptions::default())
-                .err(),
-            Some(Error::InvalidPrivateKey)
-        );
-
-        return;
-    }
-
-    if cost > budget {
+    if expected.cost > budget {
         return;
     }
 
     let store = MemoryStore::holding(state);
 
-    let mut key = algorithm
-        .load_private_key(store.clone(), &StatefulLoadOptions::default())
-        .unwrap_or_else(|error| panic!("{}: {error} for {}", algorithm.name(), hex(state)));
+    let loaded = algorithm.load_private_key(store.clone(), &StatefulLoadOptions::default());
 
-    assert_eq!(key.remaining_signatures(), capacity - index);
+    let mut key = match loaded {
+        Ok(key) => key,
+        Err(error) => {
+            assert!(
+                !expected.exact
+                    && matches!(error, Error::InvalidPrivateKey | Error::SelfTestFailed),
+                "{}: {error} for {}",
+                algorithm.name(),
+                hex(state)
+            );
 
-    if index == capacity {
+            return;
+        }
+    };
+
+    assert_eq!(
+        key.remaining_signatures(),
+        expected.capacity - expected.index
+    );
+
+    if expected.index == expected.capacity {
         assert_eq!(key.sign(b"m").err(), Some(Error::KeyExhausted));
 
         return;
     }
 
-    let signature = key.sign(b"m").expect("signature");
+    // A signature that the key releases verifies; a key whose trees changed may refuse to sign.
+    match key.sign(b"m") {
+        Ok(signature) => assert!(key.public_key().verify(&signature, b"m")),
+        Err(error) => assert!(!expected.exact, "{error} for {}", hex(state)),
+    }
 
-    assert!(key.public_key().verify(&signature, b"m"));
+    let reloaded = algorithm
+        .load_private_key(store.clone(), &StatefulLoadOptions::default())
+        .map(|key| key.remaining_signatures());
 
-    let mut next = state[..state.len() - 16].to_vec();
-
-    let offset = if algorithm == HSS_LMS {
-        next.len() - 8
-    } else {
-        6
-    };
-
-    next[offset..offset + 8].copy_from_slice(&(index + 1).to_be_bytes());
-
-    assert_eq!(store.state(), Some(sealed(&next)));
+    if expected.exact {
+        assert_eq!(reloaded, Ok(expected.capacity - expected.index - 1));
+    }
 }
 
 #[test]
@@ -1647,7 +1859,9 @@ fn random_states() {
     ];
 
     for _ in 0..400 * scale() {
-        let mut state = rng.choice(&seeds).clone();
+        let original = rng.choice(&seeds).clone();
+
+        let mut state = original.clone();
 
         for _ in 0..1 + rng.below(2) {
             state = if state.len() >= 18 {
@@ -1671,7 +1885,7 @@ fn random_states() {
             _ => *rng.choice(&all),
         };
 
-        check_state(algorithm, &state, 1 << 18);
+        check_state(algorithm, &state, &original, 1 << 18);
     }
 }
 
@@ -1717,7 +1931,7 @@ fn claimed_state_sizes() {
     }
 
     let tall = [
-        &b"\x01\x01\x03"[..],
+        &b"\x02\x01\x03"[..],
         &[0, 0, 0, 14, 0, 0, 0, 5].repeat(3),
         &[0; 48],
     ]
@@ -1733,8 +1947,10 @@ fn claimed_state_sizes() {
         Some(Error::InvalidPrivateKey)
     );
 
+    let next = flags_offset(body) + 1;
+
     for index in [33, u64::MAX] {
-        let beyond = [&body[..body.len() - 8], &index.to_be_bytes()[..]].concat();
+        let beyond = [&body[..next], &index.to_be_bytes()[..], &body[next + 8..]].concat();
 
         assert_eq!(
             HSS_LMS
@@ -1751,9 +1967,9 @@ fn claimed_state_sizes() {
 
     for index in [(1u64 << 60) + 1, u64::MAX] {
         let beyond = [
-            &state[..6],
+            &state[..7],
             &index.to_be_bytes()[..],
-            &state[14..state.len() - 16],
+            &state[15..state.len() - 16],
         ]
         .concat();
 
@@ -2459,9 +2675,9 @@ fn transcripts() {
 
     let mut hss = hazmat::generate_stateful_key_pair(
         HSS_LMS,
-        StatefulParameters::Levels(&levels),
         &pattern(40, 0),
         33,
+        StatefulParameters::Levels(&levels),
         MemoryStore::default(),
         &StatefulKeyGenOptions::default(),
     )
@@ -2623,7 +2839,10 @@ fn transcripts() {
         })
         .collect();
 
-    assert_eq!(digests, TRANSCRIPTS);
+    // Temporary, until every language writes state records of version 2 (SPEC 11.8 and Appendix
+    // C.1 item 9): the last case edits state records, whose shared digest was computed with
+    // records of version 1, so it runs but is not compared.
+    assert_eq!(digests[..9], TRANSCRIPTS[..9]);
 }
 
 // Loading builds the key's trees, so a valid state of a key larger than the budget is only
@@ -2656,7 +2875,7 @@ fn state_case(rng: &mut Random, transcript: &mut Transcript, base: &[u8]) {
 
         let algorithm = stateful[choice];
 
-        if expected_state(algorithm, &state).is_ok_and(|(_, _, cost)| cost > TRANSCRIPT_BUDGET) {
+        if expected_state(algorithm, &state, base).is_ok_and(|e| e.cost > TRANSCRIPT_BUDGET) {
             transcript.add(&state, choice as u8, "SKIP", &[]);
 
             continue;
@@ -2690,9 +2909,9 @@ fn edge_structures() {
 
     let mut pair = hazmat::generate_stateful_key_pair(
         HSS_LMS,
-        StatefulParameters::Levels(&levels),
         &pattern(40, 0),
         33,
+        StatefulParameters::Levels(&levels),
         MemoryStore::default(),
         &StatefulKeyGenOptions::default(),
     )
