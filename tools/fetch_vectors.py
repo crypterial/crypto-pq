@@ -169,7 +169,29 @@ SOURCES = {
     "eFrodoKEM-1344-SHAKE": (f"{FRODOKEM}/eFrodoKEM/KAT/PQCkemKAT_43088_shake.rsp", "591adc09a718afbc0ac36e1f57a191e557fe4eec7899e078104b9706b75e2f96"),
 }
 
-GENERATED = ("acvp", "acvp-full", "wycheproof", "xwing", "rfc", "nist-examples", "blake2", "blake3", "ascon", "frodokem")
+GENERATED = ("acvp", "wycheproof", "xwing", "rfc", "nist-examples", "blake2", "blake3", "ascon", "frodokem")
+
+# The full ACVP sets and the large-data tests run in the weekly job (SPEC 19.4) and are not kept in
+# the repository: "fetch_vectors.py --full" writes them to vectors/acvp-full, which git ignores,
+# and checks each file against its SHA-256 here.
+FULL = "acvp-full"
+
+FULL_SUMS = {
+    "ML-DSA-sigGen-v1.txt": "95e1a17b2e0fbac70cc743fbea671f474ebb0ca33a12d12fb6f3b30e1b56d95c",
+    "ML-DSA-sigGen.txt": "49d09b79d9da93b233629c11ee8caff8468865c5ed6b10c3c79d2e1f6b15abeb",
+    "ML-KEM-encapDecap-v1.txt": "38996e5df6bb2ce8f82aa116f5fe67ba34cceedb4c408149e06ff9925f3fc15e",
+    "SLH-DSA-sigGen-internal.txt": "8c76cec1a0726bda644bb2b650643b1b902c07c24d047a8a69b10c42509f6058",
+    "SLH-DSA-sigGen.txt": "2b9c84d0d623fb7a6cb33888e45de83c2ad0f06c1b4c928ed058fb10d6262a96",
+    "SLH-DSA-sigVer-internal.txt": "0799ff6ac919639972c20f4e30e7026f0dd0e50b84139b1c1aba38fd6214e3a7",
+    "SLH-DSA-sigVer.txt": "74f8e1da34ba1837aa26ebeff127f6af571580fe9a83dd1a06f2034d705e3ee2",
+    "large-data.txt": "f6fdb86b917cae80666c646e1706322a8218e591e080633fa2482c5cd833201c",
+}
+
+# The tests of each ACVP file that a projection keeps and leaves out, by the interface of their
+# group, so that the omissions SPEC 19.4 permits are counted and reported.
+KEPT = {}
+
+DROPPED = {}
 
 
 def fetch(url, expected):
@@ -198,7 +220,7 @@ def write(relative, data):
 
 
 def checksums():
-    files = sorted(p for p in VECTORS.rglob("*") if p.is_file() and p.name != "SHA256SUMS")
+    files = sorted(p for p in VECTORS.rglob("*") if p.is_file() and p.name != "SHA256SUMS" and FULL not in p.relative_to(VECTORS).parts)
 
     lines = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(VECTORS).as_posix()}" for p in files]
 
@@ -268,6 +290,12 @@ def acvp(name, keep=lambda group: True, select=lambda group, tests: tests, drop=
     groups = []
 
     for group in json.loads(source(name))["testGroups"]:
+        interface = "externalMu" if group.get("externalMu") else group.get("signatureInterface", "default")
+
+        counted = (KEPT if keep(group) else DROPPED).setdefault(name, {}).setdefault(interface, set())
+
+        counted.update(test["tcId"] for test in group["tests"])
+
         if not keep(group):
             continue
 
@@ -1565,11 +1593,6 @@ def main():
     for family, names in DIGESTS.items():
         write(f"acvp/{family}.txt", render(acvp_digests(names)))
 
-    for relative, groups in acvp_full().items():
-        write(f"acvp-full/{relative}", render(groups))
-
-    write("acvp-full/large-data.txt", render(acvp_large_data()))
-
     write("rfc/hmac.txt", render(rfc4231()))
 
     write("rfc/mlkem_keys.txt", render(rfc_keys("rfc9935")))
@@ -1650,6 +1673,36 @@ def main():
 
     checksums()
 
+    report()
+
+
+def report():
+    for name, interfaces in sorted(DROPPED.items()):
+        for interface, tests in sorted(interfaces.items()):
+            left_out = tests - KEPT.get(name, {}).get(interface, set())
+
+            if left_out:
+                print(f"{name}: {len(left_out)} tests of the {interface} interface left out")
+
+
+def full():
+    shutil.rmtree(VECTORS / FULL, ignore_errors=True)
+
+    for relative, groups in {**acvp_full(), "large-data.txt": acvp_large_data()}.items():
+        data = render(groups)
+
+        actual = hashlib.sha256(data).hexdigest()
+
+        if actual != FULL_SUMS[relative]:
+            sys.exit(f"{FULL}/{relative}: sha256 {actual}, expected {FULL_SUMS[relative]}")
+
+        write(f"{FULL}/{relative}", data)
+
+    report()
+
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--full"]:
+        full()
+    else:
+        main()
