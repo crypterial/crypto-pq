@@ -247,47 +247,57 @@ fn run(algorithm: Algorithm, record: &Fields) -> Result<(String, Option<Vec<u8>>
 }
 
 // Records whose expected result predates a rule of SPEC 1.0 that the reference generator does not
-// apply yet; each is listed with the rule, checked against it, and removed when the file is
-// regenerated.
-const PENDING: [(&str, &str, &str); 8] = [
+// apply yet, by file, function and case; each is listed with the rule and checked against it. An
+// entry that no record of its file needs any more, because the record is gone or already has the
+// new result, fails the check, so that it is removed when the file is regenerated.
+const SYMMETRIC: &str = "cross/symmetric.txt";
+
+const PENDING: [(&str, &str, &str, &str); 8] = [
     // SPEC 12.2 item 5 [D-34]: the one-shot Ascon XOFs refuse L = 0.
     (
+        SYMMETRIC,
         "Ascon-CXOF128",
         "0-byte customization, 0-byte output",
         "INVALID_LENGTH",
     ),
     (
+        SYMMETRIC,
         "Ascon-CXOF128",
         "1-byte customization, 0-byte output",
         "INVALID_LENGTH",
     ),
     (
+        SYMMETRIC,
         "Ascon-CXOF128",
         "7-byte customization, 0-byte output",
         "INVALID_LENGTH",
     ),
     (
+        SYMMETRIC,
         "Ascon-CXOF128",
         "8-byte customization, 0-byte output",
         "INVALID_LENGTH",
     ),
     (
+        SYMMETRIC,
         "Ascon-CXOF128",
         "9-byte customization, 0-byte output",
         "INVALID_LENGTH",
     ),
     (
+        SYMMETRIC,
         "Ascon-CXOF128",
         "255-byte customization, 0-byte output",
         "INVALID_LENGTH",
     ),
     (
+        SYMMETRIC,
         "Ascon-CXOF128",
         "256-byte customization, 0-byte output",
         "INVALID_LENGTH",
     ),
     // SPEC 12.6 item 1 [D-33]: HMAC takes a length of 4 to the hash output size.
-    ("HMAC-SHA-256", "length", "ok"),
+    (SYMMETRIC, "HMAC-SHA-256", "length", "ok"),
 ];
 
 fn check(file: &str, expected_records: usize) {
@@ -295,7 +305,7 @@ fn check(file: &str, expected_records: usize) {
 
     assert_eq!(found.len(), expected_records, "{file}");
 
-    let mut pending = 0;
+    let mut used = [false; PENDING.len()];
 
     for (header, record) in &found {
         for key in record.keys() {
@@ -311,14 +321,15 @@ fn check(file: &str, expected_records: usize) {
 
         let expected = match PENDING
             .iter()
-            .find(|(algorithm, case, _)| algorithm == name && *case == record["name"])
-        {
-            Some((_, _, now)) => {
-                pending += 1;
+            .position(|(pending_file, algorithm, case, _)| {
+                *pending_file == file && algorithm == name && *case == record["name"]
+            }) {
+            Some(index) if PENDING[index].3 != record["result"] => {
+                used[index] = true;
 
-                (*now).to_owned()
+                PENDING[index].3.to_owned()
             }
-            None => record["result"].clone(),
+            _ => record["result"].clone(),
         };
 
         assert_eq!(result, expected, "{context}");
@@ -328,15 +339,28 @@ fn check(file: &str, expected_records: usize) {
         }
     }
 
+    let stale: Vec<_> = PENDING
+        .iter()
+        .zip(used)
+        .filter(|((pending_file, ..), used)| *pending_file == file && !used)
+        .map(|(entry, _)| entry)
+        .collect();
+
+    assert!(
+        stale.is_empty(),
+        "{file}: pending entries no record needs: {stale:?}"
+    );
+
     println!(
-        "{file}: {} records, {pending} with a pending regeneration",
-        found.len()
+        "{file}: {} records, {} with a pending regeneration",
+        found.len(),
+        used.iter().filter(|&&used| used).count()
     );
 }
 
 #[test]
 fn cross_symmetric() {
-    check("cross/symmetric.txt", 505);
+    check(SYMMETRIC, 505);
 }
 
 #[test]
