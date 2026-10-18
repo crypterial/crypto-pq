@@ -175,6 +175,8 @@ impl HashAlgorithm {
     }
 
     // The same digest written into out, which must be digest_size() bytes, without allocating.
+    // Inline, so that a caller's buffer of the right size needs no check at run time.
+    #[inline]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         check_length(out.len(), self.digest_size)?;
 
