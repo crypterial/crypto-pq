@@ -958,7 +958,7 @@ fn loads_version_1((header, record): &(Fields, Fields)) -> bool {
 // Cases whose expected result predates a rule of SPEC 1.0 that the reference generator does not
 // apply yet, by case name, with the result under the rule. Remove them when the file is
 // regenerated (SPEC Appendix C.1 item 9).
-const PENDING: [(&str, &str); 23] = [
+const PENDING: [(&str, &str); 24] = [
     // 7.3: the options, the context included, are checked before the lengths.
     (
         "hazmat sign short randomness and long context",
@@ -981,6 +981,8 @@ const PENDING: [(&str, &str); 23] = [
         "private key der public key with version 0 and other algorithm",
         "ALGORITHM_MISMATCH",
     ),
+    // 13 [D-68]: a hazmat start index at the capacity is refused.
+    ("generate index at the capacity", "INVALID_OPTION"),
     // 10.4 item 3 [D-67]: each boundary line starts a line and holds nothing but the boundary,
     // so neither whitespace before BEGIN on its line nor a body on a boundary line is accepted.
     ("public key pem surrounding whitespace", "INVALID_ENCODING"),
@@ -1040,15 +1042,17 @@ fn errors() {
 
         let mut expected_output = record.get("output").map(|value| unhex(value));
 
+        let mut expected_remaining = record.get("remaining").map(|value| value.parse().unwrap());
+
         if let Some((name, now)) = PENDING.iter().find(|(name, _)| *name == record["name"]) {
             pending.lock().unwrap().push(*name);
 
             expected = now;
 
             expected_output = None;
-        }
 
-        let expected_remaining = record.get("remaining").map(|value| value.parse().unwrap());
+            expected_remaining = None;
+        }
 
         let mismatched = outcome.result != expected
             || expected_output.is_some_and(|output| outcome.output.as_ref() != Some(&output))

@@ -119,8 +119,8 @@ pub fn verify_internal(
 
 // SPEC 11.14: a key whose top secrets are the seed, I || SEED of the top LMS tree or
 // S_XMSS || SK_PRF || SEED, which derives its child trees and randomizers as the reference
-// implementations do, so that it reproduces their test vectors; it starts at index, which may be
-// the capacity itself for an exhausted key.
+// implementations do, so that it reproduces their test vectors; it starts at index, which must be
+// below the capacity (SPEC D-68): a key that starts exhausted could never sign.
 pub fn generate_stateful_key_pair<S: StateStore>(
     algorithm: StatefulSignatureAlgorithm,
     seed: &[u8],
@@ -135,7 +135,7 @@ pub fn generate_stateful_key_pair<S: StateStore>(
 
     require_length(seed, parameters.seed_size())?;
 
-    if index > parameters.capacity() {
+    if index >= parameters.capacity() {
         return Err(Error::InvalidOption);
     }
 

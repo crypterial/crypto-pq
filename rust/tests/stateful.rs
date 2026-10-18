@@ -548,30 +548,37 @@ fn hss_parameters() {
         Some(Error::InvalidLength)
     );
 
-    assert_eq!(
-        hazmat::generate_stateful_key_pair(
-            HSS_LMS,
-            &seed,
-            33,
-            small,
-            &mut store,
-            &StatefulKeyGenOptions::default()
-        )
-        .err(),
-        Some(Error::InvalidOption)
-    );
+    // SPEC D-68: a start index at or beyond the capacity of 32 is refused.
+    for index in [32, 33] {
+        assert_eq!(
+            hazmat::generate_stateful_key_pair(
+                HSS_LMS,
+                &seed,
+                index,
+                small,
+                &mut store,
+                &StatefulKeyGenOptions::default()
+            )
+            .err(),
+            Some(Error::InvalidOption)
+        );
+    }
 
     assert!(store.state.is_none());
 
     let mut exhausted = hazmat::generate_stateful_key_pair(
         HSS_LMS,
         &seed,
-        32,
+        31,
         small,
         store,
         &StatefulKeyGenOptions::default(),
     )
     .unwrap();
+
+    assert_eq!(exhausted.private_key.remaining_signatures(), 1);
+
+    exhausted.private_key.sign(b"m").unwrap();
 
     assert_eq!(exhausted.private_key.remaining_signatures(), 0);
 
