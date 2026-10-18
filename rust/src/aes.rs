@@ -557,8 +557,14 @@ fn sbox(q: &mut [u64; 8]) {
 mod tests {
     use super::*;
 
+    fn bytes(text: &str) -> alloc::vec::Vec<u8> {
+        (0..text.len() / 2)
+            .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
+    }
+
     fn unhex<const N: usize>(text: &str) -> [u8; N] {
-        core::array::from_fn(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap())
+        bytes(text).try_into().unwrap()
     }
 
     // FIPS 197, Appendix C.1 and C.3.
@@ -576,9 +582,7 @@ mod tests {
                 "8ea2b7ca516745bfeafc49904b496089",
             ),
         ] {
-            let key: alloc::vec::Vec<u8> = (0..key.len() / 2)
-                .map(|i| u8::from_str_radix(&key[2 * i..2 * i + 2], 16).unwrap())
-                .collect();
+            let key = bytes(key);
 
             let expected: [u8; 16] = unhex(expected);
 
@@ -603,12 +607,6 @@ mod tests {
     // its ciphertext, checked through the AES instructions and through the portable code.
     #[test]
     fn aesavs() {
-        let bytes = |text: &str| -> alloc::vec::Vec<u8> {
-            (0..text.len() / 2)
-                .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap())
-                .collect()
-        };
-
         let mut checked = 0;
 
         for kind in ["GFSbox", "KeySbox", "VarKey", "VarTxt"] {

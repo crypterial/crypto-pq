@@ -4,30 +4,10 @@ use crypto_pq::{
     CSHAKE128, CSHAKE256, Error, KMAC128, KMAC256, MacAlgorithm, MacOptions, SHAKE128, SHAKE256,
     XofAlgorithm, XofOptions, hazmat,
 };
-use vectors::{records, unhex};
+use vectors::{pieces, records, unhex};
 
 // Uneven sizes reach every buffering path: empty updates, partial blocks and whole blocks.
 const PIECES: [usize; 8] = [0, 1, 135, 136, 137, 168, 7, 300];
-
-fn pieces(data: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-
-    let mut offset = 0;
-
-    for size in PIECES.iter().cycle() {
-        if offset >= data.len() {
-            break;
-        }
-
-        let end = (offset + size).min(data.len());
-
-        out.push(&data[offset..end]);
-
-        offset = end;
-    }
-
-    out
-}
 
 fn cshake(name: &str) -> XofAlgorithm {
     match name {
@@ -60,7 +40,7 @@ fn check_xof(algorithm: XofAlgorithm, data: &[u8], expected: &[u8], context: &st
 
     let mut xof = algorithm.create();
 
-    for piece in pieces(data) {
+    for piece in pieces(data, &PIECES) {
         xof.update(piece);
     }
 
@@ -90,7 +70,7 @@ fn check_mac(algorithm: MacAlgorithm, key: &[u8], data: &[u8], expected: &[u8], 
 
     let mut mac = algorithm.create(key);
 
-    for piece in pieces(data) {
+    for piece in pieces(data, &PIECES) {
         mac.update(piece);
     }
 

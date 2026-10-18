@@ -1,30 +1,10 @@
 mod vectors;
 
 use crypto_pq::{ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, Error, XofAlgorithm, XofOptions};
-use vectors::{records, unhex};
+use vectors::{pieces, records, unhex};
 
 // Uneven sizes reach every buffering path: empty updates, partial words and whole words.
 const PIECES: [usize; 7] = [0, 1, 7, 8, 9, 3, 16];
-
-fn pieces(data: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-
-    let mut offset = 0;
-
-    for size in PIECES.iter().cycle() {
-        if offset >= data.len() {
-            break;
-        }
-
-        let end = (offset + size).min(data.len());
-
-        out.push(&data[offset..end]);
-
-        offset = end;
-    }
-
-    out
-}
 
 fn check_xof(algorithm: XofAlgorithm, data: &[u8], expected: &[u8], context: &str) {
     assert_eq!(
@@ -35,13 +15,13 @@ fn check_xof(algorithm: XofAlgorithm, data: &[u8], expected: &[u8], context: &st
 
     let mut xof = algorithm.create();
 
-    for piece in pieces(data) {
+    for piece in pieces(data, &PIECES) {
         xof.update(piece);
     }
 
     let mut out = Vec::new();
 
-    for piece in pieces(expected) {
+    for piece in pieces(expected, &PIECES) {
         out.extend(xof.read(piece.len()));
     }
 
@@ -65,7 +45,7 @@ fn designers_kats() {
 
         let mut hasher = ASCON_HASH256.create();
 
-        for piece in pieces(&data) {
+        for piece in pieces(&data, &PIECES) {
             hasher.update(piece);
         }
 

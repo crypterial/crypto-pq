@@ -3,7 +3,7 @@ mod vectors;
 use crypto_pq::{
     Error, KemAlgorithm, KeyFormat, KeyGenOptions, ML_KEM_512, ML_KEM_768, ML_KEM_1024, hazmat,
 };
-use vectors::{der, parallel, pem, records, unhex};
+use vectors::{der, example_keys, parallel, records, unhex};
 
 const ALGORITHMS: [(&str, KemAlgorithm); 3] = [
     ("ML-KEM-512", ML_KEM_512),
@@ -738,69 +738,31 @@ fn concurrent_first_use() {
 const PENDING_PAIRWISE_TEST: &str =
     "C.4.1 ML-KEM Inconsistent Seed and Expanded Private Keys example 2";
 
-// RFC 9935, Appendix C: every example key in DER and PEM, its public key and what it exports as;
-// the inconsistent seed and expanded keys of C.4 must be refused.
+// RFC 9935, Appendix C: every example key, its public key and what it exports as; the
+// inconsistent seed and expanded keys of C.4 must be refused.
 #[test]
 fn rfc9935_example_keys() {
-    for (_, record) in records("rfc/mlkem_keys.txt", "der") {
-        if record["name"] == PENDING_PAIRWISE_TEST {
-            continue;
-        }
+    example_keys(
+        "rfc/mlkem_keys.txt",
+        &[PENDING_PAIRWISE_TEST],
+        |record, data, format| {
+            let algorithm = algorithm(&record["algorithm"]);
 
-        let algorithm = algorithm(&record["algorithm"]);
+            if record["kind"] == "public" {
+                let key = algorithm.import_public_key(data, format)?;
 
-        let context = format!("RFC 9935 {}", record["name"]);
+                Ok((
+                    key.export_key(KeyFormat::Raw)?,
+                    key.export_key(KeyFormat::Der)?,
+                ))
+            } else {
+                let key = algorithm.import_private_key(data, format)?;
 
-        let der_key = unhex(&record["der"]);
-
-        let pem_key = pem(&record["label"], &record["pem"]);
-
-        let public = unhex(&record["public"]);
-
-        if record["kind"] == "public" {
-            for (data, format) in [
-                (&der_key[..], KeyFormat::Der),
-                (pem_key.as_bytes(), KeyFormat::Pem),
-            ] {
-                let key = algorithm.import_public_key(data, format).unwrap();
-
-                assert_eq!(key.export_key(KeyFormat::Raw).unwrap(), public, "{context}");
-
-                assert_eq!(
-                    key.export_key(KeyFormat::Der).unwrap(),
-                    unhex(&record["exportDer"]),
-                    "{context}"
-                );
+                Ok((
+                    key.public_key().export_key(KeyFormat::Raw)?,
+                    key.export_key(KeyFormat::Der)?,
+                ))
             }
-
-            continue;
-        }
-
-        for (data, format) in [
-            (&der_key[..], KeyFormat::Der),
-            (pem_key.as_bytes(), KeyFormat::Pem),
-        ] {
-            let result = algorithm.import_private_key(data, format);
-
-            if record["expect"] == "reject" {
-                assert_eq!(result.err(), Some(Error::InvalidPrivateKey), "{context}");
-
-                continue;
-            }
-
-            let key = result.unwrap_or_else(|error| panic!("{context}: {error}"));
-
-            assert_eq!(
-                key.public_key().export_key(KeyFormat::Raw).unwrap(),
-                public,
-                "{context}"
-            );
-
-            assert_eq!(
-                key.export_key(KeyFormat::Der).unwrap(),
-                unhex(&record["exportDer"]),
-                "{context}"
-            );
-        }
-    }
+        },
+    );
 }

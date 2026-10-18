@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::path::Path;
+mod vectors;
 
 use crypto_pq::{
     ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_512, BLAKE2S_256, CSHAKE128, CSHAKE256,
@@ -8,8 +7,7 @@ use crypto_pq::{
     SHA_512_256, SHA3_224, SHA3_256, SHA3_384, SHA3_512, SHAKE128, SHAKE256, SLH_DSA_SHAKE_128F,
     SignOptions, VerifyOptions, XofAlgorithm, XofOptions, hazmat,
 };
-
-type Fields = HashMap<String, String>;
+use vectors::{Fields, parallel, pieces, records, unhex};
 
 const HASHES: [(&str, &str, HashAlgorithm); 10] = [
     ("SHA224", "SHA-224", SHA_224),
@@ -37,106 +35,26 @@ const HMACS: [(&str, &str, MacAlgorithm); 4] = [
 // Uneven sizes reach every buffering path: empty updates, partial blocks and whole blocks.
 const PIECES: [usize; 10] = [0, 1, 3, 64, 7, 136, 128, 168, 0, 200];
 
-fn records(name: &str, field: &str) -> Vec<(Fields, Fields)> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../vectors/cavp")
-        .join(name);
-
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-
-    let mut header = Fields::new();
-
-    let mut record = Fields::new();
-
-    let mut found = Vec::new();
-
-    for line in text.lines().chain([""]) {
-        let line = line.trim();
-
-        if let Some(inner) = line
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            let (key, value) = inner.split_once('=').unwrap_or((inner, ""));
-
-            header.insert(key.trim().to_owned(), value.trim().to_owned());
-        } else if let Some((key, value)) = line.split_once('=').filter(|_| !line.starts_with('#')) {
-            record.insert(key.trim().to_owned(), value.trim().to_owned());
-        } else if !record.is_empty() {
-            found.push((header.clone(), std::mem::take(&mut record)));
-        }
-    }
-
-    let prefix = format!("{field} =");
-
-    let expected = text
-        .lines()
-        .filter(|line| line.starts_with(&prefix))
-        .count();
-
-    let parsed = found
-        .iter()
-        .filter(|(_, record)| record.contains_key(field))
-        .count();
-
-    assert!(
-        expected > 0 && parsed == expected,
-        "{name}: parsed {parsed} records, expected {expected}"
-    );
-
-    found
-}
-
-fn hex(text: &str) -> Vec<u8> {
-    assert_eq!(text.len() % 2, 0, "odd hex length");
-
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex"))
-        .collect()
-}
-
 fn message(record: &Fields) -> Vec<u8> {
     let bits: usize = record["Len"].parse().expect("Len");
 
     assert_eq!(bits % 8, 0, "bit-oriented message");
 
-    let mut data = hex(&record["Msg"]);
+    let mut data = unhex(&record["Msg"]);
 
     data.truncate(bits / 8);
 
     data
 }
 
-fn pieces(data: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-
-    let mut offset = 0;
-
-    for size in PIECES.iter().cycle() {
-        if offset >= data.len() {
-            break;
-        }
-
-        let end = (offset + size).min(data.len());
-
-        out.push(&data[offset..end]);
-
-        offset = end;
-    }
-
-    out
-}
-
 #[test]
 fn hash_vectors() {
     for (prefix, _, algorithm) in HASHES {
         for kind in ["ShortMsg", "LongMsg"] {
-            for (_, record) in records(&format!("{prefix}{kind}.rsp"), "MD") {
+            for (_, record) in records(&format!("cavp/{prefix}{kind}.rsp"), "MD") {
                 let data = message(&record);
 
-                let expected = hex(&record["MD"]);
+                let expected = unhex(&record["MD"]);
 
                 assert_eq!(
                     algorithm.digest(&data),
@@ -147,7 +65,7 @@ fn hash_vectors() {
 
                 let mut hasher = algorithm.create();
 
-                for piece in pieces(&data) {
+                for piece in pieces(&data, &PIECES) {
                     hasher.update(piece);
                 }
 
@@ -162,40 +80,26 @@ fn hash_vectors() {
     }
 }
 
-// SHAVS 6.4 and SHA3VS 6.2.3: each checkpoint chains 1000 digests from the previous one.
+// SHAVS 6.4 and SHA3VS 6.2.3, the 100 checkpoints of each chain.
 #[test]
 fn hash_monte_carlo() {
     for (prefix, _, algorithm) in HASHES {
-        let found = records(&format!("{prefix}Monte.rsp"), "MD");
+        let found = records(&format!("cavp/{prefix}Monte.rsp"), "MD");
 
-        let mut seed = hex(&found[0].1["Seed"]);
+        let seed = unhex(&found[0].1["Seed"]);
 
-        for (_, record) in &found[1..] {
-            if prefix.starts_with("SHA3_") {
-                for _ in 0..1000 {
-                    seed = algorithm.digest(&seed);
-                }
-            } else {
-                let mut md = [seed.clone(), seed.clone(), seed];
+        let checkpoints = if prefix.starts_with("SHA3_") {
+            sha3_monte_carlo(algorithm, seed)
+        } else {
+            sha2_monte_carlo(algorithm, seed, false)
+        };
 
-                for _ in 0..1000 {
-                    let next = algorithm.digest(&md.concat());
+        let expected: Vec<_> = found[1..]
+            .iter()
+            .map(|(_, record)| unhex(&record["MD"]))
+            .collect();
 
-                    md.rotate_left(1);
-
-                    md[2] = next;
-                }
-
-                seed = md[2].clone();
-            }
-
-            assert_eq!(
-                seed,
-                hex(&record["MD"]),
-                "{prefix}Monte COUNT = {}",
-                record["COUNT"]
-            );
-        }
+        assert_eq!(checkpoints, expected, "{prefix}Monte");
     }
 }
 
@@ -312,10 +216,10 @@ fn hash_properties() {
 fn xof_vectors() {
     for (prefix, algorithm) in XOFS {
         for kind in ["ShortMsg", "LongMsg"] {
-            for (header, record) in records(&format!("{prefix}{kind}.rsp"), "Output") {
+            for (header, record) in records(&format!("cavp/{prefix}{kind}.rsp"), "Output") {
                 let data = message(&record);
 
-                let expected = hex(&record["Output"]);
+                let expected = unhex(&record["Output"]);
 
                 assert_eq!(
                     header["Outputlen"].parse::<usize>().expect("Outputlen"),
@@ -331,7 +235,7 @@ fn xof_vectors() {
 
                 let mut xof = algorithm.create();
 
-                for piece in pieces(&data) {
+                for piece in pieces(&data, &PIECES) {
                     xof.update(piece);
                 }
 
@@ -347,8 +251,8 @@ fn xof_vectors() {
             }
         }
 
-        for (_, record) in records(&format!("{prefix}VariableOut.rsp"), "Output") {
-            let expected = hex(&record["Output"]);
+        for (_, record) in records(&format!("cavp/{prefix}VariableOut.rsp"), "Output") {
+            let expected = unhex(&record["Output"]);
 
             assert_eq!(
                 record["Outputlen"].parse::<usize>().expect("Outputlen"),
@@ -356,7 +260,7 @@ fn xof_vectors() {
             );
 
             assert_eq!(
-                algorithm.digest(&hex(&record["Msg"]), expected.len()),
+                algorithm.digest(&unhex(&record["Msg"]), expected.len()),
                 expected,
                 "{prefix}VariableOut COUNT = {}",
                 record["COUNT"]
@@ -370,47 +274,25 @@ fn xof_vectors() {
 #[test]
 fn xof_monte_carlo() {
     for (prefix, algorithm) in XOFS {
-        let found = records(&format!("{prefix}Monte.rsp"), "Output");
+        let found = records(&format!("cavp/{prefix}Monte.rsp"), "Output");
 
         let (header, first) = &found[0];
 
         let bits = |key: &str| header[key].parse::<usize>().expect(key);
 
-        let minimum = bits("Minimum Output Length (bits)") / 8;
+        let checkpoints = shake_monte_carlo(
+            algorithm,
+            unhex(&first["Msg"]),
+            bits("Minimum Output Length (bits)") / 8,
+            bits("Maximum Output Length (bits)") / 8,
+        );
 
-        let maximum = bits("Maximum Output Length (bits)") / 8;
+        let expected: Vec<_> = found[1..]
+            .iter()
+            .map(|(_, record)| unhex(&record["Output"]))
+            .collect();
 
-        let mut output = hex(&first["Msg"]);
-
-        let mut length = maximum;
-
-        for (_, record) in &found[1..] {
-            for _ in 0..1000 {
-                let mut message = [0u8; 16];
-
-                let n = output.len().min(16);
-
-                message[..n].copy_from_slice(&output[..n]);
-
-                output = algorithm.digest(&message, length);
-
-                let last = u16::from_be_bytes([output[output.len() - 2], output[output.len() - 1]]);
-
-                length = minimum + usize::from(last) % (maximum - minimum + 1);
-            }
-
-            assert_eq!(
-                output,
-                hex(&record["Output"]),
-                "{prefix}Monte COUNT = {}",
-                record["COUNT"]
-            );
-
-            assert_eq!(
-                8 * output.len(),
-                record["Outputlen"].parse::<usize>().expect("Outputlen")
-            );
-        }
+        assert_eq!(checkpoints, expected, "{prefix}Monte");
     }
 }
 
@@ -453,7 +335,7 @@ fn xof_properties() {
 fn hmac_vectors() {
     let mut tested = 0;
 
-    for (header, record) in records("HMAC.rsp", "Mac") {
+    for (header, record) in records("cavp/HMAC.rsp", "Mac") {
         if header["L"] == "20" {
             continue;
         }
@@ -463,11 +345,11 @@ fn hmac_vectors() {
             .find(|(length, _, _)| *length == header["L"])
             .expect("digest length");
 
-        let key = hex(&record["Key"]);
+        let key = unhex(&record["Key"]);
 
-        let data = hex(&record["Msg"]);
+        let data = unhex(&record["Msg"]);
 
-        let mac = hex(&record["Mac"]);
+        let mac = unhex(&record["Mac"]);
 
         let context = format!("L = {} Count = {}", header["L"], record["Count"]);
 
@@ -489,7 +371,7 @@ fn hmac_vectors() {
 
         let mut hmac = algorithm.create(&key);
 
-        for piece in pieces(&data) {
+        for piece in pieces(&data, &PIECES) {
             hmac.update(piece);
         }
 
@@ -657,4 +539,319 @@ fn unapproved_pre_hashes_are_refused() {
 
         assert!(pair.public_key.verify(&signed, b"message", &options));
     }
+}
+
+// ACVP names the SHA-2 functions SHA2-*, and SHAKE with a hyphen.
+fn acvp_hash(name: &str) -> HashAlgorithm {
+    let name = name.replacen("SHA2-", "SHA-", 1);
+
+    HASHES
+        .iter()
+        .find(|(_, known, _)| *known == name)
+        .map(|&(_, _, algorithm)| algorithm)
+        .unwrap_or_else(|| panic!("unknown algorithm {name}"))
+}
+
+fn acvp_xof(name: &str) -> XofAlgorithm {
+    let name = name.replace('-', "");
+
+    XOFS.iter()
+        .find(|(known, _)| *known == name)
+        .map(|&(_, algorithm)| algorithm)
+        .unwrap_or_else(|| panic!("unknown algorithm {name}"))
+}
+
+fn acvp_mac(name: &str) -> MacAlgorithm {
+    let name = name.replacen("SHA2-", "SHA-", 1);
+
+    HMACS
+        .iter()
+        .find(|(_, known, _)| *known == name)
+        .map(|&(_, _, algorithm)| algorithm)
+        .unwrap_or_else(|| panic!("unknown algorithm {name}"))
+}
+
+fn context(header: &Fields, record: &Fields) -> String {
+    format!(
+        "{} {} tcId {}",
+        header["algorithm"], header["testType"], record["tcId"]
+    )
+}
+
+// SHAVS 6.4: each checkpoint chains 1000 digests of the last three. The alternate procedure of
+// ACVP keeps every message at the length of the seed, cut or padded with zeros.
+fn sha2_monte_carlo(algorithm: HashAlgorithm, seed: Vec<u8>, alternate: bool) -> Vec<Vec<u8>> {
+    let length = seed.len();
+
+    let mut md = [seed.clone(), seed.clone(), seed];
+
+    let mut checkpoints = Vec::new();
+
+    for _ in 0..100 {
+        for _ in 0..1000 {
+            let mut message = md.concat();
+
+            if alternate {
+                message.resize(length, 0);
+            }
+
+            let next = algorithm.digest(&message);
+
+            md.rotate_left(1);
+
+            md[2] = next;
+        }
+
+        checkpoints.push(md[2].clone());
+
+        md = [md[2].clone(), md[2].clone(), md[2].clone()];
+    }
+
+    checkpoints
+}
+
+// SHA3VS 6.2.3: each checkpoint chains 1000 digests from the previous one.
+fn sha3_monte_carlo(algorithm: HashAlgorithm, mut seed: Vec<u8>) -> Vec<Vec<u8>> {
+    let mut checkpoints = Vec::new();
+
+    for _ in 0..100 {
+        for _ in 0..1000 {
+            seed = algorithm.digest(&seed);
+        }
+
+        checkpoints.push(seed.clone());
+    }
+
+    checkpoints
+}
+
+// SHA3VS 6.3.3 in bytes: each message is the first 16 bytes of the previous output, and the next
+// output length comes from its last 16 bits, within the group's bounds.
+fn shake_monte_carlo(
+    algorithm: XofAlgorithm,
+    seed: Vec<u8>,
+    minimum: usize,
+    maximum: usize,
+) -> Vec<Vec<u8>> {
+    let range = maximum - minimum + 1;
+
+    let mut length = maximum;
+
+    let mut output = seed;
+
+    let mut checkpoints = Vec::new();
+
+    for _ in 0..100 {
+        for _ in 0..1000 {
+            let mut message = [0u8; 16];
+
+            let used = output.len().min(16);
+
+            message[..used].copy_from_slice(&output[..used]);
+
+            output = algorithm.digest(&message, length);
+
+            let last = u16::from_be_bytes([output[output.len() - 2], output[output.len() - 1]]);
+
+            length = minimum + usize::from(last) % range;
+        }
+
+        checkpoints.push(output.clone());
+    }
+
+    checkpoints
+}
+
+fn expected_checkpoints(record: &Fields) -> Vec<Vec<u8>> {
+    record["results"]
+        .split(',')
+        .map(|result| unhex(result.split_once(':').map_or(result, |(md, _)| md)))
+        .collect()
+}
+
+// ACVP SHA2 and SHA3, the groups whose lengths are whole bytes: AFT one-shot and streamed, and
+// the Monte Carlo chains.
+#[test]
+fn acvp_hashes() {
+    let mut found = records("acvp/SHA2.txt", "tcId");
+
+    found.extend(records("acvp/SHA3.txt", "tcId"));
+
+    parallel(&found, |(header, record)| {
+        let algorithm = acvp_hash(&header["algorithm"]);
+
+        let context = context(header, record);
+
+        let message = unhex(&record["msg"]);
+
+        match header["testType"].as_str() {
+            "AFT" => {
+                let expected = unhex(&record["md"]);
+
+                assert_eq!(algorithm.digest(&message), expected, "{context}");
+
+                let mut hasher = algorithm.create();
+
+                for piece in pieces(&message, &PIECES) {
+                    hasher.update(piece);
+                }
+
+                assert_eq!(hasher.digest(), expected, "{context} streamed");
+            }
+            "MCT" => {
+                let checkpoints = if header["algorithm"].starts_with("SHA3") {
+                    sha3_monte_carlo(algorithm, message)
+                } else {
+                    sha2_monte_carlo(algorithm, message, header["mctVersion"] == "alternate")
+                };
+
+                assert_eq!(checkpoints, expected_checkpoints(record), "{context}");
+            }
+            kind => panic!("unknown test type {kind}"),
+        }
+    });
+}
+
+// ACVP SHAKE: AFT and VOT one-shot and streamed in two reads, and the Monte Carlo chains.
+#[test]
+fn acvp_xofs() {
+    parallel(&records("acvp/SHAKE.txt", "tcId"), |(header, record)| {
+        let algorithm = acvp_xof(&header["algorithm"]);
+
+        let context = context(header, record);
+
+        let message = unhex(&record["msg"]);
+
+        match header["testType"].as_str() {
+            "AFT" | "VOT" => {
+                let expected = unhex(&record["md"]);
+
+                let length: usize = record["outLen"].parse().expect("outLen");
+
+                assert_eq!(length, 8 * expected.len(), "{context}");
+
+                assert_eq!(
+                    algorithm.digest(&message, expected.len()),
+                    expected,
+                    "{context}"
+                );
+
+                let mut xof = algorithm.create();
+
+                for piece in pieces(&message, &PIECES) {
+                    xof.update(piece);
+                }
+
+                let mut output = xof.read(expected.len() / 3);
+
+                output.extend(xof.read(expected.len() - output.len()));
+
+                assert_eq!(output, expected, "{context} streamed");
+            }
+            "MCT" => {
+                let bits = |key: &str| header[key].parse::<usize>().expect(key);
+
+                let checkpoints = shake_monte_carlo(
+                    algorithm,
+                    message,
+                    bits("minOutLen") / 8,
+                    bits("maxOutLen") / 8,
+                );
+
+                let expected = expected_checkpoints(record);
+
+                let bits: Vec<usize> = record["results"]
+                    .split(',')
+                    .map(|result| result.split_once(':').expect("md:bits").1.parse().unwrap())
+                    .collect();
+
+                let lengths: Vec<usize> = checkpoints.iter().map(|md| 8 * md.len()).collect();
+
+                assert_eq!(lengths, bits, "{context}");
+
+                assert_eq!(checkpoints, expected, "{context}");
+            }
+            kind => panic!("unknown test type {kind}"),
+        }
+    });
+}
+
+fn check_hmac(header: &Fields, record: &Fields, context: &str) {
+    let algorithm = acvp_mac(&header["algorithm"]);
+
+    let (key, message, expected) = (
+        unhex(&record["key"]),
+        unhex(&record["msg"]),
+        unhex(&record["mac"]),
+    );
+
+    let tag = algorithm.digest(&key, &message);
+
+    assert_eq!(tag[..expected.len()], expected[..], "{context}");
+
+    let mut mac = algorithm.create(&key);
+
+    for piece in pieces(&message, &PIECES) {
+        mac.update(piece);
+    }
+
+    assert_eq!(mac.digest(), tag, "{context} streamed");
+
+    assert!(algorithm.verify(&key, &message, &tag), "{context} verify");
+}
+
+// ACVP HMAC-SHA2, whose tags may be truncated: the computed tag must start with the expected one.
+#[test]
+fn acvp_hmac() {
+    parallel(&records("acvp/HMAC.txt", "tcId"), |(header, record)| {
+        check_hmac(header, record, &context(header, record));
+    });
+}
+
+// RFC 4231, Section 4: test cases 1 to 7, case 5 with a tag truncated to 128 bits.
+#[test]
+fn rfc4231() {
+    for (header, record) in records("rfc/hmac.txt", "tcId") {
+        let context = format!("RFC 4231 {} case {}", header["algorithm"], record["tcId"]);
+
+        check_hmac(&header, &record, &context);
+    }
+}
+
+// ACVP large-data tests: the content repeats to 1, 2, 4 and 8 GiB, hashed in 1 MiB pieces.
+#[test]
+#[ignore = "weekly (fuzz.yml): hashes 150 GiB"]
+fn acvp_large_data() {
+    parallel(
+        &records("acvp-full/large-data.txt", "tcId"),
+        |(header, record)| {
+            let algorithm = acvp_hash(&header["algorithm"]);
+
+            let content = unhex(&record["content"]);
+
+            let chunk: Vec<u8> = content.iter().copied().cycle().take(1 << 20).collect();
+
+            assert_eq!(chunk.len() % content.len(), 0);
+
+            let mut left: u64 = record["length"].parse().expect("length");
+
+            let mut hasher = algorithm.create();
+
+            while left > 0 {
+                let size = left.min(chunk.len() as u64) as usize;
+
+                hasher.update(&chunk[..size]);
+
+                left -= size as u64;
+            }
+
+            assert_eq!(
+                hasher.digest(),
+                unhex(&record["md"]),
+                "{} tcId {}",
+                header["algorithm"],
+                record["tcId"]
+            );
+        },
+    );
 }

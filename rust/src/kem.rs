@@ -414,10 +414,8 @@ impl KemPublicKey {
                 &pkh[..p.shared_secret_size()],
                 randomness,
             ),
-            (Scheme::MlKem(p, _), _) => mlkem::encaps_internal(form.mlkem(), randomness, &p),
-            (Scheme::Frodo(_), Form::MlKem(_)) => {
-                unreachable!("a FrodoKEM scheme has a FrodoKEM form")
-            }
+            (Scheme::MlKem(p, _), Form::MlKem(key)) => mlkem::encaps_internal(key, randomness, &p),
+            _ => unreachable!("a public key's form follows its scheme"),
         };
 
         let encapsulation = Encapsulation {

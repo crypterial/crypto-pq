@@ -5,7 +5,7 @@ use crypto_pq::{
     BLAKE2S_224, BLAKE2S_256, BLAKE2S_MAC, Error, HashAlgorithm, HashOptions, MacAlgorithm,
     MacOptions, SHA_256,
 };
-use vectors::{records, unhex};
+use vectors::{pieces, records, unhex};
 
 const HASHES: [HashAlgorithm; 8] = [
     BLAKE2B_160,
@@ -20,26 +20,6 @@ const HASHES: [HashAlgorithm; 8] = [
 
 // Uneven sizes reach every buffering path: empty updates, partial blocks and whole blocks.
 const PIECES: [usize; 8] = [0, 1, 63, 64, 65, 128, 7, 200];
-
-fn pieces(data: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-
-    let mut offset = 0;
-
-    for size in PIECES.iter().cycle() {
-        if offset >= data.len() {
-            break;
-        }
-
-        let end = (offset + size).min(data.len());
-
-        out.push(&data[offset..end]);
-
-        offset = end;
-    }
-
-    out
-}
 
 // The function of a header name and digest length: the hash at an RFC 7693 size, or the MAC.
 fn hash(name: &str, digest_length: usize) -> HashAlgorithm {
@@ -77,7 +57,7 @@ fn check_hash(algorithm: HashAlgorithm, data: &[u8], expected: &[u8], context: &
 
     let mut hasher = algorithm.create();
 
-    for piece in pieces(data) {
+    for piece in pieces(data, &PIECES) {
         hasher.update(piece);
     }
 
@@ -91,7 +71,7 @@ fn check_mac(algorithm: MacAlgorithm, key: &[u8], data: &[u8], expected: &[u8], 
 
     let mut mac = algorithm.create(key);
 
-    for piece in pieces(data) {
+    for piece in pieces(data, &PIECES) {
         mac.update(piece);
     }
 

@@ -3,9 +3,9 @@ mod vectors;
 use crypto_pq::{
     Error, KeyFormat, KeyGenOptions, ML_DSA_44, ML_DSA_65, ML_DSA_87, PreHash, SHA_224, SHA_256,
     SHA_384, SHA_512, SHA_512_224, SHA_512_256, SHA3_224, SHA3_256, SHA3_384, SHA3_512, SHAKE128,
-    SHAKE256, SignOptions, SignatureAlgorithm, VerifyOptions, hazmat,
+    SHAKE256, SignOptions, SignatureAlgorithm, SignaturePrivateKey, VerifyOptions, hazmat,
 };
-use vectors::{Fields, der, parallel, pem, records, unhex};
+use vectors::{Fields, der, example_keys, parallel, records, unhex};
 
 const ALGORITHMS: [(&str, SignatureAlgorithm); 3] = [
     ("ML-DSA-44", ML_DSA_44),
@@ -302,8 +302,6 @@ fn wycheproof_deterministic_signing() {
 
         let seed = unhex(&header["privateSeed"]);
 
-        let context_bytes = unhex(record.get("ctx").map_or("", String::as_str));
-
         let flags = record.get("flags").map_or("", String::as_str);
 
         let context = format!("tcId {} {}", record["tcId"], header["parameterSet"]);
@@ -326,44 +324,7 @@ fn wycheproof_deterministic_signing() {
                 .unwrap()
         };
 
-        let pk = private_key.public_key().export_key(KeyFormat::Raw).unwrap();
-
-        assert_eq!(pk, unhex(&header["publicKey"]), "{context}");
-
-        let message = unhex(&record["msg"]);
-
-        if flags.contains("InvalidContext") {
-            let options = SignOptions {
-                context: &context_bytes,
-                ..SignOptions::default()
-            };
-
-            let result = private_key.sign(&message, &options);
-
-            assert_eq!(result.err(), Some(Error::InvalidContext), "{context}");
-        } else if flags.contains("Randomized") {
-            let options = VerifyOptions {
-                context: &context_bytes,
-                ..VerifyOptions::default()
-            };
-
-            let public_key = private_key.public_key();
-
-            assert!(
-                public_key.verify(&unhex(&record["sig"]), &message, &options),
-                "{context}"
-            );
-        } else {
-            let options = SignOptions {
-                context: &context_bytes,
-                deterministic: true,
-                ..SignOptions::default()
-            };
-
-            let signature = private_key.sign(&message, &options).unwrap();
-
-            assert_eq!(signature, unhex(&record["sig"]), "{context}");
-        }
+        check_wycheproof_signing(&private_key, header, record, &context);
     });
 }
 
@@ -407,105 +368,85 @@ fn wycheproof_expanded_key_signing() {
 
         let private_key = imported.unwrap_or_else(|error| panic!("{context}: {error}"));
 
-        let pk = private_key.public_key().export_key(KeyFormat::Raw).unwrap();
-
-        assert_eq!(pk, unhex(&header["publicKey"]), "{context}");
-
-        let message = unhex(&record["msg"]);
-
-        let context_bytes = unhex(record.get("ctx").map_or("", String::as_str));
-
-        if flags.contains("InvalidContext") {
-            let options = SignOptions {
-                context: &context_bytes,
-                ..SignOptions::default()
-            };
-
-            let result = private_key.sign(&message, &options);
-
-            assert_eq!(result.err(), Some(Error::InvalidContext), "{context}");
-        } else if flags.contains("Randomized") {
-            let options = VerifyOptions {
-                context: &context_bytes,
-                ..VerifyOptions::default()
-            };
-
-            assert!(
-                private_key
-                    .public_key()
-                    .verify(&unhex(&record["sig"]), &message, &options),
-                "{context}"
-            );
-        } else {
-            let options = SignOptions {
-                context: &context_bytes,
-                deterministic: true,
-                ..SignOptions::default()
-            };
-
-            let signature = private_key.sign(&message, &options).unwrap();
-
-            assert_eq!(signature, unhex(&record["sig"]), "{context}");
-        }
+        check_wycheproof_signing(&private_key, header, record, &context);
     });
 }
 
-// RFC 9881, Appendix C: every example key in DER and PEM, its public key and what it exports as;
-// the inconsistent seed and expanded keys of C.4 must be refused.
+// The public key, then by the flags: a refused context, a randomized signature that verifies, or
+// the deterministic signature.
+fn check_wycheproof_signing(
+    private_key: &SignaturePrivateKey,
+    header: &Fields,
+    record: &Fields,
+    context: &str,
+) {
+    let pk = private_key.public_key().export_key(KeyFormat::Raw).unwrap();
+
+    assert_eq!(pk, unhex(&header["publicKey"]), "{context}");
+
+    let message = unhex(&record["msg"]);
+
+    let context_bytes = unhex(record.get("ctx").map_or("", String::as_str));
+
+    let flags = record.get("flags").map_or("", String::as_str);
+
+    if flags.contains("InvalidContext") {
+        let options = SignOptions {
+            context: &context_bytes,
+            ..SignOptions::default()
+        };
+
+        let result = private_key.sign(&message, &options);
+
+        assert_eq!(result.err(), Some(Error::InvalidContext), "{context}");
+    } else if flags.contains("Randomized") {
+        let options = VerifyOptions {
+            context: &context_bytes,
+            ..VerifyOptions::default()
+        };
+
+        assert!(
+            private_key
+                .public_key()
+                .verify(&unhex(&record["sig"]), &message, &options),
+            "{context}"
+        );
+    } else {
+        let options = SignOptions {
+            context: &context_bytes,
+            deterministic: true,
+            ..SignOptions::default()
+        };
+
+        let signature = private_key.sign(&message, &options).unwrap();
+
+        assert_eq!(signature, unhex(&record["sig"]), "{context}");
+    }
+}
+
+// RFC 9881, Appendix C: every example key, its public key and what it exports as; the
+// inconsistent seed and expanded keys of C.4 must be refused.
 #[test]
 fn rfc9881_example_keys() {
-    for (_, record) in records("rfc/mldsa_keys.txt", "der") {
+    example_keys("rfc/mldsa_keys.txt", &[], |record, data, format| {
         let algorithm = algorithm(&record["algorithm"]);
 
-        let context = format!("RFC 9881 {}", record["name"]);
+        if record["kind"] == "public" {
+            let key = algorithm.import_public_key(data, format)?;
 
-        let der_key = unhex(&record["der"]);
+            Ok((
+                key.export_key(KeyFormat::Raw)?,
+                key.export_key(KeyFormat::Der)?,
+            ))
+        } else {
+            let key = algorithm.import_private_key(data, format)?;
 
-        let pem_key = pem(&record["label"], &record["pem"]);
-
-        let public = unhex(&record["public"]);
-
-        for (data, format) in [
-            (&der_key[..], KeyFormat::Der),
-            (pem_key.as_bytes(), KeyFormat::Pem),
-        ] {
-            if record["kind"] == "public" {
-                let key = algorithm.import_public_key(data, format).unwrap();
-
-                assert_eq!(key.export_key(KeyFormat::Raw).unwrap(), public, "{context}");
-
-                assert_eq!(
-                    key.export_key(KeyFormat::Der).unwrap(),
-                    unhex(&record["exportDer"]),
-                    "{context}"
-                );
-
-                continue;
-            }
-
-            let result = algorithm.import_private_key(data, format);
-
-            if record["expect"] == "reject" {
-                assert_eq!(result.err(), Some(Error::InvalidPrivateKey), "{context}");
-
-                continue;
-            }
-
-            let key = result.unwrap_or_else(|error| panic!("{context}: {error}"));
-
-            assert_eq!(
-                key.public_key().export_key(KeyFormat::Raw).unwrap(),
-                public,
-                "{context}"
-            );
-
-            assert_eq!(
-                key.export_key(KeyFormat::Der).unwrap(),
-                unhex(&record["exportDer"]),
-                "{context}"
-            );
+            Ok((
+                key.public_key().export_key(KeyFormat::Raw)?,
+                key.export_key(KeyFormat::Der)?,
+            ))
         }
-    }
+    });
 }
 
 #[test]

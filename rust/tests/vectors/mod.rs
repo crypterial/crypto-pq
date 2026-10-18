@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crypto_pq::{Error, KeyFormat};
+
 pub type Fields = HashMap<String, String>;
 
 // Checks the items on every core; a failed assertion in any worker fails the test.
@@ -115,4 +117,63 @@ pub fn pem(label: &str, lines: &str) -> String {
         "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
         lines.replace('|', "\n")
     )
+}
+
+// Cuts data into pieces of the given sizes, repeated, for streaming tests.
+pub fn pieces<'a>(data: &'a [u8], sizes: &[usize]) -> Vec<&'a [u8]> {
+    let mut out = Vec::new();
+
+    let mut offset = 0;
+
+    for size in sizes.iter().cycle() {
+        if offset >= data.len() {
+            break;
+        }
+
+        let end = (offset + size).min(data.len());
+
+        out.push(&data[offset..end]);
+
+        offset = end;
+    }
+
+    out
+}
+
+// The example keys of an RFC appendix (RFC 9935, RFC 9881), each in DER and PEM. `import` imports
+// one as the algorithm and kind of its record and gives the raw public key and the DER export;
+// the keys marked reject must fail with INVALID_PRIVATE_KEY. `skip` names records left out.
+pub fn example_keys(
+    name: &str,
+    skip: &[&str],
+    import: impl Fn(&Fields, &[u8], KeyFormat) -> Result<(Vec<u8>, Vec<u8>), Error>,
+) {
+    for (_, record) in records(name, "der") {
+        if skip.contains(&record["name"].as_str()) {
+            continue;
+        }
+
+        let context = format!("{name}: {}", record["name"]);
+
+        let pem_key = pem(&record["label"], &record["pem"]);
+
+        for (data, format) in [
+            (unhex(&record["der"]), KeyFormat::Der),
+            (pem_key.into_bytes(), KeyFormat::Pem),
+        ] {
+            let result = import(&record, &data, format);
+
+            if record["expect"] == "reject" {
+                assert_eq!(result.err(), Some(Error::InvalidPrivateKey), "{context}");
+
+                continue;
+            }
+
+            let (public, exported) = result.unwrap_or_else(|error| panic!("{context}: {error}"));
+
+            assert_eq!(public, unhex(&record["public"]), "{context}");
+
+            assert_eq!(exported, unhex(&record["exportDer"]), "{context}");
+        }
+    }
 }

@@ -4,30 +4,10 @@ use crypto_pq::{
     BLAKE3, BLAKE3_256, BLAKE3_KDF, BLAKE3_MAC, Error, HashOptions, KdfOptions, MacOptions,
     XofOptions, hazmat,
 };
-use vectors::{Fields, records, unhex};
+use vectors::{Fields, pieces, records, unhex};
 
 // Uneven sizes reach every buffering path: empty updates, partial blocks, whole blocks and chunks.
 const PIECES: [usize; 9] = [0, 1, 63, 64, 65, 1024, 7, 1025, 200];
-
-fn pieces(data: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-
-    let mut offset = 0;
-
-    for size in PIECES.iter().cycle() {
-        if offset >= data.len() {
-            break;
-        }
-
-        let end = (offset + size).min(data.len());
-
-        out.push(&data[offset..end]);
-
-        offset = end;
-    }
-
-    out
-}
 
 fn input(length: usize) -> Vec<u8> {
     (0..length).map(|i| (i % 251) as u8).collect()
@@ -58,7 +38,7 @@ fn official_vectors() {
 
         let mut xof = BLAKE3.create();
 
-        for piece in pieces(&data) {
+        for piece in pieces(&data, &PIECES) {
             hasher.update(piece);
 
             xof.update(piece);
@@ -86,7 +66,7 @@ fn official_vectors() {
 
         let mut mac = BLAKE3_MAC.create(&key);
 
-        for piece in pieces(&data) {
+        for piece in pieces(&data, &PIECES) {
             mac.update(piece);
         }
 
@@ -402,25 +382,19 @@ fn cross(name: &str, record: &Fields) -> (String, Option<Vec<u8>>) {
 // them.
 #[test]
 fn cross_vectors() {
-    let mut tested = 0;
+    let found = records("cross/blake3.txt", "result");
 
-    for (header, record) in records("cross/blake3.txt", "result") {
+    assert_eq!(found.len(), 110);
+
+    for (header, record) in &found {
         let name = header["algorithm"].as_str();
 
-        if !name.starts_with("BLAKE3") {
-            continue;
-        }
-
-        let (result, output) = cross(name, &record);
+        let (result, output) = cross(name, record);
 
         assert_eq!(result, record["result"], "{name}: {}", record["name"]);
 
         if let Some(expected) = record.get("output") {
             assert_eq!(output, Some(unhex(expected)), "{name}: {}", record["name"]);
         }
-
-        tested += 1;
     }
-
-    assert_eq!(tested, 110);
 }

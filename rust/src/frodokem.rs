@@ -14,6 +14,7 @@ use core::ops::{Deref, DerefMut};
 use crate::aes::Aes;
 use crate::ct::{self, declassify};
 use crate::keccak::{Keccak, MAX_SPONGES, Sponges};
+use crate::primitives::shake256_into;
 use crate::wipe::{SecretBytes, wipe};
 
 const BAR: usize = 8;
@@ -218,21 +219,11 @@ impl Drop for Stream {
     }
 }
 
-fn shake256(out: &mut [u8], parts: &[&[u8]]) {
-    let mut sponge = Keccak::new(SHAKE256_RATE, SHAKE_SUFFIX);
-
-    for part in parts {
-        sponge.update(part);
-    }
-
-    sponge.read(out);
-}
-
 // pkh = SHAKE256(pk), the hash that encapsulation and the private key use.
 pub(crate) fn public_key_hash(p: &Parameters, pk: &[u8]) -> [u8; 32] {
     let mut pkh = [0; 32];
 
-    shake256(&mut pkh[..p.secret_size], &[pk]);
+    shake256_into(&[pk], &mut pkh[..p.secret_size]);
 
     pkh
 }
@@ -484,7 +475,7 @@ pub(crate) fn keygen(p: &Parameters, seed: &[u8]) -> SecretBytes {
 
     let (seed_a, b) = pk.split_at_mut(16);
 
-    shake256(seed_a, &[&seed[secret + p.seed_se_size..]]);
+    shake256_into(&[&seed[secret + p.seed_se_size..]], seed_a);
 
     // seedA and B make up the public key.
     declassify(seed_a);
@@ -571,7 +562,7 @@ pub(crate) fn encapsulate(
 
     let mut g = [0u8; 96];
 
-    shake256(&mut g[..p.seed_se_size + secret], &[pkh, u, salt]);
+    shake256_into(&[pkh, u, salt], &mut g[..p.seed_se_size + secret]);
 
     let (seed_se, k) = g.split_at(p.seed_se_size);
 
@@ -600,7 +591,7 @@ pub(crate) fn encapsulate(
 
     let mut shared_secret = [0; 32];
 
-    shake256(&mut shared_secret[..secret], &[&ciphertext, &k[..secret]]);
+    shake256_into(&[&ciphertext, &k[..secret]], &mut shared_secret[..secret]);
 
     wipe(&mut g);
 
@@ -645,7 +636,7 @@ pub(crate) fn decapsulate(p: &Parameters, sk: &[u8], ciphertext: &[u8]) -> [u8; 
 
     let mut g = [0u8; 96];
 
-    shake256(&mut g[..p.seed_se_size + secret], &[&input[..length]]);
+    shake256_into(&[&input[..length]], &mut g[..p.seed_se_size + secret]);
 
     let mut c2_prime = [0u8; 2 * BAR * BAR];
 
@@ -679,9 +670,9 @@ pub(crate) fn decapsulate(p: &Parameters, sk: &[u8], ciphertext: &[u8]) -> [u8; 
 
     let mut shared_secret = [0; 32];
 
-    shake256(
-        &mut shared_secret[..secret],
+    shake256_into(
         &[ciphertext, &k_hat[..secret]],
+        &mut shared_secret[..secret],
     );
 
     wipe(&mut m);
