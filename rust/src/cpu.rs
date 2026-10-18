@@ -390,8 +390,23 @@ pub(crate) use arch::{
 // what the portable code computes. Products are Montgomery products in the portable form,
 // high(a, b) - high(a * (b * q^-1 mod 2^32), q). The twiddle factors are in Montgomery form, in
 // the order in which the forward and the inverse transform take them, each with its product by
-// q^-1. The fields are read only by the kernels, which some targets do not have.
-#[allow(dead_code)]
+// q^-1. The fields are read only by the kernels, so they are unused where there are none.
+#[cfg_attr(
+    not(any(
+        all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            target_feature = "neon",
+            not(crypto_pq_portable)
+        ),
+        all(
+            target_arch = "x86_64",
+            not(target_env = "sgx"),
+            not(crypto_pq_portable)
+        ),
+    )),
+    allow(dead_code)
+)]
 pub(crate) struct Field {
     pub(crate) q: i32,
     pub(crate) qinv: i32,
@@ -418,7 +433,22 @@ pub(crate) enum Pack {
 
 // The first step of the inverse transform: ML-DSA's x - ((x + 2^22) >> 23) q, or ML-KEM's
 // Montgomery product with a constant.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(any(
+        all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            target_feature = "neon",
+            not(crypto_pq_portable)
+        ),
+        all(
+            target_arch = "x86_64",
+            not(target_env = "sgx"),
+            not(crypto_pq_portable)
+        ),
+    )),
+    allow(dead_code)
+)]
 pub(crate) enum Prepare {
     Reduce,
     Montgomery(i32),
@@ -524,8 +554,18 @@ pub fn enable_data_independent_timing() -> bool {
 // forward sums stay below 8q < 2^15. The products are Montgomery products modulo 2^16, so these
 // kernels keep their own twiddle factors, in Montgomery form for 2^16, and compute only the same
 // canonical results as the portable code, not its intermediate values. The layers that pair
-// coefficients 4 and 2 apart take their factors as whole vectors, one factor per lane.
-#[allow(dead_code)]
+// coefficients 4 and 2 apart take their factors as whole vectors, one factor per lane. Only the
+// arm64 kernels read every field: the x86-64 ones have their own (below), and canonical,
+// inverse_scale, reduce32 and qinv32 are unused there.
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        target_feature = "neon",
+        not(crypto_pq_portable)
+    )),
+    allow(dead_code)
+)]
 pub(crate) struct Field16 {
     pub(crate) q: i16,
     pub(crate) qinv: i16,
