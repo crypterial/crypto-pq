@@ -34,18 +34,20 @@ fn assist_sub(key: __m128i) -> __m128i {
     _mm_shuffle_epi32::<0xAA>(_mm_aeskeygenassist_si128::<0>(key))
 }
 
+// Each round key goes straight to its place in round_keys, so that no copy of the key schedule is
+// left on the stack.
 #[target_feature(enable = "aes,sse2")]
 pub(super) fn expand(key: &[u8], round_keys: &mut [[u8; 16]; 15]) {
     if let Ok(key) = <&[u8; 16]>::try_from(key) {
         let mut k = load128(key);
 
-        let mut out = [k; 11];
+        store128(k, &mut round_keys[0]);
 
         macro_rules! round {
             ($i:expr, $rcon:expr) => {
                 k = next(k, assist::<$rcon>(k));
 
-                out[$i] = k;
+                store128(k, &mut round_keys[$i]);
             };
         }
 
@@ -69,10 +71,6 @@ pub(super) fn expand(key: &[u8], round_keys: &mut [[u8; 16]; 15]) {
 
         round!(10, 0x36);
 
-        for (vector, target) in out.iter().zip(round_keys.iter_mut()) {
-            store128(*vector, target);
-        }
-
         return;
     }
 
@@ -82,19 +80,19 @@ pub(super) fn expand(key: &[u8], round_keys: &mut [[u8; 16]; 15]) {
 
     let mut b = load128(<&[u8; 16]>::try_from(second).unwrap());
 
-    let mut out = [a; 15];
+    store128(a, &mut round_keys[0]);
 
-    out[1] = b;
+    store128(b, &mut round_keys[1]);
 
     macro_rules! pair {
         ($i:expr, $rcon:expr) => {
             a = next(a, assist::<$rcon>(b));
 
-            out[2 * $i] = a;
+            store128(a, &mut round_keys[2 * $i]);
 
             b = next(b, assist_sub(a));
 
-            out[2 * $i + 1] = b;
+            store128(b, &mut round_keys[2 * $i + 1]);
         };
     }
 
@@ -112,56 +110,45 @@ pub(super) fn expand(key: &[u8], round_keys: &mut [[u8; 16]; 15]) {
 
     a = next(a, assist::<0x40>(b));
 
-    out[14] = a;
-
-    for (vector, target) in out.iter().zip(round_keys.iter_mut()) {
-        store128(*vector, target);
-    }
+    store128(a, &mut round_keys[14]);
 }
 
-// N blocks under the round keys, interleaved so that the AES unit always has work.
+// N blocks under the round keys, interleaved so that the AES unit always has work. The keys are
+// read where the caller keeps them, which wipes them, rather than from a copy on the stack.
 #[target_feature(enable = "aes,sse2")]
 #[inline]
-fn encrypt<const N: usize>(keys: &[__m128i; 15], rounds: usize, blocks: &mut [__m128i; N]) {
+fn encrypt<const N: usize>(keys: &[[u8; 16]], blocks: &mut [__m128i; N]) {
+    let (first, rest) = keys.split_first().unwrap();
+
+    let (last, middle) = rest.split_last().unwrap();
+
     for block in blocks.iter_mut() {
-        *block = _mm_xor_si128(*block, keys[0]);
+        *block = _mm_xor_si128(*block, load128(first));
     }
 
-    for key in &keys[1..rounds] {
+    for key in middle {
+        let key = load128(key);
+
         for block in blocks.iter_mut() {
-            *block = _mm_aesenc_si128(*block, *key);
+            *block = _mm_aesenc_si128(*block, key);
         }
     }
 
+    let last = load128(last);
+
     for block in blocks.iter_mut() {
-        *block = _mm_aesenclast_si128(*block, keys[rounds]);
+        *block = _mm_aesenclast_si128(*block, last);
     }
 }
 
 #[target_feature(enable = "aes,sse2")]
-#[inline]
-fn load_keys(round_keys: &[[u8; 16]]) -> [__m128i; 15] {
-    let mut keys = [_mm_setzero_si128(); 15];
-
-    for (vector, key) in keys.iter_mut().zip(round_keys) {
-        *vector = load128(key);
-    }
-
-    keys
-}
-
-#[target_feature(enable = "aes,sse2")]
-pub(super) fn encrypt_blocks(round_keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) {
-    let rounds = round_keys.len() - 1;
-
-    let keys = load_keys(round_keys);
-
+pub(super) fn encrypt_blocks(keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) {
     let (groups, rest) = blocks.as_chunks_mut::<4>();
 
     for group in groups {
         let mut x: [__m128i; 4] = core::array::from_fn(|i| load128(&group[i]));
 
-        encrypt(&keys, rounds, &mut x);
+        encrypt(keys, &mut x);
 
         for (vector, block) in x.iter().zip(group.iter_mut()) {
             store128(*vector, block);
@@ -171,7 +158,7 @@ pub(super) fn encrypt_blocks(round_keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) {
     for block in rest {
         let mut x = [load128(block)];
 
-        encrypt(&keys, rounds, &mut x);
+        encrypt(keys, &mut x);
 
         store128(x[0], block);
     }

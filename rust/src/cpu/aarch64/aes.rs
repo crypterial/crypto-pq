@@ -53,46 +53,39 @@ pub(super) fn expand(key: &[u8], round_keys: &mut [[u8; 16]; 15]) {
     crate::wipe::wipe(&mut w);
 }
 
-#[target_feature(enable = "neon,aes")]
-#[inline]
-fn load_keys(round_keys: &[[u8; 16]]) -> [uint8x16_t; 15] {
-    let mut keys = [vdupq_n_u8(0); 15];
-
-    for (vector, key) in keys.iter_mut().zip(round_keys) {
-        *vector = load_u8(key);
-    }
-
-    keys
-}
-
 // N blocks under the round keys: AESE adds the round key before SubBytes and ShiftRows, so the
-// last key is added on its own.
+// last key is added on its own. The keys are read where the caller keeps them, which wipes them,
+// rather than from a copy on the stack.
 #[target_feature(enable = "neon,aes")]
 #[inline]
-fn encrypt<const N: usize>(keys: &[uint8x16_t; 15], rounds: usize, blocks: &mut [uint8x16_t; N]) {
-    for key in &keys[..rounds - 1] {
+fn encrypt<const N: usize>(keys: &[[u8; 16]], blocks: &mut [uint8x16_t; N]) {
+    let (last, rest) = keys.split_last().unwrap();
+
+    let (second_last, middle) = rest.split_last().unwrap();
+
+    for key in middle {
+        let key = load_u8(key);
+
         for block in blocks.iter_mut() {
-            *block = vaesmcq_u8(vaeseq_u8(*block, *key));
+            *block = vaesmcq_u8(vaeseq_u8(*block, key));
         }
     }
 
+    let (second_last, last) = (load_u8(second_last), load_u8(last));
+
     for block in blocks.iter_mut() {
-        *block = veorq_u8(vaeseq_u8(*block, keys[rounds - 1]), keys[rounds]);
+        *block = veorq_u8(vaeseq_u8(*block, second_last), last);
     }
 }
 
 #[target_feature(enable = "neon,aes")]
-pub(super) fn encrypt_blocks(round_keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) {
-    let rounds = round_keys.len() - 1;
-
-    let keys = load_keys(round_keys);
-
+pub(super) fn encrypt_blocks(keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) {
     let (groups, rest) = blocks.as_chunks_mut::<4>();
 
     for group in groups {
         let mut x: [uint8x16_t; 4] = core::array::from_fn(|i| load_u8(&group[i]));
 
-        encrypt(&keys, rounds, &mut x);
+        encrypt(keys, &mut x);
 
         for (vector, block) in x.iter().zip(group.iter_mut()) {
             store_u8(*vector, block);
@@ -102,7 +95,7 @@ pub(super) fn encrypt_blocks(round_keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) {
     for block in rest {
         let mut x = [load_u8(block)];
 
-        encrypt(&keys, rounds, &mut x);
+        encrypt(keys, &mut x);
 
         store_u8(x[0], block);
     }

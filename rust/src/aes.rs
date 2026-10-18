@@ -5,16 +5,32 @@
 // circuit of Boyar and Peralta (eprint 2009/191), the design of BearSSL's aes_ct64. No table is
 // indexed by data and no branch depends on it.
 
+use alloc::boxed::Box;
+
 use crate::cpu;
 use crate::wipe::wipe;
 
 // The round keys of one key: in FIPS 197 byte order for the AES instructions, or bitsliced, each
-// spread over four blocks, for the portable code; only the form in use is filled.
+// spread over four blocks, for the portable code; only the form in use is filled. They are on the
+// heap, so that moving an Aes moves a pointer and leaves no copy of them behind, and are wiped
+// when it is dropped.
 pub(crate) struct Aes {
     rounds: usize,
-    round_keys: [[u8; 16]; 15],
-    bitsliced: [u64; 120],
+    keys: Box<RoundKeys>,
     hardware: bool,
+}
+
+struct RoundKeys {
+    fips: [[u8; 16]; 15],
+    bitsliced: [u64; 120],
+}
+
+impl Drop for RoundKeys {
+    fn drop(&mut self) {
+        wipe(&mut self.fips);
+
+        wipe(&mut self.bitsliced);
+    }
 }
 
 impl Aes {
@@ -39,12 +55,14 @@ impl Aes {
 
         let mut aes = Self {
             rounds,
-            round_keys: [[0; 16]; 15],
-            bitsliced: [0; 120],
+            keys: Box::new(RoundKeys {
+                fips: [[0; 16]; 15],
+                bitsliced: [0; 120],
+            }),
             hardware: false,
         };
 
-        if hardware && cpu::aes_expand(key, &mut aes.round_keys) {
+        if hardware && cpu::aes_expand(key, &mut aes.keys.fips) {
             aes.hardware = true;
 
             return aes;
@@ -54,7 +72,7 @@ impl Aes {
 
         expand(key, &mut words[..4 * (rounds + 1)]);
 
-        for (r, keys) in aes.bitsliced[..8 * (rounds + 1)]
+        for (r, keys) in aes.keys.bitsliced[..8 * (rounds + 1)]
             .as_chunks_mut::<8>()
             .0
             .iter_mut()
@@ -87,7 +105,7 @@ impl Aes {
 
     // The round keys in FIPS 197 order, when the AES instructions run this key.
     pub(crate) fn hardware_keys(&self) -> Option<&[[u8; 16]]> {
-        self.hardware.then(|| &self.round_keys[..self.rounds + 1])
+        self.hardware.then(|| &self.keys.fips[..self.rounds + 1])
     }
 
     #[cfg(test)]
@@ -125,7 +143,7 @@ impl Aes {
 
         ortho(&mut q);
 
-        add_round_key(&mut q, &self.bitsliced[..8]);
+        add_round_key(&mut q, &self.keys.bitsliced[..8]);
 
         for r in 1..self.rounds {
             sbox(&mut q);
@@ -134,7 +152,7 @@ impl Aes {
 
             mix_columns(&mut q);
 
-            add_round_key(&mut q, &self.bitsliced[8 * r..8 * r + 8]);
+            add_round_key(&mut q, &self.keys.bitsliced[8 * r..8 * r + 8]);
         }
 
         sbox(&mut q);
@@ -143,7 +161,7 @@ impl Aes {
 
         add_round_key(
             &mut q,
-            &self.bitsliced[8 * self.rounds..8 * self.rounds + 8],
+            &self.keys.bitsliced[8 * self.rounds..8 * self.rounds + 8],
         );
 
         ortho(&mut q);
@@ -157,14 +175,6 @@ impl Aes {
         }
 
         wipe(&mut q);
-    }
-}
-
-impl Drop for Aes {
-    fn drop(&mut self) {
-        wipe(&mut self.round_keys);
-
-        wipe(&mut self.bitsliced);
     }
 }
 
