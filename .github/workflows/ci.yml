@@ -29,6 +29,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: cd vectors && sha256sum -c SHA256SUMS
 
+  # The specification under spec/: every link and anchor resolves, every decision, principle and
+  # citation referenced exists, tables are well formed, sections are numbered, and the requirement
+  # keywords appear only where they are normative.
+  spec:
+    name: specification is consistent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 -I tools/spec_check.py
+
   rust:
     name: rust ${{ matrix.rust }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
