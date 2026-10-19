@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crypto_pq::{Error, KeyFormat};
+use crypto_pq::{Error, KeyFormat, SHA_256};
 
 pub type Fields = HashMap<String, String>;
 
@@ -183,4 +183,165 @@ pub fn example_keys(
             assert_eq!(exported, unhex(&record["exportDer"]), "{context}");
         }
     }
+}
+
+// A vector file as its generators write it: groups of header lines, each followed by records of
+// key = value lines, every record ending in a blank line. Rendering gives the file back byte for
+// byte, so a generator can rewrite some records and keep the others as they are.
+pub type Record = Vec<(String, String)>;
+
+pub struct Group {
+    pub header: Vec<String>,
+    pub records: Vec<Record>,
+}
+
+pub fn vector_path(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../vectors")
+        .join(name)
+}
+
+pub fn groups(name: &str) -> Vec<Group> {
+    let text = std::fs::read_to_string(vector_path(name)).unwrap();
+
+    let mut found: Vec<Group> = Vec::new();
+
+    let mut record = Record::new();
+
+    for line in text.lines() {
+        if line.starts_with('[') {
+            if found.last().is_none_or(|group| !group.records.is_empty()) {
+                found.push(Group {
+                    header: Vec::new(),
+                    records: Vec::new(),
+                });
+            }
+
+            found.last_mut().unwrap().header.push(line.to_owned());
+        } else if let Some((key, value)) = line.split_once(" = ") {
+            record.push((key.to_owned(), value.to_owned()));
+        } else if let Some(key) = line.strip_suffix(" =") {
+            record.push((key.to_owned(), String::new()));
+        } else {
+            assert!(line.is_empty(), "{name}: unexpected line {line}");
+
+            if !record.is_empty() {
+                found
+                    .last_mut()
+                    .unwrap()
+                    .records
+                    .push(std::mem::take(&mut record));
+            }
+        }
+    }
+
+    assert!(
+        record.is_empty(),
+        "{name}: the last record has no blank line"
+    );
+
+    assert_eq!(
+        render(&found),
+        text,
+        "{name} does not render back to itself"
+    );
+
+    found
+}
+
+pub fn render(groups: &[Group]) -> String {
+    let mut lines = Vec::new();
+
+    for group in groups {
+        lines.extend(group.header.iter().cloned());
+
+        lines.push(String::new());
+
+        for record in &group.records {
+            lines.extend(record.iter().map(|(key, value)| format!("{key} = {value}")));
+
+            lines.push(String::new());
+        }
+    }
+
+    lines.join("\n") + "\n"
+}
+
+// The value of a [key = value] line of a group's header.
+pub fn header<'a>(group: &'a Group, key: &str) -> &'a str {
+    group
+        .header
+        .iter()
+        .filter_map(|line| line.strip_prefix('[')?.strip_suffix(']')?.split_once(" = "))
+        .find(|(name, _)| *name == key)
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| panic!("no header {key}"))
+}
+
+pub fn get<'a>(record: &'a Record, key: &str) -> Option<&'a str> {
+    record
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.as_str())
+}
+
+// Replaces the value of key, or appends the key when the record has none.
+pub fn set(record: &mut Record, key: &str, value: String) {
+    match record.iter_mut().find(|(name, _)| name == key) {
+        Some(entry) => entry.1 = value,
+        None => record.push((key.to_owned(), value)),
+    }
+}
+
+pub fn remove(record: &mut Record, key: &str) {
+    record.retain(|(name, _)| name != key);
+}
+
+pub fn hex(data: &[u8]) -> String {
+    data.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+// With CRYPTO_PQ_REGENERATE=1 a generator writes its file and the file's line of SHA256SUMS;
+// otherwise the file must already hold exactly what the generator produces.
+pub fn fixture(name: &str, groups: &[Group]) {
+    let text = render(groups);
+
+    let path = vector_path(name);
+
+    if std::env::var_os("CRYPTO_PQ_REGENERATE").is_some_and(|value| value == "1") {
+        std::fs::write(&path, &text).unwrap();
+
+        let sums_path = vector_path("SHA256SUMS");
+
+        let sums = std::fs::read_to_string(&sums_path).unwrap();
+
+        let suffix = format!("  {name}");
+
+        assert!(
+            sums.lines().any(|line| line.ends_with(&suffix)),
+            "{name} is not in SHA256SUMS"
+        );
+
+        let updated: String = sums
+            .lines()
+            .map(|line| {
+                if line.ends_with(&suffix) {
+                    format!("{}{suffix}\n", hex(&SHA_256.digest(text.as_bytes())))
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+
+        std::fs::write(&sums_path, updated).unwrap();
+
+        return;
+    }
+
+    let current = std::fs::read_to_string(&path).unwrap();
+
+    assert!(
+        current == text,
+        "{name} differs from what its generator writes; run the generator with CRYPTO_PQ_REGENERATE=1"
+    );
 }

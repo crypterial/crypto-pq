@@ -9,11 +9,11 @@ use crypto_pq::{
     SHA_256, SHA_384, SHA_512, SHA_512_224, SHA_512_256, SHA3_224, SHA3_256, SHA3_384, SHA3_512,
     SHAKE128, SHAKE256, XofAlgorithm, XofOptions, hazmat,
 };
-use vectors::{Fields, records, unhex};
+use vectors::{Fields, fixture, get, groups, header, hex, records, remove, set, unhex};
 
-// The runner of vectors/cross/symmetric.txt and vectors/cross/blake3.txt (SPEC 19.3; the format is
-// described in tools/cross_vectors.py): each record configures its algorithm with the options it
-// has, runs one operation and compares the result and the output.
+// The runner of vectors/cross/symmetric.txt and vectors/cross/blake3.txt (SPEC 19.3 gives the
+// format and the operations): each record configures its algorithm with the options it has, runs
+// one operation and compares the result and the output.
 #[derive(Clone, Copy)]
 enum Algorithm {
     Hash(HashAlgorithm),
@@ -246,66 +246,12 @@ fn run(algorithm: Algorithm, record: &Fields) -> Result<(String, Option<Vec<u8>>
     Ok(("ok".to_owned(), Some(output)))
 }
 
-// Records whose expected result predates a rule of SPEC 1.0 that the reference generator does not
-// apply yet, by file, function and case; each is listed with the rule and checked against it. An
-// entry that no record of its file needs any more, because the record is gone or already has the
-// new result, fails the check, so that it is removed when the file is regenerated.
 const SYMMETRIC: &str = "cross/symmetric.txt";
-
-const PENDING: [(&str, &str, &str, &str); 8] = [
-    // SPEC 12.2 item 5 [D-34]: the one-shot Ascon XOFs refuse L = 0.
-    (
-        SYMMETRIC,
-        "Ascon-CXOF128",
-        "0-byte customization, 0-byte output",
-        "INVALID_LENGTH",
-    ),
-    (
-        SYMMETRIC,
-        "Ascon-CXOF128",
-        "1-byte customization, 0-byte output",
-        "INVALID_LENGTH",
-    ),
-    (
-        SYMMETRIC,
-        "Ascon-CXOF128",
-        "7-byte customization, 0-byte output",
-        "INVALID_LENGTH",
-    ),
-    (
-        SYMMETRIC,
-        "Ascon-CXOF128",
-        "8-byte customization, 0-byte output",
-        "INVALID_LENGTH",
-    ),
-    (
-        SYMMETRIC,
-        "Ascon-CXOF128",
-        "9-byte customization, 0-byte output",
-        "INVALID_LENGTH",
-    ),
-    (
-        SYMMETRIC,
-        "Ascon-CXOF128",
-        "255-byte customization, 0-byte output",
-        "INVALID_LENGTH",
-    ),
-    (
-        SYMMETRIC,
-        "Ascon-CXOF128",
-        "256-byte customization, 0-byte output",
-        "INVALID_LENGTH",
-    ),
-    // SPEC 12.6 item 1 [D-33]: HMAC takes a length of 4 to the hash output size.
-    (SYMMETRIC, "HMAC-SHA-256", "length", "ok"),
-];
 
 fn check(file: &str, expected_records: usize) {
     let found = records(file, "result");
 
     assert_eq!(found.len(), expected_records, "{file}");
-
-    let mut used = [false; PENDING.len()];
 
     for (header, record) in &found {
         for key in record.keys() {
@@ -319,43 +265,102 @@ fn check(file: &str, expected_records: usize) {
         let (result, output) =
             run(algorithm(name), record).unwrap_or_else(|error| (error.code().to_owned(), None));
 
-        let expected = match PENDING
-            .iter()
-            .position(|(pending_file, algorithm, case, _)| {
-                *pending_file == file && algorithm == name && *case == record["name"]
-            }) {
-            Some(index) if PENDING[index].3 != record["result"] => {
-                used[index] = true;
+        assert_eq!(result, record["result"], "{context}");
 
-                PENDING[index].3.to_owned()
+        assert_eq!(
+            output,
+            record.get("output").map(|value| unhex(value)),
+            "{context}"
+        );
+    }
+}
+
+// The records of symmetric.txt whose result SPEC 1.0 decided after the earlier generator wrote
+// them, by algorithm and case, with that result. The generator runs each, checks the result and
+// writes it with its output; every other record is kept as it is.
+const DECIDED: [(&str, &str, &str); 8] = [
+    // SPEC 12.2 item 5 [D-34]: the one-shot Ascon XOFs refuse L = 0.
+    (
+        "Ascon-CXOF128",
+        "0-byte customization, 0-byte output",
+        "INVALID_LENGTH",
+    ),
+    (
+        "Ascon-CXOF128",
+        "1-byte customization, 0-byte output",
+        "INVALID_LENGTH",
+    ),
+    (
+        "Ascon-CXOF128",
+        "7-byte customization, 0-byte output",
+        "INVALID_LENGTH",
+    ),
+    (
+        "Ascon-CXOF128",
+        "8-byte customization, 0-byte output",
+        "INVALID_LENGTH",
+    ),
+    (
+        "Ascon-CXOF128",
+        "9-byte customization, 0-byte output",
+        "INVALID_LENGTH",
+    ),
+    (
+        "Ascon-CXOF128",
+        "255-byte customization, 0-byte output",
+        "INVALID_LENGTH",
+    ),
+    (
+        "Ascon-CXOF128",
+        "256-byte customization, 0-byte output",
+        "INVALID_LENGTH",
+    ),
+    // SPEC 12.6 item 1 [D-33]: HMAC takes a length of 4 to the hash output size.
+    ("HMAC-SHA-256", "length", "ok"),
+];
+
+// The generator of the decided records (see vectors::fixture).
+#[test]
+#[ignore = "generator of vectors/cross/symmetric.txt"]
+fn regenerate_symmetric() {
+    let mut found = groups(SYMMETRIC);
+
+    let mut written = 0;
+
+    for group in &mut found {
+        let name = header(group, "algorithm").to_owned();
+
+        for record in &mut group.records {
+            let case = get(record, "name").unwrap();
+
+            let Some(&(_, _, decided)) = DECIDED
+                .iter()
+                .find(|(algorithm, decided, _)| *algorithm == name && *decided == case)
+            else {
+                continue;
+            };
+
+            let fields: Fields = record.iter().cloned().collect();
+
+            let (result, output) = run(algorithm(&name), &fields)
+                .unwrap_or_else(|error| (error.code().to_owned(), None));
+
+            assert_eq!(result, decided, "{name}: {case}");
+
+            set(record, "result", result);
+
+            match output {
+                Some(output) => set(record, "output", hex(&output)),
+                None => remove(record, "output"),
             }
-            _ => record["result"].clone(),
-        };
 
-        assert_eq!(result, expected, "{context}");
-
-        if let (Some(expected), true) = (record.get("output"), result == record["result"]) {
-            assert_eq!(output, Some(unhex(expected)), "{context}");
+            written += 1;
         }
     }
 
-    let stale: Vec<_> = PENDING
-        .iter()
-        .zip(used)
-        .filter(|((pending_file, ..), used)| *pending_file == file && !used)
-        .map(|(entry, _)| entry)
-        .collect();
+    assert_eq!(written, DECIDED.len());
 
-    assert!(
-        stale.is_empty(),
-        "{file}: pending entries no record needs: {stale:?}"
-    );
-
-    println!(
-        "{file}: {} records, {} with a pending regeneration",
-        found.len(),
-        used.iter().filter(|&&used| used).count()
-    );
+    fixture(SYMMETRIC, &found);
 }
 
 #[test]

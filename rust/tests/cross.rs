@@ -1,3 +1,5 @@
+#[path = "cross/regenerate.rs"]
+mod regenerate;
 mod vectors;
 
 use std::cell::RefCell;
@@ -22,10 +24,10 @@ use crypto_pq::{
 };
 use vectors::{Fields, der, parallel, records, unhex};
 
-// The vectors under vectors/cross were computed by the Python reference: keys and their
-// encodings, hazmat signatures with every pre-hash, implicit rejection, state blobs, and the
-// error code of every malformed input. The HashSLH-DSA values are listed for the sections that
-// the regenerated files will add (SPEC Appendix C.1 item 9).
+// The fixtures under vectors/cross (SPEC 19.3): keys and their encodings, hazmat signatures with
+// every pre-hash, implicit rejection, state records and tree caches, and the error code of every
+// malformed input. The generator in cross/regenerate.rs writes the records that SPEC 1.0 decided;
+// the others are kept as they were first generated.
 const KEMS: [KemAlgorithm; 3] = [ML_KEM_512, ML_KEM_768, ML_KEM_1024];
 
 const SIGNATURES: [SignatureAlgorithm; 27] = [
@@ -162,25 +164,6 @@ fn parameters<'a>(record: &'a Fields, levels: &'a [(&'a str, &'a str)]) -> State
     match record.get("parameters") {
         Some(name) => StatefulParameters::Name(name),
         None => StatefulParameters::Levels(levels),
-    }
-}
-
-// Temporary, until the cross files are generated again (SPEC Appendix C.1 item 9): their stateful
-// records hold state records of version 1, which crypto-pq 1.0 refuses (SPEC 11.8), and the states
-// that the Python reference computed under the rules of version 1. The runner skips every check
-// of such a state, and the cases that load one, and keeps the rest: keys, encodings, signatures,
-// tree cache exports, generation and verification.
-fn version_1_state(data: &[u8]) -> bool {
-    sealed_state(data) && data[0] == 1
-}
-
-// An intact record of any version. The files' records of version 2 are version 1 layouts with
-// another version byte, which version 1 refused as an unknown version.
-fn sealed_state(data: &[u8]) -> bool {
-    data.len() >= 18 && {
-        let (body, checksum) = data.split_at(data.len() - 16);
-
-        SHA_256.digest(body)[..16] == *checksum
     }
 }
 
@@ -547,8 +530,6 @@ fn check_stateful(name: &str) {
 
         let signature = field(record, "signature");
 
-        assert!(version_1_state(&field(record, "state")), "{context}");
-
         let index: u64 = record["index"].parse().unwrap();
 
         let remaining: u64 = record["remaining"].parse().unwrap();
@@ -566,6 +547,8 @@ fn check_stateful(name: &str) {
             &StatefulKeyGenOptions::default(),
         )
         .unwrap();
+
+        assert_eq!(store.state(), Some(field(record, "state")), "{context}");
 
         assert_eq!(
             pair.public_key.export_key(KeyFormat::Raw).unwrap(),
@@ -605,7 +588,11 @@ fn check_stateful(name: &str) {
             "{context}"
         );
 
-        assert!(version_1_state(&field(record, "stateAfter")), "{context}");
+        assert_eq!(
+            store.state(),
+            Some(field(record, "stateAfter")),
+            "{context}"
+        );
 
         assert_eq!(
             pair.private_key.remaining_signatures(),
@@ -655,9 +642,9 @@ fn xmss() {
     check_stateful("cross/xmss.txt");
 }
 
-// Each export is made again, and loads with the record that the key stored as the reference
-// decided; a key that loads signs as the reference did. The load cases are skipped while their
-// states have version 1 (see version_1_state).
+// Each export is made again from its seed, index and message and must give the record's state and
+// cache; then every record loads its state with its cache. A key that loads has the record's
+// public key and remaining signatures and, where the record has a signature, signs as it says.
 #[test]
 fn tree_cache() {
     let found = records("cross/treecache.txt", "treeCache");
@@ -678,58 +665,44 @@ fn tree_cache() {
 
         let message = field(record, "message");
 
-        if record["operation"] == "load" {
-            // A state that is not a version 1 record is refused as it was.
-            if !version_1_state(&state) {
-                let options = StatefulLoadOptions::default().with_tree_cache(&cache);
+        if record["operation"] == "export" {
+            let levels = levels(record);
 
-                let result = algorithm.load_private_key(MemoryStore::holding(&state), &options);
+            let store = MemoryStore::default();
 
-                assert_eq!(
-                    result.err().map(|error| error.code()),
-                    Some(record["result"].as_str())
-                );
+            let mut pair = hazmat::generate_stateful_key_pair(
+                algorithm,
+                &field(record, "seed"),
+                record["index"].parse().unwrap(),
+                parameters(record, &levels),
+                store.clone(),
+                &StatefulKeyGenOptions::default(),
+            )
+            .unwrap();
+
+            if record["signed"] == "true" {
+                pair.private_key.sign(&message).unwrap();
             }
 
-            return;
+            assert_eq!(
+                pair.private_key.export_tree_cache().unwrap(),
+                cache,
+                "{context}"
+            );
+
+            assert_eq!(store.state(), Some(state.clone()), "{context}");
         }
-
-        assert!(version_1_state(&state), "{context}");
-
-        let levels = levels(record);
-
-        let store = MemoryStore::default();
-
-        let mut pair = hazmat::generate_stateful_key_pair(
-            algorithm,
-            &field(record, "seed"),
-            record["index"].parse().unwrap(),
-            parameters(record, &levels),
-            store.clone(),
-            &StatefulKeyGenOptions::default(),
-        )
-        .unwrap();
-
-        // Before its first signature, a key of version 1 held only its top tree; one of version 2
-        // holds the tree of every current level (SPEC 11.10 item 1), so only the exports after a
-        // signature are the same.
-        let cache = if record["signed"] == "true" {
-            pair.private_key.sign(&message).unwrap();
-
-            let exported = pair.private_key.export_tree_cache().unwrap();
-
-            assert_eq!(exported, cache, "{context}");
-
-            exported
-        } else {
-            pair.private_key.export_tree_cache().unwrap()
-        };
-
-        drop(pair);
 
         let options = StatefulLoadOptions::default().with_tree_cache(&cache);
 
-        let mut key = algorithm.load_private_key(store, &options).unwrap();
+        let mut key = match algorithm.load_private_key(MemoryStore::holding(&state), &options) {
+            Ok(key) => key,
+            Err(error) => {
+                assert_eq!(error.code(), record["result"], "{context}");
+
+                return;
+            }
+        };
 
         assert_eq!(record["result"], "ok", "{context}");
 
@@ -933,119 +906,21 @@ fn execute(header: &Fields, record: &Fields) -> Outcome {
     }
 }
 
-// A stateful load or sign of a record that the files hold in the layout of version 1.
-fn loads_version_1((header, record): &(Fields, Fields)) -> bool {
-    matches!(algorithm(&header["algorithm"]), Algorithm::Stateful(_))
-        && matches!(record["operation"].as_str(), "loadPrivateKey" | "sign")
-        && {
-            let input = field(record, "input");
-
-            sealed_state(&input) && matches!(input[0], 1 | 2)
-        }
-}
-
-// Cases whose expected result predates a rule of SPEC 1.0 that the reference generator does not
-// apply yet, by case name, with the result under the rule. Remove them when the file is
-// regenerated (SPEC Appendix C.1 item 9): an entry that no record needs any more, because no case
-// has its name or every such case already has the new result, fails the test.
-const PENDING: [(&str, &str); 24] = [
-    // 7.3: the options, the context included, are checked before the lengths.
-    (
-        "hazmat sign short randomness and long context",
-        "INVALID_CONTEXT",
-    ),
-    // 10.6 item 4: the OID is checked before the rest of the structure.
-    (
-        "public key der other algorithm and unused bits",
-        "ALGORITHM_MISMATCH",
-    ),
-    (
-        "public key der other algorithm and trailing data inside",
-        "ALGORITHM_MISMATCH",
-    ),
-    (
-        "private key der other algorithm and trailing data inside",
-        "ALGORITHM_MISMATCH",
-    ),
-    (
-        "private key der public key with version 0 and other algorithm",
-        "ALGORITHM_MISMATCH",
-    ),
-    // 13 [D-68]: a hazmat start index at the capacity is refused.
-    ("generate index at the capacity", "INVALID_OPTION"),
-    // 10.4 item 3 [D-67]: each boundary line starts a line and holds nothing but the boundary,
-    // so neither whitespace before BEGIN on its line nor a body on a boundary line is accepted.
-    ("public key pem surrounding whitespace", "INVALID_ENCODING"),
-    ("public key pem no line breaks", "INVALID_ENCODING"),
-    ("private key pem surrounding whitespace", "INVALID_ENCODING"),
-    ("private key pem no line breaks", "INVALID_ENCODING"),
-    (
-        "private key with attributes pem surrounding whitespace",
-        "INVALID_ENCODING",
-    ),
-    (
-        "private key with attributes pem no line breaks",
-        "INVALID_ENCODING",
-    ),
-    // 10.4 item 3 [D-32]: text before the BEGIN line and after the END line is ignored.
-    ("public key pem text before begin", "ok"),
-    ("public key pem text after end", "ok"),
-    ("public key pem high byte after end", "ok"),
-    ("private key pem text before begin", "ok"),
-    ("private key pem text after end", "ok"),
-    ("private key pem high byte after end", "ok"),
-    ("private key with attributes pem text before begin", "ok"),
-    ("private key with attributes pem text after end", "ok"),
-    ("private key with attributes pem high byte after end", "ok"),
-    // 8.1.4 check (3) [D-61]: every coefficient of the secret vector is below q.
-    (
-        "private key raw secret coefficient 4095",
-        "INVALID_PRIVATE_KEY",
-    ),
-    (
-        "decapsulate with secret coefficients 4095",
-        "INVALID_PRIVATE_KEY",
-    ),
-    (
-        "decapsulate with a secret coefficient stored as c + q",
-        "INVALID_PRIVATE_KEY",
-    ),
-];
-
 // Every disagreement is collected, so that one run lists them all.
 #[test]
 fn errors() {
     let failures = Mutex::new(Vec::new());
 
-    let pending = Mutex::new(Vec::new());
-
     let cases = records("cross/errors.txt", "result");
-
-    let (skipped, cases): (Vec<_>, Vec<_>) = cases.into_iter().partition(loads_version_1);
-
-    assert_eq!(skipped.len(), 48);
 
     parallel(&cases, |(header, record)| {
         let outcome = execute(header, record);
 
-        let mut expected = record["result"].as_str();
+        let expected = record["result"].as_str();
 
-        let mut expected_output = record.get("output").map(|value| unhex(value));
+        let expected_output = record.get("output").map(|value| unhex(value));
 
-        let mut expected_remaining = record.get("remaining").map(|value| value.parse().unwrap());
-
-        if let Some((name, now)) = PENDING
-            .iter()
-            .find(|(name, now)| *name == record["name"] && *now != record["result"])
-        {
-            pending.lock().unwrap().push(*name);
-
-            expected = now;
-
-            expected_output = None;
-
-            expected_remaining = None;
-        }
+        let expected_remaining = record.get("remaining").map(|value| value.parse().unwrap());
 
         let mismatched = outcome.result != expected
             || expected_output.is_some_and(|output| outcome.output.as_ref() != Some(&output))
@@ -1060,24 +935,6 @@ fn errors() {
     });
 
     let failures = failures.into_inner().unwrap();
-
-    let mut pending = pending.into_inner().unwrap();
-
-    println!("{} cases with a pending regeneration", pending.len());
-
-    pending.sort_unstable();
-
-    pending.dedup();
-
-    let unused: Vec<_> = PENDING
-        .iter()
-        .filter(|(name, _)| !pending.contains(name))
-        .collect();
-
-    assert!(
-        unused.is_empty(),
-        "pending cases that no record needs: {unused:?}"
-    );
 
     assert!(
         failures.is_empty(),

@@ -1445,8 +1445,7 @@ operation = digest
 message = 363a09fbc370ebfbac58d09f7229efc780b0e65520a4886a9912cdd0aff9c5f5fd
 customization = 
 outputLength = 0
-result = ok
-output = 
+result = INVALID_LENGTH
 
 name = 0-byte customization, 1-byte output
 operation = digest
@@ -1477,8 +1476,7 @@ operation = digest
 message = 363a09fbc370ebfbac58d09f7229efc780b0e65520a4886a9912cdd0aff9c5f5fd
 customization = f9
 outputLength = 0
-result = ok
-output = 
+result = INVALID_LENGTH
 
 name = 1-byte customization, 1-byte output
 operation = digest
@@ -1509,8 +1507,7 @@ operation = digest
 message = 363a09fbc370ebfbac58d09f7229efc780b0e65520a4886a9912cdd0aff9c5f5fd
 customization = e8797d54b2077e
 outputLength = 0
-result = ok
-output = 
+result = INVALID_LENGTH
 
 name = 7-byte customization, 1-byte output
 operation = digest
@@ -1541,8 +1538,7 @@ operation = digest
 message = 363a09fbc370ebfbac58d09f7229efc780b0e65520a4886a9912cdd0aff9c5f5fd
 customization = 5c1d433e4654a9c0
 outputLength = 0
-result = ok
-output = 
+result = INVALID_LENGTH
 
 name = 8-byte customization, 1-byte output
 operation = digest
@@ -1573,8 +1569,7 @@ operation = digest
 message = 363a09fbc370ebfbac58d09f7229efc780b0e65520a4886a9912cdd0aff9c5f5fd
 customization = ac118e6851fa224ad0
 outputLength = 0
-result = ok
-output = 
+result = INVALID_LENGTH
 
 name = 9-byte customization, 1-byte output
 operation = digest
@@ -1605,8 +1600,7 @@ operation = digest
 message = 363a09fbc370ebfbac58d09f7229efc780b0e65520a4886a9912cdd0aff9c5f5fd
 customization = 4a4a8581308eec126e60478f4d3edfd928fb842f5935690525124704460d9aa7408d71be503524fc1c3960c000adb4eb4b0fe020a3a9c20fe35f1c337c7d6dec71ced9729ee587d2ce488865f691d252bc7c2986c4a36738dec1cca9272599d63adc264b8b8c949c846cb9ce05ec72d209e297cbf90217acc324b4491cf70bd9d707a44aa8ed3ebd7adcae5962fdb623f2a5f14983b2855eeecd3e2f78bb9ad3aca07e0f8a94389d67b043d858c6454258ac4f4b4e98e5a666e84c362cbfa6dad2012e8a34d1809616f301ca1edf8db763fc54cebe15ddf89ddd38f829d52370e783cdf20b0a72b6d892d2b63e8a7a775968adcf4a1dc4e9339c91d8b6c9e8
 outputLength = 0
-result = ok
-output = 
+result = INVALID_LENGTH
 
 name = 255-byte customization, 1-byte output
 operation = digest
@@ -1637,8 +1631,7 @@ operation = digest
 message = 363a09fbc370ebfbac58d09f7229efc780b0e65520a4886a9912cdd0aff9c5f5fd
 customization = 73f72379cb61e929c696b4adc815bcfa18350110c11ab14a1f7ae6d44cb955a6ab094d0f65132f033015128ff12e33527b0f472de36bbd4e58cf80e65bfffe6e7c0a3f2c65cf08e8a736d9c432f40b07a7a3dc32cf27926b042c42c7edbf1e074531b2c12ad467470f9b34a53152494852117bad58323ca7c80f3c2e5d5faeeec65d52096c3e910937b6c9181df9e5445e11db80d34905b22ad97936b89bbca3e2e98d31e012b9f136fdba627b873ab2ca393d32a1d82e26d2714ed5e6583f14fa27401454f1279f98e793b8c69b57bacb74dfe2167a72b1e411d4becb132f44f11129b2cdb26ae9455bfd9756ba57c74e9f59aae071de58a94a5740850d2392
 outputLength = 0
-result = ok
-output = 
+result = INVALID_LENGTH
 
 name = 256-byte customization, 1-byte output
 operation = digest
@@ -3346,7 +3339,8 @@ operation = digest
 key = 6b6579
 message = 6d657373616765
 length = 32
-result = INVALID_OPTION
+result = ok
+output = 6e9ef29b75fffc5b7abae527d58fdadb2fe42e7219011976917343065f58ed4a
 
 name = customization
 operation = digest
