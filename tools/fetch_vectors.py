@@ -18,8 +18,6 @@ ACVP = "https://raw.githubusercontent.com/usnistgov/ACVP-Server/975de31eb83d8703
 
 WYCHEPROOF = "https://raw.githubusercontent.com/C2SP/wycheproof/7a325932231bd7a724c791c8b0d65ea4d6d2f435/testvectors_v1"
 
-XWING = "https://raw.githubusercontent.com/dconnolly/draft-connolly-cfrg-xwing-kem/984c2f7a93b8f8d8f8073ebb53f9f4ce50b5babd/spec"
-
 RFC = "https://www.rfc-editor.org/rfc"
 
 EXAMPLES = "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Standards-and-Guidelines/documents/examples"
@@ -83,7 +81,6 @@ SOURCES = {
     "LMS-sigGen-SP800-208": (f"{ACVP}/LMS-sigGen-SP800-208/internalProjection.json", "10c3cd4be12a8cf58bf4c3e2cf63b61b88688e7e7a9892eda01373538227968e"),
     "LMS-sigVer-1.0": (f"{ACVP}/LMS-sigVer-1.0/internalProjection.json", "298bf08f3dab576483b731dc58a4feab18b93e1e741bc6192133285962cf77dd"),
     "LMS-sigVer-SP800-208": (f"{ACVP}/LMS-sigVer-SP800-208/internalProjection.json", "015bb30cb60d4fb24bc69d0cb074965c5fd10d1c70b01d09a5914d4947e2dedf"),
-    "x25519_test": (f"{WYCHEPROOF}/x25519_test.json", "35c3f5231cf25cc640b524d403461deee9e49441d5d915a3a25b2c8ff5adbe7d"),
     "mlkem_512_test": (f"{WYCHEPROOF}/mlkem_512_test.json", "18bc5455d5bf8226b3ab1d1deb51f3ed7c44b3d90039eb25416d40fa77e76f20"),
     "mlkem_512_encaps_test": (f"{WYCHEPROOF}/mlkem_512_encaps_test.json", "85a69664f2e8243f5085f01fb22f9635b100b16a8935cf2b2ac94c127511a20c"),
     "mlkem_512_semi_expanded_decaps_test": (f"{WYCHEPROOF}/mlkem_512_semi_expanded_decaps_test.json", "bb90c7997dc3695e52882608b7c79675a012c031dd50dc08e76c4775a762ad14"),
@@ -130,8 +127,6 @@ SOURCES = {
     "HMAC-SHA2-256-2.0": (f"{ACVP}/HMAC-SHA2-256-2.0/internalProjection.json", "a9d0734b93aee71bc6f30b47daab782fd96b39688afe4fbddb009e99402ec989"),
     "HMAC-SHA2-384-2.0": (f"{ACVP}/HMAC-SHA2-384-2.0/internalProjection.json", "0ffa9332b9430ae94cfac0f23b3843293903fa34a3ac9c11a8af2bfdf7276ed3"),
     "HMAC-SHA2-512-2.0": (f"{ACVP}/HMAC-SHA2-512-2.0/internalProjection.json", "ea6e03f012d5237b95421b7d50c504f8ab010c4f7f18cd46fe61d8912d3442a0"),
-    "xwing": (f"{XWING}/test-vectors.json", "409efe197550b22985b4a0419418a0c5f2c2b193426c55bd998399ec8d3e614d"),
-    "rfc7748": (f"{RFC}/rfc7748.txt", "279ca0ecc5e92e2962e27b846986aeb74729d9dd34bd4a04a362f80dcb596ad3"),
     "rfc8554": (f"{RFC}/rfc8554.txt", "d5bfdbd457dfe7bc5f67cc1f62482999c2f55bf8033f2af56da323f2ffc2c055"),
     "rfc9858": (f"{RFC}/rfc9858.txt", "87562eee1657467b218c448c608e4605aa1149583e4f2fbf6f3fedfbd000360d"),
     "rfc5869": (f"{RFC}/rfc5869.txt", "7a40eb3835b35fc947eb12a2ed614db079d43b26e50dbc537c31fba16397089c"),
@@ -169,7 +164,7 @@ SOURCES = {
     "eFrodoKEM-1344-SHAKE": (f"{FRODOKEM}/eFrodoKEM/KAT/PQCkemKAT_43088_shake.rsp", "591adc09a718afbc0ac36e1f57a191e557fe4eec7899e078104b9706b75e2f96"),
 }
 
-GENERATED = ("acvp", "wycheproof", "xwing", "rfc", "nist-examples", "blake2", "blake3", "ascon", "frodokem")
+GENERATED = ("acvp", "wycheproof", "rfc", "nist-examples", "blake2", "blake3", "ascon", "frodokem")
 
 # The full ACVP sets and the large-data tests run in the weekly job (SPEC 19.4) and are not kept in
 # the repository: "fetch_vectors.py --full" writes them to vectors/acvp-full, which git ignores,
@@ -411,74 +406,10 @@ def wycheproof(names, fields, header_fields=()):
     return groups
 
 
-def xwing():
-    tests = [{k: v[k] for k in ("seed", "sk", "pk", "eseed", "ct", "ss")} for v in json.loads(source("xwing"))]
-
-    return [({}, tests)]
-
-
 def rfc_text(name):
     text = source(name).decode()
 
     return [line for line in text.splitlines() if "[Page " not in line and not line.startswith("RFC ")]
-
-
-def hex_after(lines, label, count=1):
-    values = []
-
-    for index, line in enumerate(lines):
-        if line.strip() == label:
-            values.append("".join(lines[index + 1].split()))
-
-    if len(values) < count:
-        sys.exit(f"missing {label}")
-
-    return values
-
-
-def rfc7748():
-    lines = rfc_text("rfc7748")
-
-    start = lines.index("5.2.  Test Vectors")
-
-    end = lines.index("6.2.  Curve448")
-
-    lines = lines[start:end]
-
-    x448 = lines.index("   X448:")
-
-    scalars = hex_after(lines[:x448], "Input scalar:", 2)
-
-    coordinates = hex_after(lines[:x448], "Input u-coordinate:", 2)
-
-    outputs = hex_after(lines[:x448], "Output u-coordinate:", 2)
-
-    tests = [{"scalar": s, "u": u, "output": o} for s, u, o in zip(scalars, coordinates, outputs)]
-
-    groups = [({"kind": "multiply"}, tests)]
-
-    iterated = lines[lines.index("   X25519:", x448) :]
-
-    iterations = []
-
-    for label, count in (("After one iteration:", 1), ("After 1,000 iterations:", 1000), ("After 1,000,000 iterations:", 1000000)):
-        iterations.append({"iterations": count, "output": hex_after(iterated, label)[0]})
-
-    groups.append(({"kind": "iterate"}, iterations))
-
-    labels = {
-        "alicePrivate": "Alice's private key, a:",
-        "alicePublic": "Alice's public key, X25519(a, 9):",
-        "bobPrivate": "Bob's private key, b:",
-        "bobPublic": "Bob's public key, X25519(b, 9):",
-        "shared": "Their shared secret, K:",
-    }
-
-    exchange = {key: hex_after(lines, label)[0] for key, label in labels.items()}
-
-    groups.append(({"kind": "exchange"}, [exchange]))
-
-    return groups
 
 
 # A test case lists labelled hexadecimal fields, wrapping long values onto lines that carry no
@@ -1630,8 +1561,6 @@ def main():
 
     write("acvp/LMS-sigVer.txt", render(lms()))
 
-    write("wycheproof/x25519.txt", render(wycheproof(["x25519_test"], ("private", "public", "shared"))))
-
     sizes = (512, 768, 1024)
 
     write("wycheproof/mlkem.txt", render(wycheproof([f"mlkem_{k}_test" for k in sizes], ("seed", "ek", "c", "K"))))
@@ -1649,10 +1578,6 @@ def main():
     write("wycheproof/mldsa_sign_noseed.txt", render(wycheproof([f"mldsa_{k}_sign_noseed_test" for k in levels], ("msg", "mu", "ctx", "sig"), ("privateKey", "publicKey"))))
 
     write("wycheproof/mlkem_keygen_seed.txt", render(wycheproof([f"mlkem_{k}_keygen_seed_test" for k in sizes], ("seed", "ek", "dk"))))
-
-    write("xwing/test-vectors.txt", render(xwing()))
-
-    write("rfc/x25519.txt", render(rfc7748()))
 
     write("rfc/hss.txt", render([({}, rfc8554() + rfc9858())]))
 

@@ -216,20 +216,9 @@ impl StateStore for MemoryStore {
     }
 }
 
-// TEMPORARY: the shared cross files keep their X-Wing groups until every language has removed
-// X-Wing. SPEC section 4 (Scope, 4.2) excludes it from crypto-pq 1.0 and the Rust crate no longer
-// has it, so these runners skip exactly those groups; delete this when the files drop them.
-fn in_scope(name: &str, field: &str) -> Vec<(Fields, Fields)> {
-    let mut found = records(name, field);
-
-    found.retain(|(header, _)| header.get("algorithm").map(String::as_str) != Some("X-Wing"));
-
-    found
-}
-
 #[test]
 fn kem() {
-    parallel(&in_scope("cross/kem.txt", "seed"), |(header, record)| {
+    parallel(&records("cross/kem.txt", "seed"), |(header, record)| {
         let algorithm = kem_algorithm(&header["algorithm"]);
 
         let context = format!("{} tcId {}", algorithm.name(), record["tcId"]);
@@ -1030,7 +1019,7 @@ fn errors() {
 
     let pending = Mutex::new(Vec::new());
 
-    let cases = in_scope("cross/errors.txt", "result");
+    let cases = records("cross/errors.txt", "result");
 
     let (skipped, cases): (Vec<_>, Vec<_>) = cases.into_iter().partition(loads_version_1);
 
