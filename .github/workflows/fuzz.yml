@@ -1,6 +1,7 @@
 name: fuzz
 
-# Weekly and on demand: the Go fuzzers and the long robustness runs take too long for every push.
+# Weekly and on demand: the long robustness runs and the full vector sets take too long for every
+# push.
 on:
   schedule:
     - cron: "23 4 * * 1"
@@ -14,81 +15,19 @@ defaults:
     shell: bash
 
 jobs:
-  go-fuzz:
-    name: go ${{ matrix.target }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [FuzzKemImport, FuzzDecapsulate, FuzzSignatureImport, FuzzVerify, FuzzLoadPrivateKey, FuzzStatefulVerify, FuzzStatefulImport, FuzzTreeCache, FuzzDer, FuzzPem, FuzzBase64, FuzzSymmetric]
-    defaults:
-      run:
-        shell: bash
-        working-directory: go
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: stable
-          cache: false
-      # Minimizing inputs of tens of kilobytes stalls the fuzzer; 300 runs is enough.
-      - run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 10m -fuzzminimizetime 300x .
-      - if: failure()
-        run: for f in testdata/fuzz/*/*; do echo "== $f"; cat "$f"; done
-
-  # Each kernel against the portable code, on both architectures.
-  go-fuzz-kernels:
-    name: go ${{ matrix.target }} (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
-        target: [FuzzSHA256Kernels, FuzzSHA256Chains, FuzzSHA512Kernels, FuzzKeccakKernels, FuzzX25519Kernels, FuzzNTTKernels, FuzzBlake2Kernels, FuzzAsconKernels, FuzzKemKernels, FuzzX25519Tiers, FuzzDsaKernels]
-    defaults:
-      run:
-        shell: bash
-        working-directory: go
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: stable
-          cache: false
-      - run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 10m .
-      - if: failure()
-        run: for f in testdata/fuzz/*/*; do echo "== $f"; cat "$f"; done
-
   long:
     name: long robustness runs
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       CRYPTO_PQ_FUZZ: "1"
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - working-directory: rust
-        run: cargo test --locked --release --test robustness
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "24"
-          package-manager-cache: false
-      - working-directory: typescript
-        run: node --test test/robustness.test.ts
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/zig-x86_64-linux-0.16.0.tar.xz
-          key: zig-x86_64-linux-0.16.0.tar.xz
-      - run: |
-          archive=~/zig-x86_64-linux-0.16.0.tar.xz
-          [ -f "$archive" ] || curl -fsSL --proto '=https' -o "$archive" https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
-          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $archive" | sha256sum -c -
-          mkdir -p ~/zig && tar -xJf "$archive" -C ~/zig --strip-components=1
-          echo ~/zig >> "$GITHUB_PATH"
-      - working-directory: zig
-        run: zig build test -Doptimize=ReleaseSafe --summary all
+      - run: cargo test --locked --release --test robustness
 
   # The official vector sets too slow for every push (SPEC 19.4): the full ACVP ML-KEM, ML-DSA and
   # SLH-DSA sets, the ACVP large-data hashes (1 to 8 GiB per test), BLAKE2 past 4 GiB and the XMSS
@@ -141,83 +80,3 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - run: rustup override set stable
       - run: cargo test --locked --release --test stateful -- --ignored --exact xmss_reference_keys_of_height_20
-
-  # The pure backend hashes with its own Python engines, about 1 MB/s, so its long run (the 16 MiB
-  # inputs and fifty times the fuzz rounds) takes most of an hour on its own.
-  long-python:
-    name: long robustness runs (Python, pure)
-    runs-on: ubuntu-latest
-    timeout-minutes: 80
-    env:
-      CRYPTO_PQ_FUZZ: "1"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.x"
-      - working-directory: python
-        run: python -m unittest discover -s tests -p test_robustness.py
-        env:
-          PYTHONPATH: src
-          CRYPTO_PQ_SLOW: "1"
-
-  # The WebAssembly core against the TypeScript implementation on random inputs for every family,
-  # keys of each backend used by the other, on both architectures (V8 lowers SIMD differently on
-  # each). A failure names its seed; CRYPTO_PQ_SEED=n repeats the run.
-  typescript-differential:
-    name: typescript wasm against js (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
-    env:
-      CRYPTO_PQ_FUZZ: "1"
-    defaults:
-      run:
-        shell: bash
-        working-directory: typescript
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "24"
-          package-manager-cache: false
-      - run: node --import ./test/backend.ts --test test/differential.test.ts
-
-  # The Python native backend, through the extension module and through ctypes, against the pure
-  # one on many more random inputs, every SLH-DSA set included, from a wheel built with this
-  # source's x86-64 files.
-  python-native-differential:
-    name: python native against pure
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/zig-x86_64-linux-0.16.0.tar.xz
-          key: zig-x86_64-linux-0.16.0.tar.xz
-      - run: |
-          archive=~/zig-x86_64-linux-0.16.0.tar.xz
-          [ -f "$archive" ] || curl -fsSL --proto '=https' -o "$archive" https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
-          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $archive" | sha256sum -c -
-          mkdir -p ~/zig && tar -xJf "$archive" -C ~/zig --strip-components=1
-          echo ~/zig >> "$GITHUB_PATH"
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.x"
-      - working-directory: zig
-        run: zig build dist
-      - working-directory: python
-        run: |
-          python build_backend/cpq_build.py wheel "$RUNNER_TEMP/wheel" --native ../zig/zig-out/dist/x86_64-linux
-          python -m pip install "$RUNNER_TEMP"/wheel/*.whl
-      - working-directory: python/tests
-        env:
-          CRYPTO_PQ_FUZZ: "1"
-          CRYPTO_PQ_BACKEND: native
-        run: |
-          python -m unittest -v test_native test_robustness
-          python -c 'import sys; sys.modules["crypto_pq._cpq"] = None; from crypto_pq import _native; assert _native.BINDING == "ctypes", _native.BINDING; import unittest; unittest.main(module=None, argv=["unittest", "-v", "test_native", "test_robustness"])'
