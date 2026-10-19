@@ -607,13 +607,13 @@ fn strict_encodings() {
         .collect();
 
     // SPEC 10.4 item 3: text before the BEGIN line and after the END line is ignored, even
-    // non-ASCII text or a boundary that starts no line; whitespace may follow a boundary on its
-    // line (D-67).
+    // non-ASCII text or a boundary that starts no line; spaces and tabs may follow a boundary on
+    // its line (D-67, the *WSP of RFC 7468).
     let accepted = [
         format!(" \t\r\n{pem}\n\n"),
         format!("Subject: test key\n\u{e9}\n{pem}-----END PUBLIC KEY-----\ntrailing \u{e9}"),
         format!("see -----BEGIN PUBLIC KEY----- below\n{pem}"),
-        pem.replacen("-----\n", "----- \t\x0b\x0c\n", 1),
+        pem.replacen("-----\n", "----- \t \n", 1),
         format!("{} \t\r\n", pem.trim_end()),
         format!(
             "{}\r\n{}\r\n{}",
@@ -646,6 +646,9 @@ fn strict_encodings() {
         format!("  {pem}"),
         format!("\x0b{pem}"),
         pem.replacen("-----\n", "----- x\n", 1),
+        pem.replacen("-----\n", "-----\x0b\n", 1),
+        pem.replacen("-----\n", "----- \t\x0c\n", 1),
+        format!("{}\x0b\n", pem.trim_end()),
         pem.replacen("-----\n", "-----", 1),
         pem.replacen("\n-----END", "-----END", 1),
         pem.replacen("\n-----END", "\n -----END", 1),

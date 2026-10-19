@@ -386,11 +386,11 @@ fn base64_decode(text: &[u8]) -> Result<SecretBytes, Error> {
     Ok(out)
 }
 
-// The layout of PEM text (SPEC 10.4 and D-67): whether a byte is whitespace other than a line
-// end, a line end, a dash, padding, or anything else. It is computed with arithmetic and only then
-// made public, so that no branch or table index depends on the value of a base64 digit, which
-// only the arithmetic decoder reads.
-const SPACE: u8 = 1;
+// The layout of PEM text (SPEC 10.4 and D-67): whether a byte is a space or a tab (the WSP that
+// RFC 7468 allows after a boundary), a line end, a dash, padding, other whitespace, or anything
+// else. It is computed with arithmetic and only then made public, so that no branch or table index
+// depends on the value of a base64 digit, which only the arithmetic decoder reads.
+const WSP: u8 = 1;
 
 const LINE_END: u8 = 2;
 
@@ -398,17 +398,25 @@ const DASH: u8 = 4;
 
 const PAD: u8 = 8;
 
+const SPACE: u8 = 16;
+
 // 1 when the bytes are equal, 0 otherwise.
 const fn same_byte(a: u8, b: u8) -> u8 {
     ((((a ^ b) as u32).wrapping_sub(1)) >> 31) as u8
 }
 
 fn layout(c: u8) -> u8 {
-    let space = same_byte(c, b' ') | same_byte(c, b'\t') | same_byte(c, 0x0B) | same_byte(c, 0x0C);
+    let wsp = same_byte(c, b' ') | same_byte(c, b'\t');
 
     let line_end = same_byte(c, b'\n') | same_byte(c, b'\r');
 
-    let class = space | (line_end << 1) | (same_byte(c, b'-') << 2) | (same_byte(c, b'=') << 3);
+    let space = same_byte(c, 0x0B) | same_byte(c, 0x0C);
+
+    let class = wsp
+        | (line_end << 1)
+        | (same_byte(c, b'-') << 2)
+        | (same_byte(c, b'=') << 3)
+        | (space << 4);
 
     black_box(declassify_value(class))
 }
@@ -418,11 +426,11 @@ fn starts_with(text: &[u8], prefix: &[u8]) -> bool {
     text.len() >= prefix.len() && declassify_value(equal_mask(&text[..prefix.len()], prefix)) != 0
 }
 
-// A boundary line holds the boundary and nothing else but trailing whitespace.
+// A boundary line holds the boundary and nothing else but trailing spaces and tabs.
 fn is_boundary(line: &[u8], kind: &[u8], label: &[u8]) -> bool {
     let size = kind.len() + label.len() + DASHES.len();
 
-    if line.len() < size || line[size..].iter().any(|&c| layout(c) != SPACE) {
+    if line.len() < size || line[size..].iter().any(|&c| layout(c) != WSP) {
         return false;
     }
 
@@ -487,10 +495,10 @@ pub(crate) fn pem_encode(label: &[u8], der: &[u8]) -> Vec<u8> {
 }
 
 // RFC 7468 and SPEC D-67: the one block with this label, whose BEGIN and END lines each start a
-// line and hold only the boundary and trailing whitespace. Lines before the first line that starts
-// with a BEGIN boundary, and after the END line, are ignored, except a second BEGIN line; between
-// them only base64 and whitespace may appear, and a line that starts with a dash must be the END
-// line. Every branch depends on the layout alone.
+// line and hold only the boundary and trailing spaces and tabs. Lines before the first line that
+// starts with a BEGIN boundary, and after the END line, are ignored, except a second BEGIN line;
+// between them only base64 and whitespace may appear, and a line that starts with a dash must be
+// the END line. Every branch depends on the layout alone.
 pub(crate) fn pem_decode(label: &[u8], data: &[u8]) -> Result<SecretBytes, Error> {
     let mut lines = lines(data);
 
@@ -513,7 +521,7 @@ pub(crate) fn pem_decode(label: &[u8], data: &[u8]) -> Result<SecretBytes, Error
 
     let body = &data[begin.end..end.start];
 
-    let digit = |c: &&u8| layout(**c) & (SPACE | LINE_END) == 0;
+    let digit = |c: &&u8| layout(**c) & (WSP | LINE_END | SPACE) == 0;
 
     let mut text = SecretBytes::zeroed(body.iter().filter(digit).count());
 
@@ -551,8 +559,9 @@ mod tests {
     fn layout_classes() {
         for c in 0..=255u8 {
             let expected = match c {
-                b' ' | b'\t' | 0x0B | 0x0C => SPACE,
+                b' ' | b'\t' => WSP,
                 b'\n' | b'\r' => LINE_END,
+                0x0B | 0x0C => SPACE,
                 b'-' => DASH,
                 b'=' => PAD,
                 _ => 0,
