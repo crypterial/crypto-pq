@@ -8,7 +8,7 @@ use crypto_pq::{
     StatefulLoadOptions, StatefulParameters, StatefulPrivateKey, StatefulSignatureAlgorithm, XMSS,
     XMSS_MT, hazmat,
 };
-use vectors::{der, parallel, records, unhex};
+use vectors::{Fields, der, parallel, records, unhex};
 
 const SMALL: [(&str, &str); 1] = [("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1")];
 
@@ -774,6 +774,84 @@ fn xmss_reference_vectors() {
 #[ignore = "builds trees of 2^16 leaves; runs in the weekly job"]
 fn xmss_reference_vectors_of_height_16() {
     xmss_vectors(true);
+}
+
+// The twelve SP 800-208 sets whose trees have 2^20 leaves, from the same reference (xmss-large.txt),
+// with signatures at indices 0 and 2^h - 2. Every signature verifies on every push; the weekly job
+// makes each key again from its seed at index 0, which builds its trees of 2^20 leaves, and signs
+// the same bytes.
+fn xmss_large_vectors() -> Vec<(Fields, Fields)> {
+    let found = records("xmss/xmss-large.txt", "signature");
+
+    assert_eq!(found.len(), 24);
+
+    found
+}
+
+fn xmss_algorithm(name: &str) -> StatefulSignatureAlgorithm {
+    if name.starts_with("XMSSMT") {
+        XMSS_MT
+    } else {
+        XMSS
+    }
+}
+
+#[test]
+fn xmss_reference_vectors_of_height_20() {
+    parallel(&xmss_large_vectors(), |(_, record)| {
+        let name = record["name"].as_str();
+
+        let context = format!("{name} index {}", record["index"]);
+
+        let public_key = xmss_algorithm(name)
+            .import_public_key(&unhex(&record["publicKey"]), KeyFormat::Raw)
+            .unwrap();
+
+        let (mut signature, message) = (unhex(&record["signature"]), unhex(&record["message"]));
+
+        assert!(public_key.verify(&signature, &message), "{context}");
+
+        *signature.last_mut().unwrap() ^= 1;
+
+        assert!(!public_key.verify(&signature, &message), "{context}");
+    });
+}
+
+#[test]
+#[ignore = "builds trees of 2^20 leaves; runs in the weekly job"]
+fn xmss_reference_keys_of_height_20() {
+    let first: Vec<_> = xmss_large_vectors()
+        .into_iter()
+        .filter(|(_, record)| record["index"] == "0")
+        .collect();
+
+    assert_eq!(first.len(), 12);
+
+    parallel(&first, |(_, record)| {
+        let name = record["name"].as_str();
+
+        let mut pair = hazmat::generate_stateful_key_pair(
+            xmss_algorithm(name),
+            &unhex(&record["seed"]),
+            0,
+            StatefulParameters::Name(name),
+            MemoryStore::default(),
+            &StatefulKeyGenOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            pair.public_key.export_key(KeyFormat::Raw).unwrap(),
+            unhex(&record["publicKey"]),
+            "{name}"
+        );
+
+        assert_eq!(
+            pair.private_key.sign(&unhex(&record["message"])).unwrap(),
+            unhex(&record["signature"]),
+            "{name}"
+        );
+    });
 }
 
 #[test]

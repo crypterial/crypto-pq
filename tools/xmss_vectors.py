@@ -11,8 +11,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 # XMSS has no NIST test vectors, so they are produced by the RFC 8391 reference implementation
 # (CC0), which follows SP 800-208 key generation. Building needs a C compiler and OpenSSL.
-# xmss.txt holds the base sets and xmss-extra.txt the other sets whose trees have at most 2^16
-# leaves (see xmss_vectors.c); the extra sets take minutes each, so they run side by side.
+# xmss.txt holds the base sets, xmss-extra.txt the other sets whose trees have at most 2^16 leaves
+# and xmss-large.txt the sets with trees of 2^20 leaves (see xmss_vectors.c); the extra sets take
+# minutes each and the large ones hours, so they run side by side.
 REFERENCE = "https://raw.githubusercontent.com/XMSS/xmss-reference/171ccbd26f098542a67eb5d2b128281c80bd71a6"
 
 FILES = {
@@ -69,7 +70,11 @@ def main():
         with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
             extra = b"".join(pool.map(lambda i: run("extra", str(i)), range(16)))
 
-    for name, output in [("xmss.txt", base), ("xmss-extra.txt", extra)]:
+            large = b"".join(pool.map(lambda i: run("large", str(i)), range(12)))
+
+    provenance = f"# xmss-reference {REFERENCE.rsplit('/', 1)[1]} (RFC 8391), tools/xmss_vectors.c large 0 to 11\n\n".encode()
+
+    for name, output in [("xmss.txt", base), ("xmss-extra.txt", extra), ("xmss-large.txt", provenance + large)]:
         path = ROOT / "vectors" / "xmss" / name
 
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,7 +83,7 @@ def main():
 
     vectors = ROOT / "vectors"
 
-    files = sorted(p for p in vectors.rglob("*") if p.is_file() and p.name != "SHA256SUMS")
+    files = sorted(p for p in vectors.rglob("*") if p.is_file() and p.name != "SHA256SUMS" and "acvp-full" not in p.relative_to(vectors).parts)
 
     lines = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(vectors).as_posix()}" for p in files]
 

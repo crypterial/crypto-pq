@@ -101,7 +101,7 @@ static const struct set base[] = {
 };
 
 // The sets of vectors/xmss/xmss-extra.txt: the other SP 800-208 sets whose trees have at most
-// 2^16 leaves. The twelve sets with trees of 2^20 leaves are left to the weekly job.
+// 2^16 leaves.
 static const struct set extra[] = {
     {"XMSS-SHA2_16_256", 0, 0x02, 16},
     {"XMSS-SHA2_16_192", 0, 0x0e, 16},
@@ -121,15 +121,39 @@ static const struct set extra[] = {
     {"XMSSMT-SHAKE256_60/6_192", 1, 0x37, 60},
 };
 
-static int vectors(const struct set *set)
+// The sets of vectors/xmss/xmss-large.txt: the twelve SP 800-208 sets whose trees have 2^20
+// leaves. The reference builds every tree of a signature's path for each signature, an hour and
+// more per set, so these get two signatures each.
+static const struct set large[] = {
+    {"XMSS-SHA2_20_256", 0, 0x03, 20},
+    {"XMSS-SHA2_20_192", 0, 0x0f, 20},
+    {"XMSS-SHAKE256_20_256", 0, 0x12, 20},
+    {"XMSS-SHAKE256_20_192", 0, 0x15, 20},
+    {"XMSSMT-SHA2_40/2_256", 1, 0x03, 40},
+    {"XMSSMT-SHA2_60/3_256", 1, 0x06, 60},
+    {"XMSSMT-SHA2_40/2_192", 1, 0x23, 40},
+    {"XMSSMT-SHA2_60/3_192", 1, 0x26, 60},
+    {"XMSSMT-SHAKE256_40/2_256", 1, 0x2b, 40},
+    {"XMSSMT-SHAKE256_60/3_256", 1, 0x2e, 60},
+    {"XMSSMT-SHAKE256_40/2_192", 1, 0x33, 40},
+    {"XMSSMT-SHAKE256_60/3_192", 1, 0x36, 60},
+};
+
+static int vectors(const struct set *set, int few)
 {
     unsigned long long last = (1ULL << set->height) - 1;
 
     // The reference wipes the key before signing at the last index, so its final signature is not
     // valid; 2^h - 2 is the largest index used here.
-    unsigned long long indices[] = {0, 1, last / 3, last - 1};
+    unsigned long long all[] = {0, 1, last / 3, last - 1};
 
-    for (unsigned int j = 0; j < sizeof indices / sizeof indices[0]; j++) {
+    unsigned long long two[] = {0, last - 1};
+
+    const unsigned long long *indices = few ? two : all;
+
+    unsigned int count = few ? 2 : 4;
+
+    for (unsigned int j = 0; j < count; j++) {
         if (vector(set->name, set->multi_tree, set->oid, indices[j]) != 0) {
             fprintf(stderr, "%s: failed\n", set->name);
 
@@ -140,14 +164,20 @@ static int vectors(const struct set *set)
     return 0;
 }
 
-// Without arguments, every base set; with "extra" and a number, that extra set alone, so that the
-// slow ones can run side by side.
+// Without arguments, every base set; with "extra" or "large" and a number, that set alone, so
+// that the slow ones can run side by side.
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "extra") == 0) {
         unsigned long i = strtoul(argv[2], NULL, 10);
 
-        return i < sizeof extra / sizeof extra[0] ? vectors(&extra[i]) : 2;
+        return i < sizeof extra / sizeof extra[0] ? vectors(&extra[i], 0) : 2;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "large") == 0) {
+        unsigned long i = strtoul(argv[2], NULL, 10);
+
+        return i < sizeof large / sizeof large[0] ? vectors(&large[i], 1) : 2;
     }
 
     if (argc != 1) {
@@ -155,7 +185,7 @@ int main(int argc, char **argv)
     }
 
     for (unsigned int i = 0; i < sizeof base / sizeof base[0]; i++) {
-        if (vectors(&base[i]) != 0) {
+        if (vectors(&base[i], 0) != 0) {
             return 1;
         }
     }

@@ -91,8 +91,8 @@ jobs:
         run: zig build test -Doptimize=ReleaseSafe --summary all
 
   # The official vector sets too slow for every push (SPEC 19.4): the full ACVP ML-KEM, ML-DSA and
-  # SLH-DSA sets, the ACVP large-data hashes (1 to 8 GiB per test) and BLAKE2 past 4 GiB, the tests
-  # marked #[ignore].
+  # SLH-DSA sets, the ACVP large-data hashes (1 to 8 GiB per test), BLAKE2 past 4 GiB and the XMSS
+  # keys with trees of 2^20 leaves (24 trees, most of the time), the tests marked #[ignore].
   # The full sets are not in the repository: the fetch tool downloads them from their pinned URLs
   # and checks every source and every file it writes against its SHA-256. CRYPTO_PQ_SLOW adds the
   # slow cases of the regular tests, such as the key of RFC 9858 A.4 with its tree of 2^20 leaves,
@@ -100,7 +100,7 @@ jobs:
   rust-full-vectors:
     name: rust full vector sets (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
