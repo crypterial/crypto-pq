@@ -1218,7 +1218,7 @@ fn state_record_layout() {
 // every other version.
 #[test]
 fn version_1_records_are_refused() {
-    // A version 1 HSS record written by the Python reference before 1.0.
+    // A version 1 HSS record, as a pre-release version wrote it.
     let version_1 = unhex(concat!(
         "0101010000000a00000005000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c",
         "1d1e1f2021222324252627000000000000000332b414e1d42dc2866aeed26f724a5be7",
@@ -2045,7 +2045,7 @@ fn xmss_mt_kept_layers_match_fresh_keys() {
     }
 }
 
-// Tree caches. The levels and the parameter set are those of the Python tests.
+// Tree caches.
 const TWO: [(&str, &str); 2] = [
     ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W4"),
     ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W2"),
