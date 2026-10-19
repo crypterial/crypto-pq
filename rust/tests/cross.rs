@@ -957,7 +957,8 @@ fn loads_version_1((header, record): &(Fields, Fields)) -> bool {
 
 // Cases whose expected result predates a rule of SPEC 1.0 that the reference generator does not
 // apply yet, by case name, with the result under the rule. Remove them when the file is
-// regenerated (SPEC Appendix C.1 item 9).
+// regenerated (SPEC Appendix C.1 item 9): an entry that no record needs any more, because no case
+// has its name or every such case already has the new result, fails the test.
 const PENDING: [(&str, &str); 24] = [
     // 7.3: the options, the context included, are checked before the lengths.
     (
@@ -1044,7 +1045,10 @@ fn errors() {
 
         let mut expected_remaining = record.get("remaining").map(|value| value.parse().unwrap());
 
-        if let Some((name, now)) = PENDING.iter().find(|(name, _)| *name == record["name"]) {
+        if let Some((name, now)) = PENDING
+            .iter()
+            .find(|(name, now)| *name == record["name"] && *now != record["result"])
+        {
             pending.lock().unwrap().push(*name);
 
             expected = now;
@@ -1083,7 +1087,7 @@ fn errors() {
 
     assert!(
         unused.is_empty(),
-        "pending cases not in the file: {unused:?}"
+        "pending cases that no record needs: {unused:?}"
     );
 
     assert!(
