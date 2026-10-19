@@ -2465,18 +2465,18 @@ fn concurrent_keys_sharing_a_store() {
     );
 }
 
-// Every implementation runs these rounds on the same inputs, made by the same generator from
-// byte-identical keys, and hashes each input with its outcome: an error code, true or false, or
-// OK and the result. Equal digests mean that all five implementations accept, refuse and compute
-// alike on untrusted input.
+// These rounds run on inputs made by a fixed generator from byte-identical keys and hash each
+// input with its outcome: an error code, true or false, or OK and the result. The digests are
+// fixed, so every build and platform, and every port that runs the same rounds, must accept,
+// refuse and compute alike on untrusted input.
 const TRANSCRIPT_ROUNDS: usize = 96;
 
 const TRANSCRIPT_BUDGET: u64 = 1 << 14;
 
 // Each case is known by its number, which also seeds its generator. Cases 0, 1, 3 and 5 follow the
 // import rules of SPEC 1.0 (the text around a PEM block, the OID before the rest of the DER, the
-// ML-KEM secret-vector check and pairwise test); the other implementations reach these digests as
-// they apply the same rules.
+// ML-KEM secret-vector check and pairwise test); case 10 edits state records of version 2 (SPEC
+// 11.7) and loads them by the rules of SPEC 11.9.
 const TRANSCRIPT_CASES: [u64; 10] = [0, 1, 3, 4, 5, 6, 7, 8, 9, 10];
 
 const TRANSCRIPTS: [&str; 10] = [
@@ -2489,7 +2489,7 @@ const TRANSCRIPTS: [&str; 10] = [
     "7b468ce2966d2edd458ed4a62183bf6d4c06e182509a7773c505a3cb2ae12e58",
     "b2ecff951172fdfdd464c3b4bed07055c3041b64d0c11dc6c9bc62eae7cc0b0e",
     "57986f97a5d291a67f8a875f558d59a535f2157155e13b83b364a6a1cca5dc7d",
-    "b46878b67dab92d46731b18b1c63b71f24e7ec4cb53bca10ec36540ca1b4b054",
+    "70ec2aea4f3cd771ebbbb9ca2af7aa26d9211ec5f1ea82a0ff87232324750d65",
 ];
 
 struct Transcript(crypto_pq::Hasher);
@@ -2810,10 +2810,7 @@ fn transcripts() {
         })
         .collect();
 
-    // Temporary, until every language writes state records of version 2 (SPEC 11.8 and Appendix
-    // C.1 item 9): the last case edits state records, whose shared digest was computed with
-    // records of version 1, so it runs but is not compared.
-    assert_eq!(digests[..9], TRANSCRIPTS[..9]);
+    assert_eq!(digests, TRANSCRIPTS);
 }
 
 // Loading builds the key's trees, so a valid state of a key larger than the budget is only
