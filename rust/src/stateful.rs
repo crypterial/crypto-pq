@@ -2365,4 +2365,64 @@ mod tests {
             }
         }
     }
+
+    // SPEC 11.10 item 4 and D-64 (2): a cache exported before the key signed past a transition of
+    // its bottom level holds a stale bottom tree. The load ignores that tree and builds it, takes
+    // the trees above it from the cache, and the key signs.
+    #[test]
+    fn an_old_tree_cache_has_a_stale_tree() {
+        let seed: Vec<u8> = (0..72).collect();
+
+        let two = [
+            ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W4"),
+            ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W2"),
+        ];
+
+        let mt = StatefulParameters::Name("XMSSMT-SHA2_20/4_192");
+
+        for (algorithm, parameters, size, index) in [
+            (HSS_LMS, StatefulParameters::Levels(&two), 40, 30),
+            (XMSS_MT, mt, 72, 0x1233E),
+        ] {
+            let store = CrashingStore::default();
+
+            let mut pair = generate_stateful_key_pair(
+                algorithm,
+                &seed[..size],
+                index,
+                parameters,
+                store.clone(),
+                &StatefulKeyGenOptions::default(),
+            )
+            .unwrap();
+
+            pair.private_key.sign(b"first").unwrap();
+
+            let cache = pair.private_key.export_tree_cache().unwrap();
+
+            for message in [&b"second"[..], b"third"] {
+                pair.private_key.sign(message).unwrap();
+            }
+
+            drop(pair.private_key);
+
+            let state = store.state.borrow().clone().unwrap();
+
+            let options = StatefulLoadOptions::default().with_tree_cache(&cache);
+
+            computed();
+
+            let store = CrashingStore::default();
+
+            *store.state.borrow_mut() = Some(state);
+
+            let mut key = algorithm.load_private_key(store, &options).unwrap();
+
+            assert_eq!(computed(), 32, "{}", algorithm.name());
+
+            let signature = key.sign(b"m").unwrap();
+
+            assert!(pair.public_key.verify(&signature, b"m"));
+        }
+    }
 }
