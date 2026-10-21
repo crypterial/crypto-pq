@@ -470,12 +470,18 @@ impl<'a> Hashes<'a> {
 
         let mut lanes: [Option<(usize, u32)>; LANES] = [None; LANES];
 
+        // The inputs of the last steps: in a signature, chain values below the signed ones, which
+        // would let anyone sign a smaller digit, so they are wiped.
+        let mut x = [[0; 32]; LANES];
+
         loop {
             for lane in lanes.iter_mut().filter(|lane| lane.is_none()) {
                 *lane = pending.next().map(|i| (i, starts[i]));
             }
 
             if lanes.iter().all(Option::is_none) {
+                wipe(x.as_flattened_mut());
+
                 return;
             }
 
@@ -491,7 +497,9 @@ impl<'a> Hashes<'a> {
                 chain_adrs
             });
 
-            let x = lanes.map(|lane| lane.map_or([0; 32], |(i, _)| values[i]));
+            for (x, lane) in x.iter_mut().zip(lanes) {
+                *x = lane.map_or([0; 32], |(i, _)| values[i]);
+            }
 
             let outputs = self.chain_lanes(&x, &mut lane_adrs, lanes.map(|lane| lane.is_some()));
 
@@ -539,6 +547,9 @@ impl<'a> Hashes<'a> {
         for value in &values[..len] {
             out.extend_from_slice(&value[..self.p.n]);
         }
+
+        // The caller verifies the signature before it is released and wipes it if it is faulty.
+        wipe(values.as_flattened_mut());
     }
 
     fn wots_public_from_signature(

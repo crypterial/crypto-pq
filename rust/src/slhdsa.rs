@@ -941,7 +941,7 @@ impl Context<'_> {
                     secret_adrs
                 });
 
-                let secrets = self.hashes.prf_lanes(&secret_adrs);
+                let mut secrets = self.hashes.prf_lanes(&secret_adrs);
 
                 if (first..first + LANES as u32).contains(&selected) {
                     secret.copy_from_slice(&secrets[(selected - first) as usize][..n]);
@@ -961,6 +961,9 @@ impl Context<'_> {
                     &leaf_adrs,
                     core::array::from_fn(|lane| Some(&secrets[lane][..n])),
                 );
+
+                // The FORS secret values of the leaves that are not revealed.
+                wipe(secrets.as_flattened_mut());
 
                 for (lane, leaf) in leaves.into_iter().enumerate() {
                     tree.push(first + lane as u32, leaf, |height, index, left, right| {

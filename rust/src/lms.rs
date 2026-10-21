@@ -480,7 +480,9 @@ fn ots_sign(
         out.extend_from_slice(&value[..n]);
     }
 
-    wipe(&mut values[p..]);
+    // The chain starts past p that the last group derived, and the copy of the signature, which
+    // the caller verifies before it is released and wipes if it is faulty.
+    wipe(values.as_flattened_mut());
 
     out
 }
