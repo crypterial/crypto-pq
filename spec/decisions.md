@@ -504,6 +504,7 @@ value derived from the challenge stream that is declassified is whether fewer th
 candidate bytes of the first SHAKE256 block fit, so that a further block is read; for a uniform stream
 its probability is 2^−87.7 for τ = 60, 2^−140.3 for τ = 49 and 2^−202.9 for τ = 39. Verification
 runs the same code. Rationale: the challenge c̃ of a rejected attempt is never output, so it is a
-secret, and only the decision to reject is public; leaked challenges, including those of rejected
-attempts, help to recover ML-DSA private keys [KARABULUT21] [SIB-REJECTED]. The declassified bit is
+secret, and only the decision to reject is public. Side channels on the challenges of rejected
+attempts are a demonstrated threat: [KARABULUT21] recovers their signs, and [ZHOU25] recovers the
+private key from rejected challenges together with the rejected responses. The declassified bit is
 expected fewer than 2^−23 times in 2^64 attempts, and no fixed amount of stream avoids it entirely.
