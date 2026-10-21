@@ -49,3 +49,5 @@
 | [ACVP] | NIST ACVP-Server, gen-val/json-files. |
 | [WYCHEPROOF] | C2SP Wycheproof, testvectors_v1. |
 | [LWEKE] | microsoft/PQCrypto-LWEKE, the FrodoKEM reference implementation. |
+| [KARABULUT21] | E. Karabulut, E. Alkim, A. Aysu, Single-Trace Side-Channel Attacks on ω-Small Polynomial Sampling: With Applications to NTRU, NTRU Prime, and CRYSTALS-DILITHIUM, IEEE HOST 2021. |
+| [SIB-REJECTED] | IACR Cryptology ePrint Archive, Paper 2025/214: key recovery from the challenges of rejected CRYSTALS-Dilithium signing attempts through side channels. |

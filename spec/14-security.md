@@ -14,10 +14,12 @@
 5. A value derived from secrets MAY be declassified only where this document allows it: the outcome
    of a validity check that fails the call; values that become public outputs (public keys, roots,
    ciphertexts, signatures, randomizers C and r that are part of a signature); rejection-loop
-   decisions of ML-DSA signing; ML-KEM and FrodoKEM matrix generation from public seeds. Each
+   decisions of ML-DSA signing; whether ML-DSA SampleInBall needs a second SHAKE256 block, that is,
+   whether fewer than τ of the 128 candidate bytes of the first block fit, which is its only
+   declassification [[D-72](decisions.md#decision-d-72)]; ML-KEM and FrodoKEM matrix generation from public seeds. Each
    declassification MUST be marked in the code so that the checker of [14.1](#141-constant-time) item 7 sees it.
 6. Rejection sampling on secret data is permitted only in the form that FIPS 204 specifies for the
-   signing loop.
+   signing loop, and in SampleInBall without a branch on the candidates [[D-72](decisions.md#decision-d-72)].
 7. Every language MUST verify item 1 mechanically in CI for every secret-handling path, including
    every CPU-specific kernel that the checker can execute:
 

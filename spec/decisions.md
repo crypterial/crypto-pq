@@ -494,3 +494,16 @@ the default branch of the package's repository, and where a package manager read
 repository tags (Go modules), the release also creates the tag that it requires
 ([20.4](20-versioning.md#204-release-process)). Rationale: Rust is released first and alone (P13); a package released
 later fixes its repository in its profile, and no release depends on a generated mirror.
+
+## Decision D-72
+
+SampleInBall (FIPS 204 Algorithm 29) runs in constant time in every
+attempt of ML-DSA signing: neither the positions nor the signs of the challenge decide a branch, a
+memory address or the number of steps ([14.1](14-security.md#141-constant-time) item 5). The only
+value derived from the challenge stream that is declassified is whether fewer than τ of the 128
+candidate bytes of the first SHAKE256 block fit, so that a further block is read; for a uniform stream
+its probability is 2^−87.7 for τ = 60, 2^−140.3 for τ = 49 and 2^−202.9 for τ = 39. Verification
+runs the same code. Rationale: the challenge c̃ of a rejected attempt is never output, so it is a
+secret, and only the decision to reject is public; leaked challenges, including those of rejected
+attempts, help to recover ML-DSA private keys [KARABULUT21] [SIB-REJECTED]. The declassified bit is
+expected fewer than 2^−23 times in 2^64 attempts, and no fixed amount of stream avoids it entirely.
