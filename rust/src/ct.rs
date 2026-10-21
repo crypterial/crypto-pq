@@ -60,6 +60,7 @@ pub(crate) fn select(mask: u8, a: &[u8], b: &[u8], out: &mut [u8]) {
 // with every secret marked uninitialised, so that a branch or a memory index that depends on a
 // secret is reported. A value derived from secrets is declassified where the specification makes
 // it public. Without the cfg these hooks compile to nothing.
+/// Marks `values` as secret for the valgrind check of the `crypto_pq_ct` build.
 #[cfg(crypto_pq_ct)]
 pub fn secret<T>(values: &[T]) {
     valgrind::request(
@@ -69,6 +70,7 @@ pub fn secret<T>(values: &[T]) {
     );
 }
 
+/// Marks `values` as public for the valgrind check of the `crypto_pq_ct` build.
 #[cfg(crypto_pq_ct)]
 pub fn declassify<T>(values: &[T]) {
     valgrind::request(
