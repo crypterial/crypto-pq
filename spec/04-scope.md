@@ -20,6 +20,7 @@ private key encoding (raw, DER, PEM) for the algorithms that have a standard enc
 | HPKE (RFC 9180) with post-quantum KEMs | P2: the post-quantum HPKE profiles are drafts. |
 | AEAD (AES-GCM, ChaCha20-Poly1305, Ascon-AEAD128) | Deferred to crypto-pq 1.1. There is no AEAD category and no `DECRYPTION_FAILED` error in 1.0. |
 | SHA-1, MD5 | Not quantum-resistant at their sizes and not needed by any included algorithm. |
+| TupleHash and ParallelHash (SP 800-185); HMAC and HKDF over SHA-3 | Not in 1.0: no included algorithm uses them, and KMAC is the SHA-3 based MAC. |
 | External μ (ExternalMu-ML-DSA) | Not exposed; see [9.1.5](09-signatures.md#915-no-external-μ). |
 | JSON Web Key and other key formats | Only raw, DER and PEM (Section [10](10-key-formats.md)). |
 | Streaming signatures, multi-threaded operations | Not in 1.0. Multi-threading is a later, opt-in option. |
