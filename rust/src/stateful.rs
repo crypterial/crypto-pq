@@ -1678,6 +1678,9 @@ impl<S: StateStore> StatefulPrivateKey<S> {
         if index == capacity {
             if self.erasure_pending {
                 self.erase();
+
+                // A panic in a transition can leave the key here with its secrets.
+                self.wipe_secrets();
             }
 
             return Err(Error::KeyExhausted);
@@ -1785,6 +1788,13 @@ impl<S: StateStore> StatefulPrivateKey<S> {
             *tree = None;
         }
 
+        // Until the signed write stores the new trees, the key stands where step 3.5 puts it, so
+        // that a panic on the way (of the store, for one) leaves no claimed parent leaf free to
+        // sign another tree when the caller signs on.
+        self.index = self.past_claim(index, first);
+
+        self.erasure_pending = self.index == capacity;
+
         let grown = match self.grow(index, first, fresh) {
             Ok(grown) => grown,
             Err(error) => return Err(self.abandon(index, first, error)),
@@ -1808,7 +1818,19 @@ impl<S: StateStore> StatefulPrivateKey<S> {
 
         self.install(first, grown);
 
+        self.index = index;
+
+        self.erasure_pending = false;
+
         Ok(())
+    }
+
+    // SPEC 11.5.2 step 3.5: the index past the subtree of the topmost claimed level, which a load
+    // of the claim derives.
+    fn past_claim(&self, index: u64, first: usize) -> u64 {
+        let p = &self.parameters;
+
+        ((p.tree_number(index, first) + 1) << p.below(first)).min(p.capacity())
     }
 
     // SPEC 11.5.2 step 3.5: after a failure that follows a claim, the key moves past the subtree
@@ -1816,13 +1838,9 @@ impl<S: StateStore> StatefulPrivateKey<S> {
     // claim covers signs another tree. The new trees and signatures were dropped, and wiped, by
     // the caller.
     fn abandon(&mut self, index: u64, first: usize, error: Error) -> Error {
-        let p = &self.parameters;
+        self.index = self.past_claim(index, first);
 
-        let capacity = p.capacity();
-
-        self.index = ((p.tree_number(index, first) + 1) << p.below(first)).min(capacity);
-
-        if self.index == capacity {
+        if self.index == self.parameters.capacity() {
             self.erasure_pending = true;
 
             self.wipe_secrets();
@@ -2012,6 +2030,7 @@ mod tests {
     use alloc::vec::Vec;
     use core::cell::{Cell, RefCell};
     use std::collections::HashSet;
+    use std::panic::AssertUnwindSafe;
 
     use super::{
         HSS_LMS, StateStore, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
@@ -2043,15 +2062,28 @@ mod tests {
 
     // A store shared by every key object of a run, as a file is by processes. Its write number
     // `crash` fails as a crash on one side of the durable write would: lost, or stored and then
-    // reported as failed. Every write before and after it succeeds. `fault` injects a fault into
-    // the sign call of that number.
+    // reported as failed, or with `panic` set, a panic of the store that the caller catches.
+    // Every write before and after it succeeds. `fault` injects a fault into the sign call of that
+    // number.
     #[derive(Clone, Default)]
     struct CrashingStore {
         state: Rc<RefCell<Option<Vec<u8>>>>,
         writes: Rc<Cell<usize>>,
         crash: usize,
         stored: bool,
+        panic: bool,
         fault: Option<(usize, Fault)>,
+    }
+
+    impl CrashingStore {
+        fn crashed(&self) -> Result<bool, Error> {
+            if self.panic {
+                // Without the panic hook, so that the run prints nothing.
+                std::panic::resume_unwind(alloc::boxed::Box::new("the store crashed"));
+            }
+
+            Err(Error::Unsupported)
+        }
     }
 
     impl StateStore for CrashingStore {
@@ -2069,17 +2101,22 @@ mod tests {
             self.writes.set(self.writes.get() + 1);
 
             if self.writes.get() == self.crash && !self.stored {
-                return Err(Error::Unsupported);
+                return self.crashed();
             }
 
             *state = Some(next.to_vec());
 
             if self.writes.get() == self.crash {
-                return Err(Error::Unsupported);
+                return self.crashed();
             }
 
             Ok(true)
         }
+    }
+
+    // A panic of the store, caught, is a failure of the store.
+    fn caught<T>(result: std::thread::Result<Result<T, Error>>) -> Result<T, Error> {
+        result.unwrap_or(Err(Error::StatePersistFailed))
     }
 
     // How a run makes its key: the public generation with fresh randomness, or the deterministic
@@ -2125,7 +2162,9 @@ mod tests {
 
         let load = || algorithm.load_private_key(store.clone(), &StatefulLoadOptions::default());
 
-        let mut key: StatefulPrivateKey<CrashingStore> = match generate() {
+        let generated = caught(std::panic::catch_unwind(AssertUnwindSafe(generate)));
+
+        let mut key: StatefulPrivateKey<CrashingStore> = match generated {
             Ok(pair) => pair.private_key,
             // The record was stored before the failure: the key exists, and a load resumes it.
             Err(_) if store.state.borrow().is_some() => load().unwrap(),
@@ -2158,7 +2197,9 @@ mod tests {
 
             calls += 1;
 
-            let result = key.sign(&message);
+            let result = caught(std::panic::catch_unwind(AssertUnwindSafe(|| {
+                key.sign(&message)
+            })));
 
             // A fault that fired is refused as SELF_TEST_FAILED, and the index stays spent; a
             // child-root fault fires only in a call that moves to new trees.
@@ -2214,7 +2255,10 @@ mod tests {
         assert!(!(reload && exhausted) || last.remaining_signatures() == 0);
 
         for message in 0..4u64 {
-            match last.sign(&message.to_be_bytes()) {
+            let result =
+                std::panic::catch_unwind(AssertUnwindSafe(|| last.sign(&message.to_be_bytes())));
+
+            match caught(result) {
                 Ok(signature) => {
                     assert!(public_key.verify(&signature, &message.to_be_bytes()));
 
@@ -2292,19 +2336,32 @@ mod tests {
             true,
         );
 
+        // A panic of the store with a reload after it is a crash; without one, the caller signs
+        // on with the key object that the panic left.
+        let variants = [
+            (false, true, false),
+            (true, true, false),
+            (false, false, false),
+            (true, false, false),
+            (false, false, true),
+            (true, false, true),
+        ];
+
         for crash in 1..=writes {
-            for (stored, reload) in [(false, true), (true, true), (false, false), (true, false)] {
+            for (stored, reload, panic) in variants {
                 ONE_TIME_SIGNATURES.with(|signatures| signatures.borrow_mut().clear());
 
                 let store = CrashingStore {
                     crash,
                     stored,
+                    panic,
                     ..CrashingStore::default()
                 };
 
                 let (released, _) = run(algorithm, parameters, start, count, &store, reload);
 
-                let context = std::format!("{} {crash} {stored} {reload}", algorithm.name());
+                let context =
+                    std::format!("{} {crash} {stored} {reload} {panic}", algorithm.name());
 
                 let signed = ONE_TIME_SIGNATURES.with(|signatures| signatures.take());
 
