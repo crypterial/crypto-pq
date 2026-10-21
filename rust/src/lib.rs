@@ -174,10 +174,24 @@
 #![warn(missing_docs)]
 // A build without every algorithm family compiles out enum variants and the code that only they
 // use. That leaves items, imports and parameters unused and patterns unreachable or irrefutable,
-// and it gives clippy enum sizes and closures to flag that only such builds have. The default
-// build, which has every family, keeps all these lints.
+// and it gives clippy enum sizes and closures to flag that only such builds have. A build with
+// every family, with or without the default feature, keeps all these lints.
 #![cfg_attr(
-    not(feature = "default"),
+    not(all(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha2",
+        feature = "sha3",
+        feature = "blake2",
+        feature = "blake3",
+        feature = "ascon",
+        feature = "hmac",
+        feature = "hkdf"
+    )),
     allow(
         dead_code,
         unused_imports,
