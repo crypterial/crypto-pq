@@ -16,6 +16,6 @@ the rule.
 6. **Secrets wiped** ([14.5](14-security.md#145-wiping)); **constant time** ([14.1](14-security.md#141-constant-time)).
 7. **Repository files.** `LICENSE-APACHE`, `LICENSE-MIT` and `SECURITY.md` at the root, and the
    license files in every package directory. Vector provenance lives in the vector tools.
-8. **Source and mirrors.** The five packages are developed in the repository `crypterial/crypto-pq`.
-   The Go and Zig packages are also published as the mirror repositories `crypterial/crypto-pq-go`
-   and `crypterial/crypto-pq-zig` ([20.4](20-versioning.md#204-release-process)).
+8. **Repositories.** The repository `crypterial/crypto-pq` holds this specification, the compliance
+   suite ([19.2](19-conformance.md#192-compliance-suite)) and the Rust package. Each other package is developed and released from the
+   repository that its profile names ([20.4](20-versioning.md#204-release-process)).

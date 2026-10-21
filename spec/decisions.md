@@ -444,7 +444,7 @@ ACVP internal-interface groups can run. External μ stays unsupported (Section [
 internal groups are part of the official conformance evidence for both standards, and the internal
 algorithms cannot be reached through the pure or pre-hash interfaces.
 
-## Decision D-66
+## Decision D-66 (revised by D-71)
 
 Packages are released one language at a time.
 Each package follows SemVer; its MAJOR.MINOR equals the version of this specification it implements
@@ -484,3 +484,13 @@ opt-in `hazmat` feature ([23.4](profiles/rust.md#234-build-packaging-and-platfor
 algorithms that an application uses, with less code to compile and review, while the default build
 stays the whole of Part I; `hazmat` takes caller seeds and randomness, so only a build that names it
 contains it.
+
+## Decision D-71
+
+The repository `crypterial/crypto-pq` holds this specification, the compliance suite and the Rust
+package. Every other package is developed and released from the repository that its profile names;
+the mirror repositories of [D-43](#decision-d-43-revised-by-d-66) and [D-66](#decision-d-66-revised-by-d-71) are dropped. A release tag sits on
+the default branch of the package's repository, and where a package manager reads versions from
+repository tags (Go modules), the release also creates the tag that it requires
+([20.4](20-versioning.md#204-release-process)). Rationale: Rust is released first and alone (P13); a package released
+later fixes its repository in its profile, and no release depends on a generated mirror.

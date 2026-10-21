@@ -2,7 +2,7 @@
 
 ## 20.1 Versions
 
-1. Each package follows Semantic Versioning 2.0.0 and is released on its own [[D-66](decisions.md#decision-d-66)]. Its MAJOR.MINOR
+1. Each package follows Semantic Versioning 2.0.0 and is released on its own [[D-66](decisions.md#decision-d-66-revised-by-d-71)]. Its MAJOR.MINOR
    equals the version of this specification it implements (1.0.x implements SPEC 1.0); PATCH is
    counted per package. The first production release of each package is 1.0.0, preceded by release
    candidates 1.0.0-rc.N.
@@ -33,15 +33,16 @@
 ## 20.4 Release process
 
 1. A release of one package starts from a signed, annotated tag `<language>-vX.Y.Z` (for example
-   `rust-v1.0.0`) on a commit of `main` [[D-43](decisions.md#decision-d-43-revised-by-d-66), [D-66](decisions.md#decision-d-66)]. A Go release also tags the mirror repository
-   `vX.Y.Z`, as Go modules require; a Zig release tags its mirror the same way.
+   `rust-v1.0.0`) on a commit of the default branch of the repository that holds the package
+   [[D-43](decisions.md#decision-d-43-revised-by-d-66), [D-66](decisions.md#decision-d-66-revised-by-d-71), [D-71](decisions.md#decision-d-71)]. Where a package manager reads versions from repository
+   tags, as Go modules do, the release also creates the tag that the package manager requires.
 2. A release check verifies that the tag equals the package's manifest versions, that the commit is on
-   `main`, and that [19.5](19-conformance.md#195-release-gate) holds.
+   the default branch, and that [19.5](19-conformance.md#195-release-gate) holds.
 3. The artifacts are built on x86-64 and ARM64 hosts, compared byte for byte, and listed in
    `SHA256SUMS`. Build provenance is attested for every artifact.
-4. Publishing runs only after approval by the maintainers in a protected environment: crates.io for Rust (trusted
-   publishing); the mirror repository for Go and Zig (the generated tree, committed and tagged);
-   PyPI for Python (trusted publishing); npm for TypeScript (with provenance).
+4. Publishing runs only after approval by the maintainers in a protected environment, to the registry
+   that the package's profile names (crates.io for Rust). Where the registry offers trusted
+   publishing or provenance, the release uses it.
 5. After publishing, the published artifacts are downloaded and verified against `SHA256SUMS`.
 6. Every package contains `LICENSE-APACHE` and `LICENSE-MIT`; the license is `Apache-2.0 OR MIT`.
 7. Package descriptions and release notes follow P14 and state the policies of [9.1.3](09-signatures.md#913-pre-hash-hashml-dsa-and-hashslh-dsa), [9.1.5](09-signatures.md#915-no-external-μ), [11.6](11-stateful-signatures.md#116-state-store-contract) and

@@ -33,8 +33,7 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
 
 1. The files of `vectors/cross/` define the behaviour that no official vector covers: every error
    case, every option, formats, stateful records, tree caches and the edge cases of Sections [6](06-api.md) to [13](13-hazmat.md).
-   They are generated from a reference model by a test-only generator and checked in CI
-   ([18.4](18-testing.md#184-vectors-and-robustness)).
+   They are written by the test-only generator of [18.4](18-testing.md#184-vectors-and-robustness) item 2 and checked in CI.
 2. Format: UTF-8 text. A line `[algorithm = <name>]` starts a section for the algorithm value with
    that `name`. In `mldsa.txt` and `slhdsa.txt`, a line `[seed = <hex>]` starts a key group: the
    records up to the next header use the key pair that hazmat key generation derives from that
@@ -182,7 +181,7 @@ are part of the release gate ([19.5](#195-release-gate)).
 A release MUST NOT be published unless, for the release commit:
 
 1. every CI check passes, and the latest weekly fuzz run and weekly full-vector run passed;
-2. the compliance suite passes in every language and backend;
+2. the compliance suite passes in every backend of the package;
 3. the constant-time checks pass;
 4. the release artifacts are reproducible ([18.5](18-testing.md#185-supply-chain) item 3);
 5. the package conforms to this specification ([19.1](#191-definition));
