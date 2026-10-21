@@ -161,6 +161,8 @@ fn probe() -> u32 {
 
     const HWCAP_AES: u64 = 1 << 3;
 
+    const HWCAP_PMULL: u64 = 1 << 4;
+
     const HWCAP_SHA2: u64 = 1 << 6;
 
     const HWCAP_CPUID: u64 = 1 << 11;
@@ -185,7 +187,9 @@ fn probe() -> u32 {
         found |= SHA2;
     }
 
-    if hwcap & HWCAP_AES != 0 {
+    // Rust's `aes` target feature also enables PMULL, so the kernels compiled with it need both,
+    // as std_detect requires.
+    if hwcap & (HWCAP_AES | HWCAP_PMULL) == HWCAP_AES | HWCAP_PMULL {
         found |= AES;
     }
 
