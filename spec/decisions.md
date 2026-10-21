@@ -476,3 +476,11 @@ The key-generation self-test of [9.1.7](09-signatures.md#917-self-test) signs
 and verifies a fixed message in the algorithm's own mode: pure for `ML_DSA_*` and `SLH_DSA_*`, pre-hash
 with the fixed hash for `HASH_SLH_DSA_*`; signing is hedged. Rationale: the self-test checks the key in
 the way it will be used; a `HASH_SLH_DSA_*` key is never used for pure signing.
+
+## Decision D-70
+
+The Rust crate has one Cargo feature per algorithm family, all of them in the default set, and an
+opt-in `hazmat` feature ([23.4](profiles/rust.md#234-build-packaging-and-platforms) item 4). Rationale: a user can build only the
+algorithms that an application uses, with less code to compile and review, while the default build
+stays the whole of Part I; `hazmat` takes caller seeds and randomness, so only a build that names it
+contains it.

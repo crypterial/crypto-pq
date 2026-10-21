@@ -78,11 +78,63 @@
    (vectors are plain text).
 3. The published crate contains the sources, `Cargo.toml`, `Cargo.lock`, `LICENSE-APACHE` and
    `LICENSE-MIT`; it is published by crates.io trusted publishing ([20.4](../20-versioning.md#204-release-process)).
+   The release packages and verifies the crate with its default features.
+4. Cargo features [[D-70](../decisions.md#decision-d-70)]. Each algorithm family is a feature that gates its public
+   constants and the API types that they use:
+
+   | feature | public items | needs |
+   |---|---|---|
+   | `ml-kem` | `ML_KEM_*`; the KEM types | |
+   | `frodokem` | `FRODOKEM_*`, `EFRODOKEM_*`; the KEM types | |
+   | `ml-dsa` | `ML_DSA_*`; the signature types | |
+   | `slh-dsa` | `SLH_DSA_*`, `HASH_SLH_DSA_*`; the signature types | |
+   | `lms` | `HSS_LMS`; the stateful types | |
+   | `xmss` | `XMSS`, `XMSS_MT`; the stateful types | |
+   | `sha2` | `SHA_*`; the hash types | |
+   | `sha3` | `SHA3_*`, `SHAKE*`, `CSHAKE*`, `KMAC*`; the hash, XOF and MAC types | |
+   | `blake2` | `BLAKE2B_*`, `BLAKE2S_*`, `BLAKE2B_MAC`, `BLAKE2S_MAC` | |
+   | `blake3` | `BLAKE3`, `BLAKE3_256`, `BLAKE3_MAC`, `BLAKE3_KDF` | |
+   | `ascon` | `ASCON_HASH256`, `ASCON_XOF128`, `ASCON_CXOF128` | |
+   | `hmac` | `HMAC_SHA_*`; the MAC types | `sha2` |
+   | `hkdf` | `HKDF_SHA_*`; the KDF types | `hmac` |
+   | `hazmat` | the `hazmat` module ([13](../13-hazmat.md#13-the-hazmat-namespace)), with the operations of the enabled families | |
+
+   Rules:
+
+   1. `default` enables every algorithm family. `hazmat` is not a default feature: a caller enables it
+      explicitly. Rationale: hazmat operations take seeds and randomness from the caller, and a reused
+      value breaks the scheme ([13](../13-hazmat.md#13-the-hazmat-namespace) item 1); an application that never names the feature cannot
+      reach them, so no default build exposes them.
+   2. `Error`, `enable_data_independent_timing` and the key formats and options of the enabled
+      families are always available with them; `SecretBytes` is available with every family that
+      returns it.
+   3. The `ml-dsa` and `slh-dsa` features also make public the hash values that [9.1.3](../09-signatures.md#913-pre-hash-hashml-dsa-and-hashslh-dsa) approves as a
+      pre-hash (`SHA_*`, `SHA3_*`, `SHAKE128`, `SHAKE256`) and their types, so that the pre-hash
+      options work whether or not `sha2` or `sha3` is enabled; they compute with the internal cores.
+   4. Internal building blocks (Keccak, the SHA-2 cores, AES, the DER, PEM and base64 encodings,
+      the entropy source, CPU detection and the CPU kernels) compile whenever an enabled family needs
+      them. They are not features.
+   5. Features are additive: enabling one never changes the behaviour of an item that another feature
+      provides. An item keeps its whole interface in every build that has it; for example
+      `BLAKE3_KDF.extract` fails with UNSUPPORTED with or without `hkdf`.
+   6. Every combination of features builds. CI builds no feature, each feature alone and each family
+      with `hazmat` with `cargo clippy -D warnings`, on x86-64 and ARM64, and tests the default
+      features and every feature. A build without every family allows only the lints that compiled-out
+      code causes (unused items and parameters, unreachable or irrefutable patterns); the default
+      build keeps them all.
+5. The crate as published provides the whole of Part I; its features select what a build compiles.
+   The compliance suite and the checks of Section 18 run with every feature, `hazmat` included.
+6. API documentation is rustdoc: the crate root has an overview, the feature table and an example
+   for each category, and every public item has a doc comment (`missing_docs`). `cargo doc` runs
+   without a warning, broken links included, for the default features, every feature and none.
 
 ## 23.5 Conformance checklist
 
 - [ ] Part I behaviour.
 - [ ] Compliance suite: all of `vectors/` in the default, portable and `crypto_pq_ct` builds.
-- [ ] `cargo fmt --check`, `cargo clippy -D warnings` for every cfg and cross target.
+- [ ] `cargo fmt --check`, `cargo clippy -D warnings` for every cfg and cross target, with the default
+  features and with every feature.
+- [ ] `cargo clippy -D warnings` with no feature, each feature alone and each family with `hazmat`.
+- [ ] `cargo doc` without a warning.
 - [ ] valgrind constant-time check on x86-64 and ARM64, default and portable.
 - [ ] x86-64 CPU models of [18.2](../18-testing.md#182-cpu-tiers) under emulation.
