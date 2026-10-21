@@ -119,7 +119,8 @@
       `BLAKE3_KDF.extract` fails with UNSUPPORTED with or without `hkdf`.
    6. Every combination of features builds. CI builds no feature, each feature alone and each family
       with `hazmat` with `cargo clippy -D warnings`, on x86-64 and ARM64, and tests the default
-      features and every feature. A build without every family allows only the lints that compiled-out
+      features, every feature, and each family with `hazmat` and the families that its tests also
+      use. A build without every family allows only the lints that compiled-out
       code causes (unused items and parameters, unreachable or irrefutable patterns); the default
       build keeps them all.
 5. The crate as published provides the whole of Part I; its features select what a build compiles.
