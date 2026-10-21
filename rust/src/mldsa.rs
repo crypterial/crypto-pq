@@ -834,52 +834,129 @@ fn unpack_mask_portable(bytes: &[u8], bits: u32, gamma1: i32) -> Poly {
     unpack(bytes, bits).map(|x| canonical(gamma1 - x))
 }
 
+// FIPS 204 Algorithm 29. The challenge of a rejected attempt is never output, so it is a secret
+// (14.1 item 5, D-72): no branch and no memory index depends on the stream, only on public step
+// numbers. The candidates are taken in order with a secret count, the inside-out shuffle runs on
+// the list of drawn positions, and the list is spread over the 256 coefficients last; each of
+// these steps is a pass of byte masks over a fixed range, which the compiler vectorizes.
 fn sample_in_ball(seed: &[u8], tau: usize) -> Poly {
     let mut stream = shake256(&[seed]);
 
-    // The stream a block at a time: read a byte at a time, as the algorithm takes it, the reads
-    // cost more than the permutation. The first eight bytes are the signs.
+    sample_in_ball_from(|block| stream.read(block), tau)
+}
+
+// 0, 1, ..., 255: the lane numbers that the passes compare with a secret slot or position.
+const LANES: [u8; 256] = {
+    let mut lanes = [0; 256];
+
+    let mut i = 0;
+
+    while i < 256 {
+        lanes[i] = i as u8;
+
+        i += 1;
+    }
+
+    lanes
+};
+
+fn sample_in_ball_from(mut squeeze: impl FnMut(&mut [u8; 136]), tau: usize) -> Poly {
     let mut block = [0u8; 136];
 
-    stream.read(&mut block);
+    squeeze(&mut block);
 
-    let mut signs = u64::from_le_bytes(*block.first_chunk().expect("a block has eight bytes"));
+    let zero = black_box(0);
 
-    let mut next = 8;
+    // The sign of step t as a coefficient byte: 1, or 0xFF for -1.
+    let mut signs = [0u8; 64];
 
-    let mut c = [0; 256];
+    for (t, sign) in signs.iter_mut().enumerate() {
+        *sign = 1u8.wrapping_sub(((block[t / 8] >> (t % 8)) & 1) << 1);
+    }
 
-    // The positions of the nonzero coefficients are public, as in BoringSSL, while their signs
-    // stay secret. For an accepted signature c_tilde is public; for a rejected attempt the
-    // positions say nothing about the key, because whether an attempt is rejected does not depend
-    // on c * s1 or c * s2.
-    for i in 256 - tau..256 {
-        let j = loop {
-            if next == block.len() {
-                stream.read(&mut block);
+    // The j of each step of the shuffle: the candidates that fit, in order. Step count takes a
+    // candidate of at most 256 - tau + count. Every candidate is written to drawn[count], and
+    // the one that fits stays there, as count moves on; after the last step every candidate fits,
+    // and count passes the slots that the shuffle reads.
+    let mut drawn = [0u8; 64];
 
-                next = 0;
+    let mut count = 0u32;
+
+    let mut start = 8;
+
+    loop {
+        for &candidate in &block[start..] {
+            for (j, &slot) in drawn.iter_mut().zip(&LANES) {
+                *j ^= (*j ^ candidate) & equal_byte(slot, count as u8, zero);
             }
 
-            let j = declassify_value(block[next]);
+            count += (u32::from(candidate) + tau as u32)
+                .wrapping_sub(257)
+                .wrapping_sub(count)
+                >> 31;
+        }
 
-            next += 1;
+        // Fewer than tau of the first block's 128 candidates fit with probability 2^-87.7 for
+        // tau = 60 (2^-140.3 for 49, 2^-202.9 for 39); that single bit is public.
+        if declassify_value(count.wrapping_sub(tau as u32) >> 31) == 0 {
+            break;
+        }
 
-            if usize::from(j) <= i {
-                break usize::from(j);
-            }
-        };
+        squeeze(&mut block);
 
-        c[i] = c[j];
+        start = 0;
+    }
 
-        c[j] = 1 - 2 * (signs & 1) as i32;
+    // Entry t of the list is the position of the sign drawn at step t: the entry at j moves to
+    // i, and slot t takes j. Slots past the step hold scratch that a later step overwrites.
+    let mut positions = [0u8; 64];
 
-        signs >>= 1;
+    for (t, &j) in drawn[..tau].iter().enumerate() {
+        let i = (256 - tau + t) as u8;
+
+        for (position, &slot) in positions.iter_mut().zip(&LANES) {
+            let moved = *position ^ ((*position ^ i) & equal_byte(*position, j, zero));
+
+            *position = moved ^ ((moved ^ j) & equal_byte(slot, t as u8, 0));
+        }
+    }
+
+    // The coefficients as bytes; the positions are distinct, so each takes at most one sign.
+    let mut c = [0u8; 256];
+
+    for (&position, &sign) in positions[..tau].iter().zip(&signs) {
+        for (coefficient, &lane) in c.iter_mut().zip(&LANES) {
+            *coefficient ^= (*coefficient ^ sign) & equal_byte(lane, position, zero);
+        }
+    }
+
+    let mut poly = [0; 256];
+
+    for (x, &byte) in poly.iter_mut().zip(&c) {
+        *x = canonical(i32::from(byte as i8));
     }
 
     wipe(&mut block);
 
-    c.map(canonical)
+    wipe(&mut signs);
+
+    wipe(&mut drawn);
+
+    wipe(&mut positions);
+
+    wipe(&mut c);
+
+    poly
+}
+
+// 0xFF when a equals b, 0 otherwise, XORed with zero. Given a zero from black_box, the compiler
+// cannot see the mask as a boolean, so it cannot make the selection that uses it a branch, which
+// it does on targets without a conditional move (RISC-V).
+#[inline(always)]
+const fn equal_byte(a: u8, b: u8, zero: u8) -> u8 {
+    let difference = a ^ b;
+
+    ((difference | difference.wrapping_neg()) >> 7).wrapping_sub(1) ^ zero
 }
 
 fn ntt_of(signed: &Poly) -> Poly {
@@ -1956,5 +2033,105 @@ mod tests {
                 assert_eq!(tr, hash_public_key(pk), "{p:?}, {extra}");
             }
         }
+    }
+
+    // FIPS 204 Algorithm 29 as written, a byte at a time with a branch on each: the oracle of the
+    // constant-time sample_in_ball.
+    fn sample_in_ball_reference(mut squeeze: impl FnMut(&mut [u8; 136]), tau: usize) -> Poly {
+        let mut block = [0; 136];
+
+        squeeze(&mut block);
+
+        let mut signs = u64::from_le_bytes(*block.first_chunk().unwrap());
+
+        let mut next = 8;
+
+        let mut c = [0; 256];
+
+        for i in 256 - tau..256 {
+            let j = loop {
+                if next == block.len() {
+                    squeeze(&mut block);
+
+                    next = 0;
+                }
+
+                let j = usize::from(block[next]);
+
+                next += 1;
+
+                if j <= i {
+                    break j;
+                }
+            };
+
+            c[i] = c[j];
+
+            c[j] = 1 - 2 * (signs & 1) as i32;
+
+            signs >>= 1;
+        }
+
+        c.map(canonical)
+    }
+
+    // The constant-time SampleInBall against the oracle: on SHAKE256 streams from random seeds of
+    // each parameter set's length, and on streams of high bytes, most of which do not fit, so that
+    // the draw goes on into later blocks and ends at every point of a block.
+    #[test]
+    fn sample_in_ball_matches_the_definition() {
+        let seeds = 100_000;
+
+        let mut inputs = Inputs::new(29);
+
+        let mut later_blocks = 0;
+
+        for p in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
+            for n in 0..seeds {
+                let seed: [u8; 64] = inputs.bytes();
+
+                let seed = &seed[..p.challenge_size()];
+
+                let mut stream = shake256(&[seed]);
+
+                let expected = sample_in_ball_reference(|block| stream.read(block), p.tau);
+
+                assert!(sample_in_ball(seed, p.tau) == expected, "{p:?}, seed {n}");
+            }
+
+            // The first step takes only bytes up to 256 - tau, the lowest floor here.
+            for n in 0..seeds / 10 {
+                let floor = 256 - p.tau as u64 - [64, 32, 8, 0][n % 4];
+
+                let stream = |inputs: &mut Inputs, block: &mut [u8; 136]| {
+                    for byte in block.iter_mut() {
+                        *byte = (floor + inputs.next() % (256 - floor)) as u8;
+                    }
+                };
+
+                let (mut first, mut second) = (Inputs::new(n as u64), Inputs::new(n as u64));
+
+                let mut blocks = 0;
+
+                let expected = sample_in_ball_reference(|block| stream(&mut first, block), p.tau);
+
+                let actual = sample_in_ball_from(
+                    |block| {
+                        blocks += 1;
+
+                        stream(&mut second, block);
+                    },
+                    p.tau,
+                );
+
+                assert!(actual == expected, "{p:?}, floor {floor}, stream {n}");
+
+                later_blocks += usize::from(blocks > 1);
+            }
+        }
+
+        std::eprintln!(
+            "SampleInBall: {seeds} seeds per parameter set, {later_blocks} streams past one block"
+        );
     }
 }
