@@ -97,6 +97,7 @@ jobs:
         working-directory: rust
         env:
           VERSION: ${{ needs.gate.outputs.version }}
+        # cargo package builds the packaged crate with its default features, the set users get.
         run: |
           set -euo pipefail
           cargo package --locked

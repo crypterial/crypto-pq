@@ -27,7 +27,7 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: cargo test --locked --release --test robustness
+      - run: cargo test --locked --release --all-features --test robustness
 
   # The official vector sets too slow for every push (SPEC 19.4): the full ACVP ML-KEM, ML-DSA and
   # SLH-DSA sets, the ACVP large-data hashes (1 to 8 GiB per test), BLAKE2 past 4 GiB and the XMSS
@@ -59,7 +59,7 @@ jobs:
         run: python -I tools/fetch_vectors.py --full
       - run: rustup toolchain install stable --profile minimal
       - run: rustup override set stable
-      - run: cargo test --locked --release -- --include-ignored --skip xmss_reference_keys_of_height_20
+      - run: cargo test --locked --release --all-features -- --include-ignored --skip xmss_reference_keys_of_height_20
 
   # Rebuilding the twelve XMSS keys of 2^20 leaves takes about 35 minutes on 6 ARM cores and much longer
   # on a 4-core x86 runner, so it runs as its own job with room to spare.
@@ -79,4 +79,4 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install stable --profile minimal
       - run: rustup override set stable
-      - run: cargo test --locked --release --test stateful -- --ignored --exact xmss_reference_keys_of_height_20
+      - run: cargo test --locked --release --all-features --test stateful -- --ignored --exact xmss_reference_keys_of_height_20
