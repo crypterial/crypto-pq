@@ -123,8 +123,8 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
    | `hazmatSignInternal` | `errors.txt` | `hazmat.signInternal` under `key` with `message` as M′ and `randomness` | the signature |
    | `verify`, `hazmatVerify` | `errors.txt` | verify `input` over `message` under `key` | none; `result` is `true` or `false` |
    | `loadPrivateKey` | `errors.txt` | `loadPrivateKey` from a store holding `input` | the raw public key, and `remaining` |
-   | `digest`, `verify` | `symmetric.txt` | the hash, XOF or MAC of the section's algorithm value, configured with the option keys of the record | the digest, XOF output or tag (`verify`: `result` only) |
-   | `derive`, `extract`, `expand` | `symmetric.txt` | the KDF operation with `ikm` or `prk`, `salt`, `info`, `outputLength` | the KDF output |
+   | `digest`, `verify` | `symmetric.txt`, `blake3.txt` | the hash, XOF or MAC of the section's algorithm value, configured with the option keys of the record | the digest, XOF output or tag (`verify`: `result` only) |
+   | `derive`, `extract`, `expand` | `symmetric.txt`, `blake3.txt` | the KDF operation with `ikm` or `prk`, `salt`, `info`, `outputLength` | the KDF output |
    | `export` | `treecache.txt` | hazmat stateful key generation from `seed` at `index`, a signature of `message` if `signed`, then `exportTreeCache` | `state`, `treeCache`, then as `load` |
    | `load` | `treecache.txt` | `loadPrivateKey` of `state` with `treeCache`; on success a signature of `message` | `publicKey`, `remaining`, `signature` |
 
@@ -141,6 +141,7 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
    | `hss.txt`, `xmss.txt` | deterministic stateful key generation, signatures, public keys in every format, and the state record after each step |
    | `treecache.txt` | tree cache export and every load check |
    | `symmetric.txt` | every hash, XOF, MAC and KDF operation, option, limit, streaming order and error |
+   | `blake3.txt` | BLAKE3-256, the BLAKE3 XOF, BLAKE3-MAC and BLAKE3-KDF: digests, tags and their verification, derived keys, option and length errors, and the `extract` and `expand` that BLAKE3-KDF refuses |
 
 6. Go cannot express an explicit numeric option of 0 ([6.3](06-api.md#63-options) item 6). A record that sets such an option
    to 0 carries a field `zeroAbsentResult` with the expected result when 0 means "absent"; the Go
@@ -167,7 +168,7 @@ reported by the runner. The internal-interface groups of ML-DSA and SLH-DSA run 
 | cSHAKE, KMAC | ACVP cSHAKE and KMAC; NIST example values; Wycheproof KMAC |
 | HKDF | RFC 5869 Appendix A; ACVP KDA-HKDF; Wycheproof HKDF |
 | BLAKE2 | RFC 7693 Appendix and the BLAKE2 reference known-answer tests; parameter (salt, personalization, length) tests; data above 4 GiB weekly |
-| BLAKE3 | `test_vectors.json` of the BLAKE3 repository at commit f55849f89cd85083c1c9daa2c5de20766f309c00 (SHA-256 dcb91ea8accc77e6d6e632af7cdc1a99a9f3ae78cf648da595c7d064db32f624): hash, keyed_hash and derive_key at every listed length |
+| BLAKE3 | `test_vectors.json` of the BLAKE3 repository at commit f55849f89cd85083c1c9daa2c5de20766f309c00 (SHA-256 dcb91ea8accc77e6d6e632af7cdc1a99a9f3ae78cf648da595c7d064db32f624): hash, keyed_hash and derive_key at every listed length; `cross/blake3.txt` |
 | Ascon | ACVP Ascon (SP 800-232) and the Ascon known-answer tests for Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128 |
 | all symmetric | `cross/symmetric.txt` |
 
