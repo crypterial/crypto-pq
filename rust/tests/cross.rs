@@ -3,6 +3,7 @@ mod regenerate;
 mod vectors;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Mutex;
 
@@ -338,58 +339,63 @@ fn kem() {
 
 fn check_signatures(name: &str) {
     parallel(&records(name, "signature"), |(header, record)| {
-        let algorithm = signature_algorithm(&header["algorithm"]);
-
-        let seed = field(header, "seed");
-
-        let pair = hazmat::generate_signature_key_pair(algorithm, &seed).unwrap();
-
-        if !record.contains_key("signature") {
-            check_signature_key(algorithm, &pair, &seed, record);
-
-            return;
-        }
-
-        let context = format!(
-            "{} {} {}",
-            algorithm.name(),
-            record["mode"],
-            record["preHash"]
-        );
-
-        let (message, context_bytes) = (field(record, "message"), field(record, "context"));
-
-        let pre_hash = pre_hash(&record["preHash"]);
-
-        let mut options = SignOptions::default()
-            .with_context(&context_bytes)
-            .with_deterministic(true);
-
-        options.pre_hash = pre_hash;
-
-        let signature = if record["mode"] == "hazmat" {
-            let randomness = field(record, "randomness");
-
-            hazmat::sign(&pair.private_key, &message, &randomness, &options).unwrap()
-        } else {
-            pair.private_key.sign(&message, &options).unwrap()
-        };
-
-        assert_eq!(signature, field(record, "signature"), "{context}");
-
-        let mut options = VerifyOptions::default().with_context(&context_bytes);
-
-        options.pre_hash = pre_hash;
-
-        assert!(
-            hazmat::verify(&pair.public_key, &signature, &message, &options),
-            "{context}"
-        );
-
-        let verified = pair.public_key.verify(&signature, &message, &options);
-
-        assert_eq!(verified, record["publicVerify"] == "true", "{context}");
+        check_signature_record(header, record);
     });
+}
+
+// One record of a key group of mldsa.txt or slhdsa.txt: the keys, or a signature.
+fn check_signature_record(header: &Fields, record: &Fields) {
+    let algorithm = signature_algorithm(&header["algorithm"]);
+
+    let seed = field(header, "seed");
+
+    let pair = hazmat::generate_signature_key_pair(algorithm, &seed).unwrap();
+
+    if !record.contains_key("signature") {
+        check_signature_key(algorithm, &pair, &seed, record);
+
+        return;
+    }
+
+    let context = format!(
+        "{} {} {}",
+        algorithm.name(),
+        record["mode"],
+        record["preHash"]
+    );
+
+    let (message, context_bytes) = (field(record, "message"), field(record, "context"));
+
+    let pre_hash = pre_hash(&record["preHash"]);
+
+    let mut options = SignOptions::default()
+        .with_context(&context_bytes)
+        .with_deterministic(true);
+
+    options.pre_hash = pre_hash;
+
+    let signature = if record["mode"] == "hazmat" {
+        let randomness = field(record, "randomness");
+
+        hazmat::sign(&pair.private_key, &message, &randomness, &options).unwrap()
+    } else {
+        pair.private_key.sign(&message, &options).unwrap()
+    };
+
+    assert_eq!(signature, field(record, "signature"), "{context}");
+
+    let mut options = VerifyOptions::default().with_context(&context_bytes);
+
+    options.pre_hash = pre_hash;
+
+    assert!(
+        hazmat::verify(&pair.public_key, &signature, &message, &options),
+        "{context}"
+    );
+
+    let verified = pair.public_key.verify(&signature, &message, &options);
+
+    assert_eq!(verified, record["publicVerify"] == "true", "{context}");
 }
 
 fn check_signature_key(
@@ -513,8 +519,24 @@ fn mldsa() {
     check_signatures("cross/mldsa.txt");
 }
 
+// Every SLH-DSA and HashSLH-DSA value has a key group.
 #[test]
 fn slhdsa() {
+    let sections: HashSet<String> = records("cross/slhdsa.txt", "signature")
+        .into_iter()
+        .map(|(header, _)| header["algorithm"].clone())
+        .collect();
+
+    let values: HashSet<String> = SIGNATURES
+        .iter()
+        .map(|algorithm| algorithm.name().to_owned())
+        .filter(|name| name.contains("SLH-DSA"))
+        .collect();
+
+    assert_eq!(values.len(), 24);
+
+    assert_eq!(sections, values);
+
     check_signatures("cross/slhdsa.txt");
 }
 
@@ -840,6 +862,10 @@ fn execute(header: &Fields, record: &Fields) -> Outcome {
         (Algorithm::Signature(a), "hazmatSign") => finished(
             a.import_private_key(&key, KeyFormat::Raw)
                 .and_then(|k| hazmat::sign(&k, &message, &randomness, &sign_options)),
+        ),
+        (Algorithm::Signature(a), "hazmatSignInternal") => finished(
+            a.import_private_key(&key, KeyFormat::Raw)
+                .and_then(|k| hazmat::sign_internal(&k, &message, &randomness)),
         ),
         (Algorithm::Signature(a), "verify") => {
             let public_key = a.import_public_key(&key, KeyFormat::Raw).unwrap();

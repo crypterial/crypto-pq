@@ -1,18 +1,29 @@
 // The generator of the records of vectors/cross that SPEC 1.0 decided after the earlier generator
 // wrote the files: the results of the error cases that a rule of 1.0 changed, every state record
-// (version 2, SPEC 11.7) with the cases built on one, and the whole of treecache.txt. Every other
-// record is a frozen fixture and is kept byte for byte. Each case is built as the earlier
-// generator built it, from the same splitmix64 streams, and states the result it is built to
-// reach; the generator fails if the crate gives another. See vectors::fixture for how it writes.
+// (version 2, SPEC 11.7) with the cases built on one, the whole of treecache.txt, and the
+// HashSLH-DSA sections of slhdsa.txt and errors.txt with the records that the SLH-DSA sections of
+// errors.txt gain from them (SPEC 9.4). Every other record is a frozen fixture and is kept byte
+// for byte. Each case is built as the earlier generator built it, from the same splitmix64
+// streams, and states the result it is built to reach; the generator fails if the crate gives
+// another. See vectors::fixture for how it writes.
 
 use std::collections::HashSet;
 
 use crypto_pq::{
-    HMAC_SHA_256, HSS_LMS, KeyFormat, SHA_256, StatefulKeyGenOptions, StatefulLoadOptions,
-    StatefulParameters, StatefulSignatureAlgorithm, XMSS, XMSS_MT, hazmat,
+    HASH_SLH_DSA_SHA2_128F_WITH_SHA256, HASH_SLH_DSA_SHA2_128S_WITH_SHA256,
+    HASH_SLH_DSA_SHA2_192F_WITH_SHA512, HASH_SLH_DSA_SHA2_192S_WITH_SHA512,
+    HASH_SLH_DSA_SHA2_256F_WITH_SHA512, HASH_SLH_DSA_SHA2_256S_WITH_SHA512,
+    HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128, HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128,
+    HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256, HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256,
+    HASH_SLH_DSA_SHAKE_256F_WITH_SHAKE256, HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256, HMAC_SHA_256,
+    HSS_LMS, KeyFormat, SHA_256, SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F,
+    SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F,
+    SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F,
+    SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, SignatureKeyPair, StatefulKeyGenOptions,
+    StatefulLoadOptions, StatefulParameters, StatefulSignatureAlgorithm, XMSS, XMSS_MT, hazmat,
 };
 
-use super::vectors::{Fields, Group, Record, fixture, get, groups, header, hex, remove, set};
+use super::vectors::{Fields, Group, Record, der, fixture, get, groups, header, hex, remove, set};
 use super::{MemoryStore, execute};
 
 // splitmix64, the fixed generator of the inputs of the earlier files; the same seed gives the same
@@ -797,7 +808,7 @@ fn input_of(group: &Group, name: &str) -> String {
         .to_owned()
 }
 
-fn regenerate_errors() {
+fn regenerate_errors(keys: &[HashGroup]) {
     let name = "cross/errors.txt";
 
     let mut found = groups(name);
@@ -850,6 +861,8 @@ fn regenerate_errors() {
     assert_eq!(decided.len(), DECIDED.len(), "a decided case is missing");
 
     println!("{name}: {written} decided records");
+
+    regenerate_hash_slh_dsa_errors(&mut found, keys);
 
     fixture(name, &found);
 }
@@ -2057,10 +2070,540 @@ fn tree_cache_xmss() -> Group {
     table.group()
 }
 
+// SPEC 9.4: each HashSLH-DSA value, its pure SLH-DSA value, the ACVP names of its fixed pre-hash
+// and of another pre-hash that the strength rule of 9.1.3 item 3 permits, and the last arc of its
+// OID (RFC 9909, 3).
+struct HashSlhDsa {
+    algorithm: SignatureAlgorithm,
+    pure: SignatureAlgorithm,
+    fixed: &'static str,
+    other: &'static str,
+    arc: u8,
+}
+
+const fn hash_slh_dsa(
+    algorithm: SignatureAlgorithm,
+    pure: SignatureAlgorithm,
+    fixed: &'static str,
+    other: &'static str,
+    arc: u8,
+) -> HashSlhDsa {
+    HashSlhDsa {
+        algorithm,
+        pure,
+        fixed,
+        other,
+        arc,
+    }
+}
+
+const HASH_SLH_DSA: [HashSlhDsa; 12] = [
+    hash_slh_dsa(
+        HASH_SLH_DSA_SHA2_128S_WITH_SHA256,
+        SLH_DSA_SHA2_128S,
+        "SHA2-256",
+        "SHA3-256",
+        35,
+    ),
+    hash_slh_dsa(
+        HASH_SLH_DSA_SHA2_128F_WITH_SHA256,
+        SLH_DSA_SHA2_128F,
+        "SHA2-256",
+        "SHA3-256",
+        36,
+    ),
+    hash_slh_dsa(
+        HASH_SLH_DSA_SHA2_192S_WITH_SHA512,
+        SLH_DSA_SHA2_192S,
+        "SHA2-512",
+        "SHA3-512",
+        37,
+    ),
+    hash_slh_dsa(
+        HASH_SLH_DSA_SHA2_192F_WITH_SHA512,
+        SLH_DSA_SHA2_192F,
+        "SHA2-512",
+        "SHA3-512",
+        38,
+    ),
+    hash_slh_dsa(
+        HASH_SLH_DSA_SHA2_256S_WITH_SHA512,
+        SLH_DSA_SHA2_256S,
+        "SHA2-512",
+        "SHA3-512",
+        39,
+    ),
+    hash_slh_dsa(
+        HASH_SLH_DSA_SHA2_256F_WITH_SHA512,
+        SLH_DSA_SHA2_256F,
+        "SHA2-512",
+        "SHA3-512",
+        40,
+    ),
+    hash_slh_dsa(
+        HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128,
+        SLH_DSA_SHAKE_128S,
+        "SHAKE-128",
+        "SHAKE-256",
+        41,
+    ),
+    hash_slh_dsa(
+        HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128,
+        SLH_DSA_SHAKE_128F,
+        "SHAKE-128",
+        "SHAKE-256",
+        42,
+    ),
+    hash_slh_dsa(
+        HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256,
+        SLH_DSA_SHAKE_192S,
+        "SHAKE-256",
+        "SHA2-512",
+        43,
+    ),
+    hash_slh_dsa(
+        HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256,
+        SLH_DSA_SHAKE_192F,
+        "SHAKE-256",
+        "SHA2-512",
+        44,
+    ),
+    hash_slh_dsa(
+        HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256,
+        SLH_DSA_SHAKE_256S,
+        "SHAKE-256",
+        "SHA2-512",
+        45,
+    ),
+    hash_slh_dsa(
+        HASH_SLH_DSA_SHAKE_256F_WITH_SHAKE256,
+        SLH_DSA_SHAKE_256F,
+        "SHAKE-256",
+        "SHA2-512",
+        46,
+    ),
+];
+
+const HASH_SLH_DSA_PREFIX: &str = "HashSLH-DSA-";
+
+// The records that the generator adds to each SLH-DSA section of errors.txt: the keys of the
+// HashSLH-DSA value of the same set, which the pure value refuses (SPEC 9.4 item 3).
+const PURE_REFUSALS: [&str; 4] = [
+    "public key der of the pre-hash algorithm",
+    "public key pem of the pre-hash algorithm",
+    "private key der of the pre-hash algorithm",
+    "private key pem of the pre-hash algorithm",
+];
+
+// The DER of SPEC 10.2 and 10.3 for an RFC 9909 OID, built here rather than by the crate.
+fn identifier(arc: u8) -> Vec<u8> {
+    der(
+        0x30,
+        &der(0x06, &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, arc]),
+    )
+}
+
+fn spki(arc: u8, public_key: &[u8]) -> Vec<u8> {
+    let key = der(0x03, &[&[0][..], public_key].concat());
+
+    der(0x30, &[identifier(arc), key].concat())
+}
+
+fn pkcs8(arc: u8, private_key: &[u8]) -> Vec<u8> {
+    let key = der(0x04, private_key);
+
+    der(0x30, &[vec![2, 1, 0], identifier(arc), key].concat())
+}
+
+// One key group of a HashSLH-DSA value: the key pair from its seed, and the deterministic
+// signature of a message with a context.
+struct HashGroup {
+    seed: Vec<u8>,
+    pair: SignatureKeyPair,
+    message: Vec<u8>,
+    context: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+fn hash_group(value: &HashSlhDsa, number: u64) -> HashGroup {
+    let mut stream = Stream(0x9909_0000 + number);
+
+    let n = value.algorithm.public_key_size() / 2;
+
+    let seed = stream.bytes(3 * n);
+
+    let length = 1 + (stream.next() % 64) as usize;
+
+    let message = stream.bytes(length);
+
+    let length = 1 + (stream.next() % 255) as usize;
+
+    let context = stream.bytes(length);
+
+    let pair = hazmat::generate_signature_key_pair(value.algorithm, &seed).unwrap();
+
+    let options = SignOptions::default()
+        .with_context(&context)
+        .with_deterministic(true);
+
+    let signature = pair.private_key.sign(&message, &options).unwrap();
+
+    // SPEC 9.4 item 3: the signature of the pure value of the same key with the fixed pre-hash.
+    let pure = hazmat::generate_signature_key_pair(value.pure, &seed).unwrap();
+
+    let mut fixed = options;
+
+    fixed.pre_hash = super::pre_hash(value.fixed);
+
+    assert_eq!(pure.private_key.sign(&message, &fixed).unwrap(), signature);
+
+    // SPEC 9.1.2 item 2: the deterministic variant is opt_rand = PK.seed.
+    let public = pair.public_key.export_key(KeyFormat::Raw).unwrap();
+
+    assert_eq!(
+        hazmat::sign(&pair.private_key, &message, &public[..n], &fixed).unwrap(),
+        signature
+    );
+
+    HashGroup {
+        seed,
+        pair,
+        message,
+        context,
+        signature,
+    }
+}
+
+fn exported(pair: &SignatureKeyPair, format: KeyFormat) -> (Vec<u8>, Vec<u8>) {
+    (
+        pair.public_key.export_key(format).unwrap(),
+        pair.private_key.export_key(format).unwrap().to_vec(),
+    )
+}
+
+// The section of slhdsa.txt: the keys in every format, with the OID checked against SPEC 10.2 and
+// 10.3, and the deterministic signature, which the runner signs again and verifies.
+fn hash_signature_group(value: &HashSlhDsa, group: &HashGroup) -> Group {
+    let pair = &group.pair;
+
+    let (public, private) = exported(pair, KeyFormat::Raw);
+
+    let (public_der, private_der) = exported(pair, KeyFormat::Der);
+
+    let (public_pem, private_pem) = exported(pair, KeyFormat::Pem);
+
+    assert_eq!(public_der, spki(value.arc, &public));
+
+    assert_eq!(private_der, pkcs8(value.arc, &private));
+
+    assert_eq!(private[private.len() - public.len()..], public);
+
+    let keys = record(&[
+        ("publicKey", hex(&public)),
+        ("publicKeyDer", hex(&public_der)),
+        ("publicKeyPem", hex(&public_pem)),
+        ("privateKey", hex(&private)),
+        ("privateKeyDer", hex(&private_der)),
+        ("privateKeyPem", hex(&private_pem)),
+    ]);
+
+    let signature = record(&[
+        ("mode", "deterministic".into()),
+        ("message", hex(&group.message)),
+        ("context", hex(&group.context)),
+        ("preHash", "none".into()),
+        ("signature", hex(&group.signature)),
+        ("publicVerify", "true".into()),
+    ]);
+
+    let name = value.algorithm.name();
+
+    let header = Fields::from([
+        ("algorithm".to_owned(), name.to_owned()),
+        ("seed".to_owned(), hex(&group.seed)),
+    ]);
+
+    super::check_signature_record(&header, &fields(&keys));
+
+    super::check_signature_record(&header, &fields(&signature));
+
+    Group {
+        header: vec![
+            format!("[algorithm = {name}]"),
+            format!("[seed = {}]", hex(&group.seed)),
+        ],
+        records: vec![keys, signature],
+    }
+}
+
+// The section of errors.txt: SPEC 9.4 items 2 and 3, and 13 item 3 [D-65].
+fn hash_error_group(value: &HashSlhDsa, group: &HashGroup) -> Group {
+    let name = value.algorithm.name();
+
+    let pure = hazmat::generate_signature_key_pair(value.pure, &group.seed).unwrap();
+
+    let (public, private) = exported(&group.pair, KeyFormat::Raw);
+
+    let n = public.len() / 2;
+
+    let (message, context) = (hex(&group.message), hex(&group.context));
+
+    let long = hex(&[0x63; 256]);
+
+    let mut records = Vec::new();
+
+    for (format, label) in [(KeyFormat::Der, "der"), (KeyFormat::Pem, "pem")] {
+        let (public_key, private_key) = exported(&pure, format);
+
+        records.push(record(&[
+            ("name", format!("public key {label} of the pure algorithm")),
+            ("operation", "importPublicKey".into()),
+            ("format", label.into()),
+            ("input", hex(&public_key)),
+        ]));
+
+        records.push(record(&[
+            ("name", format!("private key {label} of the pure algorithm")),
+            ("operation", "importPrivateKey".into()),
+            ("format", label.into()),
+            ("input", hex(&private_key)),
+        ]));
+    }
+
+    let sign = |name: &str, context: &str, pre_hash: &str| {
+        record(&[
+            ("name", name.into()),
+            ("operation", "sign".into()),
+            ("key", hex(&private)),
+            ("message", message.clone()),
+            ("context", context.into()),
+            ("preHash", pre_hash.into()),
+        ])
+    };
+
+    records.push(sign("sign other pre-hash", &context, value.other));
+
+    records.push(sign(
+        "sign other pre-hash and long context",
+        &long,
+        value.other,
+    ));
+
+    records.push(sign(
+        "sign fixed pre-hash and long context",
+        &long,
+        value.fixed,
+    ));
+
+    let hazmat_sign = |name: &str, pre_hash: &str, randomness: &[u8]| {
+        record(&[
+            ("name", name.into()),
+            ("operation", "hazmatSign".into()),
+            ("key", hex(&private)),
+            ("message", message.clone()),
+            ("context", context.clone()),
+            ("preHash", pre_hash.into()),
+            ("randomness", hex(randomness)),
+        ])
+    };
+
+    let randomness = vec![0x5a; n];
+
+    records.push(hazmat_sign(
+        "hazmat sign other pre-hash",
+        value.other,
+        &randomness,
+    ));
+
+    // hazmat.sign skips the strength rule, not the fixed pre-hash.
+    records.push(hazmat_sign(
+        "hazmat sign weak pre-hash",
+        "SHA2-224",
+        &randomness,
+    ));
+
+    records.push(hazmat_sign(
+        "hazmat sign fixed pre-hash and short randomness",
+        value.fixed,
+        &randomness[1..],
+    ));
+
+    // M' of the pure interface for the same message and context (SPEC 9.1.4).
+    let representative = [
+        &[0, group.context.len() as u8][..],
+        &group.context,
+        &group.message,
+    ]
+    .concat();
+
+    records.push(record(&[
+        ("name", "hazmat sign internal".into()),
+        ("operation", "hazmatSignInternal".into()),
+        ("key", hex(&private)),
+        ("message", hex(&representative)),
+        ("randomness", hex(&randomness)),
+    ]));
+
+    let verify = |name: &str, operation: &str, signature: &[u8], pre_hash: &str| {
+        record(&[
+            ("name", name.into()),
+            ("operation", operation.into()),
+            ("key", hex(&public)),
+            ("input", hex(signature)),
+            ("message", message.clone()),
+            ("context", context.clone()),
+            ("preHash", pre_hash.into()),
+        ])
+    };
+
+    records.push(verify(
+        "verify changed signature",
+        "verify",
+        &flip(&group.signature, group.signature.len() / 2),
+        "none",
+    ));
+
+    records.push(verify(
+        "verify other pre-hash",
+        "verify",
+        &group.signature,
+        value.other,
+    ));
+
+    records.push(verify(
+        "hazmat verify other pre-hash",
+        "hazmatVerify",
+        &group.signature,
+        value.other,
+    ));
+
+    for record in &mut records {
+        let expected = match get(record, "name").unwrap() {
+            "sign fixed pre-hash and long context" => "INVALID_CONTEXT",
+            "hazmat sign fixed pre-hash and short randomness" => "INVALID_LENGTH",
+            case if case.starts_with("verify") || case.starts_with("hazmat verify") => "false",
+            case if case.contains("pure algorithm") => "ALGORITHM_MISMATCH",
+            _ => "INVALID_OPTION",
+        };
+
+        run_into(name, record, expected);
+    }
+
+    Group {
+        header: vec![format!("[algorithm = {name}]")],
+        records,
+    }
+}
+
+// The keys of a HashSLH-DSA value, imported through its pure value (SPEC 9.4 item 3).
+fn pure_refusals(pure: &str, group: &HashGroup) -> Vec<Record> {
+    let mut records = Vec::new();
+
+    for (format, label) in [(KeyFormat::Der, "der"), (KeyFormat::Pem, "pem")] {
+        let (public_key, private_key) = exported(&group.pair, format);
+
+        records.push(record(&[
+            (
+                "name",
+                format!("public key {label} of the pre-hash algorithm"),
+            ),
+            ("operation", "importPublicKey".into()),
+            ("format", label.into()),
+            ("input", hex(&public_key)),
+        ]));
+
+        records.push(record(&[
+            (
+                "name",
+                format!("private key {label} of the pre-hash algorithm"),
+            ),
+            ("operation", "importPrivateKey".into()),
+            ("format", label.into()),
+            ("input", hex(&private_key)),
+        ]));
+    }
+
+    for record in &mut records {
+        run_into(pure, record, "ALGORITHM_MISMATCH");
+    }
+
+    records
+}
+
+fn is_hash_slh_dsa(group: &Group) -> bool {
+    header(group, "algorithm").starts_with(HASH_SLH_DSA_PREFIX)
+}
+
+// Puts the HashSLH-DSA sections after the last SLH-DSA section, replacing those of an earlier run.
+fn place_hash_groups(found: &mut Vec<Group>, groups: Vec<Group>) {
+    found.retain(|group| !is_hash_slh_dsa(group));
+
+    let last = found
+        .iter()
+        .rposition(|group| header(group, "algorithm").starts_with("SLH-DSA-"))
+        .unwrap();
+
+    found.splice(last + 1..last + 1, groups);
+}
+
+fn hash_groups() -> Vec<HashGroup> {
+    HASH_SLH_DSA
+        .iter()
+        .zip(0..)
+        .map(|(value, number)| hash_group(value, number))
+        .collect()
+}
+
+fn regenerate_hash_slh_dsa_errors(found: &mut Vec<Group>, keys: &[HashGroup]) {
+    for (value, group) in HASH_SLH_DSA.iter().zip(keys) {
+        let pure = value.pure.name();
+
+        let section = found
+            .iter_mut()
+            .find(|found| header(found, "algorithm") == pure)
+            .unwrap();
+
+        section
+            .records
+            .retain(|record| !PURE_REFUSALS.contains(&get(record, "name").unwrap()));
+
+        section.records.extend(pure_refusals(pure, group));
+    }
+
+    let sections = HASH_SLH_DSA
+        .iter()
+        .zip(keys)
+        .map(|(value, group)| hash_error_group(value, group))
+        .collect();
+
+    place_hash_groups(found, sections);
+}
+
+// slhdsa.txt: the SLH-DSA sections are frozen; the HashSLH-DSA sections follow them.
+fn regenerate_hash_slh_dsa_signatures(keys: &[HashGroup]) {
+    let name = "cross/slhdsa.txt";
+
+    let mut found = groups(name);
+
+    let sections = HASH_SLH_DSA
+        .iter()
+        .zip(keys)
+        .map(|(value, group)| hash_signature_group(value, group))
+        .collect();
+
+    place_hash_groups(&mut found, sections);
+
+    fixture(name, &found);
+}
+
 #[test]
-#[ignore = "generator of the stateful and decided records of vectors/cross"]
+#[ignore = "generator of the stateful, decided and HashSLH-DSA records of vectors/cross"]
 fn regenerate_cross() {
-    regenerate_errors();
+    let keys = hash_groups();
+
+    regenerate_errors(&keys);
+
+    regenerate_hash_slh_dsa_signatures(&keys);
 
     regenerate_signatures("cross/hss.txt");
 

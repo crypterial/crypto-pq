@@ -90,8 +90,8 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
    | `publicVerify` | bool | the result that the public `verify` (with the strength rule) gives for `signature` |
    | `input` | bytes | the main input: the key encoding to import (in `format`), the seed of `generate`, the ciphertext of `decapsulate`, the signature of `verify` and `hazmatVerify`, the state record of `loadPrivateKey` and of stateful `sign` |
    | `output` | bytes | the output of a successful operation; see the operation table |
-   | `key` | bytes | the key of the operation: a raw public key (`encapsulate`, `verify`, `hazmatVerify`), a raw private key (`decapsulate`, `sign`, `hazmatSign`), the hazmat seed of the key to export (`exportPublicKey`, `exportPrivateKey`), or a MAC key |
-   | `message` | bytes | the message to hash, MAC or sign |
+   | `key` | bytes | the key of the operation: a raw public key (`encapsulate`, `verify`, `hazmatVerify`), a raw private key (`decapsulate`, `sign`, `hazmatSign`, `hazmatSignInternal`), the hazmat seed of the key to export (`exportPublicKey`, `exportPrivateKey`), or a MAC key |
+   | `message` | bytes | the message to hash, MAC or sign; for `hazmatSignInternal`, the message representative M′ |
    | `context` | bytes | the signature context |
    | `randomness` | bytes | hazmat randomness: `rnd` or `opt_rand` for signing, the encapsulation randomness |
    | `seed` | bytes | the hazmat key-generation seed |
@@ -120,6 +120,7 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
    | `decapsulate` | `errors.txt` | `decapsulate(input)` with the raw private key `key` | the shared secret |
    | `sign` | `errors.txt` | signatures: the public `sign` of `message` with `context`, `preHash` and `deterministic = true` under `key`; stateful: load the state record `input`, then `sign(message)` | the signature |
    | `hazmatSign` | `errors.txt` | `hazmat.sign` under `key` with `randomness`, `context`, `preHash` | the signature |
+   | `hazmatSignInternal` | `errors.txt` | `hazmat.signInternal` under `key` with `message` as M′ and `randomness` | the signature |
    | `verify`, `hazmatVerify` | `errors.txt` | verify `input` over `message` under `key` | none; `result` is `true` or `false` |
    | `loadPrivateKey` | `errors.txt` | `loadPrivateKey` from a store holding `input` | the raw public key, and `remaining` |
    | `digest`, `verify` | `symmetric.txt` | the hash, XOF or MAC of the section's algorithm value, configured with the option keys of the record | the digest, XOF output or tag (`verify`: `result` only) |
@@ -134,9 +135,9 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
 
    | file | covers |
    |---|---|
-   | `errors.txt` | every import, export, encapsulate, decapsulate, sign, verify, generate, load and hazmat error of the asymmetric algorithms |
+   | `errors.txt` | every import, export, encapsulate, decapsulate, sign, verify, generate, load and hazmat error of the asymmetric algorithms; for each HashSLH-DSA value, the refusals of [9.4](09-signatures.md#94-hashslh-dsa-algorithm-values) items 2 and 3 and of [13](13-hazmat.md) item 3 (a `preHash` other than the fixed one, `hazmat.signInternal`, a key with the pure SLH-DSA identifier and the reverse) and a changed signature |
    | `kem.txt` | ML-KEM and FrodoKEM keys in every form, encapsulation, implicit rejection |
-   | `mldsa.txt`, `slhdsa.txt` | keys in every form, pure and pre-hash modes, contexts, hedged and deterministic signatures, HashSLH-DSA values |
+   | `mldsa.txt`, `slhdsa.txt` | for each ML-DSA and SLH-DSA value: keys in every form, pure and pre-hash modes, contexts, hedged and deterministic signatures; in `slhdsa.txt`, for each HashSLH-DSA value: keys in every form with the identifiers of [9.4](09-signatures.md#94-hashslh-dsa-algorithm-values) and a deterministic signature with a context and the fixed pre-hash |
    | `hss.txt`, `xmss.txt` | deterministic stateful key generation, signatures, public keys in every format, and the state record after each step |
    | `treecache.txt` | tree cache export and every load check |
    | `symmetric.txt` | every hash, XOF, MAC and KDF operation, option, limit, streaming order and error |
