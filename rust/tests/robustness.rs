@@ -1,6 +1,6 @@
 // Untrusted input gets only the defined errors: random and mutated encodings, signatures,
-// ciphertexts and state blobs go through every parsing path, accepted inputs must round-trip, and
-// nothing may panic or allocate what a length field claims before checking it. A deterministic
+// ciphertexts, state blobs and tree caches go through every parsing path, accepted inputs must
+// round-trip, and nothing may panic or allocate what a length field claims before checking it. A deterministic
 // generator keeps every run reproducible; CRYPTO_PQ_FUZZ=1 runs many more rounds.
 
 mod vectors;
@@ -1970,6 +1970,346 @@ fn claimed_state_sizes() {
             .err(),
         Some(Error::InvalidPrivateKey)
     );
+}
+
+// A tree cache body closed by its tag (SPEC 11.10 item 2), under the key that the top secrets
+// give; those of a hazmat key are its seed.
+fn seal_cache(body: &[u8], seed: &[u8]) -> Vec<u8> {
+    let key = HMAC_SHA_256
+        .digest(b"crypto-pq tree cache v1", seed)
+        .expect("key");
+
+    [body, &HMAC_SHA_256.digest(&key, body).expect("tag")].concat()
+}
+
+// Where a field or a tree lies in a tree cache: its offset and size.
+type Span = (usize, usize);
+
+// A key's state and the tree cache it exported, with what a load of the state alone gives (the
+// remaining signatures and the next signature), the most memory that a load with or without the
+// cache held, and the layout of the cache.
+struct CacheFixture {
+    algorithm: StatefulSignatureAlgorithm,
+    seed: Vec<u8>,
+    state: Vec<u8>,
+    cache: Vec<u8>,
+    remaining: u64,
+    signature: Vec<u8>,
+    peak: usize,
+    fields: Vec<Span>,
+    trees: Vec<Span>,
+}
+
+fn cache_fixture(
+    algorithm: StatefulSignatureAlgorithm,
+    parameters: StatefulParameters,
+    seed: Vec<u8>,
+    index: u64,
+) -> CacheFixture {
+    let store = MemoryStore::default();
+
+    let mut pair = hazmat::generate_stateful_key_pair(
+        algorithm,
+        &seed,
+        index,
+        parameters,
+        store.clone(),
+        &StatefulKeyGenOptions::default(),
+    )
+    .expect("key");
+
+    pair.private_key.sign(b"first").expect("signature");
+
+    let cache = pair.private_key.export_tree_cache().expect("cache");
+
+    let state = store.state().expect("state");
+
+    let mut loaded = None;
+
+    let plain = peak_allocation(|| {
+        loaded = Some(algorithm.load_private_key(
+            MemoryStore::holding(&state),
+            &StatefulLoadOptions::default(),
+        ));
+    });
+
+    let mut key = loaded.expect("load").expect("key");
+
+    let cached = peak_allocation(|| {
+        let options = StatefulLoadOptions::default().with_tree_cache(&cache);
+
+        drop(algorithm.load_private_key(MemoryStore::holding(&state), &options));
+    });
+
+    let (fields, trees) = cache_layout(&cache);
+
+    CacheFixture {
+        algorithm,
+        seed,
+        remaining: key.remaining_signatures(),
+        signature: key.sign(b"m").expect("signature"),
+        state,
+        cache,
+        peak: plain.max(cached),
+        fields,
+        trees,
+    }
+}
+
+// The fields of a valid tree cache as (offset, size): version, kind, the parameters, the public key
+// length, the tree count and the six header fields of each tree; and the span of each tree.
+fn cache_layout(cache: &[u8]) -> (Vec<Span>, Vec<Span>) {
+    let end = flags_offset(cache);
+
+    let mut fields = vec![(0, 1), (1, 1)];
+
+    if cache[1] == 1 {
+        fields.push((2, 1));
+
+        fields.extend((3..end).step_by(4).map(|at| (at, 4)));
+    } else {
+        fields.push((2, 4));
+    }
+
+    let size = read_u32(cache, end) as usize;
+
+    let count = end + 4 + size;
+
+    fields.extend([(end, 4), (count, 1)]);
+
+    let mut trees = Vec::new();
+
+    let mut at = count + 1;
+
+    for _ in 0..cache[count] {
+        fields.extend([
+            (at, 1),
+            (at + 1, 8),
+            (at + 9, 1),
+            (at + 10, 1),
+            (at + 11, 1),
+            (at + 12, 4),
+        ]);
+
+        let length = 16 + usize::from(cache[at + 11]) * read_u32(cache, at + 12) as usize;
+
+        trees.push((at, length));
+
+        at += length;
+    }
+
+    assert_eq!(at + 32, cache.len());
+
+    (fields, trees)
+}
+
+// A value for a field of `size` bytes: zero, one, one more or less than it holds, the largest, the
+// top bit alone, or random.
+fn field_value(rng: &mut Random, size: usize, current: u64) -> u64 {
+    let bits = 8 * size as u32;
+
+    let mask = u64::MAX >> (64 - bits);
+
+    let value = match rng.below(7) {
+        0 => 0,
+        1 => 1,
+        2 => current.wrapping_add(1),
+        3 => current.wrapping_sub(1),
+        4 => mask,
+        5 => 1 << (bits - 1),
+        _ => rng.next(),
+    };
+
+    value & mask
+}
+
+// Random edits of a tree cache body: its fields, whole trees dropped, repeated or swapped, the end
+// cut or extended, and byte edits.
+fn mutate_cache(rng: &mut Random, fixture: &CacheFixture, others: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = fixture.cache[..fixture.cache.len() - 32].to_vec();
+
+    for _ in 0..1 + rng.below(2) {
+        match rng.below(8) {
+            0..=3 => {
+                let &(at, size) = rng.choice(&fixture.fields);
+
+                if at + size <= body.len() {
+                    let current = body[at..at + size]
+                        .iter()
+                        .fold(0, |value, &byte| value << 8 | u64::from(byte));
+
+                    let value = field_value(rng, size, current);
+
+                    body[at..at + size].copy_from_slice(&value.to_be_bytes()[8 - size..]);
+                }
+            }
+            4 => {
+                let &(at, length) = rng.choice(&fixture.trees);
+
+                if at + length <= body.len() {
+                    let tree = body[at..at + length].to_vec();
+
+                    match rng.below(3) {
+                        0 => drop(body.drain(at..at + length)),
+                        1 => drop(body.splice(at..at, tree)),
+                        _ => {
+                            let &(other, size) = rng.choice(&fixture.trees);
+
+                            if other + size <= body.len() && other > at {
+                                let second = body[other..other + size].to_vec();
+
+                                body.splice(other..other + size, tree);
+
+                                body.splice(at..at + length, second);
+                            }
+                        }
+                    }
+                }
+            }
+            5 => {
+                if rng.below(2) == 0 {
+                    let length = rng.below(body.len() + 1);
+
+                    body.truncate(length);
+                } else {
+                    let length = 1 + rng.below(48);
+
+                    body.extend(rng.bytes(length));
+                }
+            }
+            _ => body = mutate(rng, &body, others),
+        }
+    }
+
+    if rng.below(4) == 0 {
+        [&body[..], &fixture.cache[fixture.cache.len() - 32..]].concat()
+    } else {
+        seal_cache(&body, &fixture.seed)
+    }
+}
+
+// SPEC 11.10 items 3 and 4: a cache is refused with INVALID_ENCODING or ALGORITHM_MISMATCH, or the
+// key loads and signs as one that built its trees. Neither allocates what a field claims. Returns
+// the refusal.
+fn check_cache(fixture: &CacheFixture, cache: &[u8]) -> Option<Error> {
+    let name = fixture.algorithm.name();
+
+    let options = StatefulLoadOptions::default().with_tree_cache(cache);
+
+    let mut loaded = None;
+
+    let peak = peak_allocation(|| {
+        loaded = Some(
+            fixture
+                .algorithm
+                .load_private_key(MemoryStore::holding(&fixture.state), &options),
+        );
+    });
+
+    assert!(
+        peak <= fixture.peak + 2 * cache.len() + (64 << 10),
+        "{name}: {peak} bytes for {}",
+        hex(cache)
+    );
+
+    match loaded.expect("load") {
+        Ok(mut key) => {
+            assert_eq!(key.remaining_signatures(), fixture.remaining, "{name}");
+
+            assert_eq!(
+                key.sign(b"m").as_ref(),
+                Ok(&fixture.signature),
+                "{name}: {}",
+                hex(cache)
+            );
+
+            None
+        }
+        Err(error) => {
+            assert!(
+                matches!(error, Error::InvalidEncoding | Error::AlgorithmMismatch),
+                "{name}: {error} for {}",
+                hex(cache)
+            );
+
+            Some(error)
+        }
+    }
+}
+
+// Random and mutated tree caches, most sealed again with the tag key of the state so that they
+// reach the checks behind the tag, and the caches of the other keys as they were exported.
+#[test]
+fn random_tree_caches() {
+    let mut rng = Random(11);
+
+    let fixtures = [
+        cache_fixture(
+            HSS_LMS,
+            StatefulParameters::Levels(&[
+                ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W4"),
+                ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1"),
+            ]),
+            pattern(40, 0),
+            3,
+        ),
+        cache_fixture(
+            HSS_LMS,
+            StatefulParameters::Levels(&[("LMS_SHAKE_M24_H5", "LMOTS_SHAKE_N24_W2")]),
+            pattern(40, 1),
+            30,
+        ),
+        cache_fixture(
+            XMSS,
+            StatefulParameters::Name("XMSS-SHA2_10_256"),
+            pattern(96, 0),
+            3,
+        ),
+        cache_fixture(
+            XMSS_MT,
+            StatefulParameters::Name("XMSSMT-SHAKE256_20/4_192"),
+            pattern(72, 0),
+            0x12345,
+        ),
+    ];
+
+    let caches: Vec<Vec<u8>> = fixtures
+        .iter()
+        .map(|fixture| fixture.cache.clone())
+        .collect();
+
+    for fixture in &fixtures {
+        assert_eq!(check_cache(fixture, &fixture.cache), None);
+
+        assert_eq!(check_cache(fixture, &[]), None);
+    }
+
+    let mut outcomes = Vec::new();
+
+    for _ in 0..300 * scale() {
+        let fixture = rng.choice(&fixtures);
+
+        let cache = match rng.below(16) {
+            0 => {
+                let length = rng.below(200);
+
+                rng.bytes(length)
+            }
+            1 => rng.choice(&caches).clone(),
+            _ => mutate_cache(&mut rng, fixture, &caches),
+        };
+
+        outcomes.push(check_cache(fixture, &cache));
+    }
+
+    // The edits reach every outcome: loads, and both refusals.
+    for outcome in [
+        None,
+        Some(Error::InvalidEncoding),
+        Some(Error::AlgorithmMismatch),
+    ] {
+        assert!(outcomes.contains(&outcome), "{outcome:?}");
+    }
 }
 
 // The message whose byte i is i mod 251, and its digests from an independent implementation.
