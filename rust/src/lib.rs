@@ -1,5 +1,167 @@
+//! Fast, secure post-quantum cryptography in pure Rust with no dependencies: ML-KEM, ML-DSA,
+//! SLH-DSA, FrodoKEM, LMS/HSS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF.
+//!
+//! The crate is `no_std` and needs `alloc`. Every operation is a synchronous function; fallible
+//! ones return [`Result`] with [`Error`]. Algorithms are constants of `Copy` types, such as
+//! `ML_KEM_768` or `SHA_256`, and keys are objects made from them. Secret outputs are
+//! `SecretBytes`, which wipe themselves when dropped. Operations on secret data run in constant
+//! time. CPU-specific code for x86-64 and ARM64 is chosen at run time, with a portable fallback on
+//! every target.
+//!
+//! # Features
+//!
+//! Each algorithm family is a Cargo feature, and the default features enable all of them. A build
+//! that needs only some takes `default-features = false` and names them, for example
+//! `crypto-pq = { version = "1", default-features = false, features = ["ml-kem", "ml-dsa"] }`.
+//!
+//! | feature | enables |
+//! |---|---|
+//! | `ml-kem` | `ML_KEM_512`, `ML_KEM_768`, `ML_KEM_1024` (FIPS 203) |
+//! | `frodokem` | FrodoKEM and eFrodoKEM, such as `FRODOKEM_976_AES` (ISO/IEC 18033-2 Amd 2) |
+//! | `ml-dsa` | `ML_DSA_44`, `ML_DSA_65`, `ML_DSA_87` (FIPS 204) |
+//! | `slh-dsa` | SLH-DSA and HashSLH-DSA, such as `SLH_DSA_SHA2_128S` (FIPS 205, RFC 9909) |
+//! | `lms` | `HSS_LMS` (RFC 8554, NIST SP 800-208) |
+//! | `xmss` | `XMSS`, `XMSS_MT` (RFC 8391, NIST SP 800-208) |
+//! | `sha2` | SHA-2, such as `SHA_256` (FIPS 180-4) |
+//! | `sha3` | SHA-3, SHAKE, cSHAKE and KMAC, such as `SHA3_256` (FIPS 202, NIST SP 800-185) |
+//! | `blake2` | BLAKE2b, BLAKE2s and their MACs, such as `BLAKE2B_512` (RFC 7693) |
+//! | `blake3` | `BLAKE3`, `BLAKE3_256`, `BLAKE3_MAC`, `BLAKE3_KDF` |
+//! | `ascon` | `ASCON_HASH256`, `ASCON_XOF128`, `ASCON_CXOF128` (NIST SP 800-232) |
+//! | `hmac` | HMAC with SHA-2, such as `HMAC_SHA_256` (FIPS 198-1); enables `sha2` |
+//! | `hkdf` | HKDF with SHA-2, such as `HKDF_SHA_256` (RFC 5869); enables `hmac` |
+//! | `hazmat` | `hazmat`: deterministic operations for test vectors; not a default feature |
+//!
+//! A feature also enables the types that its constants use, such as `KemAlgorithm` for
+//! `ml-kem`. The signature features make the SHA-2 and SHA-3 values that FIPS 204 and FIPS 205
+//! allow as pre-hashes public as well, for `SignOptions::with_pre_hash`. The internal building
+//! blocks that a family needs, such as Keccak or the SHA-2 cores, compile with it.
+//!
+//! `hazmat` takes seeds and randomness from the caller instead of the operating-system entropy
+//! source, where a reused value breaks the scheme, so it is opt-in.
+//!
+//! # Examples
+//!
+//! Key encapsulation:
+//!
+//! ```
+//! use crypto_pq::{KeyGenOptions, ML_KEM_768};
+//!
+//! let pair = ML_KEM_768.generate_key_pair(&KeyGenOptions::default())?;
+//!
+//! let encapsulation = pair.public_key.encapsulate()?;
+//!
+//! let shared_secret = pair.private_key.decapsulate(&encapsulation.ciphertext)?;
+//!
+//! assert_eq!(*shared_secret, *encapsulation.shared_secret);
+//! # Ok::<(), crypto_pq::Error>(())
+//! ```
+//!
+//! Signatures:
+//!
+//! ```
+//! use crypto_pq::{KeyGenOptions, ML_DSA_65, SignOptions, VerifyOptions};
+//!
+//! let pair = ML_DSA_65.generate_key_pair(&KeyGenOptions::default())?;
+//!
+//! let options = SignOptions::default().with_context(b"example");
+//!
+//! let signature = pair.private_key.sign(b"message", &options)?;
+//!
+//! let verify = VerifyOptions::default().with_context(b"example");
+//!
+//! assert!(pair.public_key.verify(&signature, b"message", &verify));
+//! # Ok::<(), crypto_pq::Error>(())
+//! ```
+//!
+//! Stateful signatures, with a `StateStore` that a real application makes durable:
+//!
+//! ```
+//! use crypto_pq::{
+//!     Error, HSS_LMS, StateStore, StatefulKeyGenOptions, StatefulParameters,
+//! };
+//!
+//! struct Memory(Option<Vec<u8>>);
+//!
+//! impl StateStore for Memory {
+//!     fn read(&mut self) -> Result<Option<Vec<u8>>, Error> {
+//!         Ok(self.0.clone())
+//!     }
+//!
+//!     fn update(&mut self, previous: Option<&[u8]>, next: &[u8]) -> Result<bool, Error> {
+//!         if self.0.as_deref() != previous {
+//!             return Ok(false);
+//!         }
+//!
+//!         self.0 = Some(next.to_vec());
+//!
+//!         Ok(true)
+//!     }
+//! }
+//!
+//! let levels = [("LMS_SHA256_M32_H5", "LMOTS_SHA256_N32_W8")];
+//!
+//! let mut pair = HSS_LMS.generate_key_pair(
+//!     StatefulParameters::Levels(&levels),
+//!     Memory(None),
+//!     &StatefulKeyGenOptions::default(),
+//! )?;
+//!
+//! let signature = pair.private_key.sign(b"message")?;
+//!
+//! assert!(pair.public_key.verify(&signature, b"message"));
+//!
+//! assert_eq!(pair.private_key.remaining_signatures(), 31);
+//! # Ok::<(), crypto_pq::Error>(())
+//! ```
+//!
+//! Hash functions and XOFs:
+//!
+//! ```
+//! use crypto_pq::{SHA_256, SHAKE256};
+//!
+//! let digest = SHA_256.digest(b"message");
+//!
+//! let mut hasher = SHA_256.create();
+//!
+//! hasher.update(b"mess");
+//!
+//! hasher.update(b"age");
+//!
+//! assert_eq!(hasher.digest(), digest);
+//!
+//! let output = SHAKE256.digest(b"message", 64)?;
+//!
+//! assert_eq!(output.len(), 64);
+//! # Ok::<(), crypto_pq::Error>(())
+//! ```
+//!
+//! MACs and key derivation:
+//!
+//! ```
+//! use crypto_pq::{HKDF_SHA_256, HMAC_SHA_256, KdfOptions};
+//!
+//! let tag = HMAC_SHA_256.digest(b"key", b"message")?;
+//!
+//! assert!(HMAC_SHA_256.verify(b"key", b"message", &tag));
+//!
+//! let options = KdfOptions::default().with_salt(b"salt").with_info(b"context");
+//!
+//! let key = HKDF_SHA_256.derive(b"input keying material", 32, &options)?;
+//!
+//! assert_eq!(key.len(), 32);
+//! # Ok::<(), crypto_pq::Error>(())
+//! ```
+//!
+//! # Specification
+//!
+//! The behaviour of every operation, the sizes, the key formats, the errors and the security
+//! requirements are specified in the `spec/` directory of the
+//! [repository](https://github.com/crypterial/crypto-pq), which all the language implementations
+//! of crypto-pq follow; `spec/profiles/rust.md` is the profile of this crate.
+
 #![no_std]
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
 // A build without every algorithm family compiles out enum variants and the code that only they
 // use, which leaves items, imports and parameters unused, patterns unreachable or irrefutable, and
 // enums and closures that only some families make worth their form; the default build, which has

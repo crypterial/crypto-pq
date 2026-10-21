@@ -8,17 +8,24 @@ use crate::encoding::{
 use crate::error::Error;
 use crate::wipe::SecretBytes;
 
+/// The encoding of an exported or imported key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeyFormat {
+    /// The encoding of the algorithm's standard. A private ML-KEM or ML-DSA key exports as its
+    /// seed when the key holds one, and imports from the seed or the expanded key.
     Raw,
+    /// DER: SubjectPublicKeyInfo for a public key, PKCS #8 OneAsymmetricKey for a private key.
+    /// FrodoKEM has no DER form.
     Der,
+    /// The DER encoding in PEM, labelled `PUBLIC KEY` or `PRIVATE KEY`.
     Pem,
 }
 
-// self_test: the pairwise consistency test of SPEC 14.4, on by default.
+/// Options of KEM and signature key generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct KeyGenOptions {
+    /// Run the pairwise consistency test on the new key pair. On by default.
     pub self_test: bool,
 }
 
@@ -29,6 +36,7 @@ impl Default for KeyGenOptions {
 }
 
 impl KeyGenOptions {
+    /// These options with `self_test` set.
     #[must_use]
     pub const fn with_self_test(mut self, self_test: bool) -> Self {
         self.self_test = self_test;

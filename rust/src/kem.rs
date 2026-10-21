@@ -38,73 +38,88 @@ enum Scheme {
     Frodo(frodokem::Parameters),
 }
 
+/// A key encapsulation mechanism: ML-KEM (FIPS 203) or FrodoKEM (ISO/IEC 18033-2 Amd 2).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KemAlgorithm {
     name: &'static str,
     scheme: Scheme,
 }
 
+/// ML-KEM-512 (FIPS 203), security category 1.
 #[cfg(feature = "ml-kem")]
 pub const ML_KEM_512: KemAlgorithm = KemAlgorithm {
     name: "ML-KEM-512",
     scheme: Scheme::MlKem(mlkem::ML_KEM_512, oid(1)),
 };
 
+/// ML-KEM-768 (FIPS 203), security category 3.
 #[cfg(feature = "ml-kem")]
 pub const ML_KEM_768: KemAlgorithm = KemAlgorithm {
     name: "ML-KEM-768",
     scheme: Scheme::MlKem(mlkem::ML_KEM_768, oid(2)),
 };
 
+/// ML-KEM-1024 (FIPS 203), security category 5.
 #[cfg(feature = "ml-kem")]
 pub const ML_KEM_1024: KemAlgorithm = KemAlgorithm {
     name: "ML-KEM-1024",
     scheme: Scheme::MlKem(mlkem::ML_KEM_1024, oid(3)),
 };
 
+/// FrodoKEM-976-AES, security category 3, with AES-128 generating the matrix.
 #[cfg(feature = "frodokem")]
 pub const FRODOKEM_976_AES: KemAlgorithm = KemAlgorithm {
     name: "FrodoKEM-976-AES",
     scheme: Scheme::Frodo(frodokem::FRODOKEM_976_AES),
 };
 
+/// FrodoKEM-976-SHAKE, security category 3, with SHAKE128 generating the matrix.
 #[cfg(feature = "frodokem")]
 pub const FRODOKEM_976_SHAKE: KemAlgorithm = KemAlgorithm {
     name: "FrodoKEM-976-SHAKE",
     scheme: Scheme::Frodo(frodokem::FRODOKEM_976_SHAKE),
 };
 
+/// FrodoKEM-1344-AES, security category 5, with AES-128 generating the matrix.
 #[cfg(feature = "frodokem")]
 pub const FRODOKEM_1344_AES: KemAlgorithm = KemAlgorithm {
     name: "FrodoKEM-1344-AES",
     scheme: Scheme::Frodo(frodokem::FRODOKEM_1344_AES),
 };
 
+/// FrodoKEM-1344-SHAKE, security category 5, with SHAKE128 generating the matrix.
 #[cfg(feature = "frodokem")]
 pub const FRODOKEM_1344_SHAKE: KemAlgorithm = KemAlgorithm {
     name: "FrodoKEM-1344-SHAKE",
     scheme: Scheme::Frodo(frodokem::FRODOKEM_1344_SHAKE),
 };
 
-// The ephemeral sets: a public key must encapsulate fewer than 2^8 ciphertexts.
+/// eFrodoKEM-976-AES, the ephemeral form of FrodoKEM-976-AES: a public key must encapsulate
+/// fewer than 2^8 ciphertexts.
 #[cfg(feature = "frodokem")]
 pub const EFRODOKEM_976_AES: KemAlgorithm = KemAlgorithm {
     name: "eFrodoKEM-976-AES",
     scheme: Scheme::Frodo(frodokem::EFRODOKEM_976_AES),
 };
 
+/// eFrodoKEM-976-SHAKE, the ephemeral form of FrodoKEM-976-SHAKE: a public key must
+/// encapsulate fewer than 2^8 ciphertexts.
 #[cfg(feature = "frodokem")]
 pub const EFRODOKEM_976_SHAKE: KemAlgorithm = KemAlgorithm {
     name: "eFrodoKEM-976-SHAKE",
     scheme: Scheme::Frodo(frodokem::EFRODOKEM_976_SHAKE),
 };
 
+/// eFrodoKEM-1344-AES, the ephemeral form of FrodoKEM-1344-AES: a public key must
+/// encapsulate fewer than 2^8 ciphertexts.
 #[cfg(feature = "frodokem")]
 pub const EFRODOKEM_1344_AES: KemAlgorithm = KemAlgorithm {
     name: "eFrodoKEM-1344-AES",
     scheme: Scheme::Frodo(frodokem::EFRODOKEM_1344_AES),
 };
 
+/// eFrodoKEM-1344-SHAKE, the ephemeral form of FrodoKEM-1344-SHAKE: a public key must
+/// encapsulate fewer than 2^8 ciphertexts.
 #[cfg(feature = "frodokem")]
 pub const EFRODOKEM_1344_SHAKE: KemAlgorithm = KemAlgorithm {
     name: "eFrodoKEM-1344-SHAKE",
@@ -112,10 +127,12 @@ pub const EFRODOKEM_1344_SHAKE: KemAlgorithm = KemAlgorithm {
 };
 
 impl KemAlgorithm {
+    /// The name of the algorithm, such as `"ML-KEM-768"`.
     pub const fn name(&self) -> &'static str {
         self.name
     }
 
+    /// The size of a raw public key in bytes.
     pub const fn public_key_size(&self) -> usize {
         match self.scheme {
             #[cfg(feature = "ml-kem")]
@@ -125,6 +142,7 @@ impl KemAlgorithm {
         }
     }
 
+    /// The size of a ciphertext in bytes.
     pub const fn ciphertext_size(&self) -> usize {
         match self.scheme {
             #[cfg(feature = "ml-kem")]
@@ -134,6 +152,7 @@ impl KemAlgorithm {
         }
     }
 
+    /// The size of a shared secret in bytes.
     pub const fn shared_secret_size(&self) -> usize {
         match self.scheme {
             #[cfg(feature = "frodokem")]
@@ -142,6 +161,10 @@ impl KemAlgorithm {
         }
     }
 
+    /// Generates a key pair from the operating-system entropy source.
+    ///
+    /// With `options.self_test` (the default) a fresh encapsulation must decapsulate to its shared
+    /// secret, or the call fails with [`Error::SelfTestFailed`].
     // The self-test is the first use of the new keys, so it computes their cached forms from the
     // encoded keys and checks those too.
     pub fn generate_key_pair(&self, options: &KeyGenOptions) -> Result<KemKeyPair, Error> {
@@ -159,6 +182,8 @@ impl KemAlgorithm {
         })
     }
 
+    /// Imports a public key in `format`. An ML-KEM key must pass the modulus check of FIPS 203.
+    /// FrodoKEM keys have only the raw form.
     pub fn import_public_key(&self, data: &[u8], format: KeyFormat) -> Result<KemPublicKey, Error> {
         let key = import_public(format, data, self.oid())?;
 
@@ -182,6 +207,11 @@ impl KemAlgorithm {
         })
     }
 
+    /// Imports a private key in `format` and checks it.
+    ///
+    /// A raw ML-KEM key is the 64-byte seed or the expanded decapsulation key; a raw FrodoKEM key
+    /// is the standard secret key. An imported key without its seed, and every FrodoKEM key, must
+    /// pass a pairwise test.
     pub fn import_private_key(
         &self,
         data: &[u8],
@@ -420,7 +450,7 @@ enum PublicPart {
     Frodo(Shared<FrodoPublic>),
 }
 
-// Equality and hashing look at the key alone.
+/// A KEM public key. Equality and hashing compare the algorithm and the encoded key.
 #[derive(Clone)]
 pub struct KemPublicKey {
     algorithm: KemAlgorithm,
@@ -444,6 +474,7 @@ impl Hash for KemPublicKey {
 }
 
 impl KemPublicKey {
+    /// The algorithm of the key.
     pub const fn algorithm(&self) -> KemAlgorithm {
         self.algorithm
     }
@@ -457,6 +488,8 @@ impl KemPublicKey {
         }
     }
 
+    /// Encapsulates a fresh shared secret to this key, with randomness from the operating-system
+    /// entropy source.
     pub fn encapsulate(&self) -> Result<Encapsulation, Error> {
         let randomness = random_bytes(self.algorithm.randomness_size())?;
 
@@ -483,6 +516,7 @@ impl KemPublicKey {
         }
     }
 
+    /// Exports the key in `format`; FrodoKEM keys have only the raw form.
     pub fn export_key(&self, format: KeyFormat) -> Result<Vec<u8>, Error> {
         export_public(format, self.algorithm.oid(), self.key())
     }
@@ -496,8 +530,11 @@ impl fmt::Debug for KemPublicKey {
     }
 }
 
+/// The result of an encapsulation.
 pub struct Encapsulation {
+    /// The shared secret, which the holder of the private key recovers from the ciphertext.
     pub shared_secret: SecretBytes,
+    /// The ciphertext to send to the holder of the private key.
     pub ciphertext: Vec<u8>,
 }
 
@@ -526,16 +563,20 @@ enum Secret {
     },
 }
 
+/// A KEM private key. Its secrets are wiped when it is dropped; it has neither `Clone` nor
+/// `PartialEq`.
 pub struct KemPrivateKey {
     algorithm: KemAlgorithm,
     secret: Secret,
 }
 
 impl KemPrivateKey {
+    /// The algorithm of the key.
     pub const fn algorithm(&self) -> KemAlgorithm {
         self.algorithm
     }
 
+    /// The public key of this private key.
     pub fn public_key(&self) -> KemPublicKey {
         let public = match &self.secret {
             #[cfg(feature = "ml-kem")]
@@ -550,6 +591,10 @@ impl KemPrivateKey {
         }
     }
 
+    /// Recovers the shared secret of `ciphertext`.
+    ///
+    /// A ciphertext of the right size never fails: a modified one gives an unrelated secret
+    /// (implicit rejection), so that decapsulation reveals nothing about it.
     pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<SecretBytes, Error> {
         let _dit = Dit::new();
 
@@ -600,6 +645,8 @@ impl KemPrivateKey {
         }
     }
 
+    /// Exports the key in `format`. A raw ML-KEM key is its seed when the key holds one, otherwise
+    /// the expanded decapsulation key; FrodoKEM keys have only the raw form.
     pub fn export_key(&self, format: KeyFormat) -> Result<SecretBytes, Error> {
         let _dit = Dit::new();
 
@@ -628,9 +675,12 @@ impl fmt::Debug for KemPrivateKey {
     }
 }
 
+/// A KEM key pair.
 #[derive(Debug)]
 pub struct KemKeyPair {
+    /// The public key.
     pub public_key: KemPublicKey,
+    /// The private key.
     pub private_key: KemPrivateKey,
 }
 

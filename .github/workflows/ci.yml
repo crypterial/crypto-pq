@@ -140,6 +140,15 @@ jobs:
       - run: rustup target add aarch64-unknown-linux-gnu aarch64-apple-darwin aarch64-pc-windows-msvc x86_64-pc-windows-msvc
       - if: matrix.rust == 'stable' && matrix.cfg == ''
         run: cargo fmt --check
+      # The API documentation builds without a warning, broken links included, for the default
+      # features, every feature, and none.
+      - if: matrix.cfg == ''
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          for features in "" --all-features --no-default-features; do
+            cargo doc --locked --no-deps $features
+          done
       - run: |
           for features in "" --all-features; do
             cargo clippy --all-targets --locked $features -- -D warnings

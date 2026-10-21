@@ -181,6 +181,7 @@ pub(crate) fn field(bytes: &[u8], size: usize) -> Result<&[u8], Error> {
     }
 }
 
+/// A hash function with a fixed digest size: SHA-2, SHA-3, BLAKE2, Ascon-Hash256 or BLAKE3-256.
 // oid_arc is the last arc of the NIST identifier 2.16.840.1.101.3.4.2.x, which pre-hashed
 // signatures embed; 0 for a hash function that FIPS 204 and FIPS 205 do not allow there.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -197,15 +198,19 @@ impl fmt::Debug for HashAlgorithm {
     }
 }
 
-// BLAKE2's salt and personalization, at most 16 bytes each for BLAKE2b and 8 for BLAKE2s.
+/// BLAKE2's salt and personalization, at most 16 bytes each for BLAKE2b and 8 for BLAKE2s. Other
+/// hash functions take only the empty options.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HashOptions<'a> {
+    /// The BLAKE2 salt.
     pub salt: &'a [u8],
+    /// The BLAKE2 personalization.
     pub personalization: &'a [u8],
 }
 
 impl<'a> HashOptions<'a> {
+    /// These options with `salt` set.
     #[must_use]
     pub const fn with_salt(mut self, salt: &'a [u8]) -> Self {
         self.salt = salt;
@@ -213,6 +218,7 @@ impl<'a> HashOptions<'a> {
         self
     }
 
+    /// These options with `personalization` set.
     #[must_use]
     pub const fn with_personalization(mut self, personalization: &'a [u8]) -> Self {
         self.personalization = personalization;
@@ -222,10 +228,12 @@ impl<'a> HashOptions<'a> {
 }
 
 impl HashAlgorithm {
+    /// The name of the algorithm, such as `"SHA-256"`.
     pub const fn name(&self) -> &'static str {
         self.name
     }
 
+    /// The size of a digest in bytes.
     pub const fn digest_size(&self) -> usize {
         self.digest_size
     }
@@ -234,8 +242,8 @@ impl HashAlgorithm {
         self.oid_arc
     }
 
-    // The algorithm with these options in place of any set before. Hash functions without
-    // options take only the empty ones.
+    /// The algorithm with these options in place of any set before. Hash functions without
+    /// options accept only the empty ones; others fail with [`Error::InvalidOption`].
     pub fn configure(&self, options: &HashOptions) -> Result<Self, Error> {
         let (salt, personalization) = (options.salt, options.personalization);
 
@@ -259,6 +267,7 @@ impl HashAlgorithm {
         Ok(Self { kind, ..*self })
     }
 
+    /// The digest of `data`.
     pub fn digest(&self, data: &[u8]) -> Vec<u8> {
         let mut out = vec![0; self.digest_size];
 
@@ -267,7 +276,8 @@ impl HashAlgorithm {
         out
     }
 
-    // The same digest written into out, which must be digest_size() bytes, without allocating.
+    /// The digest of `data` written into `out`, which must be [`digest_size`](Self::digest_size)
+    /// bytes, without allocating.
     // Inline, so that a caller's buffer of the right size needs no check at run time.
     #[inline]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
@@ -310,6 +320,7 @@ impl HashAlgorithm {
         }
     }
 
+    /// An incremental hasher.
     pub fn create(&self) -> Hasher {
         let engine = match &self.kind {
             #[cfg(any(
@@ -379,16 +390,19 @@ impl HashAlgorithm {
     }
 }
 
+/// An incremental hash computation, made by [`HashAlgorithm::create`].
 pub struct Hasher {
     engine: Engine,
     size: usize,
 }
 
 impl Hasher {
+    /// Absorbs `data`.
     pub fn update(&mut self, data: &[u8]) {
         self.engine.update(data);
     }
 
+    /// The digest of everything absorbed so far. The hasher stays usable.
     pub fn digest(&self) -> Vec<u8> {
         let mut out = vec![0; self.size];
 
@@ -397,6 +411,7 @@ impl Hasher {
         out
     }
 
+    /// The digest written into `out`, which must be the digest size of the algorithm.
     pub fn digest_into(&self, out: &mut [u8]) -> Result<(), Error> {
         check_length(out.len(), self.size)?;
 
@@ -430,6 +445,7 @@ enum XofKind {
     Blake3,
 }
 
+/// An extendable-output function: SHAKE, cSHAKE, Ascon-XOF128, Ascon-CXOF128 or BLAKE3.
 #[cfg(any(
     feature = "sha3",
     feature = "blake3",
@@ -458,7 +474,8 @@ impl fmt::Debug for XofAlgorithm {
     }
 }
 
-// The customization string S of cSHAKE (any length) and of Ascon-CXOF128 (at most 256 bytes).
+/// The customization string S of cSHAKE (any length) and of Ascon-CXOF128 (at most 256 bytes).
+/// Other XOFs take only the empty string.
 #[cfg(any(
     feature = "sha3",
     feature = "blake3",
@@ -469,6 +486,7 @@ impl fmt::Debug for XofAlgorithm {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct XofOptions<'a> {
+    /// The customization string.
     pub customization: &'a [u8],
 }
 
@@ -480,6 +498,7 @@ pub struct XofOptions<'a> {
     feature = "slh-dsa"
 ))]
 impl<'a> XofOptions<'a> {
+    /// These options with `customization` set.
     #[must_use]
     pub const fn with_customization(mut self, customization: &'a [u8]) -> Self {
         self.customization = customization;
@@ -496,6 +515,7 @@ impl<'a> XofOptions<'a> {
     feature = "slh-dsa"
 ))]
 impl XofAlgorithm {
+    /// The name of the algorithm, such as `"SHAKE256"`.
     pub const fn name(&self) -> &'static str {
         self.name
     }
@@ -504,8 +524,9 @@ impl XofAlgorithm {
         self.oid_arc
     }
 
-    // The algorithm with this customization in place of any set before; XOFs without one take
-    // only the empty string. cSHAKE's function name N is reserved for NIST: only hazmat sets it.
+    /// The algorithm with this customization in place of any set before.
+    ///
+    /// cSHAKE's function name N is reserved for NIST, so this sets the customization alone.
     pub fn configure(&self, options: &XofOptions) -> Result<Self, Error> {
         let customization = options.customization;
 
@@ -554,6 +575,8 @@ impl XofAlgorithm {
         }
     }
 
+    /// `length` bytes of output for `data`. A call gives at most 2^32 - 1 bytes; the Ascon XOFs
+    /// give at least one.
     pub fn digest(&self, data: &[u8], length: usize) -> Result<Vec<u8>, Error> {
         self.check_output(length)?;
 
@@ -564,7 +587,7 @@ impl XofAlgorithm {
         Ok(out)
     }
 
-    // out.len() bytes of output, without allocating.
+    /// `out.len()` bytes of output for `data`, without allocating.
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         self.check_output(out.len())?;
 
@@ -594,6 +617,7 @@ impl XofAlgorithm {
         }
     }
 
+    /// An incremental XOF.
     pub fn create(&self) -> Xof {
         let engine = match &self.kind {
             #[cfg(feature = "sha3")]
@@ -637,7 +661,8 @@ enum XofEngine {
     Blake3(Box<blake3::Hasher>),
 }
 
-// Absorbing until the first read, of any length, and squeezing from then on (SPEC 12.2).
+/// An incremental XOF, made by [`XofAlgorithm::create`]: it absorbs until the first read and
+/// squeezes from then on.
 #[cfg(any(
     feature = "sha3",
     feature = "blake3",
@@ -658,6 +683,7 @@ pub struct Xof {
     feature = "slh-dsa"
 ))]
 impl Xof {
+    /// Absorbs `data`; [`Error::Unsupported`] after the first read.
     pub fn update(&mut self, data: &[u8]) -> Result<(), Error> {
         if self.squeezing {
             return Err(Error::Unsupported);
@@ -675,6 +701,8 @@ impl Xof {
         Ok(())
     }
 
+    /// The next `length` bytes of output, at most 2^32 - 1 a call. BLAKE3 ends after 2^64 - 1
+    /// bytes.
     pub fn read(&mut self, length: usize) -> Result<Vec<u8>, Error> {
         self.check_read(length)?;
 
@@ -685,6 +713,7 @@ impl Xof {
         Ok(out)
     }
 
+    /// The next `out.len()` bytes of output, as [`read`](Self::read) gives them.
     pub fn read_into(&mut self, out: &mut [u8]) -> Result<(), Error> {
         self.check_read(out.len())?;
 
@@ -722,6 +751,7 @@ impl Xof {
     }
 }
 
+/// SHA-224 (FIPS 180-4).
 #[cfg(any(
     feature = "sha2",
     feature = "ml-dsa",
@@ -736,6 +766,7 @@ pub const SHA_224: HashAlgorithm = HashAlgorithm {
     oid_arc: 4,
 };
 
+/// SHA-256 (FIPS 180-4).
 #[cfg(any(
     feature = "sha2",
     feature = "ml-dsa",
@@ -750,6 +781,7 @@ pub const SHA_256: HashAlgorithm = HashAlgorithm {
     oid_arc: 1,
 };
 
+/// SHA-384 (FIPS 180-4).
 #[cfg(any(
     feature = "sha2",
     feature = "ml-dsa",
@@ -764,6 +796,7 @@ pub const SHA_384: HashAlgorithm = HashAlgorithm {
     oid_arc: 2,
 };
 
+/// SHA-512 (FIPS 180-4).
 #[cfg(any(
     feature = "sha2",
     feature = "ml-dsa",
@@ -778,6 +811,7 @@ pub const SHA_512: HashAlgorithm = HashAlgorithm {
     oid_arc: 3,
 };
 
+/// SHA-512/224 (FIPS 180-4).
 #[cfg(any(
     feature = "sha2",
     feature = "ml-dsa",
@@ -792,6 +826,7 @@ pub const SHA_512_224: HashAlgorithm = HashAlgorithm {
     oid_arc: 5,
 };
 
+/// SHA-512/256 (FIPS 180-4).
 #[cfg(any(
     feature = "sha2",
     feature = "ml-dsa",
@@ -806,6 +841,7 @@ pub const SHA_512_256: HashAlgorithm = HashAlgorithm {
     oid_arc: 6,
 };
 
+/// SHA3-224 (FIPS 202).
 #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 pub const SHA3_224: HashAlgorithm = HashAlgorithm {
     name: "SHA3-224",
@@ -814,6 +850,7 @@ pub const SHA3_224: HashAlgorithm = HashAlgorithm {
     oid_arc: 7,
 };
 
+/// SHA3-256 (FIPS 202).
 #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 pub const SHA3_256: HashAlgorithm = HashAlgorithm {
     name: "SHA3-256",
@@ -822,6 +859,7 @@ pub const SHA3_256: HashAlgorithm = HashAlgorithm {
     oid_arc: 8,
 };
 
+/// SHA3-384 (FIPS 202).
 #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 pub const SHA3_384: HashAlgorithm = HashAlgorithm {
     name: "SHA3-384",
@@ -830,6 +868,7 @@ pub const SHA3_384: HashAlgorithm = HashAlgorithm {
     oid_arc: 9,
 };
 
+/// SHA3-512 (FIPS 202).
 #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 pub const SHA3_512: HashAlgorithm = HashAlgorithm {
     name: "SHA3-512",
@@ -859,30 +898,39 @@ const fn blake2s(name: &'static str, digest_size: usize) -> HashAlgorithm {
     }
 }
 
+/// BLAKE2b with a 20-byte digest (RFC 7693).
 #[cfg(feature = "blake2")]
 pub const BLAKE2B_160: HashAlgorithm = blake2b("BLAKE2b-160", 20);
 
+/// BLAKE2b with a 32-byte digest (RFC 7693).
 #[cfg(feature = "blake2")]
 pub const BLAKE2B_256: HashAlgorithm = blake2b("BLAKE2b-256", 32);
 
+/// BLAKE2b with a 48-byte digest (RFC 7693).
 #[cfg(feature = "blake2")]
 pub const BLAKE2B_384: HashAlgorithm = blake2b("BLAKE2b-384", 48);
 
+/// BLAKE2b with a 64-byte digest (RFC 7693).
 #[cfg(feature = "blake2")]
 pub const BLAKE2B_512: HashAlgorithm = blake2b("BLAKE2b-512", 64);
 
+/// BLAKE2s with a 16-byte digest (RFC 7693).
 #[cfg(feature = "blake2")]
 pub const BLAKE2S_128: HashAlgorithm = blake2s("BLAKE2s-128", 16);
 
+/// BLAKE2s with a 20-byte digest (RFC 7693).
 #[cfg(feature = "blake2")]
 pub const BLAKE2S_160: HashAlgorithm = blake2s("BLAKE2s-160", 20);
 
+/// BLAKE2s with a 28-byte digest (RFC 7693).
 #[cfg(feature = "blake2")]
 pub const BLAKE2S_224: HashAlgorithm = blake2s("BLAKE2s-224", 28);
 
+/// BLAKE2s with a 32-byte digest (RFC 7693).
 #[cfg(feature = "blake2")]
 pub const BLAKE2S_256: HashAlgorithm = blake2s("BLAKE2s-256", 32);
 
+/// Ascon-Hash256 (NIST SP 800-232).
 #[cfg(feature = "ascon")]
 pub const ASCON_HASH256: HashAlgorithm = HashAlgorithm {
     name: "Ascon-Hash256",
@@ -891,6 +939,7 @@ pub const ASCON_HASH256: HashAlgorithm = HashAlgorithm {
     oid_arc: 0,
 };
 
+/// BLAKE3 with a 32-byte digest.
 #[cfg(feature = "blake3")]
 pub const BLAKE3_256: HashAlgorithm = HashAlgorithm {
     name: "BLAKE3-256",
@@ -899,6 +948,7 @@ pub const BLAKE3_256: HashAlgorithm = HashAlgorithm {
     oid_arc: 0,
 };
 
+/// SHAKE128 (FIPS 202).
 #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 pub const SHAKE128: XofAlgorithm = XofAlgorithm {
     name: "SHAKE128",
@@ -907,6 +957,7 @@ pub const SHAKE128: XofAlgorithm = XofAlgorithm {
     oid_arc: 11,
 };
 
+/// SHAKE256 (FIPS 202).
 #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 pub const SHAKE256: XofAlgorithm = XofAlgorithm {
     name: "SHAKE256",
@@ -915,6 +966,7 @@ pub const SHAKE256: XofAlgorithm = XofAlgorithm {
     oid_arc: 12,
 };
 
+/// cSHAKE128 (NIST SP 800-185), with the customization of [`XofOptions`].
 #[cfg(feature = "sha3")]
 pub const CSHAKE128: XofAlgorithm = XofAlgorithm {
     name: "cSHAKE128",
@@ -923,6 +975,7 @@ pub const CSHAKE128: XofAlgorithm = XofAlgorithm {
     oid_arc: 0,
 };
 
+/// cSHAKE256 (NIST SP 800-185), with the customization of [`XofOptions`].
 #[cfg(feature = "sha3")]
 pub const CSHAKE256: XofAlgorithm = XofAlgorithm {
     name: "cSHAKE256",
@@ -931,6 +984,7 @@ pub const CSHAKE256: XofAlgorithm = XofAlgorithm {
     oid_arc: 0,
 };
 
+/// Ascon-XOF128 (NIST SP 800-232).
 #[cfg(feature = "ascon")]
 pub const ASCON_XOF128: XofAlgorithm = XofAlgorithm {
     name: "Ascon-XOF128",
@@ -939,6 +993,7 @@ pub const ASCON_XOF128: XofAlgorithm = XofAlgorithm {
     oid_arc: 0,
 };
 
+/// Ascon-CXOF128 (NIST SP 800-232), with the customization of [`XofOptions`].
 #[cfg(feature = "ascon")]
 pub const ASCON_CXOF128: XofAlgorithm = XofAlgorithm {
     name: "Ascon-CXOF128",
@@ -947,6 +1002,7 @@ pub const ASCON_CXOF128: XofAlgorithm = XofAlgorithm {
     oid_arc: 0,
 };
 
+/// BLAKE3 as an XOF.
 #[cfg(feature = "blake3")]
 pub const BLAKE3: XofAlgorithm = XofAlgorithm {
     name: "BLAKE3",

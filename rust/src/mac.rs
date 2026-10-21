@@ -64,6 +64,7 @@ enum MacKind {
     Blake3,
 }
 
+/// A message authentication code: HMAC with SHA-2, KMAC, keyed BLAKE2 or keyed BLAKE3.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MacAlgorithm {
     name: &'static str,
@@ -77,20 +78,26 @@ impl fmt::Debug for MacAlgorithm {
     }
 }
 
-// length: the tag size in bytes, None for the default (the hash output for HMAC, KMAC128 32,
-// KMAC256 64, BLAKE2b 64, BLAKE2s 32). KMAC takes a customization and xof (KMACXOF); BLAKE2 a
-// salt and personalization.
+/// The options of a MAC. HMAC takes `length` alone, KMAC `length`, `customization` and `xof`,
+/// BLAKE2 `length`, `salt` and `personalization`, and BLAKE3 none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MacOptions<'a> {
+    /// The tag size in bytes; `None` for the default: the hash output for HMAC, 32 for KMAC128, 64
+    /// for KMAC256 and BLAKE2b, 32 for BLAKE2s. HMAC and KMAC tags have at least 4 bytes.
     pub length: Option<usize>,
+    /// The KMAC customization string.
     pub customization: &'a [u8],
+    /// KMACXOF instead of KMAC.
     pub xof: bool,
+    /// The BLAKE2 salt, at most 16 bytes for BLAKE2b and 8 for BLAKE2s.
     pub salt: &'a [u8],
+    /// The BLAKE2 personalization, at most 16 bytes for BLAKE2b and 8 for BLAKE2s.
     pub personalization: &'a [u8],
 }
 
 impl<'a> MacOptions<'a> {
+    /// These options with `length` set.
     #[must_use]
     pub const fn with_length(mut self, length: usize) -> Self {
         self.length = Some(length);
@@ -98,6 +105,7 @@ impl<'a> MacOptions<'a> {
         self
     }
 
+    /// These options with `customization` set.
     #[must_use]
     pub const fn with_customization(mut self, customization: &'a [u8]) -> Self {
         self.customization = customization;
@@ -105,6 +113,7 @@ impl<'a> MacOptions<'a> {
         self
     }
 
+    /// These options with `xof` set.
     #[must_use]
     pub const fn with_xof(mut self, xof: bool) -> Self {
         self.xof = xof;
@@ -112,6 +121,7 @@ impl<'a> MacOptions<'a> {
         self
     }
 
+    /// These options with `salt` set.
     #[must_use]
     pub const fn with_salt(mut self, salt: &'a [u8]) -> Self {
         self.salt = salt;
@@ -119,6 +129,7 @@ impl<'a> MacOptions<'a> {
         self
     }
 
+    /// These options with `personalization` set.
     #[must_use]
     pub const fn with_personalization(mut self, personalization: &'a [u8]) -> Self {
         self.personalization = personalization;
@@ -195,15 +206,18 @@ fn squeeze_equal(engine: &mut Keccak, tag: &[u8]) -> bool {
 // Each public method that uses the key takes the keyed DIT guard once, around everything it does
 // with the key, and the functions it calls take none of their own.
 impl MacAlgorithm {
+    /// The name of the algorithm, such as `"HMAC-SHA-256"`.
     pub const fn name(&self) -> &'static str {
         self.name
     }
 
+    /// The size of a tag in bytes.
     pub const fn digest_size(&self) -> usize {
         self.size
     }
 
-    // The algorithm with these options in place of any set before. HMAC takes a length alone.
+    /// The algorithm with these options in place of any set before. An option that the algorithm
+    /// does not take fails with [`Error::InvalidOption`].
     pub fn configure(&self, options: &MacOptions) -> Result<Self, Error> {
         let MacOptions {
             length,
@@ -314,6 +328,8 @@ impl MacAlgorithm {
         }
     }
 
+    /// The tag of `data` under `key`. HMAC and KMAC take keys of any length, BLAKE2b 1 to 64 bytes,
+    /// BLAKE2s 1 to 32 and BLAKE3 exactly 32.
     pub fn digest(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
         self.check_key(key)?;
 
@@ -326,6 +342,8 @@ impl MacAlgorithm {
         Ok(out)
     }
 
+    /// The tag of `data` under `key`, written into `out`, which must be
+    /// [`digest_size`](Self::digest_size) bytes.
     pub fn digest_into(&self, key: &[u8], data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         self.check_key(key)?;
 
@@ -338,6 +356,7 @@ impl MacAlgorithm {
         Ok(())
     }
 
+    /// An incremental MAC under `key`.
     pub fn create(&self, key: &[u8]) -> Result<Mac, Error> {
         self.check_key(key)?;
 
@@ -375,8 +394,9 @@ impl MacAlgorithm {
         }
     }
 
-    // Constant time over the whole tag, which must have digest_size() bytes. A key of a length
-    // the algorithm does not take verifies nothing.
+    /// Whether `tag` is the tag of `data` under `key`, compared in constant time over the whole
+    /// tag. A tag of another size, or a key of a length the algorithm does not take, verifies
+    /// nothing.
     pub fn verify(&self, key: &[u8], data: &[u8], tag: &[u8]) -> bool {
         if !self.key_fits(key) || tag.len() != self.size {
             return false;
@@ -544,12 +564,15 @@ enum MacEngine {
     Blake3(Box<blake3::Hasher>),
 }
 
+/// An incremental MAC computation, made by [`MacAlgorithm::create`]. Its keyed state is wiped
+/// when it is dropped.
 pub struct Mac {
     engine: MacEngine,
     size: usize,
 }
 
 impl Mac {
+    /// Absorbs `data`.
     pub fn update(&mut self, data: &[u8]) {
         let _dit = Dit::keyed();
 
@@ -572,6 +595,7 @@ impl Mac {
         }
     }
 
+    /// The tag of everything absorbed so far. The MAC stays usable.
     pub fn digest(&self) -> Vec<u8> {
         let mut out = vec![0; self.size];
 
@@ -582,6 +606,7 @@ impl Mac {
         out
     }
 
+    /// The tag written into `out`, which must be the tag size of the algorithm.
     pub fn digest_into(&self, out: &mut [u8]) -> Result<(), Error> {
         check_length(out.len(), self.size)?;
 
@@ -592,6 +617,7 @@ impl Mac {
         Ok(())
     }
 
+    /// Whether `tag` is the tag of everything absorbed so far, compared in constant time.
     pub fn verify(&self, tag: &[u8]) -> bool {
         if tag.len() != self.size {
             return false;
@@ -685,6 +711,7 @@ const fn hmac_algorithm(name: &'static str, hash: HashAlgorithm) -> MacAlgorithm
     }
 }
 
+/// HMAC with SHA-224 (FIPS 198-1, RFC 2104).
 #[cfg(any(
     feature = "hmac",
     feature = "slh-dsa",
@@ -693,6 +720,7 @@ const fn hmac_algorithm(name: &'static str, hash: HashAlgorithm) -> MacAlgorithm
 ))]
 pub const HMAC_SHA_224: MacAlgorithm = hmac_algorithm("HMAC-SHA-224", SHA_224);
 
+/// HMAC with SHA-256 (FIPS 198-1, RFC 2104).
 #[cfg(any(
     feature = "hmac",
     feature = "slh-dsa",
@@ -701,6 +729,7 @@ pub const HMAC_SHA_224: MacAlgorithm = hmac_algorithm("HMAC-SHA-224", SHA_224);
 ))]
 pub const HMAC_SHA_256: MacAlgorithm = hmac_algorithm("HMAC-SHA-256", SHA_256);
 
+/// HMAC with SHA-384 (FIPS 198-1, RFC 2104).
 #[cfg(any(
     feature = "hmac",
     feature = "slh-dsa",
@@ -709,6 +738,7 @@ pub const HMAC_SHA_256: MacAlgorithm = hmac_algorithm("HMAC-SHA-256", SHA_256);
 ))]
 pub const HMAC_SHA_384: MacAlgorithm = hmac_algorithm("HMAC-SHA-384", SHA_384);
 
+/// HMAC with SHA-512 (FIPS 198-1, RFC 2104).
 #[cfg(any(
     feature = "hmac",
     feature = "slh-dsa",
@@ -717,6 +747,7 @@ pub const HMAC_SHA_384: MacAlgorithm = hmac_algorithm("HMAC-SHA-384", SHA_384);
 ))]
 pub const HMAC_SHA_512: MacAlgorithm = hmac_algorithm("HMAC-SHA-512", SHA_512);
 
+/// KMAC128 (NIST SP 800-185), with a 32-byte tag by default.
 #[cfg(feature = "sha3")]
 pub const KMAC128: MacAlgorithm = MacAlgorithm {
     name: "KMAC128",
@@ -728,6 +759,7 @@ pub const KMAC128: MacAlgorithm = MacAlgorithm {
     },
 };
 
+/// KMAC256 (NIST SP 800-185), with a 64-byte tag by default.
 #[cfg(feature = "sha3")]
 pub const KMAC256: MacAlgorithm = MacAlgorithm {
     name: "KMAC256",
@@ -739,6 +771,7 @@ pub const KMAC256: MacAlgorithm = MacAlgorithm {
     },
 };
 
+/// Keyed BLAKE2b (RFC 7693), with a 64-byte tag by default.
 #[cfg(feature = "blake2")]
 pub const BLAKE2B_MAC: MacAlgorithm = MacAlgorithm {
     name: "BLAKE2b-MAC",
@@ -746,6 +779,7 @@ pub const BLAKE2B_MAC: MacAlgorithm = MacAlgorithm {
     kind: MacKind::Blake2b(blake2::start64(64, &[], &[])),
 };
 
+/// Keyed BLAKE2s (RFC 7693), with a 32-byte tag by default.
 #[cfg(feature = "blake2")]
 pub const BLAKE2S_MAC: MacAlgorithm = MacAlgorithm {
     name: "BLAKE2s-MAC",
@@ -753,6 +787,7 @@ pub const BLAKE2S_MAC: MacAlgorithm = MacAlgorithm {
     kind: MacKind::Blake2s(blake2::start32(32, &[], &[])),
 };
 
+/// BLAKE3's keyed_hash mode, under a 32-byte key, with a 32-byte tag.
 #[cfg(feature = "blake3")]
 pub const BLAKE3_MAC: MacAlgorithm = MacAlgorithm {
     name: "BLAKE3-MAC",

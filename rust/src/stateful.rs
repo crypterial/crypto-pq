@@ -38,17 +38,20 @@ const MAX_LEVELS: usize = 8;
 
 const MAX_HEIGHT: u32 = 60;
 
-// Persistent storage for the signing state (SPEC 11.6). update(previous, next) is an atomic
-// compare-and-swap: it replaces the stored record with next only when the stored one is byte for
-// byte previous (None: the store is empty), and reports whether it did. It must make next durable,
-// surviving a crash and a power loss, before it returns true. The record holds the private key,
-// so the store must protect it like one, and must never restore it from a copy or a backup, clone
-// it, or let two key objects or processes use it at once: an old record signs again with spent
-// one-time keys. Compare-and-swap catches another writer on the same store, not a rollback of
-// the storage itself.
+/// Persistent storage for the signing state of a stateful private key.
+///
+/// The record holds the private key, so the store must protect it like one. It must never restore
+/// the record from a copy or a backup, clone it, or let two key objects or processes use it at
+/// once: an old record signs again with spent one-time keys. Compare-and-swap catches another
+/// writer on the same store, not a rollback of the storage itself. An error from either method
+/// becomes [`Error::StatePersistFailed`].
 pub trait StateStore {
+    /// The stored record, or `None` when the store is empty.
     fn read(&mut self) -> Result<Option<Vec<u8>>, Error>;
 
+    /// Replaces the stored record with `next` only when the stored one is byte for byte
+    /// `previous` (`None`: the store is empty), and reports whether it did. It must make `next`
+    /// durable, surviving a crash and a power loss, before it returns `true`.
     fn update(&mut self, previous: Option<&[u8]>, next: &[u8]) -> Result<bool, Error>;
 }
 
@@ -62,18 +65,26 @@ impl<T: StateStore + ?Sized> StateStore for &mut T {
     }
 }
 
+/// The parameter set of a new stateful key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatefulParameters<'a> {
+    /// HSS/LMS: the LMS and LM-OTS type names of each level, top first, such as
+    /// `("LMS_SHA256_M32_H10", "LMOTS_SHA256_N32_W8")`; 1 to 8 levels of one hash function.
     Levels(&'a [(&'a str, &'a str)]),
+    /// XMSS or XMSS^MT: the name of a parameter set, such as `"XMSS-SHA2_10_256"` or
+    /// `"XMSSMT-SHA2_20/2_256"`.
     Name(&'a str),
 }
 
+/// The options of stateful key generation.
 // reserve: how many indices one write to the store claims, at least 1. A key that stops before
 // using them loses the rest, because loading starts after them. It is not part of the stored
 // state, so a generated key and a loaded one each take it as an option.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct StatefulKeyGenOptions {
+    /// How many indices one write to the store claims, at least 1 (the default). A key that stops
+    /// before using them loses the rest, because loading starts after them.
     pub reserve: u64,
 }
 
@@ -84,6 +95,7 @@ impl Default for StatefulKeyGenOptions {
 }
 
 impl StatefulKeyGenOptions {
+    /// These options with `reserve` set.
     #[must_use]
     pub const fn with_reserve(mut self, reserve: u64) -> Self {
         self.reserve = reserve;
@@ -92,12 +104,15 @@ impl StatefulKeyGenOptions {
     }
 }
 
-// tree_cache: bytes from export_tree_cache, for load_private_key to take the trees they hold
-// instead of building them; the key loads only if they pass every check. Empty means none.
+/// The options of loading a stateful private key from its store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct StatefulLoadOptions<'a> {
+    /// How many indices one write to the store claims, at least 1 (the default); not part of the
+    /// stored state.
     pub reserve: u64,
+    /// Bytes from [`StatefulPrivateKey::export_tree_cache`], whose trees the key takes instead of
+    /// building them; the key loads only if they pass every check. Empty means none.
     pub tree_cache: &'a [u8],
 }
 
@@ -111,6 +126,7 @@ impl Default for StatefulLoadOptions<'_> {
 }
 
 impl<'a> StatefulLoadOptions<'a> {
+    /// These options with `reserve` set.
     #[must_use]
     pub const fn with_reserve(mut self, reserve: u64) -> Self {
         self.reserve = reserve;
@@ -118,6 +134,7 @@ impl<'a> StatefulLoadOptions<'a> {
         self
     }
 
+    /// These options with `tree_cache` set.
     #[must_use]
     pub const fn with_tree_cache(mut self, tree_cache: &'a [u8]) -> Self {
         self.tree_cache = tree_cache;
@@ -144,24 +161,30 @@ enum Kind {
     XmssMt,
 }
 
+/// A stateful hash-based signature algorithm: HSS/LMS (RFC 8554), XMSS or XMSS^MT (RFC 8391),
+/// as NIST SP 800-208 profiles them. Every signature uses a one-time key once, so the private key
+/// lives in a [`StateStore`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StatefulSignatureAlgorithm {
     name: &'static str,
     kind: Kind,
 }
 
+/// HSS/LMS (RFC 8554, NIST SP 800-208).
 #[cfg(feature = "lms")]
 pub const HSS_LMS: StatefulSignatureAlgorithm = StatefulSignatureAlgorithm {
     name: "HSS/LMS",
     kind: Kind::Hss,
 };
 
+/// XMSS (RFC 8391, NIST SP 800-208).
 #[cfg(feature = "xmss")]
 pub const XMSS: StatefulSignatureAlgorithm = StatefulSignatureAlgorithm {
     name: "XMSS",
     kind: Kind::Xmss,
 };
 
+/// XMSS^MT (RFC 8391, NIST SP 800-208).
 #[cfg(feature = "xmss")]
 pub const XMSS_MT: StatefulSignatureAlgorithm = StatefulSignatureAlgorithm {
     name: "XMSS^MT",
@@ -622,10 +645,13 @@ struct Decoded {
 }
 
 impl StatefulSignatureAlgorithm {
+    /// The name of the algorithm, such as `"XMSS"`.
     pub const fn name(&self) -> &'static str {
         self.name
     }
 
+    /// Generates a key pair with these parameters from the operating-system entropy source and
+    /// writes its first record into `store`, which must be empty.
     pub fn generate_key_pair<S: StateStore>(
         &self,
         parameters: StatefulParameters,
@@ -641,8 +667,8 @@ impl StatefulSignatureAlgorithm {
         self.create(parameters, top, false, 0, reserve, store)
     }
 
-    // SPEC 11.9. The key resumes at the stored bound `next`, past every index that an earlier key
-    // reserved, and past the subtree of every level that a crash left claimed but not signed.
+    /// Loads the private key that `store` holds. The key resumes past every index that an earlier
+    /// key object reserved or may have used.
     pub fn load_private_key<S: StateStore>(
         &self,
         mut store: S,
@@ -706,6 +732,8 @@ impl StatefulSignatureAlgorithm {
         Ok(key)
     }
 
+    /// Imports a public key in `format`; its length must match the type codes or the OID it
+    /// contains.
     pub fn import_public_key(
         &self,
         data: &[u8],
@@ -1012,6 +1040,7 @@ impl fmt::Debug for StatefulSignatureAlgorithm {
     }
 }
 
+/// A stateful signature public key.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct StatefulPublicKey {
     algorithm: StatefulSignatureAlgorithm,
@@ -1019,14 +1048,17 @@ pub struct StatefulPublicKey {
 }
 
 impl StatefulPublicKey {
+    /// The algorithm of the key.
     pub const fn algorithm(&self) -> StatefulSignatureAlgorithm {
         self.algorithm
     }
 
+    /// Whether `signature` is a valid signature of `message`.
     pub fn verify(&self, signature: &[u8], message: &[u8]) -> bool {
         self.algorithm.verifies(&self.key, message, signature)
     }
 
+    /// Exports the key in `format`; DER and PEM are SubjectPublicKeyInfo.
     pub fn export_key(&self, format: KeyFormat) -> Result<Vec<u8>, Error> {
         export_public(format, Some(self.algorithm.oid()), &self.key)
     }
@@ -1040,6 +1072,8 @@ impl fmt::Debug for StatefulPublicKey {
     }
 }
 
+/// A stateful private key, bound to the [`StateStore`] that it owns. Its secrets are wiped when
+/// it is dropped; it has neither `Clone` nor `PartialEq`.
 // A key object bound to its store (SPEC 11). `index` is the next index to sign with, `next` the
 // bound in the stored record: no index at or above it has been used, and the indices from index
 // up to it are reserved. `records` holds the level records of levels 1 to L - 1 as last stored,
@@ -1066,10 +1100,12 @@ pub struct StatefulPrivateKey<S> {
 }
 
 impl<S> StatefulPrivateKey<S> {
+    /// The algorithm of the key.
     pub const fn algorithm(&self) -> StatefulSignatureAlgorithm {
         self.algorithm
     }
 
+    /// The public key of this private key.
     pub fn public_key(&self) -> StatefulPublicKey {
         StatefulPublicKey {
             algorithm: self.algorithm,
@@ -1077,10 +1113,14 @@ impl<S> StatefulPrivateKey<S> {
         }
     }
 
+    /// How many signatures the key can still make.
     pub fn remaining_signatures(&self) -> u64 {
         self.parameters.capacity() - self.index
     }
 
+    /// The public nodes of the trees in use for the next index, authenticated with a key derived
+    /// from the private key, for [`StatefulLoadOptions::tree_cache`] to skip their build.
+    /// [`Error::KeyExhausted`] when the key can make no more signatures.
     // SPEC 11.10: the public nodes of the tree of every level that is current for the next index,
     // top first, for StatefulLoadOptions::tree_cache to skip their build. sign takes &mut self, so
     // no export can overlap a signature: the StateConflict of the other languages cannot happen
@@ -1624,9 +1664,10 @@ impl<S> StatefulPrivateKey<S> {
 }
 
 impl<S: StateStore> StatefulPrivateKey<S> {
-    // SPEC 11.5.2. Every index is made durable before its signature exists, and every child tree is
-    // claimed before its parent leaf signs it, so a crash or a failed write can waste indices but
-    // never use a one-time key twice.
+    /// Signs `message`. The index is made durable in the store before the signature exists, and
+    /// the signature is verified before it is returned, so a crash or a failed write can waste
+    /// indices but never use a one-time key twice.
+    // SPEC 11.5.2. Every child tree is claimed before its parent leaf signs it, too.
     pub fn sign(&mut self, message: &[u8]) -> Result<Vec<u8>, Error> {
         let _dit = Dit::new();
 
@@ -1948,8 +1989,11 @@ impl<S> fmt::Debug for StatefulPrivateKey<S> {
     }
 }
 
+/// A stateful key pair.
 pub struct StatefulKeyPair<S> {
+    /// The public key.
     pub public_key: StatefulPublicKey,
+    /// The private key.
     pub private_key: StatefulPrivateKey<S>,
 }
 

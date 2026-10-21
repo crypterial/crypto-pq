@@ -1,24 +1,45 @@
 use core::fmt;
 
+/// The error of every fallible operation, one variant per error code of the specification.
+///
+/// No variant carries caller or secret data. New variants may be added in a minor version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Error {
+    /// A byte input, length argument or output buffer has a length that the operation does not
+    /// accept.
     InvalidLength,
+    /// DER, PEM, base64 or a tree cache is malformed or not in the required form.
     InvalidEncoding,
+    /// A DER or PEM key, a state record or a tree cache belongs to another algorithm.
     AlgorithmMismatch,
+    /// A public key fails a validity check of its standard.
     InvalidPublicKey,
+    /// A private key or a stateful state record fails a validity check.
     InvalidPrivateKey,
+    /// A signature context is longer than 255 bytes.
     InvalidContext,
+    /// An option value is not allowed for the operation.
     InvalidOption,
+    /// The operating-system entropy source failed or does not exist on the platform.
     RngFailure,
+    /// A pairwise consistency test, or the verification of a stateful signature before its
+    /// release, failed.
     SelfTestFailed,
+    /// Every signature index of a stateful key has been used.
     KeyExhausted,
+    /// The state store of a stateful key reported an error.
     StatePersistFailed,
+    /// The stored state changed under the key, the store already holds a state, or the key is
+    /// already signing.
     StateConflict,
+    /// The algorithm does not have this operation.
     Unsupported,
 }
 
 impl Error {
+    /// The error code of the specification, such as `"INVALID_LENGTH"`, the same in every
+    /// language.
     pub const fn code(&self) -> &'static str {
         match self {
             Self::InvalidLength => "INVALID_LENGTH",

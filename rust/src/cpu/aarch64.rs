@@ -297,8 +297,11 @@ impl Drop for Dit {
 // SHA-2, Keccak and BLAKE2 states, each a function of the whole key, do not.
 static KEYED: AtomicBool = AtomicBool::new(false);
 
-// From now on every MAC and KDF call, on every thread, holds DIT as the asymmetric operations
-// always do; there is no way back. False when the CPU has no DIT.
+/// Makes every MAC and KDF call, on every thread, run with the CPU's data-independent timing
+/// mode, as the asymmetric operations always do. There is no way back.
+///
+/// The mode exists on ARM64 CPUs with FEAT_DIT. Returns whether the CPU has it: `false` on every
+/// other CPU, in the portable build, and wherever the call has no effect.
 pub fn enable_data_independent_timing() -> bool {
     if !has(DIT) {
         return false;

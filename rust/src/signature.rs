@@ -37,6 +37,9 @@ enum PreHashKind {
     Xof(XofAlgorithm),
 }
 
+/// The hash function of HashML-DSA or HashSLH-DSA, made from a [`HashAlgorithm`] or an
+/// [`XofAlgorithm`] with `From`. FIPS 204 and FIPS 205 allow SHA-2, SHA-3, SHAKE128 and SHAKE256;
+/// the others are refused.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PreHash(PreHashKind);
 
@@ -135,17 +138,21 @@ impl Fixed {
     }
 }
 
-// context: 0 to 255 bytes; deterministic: the deterministic variant instead of hedged signing;
-// pre_hash: HashML-DSA or HashSLH-DSA with this function instead of the pure mode.
+/// The options of signing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SignOptions<'a> {
+    /// The context string, 0 to 255 bytes.
     pub context: &'a [u8],
+    /// The deterministic variant instead of hedged signing, which adds fresh randomness.
     pub deterministic: bool,
+    /// HashML-DSA or HashSLH-DSA with this function instead of the pure mode. It must give at least
+    /// the collision strength of the signature.
     pub pre_hash: Option<PreHash>,
 }
 
 impl<'a> SignOptions<'a> {
+    /// These options with `context` set.
     #[must_use]
     pub const fn with_context(mut self, context: &'a [u8]) -> Self {
         self.context = context;
@@ -153,6 +160,7 @@ impl<'a> SignOptions<'a> {
         self
     }
 
+    /// These options with `deterministic` set.
     #[must_use]
     pub const fn with_deterministic(mut self, deterministic: bool) -> Self {
         self.deterministic = deterministic;
@@ -160,6 +168,7 @@ impl<'a> SignOptions<'a> {
         self
     }
 
+    /// These options with `pre_hash` set.
     #[must_use]
     pub fn with_pre_hash(mut self, pre_hash: impl Into<PreHash>) -> Self {
         self.pre_hash = Some(pre_hash.into());
@@ -168,14 +177,18 @@ impl<'a> SignOptions<'a> {
     }
 }
 
+/// The options of verification, which must match those of signing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct VerifyOptions<'a> {
+    /// The context string that the signature was made with.
     pub context: &'a [u8],
+    /// The pre-hash that the signature was made with, if any.
     pub pre_hash: Option<PreHash>,
 }
 
 impl<'a> VerifyOptions<'a> {
+    /// These options with `context` set.
     #[must_use]
     pub const fn with_context(mut self, context: &'a [u8]) -> Self {
         self.context = context;
@@ -183,6 +196,7 @@ impl<'a> VerifyOptions<'a> {
         self
     }
 
+    /// These options with `pre_hash` set.
     #[must_use]
     pub fn with_pre_hash(mut self, pre_hash: impl Into<PreHash>) -> Self {
         self.pre_hash = Some(pre_hash.into());
@@ -232,6 +246,8 @@ enum Scheme {
     SlhDsa(slhdsa::Parameters),
 }
 
+/// A stateless signature algorithm: ML-DSA (FIPS 204), SLH-DSA (FIPS 205), or HashSLH-DSA with
+/// the pre-hash that RFC 9909 fixes for it.
 // fixed: the pre-hash of a HashSLH-DSA value, which every signature under it uses.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SignatureAlgorithm {
@@ -286,63 +302,80 @@ const fn hash_slh_dsa(
     }
 }
 
+/// ML-DSA-44 (FIPS 204), security category 2.
 #[cfg(feature = "ml-dsa")]
 pub const ML_DSA_44: SignatureAlgorithm = ml_dsa("ML-DSA-44", mldsa::ML_DSA_44, 17);
 
+/// ML-DSA-65 (FIPS 204), security category 3.
 #[cfg(feature = "ml-dsa")]
 pub const ML_DSA_65: SignatureAlgorithm = ml_dsa("ML-DSA-65", mldsa::ML_DSA_65, 18);
 
+/// ML-DSA-87 (FIPS 204), security category 5.
 #[cfg(feature = "ml-dsa")]
 pub const ML_DSA_87: SignatureAlgorithm = ml_dsa("ML-DSA-87", mldsa::ML_DSA_87, 19);
 
+/// SLH-DSA-SHA2-128s (FIPS 205), security category 1, the set for small signatures.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_128S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-128s", slhdsa::SHA2_128S, 20);
 
+/// SLH-DSA-SHA2-128f (FIPS 205), security category 1, the set for fast signing.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_128F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-128f", slhdsa::SHA2_128F, 21);
 
+/// SLH-DSA-SHA2-192s (FIPS 205), security category 3, the set for small signatures.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_192S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-192s", slhdsa::SHA2_192S, 22);
 
+/// SLH-DSA-SHA2-192f (FIPS 205), security category 3, the set for fast signing.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_192F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-192f", slhdsa::SHA2_192F, 23);
 
+/// SLH-DSA-SHA2-256s (FIPS 205), security category 5, the set for small signatures.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_256S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-256s", slhdsa::SHA2_256S, 24);
 
+/// SLH-DSA-SHA2-256f (FIPS 205), security category 5, the set for fast signing.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_256F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-256f", slhdsa::SHA2_256F, 25);
 
+/// SLH-DSA-SHAKE-128s (FIPS 205), security category 1, the set for small signatures.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_128S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-128s", slhdsa::SHAKE_128S, 26);
 
+/// SLH-DSA-SHAKE-128f (FIPS 205), security category 1, the set for fast signing.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_128F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-128f", slhdsa::SHAKE_128F, 27);
 
+/// SLH-DSA-SHAKE-192s (FIPS 205), security category 3, the set for small signatures.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_192S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-192s", slhdsa::SHAKE_192S, 28);
 
+/// SLH-DSA-SHAKE-192f (FIPS 205), security category 3, the set for fast signing.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_192F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-192f", slhdsa::SHAKE_192F, 29);
 
+/// SLH-DSA-SHAKE-256s (FIPS 205), security category 5, the set for small signatures.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_256S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-256s", slhdsa::SHAKE_256S, 30);
 
+/// SLH-DSA-SHAKE-256f (FIPS 205), security category 5, the set for fast signing.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_256F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-256f", slhdsa::SHAKE_256F, 31);
 
+/// HashSLH-DSA-SHA2-128s-with-SHA256 (FIPS 205, RFC 9909), security category 1: every signature
+/// pre-hashes the message with SHA-256.
 #[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHA2_128S_WITH_SHA256: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHA2-128s-with-SHA256",
@@ -351,6 +384,8 @@ pub const HASH_SLH_DSA_SHA2_128S_WITH_SHA256: SignatureAlgorithm = hash_slh_dsa(
     Fixed::Sha256,
 );
 
+/// HashSLH-DSA-SHA2-128f-with-SHA256 (FIPS 205, RFC 9909), security category 1: every signature
+/// pre-hashes the message with SHA-256.
 #[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHA2_128F_WITH_SHA256: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHA2-128f-with-SHA256",
@@ -359,6 +394,8 @@ pub const HASH_SLH_DSA_SHA2_128F_WITH_SHA256: SignatureAlgorithm = hash_slh_dsa(
     Fixed::Sha256,
 );
 
+/// HashSLH-DSA-SHA2-192s-with-SHA512 (FIPS 205, RFC 9909), security category 3: every signature
+/// pre-hashes the message with SHA-512.
 #[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHA2_192S_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHA2-192s-with-SHA512",
@@ -367,6 +404,8 @@ pub const HASH_SLH_DSA_SHA2_192S_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     Fixed::Sha512,
 );
 
+/// HashSLH-DSA-SHA2-192f-with-SHA512 (FIPS 205, RFC 9909), security category 3: every signature
+/// pre-hashes the message with SHA-512.
 #[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHA2_192F_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHA2-192f-with-SHA512",
@@ -375,6 +414,8 @@ pub const HASH_SLH_DSA_SHA2_192F_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     Fixed::Sha512,
 );
 
+/// HashSLH-DSA-SHA2-256s-with-SHA512 (FIPS 205, RFC 9909), security category 5: every signature
+/// pre-hashes the message with SHA-512.
 #[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHA2_256S_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHA2-256s-with-SHA512",
@@ -383,6 +424,8 @@ pub const HASH_SLH_DSA_SHA2_256S_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     Fixed::Sha512,
 );
 
+/// HashSLH-DSA-SHA2-256f-with-SHA512 (FIPS 205, RFC 9909), security category 5: every signature
+/// pre-hashes the message with SHA-512.
 #[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHA2_256F_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHA2-256f-with-SHA512",
@@ -391,6 +434,8 @@ pub const HASH_SLH_DSA_SHA2_256F_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     Fixed::Sha512,
 );
 
+/// HashSLH-DSA-SHAKE-128s-with-SHAKE128 (FIPS 205, RFC 9909), security category 1: every signature
+/// pre-hashes the message with SHAKE128.
 #[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHAKE-128s-with-SHAKE128",
@@ -399,6 +444,8 @@ pub const HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128: SignatureAlgorithm = hash_slh_d
     Fixed::Shake128,
 );
 
+/// HashSLH-DSA-SHAKE-128f-with-SHAKE128 (FIPS 205, RFC 9909), security category 1: every signature
+/// pre-hashes the message with SHAKE128.
 #[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHAKE-128f-with-SHAKE128",
@@ -407,6 +454,8 @@ pub const HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128: SignatureAlgorithm = hash_slh_d
     Fixed::Shake128,
 );
 
+/// HashSLH-DSA-SHAKE-192s-with-SHAKE256 (FIPS 205, RFC 9909), security category 3: every signature
+/// pre-hashes the message with SHAKE256.
 #[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHAKE-192s-with-SHAKE256",
@@ -415,6 +464,8 @@ pub const HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256: SignatureAlgorithm = hash_slh_d
     Fixed::Shake256,
 );
 
+/// HashSLH-DSA-SHAKE-192f-with-SHAKE256 (FIPS 205, RFC 9909), security category 3: every signature
+/// pre-hashes the message with SHAKE256.
 #[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHAKE-192f-with-SHAKE256",
@@ -423,6 +474,8 @@ pub const HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256: SignatureAlgorithm = hash_slh_d
     Fixed::Shake256,
 );
 
+/// HashSLH-DSA-SHAKE-256s-with-SHAKE256 (FIPS 205, RFC 9909), security category 5: every signature
+/// pre-hashes the message with SHAKE256.
 #[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHAKE-256s-with-SHAKE256",
@@ -431,6 +484,8 @@ pub const HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256: SignatureAlgorithm = hash_slh_d
     Fixed::Shake256,
 );
 
+/// HashSLH-DSA-SHAKE-256f-with-SHAKE256 (FIPS 205, RFC 9909), security category 5: every signature
+/// pre-hashes the message with SHAKE256.
 #[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHAKE_256F_WITH_SHAKE256: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHAKE-256f-with-SHAKE256",
@@ -440,10 +495,12 @@ pub const HASH_SLH_DSA_SHAKE_256F_WITH_SHAKE256: SignatureAlgorithm = hash_slh_d
 );
 
 impl SignatureAlgorithm {
+    /// The name of the algorithm, such as `"ML-DSA-65"`.
     pub const fn name(&self) -> &'static str {
         self.name
     }
 
+    /// The size of a raw public key in bytes.
     pub const fn public_key_size(&self) -> usize {
         match self.scheme {
             #[cfg(feature = "ml-dsa")]
@@ -453,6 +510,7 @@ impl SignatureAlgorithm {
         }
     }
 
+    /// The size of a signature in bytes.
     pub const fn signature_size(&self) -> usize {
         match self.scheme {
             #[cfg(feature = "ml-dsa")]
@@ -462,6 +520,10 @@ impl SignatureAlgorithm {
         }
     }
 
+    /// Generates a key pair from the operating-system entropy source.
+    ///
+    /// With `options.self_test` (the default) a signature of a fixed message must verify, or the
+    /// call fails with [`Error::SelfTestFailed`].
     // The self-test is the first use of the new keys, so it computes their cached forms from the
     // encoded keys and checks those too.
     pub fn generate_key_pair(&self, options: &KeyGenOptions) -> Result<SignatureKeyPair, Error> {
@@ -481,6 +543,7 @@ impl SignatureAlgorithm {
         })
     }
 
+    /// Imports a public key in `format`.
     pub fn import_public_key(
         &self,
         data: &[u8],
@@ -496,6 +559,8 @@ impl SignatureAlgorithm {
         })
     }
 
+    /// Imports a private key in `format` and checks it. A raw ML-DSA key is the 32-byte seed or the
+    /// expanded key; a raw SLH-DSA key is the 4n-byte key, whose public root must match its seeds.
     pub fn import_private_key(
         &self,
         data: &[u8],
@@ -813,7 +878,7 @@ impl PublicPart {
     }
 }
 
-// Equality and hashing look at the key alone.
+/// A signature public key. Equality and hashing compare the algorithm and the encoded key.
 #[derive(Clone)]
 pub struct SignaturePublicKey {
     algorithm: SignatureAlgorithm,
@@ -837,12 +902,14 @@ impl Hash for SignaturePublicKey {
 }
 
 impl SignaturePublicKey {
+    /// The algorithm of the key.
     pub const fn algorithm(&self) -> SignatureAlgorithm {
         self.algorithm
     }
 
-    // Fails closed: a long context, a wrong signature length or a weak or unapproved pre-hash is
-    // just false.
+    /// Whether `signature` is a valid signature of `message` with these options. A context longer
+    /// than 255 bytes, a signature of the wrong size, or a pre-hash that is not approved or too
+    /// weak gives `false`.
     pub fn verify(&self, signature: &[u8], message: &[u8], options: &VerifyOptions) -> bool {
         self.verify_with(signature, message, options, true)
     }
@@ -889,6 +956,7 @@ impl SignaturePublicKey {
         }
     }
 
+    /// Exports the key in `format`.
     pub fn export_key(&self, format: KeyFormat) -> Result<Vec<u8>, Error> {
         export_public(format, Some(&self.algorithm.oid), &self.public.key)
     }
@@ -902,6 +970,8 @@ impl fmt::Debug for SignaturePublicKey {
     }
 }
 
+/// A signature private key. Its secrets are wiped when it is dropped; it has neither `Clone` nor
+/// `PartialEq`.
 // The secret fields are SecretBytes, which wipe themselves when the key is dropped, as does
 // `signing`, the form of an ML-DSA key that signing computes on first use.
 pub struct SignaturePrivateKey {
@@ -913,10 +983,12 @@ pub struct SignaturePrivateKey {
 }
 
 impl SignaturePrivateKey {
+    /// The algorithm of the key.
     pub const fn algorithm(&self) -> SignatureAlgorithm {
         self.algorithm
     }
 
+    /// The public key of this private key.
     pub fn public_key(&self) -> SignaturePublicKey {
         SignaturePublicKey {
             algorithm: self.algorithm,
@@ -924,6 +996,9 @@ impl SignaturePrivateKey {
         }
     }
 
+    /// Signs `message` with these options, hedged with randomness from the operating-system entropy
+    /// source unless `options.deterministic` is set. A HashSLH-DSA key always pre-hashes with its
+    /// fixed function, which `options.pre_hash` may only name again.
     pub fn sign(&self, message: &[u8], options: &SignOptions) -> Result<Vec<u8>, Error> {
         let _dit = Dit::new();
 
@@ -989,6 +1064,8 @@ impl SignaturePrivateKey {
         }
     }
 
+    /// Exports the key in `format`. A raw ML-DSA key is its seed when the key holds one, otherwise
+    /// the expanded key.
     pub fn export_key(&self, format: KeyFormat) -> Result<SecretBytes, Error> {
         let _dit = Dit::new();
 
@@ -1015,9 +1092,12 @@ impl fmt::Debug for SignaturePrivateKey {
     }
 }
 
+/// A signature key pair.
 #[derive(Debug)]
 pub struct SignatureKeyPair {
+    /// The public key.
     pub public_key: SignaturePublicKey,
+    /// The private key.
     pub private_key: SignaturePrivateKey,
 }
 

@@ -89,10 +89,13 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
     compiler_fence(Ordering::SeqCst);
 }
 
-// Secret bytes on the heap, wiped when dropped: the type of every secret output (shared secrets,
-// derived keys, exported private keys). The buffer never grows after creation, so no reallocation
-// leaves an unwiped copy behind. There is no Clone, so that every copy is one the caller makes, and
-// no PartialEq: compare secrets in constant time, never with ==.
+/// Secret bytes on the heap, wiped when dropped: the type of every secret output, such as shared
+/// secrets, derived keys and exported private keys.
+///
+/// It dereferences to `[u8]` and prints as redacted. It implements neither `Clone`, so that every
+/// copy is one the caller makes, nor `PartialEq`: compare secrets in constant time, never with
+/// `==`. Copies that the compiler makes in registers or on the stack cannot be wiped.
+// The buffer never grows after creation, so no reallocation leaves an unwiped copy behind.
 pub struct SecretBytes(Vec<u8>);
 
 impl SecretBytes {

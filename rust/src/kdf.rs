@@ -30,7 +30,8 @@ fn expand_unchecked(hash: &HashAlgorithm, _: &[u8], _: &[u8], _: &mut [u8]) {
     match *hash {}
 }
 
-// HKDF (RFC 5869) over HMAC with SHA-2, and BLAKE3's derive_key, whose context string is info.
+/// A key derivation function: HKDF (RFC 5869) over HMAC with SHA-2, or BLAKE3-KDF, BLAKE3's
+/// `derive_key` with `info` as its context string.
 // The PRK, every T(i) and the keyed states are secret and wiped; one keyed DIT guard covers each
 // public call.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,15 +55,19 @@ impl fmt::Debug for KdfAlgorithm {
     }
 }
 
-// An empty salt is HashLen zero bytes (RFC 5869, 2.2). Extract takes no info and Expand no salt.
+/// The options of a key derivation. An empty HKDF salt stands for HashLen zero bytes (RFC 5869,
+/// 2.2). `extract` takes no `info` and `expand` no `salt`; BLAKE3-KDF takes no `salt`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct KdfOptions<'a> {
+    /// The HKDF salt.
     pub salt: &'a [u8],
+    /// The HKDF info, or the BLAKE3-KDF context string.
     pub info: &'a [u8],
 }
 
 impl<'a> KdfOptions<'a> {
+    /// These options with `salt` set.
     #[must_use]
     pub const fn with_salt(mut self, salt: &'a [u8]) -> Self {
         self.salt = salt;
@@ -70,6 +75,7 @@ impl<'a> KdfOptions<'a> {
         self
     }
 
+    /// These options with `info` set.
     #[must_use]
     pub const fn with_info(mut self, info: &'a [u8]) -> Self {
         self.info = info;
@@ -79,11 +85,12 @@ impl<'a> KdfOptions<'a> {
 }
 
 impl KdfAlgorithm {
+    /// The name of the algorithm, such as `"HKDF-SHA-256"`.
     pub const fn name(&self) -> &'static str {
         self.name
     }
 
-    // The size of a pseudorandom key, HashLen; BLAKE3's key size for BLAKE3-KDF.
+    /// The size of a pseudorandom key: HashLen for HKDF, BLAKE3's 32-byte key size for BLAKE3-KDF.
     pub const fn prk_size(&self) -> usize {
         match self.kind {
             #[cfg(feature = "hkdf")]
@@ -120,6 +127,9 @@ impl KdfAlgorithm {
         }
     }
 
+    /// Derives `length` bytes from the input keying material `ikm`: HKDF Extract and then Expand,
+    /// or BLAKE3-KDF. `length` is at most 255 HashLen for HKDF and below 2^32 for BLAKE3-KDF, and
+    /// never 0.
     pub fn derive(
         &self,
         ikm: &[u8],
@@ -137,7 +147,7 @@ impl KdfAlgorithm {
         Ok(out)
     }
 
-    // Extract and then Expand into out, whose length is L.
+    /// Derives `out.len()` bytes into `out`, as [`derive`](Self::derive) does.
     pub fn derive_into(
         &self,
         ikm: &[u8],
@@ -189,6 +199,8 @@ impl KdfAlgorithm {
         wipe(&mut prk);
     }
 
+    /// HKDF Extract: the pseudorandom key HMAC(salt, ikm), of [`prk_size`](Self::prk_size) bytes.
+    /// [`Error::Unsupported`] for BLAKE3-KDF.
     pub fn extract(&self, ikm: &[u8], options: &KdfOptions) -> Result<SecretBytes, Error> {
         let mut out = SecretBytes::zeroed(self.prk_size());
 
@@ -197,7 +209,8 @@ impl KdfAlgorithm {
         Ok(out)
     }
 
-    // PRK = HMAC(salt, IKM) into out, which must be prk_size() bytes.
+    /// HKDF Extract into `out`, which must be [`prk_size`](Self::prk_size) bytes.
+    /// [`Error::Unsupported`] for BLAKE3-KDF.
     pub fn extract_into(
         &self,
         ikm: &[u8],
@@ -221,6 +234,8 @@ impl KdfAlgorithm {
         Ok(())
     }
 
+    /// HKDF Expand: `length` bytes from a pseudorandom key of at least
+    /// [`prk_size`](Self::prk_size) bytes. [`Error::Unsupported`] for BLAKE3-KDF.
     pub fn expand(
         &self,
         prk: &[u8],
@@ -238,6 +253,7 @@ impl KdfAlgorithm {
         Ok(out)
     }
 
+    /// HKDF Expand into `out`, as [`expand`](Self::expand) does.
     pub fn expand_into(
         &self,
         prk: &[u8],
@@ -420,24 +436,28 @@ impl Drop for Keyed {
     }
 }
 
+/// HKDF with HMAC-SHA-256 (RFC 5869).
 #[cfg(feature = "hkdf")]
 pub const HKDF_SHA_256: KdfAlgorithm = KdfAlgorithm {
     name: "HKDF-SHA-256",
     kind: KdfKind::Hkdf(SHA_256),
 };
 
+/// HKDF with HMAC-SHA-384 (RFC 5869).
 #[cfg(feature = "hkdf")]
 pub const HKDF_SHA_384: KdfAlgorithm = KdfAlgorithm {
     name: "HKDF-SHA-384",
     kind: KdfKind::Hkdf(SHA_384),
 };
 
+/// HKDF with HMAC-SHA-512 (RFC 5869).
 #[cfg(feature = "hkdf")]
 pub const HKDF_SHA_512: KdfAlgorithm = KdfAlgorithm {
     name: "HKDF-SHA-512",
     kind: KdfKind::Hkdf(SHA_512),
 };
 
+/// BLAKE3-KDF: BLAKE3's `derive_key` mode, with the `info` option as its context string.
 #[cfg(feature = "blake3")]
 pub const BLAKE3_KDF: KdfAlgorithm = KdfAlgorithm {
     name: "BLAKE3-KDF",

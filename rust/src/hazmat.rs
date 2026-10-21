@@ -1,7 +1,9 @@
-// Deterministic operations for test vectors. Production code must not call them: reusing a seed
-// or randomness value with a different key, message or ciphertext breaks the scheme, and the
-// signing functions skip the pre-hash strength policy of the public API (but not the fixed
-// pre-hash of the HashSLH-DSA values).
+//! Deterministic operations for test vectors, enabled by the `hazmat` feature.
+//!
+//! Production code must not call them. Each one takes a seed or randomness from the caller
+//! instead of the operating-system entropy source, and reusing one with a different key, message
+//! or ciphertext breaks the scheme. The signing functions skip the pre-hash strength policy of the
+//! public API, but not the fixed pre-hash of the HashSLH-DSA values.
 
 #[cfg(any(feature = "ml-dsa", feature = "slh-dsa"))]
 use alloc::vec::Vec;
@@ -49,6 +51,8 @@ fn require_length(data: &[u8], length: usize) -> Result<(), Error> {
     }
 }
 
+/// The KEM key pair of `seed`, of the algorithm's seed size: d || z for ML-KEM (FIPS 203
+/// Algorithm 16). The pairwise test is not run.
 #[cfg(any(feature = "ml-kem", feature = "frodokem"))]
 pub fn generate_kem_key_pair(algorithm: KemAlgorithm, seed: &[u8]) -> Result<KemKeyPair, Error> {
     require_length(seed, algorithm.seed_size())?;
@@ -61,6 +65,8 @@ pub fn generate_kem_key_pair(algorithm: KemAlgorithm, seed: &[u8]) -> Result<Kem
     })
 }
 
+/// The signature key pair of `seed`: the 32-byte ξ for ML-DSA, SK.seed || SK.prf || PK.seed for
+/// SLH-DSA.
 #[cfg(any(feature = "ml-dsa", feature = "slh-dsa"))]
 pub fn generate_signature_key_pair(
     algorithm: SignatureAlgorithm,
@@ -76,6 +82,7 @@ pub fn generate_signature_key_pair(
     })
 }
 
+/// Encapsulation with the caller's `randomness`, of the algorithm's randomness size.
 #[cfg(any(feature = "ml-kem", feature = "frodokem"))]
 pub fn encapsulate(public_key: &KemPublicKey, randomness: &[u8]) -> Result<Encapsulation, Error> {
     require_length(randomness, public_key.algorithm().randomness_size())?;
@@ -83,8 +90,11 @@ pub fn encapsulate(public_key: &KemPublicKey, randomness: &[u8]) -> Result<Encap
     Ok(public_key.encapsulate_with(randomness))
 }
 
-// options.deterministic is ignored: the randomness argument decides. The options are checked
-// before the length of the randomness (SPEC 7.3).
+/// Signing with the caller's `randomness`: rnd for ML-DSA, opt_rand for SLH-DSA.
+/// `options.deterministic` is ignored, since the randomness decides, and the pre-hash strength
+/// policy of [`SignaturePrivateKey::sign`] does not apply; the fixed pre-hash of a HashSLH-DSA key
+/// does.
+// The options are checked before the length of the randomness (SPEC 7.3).
 #[cfg(any(feature = "ml-dsa", feature = "slh-dsa"))]
 pub fn sign(
     private_key: &SignaturePrivateKey,
@@ -99,6 +109,7 @@ pub fn sign(
     Ok(private_key.sign_with(message, randomness, options.context, pre_hash))
 }
 
+/// Verification without the pre-hash strength policy of [`SignaturePublicKey::verify`].
 #[cfg(any(feature = "ml-dsa", feature = "slh-dsa"))]
 pub fn verify(
     public_key: &SignaturePublicKey,
@@ -109,12 +120,14 @@ pub fn verify(
     public_key.verify_with(signature, message, options, false)
 }
 
-// SPEC D-65: ML-DSA.Sign_internal (FIPS 204 Algorithm 7) or slh_sign_internal (FIPS 205 Algorithm
-// 19) on a caller-supplied message representative M', for the internal groups of ACVP. M' skips
-// the domain separation of the pure and pre-hash interfaces, so a HashSLH-DSA key, which signs
-// pre-hashed messages alone, refuses it with INVALID_OPTION. The randomness is rnd for ML-DSA
-// (32 zero bytes for the deterministic variant) and opt_rand for SLH-DSA (PK.seed for the
-// deterministic variant).
+/// ML-DSA.Sign_internal (FIPS 204 Algorithm 7) or slh_sign_internal (FIPS 205 Algorithm 19) on a
+/// message representative M' given by the caller, as the internal test groups of ACVP use them.
+///
+/// M' skips the domain separation of the pure and pre-hash interfaces, so a HashSLH-DSA key, which
+/// signs pre-hashed messages alone, refuses it with [`Error::InvalidOption`]. The randomness is
+/// rnd for ML-DSA (32 zero bytes for the deterministic variant) and opt_rand for SLH-DSA (PK.seed
+/// for the deterministic variant).
+// SPEC D-65.
 #[cfg(any(feature = "ml-dsa", feature = "slh-dsa"))]
 pub fn sign_internal(
     private_key: &SignaturePrivateKey,
@@ -132,8 +145,9 @@ pub fn sign_internal(
     Ok(private_key.sign_representative(&[message_representative], randomness))
 }
 
-// ML-DSA.Verify_internal (FIPS 204 Algorithm 8) or slh_verify_internal (FIPS 205 Algorithm 20);
-// false for a HashSLH-DSA key, as sign_internal refuses it.
+/// ML-DSA.Verify_internal (FIPS 204 Algorithm 8) or slh_verify_internal (FIPS 205 Algorithm 20)
+/// on a message representative M'; `false` for a HashSLH-DSA key, as [`sign_internal`] refuses
+/// it.
 #[cfg(any(feature = "ml-dsa", feature = "slh-dsa"))]
 pub fn verify_internal(
     public_key: &SignaturePublicKey,
@@ -147,10 +161,11 @@ pub fn verify_internal(
         && public_key.verify_representative(&[message_representative], signature)
 }
 
-// SPEC 11.14: a key whose top secrets are the seed, I || SEED of the top LMS tree or
-// S_XMSS || SK_PRF || SEED, which derives its child trees and randomizers as the reference
-// implementations do, so that it reproduces their test vectors; it starts at index, which must be
-// below the capacity (SPEC D-68): a key that starts exhausted could never sign.
+/// A stateful key pair whose top secrets are `seed`, I || SEED of the top LMS tree or
+/// S_XMSS || SK_PRF || SEED, and which derives its child trees and randomizers as the reference
+/// implementations do, so that it reproduces their test vectors. It starts at `index`, which must
+/// be below the capacity: a key that starts exhausted could never sign.
+// SPEC 11.14 and D-68.
 #[cfg(any(feature = "lms", feature = "xmss"))]
 pub fn generate_stateful_key_pair<S: StateStore>(
     algorithm: StatefulSignatureAlgorithm,
@@ -175,9 +190,9 @@ pub fn generate_stateful_key_pair<S: StateStore>(
     algorithm.create(parameters, seed, true, index, reserve, store)
 }
 
-// cSHAKE128 or cSHAKE256 with a function name N as well as a customization S, as the ACVP vectors
-// set it. SP 800-185, 3.4: N should only take values that NIST defines, so the public configure
-// takes S alone.
+/// cSHAKE128 or cSHAKE256 with a function name N as well as a customization S, as the ACVP
+/// vectors set them. NIST SP 800-185, 3.4, reserves N for values that NIST defines, so
+/// [`XofAlgorithm::configure`] takes S alone.
 #[cfg(feature = "sha3")]
 pub fn configure_cshake(
     algorithm: XofAlgorithm,
