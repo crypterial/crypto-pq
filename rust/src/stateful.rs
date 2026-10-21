@@ -2032,10 +2032,14 @@ mod tests {
     use std::collections::HashSet;
     use std::panic::AssertUnwindSafe;
 
+    #[cfg(feature = "lms")]
+    use super::HSS_LMS;
     use super::{
-        HSS_LMS, StateStore, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
-        StatefulPrivateKey, StatefulSignatureAlgorithm, XMSS, XMSS_MT,
+        StateStore, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
+        StatefulPrivateKey, StatefulSignatureAlgorithm,
     };
+    #[cfg(feature = "xmss")]
+    use super::{XMSS, XMSS_MT};
     use crate::error::Error;
     use crate::hazmat::generate_stateful_key_pair;
     use crate::merkle::{LEAVES_COMPUTED, ONE_TIME_SIGNATURES};
@@ -2289,22 +2293,29 @@ mod tests {
         let mt = StatefulParameters::Name("XMSSMT-SHA2_20/4_192");
 
         let cases = [
+            #[cfg(feature = "lms")]
             (HSS_LMS, StatefulParameters::Levels(&two), Start::Random, 34),
+            #[cfg(feature = "lms")]
             (
                 HSS_LMS,
                 StatefulParameters::Levels(&two),
                 Start::Hazmat(1000),
                 40,
             ),
+            #[cfg(feature = "lms")]
             (
                 HSS_LMS,
                 StatefulParameters::Levels(&three),
                 Start::Hazmat(1022),
                 6,
             ),
+            #[cfg(feature = "xmss")]
             (XMSS_MT, mt, Start::Random, 34),
+            #[cfg(feature = "xmss")]
             (XMSS_MT, mt, Start::Hazmat(32766), 6),
+            #[cfg(feature = "xmss")]
             (XMSS_MT, mt, Start::Hazmat((1 << 20) - 6), 10),
+            #[cfg(feature = "xmss")]
             (
                 XMSS,
                 StatefulParameters::Name("XMSS-SHA2_10_192"),
@@ -2421,8 +2432,11 @@ mod tests {
         let xmss = StatefulParameters::Name("XMSS-SHA2_10_192");
 
         for (algorithm, parameters, capacity, skip) in [
+            #[cfg(feature = "lms")]
             (HSS_LMS, StatefulParameters::Levels(&two), 1 << 10, Some(64)),
+            #[cfg(feature = "xmss")]
             (XMSS_MT, mt, 1 << 20, Some(64)),
+            #[cfg(feature = "xmss")]
             (XMSS, xmss, 1 << 10, None),
         ] {
             ONE_TIME_SIGNATURES.with(|signatures| signatures.borrow_mut().clear());
@@ -2509,7 +2523,9 @@ mod tests {
         let mt = StatefulParameters::Name("XMSSMT-SHA2_20/4_192");
 
         for (algorithm, parameters, size, index, trees) in [
+            #[cfg(feature = "lms")]
             (HSS_LMS, StatefulParameters::Levels(&two), 40, 40, 2),
+            #[cfg(feature = "xmss")]
             (XMSS_MT, mt, 72, 0x12345, 4),
         ] {
             let store = CrashingStore::default();
@@ -2567,7 +2583,9 @@ mod tests {
         let mt = StatefulParameters::Name("XMSSMT-SHA2_20/4_192");
 
         for (algorithm, parameters, size, index) in [
+            #[cfg(feature = "lms")]
             (HSS_LMS, StatefulParameters::Levels(&two), 40, 30),
+            #[cfg(feature = "xmss")]
             (XMSS_MT, mt, 72, 0x1233E),
         ] {
             let store = CrashingStore::default();

@@ -188,6 +188,17 @@ jobs:
               echo "::endgroup::"
             done
           done
+      # The tests of each family with hazmat and only the families that its suites also use: the
+      # unit tests and doc tests that the features compile, and the integration tests whose
+      # required features they enable. The stateful suite needs both stateful families.
+      - run: |
+          for features in "ml-kem hazmat" "frodokem sha2 sha3 hazmat" "ml-dsa hazmat" "slh-dsa hazmat" \
+            "lms hazmat" "xmss hazmat" "lms xmss hmac hazmat" "sha2 hazmat" "sha3 hazmat" "blake2 sha2 hazmat" \
+            "blake3 hazmat" "ascon hazmat" "hmac hazmat" "hkdf hazmat"; do
+            echo "::group::test [$features]"
+            cargo test --release --locked --no-default-features --features "$features"
+            echo "::endgroup::"
+          done
 
   # The fallback of every CPU-specific kernel, on runners that have the instructions.
   rust-portable:

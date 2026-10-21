@@ -2265,10 +2265,23 @@ fn digest_sha3<const RATE: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::SHA_256;
-    use crate::kdf::{HKDF_SHA_256, HKDF_SHA_512, KdfOptions};
-    use crate::kem::ML_KEM_768;
-    use crate::mac::{BLAKE2B_MAC, BLAKE2S_MAC, HMAC_SHA_256, HMAC_SHA_512, KMAC128, KMAC256};
+    #[cfg(feature = "hmac")]
+    use crate::mac::HMAC_SHA_256;
+    // keyed_dit_is_opt_in calls one algorithm of every family that it covers.
+    #[cfg(all(
+        feature = "ml-kem",
+        feature = "sha2",
+        feature = "sha3",
+        feature = "blake2",
+        feature = "hmac",
+        feature = "hkdf"
+    ))]
+    use crate::{
+        hash::SHA_256,
+        kdf::{HKDF_SHA_256, HKDF_SHA_512, KdfOptions},
+        kem::ML_KEM_768,
+        mac::{BLAKE2B_MAC, BLAKE2S_MAC, HMAC_SHA_512, KMAC128, KMAC256},
+    };
     use std::boxed::Box;
     use std::cell::{Cell, RefCell};
     use std::thread::LocalKey;
@@ -2339,12 +2352,21 @@ mod tests {
 
         assert!(!dit_is_set());
 
+        #[cfg(feature = "hmac")]
         HMAC_SHA_256.digest(b"key", b"data").unwrap();
 
         assert!(!dit_is_set());
     }
 
     // Every public MAC and KDF call that uses a key, each on its own state.
+    #[cfg(all(
+        feature = "ml-kem",
+        feature = "sha2",
+        feature = "sha3",
+        feature = "blake2",
+        feature = "hmac",
+        feature = "hkdf"
+    ))]
     fn keyed_calls() -> Vec<Box<dyn Fn()>> {
         let mut calls: Vec<Box<dyn Fn()>> = Vec::new();
 
@@ -2408,6 +2430,14 @@ mod tests {
     // MAC and KDF calls leave the DIT register alone until enable_data_independent_timing(), and
     // then set and clear it as the asymmetric operations always do; inside another guard they
     // only read it. Hashes never touch it.
+    #[cfg(all(
+        feature = "ml-kem",
+        feature = "sha2",
+        feature = "sha3",
+        feature = "blake2",
+        feature = "hmac",
+        feature = "hkdf"
+    ))]
     #[test]
     fn keyed_dit_is_opt_in() {
         KEYED.store(false, Ordering::Relaxed);

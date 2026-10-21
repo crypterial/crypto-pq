@@ -684,7 +684,7 @@ pub struct KemKeyPair {
     pub private_key: KemPrivateKey,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ml-kem"))]
 mod tests {
     use super::*;
     use crate::hazmat;
@@ -692,6 +692,7 @@ mod tests {
     fn part(key: &KemPrivateKey) -> &MlKemPublic {
         match &key.secret {
             Secret::MlKem { public, .. } => public,
+            #[cfg(feature = "frodokem")]
             Secret::Frodo { .. } => panic!("an ML-KEM key"),
         }
     }
@@ -701,6 +702,7 @@ mod tests {
             Secret::MlKem {
                 public, decoded, ..
             } => (public.form.get().is_some(), decoded.get().is_some()),
+            #[cfg(feature = "frodokem")]
             Secret::Frodo { .. } => panic!("an ML-KEM key"),
         }
     }
@@ -708,6 +710,7 @@ mod tests {
     fn public_part(key: &KemPublicKey) -> &MlKemPublic {
         match &key.public {
             PublicPart::MlKem(part) => part,
+            #[cfg(feature = "frodokem")]
             PublicPart::Frodo(_) => panic!("an ML-KEM key"),
         }
     }

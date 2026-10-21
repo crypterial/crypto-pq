@@ -1107,6 +1107,7 @@ mod tests {
     use crate::hazmat;
 
     // Whether Â, t̂1 and tr, and the signing form of a private key, are filled.
+    #[cfg(feature = "ml-dsa")]
     fn filled(key: &SignaturePrivateKey) -> (bool, bool, bool) {
         let derived = key.public.derived.as_ref().expect("an ML-DSA key");
 
@@ -1117,10 +1118,12 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "ml-dsa")]
     const MESSAGE: &[u8] = b"lazy caches";
 
     // The caches fill on first use, which for a generated key is its self-test, and a key pair
     // shares one public part. Signing needs Â but not t̂1.
+    #[cfg(feature = "ml-dsa")]
     #[test]
     fn caches_fill_on_first_use_and_are_shared() {
         let options = SignOptions::default().with_deterministic(true);
@@ -1184,6 +1187,7 @@ mod tests {
 
     // D-69: the self-test signature of a HashSLH-DSA key is a pre-hash signature with its fixed
     // function, hedged, and that of an SLH-DSA key a pure one.
+    #[cfg(feature = "slh-dsa")]
     #[test]
     fn self_test_in_the_algorithm_mode() {
         let seed = [6; 48];
@@ -1226,6 +1230,7 @@ mod tests {
         assert_ne!(signature, fixed);
     }
 
+    #[cfg(feature = "slh-dsa")]
     #[test]
     fn slh_dsa_keys_have_no_caches() {
         let pair = hazmat::generate_signature_key_pair(SLH_DSA_SHAKE_128F, &[4; 48]).expect("key");

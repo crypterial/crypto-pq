@@ -44,6 +44,7 @@
 //! Key encapsulation:
 //!
 //! ```
+//! # #[cfg(feature = "ml-kem")] {
 //! use crypto_pq::{KeyGenOptions, ML_KEM_768};
 //!
 //! let pair = ML_KEM_768.generate_key_pair(&KeyGenOptions::default())?;
@@ -53,12 +54,14 @@
 //! let shared_secret = pair.private_key.decapsulate(&encapsulation.ciphertext)?;
 //!
 //! assert_eq!(*shared_secret, *encapsulation.shared_secret);
+//! # }
 //! # Ok::<(), crypto_pq::Error>(())
 //! ```
 //!
 //! Signatures:
 //!
 //! ```
+//! # #[cfg(feature = "ml-dsa")] {
 //! use crypto_pq::{KeyGenOptions, ML_DSA_65, SignOptions, VerifyOptions};
 //!
 //! let pair = ML_DSA_65.generate_key_pair(&KeyGenOptions::default())?;
@@ -70,12 +73,14 @@
 //! let verify = VerifyOptions::default().with_context(b"example");
 //!
 //! assert!(pair.public_key.verify(&signature, b"message", &verify));
+//! # }
 //! # Ok::<(), crypto_pq::Error>(())
 //! ```
 //!
 //! Stateful signatures, with a `StateStore` that a real application makes durable:
 //!
 //! ```
+//! # #[cfg(feature = "lms")] {
 //! use crypto_pq::{
 //!     Error, HSS_LMS, StateStore, StatefulKeyGenOptions, StatefulParameters,
 //! };
@@ -111,12 +116,14 @@
 //! assert!(pair.public_key.verify(&signature, b"message"));
 //!
 //! assert_eq!(pair.private_key.remaining_signatures(), 31);
+//! # }
 //! # Ok::<(), crypto_pq::Error>(())
 //! ```
 //!
 //! Hash functions and XOFs:
 //!
 //! ```
+//! # #[cfg(all(feature = "sha2", feature = "sha3"))] {
 //! use crypto_pq::{SHA_256, SHAKE256};
 //!
 //! let digest = SHA_256.digest(b"message");
@@ -132,12 +139,14 @@
 //! let output = SHAKE256.digest(b"message", 64)?;
 //!
 //! assert_eq!(output.len(), 64);
+//! # }
 //! # Ok::<(), crypto_pq::Error>(())
 //! ```
 //!
 //! MACs and key derivation:
 //!
 //! ```
+//! # #[cfg(feature = "hkdf")] {
 //! use crypto_pq::{HKDF_SHA_256, HMAC_SHA_256, KdfOptions};
 //!
 //! let tag = HMAC_SHA_256.digest(b"key", b"message")?;
@@ -149,6 +158,7 @@
 //! let key = HKDF_SHA_256.derive(b"input keying material", 32, &options)?;
 //!
 //! assert_eq!(key.len(), 32);
+//! # }
 //! # Ok::<(), crypto_pq::Error>(())
 //! ```
 //!
