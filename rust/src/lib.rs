@@ -163,9 +163,9 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 // A build without every algorithm family compiles out enum variants and the code that only they
-// use, which leaves items, imports and parameters unused, patterns unreachable or irrefutable, and
-// enums and closures that only some families make worth their form; the default build, which has
-// every family, keeps these lints.
+// use. That leaves items, imports and parameters unused and patterns unreachable or irrefutable,
+// and it gives clippy enum sizes and closures to flag that only such builds have. The default
+// build, which has every family, keeps all these lints.
 #![cfg_attr(
     not(feature = "default"),
     allow(
