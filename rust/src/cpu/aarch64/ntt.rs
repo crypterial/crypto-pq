@@ -20,6 +20,7 @@ use super::memory::{load_i16, load_i32, load_u16, store_i32, store_u16};
 use crate::cpu::{Field, Field16, Prepare};
 
 #[allow(unsafe_code)]
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 pub(crate) fn ntt(w: &mut [i32; 256], field: &Field) -> bool {
     // SAFETY: NEON is part of every target this module is built for.
     unsafe { forward(w, field) };
@@ -28,6 +29,7 @@ pub(crate) fn ntt(w: &mut [i32; 256], field: &Field) -> bool {
 }
 
 #[allow(unsafe_code)]
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 pub(crate) fn inverse_ntt(w: &mut [i32; 256], field: &Field) -> bool {
     // SAFETY: as in ntt.
     unsafe { inverse(w, field) };
@@ -36,6 +38,7 @@ pub(crate) fn inverse_ntt(w: &mut [i32; 256], field: &Field) -> bool {
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn multiply(
     out: &mut [i32; 256],
     f: &[i32; 256],
@@ -49,6 +52,7 @@ pub(crate) fn multiply(
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn multiply_add(
     acc: &mut [i32; 256],
     f: &[[i32; 256]],
@@ -62,6 +66,7 @@ pub(crate) fn multiply_add(
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn base_multiply_add(
     acc: &mut [i32; 256],
     a: &[u16; 256],
@@ -75,6 +80,7 @@ pub(crate) fn base_multiply_add(
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_matrix_vector(
     t: &mut [[u16; 256]],
     a: &[[u16; 256]],
@@ -96,6 +102,7 @@ pub(crate) fn mlkem_matrix_vector(
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn ntt16(f: &mut [u16; 256], field: &Field16) -> bool {
     // SAFETY: as in ntt.
     unsafe { forward16(f, field) };
@@ -104,6 +111,7 @@ pub(crate) fn ntt16(f: &mut [u16; 256], field: &Field16) -> bool {
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn inverse_ntt16(acc: &[i32; 256], out: &mut [u16; 256], field: &Field16) -> bool {
     // SAFETY: as in ntt.
     unsafe { inverse16(acc, out, field) };

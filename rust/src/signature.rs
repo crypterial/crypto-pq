@@ -4,16 +4,22 @@ use core::fmt;
 use core::hash::{Hash, Hasher};
 
 use crate::cpu::Dit;
-use crate::ct::{self, declassify};
+use crate::ct;
+#[cfg(feature = "slh-dsa")]
+use crate::ct::declassify;
 use crate::error::Error;
 use crate::hash::{HashAlgorithm, SHA_256, SHA_512, SHAKE128, SHAKE256, XofAlgorithm};
 use crate::keys::{
-    KeyFormat, KeyGenOptions, PrivateInput, SeedChoice, check_size, decode_seed_choice,
-    encode_expanded, encode_seed, export_private, export_public, import_private, import_public,
+    KeyFormat, KeyGenOptions, PrivateInput, check_size, export_private, export_public,
+    import_private, import_public,
 };
-use crate::mldsa;
+#[cfg(feature = "ml-dsa")]
+use crate::keys::{SeedChoice, decode_seed_choice, encode_expanded, encode_seed};
+#[cfg(feature = "ml-dsa")]
+use crate::mldsa::{self, SigningKey};
 use crate::once::{OnceBox, Shared};
 use crate::rng::random_bytes;
+#[cfg(feature = "slh-dsa")]
 use crate::slhdsa;
 use crate::wipe::SecretBytes;
 
@@ -220,7 +226,9 @@ impl<'a> Representative<'a> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Scheme {
+    #[cfg(feature = "ml-dsa")]
     MlDsa(mldsa::Parameters),
+    #[cfg(feature = "slh-dsa")]
     SlhDsa(slhdsa::Parameters),
 }
 
@@ -237,6 +245,7 @@ const fn oid(arc: u8) -> [u8; 9] {
     [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, arc]
 }
 
+#[cfg(feature = "ml-dsa")]
 const fn ml_dsa(name: &'static str, parameters: mldsa::Parameters, arc: u8) -> SignatureAlgorithm {
     SignatureAlgorithm {
         name,
@@ -246,6 +255,7 @@ const fn ml_dsa(name: &'static str, parameters: mldsa::Parameters, arc: u8) -> S
     }
 }
 
+#[cfg(feature = "slh-dsa")]
 const fn slh_dsa(
     name: &'static str,
     parameters: slhdsa::Parameters,
@@ -261,6 +271,7 @@ const fn slh_dsa(
 
 // RFC 9909, 3 and 4: HashSLH-DSA with the pre-hash of its identifier, which keys, sizes and raw
 // formats share with the pure value of the same set.
+#[cfg(feature = "slh-dsa")]
 const fn hash_slh_dsa(
     name: &'static str,
     parameters: slhdsa::Parameters,
@@ -275,48 +286,64 @@ const fn hash_slh_dsa(
     }
 }
 
+#[cfg(feature = "ml-dsa")]
 pub const ML_DSA_44: SignatureAlgorithm = ml_dsa("ML-DSA-44", mldsa::ML_DSA_44, 17);
 
+#[cfg(feature = "ml-dsa")]
 pub const ML_DSA_65: SignatureAlgorithm = ml_dsa("ML-DSA-65", mldsa::ML_DSA_65, 18);
 
+#[cfg(feature = "ml-dsa")]
 pub const ML_DSA_87: SignatureAlgorithm = ml_dsa("ML-DSA-87", mldsa::ML_DSA_87, 19);
 
+#[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_128S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-128s", slhdsa::SHA2_128S, 20);
 
+#[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_128F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-128f", slhdsa::SHA2_128F, 21);
 
+#[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_192S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-192s", slhdsa::SHA2_192S, 22);
 
+#[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_192F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-192f", slhdsa::SHA2_192F, 23);
 
+#[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_256S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-256s", slhdsa::SHA2_256S, 24);
 
+#[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_256F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-256f", slhdsa::SHA2_256F, 25);
 
+#[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_128S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-128s", slhdsa::SHAKE_128S, 26);
 
+#[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_128F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-128f", slhdsa::SHAKE_128F, 27);
 
+#[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_192S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-192s", slhdsa::SHAKE_192S, 28);
 
+#[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_192F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-192f", slhdsa::SHAKE_192F, 29);
 
+#[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_256S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-256s", slhdsa::SHAKE_256S, 30);
 
+#[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_256F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-256f", slhdsa::SHAKE_256F, 31);
 
+#[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHA2_128S_WITH_SHA256: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHA2-128s-with-SHA256",
     slhdsa::SHA2_128S,
@@ -324,6 +351,7 @@ pub const HASH_SLH_DSA_SHA2_128S_WITH_SHA256: SignatureAlgorithm = hash_slh_dsa(
     Fixed::Sha256,
 );
 
+#[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHA2_128F_WITH_SHA256: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHA2-128f-with-SHA256",
     slhdsa::SHA2_128F,
@@ -331,6 +359,7 @@ pub const HASH_SLH_DSA_SHA2_128F_WITH_SHA256: SignatureAlgorithm = hash_slh_dsa(
     Fixed::Sha256,
 );
 
+#[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHA2_192S_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHA2-192s-with-SHA512",
     slhdsa::SHA2_192S,
@@ -338,6 +367,7 @@ pub const HASH_SLH_DSA_SHA2_192S_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     Fixed::Sha512,
 );
 
+#[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHA2_192F_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHA2-192f-with-SHA512",
     slhdsa::SHA2_192F,
@@ -345,6 +375,7 @@ pub const HASH_SLH_DSA_SHA2_192F_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     Fixed::Sha512,
 );
 
+#[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHA2_256S_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHA2-256s-with-SHA512",
     slhdsa::SHA2_256S,
@@ -352,6 +383,7 @@ pub const HASH_SLH_DSA_SHA2_256S_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     Fixed::Sha512,
 );
 
+#[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHA2_256F_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHA2-256f-with-SHA512",
     slhdsa::SHA2_256F,
@@ -359,6 +391,7 @@ pub const HASH_SLH_DSA_SHA2_256F_WITH_SHA512: SignatureAlgorithm = hash_slh_dsa(
     Fixed::Sha512,
 );
 
+#[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHAKE-128s-with-SHAKE128",
     slhdsa::SHAKE_128S,
@@ -366,6 +399,7 @@ pub const HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128: SignatureAlgorithm = hash_slh_d
     Fixed::Shake128,
 );
 
+#[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHAKE-128f-with-SHAKE128",
     slhdsa::SHAKE_128F,
@@ -373,6 +407,7 @@ pub const HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128: SignatureAlgorithm = hash_slh_d
     Fixed::Shake128,
 );
 
+#[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHAKE-192s-with-SHAKE256",
     slhdsa::SHAKE_192S,
@@ -380,6 +415,7 @@ pub const HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256: SignatureAlgorithm = hash_slh_d
     Fixed::Shake256,
 );
 
+#[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHAKE-192f-with-SHAKE256",
     slhdsa::SHAKE_192F,
@@ -387,6 +423,7 @@ pub const HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256: SignatureAlgorithm = hash_slh_d
     Fixed::Shake256,
 );
 
+#[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHAKE-256s-with-SHAKE256",
     slhdsa::SHAKE_256S,
@@ -394,6 +431,7 @@ pub const HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256: SignatureAlgorithm = hash_slh_d
     Fixed::Shake256,
 );
 
+#[cfg(feature = "slh-dsa")]
 pub const HASH_SLH_DSA_SHAKE_256F_WITH_SHAKE256: SignatureAlgorithm = hash_slh_dsa(
     "HashSLH-DSA-SHAKE-256f-with-SHAKE256",
     slhdsa::SHAKE_256F,
@@ -408,14 +446,18 @@ impl SignatureAlgorithm {
 
     pub const fn public_key_size(&self) -> usize {
         match self.scheme {
+            #[cfg(feature = "ml-dsa")]
             Scheme::MlDsa(p) => p.public_key_size(),
+            #[cfg(feature = "slh-dsa")]
             Scheme::SlhDsa(p) => p.public_key_size(),
         }
     }
 
     pub const fn signature_size(&self) -> usize {
         match self.scheme {
+            #[cfg(feature = "ml-dsa")]
             Scheme::MlDsa(p) => p.signature_size(),
+            #[cfg(feature = "slh-dsa")]
             Scheme::SlhDsa(p) => p.signature_size(),
         }
     }
@@ -464,13 +506,17 @@ impl SignatureAlgorithm {
         let input = import_private(format, data, Some(&self.oid))?;
 
         let (key, public_key) = match (input, self.scheme) {
+            #[cfg(feature = "slh-dsa")]
             (PrivateInput::Raw(raw), Scheme::SlhDsa(p)) => {
                 (self.import_slh_dsa(p, KeyFormat::Raw, &raw)?, None)
             }
+            #[cfg(feature = "slh-dsa")]
             (PrivateInput::Pkcs8 { key, public_key }, Scheme::SlhDsa(p)) => {
                 (self.import_slh_dsa(p, format, &key)?, public_key)
             }
+            #[cfg(feature = "ml-dsa")]
             (PrivateInput::Raw(raw), Scheme::MlDsa(p)) => (self.import_ml_dsa_raw(p, &raw)?, None),
+            #[cfg(feature = "ml-dsa")]
             (PrivateInput::Pkcs8 { key, public_key }, Scheme::MlDsa(p)) => {
                 (self.import_ml_dsa_choice(p, &key)?, public_key)
             }
@@ -483,6 +529,7 @@ impl SignatureAlgorithm {
         Ok(key)
     }
 
+    #[cfg(feature = "slh-dsa")]
     fn import_slh_dsa(
         &self,
         p: slhdsa::Parameters,
@@ -512,6 +559,7 @@ impl SignatureAlgorithm {
         })
     }
 
+    #[cfg(feature = "ml-dsa")]
     fn import_ml_dsa_raw(
         &self,
         p: mldsa::Parameters,
@@ -526,6 +574,7 @@ impl SignatureAlgorithm {
         self.key_from_expanded(p, raw)
     }
 
+    #[cfg(feature = "ml-dsa")]
     fn import_ml_dsa_choice(
         &self,
         p: mldsa::Parameters,
@@ -546,6 +595,7 @@ impl SignatureAlgorithm {
         }
     }
 
+    #[cfg(feature = "ml-dsa")]
     fn key_from_expanded(
         &self,
         p: mldsa::Parameters,
@@ -561,11 +611,13 @@ impl SignatureAlgorithm {
         let _dit = Dit::new();
 
         match self.scheme {
+            #[cfg(feature = "ml-dsa")]
             Scheme::MlDsa(p) => {
                 let (public, private) = mldsa::keygen_internal(seed, &p);
 
                 self.ml_dsa_key(p, Some(SecretBytes::concat(&[seed])), private, public)
             }
+            #[cfg(feature = "slh-dsa")]
             Scheme::SlhDsa(p) => {
                 let n = p.n;
 
@@ -583,6 +635,7 @@ impl SignatureAlgorithm {
         }
     }
 
+    #[cfg(feature = "ml-dsa")]
     fn ml_dsa_key(
         &self,
         p: mldsa::Parameters,
@@ -590,7 +643,7 @@ impl SignatureAlgorithm {
         private: SecretBytes,
         public: Vec<u8>,
     ) -> SignaturePrivateKey {
-        let signing = OnceBox::new(|| mldsa::SigningKey::new(&private, &p));
+        let signing = OnceBox::new(|| SigningKey::new(&private, &p));
 
         SignaturePrivateKey {
             algorithm: *self,
@@ -603,19 +656,24 @@ impl SignatureAlgorithm {
 
     pub(crate) const fn seed_size(&self) -> usize {
         match self.scheme {
+            #[cfg(feature = "ml-dsa")]
             Scheme::MlDsa(_) => ML_DSA_SEED_SIZE,
+            #[cfg(feature = "slh-dsa")]
             Scheme::SlhDsa(p) => 3 * p.n,
         }
     }
 
     pub(crate) const fn randomness_size(&self) -> usize {
         match self.scheme {
+            #[cfg(feature = "ml-dsa")]
             Scheme::MlDsa(_) => ML_DSA_RANDOMNESS_SIZE,
+            #[cfg(feature = "slh-dsa")]
             Scheme::SlhDsa(p) => p.n,
         }
     }
 
     // A HashSLH-DSA value, whose keys sign only pre-hashed messages.
+    #[cfg(any(feature = "hazmat", test))]
     pub(crate) const fn has_fixed_pre_hash(&self) -> bool {
         self.fixed.is_some()
     }
@@ -624,7 +682,9 @@ impl SignatureAlgorithm {
     // FIPS 205, 10.2).
     fn too_weak(&self, pre_hash: Option<PreHash>, policy: bool) -> bool {
         let strength = match self.scheme {
+            #[cfg(feature = "ml-dsa")]
             Scheme::MlDsa(p) => p.lambda,
+            #[cfg(feature = "slh-dsa")]
             Scheme::SlhDsa(p) => 8 * p.n,
         };
 
@@ -676,15 +736,26 @@ impl fmt::Debug for SignatureAlgorithm {
     }
 }
 
+// SLH-DSA derives nothing from its keys: without ML-DSA in the build, the types of the cached
+// forms are empty.
+#[cfg(not(feature = "ml-dsa"))]
+#[derive(Clone)]
+struct Derived;
+
+#[cfg(not(feature = "ml-dsa"))]
+struct SigningKey;
+
 // What ML-DSA derives from a public key, computed on first use so that no signature or
 // verification samples the matrix or hashes the key again: Â for both, t̂1 and tr for
 // verification alone.
+#[cfg(feature = "ml-dsa")]
 #[derive(Clone)]
 struct Derived {
     matrix: OnceBox<mldsa::Matrix>,
     verifying: OnceBox<mldsa::VerifyingKey>,
 }
 
+#[cfg(feature = "ml-dsa")]
 impl Derived {
     fn new(key: &[u8], p: mldsa::Parameters) -> Self {
         Self {
@@ -732,7 +803,9 @@ struct PublicPart {
 impl PublicPart {
     fn new(scheme: Scheme, key: Vec<u8>) -> Self {
         let derived = match scheme {
+            #[cfg(feature = "ml-dsa")]
             Scheme::MlDsa(p) => Some(Derived::new(&key, p)),
+            #[cfg(feature = "slh-dsa")]
             Scheme::SlhDsa(_) => None,
         };
 
@@ -802,13 +875,16 @@ impl SignaturePublicKey {
         let key = &self.public.key;
 
         match (self.algorithm.scheme, &self.public.derived) {
+            #[cfg(feature = "ml-dsa")]
             (Scheme::MlDsa(p), Some(derived)) => {
                 let (matrix, verifying) = derived.for_verify(key, &p);
 
                 mldsa::verify_internal(matrix, verifying, parts, signature, &p)
             }
+            #[cfg(feature = "slh-dsa")]
             (Scheme::SlhDsa(p), _) => slhdsa::verify_internal(parts, signature, key, &p),
             // Every ML-DSA key is made with its caches.
+            #[cfg(feature = "ml-dsa")]
             (Scheme::MlDsa(_), None) => false,
         }
     }
@@ -833,7 +909,7 @@ pub struct SignaturePrivateKey {
     seed: Option<SecretBytes>,
     private: SecretBytes,
     public: Shared<PublicPart>,
-    signing: Option<OnceBox<mldsa::SigningKey>>,
+    signing: Option<OnceBox<SigningKey>>,
 }
 
 impl SignaturePrivateKey {
@@ -854,7 +930,9 @@ impl SignaturePrivateKey {
         let pre_hash = self.check_options(options, true)?;
 
         let randomness = match (options.deterministic, self.algorithm.scheme) {
+            #[cfg(feature = "ml-dsa")]
             (true, Scheme::MlDsa(_)) => SecretBytes::zeroed(ML_DSA_RANDOMNESS_SIZE),
+            #[cfg(feature = "slh-dsa")]
             (true, Scheme::SlhDsa(p)) => SecretBytes::concat(&[&self.private[2 * p.n..3 * p.n]]),
             (false, _) => random_bytes(self.algorithm.randomness_size())?,
         };
@@ -896,14 +974,17 @@ impl SignaturePrivateKey {
         let sk = &self.private;
 
         match (self.algorithm.scheme, &self.public.derived, &self.signing) {
+            #[cfg(feature = "ml-dsa")]
             (Scheme::MlDsa(p), Some(derived), Some(signing)) => {
                 let matrix = derived.matrix(&self.public.key, &p);
 
-                let key = signing.get_or_init(|| mldsa::SigningKey::new(sk, &p));
+                let key = signing.get_or_init(|| SigningKey::new(sk, &p));
 
                 mldsa::sign_internal(matrix, key, sk, parts, randomness, &p)
             }
+            #[cfg(feature = "slh-dsa")]
             (Scheme::SlhDsa(p), ..) => slhdsa::sign_internal(parts, sk, randomness, &p),
+            #[cfg(feature = "ml-dsa")]
             (Scheme::MlDsa(_), ..) => unreachable!("every ML-DSA key is made with its caches"),
         }
     }
@@ -914,8 +995,11 @@ impl SignaturePrivateKey {
         let oid = Some(&self.algorithm.oid[..]);
 
         match (&self.seed, self.algorithm.scheme) {
+            #[cfg(feature = "slh-dsa")]
             (_, Scheme::SlhDsa(_)) => export_private(format, oid, &self.private, &self.private),
+            #[cfg(feature = "ml-dsa")]
             (Some(seed), Scheme::MlDsa(_)) => export_private(format, oid, &encode_seed(seed), seed),
+            #[cfg(feature = "ml-dsa")]
             (None, Scheme::MlDsa(_)) => {
                 export_private(format, oid, &encode_expanded(&self.private), &self.private)
             }

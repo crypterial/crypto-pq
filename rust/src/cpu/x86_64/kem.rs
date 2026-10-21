@@ -15,6 +15,7 @@
 
 use core::arch::x86_64::*;
 
+use super::ACCEPTED;
 use super::memory::{load128, load256, store128, store256};
 use crate::cpu::Field16;
 
@@ -1188,20 +1189,6 @@ const fn compaction() -> [[u8; 16]; 256] {
 }
 
 static COMPACT: [[u8; 16]; 256] = compaction();
-
-pub(super) static ACCEPTED: [u8; 256] = {
-    let mut counts = [0; 256];
-
-    let mut pattern = 0;
-
-    while pattern < 256 {
-        counts[pattern] = (pattern as u32).count_ones() as u8;
-
-        pattern += 1;
-    }
-
-    counts
-};
 
 // ML-KEM's rejection sampling of the public matrix (FIPS 203, Algorithm 7) on a block of XOF
 // output given as the lanes of the Keccak state: sixteen candidates of twelve bits from every 24

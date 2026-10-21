@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 // 16 into two of them on both of its operands, which doubled the work of the one port that runs
 // shuffles on Intel cores, and in SHA-512 a lane-crossing pair into a permutation that takes two
 // operations and twice the latency on AMD cores. An instruction in assembly is opaque to it.
+#[cfg(feature = "blake2")]
 macro_rules! instruction {
     ($name:ident, $vector:ty, $class:ident, $template:literal, $($input:ident),+) => {
         #[target_feature(enable = "avx2")]
@@ -41,27 +42,62 @@ macro_rules! instruction {
     };
 }
 
+#[cfg(feature = "frodokem")]
 mod aes;
 
+#[cfg(feature = "ascon")]
 mod ascon;
 
+#[cfg(feature = "blake2")]
 mod blake2;
 
+#[cfg(feature = "ml-dsa")]
 mod dsa;
 
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 mod keccak;
 
+#[cfg(feature = "ml-kem")]
 mod kem;
 
 mod memory;
 
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 mod ntt;
 
 mod sha2;
 
-use crate::cpu::{Field, Field16, Pack};
+#[cfg(feature = "ml-dsa")]
+use crate::cpu::Pack;
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
+use crate::cpu::{Field, Field16};
 use crate::sha2::{K256, compress256_lanes_portable};
 use crate::wipe::wipe;
+
+// The number of accepted lanes in each pattern of eight, for the rejection samplers of ML-KEM and
+// ML-DSA.
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
+static ACCEPTED: [u8; 256] = {
+    let mut counts = [0; 256];
+
+    let mut pattern = 0;
+
+    while pattern < 256 {
+        counts[pattern] = (pattern as u32).count_ones() as u8;
+
+        pattern += 1;
+    }
+
+    counts
+};
 
 // The SHA extensions together with the SSSE3 and SSE4.1 shuffles that the kernel needs.
 const SHA: u32 = 1;
@@ -341,6 +377,7 @@ pub(crate) fn compress512_pair(states: &mut [[u64; 8]; 2], blocks: &[[u8; 128]; 
 
 // The transforms and products of ML-DSA, and of ML-KEM where the 16-bit kernels are not used.
 #[allow(unsafe_code)]
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 pub(crate) fn ntt(w: &mut [i32; 256], field: &Field) -> bool {
     if !has(AVX2) {
         return false;
@@ -353,6 +390,7 @@ pub(crate) fn ntt(w: &mut [i32; 256], field: &Field) -> bool {
 }
 
 #[allow(unsafe_code)]
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 pub(crate) fn inverse_ntt(w: &mut [i32; 256], field: &Field) -> bool {
     if !has(AVX2) {
         return false;
@@ -365,6 +403,7 @@ pub(crate) fn inverse_ntt(w: &mut [i32; 256], field: &Field) -> bool {
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn multiply(
     out: &mut [i32; 256],
     f: &[i32; 256],
@@ -382,6 +421,7 @@ pub(crate) fn multiply(
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn multiply_add(
     acc: &mut [i32; 256],
     f: &[[i32; 256]],
@@ -399,6 +439,7 @@ pub(crate) fn multiply_add(
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn base_multiply_add(
     acc: &mut [i32; 256],
     a: &[u16; 256],
@@ -417,6 +458,7 @@ pub(crate) fn base_multiply_add(
 
 // The PRF output is given as the 64-bit lanes of the sponges, in stream order.
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn binomial(eta: usize, lanes: &[u64], q: u16, out: &mut [u16; 256]) -> bool {
     if !matches!((eta, lanes.len()), (2, 16) | (3, 24)) || !has(AVX2) {
         return false;
@@ -429,6 +471,7 @@ pub(crate) fn binomial(eta: usize, lanes: &[u64], q: u16, out: &mut [u16; 256]) 
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn mldsa_add(out: &mut [i32; 256], a: &[i32; 256], b: &[i32; 256], q: i32) -> bool {
     if !has(AVX2) {
         return false;
@@ -441,6 +484,7 @@ pub(crate) fn mldsa_add(out: &mut [i32; 256], a: &[i32; 256], b: &[i32; 256], q:
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn mldsa_sub(out: &mut [i32; 256], a: &[i32; 256], b: &[i32; 256], q: i32) -> bool {
     if !has(AVX2) {
         return false;
@@ -455,6 +499,7 @@ pub(crate) fn mldsa_sub(out: &mut [i32; 256], a: &[i32; 256], b: &[i32; 256], q:
 // -1 when some value reaches the bound in absolute value: the centered coefficients, or with
 // gamma2 the low bits of Decompose; 0 otherwise.
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn mldsa_norm(
     values: &[i32; 256],
     bound: i32,
@@ -471,6 +516,7 @@ pub(crate) fn mldsa_norm(
 
 // The hints of r and ct0, one per coefficient, and how many are set.
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn mldsa_hints(
     h: &mut [i32; 256],
     r: &[i32; 256],
@@ -489,6 +535,7 @@ pub(crate) fn mldsa_hints(
 // HighBits of every coefficient packed in four bits, for gamma2 = (q - 1) / 32, or six, for
 // gamma2 = (q - 1) / 88.
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn mldsa_w1(out: &mut [u8], w: &[i32; 256], gamma2: i32, q: i32) -> bool {
     let bits = if gamma2 == (q - 1) / 32 { 4 } else { 6 };
 
@@ -504,6 +551,7 @@ pub(crate) fn mldsa_w1(out: &mut [u8], w: &[i32; 256], gamma2: i32, q: i32) -> b
 
 // The coefficients mapped as `map` says and packed in `bits` bits each.
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn mldsa_pack(out: &mut [u8], poly: &[i32; 256], bits: u32, map: Pack, q: i32) -> bool {
     if !matches!(bits, 3 | 4 | 10 | 13 | 18 | 20) || out.len() != 32 * bits as usize || !has(AVX2) {
         return false;
@@ -517,6 +565,7 @@ pub(crate) fn mldsa_pack(out: &mut [u8], poly: &[i32; 256], bits: u32, map: Pack
 
 // gamma1 - x modulo q for the mask's values x of 18 or 20 bits.
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn mldsa_mask(
     out: &mut [i32; 256],
     bytes: &[u8],
@@ -541,6 +590,7 @@ pub(crate) fn mldsa_mask(
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_matrix_vector(
     t: &mut [[u16; 256]],
     a: &[[u16; 256]],
@@ -562,6 +612,7 @@ pub(crate) fn mlkem_matrix_vector(
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn reduce(w: &[i32; 256], factor: i32, field: &Field, out: &mut [u16; 256]) -> bool {
     if !has(AVX2) {
         return false;
@@ -574,6 +625,7 @@ pub(crate) fn reduce(w: &[i32; 256], factor: i32, field: &Field, out: &mut [u16;
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn encode12(f: &[u16; 256], out: &mut [u8; 384]) -> bool {
     if !has(AVX2) {
         return false;
@@ -586,6 +638,7 @@ pub(crate) fn encode12(f: &[u16; 256], out: &mut [u8; 384]) -> bool {
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn decode12(data: &[u8; 384], q: u16, out: &mut [u16; 256]) -> bool {
     if !has(AVX2) {
         return false;
@@ -598,6 +651,7 @@ pub(crate) fn decode12(data: &[u8; 384], q: u16, out: &mut [u16; 256]) -> bool {
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_compress(
     f: &[u16; 256],
     e: &[u16; 256],
@@ -617,6 +671,7 @@ pub(crate) fn mlkem_compress(
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_decompress(data: &[u8], d: u32, q: u16, out: &mut [u16; 256]) -> bool {
     if !matches!(d, 4 | 5 | 10 | 11) || data.len() != 32 * d as usize || !has(AVX2) {
         return false;
@@ -629,6 +684,7 @@ pub(crate) fn mlkem_decompress(data: &[u8], d: u32, q: u16, out: &mut [u16; 256]
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_message(v: &[u16; 256], w: &[u16; 256], q: u16, out: &mut [u8; 32]) -> bool {
     if !has(AVX2) {
         return false;
@@ -641,6 +697,7 @@ pub(crate) fn mlkem_message(v: &[u16; 256], w: &[u16; 256], q: u16, out: &mut [u
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn uniform12(lanes: &[u64; 21], q: u16, a: &mut [u16; 256], count: &mut usize) -> bool {
     if !has(AVX2) {
         return false;
@@ -653,6 +710,7 @@ pub(crate) fn uniform12(lanes: &[u64; 21], q: u16, a: &mut [u16; 256], count: &m
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn uniform23(lanes: &[u64; 21], q: i32, a: &mut [i32; 256], count: &mut usize) -> bool {
     if !has(AVX2) {
         return false;
@@ -665,6 +723,7 @@ pub(crate) fn uniform23(lanes: &[u64; 21], q: i32, a: &mut [i32; 256], count: &m
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn bounded(lanes: &[u64; 17], eta: i32, a: &mut [i32; 256], count: &mut usize) -> bool {
     if (eta != 2 && eta != 4) || !has(AVX2) {
         return false;
@@ -679,6 +738,7 @@ pub(crate) fn bounded(lanes: &[u64; 17], eta: i32, a: &mut [i32; 256], count: &m
 // The products b[2i + 1] gamma_i mod q of ML-KEM's base multiplication, with the gammas in
 // Montgomery form for 2^16.
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_multiply_cache(
     b: &[u16; 256],
     gammas: &[i16; 128],
@@ -697,6 +757,7 @@ pub(crate) fn mlkem_multiply_cache(
 
 // InvNTT of the sum of the products a[j] * b[j], with the caches of the b[j], for at most four.
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_inner_product(
     out: &mut [u16; 256],
     a: &[&[u16; 256]],
@@ -715,6 +776,7 @@ pub(crate) fn mlkem_inner_product(
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn ntt16(f: &mut [u16; 256], field: &Field16) -> bool {
     if !has(AVX2) {
         return false;
@@ -727,6 +789,7 @@ pub(crate) fn ntt16(f: &mut [u16; 256], field: &Field16) -> bool {
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn inverse_ntt16(acc: &[i32; 256], out: &mut [u16; 256], field: &Field16) -> bool {
     if !has(AVX2) {
         return false;
@@ -739,6 +802,7 @@ pub(crate) fn inverse_ntt16(acc: &[i32; 256], out: &mut [u16; 256], field: &Fiel
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ascon")]
 pub(crate) fn ascon(s: &mut [u64; 5]) -> bool {
     if !has(AVX2) {
         return false;
@@ -751,6 +815,7 @@ pub(crate) fn ascon(s: &mut [u64; 5]) -> bool {
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ascon")]
 pub(crate) fn ascon_digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) -> bool {
     if !has(AVX2) {
         return false;
@@ -763,6 +828,7 @@ pub(crate) fn ascon_digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) -> boo
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "frodokem")]
 pub(crate) fn aes_expand(key: &[u8], round_keys: &mut [[u8; 16]; 15]) -> bool {
     if !has(AES) {
         return false;
@@ -775,6 +841,7 @@ pub(crate) fn aes_expand(key: &[u8], round_keys: &mut [[u8; 16]; 15]) -> bool {
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "frodokem")]
 pub(crate) fn aes_encrypt(round_keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) -> bool {
     if !has(AES) {
         return false;
@@ -787,6 +854,15 @@ pub(crate) fn aes_encrypt(round_keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) -> b
 }
 
 // Groups of four fill the AVX2 kernel.
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 pub(crate) const fn keccak_group() -> usize {
     4
 }
@@ -794,6 +870,15 @@ pub(crate) const fn keccak_group() -> usize {
 // Absorbs the whole blocks of data, rate bytes each, into one state, and returns how many bytes
 // that was.
 #[allow(unsafe_code)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 pub(crate) fn absorb(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
     let length = data.len() - data.len() % rate;
 
@@ -821,6 +906,15 @@ pub(crate) fn absorb(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
 // The output of a sponge of the given rate and suffix that absorbs data and is read once into
 // out, in one call.
 #[allow(unsafe_code)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 pub(crate) fn digest(
     initial: Option<&[u64; 25]>,
     rate: usize,
@@ -848,6 +942,7 @@ pub(crate) fn digest(
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "blake2")]
 pub(crate) fn blake2b(
     h: &mut [u64; 8],
     first: Option<&[u64; 16]>,
@@ -873,6 +968,7 @@ pub(crate) fn blake2b(
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "blake2")]
 pub(crate) fn blake2s(
     h: &mut [u32; 8],
     first: Option<&[u32; 16]>,
@@ -921,6 +1017,7 @@ pub(crate) fn blake2s(
 // BLAKE2's digest in one call with the state in registers throughout: the generic path's word
 // conversions, chaining value copies and calls cost a 64-byte message a sixth of its time.
 #[allow(unsafe_code)]
+#[cfg(feature = "blake2")]
 pub(crate) fn blake2b_digest(h: &[u64; 8], data: &[u8], out: &mut [u8]) -> bool {
     if !has(AVX2) {
         return false;
@@ -934,6 +1031,7 @@ pub(crate) fn blake2b_digest(h: &[u64; 8], data: &[u8], out: &mut [u8]) -> bool 
 
 // BLAKE2s's digest and MAC in one call of the AVX2 code each, with the blocks found here.
 #[allow(unsafe_code)]
+#[cfg(feature = "blake2")]
 pub(crate) fn blake2s_digest(h: &[u32; 8], data: &[u8], out: &mut [u8]) -> bool {
     if !has(AVX2) {
         return false;
@@ -962,6 +1060,7 @@ pub(crate) fn blake2s_digest(h: &[u32; 8], data: &[u8], out: &mut [u8]) -> bool 
 
 // The key, zero-padded to a block, comes first, or last for empty data.
 #[allow(unsafe_code)]
+#[cfg(feature = "blake2")]
 pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> bool {
     if !has(AVX2) {
         return false;
@@ -1015,6 +1114,15 @@ pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8])
 // BMI1 and BMI2: four in vectors beside one in general registers measured no faster than one after
 // the other, as both compete for the same ports.
 #[allow(unsafe_code)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 pub(crate) fn permute_many(states: &mut [&mut [u64; 25]]) -> usize {
     if !has(AVX2) {
         return 0;

@@ -3,21 +3,44 @@
 // signing functions skip the pre-hash strength policy of the public API (but not the fixed
 // pre-hash of the HashSLH-DSA values).
 
+#[cfg(any(feature = "ml-dsa", feature = "slh-dsa"))]
 use alloc::vec::Vec;
 
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 use crate::error::Error;
+#[cfg(feature = "sha3")]
 use crate::hash::XofAlgorithm;
+#[cfg(any(feature = "ml-kem", feature = "frodokem"))]
 use crate::kem::{Encapsulation, KemAlgorithm, KemKeyPair, KemPublicKey};
+#[cfg(any(feature = "ml-dsa", feature = "slh-dsa"))]
 use crate::signature::{
     SignOptions, SignatureAlgorithm, SignatureKeyPair, SignaturePrivateKey, SignaturePublicKey,
     VerifyOptions,
 };
+#[cfg(any(feature = "lms", feature = "xmss"))]
 use crate::stateful::{
     StateStore, StatefulKeyGenOptions, StatefulKeyPair, StatefulParameters,
     StatefulSignatureAlgorithm, check_reserve,
 };
+#[cfg(any(feature = "lms", feature = "xmss"))]
 use crate::wipe::SecretBytes;
 
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 fn require_length(data: &[u8], length: usize) -> Result<(), Error> {
     if data.len() == length {
         Ok(())
@@ -26,6 +49,7 @@ fn require_length(data: &[u8], length: usize) -> Result<(), Error> {
     }
 }
 
+#[cfg(any(feature = "ml-kem", feature = "frodokem"))]
 pub fn generate_kem_key_pair(algorithm: KemAlgorithm, seed: &[u8]) -> Result<KemKeyPair, Error> {
     require_length(seed, algorithm.seed_size())?;
 
@@ -37,6 +61,7 @@ pub fn generate_kem_key_pair(algorithm: KemAlgorithm, seed: &[u8]) -> Result<Kem
     })
 }
 
+#[cfg(any(feature = "ml-dsa", feature = "slh-dsa"))]
 pub fn generate_signature_key_pair(
     algorithm: SignatureAlgorithm,
     seed: &[u8],
@@ -51,6 +76,7 @@ pub fn generate_signature_key_pair(
     })
 }
 
+#[cfg(any(feature = "ml-kem", feature = "frodokem"))]
 pub fn encapsulate(public_key: &KemPublicKey, randomness: &[u8]) -> Result<Encapsulation, Error> {
     require_length(randomness, public_key.algorithm().randomness_size())?;
 
@@ -59,6 +85,7 @@ pub fn encapsulate(public_key: &KemPublicKey, randomness: &[u8]) -> Result<Encap
 
 // options.deterministic is ignored: the randomness argument decides. The options are checked
 // before the length of the randomness (SPEC 7.3).
+#[cfg(any(feature = "ml-dsa", feature = "slh-dsa"))]
 pub fn sign(
     private_key: &SignaturePrivateKey,
     message: &[u8],
@@ -72,6 +99,7 @@ pub fn sign(
     Ok(private_key.sign_with(message, randomness, options.context, pre_hash))
 }
 
+#[cfg(any(feature = "ml-dsa", feature = "slh-dsa"))]
 pub fn verify(
     public_key: &SignaturePublicKey,
     signature: &[u8],
@@ -87,6 +115,7 @@ pub fn verify(
 // pre-hashed messages alone, refuses it with INVALID_OPTION. The randomness is rnd for ML-DSA
 // (32 zero bytes for the deterministic variant) and opt_rand for SLH-DSA (PK.seed for the
 // deterministic variant).
+#[cfg(any(feature = "ml-dsa", feature = "slh-dsa"))]
 pub fn sign_internal(
     private_key: &SignaturePrivateKey,
     message_representative: &[u8],
@@ -105,6 +134,7 @@ pub fn sign_internal(
 
 // ML-DSA.Verify_internal (FIPS 204 Algorithm 8) or slh_verify_internal (FIPS 205 Algorithm 20);
 // false for a HashSLH-DSA key, as sign_internal refuses it.
+#[cfg(any(feature = "ml-dsa", feature = "slh-dsa"))]
 pub fn verify_internal(
     public_key: &SignaturePublicKey,
     signature: &[u8],
@@ -121,6 +151,7 @@ pub fn verify_internal(
 // S_XMSS || SK_PRF || SEED, which derives its child trees and randomizers as the reference
 // implementations do, so that it reproduces their test vectors; it starts at index, which must be
 // below the capacity (SPEC D-68): a key that starts exhausted could never sign.
+#[cfg(any(feature = "lms", feature = "xmss"))]
 pub fn generate_stateful_key_pair<S: StateStore>(
     algorithm: StatefulSignatureAlgorithm,
     seed: &[u8],
@@ -147,6 +178,7 @@ pub fn generate_stateful_key_pair<S: StateStore>(
 // cSHAKE128 or cSHAKE256 with a function name N as well as a customization S, as the ACVP vectors
 // set it. SP 800-185, 3.4: N should only take values that NIST defines, so the public configure
 // takes S alone.
+#[cfg(feature = "sha3")]
 pub fn configure_cshake(
     algorithm: XofAlgorithm,
     function_name: &[u8],

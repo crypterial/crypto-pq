@@ -11,45 +11,73 @@
 use core::arch::aarch64::*;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 use crate::keccak::{self, ROUND_CONSTANTS};
 use crate::sha2::{K256, K512, last_bytes};
 use crate::wipe::wipe;
 
+#[cfg(feature = "frodokem")]
 mod aes;
 
+#[cfg(feature = "ascon")]
 mod ascon;
 
+#[cfg(feature = "ml-kem")]
 mod binomial;
 
+#[cfg(feature = "ml-dsa")]
 mod dsa;
 
 mod memory;
 
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 mod ntt;
 
+#[cfg(feature = "ml-kem")]
 mod pack;
 
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 mod sample;
 
 use memory::{load_u8, load_u32, load_u64, store_u8, store_u32, store_u64};
 
+#[cfg(feature = "ascon")]
 pub(crate) use ascon::{ascon, ascon_digest};
 
+#[cfg(feature = "ml-kem")]
 pub(crate) use binomial::binomial;
 
+#[cfg(feature = "ml-dsa")]
 pub(crate) use dsa::{
     add as mldsa_add, encode_w1 as mldsa_w1, hints as mldsa_hints, norm as mldsa_norm,
     sub as mldsa_sub, unpack_mask as mldsa_mask,
 };
 
+#[cfg(feature = "ml-kem")]
 pub(crate) use pack::{encode12, reduce};
 
-pub(crate) use sample::{bounded, uniform12, uniform23};
+#[cfg(feature = "ml-dsa")]
+pub(crate) use sample::{bounded, uniform23};
 
-pub(crate) use ntt::{
-    base_multiply_add, inverse_ntt, inverse_ntt16, mlkem_matrix_vector, multiply, multiply_add,
-    ntt, ntt16,
-};
+#[cfg(feature = "ml-kem")]
+pub(crate) use sample::uniform12;
+
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
+pub(crate) use ntt::{inverse_ntt, ntt};
+
+#[cfg(feature = "ml-kem")]
+pub(crate) use ntt::{base_multiply_add, inverse_ntt16, mlkem_matrix_vector, ntt16};
+
+#[cfg(feature = "ml-dsa")]
+pub(crate) use ntt::{multiply, multiply_add};
 
 const SHA2: u32 = 1;
 
@@ -334,6 +362,7 @@ fn clear_dit() {
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "frodokem")]
 pub(crate) fn aes_expand(key: &[u8], round_keys: &mut [[u8; 16]; 15]) -> bool {
     if !has(AES) {
         return false;
@@ -346,6 +375,7 @@ pub(crate) fn aes_expand(key: &[u8], round_keys: &mut [[u8; 16]; 15]) -> bool {
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "frodokem")]
 pub(crate) fn aes_encrypt(round_keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) -> bool {
     if !has(AES) {
         return false;
@@ -498,6 +528,15 @@ pub(crate) fn compress512_pair(states: &mut [[u64; 8]; 2], blocks: &[[u8; 128]; 
 
 // Two states fill the vector pipes, and the scalar pipes permute a third beside them in little
 // more time, so sponges run in groups of six.
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 pub(crate) fn keccak_group() -> usize {
     if has(KECCAK) { 6 } else { 4 }
 }
@@ -505,6 +544,15 @@ pub(crate) fn keccak_group() -> usize {
 // Permutes every state, three at a time where that leaves no single state over, then two, then
 // one in vector registers, which is still faster than the scalar permutation; returns how many.
 #[allow(unsafe_code)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 pub(crate) fn permute_many(states: &mut [&mut [u64; 25]]) -> usize {
     if !has(KECCAK) {
         return 0;
@@ -542,6 +590,15 @@ pub(crate) fn permute_many(states: &mut [&mut [u64; 25]]) -> usize {
 // Absorbs the whole blocks of data, rate bytes each, into one state, and returns how many bytes
 // that was. The state stays in vector registers from one block to the next.
 #[allow(unsafe_code)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 pub(crate) fn absorb(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
     let length = data.len() - data.len() % rate;
 
@@ -570,6 +627,15 @@ pub(crate) fn absorb(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
 // out. A kernel per rate: whole blocks of a constant size keep the state in registers, which a
 // rate known only at run time did not quite do.
 #[allow(unsafe_code)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 pub(crate) fn digest(
     initial: Option<&[u64; 25]>,
     rate: usize,
@@ -598,6 +664,7 @@ pub(crate) fn digest(
 
 // ML-DSA's packing stays portable.
 #[inline(always)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn mldsa_pack(
     _: &mut [u8],
     _: &[i32; 256],
@@ -609,6 +676,7 @@ pub(crate) fn mldsa_pack(
 }
 
 #[inline(always)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_multiply_cache(
     _: &[u16; 256],
     _: &[i16; 128],
@@ -621,6 +689,7 @@ pub(crate) fn mlkem_multiply_cache(
 // ML-KEM's inner products go through base_multiply_add and inverse_ntt16, whose widening
 // multiply-adds keep the sums in registers already.
 #[inline(always)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_inner_product(
     _: &mut [u16; 256],
     _: &[&[u16; 256]],
@@ -634,11 +703,13 @@ pub(crate) fn mlkem_inner_product(
 // ML-KEM's decoding, compression and message encoding stay portable, which NEON's compiled loops
 // already serve.
 #[inline(always)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn decode12(_: &[u8; 384], _: u16, _: &mut [u16; 256]) -> bool {
     false
 }
 
 #[inline(always)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_compress(
     _: &[u16; 256],
     _: &[u16; 256],
@@ -651,11 +722,13 @@ pub(crate) fn mlkem_compress(
 }
 
 #[inline(always)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_decompress(_: &[u8], _: u32, _: u16, _: &mut [u16; 256]) -> bool {
     false
 }
 
 #[inline(always)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_message(_: &[u16; 256], _: &[u16; 256], _: u16, _: &mut [u8; 32]) -> bool {
     false
 }
@@ -664,6 +737,7 @@ pub(crate) fn mlkem_message(_: &[u16; 256], _: &[u16; 256], _: u16, _: &mut [u8;
 // them busy, a hand-ordered assembly version measured the same, and NEON's two-cycle instructions
 // and two-instruction rotations lengthen the chain.
 #[inline(always)]
+#[cfg(feature = "blake2")]
 pub(crate) fn blake2b(
     _: &mut [u64; 8],
     _: Option<&[u64; 16]>,
@@ -675,6 +749,7 @@ pub(crate) fn blake2b(
 }
 
 #[inline(always)]
+#[cfg(feature = "blake2")]
 pub(crate) fn blake2s(
     _: &mut [u32; 8],
     _: Option<&[u32; 16]>,
@@ -686,16 +761,19 @@ pub(crate) fn blake2s(
 }
 
 #[inline(always)]
+#[cfg(feature = "blake2")]
 pub(crate) fn blake2b_digest(_: &[u64; 8], _: &[u8], _: &mut [u8]) -> bool {
     false
 }
 
 #[inline(always)]
+#[cfg(feature = "blake2")]
 pub(crate) fn blake2s_digest(_: &[u32; 8], _: &[u8], _: &mut [u8]) -> bool {
     false
 }
 
 #[inline(always)]
+#[cfg(feature = "blake2")]
 pub(crate) fn blake2s_mac(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
     false
 }
@@ -1604,6 +1682,15 @@ fn words512(chunks: [uint8x16_t; 8]) -> [uint64x2_t; 8] {
 // take two EOR3 each and its D values one RAX1; XAR applies D and the rho rotation at once (it
 // rotates right, so a left rotation by r is XAR by 64 - r) while pi picks the source lane of
 // each output position; BCAX is chi's b[x] ^ (b[x + 2] & !b[x + 1]).
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 #[target_feature(enable = "sha3")]
 #[inline]
 fn round(a: &mut [uint64x2_t; 25], constant: u64) {
@@ -1668,6 +1755,15 @@ fn round(a: &mut [uint64x2_t; 25], constant: u64) {
 // reuses. Compiled from round, the absorption of 168-byte blocks kept a lane in memory from one
 // round to the next, a store and a load on the chain of every round: 164 ns a block on an Apple
 // M3 instead of 131.
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 #[target_feature(enable = "sha3")]
 #[inline]
 #[allow(unsafe_code)]
@@ -1796,6 +1892,15 @@ fn rounds(a: &mut [uint64x2_t; 25]) {
     }
 }
 
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 #[target_feature(enable = "sha3")]
 fn permute2_sha3(first: &mut [u64; 25], second: &mut [u64; 25]) {
     let mut a = [vdupq_n_u64(0); 25];
@@ -1814,6 +1919,15 @@ fn permute2_sha3(first: &mut [u64; 25], second: &mut [u64; 25]) {
 }
 
 // One state in both halves of the vectors: the instructions of a pair, for a state alone.
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 #[target_feature(enable = "sha3")]
 fn permute1_sha3(state: &mut [u64; 25]) {
     let mut a = [vdupq_n_u64(0); 25];
@@ -1830,6 +1944,15 @@ fn permute1_sha3(state: &mut [u64; 25]) {
 }
 
 // A pair in the vector pipes and the third state in the scalar ones, their rounds alternating.
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 #[target_feature(enable = "sha3")]
 fn permute3_sha3(first: &mut [u64; 25], second: &mut [u64; 25], third: &mut [u64; 25]) {
     let mut a = [vdupq_n_u64(0); 25];
@@ -1859,6 +1982,15 @@ fn permute3_sha3(first: &mut [u64; 25], second: &mut [u64; 25], third: &mut [u64
     }
 }
 
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 #[target_feature(enable = "sha3")]
 fn absorb_sha3<const RATE: usize>(state: &mut [u64; 25], blocks: &[[u8; RATE]]) {
     let mut a = [vdupq_n_u64(0); 25];
@@ -1882,6 +2014,15 @@ fn absorb_sha3<const RATE: usize>(state: &mut [u64; 25], blocks: &[[u8; RATE]]) 
 // in v0 to v24 as rounds does: compiled from intrinsics, the loads ran ahead of the XORs and the
 // lanes they displaced went to memory. Only the low half of each vector takes the block, as only
 // the low half is read out; the high half runs the same permutation on a state of its own.
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 macro_rules! xor_lanes {
     ($a:ident, $block:ident, $($lane:literal),+) => {
         // SAFETY: the assembly reads the block's lanes, each inside the array the pointer comes
@@ -1925,6 +2066,15 @@ macro_rules! xor_lanes {
     };
 }
 
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 #[target_feature(enable = "neon")]
 #[inline]
 #[allow(unsafe_code)]
@@ -1946,6 +2096,15 @@ fn xor_block<const RATE: usize>(a: &mut [uint64x2_t; 25], block: &[u8; RATE]) {
 }
 
 // The lanes of the rate stored from the state, as xor_lanes reads them.
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 macro_rules! store_lanes {
     ($a:ident, $out:ident, $($lane:literal),+) => {
         // SAFETY: the assembly writes the lanes inside the array the pointer comes from, reads no
@@ -1981,6 +2140,15 @@ macro_rules! store_lanes {
     };
 }
 
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 #[target_feature(enable = "neon")]
 #[inline]
 #[allow(unsafe_code)]
@@ -2006,6 +2174,15 @@ fn store_rate<const RATE: usize>(a: &[uint64x2_t; 25], out: &mut [u8; RATE]) {
 // otherwise. The last block is built before the state is live, since a call to memcpy while it is
 // would push it to memory, and it and the squeezed lanes pass through small buffers that are
 // wiped.
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
 #[target_feature(enable = "sha3")]
 fn digest_sha3<const RATE: usize>(
     initial: Option<&[u64; 25]>,

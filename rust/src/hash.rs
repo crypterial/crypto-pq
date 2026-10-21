@@ -1,67 +1,158 @@
+#[cfg(feature = "blake3")]
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
+#[cfg(feature = "ascon")]
 use crate::ascon;
+#[cfg(feature = "blake2")]
 use crate::blake2;
+#[cfg(feature = "blake3")]
 use crate::blake3;
 use crate::error::Error;
+#[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 use crate::keccak::Keccak;
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 use crate::sha2::{
     IV_224, IV_256, IV_384, IV_512, IV_512_224, IV_512_256, Sha256, Sha512, finish256, finish512,
 };
+#[cfg(feature = "sha3")]
 use crate::sp800_185;
 
+#[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 const SHA3_SUFFIX: u8 = 0x06;
 
+#[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 const SHAKE_SUFFIX: u8 = 0x1F;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
+    #[cfg(any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ))]
     Sha256(&'static [u32; 8]),
+    #[cfg(any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ))]
     Sha512(&'static [u64; 8]),
+    #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
     Sha3,
     // The chaining value after the parameter block.
+    #[cfg(feature = "blake2")]
     Blake2b([u64; 8]),
+    #[cfg(feature = "blake2")]
     Blake2s([u32; 8]),
+    #[cfg(feature = "ascon")]
     Ascon,
+    #[cfg(feature = "blake3")]
     Blake3,
 }
 
 #[derive(Clone)]
 pub(crate) enum Engine {
+    #[cfg(any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ))]
     Sha256(Sha256),
+    #[cfg(any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ))]
     Sha512(Sha512),
+    #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
     Keccak(Keccak),
+    #[cfg(feature = "blake2")]
     Blake2b(blake2::Engine<u64>),
+    #[cfg(feature = "blake2")]
     Blake2s(blake2::Engine<u32>),
+    #[cfg(feature = "ascon")]
     Ascon(ascon::Sponge),
     // Boxed: with its stack of chaining values it is ten times the size of the others.
+    #[cfg(feature = "blake3")]
     Blake3(Box<blake3::Hasher>),
 }
 
 impl Engine {
     pub(crate) fn update(&mut self, data: &[u8]) {
         match self {
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             Self::Sha256(engine) => engine.update(data),
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             Self::Sha512(engine) => engine.update(data),
+            #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
             Self::Keccak(engine) => engine.update(data),
+            #[cfg(feature = "blake2")]
             Self::Blake2b(engine) => engine.update(data),
+            #[cfg(feature = "blake2")]
             Self::Blake2s(engine) => engine.update(data),
+            #[cfg(feature = "ascon")]
             Self::Ascon(sponge) => sponge.update(data),
+            #[cfg(feature = "blake3")]
             Self::Blake3(hasher) => hasher.update(data),
         }
     }
 
     pub(crate) fn digest_into(&self, out: &mut [u8]) {
         match self {
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             Self::Sha256(engine) => engine.digest_into(out),
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             Self::Sha512(engine) => engine.digest_into(out),
+            #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
             Self::Keccak(engine) => engine.clone().read(out),
+            #[cfg(feature = "blake2")]
             Self::Blake2b(engine) => engine.finish(out),
+            #[cfg(feature = "blake2")]
             Self::Blake2s(engine) => engine.finish(out),
+            #[cfg(feature = "ascon")]
             Self::Ascon(sponge) => sponge.clone().read(out),
+            #[cfg(feature = "blake3")]
             Self::Blake3(hasher) => hasher.finish(out),
         }
     }
@@ -149,11 +240,13 @@ impl HashAlgorithm {
         let (salt, personalization) = (options.salt, options.personalization);
 
         let kind = match self.kind {
+            #[cfg(feature = "blake2")]
             Kind::Blake2b(_) => Kind::Blake2b(blake2::start64(
                 self.digest_size,
                 field(salt, 16)?,
                 field(personalization, 16)?,
             )),
+            #[cfg(feature = "blake2")]
             Kind::Blake2s(_) => Kind::Blake2s(blake2::start32(
                 self.digest_size,
                 field(salt, 8)?,
@@ -188,24 +281,62 @@ impl HashAlgorithm {
     // digest_into for an out of digest_size bytes.
     pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
         match &self.kind {
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             Kind::Sha256(iv) => finish256(iv, 0, data, out),
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             Kind::Sha512(iv) => finish512(iv, 0, data, out),
+            #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
             Kind::Sha3 => Keccak::digest_into(self.block_size(), SHA3_SUFFIX, data, out),
+            #[cfg(feature = "blake2")]
             Kind::Blake2b(h) => blake2::digest(h, data, out),
+            #[cfg(feature = "blake2")]
             Kind::Blake2s(h) => blake2::digest(h, data, out),
+            #[cfg(feature = "ascon")]
             Kind::Ascon => ascon::digest(&ascon::HASH256, data, out),
+            #[cfg(feature = "blake3")]
             Kind::Blake3 => blake3::digest(data, out),
         }
     }
 
     pub fn create(&self) -> Hasher {
         let engine = match &self.kind {
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             Kind::Sha256(iv) => Engine::Sha256(Sha256::new(iv)),
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             Kind::Sha512(iv) => Engine::Sha512(Sha512::new(iv)),
+            #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
             Kind::Sha3 => Engine::Keccak(Keccak::new(self.block_size(), SHA3_SUFFIX)),
+            #[cfg(feature = "blake2")]
             Kind::Blake2b(h) => Engine::Blake2b(blake2::Engine::new(h)),
+            #[cfg(feature = "blake2")]
             Kind::Blake2s(h) => Engine::Blake2s(blake2::Engine::new(h)),
+            #[cfg(feature = "ascon")]
             Kind::Ascon => Engine::Ascon(ascon::Sponge::new(&ascon::HASH256)),
+            #[cfg(feature = "blake3")]
             Kind::Blake3 => Engine::Blake3(Box::new(blake3::Hasher::hash())),
         };
 
@@ -218,9 +349,31 @@ impl HashAlgorithm {
     // The block size of HMAC's key blocks, and the rate of SHA-3.
     pub(crate) const fn block_size(&self) -> usize {
         match self.kind {
-            Kind::Sha256(_) | Kind::Blake2s(_) | Kind::Blake3 => 64,
-            Kind::Sha512(_) | Kind::Blake2b(_) => 128,
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
+            Kind::Sha256(_) => 64,
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
+            Kind::Sha512(_) => 128,
+            #[cfg(feature = "blake2")]
+            Kind::Blake2s(_) => 64,
+            #[cfg(feature = "blake2")]
+            Kind::Blake2b(_) => 128,
+            #[cfg(feature = "blake3")]
+            Kind::Blake3 => 64,
+            #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
             Kind::Sha3 => 200 - 2 * self.digest_size,
+            #[cfg(feature = "ascon")]
             Kind::Ascon => 8,
         }
     }
@@ -253,18 +406,37 @@ impl Hasher {
     }
 }
 
+#[cfg(any(
+    feature = "sha3",
+    feature = "blake3",
+    feature = "ascon",
+    feature = "ml-dsa",
+    feature = "slh-dsa"
+))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum XofKind {
+    #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
     Shake,
     // The state after cSHAKE's prefix, or None when the function name and the customization are
     // both empty, which makes cSHAKE equal to SHAKE.
+    #[cfg(feature = "sha3")]
     CShake(Option<[u64; 25]>),
+    #[cfg(feature = "ascon")]
     AsconXof,
     // The state after the customization string.
+    #[cfg(feature = "ascon")]
     AsconCxof([u64; 5]),
+    #[cfg(feature = "blake3")]
     Blake3,
 }
 
+#[cfg(any(
+    feature = "sha3",
+    feature = "blake3",
+    feature = "ascon",
+    feature = "ml-dsa",
+    feature = "slh-dsa"
+))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct XofAlgorithm {
     name: &'static str,
@@ -273,6 +445,13 @@ pub struct XofAlgorithm {
     oid_arc: u8,
 }
 
+#[cfg(any(
+    feature = "sha3",
+    feature = "blake3",
+    feature = "ascon",
+    feature = "ml-dsa",
+    feature = "slh-dsa"
+))]
 impl fmt::Debug for XofAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("XofAlgorithm").field(&self.name).finish()
@@ -280,12 +459,26 @@ impl fmt::Debug for XofAlgorithm {
 }
 
 // The customization string S of cSHAKE (any length) and of Ascon-CXOF128 (at most 256 bytes).
+#[cfg(any(
+    feature = "sha3",
+    feature = "blake3",
+    feature = "ascon",
+    feature = "ml-dsa",
+    feature = "slh-dsa"
+))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct XofOptions<'a> {
     pub customization: &'a [u8],
 }
 
+#[cfg(any(
+    feature = "sha3",
+    feature = "blake3",
+    feature = "ascon",
+    feature = "ml-dsa",
+    feature = "slh-dsa"
+))]
 impl<'a> XofOptions<'a> {
     #[must_use]
     pub const fn with_customization(mut self, customization: &'a [u8]) -> Self {
@@ -295,6 +488,13 @@ impl<'a> XofOptions<'a> {
     }
 }
 
+#[cfg(any(
+    feature = "sha3",
+    feature = "blake3",
+    feature = "ascon",
+    feature = "ml-dsa",
+    feature = "slh-dsa"
+))]
 impl XofAlgorithm {
     pub const fn name(&self) -> &'static str {
         self.name
@@ -310,7 +510,9 @@ impl XofAlgorithm {
         let customization = options.customization;
 
         let kind = match self.kind {
+            #[cfg(feature = "sha3")]
             XofKind::CShake(_) => XofKind::CShake(sp800_185::prefix(self.rate, &[], customization)),
+            #[cfg(feature = "ascon")]
             XofKind::AsconCxof(_) if customization.len() <= ascon::MAX_CUSTOMIZATION => {
                 XofKind::AsconCxof(ascon::customize(customization))
             }
@@ -321,12 +523,14 @@ impl XofAlgorithm {
         Ok(Self { kind, ..*self })
     }
 
+    #[cfg(all(any(feature = "hazmat", test), feature = "sha3"))]
     pub(crate) fn configure_cshake(
         &self,
         name: &[u8],
         customization: &[u8],
     ) -> Result<Self, Error> {
         match self.kind {
+            #[cfg(feature = "sha3")]
             XofKind::CShake(_) => Ok(Self {
                 kind: XofKind::CShake(sp800_185::prefix(self.rate, name, customization)),
                 ..*self
@@ -337,7 +541,11 @@ impl XofAlgorithm {
 
     // SP 800-232, 5.2 and 5.3: the Ascon XOFs take an output length L > 0.
     const fn check_output(&self, length: usize) -> Result<(), Error> {
+        #[cfg(feature = "ascon")]
         let ascon = matches!(self.kind, XofKind::AsconXof | XofKind::AsconCxof(_));
+
+        #[cfg(not(feature = "ascon"))]
+        let ascon = false;
 
         if !fits_u32(length) || (ascon && length == 0) {
             Err(Error::InvalidLength)
@@ -367,28 +575,42 @@ impl XofAlgorithm {
 
     pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
         match &self.kind {
+            #[cfg(feature = "sha3")]
             XofKind::Shake | XofKind::CShake(None) => {
                 Keccak::digest_into(self.rate, SHAKE_SUFFIX, data, out);
             }
+            #[cfg(all(not(feature = "sha3"), any(feature = "ml-dsa", feature = "slh-dsa")))]
+            XofKind::Shake => Keccak::digest_into(self.rate, SHAKE_SUFFIX, data, out),
+            #[cfg(feature = "sha3")]
             XofKind::CShake(Some(start)) => {
                 Keccak::digest_from(start, self.rate, sp800_185::SUFFIX, data, out);
             }
+            #[cfg(feature = "ascon")]
             XofKind::AsconXof => ascon::digest(&ascon::XOF128, data, out),
+            #[cfg(feature = "ascon")]
             XofKind::AsconCxof(start) => ascon::digest(start, data, out),
+            #[cfg(feature = "blake3")]
             XofKind::Blake3 => blake3::digest(data, out),
         }
     }
 
     pub fn create(&self) -> Xof {
         let engine = match &self.kind {
+            #[cfg(feature = "sha3")]
             XofKind::Shake | XofKind::CShake(None) => {
                 XofEngine::Keccak(Keccak::new(self.rate, SHAKE_SUFFIX))
             }
+            #[cfg(all(not(feature = "sha3"), any(feature = "ml-dsa", feature = "slh-dsa")))]
+            XofKind::Shake => XofEngine::Keccak(Keccak::new(self.rate, SHAKE_SUFFIX)),
+            #[cfg(feature = "sha3")]
             XofKind::CShake(Some(start)) => {
                 XofEngine::Keccak(Keccak::resume(*start, self.rate, sp800_185::SUFFIX))
             }
+            #[cfg(feature = "ascon")]
             XofKind::AsconXof => XofEngine::Ascon(ascon::Sponge::new(&ascon::XOF128)),
+            #[cfg(feature = "ascon")]
             XofKind::AsconCxof(start) => XofEngine::Ascon(ascon::Sponge::new(start)),
+            #[cfg(feature = "blake3")]
             XofKind::Blake3 => XofEngine::Blake3(Box::new(blake3::Hasher::hash())),
         };
 
@@ -399,18 +621,42 @@ impl XofAlgorithm {
     }
 }
 
+#[cfg(any(
+    feature = "sha3",
+    feature = "blake3",
+    feature = "ascon",
+    feature = "ml-dsa",
+    feature = "slh-dsa"
+))]
 enum XofEngine {
+    #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
     Keccak(Keccak),
+    #[cfg(feature = "ascon")]
     Ascon(ascon::Sponge),
+    #[cfg(feature = "blake3")]
     Blake3(Box<blake3::Hasher>),
 }
 
 // Absorbing until the first read, of any length, and squeezing from then on (SPEC 12.2).
+#[cfg(any(
+    feature = "sha3",
+    feature = "blake3",
+    feature = "ascon",
+    feature = "ml-dsa",
+    feature = "slh-dsa"
+))]
 pub struct Xof {
     engine: XofEngine,
     squeezing: bool,
 }
 
+#[cfg(any(
+    feature = "sha3",
+    feature = "blake3",
+    feature = "ascon",
+    feature = "ml-dsa",
+    feature = "slh-dsa"
+))]
 impl Xof {
     pub fn update(&mut self, data: &[u8]) -> Result<(), Error> {
         if self.squeezing {
@@ -418,8 +664,11 @@ impl Xof {
         }
 
         match &mut self.engine {
+            #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
             XofEngine::Keccak(engine) => engine.update(data),
+            #[cfg(feature = "ascon")]
             XofEngine::Ascon(sponge) => sponge.update(data),
+            #[cfg(feature = "blake3")]
             XofEngine::Blake3(hasher) => hasher.update(data),
         }
 
@@ -447,6 +696,7 @@ impl Xof {
     // At most 2^32 - 1 bytes a call, and BLAKE3 ends after 2^64 - 1 bytes in all.
     fn check_read(&self, length: usize) -> Result<(), Error> {
         let fits = match &self.engine {
+            #[cfg(feature = "blake3")]
             XofEngine::Blake3(hasher) => length as u64 <= hasher.output_left(),
             _ => true,
         };
@@ -462,13 +712,23 @@ impl Xof {
         self.squeezing = true;
 
         match &mut self.engine {
+            #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
             XofEngine::Keccak(engine) => engine.read(out),
+            #[cfg(feature = "ascon")]
             XofEngine::Ascon(sponge) => sponge.read(out),
+            #[cfg(feature = "blake3")]
             XofEngine::Blake3(hasher) => hasher.read(out),
         }
     }
 }
 
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 pub const SHA_224: HashAlgorithm = HashAlgorithm {
     name: "SHA-224",
     digest_size: 28,
@@ -476,6 +736,13 @@ pub const SHA_224: HashAlgorithm = HashAlgorithm {
     oid_arc: 4,
 };
 
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 pub const SHA_256: HashAlgorithm = HashAlgorithm {
     name: "SHA-256",
     digest_size: 32,
@@ -483,6 +750,13 @@ pub const SHA_256: HashAlgorithm = HashAlgorithm {
     oid_arc: 1,
 };
 
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 pub const SHA_384: HashAlgorithm = HashAlgorithm {
     name: "SHA-384",
     digest_size: 48,
@@ -490,6 +764,13 @@ pub const SHA_384: HashAlgorithm = HashAlgorithm {
     oid_arc: 2,
 };
 
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 pub const SHA_512: HashAlgorithm = HashAlgorithm {
     name: "SHA-512",
     digest_size: 64,
@@ -497,6 +778,13 @@ pub const SHA_512: HashAlgorithm = HashAlgorithm {
     oid_arc: 3,
 };
 
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 pub const SHA_512_224: HashAlgorithm = HashAlgorithm {
     name: "SHA-512/224",
     digest_size: 28,
@@ -504,6 +792,13 @@ pub const SHA_512_224: HashAlgorithm = HashAlgorithm {
     oid_arc: 5,
 };
 
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 pub const SHA_512_256: HashAlgorithm = HashAlgorithm {
     name: "SHA-512/256",
     digest_size: 32,
@@ -511,6 +806,7 @@ pub const SHA_512_256: HashAlgorithm = HashAlgorithm {
     oid_arc: 6,
 };
 
+#[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 pub const SHA3_224: HashAlgorithm = HashAlgorithm {
     name: "SHA3-224",
     digest_size: 28,
@@ -518,6 +814,7 @@ pub const SHA3_224: HashAlgorithm = HashAlgorithm {
     oid_arc: 7,
 };
 
+#[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 pub const SHA3_256: HashAlgorithm = HashAlgorithm {
     name: "SHA3-256",
     digest_size: 32,
@@ -525,6 +822,7 @@ pub const SHA3_256: HashAlgorithm = HashAlgorithm {
     oid_arc: 8,
 };
 
+#[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 pub const SHA3_384: HashAlgorithm = HashAlgorithm {
     name: "SHA3-384",
     digest_size: 48,
@@ -532,6 +830,7 @@ pub const SHA3_384: HashAlgorithm = HashAlgorithm {
     oid_arc: 9,
 };
 
+#[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 pub const SHA3_512: HashAlgorithm = HashAlgorithm {
     name: "SHA3-512",
     digest_size: 64,
@@ -540,6 +839,7 @@ pub const SHA3_512: HashAlgorithm = HashAlgorithm {
 };
 
 // RFC 7693, 4: BLAKE2b and BLAKE2s at their recommended digest sizes, unkeyed.
+#[cfg(feature = "blake2")]
 const fn blake2b(name: &'static str, digest_size: usize) -> HashAlgorithm {
     HashAlgorithm {
         name,
@@ -549,6 +849,7 @@ const fn blake2b(name: &'static str, digest_size: usize) -> HashAlgorithm {
     }
 }
 
+#[cfg(feature = "blake2")]
 const fn blake2s(name: &'static str, digest_size: usize) -> HashAlgorithm {
     HashAlgorithm {
         name,
@@ -558,22 +859,31 @@ const fn blake2s(name: &'static str, digest_size: usize) -> HashAlgorithm {
     }
 }
 
+#[cfg(feature = "blake2")]
 pub const BLAKE2B_160: HashAlgorithm = blake2b("BLAKE2b-160", 20);
 
+#[cfg(feature = "blake2")]
 pub const BLAKE2B_256: HashAlgorithm = blake2b("BLAKE2b-256", 32);
 
+#[cfg(feature = "blake2")]
 pub const BLAKE2B_384: HashAlgorithm = blake2b("BLAKE2b-384", 48);
 
+#[cfg(feature = "blake2")]
 pub const BLAKE2B_512: HashAlgorithm = blake2b("BLAKE2b-512", 64);
 
+#[cfg(feature = "blake2")]
 pub const BLAKE2S_128: HashAlgorithm = blake2s("BLAKE2s-128", 16);
 
+#[cfg(feature = "blake2")]
 pub const BLAKE2S_160: HashAlgorithm = blake2s("BLAKE2s-160", 20);
 
+#[cfg(feature = "blake2")]
 pub const BLAKE2S_224: HashAlgorithm = blake2s("BLAKE2s-224", 28);
 
+#[cfg(feature = "blake2")]
 pub const BLAKE2S_256: HashAlgorithm = blake2s("BLAKE2s-256", 32);
 
+#[cfg(feature = "ascon")]
 pub const ASCON_HASH256: HashAlgorithm = HashAlgorithm {
     name: "Ascon-Hash256",
     digest_size: 32,
@@ -581,6 +891,7 @@ pub const ASCON_HASH256: HashAlgorithm = HashAlgorithm {
     oid_arc: 0,
 };
 
+#[cfg(feature = "blake3")]
 pub const BLAKE3_256: HashAlgorithm = HashAlgorithm {
     name: "BLAKE3-256",
     digest_size: 32,
@@ -588,6 +899,7 @@ pub const BLAKE3_256: HashAlgorithm = HashAlgorithm {
     oid_arc: 0,
 };
 
+#[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 pub const SHAKE128: XofAlgorithm = XofAlgorithm {
     name: "SHAKE128",
     rate: 168,
@@ -595,6 +907,7 @@ pub const SHAKE128: XofAlgorithm = XofAlgorithm {
     oid_arc: 11,
 };
 
+#[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 pub const SHAKE256: XofAlgorithm = XofAlgorithm {
     name: "SHAKE256",
     rate: 136,
@@ -602,6 +915,7 @@ pub const SHAKE256: XofAlgorithm = XofAlgorithm {
     oid_arc: 12,
 };
 
+#[cfg(feature = "sha3")]
 pub const CSHAKE128: XofAlgorithm = XofAlgorithm {
     name: "cSHAKE128",
     rate: 168,
@@ -609,6 +923,7 @@ pub const CSHAKE128: XofAlgorithm = XofAlgorithm {
     oid_arc: 0,
 };
 
+#[cfg(feature = "sha3")]
 pub const CSHAKE256: XofAlgorithm = XofAlgorithm {
     name: "cSHAKE256",
     rate: 136,
@@ -616,6 +931,7 @@ pub const CSHAKE256: XofAlgorithm = XofAlgorithm {
     oid_arc: 0,
 };
 
+#[cfg(feature = "ascon")]
 pub const ASCON_XOF128: XofAlgorithm = XofAlgorithm {
     name: "Ascon-XOF128",
     rate: 8,
@@ -623,6 +939,7 @@ pub const ASCON_XOF128: XofAlgorithm = XofAlgorithm {
     oid_arc: 0,
 };
 
+#[cfg(feature = "ascon")]
 pub const ASCON_CXOF128: XofAlgorithm = XofAlgorithm {
     name: "Ascon-CXOF128",
     rate: 8,
@@ -630,6 +947,7 @@ pub const ASCON_CXOF128: XofAlgorithm = XofAlgorithm {
     oid_arc: 0,
 };
 
+#[cfg(feature = "blake3")]
 pub const BLAKE3: XofAlgorithm = XofAlgorithm {
     name: "BLAKE3",
     rate: 64,

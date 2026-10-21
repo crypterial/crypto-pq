@@ -5,7 +5,17 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crypto_pq::{Error, KeyFormat, SHA_256};
+#[cfg(feature = "sha2")]
+use crypto_pq::SHA_256;
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+use crypto_pq::{Error, KeyFormat};
 
 pub type Fields = HashMap<String, String>;
 
@@ -155,6 +165,14 @@ pub fn pieces<'a>(data: &'a [u8], sizes: &[usize]) -> Vec<&'a [u8]> {
 // The example keys of an RFC appendix (RFC 9935, RFC 9881), each in DER and PEM. `import` imports
 // one as the algorithm and kind of its record and gives the raw public key and the DER export;
 // the keys marked reject must fail with INVALID_PRIVATE_KEY.
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 pub fn example_keys(
     name: &str,
     import: impl Fn(&Fields, &[u8], KeyFormat) -> Result<(Vec<u8>, Vec<u8>), Error>,
@@ -303,6 +321,7 @@ pub fn hex(data: &[u8]) -> String {
 
 // With CRYPTO_PQ_REGENERATE=1 a generator writes its file and the file's line of SHA256SUMS;
 // otherwise the file must already hold exactly what the generator produces.
+#[cfg(feature = "sha2")]
 pub fn fixture(name: &str, groups: &[Group]) {
     let text = render(groups);
 

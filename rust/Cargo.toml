@@ -11,9 +11,151 @@ keywords = ["post-quantum", "cryptography", "ml-kem", "ml-dsa", "slh-dsa"]
 categories = ["cryptography", "no-std"]
 include = ["/src", "/LICENSE-APACHE", "/LICENSE-MIT"]
 
+# Every algorithm family is a feature, and the default set enables them all. hazmat, the
+# deterministic operations for test vectors that take the caller's seeds and randomness, is opt-in.
+[features]
+default = [
+    "ml-kem",
+    "frodokem",
+    "ml-dsa",
+    "slh-dsa",
+    "lms",
+    "xmss",
+    "sha2",
+    "sha3",
+    "blake2",
+    "blake3",
+    "ascon",
+    "hmac",
+    "hkdf",
+]
+ml-kem = []
+frodokem = []
+ml-dsa = []
+slh-dsa = []
+lms = []
+xmss = []
+sha2 = []
+sha3 = []
+blake2 = []
+blake3 = []
+ascon = []
+hmac = ["sha2"]
+hkdf = ["hmac"]
+hazmat = []
+
 [[bench]]
 name = "bench"
 harness = false
+required-features = [
+    "ml-kem",
+    "frodokem",
+    "ml-dsa",
+    "slh-dsa",
+    "lms",
+    "xmss",
+    "sha2",
+    "sha3",
+    "blake2",
+    "blake3",
+    "ascon",
+    "hmac",
+    "hkdf",
+    "hazmat",
+]
+
+[[test]]
+name = "ascon"
+required-features = ["ascon"]
+
+[[test]]
+name = "blake2"
+required-features = ["blake2", "sha2"]
+
+[[test]]
+name = "blake3"
+required-features = ["blake3"]
+
+[[test]]
+name = "cross"
+required-features = ["ml-kem", "ml-dsa", "slh-dsa", "lms", "xmss", "hmac", "sha3", "hazmat"]
+
+[[test]]
+name = "ct"
+required-features = [
+    "ml-kem",
+    "frodokem",
+    "ml-dsa",
+    "slh-dsa",
+    "lms",
+    "xmss",
+    "sha2",
+    "sha3",
+    "blake2",
+    "blake3",
+    "ascon",
+    "hmac",
+    "hkdf",
+    "hazmat",
+]
+
+[[test]]
+name = "frodokem"
+required-features = ["frodokem", "sha2", "sha3", "hazmat"]
+
+[[test]]
+name = "hash"
+required-features = ["sha2", "sha3", "blake2", "ascon", "hmac", "ml-dsa", "slh-dsa", "hazmat"]
+
+[[test]]
+name = "kdf"
+required-features = ["hkdf"]
+
+[[test]]
+name = "kem"
+required-features = ["ml-kem", "hazmat"]
+
+[[test]]
+name = "mldsa"
+required-features = ["ml-dsa", "hazmat"]
+
+[[test]]
+name = "robustness"
+required-features = [
+    "ml-kem",
+    "frodokem",
+    "ml-dsa",
+    "slh-dsa",
+    "lms",
+    "xmss",
+    "hmac",
+    "hazmat",
+]
+
+[[test]]
+name = "slhdsa"
+required-features = ["slh-dsa", "hazmat"]
+
+[[test]]
+name = "sp800_185"
+required-features = ["sha3", "hazmat"]
+
+[[test]]
+name = "stateful"
+required-features = ["lms", "xmss", "hmac", "hazmat"]
+
+[[test]]
+name = "symmetric"
+required-features = [
+    "sha2",
+    "sha3",
+    "blake2",
+    "blake3",
+    "ascon",
+    "hmac",
+    "hkdf",
+    "hazmat",
+]
 
 # The SLH-DSA, XMSS and LMS vector suites take minutes unoptimized; test builds keep their debug
 # assertions and overflow checks but are optimized.

@@ -9,7 +9,7 @@
 
 use core::arch::x86_64::*;
 
-use super::kem::ACCEPTED;
+use super::ACCEPTED;
 use super::memory::{load128, load256, store128, store256};
 use crate::cpu::Pack;
 use crate::ct::declassify_value;

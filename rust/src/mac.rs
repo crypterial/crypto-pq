@@ -1,26 +1,53 @@
+#[cfg(feature = "blake3")]
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
+#[cfg(feature = "blake2")]
 use crate::blake2;
+#[cfg(feature = "blake3")]
 use crate::blake3;
 use crate::cpu::Dit;
 use crate::ct;
 use crate::error::Error;
-use crate::hash::{
-    Engine, HashAlgorithm, Kind, SHA_224, SHA_256, SHA_384, SHA_512, check_length, field, fits_u32,
-};
+use crate::hash::check_length;
+#[cfg(feature = "blake2")]
+use crate::hash::field;
+#[cfg(feature = "sha3")]
+use crate::hash::fits_u32;
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+use crate::hash::{Engine, HashAlgorithm, Kind, SHA_224, SHA_256, SHA_384, SHA_512};
+#[cfg(feature = "sha3")]
 use crate::keccak::Keccak;
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 use crate::sha2::{self, Sha256, Sha512, finish256, finish512};
+#[cfg(feature = "sha3")]
 use crate::sp800_185;
 use crate::wipe::wipe;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MacKind {
     // The tag is the leftmost `size` bytes of the hash output (FIPS 198-1, 5).
+    #[cfg(any(
+        feature = "hmac",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ))]
     Hmac(HashAlgorithm),
     // The state after cSHAKE's prefix for the function name "KMAC" and the customization.
+    #[cfg(feature = "sha3")]
     Kmac {
         prefix: [u64; 25],
         rate: usize,
@@ -28,9 +55,12 @@ enum MacKind {
     },
     // The chaining value of the configured length, salt and personalization, before the key
     // length is added.
+    #[cfg(feature = "blake2")]
     Blake2b([u64; 8]),
+    #[cfg(feature = "blake2")]
     Blake2s([u32; 8]),
     // keyed_hash, under a key of exactly 32 bytes.
+    #[cfg(feature = "blake3")]
     Blake3,
 }
 
@@ -98,6 +128,12 @@ impl<'a> MacOptions<'a> {
 }
 
 // RFC 2104: a key longer than a block is replaced by its hash, which `hashed` then holds.
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 pub(crate) fn block_key<'a>(
     hash: &HashAlgorithm,
     key: &'a [u8],
@@ -115,6 +151,12 @@ pub(crate) fn block_key<'a>(
 }
 
 // HMAC over SHA-2 of data, out.len() bytes: the hash's digest size.
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 pub(crate) fn hmac(hash: &HashAlgorithm, key: &[u8], data: &[u8], out: &mut [u8]) {
     let mut hashed = [0; 64];
 
@@ -131,6 +173,7 @@ pub(crate) fn hmac(hash: &HashAlgorithm, key: &[u8], data: &[u8], out: &mut [u8]
 
 // Whether the next tag.len() bytes of output equal tag, in chunks that need no allocation and in
 // constant time over the whole tag.
+#[cfg(feature = "sha3")]
 fn squeeze_equal(engine: &mut Keccak, tag: &[u8]) -> bool {
     let mut chunk = [0; 64];
 
@@ -171,9 +214,17 @@ impl MacAlgorithm {
         } = *options;
 
         let (size, kind) = match self.kind {
+            #[cfg(feature = "blake3")]
             MacKind::Blake3 if *options == MacOptions::default() => return Ok(*self),
+            #[cfg(feature = "blake3")]
             MacKind::Blake3 => return Err(Error::InvalidOption),
             // The 32-bit minimum is KMAC's (SP 800-185, 8.4.2).
+            #[cfg(any(
+                feature = "hmac",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             MacKind::Hmac(hash) => {
                 let size = length.unwrap_or(hash.digest_size);
 
@@ -188,6 +239,7 @@ impl MacAlgorithm {
 
                 (size, MacKind::Hmac(hash))
             }
+            #[cfg(feature = "sha3")]
             MacKind::Kmac { rate, .. } => {
                 // SP 800-185, 8.4.2: a tag shall not be shorter than 32 bits.
                 let size = length.unwrap_or(if rate == 168 { 32 } else { 64 });
@@ -201,6 +253,7 @@ impl MacAlgorithm {
 
                 (size, MacKind::Kmac { prefix, rate, xof })
             }
+            #[cfg(feature = "blake2")]
             MacKind::Blake2b(_) => {
                 let size = length.unwrap_or(64);
 
@@ -212,6 +265,7 @@ impl MacAlgorithm {
 
                 (size, MacKind::Blake2b(h))
             }
+            #[cfg(feature = "blake2")]
             MacKind::Blake2s(_) => {
                 let size = length.unwrap_or(32);
 
@@ -236,8 +290,11 @@ impl MacAlgorithm {
     // exactly 32. HMAC and KMAC take keys of any length.
     const fn key_sizes(&self) -> (usize, usize) {
         match self.kind {
+            #[cfg(feature = "blake2")]
             MacKind::Blake2b(_) => (1, 64),
+            #[cfg(feature = "blake2")]
             MacKind::Blake2s(_) => (1, 32),
+            #[cfg(feature = "blake3")]
             MacKind::Blake3 => (blake3::KEY, blake3::KEY),
             _ => (0, usize::MAX),
         }
@@ -292,13 +349,23 @@ impl MacAlgorithm {
     // create for a key of an accepted length, under the caller's DIT guard.
     pub(crate) fn create_unchecked(&self, key: &[u8]) -> Mac {
         let engine = match &self.kind {
+            #[cfg(any(
+                feature = "hmac",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             MacKind::Hmac(hash) => keyed_hmac(hash, key),
+            #[cfg(feature = "sha3")]
             MacKind::Kmac { prefix, rate, xof } => MacEngine::Kmac {
                 engine: sp800_185::keyed(prefix, *rate, key),
                 xof: *xof,
             },
+            #[cfg(feature = "blake2")]
             MacKind::Blake2b(h) => MacEngine::Blake2b(blake2::Engine::keyed(h, key)),
+            #[cfg(feature = "blake2")]
             MacKind::Blake2s(h) => MacEngine::Blake2s(blake2::Engine::keyed(h, key)),
+            #[cfg(feature = "blake3")]
             MacKind::Blake3 => MacEngine::Blake3(Box::new(blake3::Hasher::keyed(key))),
         };
 
@@ -317,6 +384,7 @@ impl MacAlgorithm {
 
         let _dit = Dit::keyed();
 
+        #[cfg(feature = "sha3")]
         if let MacKind::Kmac { prefix, rate, xof } = &self.kind {
             let mut engine = sp800_185::keyed(prefix, *rate, key);
 
@@ -341,7 +409,19 @@ impl MacAlgorithm {
     // The tag into out, which has digest_size() bytes.
     fn mac(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
         match &self.kind {
+            #[cfg(any(
+                feature = "hmac",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             MacKind::Hmac(hash) if out.len() == hash.digest_size => hmac(hash, key, data, out),
+            #[cfg(any(
+                feature = "hmac",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             MacKind::Hmac(hash) => {
                 let mut full = [0; 64];
 
@@ -351,17 +431,27 @@ impl MacAlgorithm {
 
                 wipe(&mut full);
             }
+            #[cfg(feature = "sha3")]
             MacKind::Kmac { prefix, rate, xof } => {
                 sp800_185::kmac(prefix, *rate, key, data, *xof, out);
             }
+            #[cfg(feature = "blake2")]
             MacKind::Blake2b(h) => blake2::mac(h, key, data, out),
+            #[cfg(feature = "blake2")]
             MacKind::Blake2s(h) => blake2::mac(h, key, data, out),
+            #[cfg(feature = "blake3")]
             MacKind::Blake3 => blake3::keyed_hash(key, data, out),
         }
     }
 }
 
 // HMAC's inner engine after the inner key block, and the state after the outer one.
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 fn keyed_hmac(hash: &HashAlgorithm, key: &[u8]) -> MacEngine {
     let mut hashed = [0; 64];
 
@@ -405,11 +495,23 @@ fn keyed_hmac(hash: &HashAlgorithm, key: &[u8]) -> MacEngine {
 }
 
 // HMAC's state after the outer key block, wiped when dropped.
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 enum Outer {
     Sha256([u32; 8]),
     Sha512([u64; 8]),
 }
 
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 impl Drop for Outer {
     fn drop(&mut self) {
         match self {
@@ -421,17 +523,24 @@ impl Drop for Outer {
 
 enum MacEngine {
     // The inner engine has absorbed the inner key block and the data so far.
+    #[cfg(any(
+        feature = "hmac",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ))]
     Hmac {
         inner: Engine,
         outer: Outer,
         digest_size: usize,
     },
-    Kmac {
-        engine: Keccak,
-        xof: bool,
-    },
+    #[cfg(feature = "sha3")]
+    Kmac { engine: Keccak, xof: bool },
+    #[cfg(feature = "blake2")]
     Blake2b(blake2::Engine<u64>),
+    #[cfg(feature = "blake2")]
     Blake2s(blake2::Engine<u32>),
+    #[cfg(feature = "blake3")]
     Blake3(Box<blake3::Hasher>),
 }
 
@@ -445,10 +554,20 @@ impl Mac {
         let _dit = Dit::keyed();
 
         match &mut self.engine {
+            #[cfg(any(
+                feature = "hmac",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             MacEngine::Hmac { inner, .. } => inner.update(data),
+            #[cfg(feature = "sha3")]
             MacEngine::Kmac { engine, .. } => engine.update(data),
+            #[cfg(feature = "blake2")]
             MacEngine::Blake2b(engine) => engine.update(data),
+            #[cfg(feature = "blake2")]
             MacEngine::Blake2s(engine) => engine.update(data),
+            #[cfg(feature = "blake3")]
             MacEngine::Blake3(hasher) => hasher.update(data),
         }
     }
@@ -480,6 +599,7 @@ impl Mac {
 
         let _dit = Dit::keyed();
 
+        #[cfg(feature = "sha3")]
         if let MacEngine::Kmac { engine, xof } = &self.engine {
             let mut engine = engine.clone();
 
@@ -503,6 +623,12 @@ impl Mac {
     // itself. The engines that finish here are copies, which their drops wipe.
     fn finish(&self, out: &mut [u8]) {
         match &self.engine {
+            #[cfg(any(
+                feature = "hmac",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
             MacEngine::Hmac {
                 inner,
                 outer,
@@ -527,6 +653,7 @@ impl Mac {
 
                 wipe(&mut full);
             }
+            #[cfg(feature = "sha3")]
             MacEngine::Kmac { engine, xof } => {
                 let mut engine = engine.clone();
 
@@ -534,13 +661,22 @@ impl Mac {
 
                 engine.read(out);
             }
+            #[cfg(feature = "blake2")]
             MacEngine::Blake2b(engine) => engine.finish(out),
+            #[cfg(feature = "blake2")]
             MacEngine::Blake2s(engine) => engine.finish(out),
+            #[cfg(feature = "blake3")]
             MacEngine::Blake3(hasher) => hasher.finish(out),
         }
     }
 }
 
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 const fn hmac_algorithm(name: &'static str, hash: HashAlgorithm) -> MacAlgorithm {
     MacAlgorithm {
         name,
@@ -549,14 +685,39 @@ const fn hmac_algorithm(name: &'static str, hash: HashAlgorithm) -> MacAlgorithm
     }
 }
 
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 pub const HMAC_SHA_224: MacAlgorithm = hmac_algorithm("HMAC-SHA-224", SHA_224);
 
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 pub const HMAC_SHA_256: MacAlgorithm = hmac_algorithm("HMAC-SHA-256", SHA_256);
 
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 pub const HMAC_SHA_384: MacAlgorithm = hmac_algorithm("HMAC-SHA-384", SHA_384);
 
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
 pub const HMAC_SHA_512: MacAlgorithm = hmac_algorithm("HMAC-SHA-512", SHA_512);
 
+#[cfg(feature = "sha3")]
 pub const KMAC128: MacAlgorithm = MacAlgorithm {
     name: "KMAC128",
     size: 32,
@@ -567,6 +728,7 @@ pub const KMAC128: MacAlgorithm = MacAlgorithm {
     },
 };
 
+#[cfg(feature = "sha3")]
 pub const KMAC256: MacAlgorithm = MacAlgorithm {
     name: "KMAC256",
     size: 64,
@@ -577,18 +739,21 @@ pub const KMAC256: MacAlgorithm = MacAlgorithm {
     },
 };
 
+#[cfg(feature = "blake2")]
 pub const BLAKE2B_MAC: MacAlgorithm = MacAlgorithm {
     name: "BLAKE2b-MAC",
     size: 64,
     kind: MacKind::Blake2b(blake2::start64(64, &[], &[])),
 };
 
+#[cfg(feature = "blake2")]
 pub const BLAKE2S_MAC: MacAlgorithm = MacAlgorithm {
     name: "BLAKE2s-MAC",
     size: 32,
     kind: MacKind::Blake2s(blake2::start32(32, &[], &[])),
 };
 
+#[cfg(feature = "blake3")]
 pub const BLAKE3_MAC: MacAlgorithm = MacAlgorithm {
     name: "BLAKE3-MAC",
     size: 32,

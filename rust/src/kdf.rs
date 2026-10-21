@@ -1,12 +1,34 @@
 use core::fmt;
 
+#[cfg(feature = "blake3")]
 use crate::blake3;
 use crate::cpu::Dit;
 use crate::error::Error;
-use crate::hash::{HashAlgorithm, Kind, SHA_256, SHA_384, SHA_512, fits_u32};
+#[cfg(feature = "blake3")]
+use crate::hash::fits_u32;
+#[cfg(feature = "hkdf")]
+use crate::hash::{HashAlgorithm, Kind, SHA_256, SHA_384, SHA_512};
+#[cfg(feature = "hkdf")]
 use crate::mac::{block_key, hmac};
+#[cfg(feature = "hkdf")]
 use crate::sha2::{self, Sha256, Sha512, finish256, finish512};
 use crate::wipe::{SecretBytes, wipe};
+
+// A build without HKDF has no hash for it: hkdf() always fails, which the empty type lets the
+// compiler see, so that BLAKE3-KDF keeps the whole interface.
+#[cfg(not(feature = "hkdf"))]
+#[derive(Clone, Copy)]
+enum HashAlgorithm {}
+
+#[cfg(not(feature = "hkdf"))]
+fn hmac(hash: &HashAlgorithm, _: &[u8], _: &[u8], _: &mut [u8]) {
+    match *hash {}
+}
+
+#[cfg(not(feature = "hkdf"))]
+fn expand_unchecked(hash: &HashAlgorithm, _: &[u8], _: &[u8], _: &mut [u8]) {
+    match *hash {}
+}
 
 // HKDF (RFC 5869) over HMAC with SHA-2, and BLAKE3's derive_key, whose context string is info.
 // The PRK, every T(i) and the keyed states are secret and wiped; one keyed DIT guard covers each
@@ -19,8 +41,10 @@ pub struct KdfAlgorithm {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum KdfKind {
+    #[cfg(feature = "hkdf")]
     Hkdf(HashAlgorithm),
     // No extract or expand step of its own, and no salt.
+    #[cfg(feature = "blake3")]
     Blake3,
 }
 
@@ -62,7 +86,9 @@ impl KdfAlgorithm {
     // The size of a pseudorandom key, HashLen; BLAKE3's key size for BLAKE3-KDF.
     pub const fn prk_size(&self) -> usize {
         match self.kind {
+            #[cfg(feature = "hkdf")]
             KdfKind::Hkdf(hash) => hash.digest_size(),
+            #[cfg(feature = "blake3")]
             KdfKind::Blake3 => blake3::KEY,
         }
     }
@@ -70,7 +96,9 @@ impl KdfAlgorithm {
     // HKDF's hash; BLAKE3-KDF has no extract and expand steps.
     const fn hkdf(&self) -> Result<HashAlgorithm, Error> {
         match self.kind {
+            #[cfg(feature = "hkdf")]
             KdfKind::Hkdf(hash) => Ok(hash),
+            #[cfg(feature = "blake3")]
             KdfKind::Blake3 => Err(Error::Unsupported),
         }
     }
@@ -79,7 +107,9 @@ impl KdfAlgorithm {
     // Every KDF refuses an empty output.
     const fn check_output(&self, length: usize) -> Result<(), Error> {
         let fits = match self.kind {
+            #[cfg(feature = "hkdf")]
             KdfKind::Hkdf(hash) => length <= 255 * hash.digest_size(),
+            #[cfg(feature = "blake3")]
             KdfKind::Blake3 => fits_u32(length),
         };
 
@@ -126,6 +156,7 @@ impl KdfAlgorithm {
     // BLAKE3-KDF has no salt.
     const fn check_derive(&self, options: &KdfOptions) -> Result<(), Error> {
         match self.kind {
+            #[cfg(feature = "blake3")]
             KdfKind::Blake3 if !options.salt.is_empty() => Err(Error::InvalidOption),
             _ => Ok(()),
         }
@@ -133,7 +164,9 @@ impl KdfAlgorithm {
 
     fn derive_unchecked(&self, ikm: &[u8], out: &mut [u8], options: &KdfOptions) {
         let hash = match self.kind {
+            #[cfg(feature = "hkdf")]
             KdfKind::Hkdf(hash) => hash,
+            #[cfg(feature = "blake3")]
             KdfKind::Blake3 => {
                 let _dit = Dit::keyed();
 
@@ -246,6 +279,7 @@ impl KdfAlgorithm {
 // T(i) = HMAC(PRK, T(i - 1) || info || i), from T(0) empty, until out is full. T(1) alone is a
 // single HMAC call; otherwise the key blocks are compressed once, and each message is built in a
 // buffer that holds info from the start and takes T(i - 1) and i before each call.
+#[cfg(feature = "hkdf")]
 fn expand_unchecked(hash: &HashAlgorithm, prk: &[u8], info: &[u8], out: &mut [u8]) {
     let size = hash.digest_size();
 
@@ -313,14 +347,17 @@ fn expand_unchecked(hash: &HashAlgorithm, prk: &[u8], info: &[u8], out: &mut [u8
 }
 
 // The messages of expand: T(i - 1), info and the counter byte together, when they fit.
+#[cfg(feature = "hkdf")]
 const MESSAGE: usize = 256;
 
 // HMAC's states after the inner and the outer key block of a PRK, wiped when dropped.
+#[cfg(feature = "hkdf")]
 enum Keyed {
     Sha256([[u32; 8]; 2]),
     Sha512([[u64; 8]; 2]),
 }
 
+#[cfg(feature = "hkdf")]
 impl Keyed {
     fn new(hash: &HashAlgorithm, key: &[u8]) -> Self {
         match hash.kind {
@@ -373,6 +410,7 @@ impl Keyed {
     }
 }
 
+#[cfg(feature = "hkdf")]
 impl Drop for Keyed {
     fn drop(&mut self) {
         match self {
@@ -382,21 +420,25 @@ impl Drop for Keyed {
     }
 }
 
+#[cfg(feature = "hkdf")]
 pub const HKDF_SHA_256: KdfAlgorithm = KdfAlgorithm {
     name: "HKDF-SHA-256",
     kind: KdfKind::Hkdf(SHA_256),
 };
 
+#[cfg(feature = "hkdf")]
 pub const HKDF_SHA_384: KdfAlgorithm = KdfAlgorithm {
     name: "HKDF-SHA-384",
     kind: KdfKind::Hkdf(SHA_384),
 };
 
+#[cfg(feature = "hkdf")]
 pub const HKDF_SHA_512: KdfAlgorithm = KdfAlgorithm {
     name: "HKDF-SHA-512",
     kind: KdfKind::Hkdf(SHA_512),
 };
 
+#[cfg(feature = "blake3")]
 pub const BLAKE3_KDF: KdfAlgorithm = KdfAlgorithm {
     name: "BLAKE3-KDF",
     kind: KdfKind::Blake3,

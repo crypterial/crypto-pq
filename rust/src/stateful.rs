@@ -5,12 +5,14 @@ use crate::cpu::Dit;
 use crate::ct;
 use crate::error::Error;
 use crate::keys::{KeyFormat, export_public, import_public};
+#[cfg(feature = "lms")]
 use crate::lms::{self, LmsType, OtsType};
 use crate::mac::HMAC_SHA_256;
 use crate::merkle::{CACHED_HEIGHT, MerkleTree};
 use crate::primitives::sha256;
 use crate::rng::random_bytes;
 use crate::wipe::{SecretBytes, wipe};
+#[cfg(feature = "xmss")]
 use crate::xmss;
 
 // SPEC 11.7: the state record, version 2.
@@ -134,8 +136,11 @@ pub(crate) fn check_reserve(reserve: u64) -> Result<u64, Error> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Kind {
+    #[cfg(feature = "lms")]
     Hss,
+    #[cfg(feature = "xmss")]
     Xmss,
+    #[cfg(feature = "xmss")]
     XmssMt,
 }
 
@@ -145,16 +150,19 @@ pub struct StatefulSignatureAlgorithm {
     kind: Kind,
 }
 
+#[cfg(feature = "lms")]
 pub const HSS_LMS: StatefulSignatureAlgorithm = StatefulSignatureAlgorithm {
     name: "HSS/LMS",
     kind: Kind::Hss,
 };
 
+#[cfg(feature = "xmss")]
 pub const XMSS: StatefulSignatureAlgorithm = StatefulSignatureAlgorithm {
     name: "XMSS",
     kind: Kind::Xmss,
 };
 
+#[cfg(feature = "xmss")]
 pub const XMSS_MT: StatefulSignatureAlgorithm = StatefulSignatureAlgorithm {
     name: "XMSS^MT",
     kind: Kind::XmssMt,
@@ -162,21 +170,27 @@ pub const XMSS_MT: StatefulSignatureAlgorithm = StatefulSignatureAlgorithm {
 
 // The levels of SPEC 11.3 are numbered from the top: HSS level l, or XMSS^MT layer d - 1 - l.
 pub(crate) enum Parameters {
+    #[cfg(feature = "lms")]
     Hss(Vec<(LmsType, OtsType)>),
+    #[cfg(feature = "xmss")]
     Xmss(&'static xmss::Parameters),
 }
 
 impl Parameters {
     fn levels(&self) -> usize {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(levels) => levels.len(),
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => p.d as usize,
         }
     }
 
     fn height(&self, level: usize) -> u32 {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(levels) => levels[level].0.h,
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => p.tree_height(),
         }
     }
@@ -212,21 +226,27 @@ impl Parameters {
     // HSS: I || SEED of the top tree. XMSS: S_XMSS || SK_PRF || SEED.
     pub(crate) fn seed_size(&self) -> usize {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(levels) => 16 + levels[0].0.m,
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => 3 * p.n,
         }
     }
 
     fn public_key_size(&self) -> usize {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(levels) => 4 + levels[0].0.public_key_size(),
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => p.public_key_size(),
         }
     }
 
     fn node_size(&self) -> usize {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(levels) => levels[0].0.m,
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => p.n,
         }
     }
@@ -234,7 +254,9 @@ impl Parameters {
     // HSS: I || SEED of a child tree. XMSS^MT: its S_XMSS.
     fn child_secrets_size(&self) -> usize {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(levels) => 16 + levels[0].0.m,
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => p.n,
         }
     }
@@ -242,11 +264,13 @@ impl Parameters {
     // The signature of a child's public key by its parent at level - 1.
     fn parent_signature_size(&self, level: usize) -> usize {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(levels) => {
                 let (lms, ots) = &levels[level - 1];
 
                 lms.signature_size(ots)
             }
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => p.layer_signature_size(),
         }
     }
@@ -262,6 +286,7 @@ impl Parameters {
     // type codes of every level, or the XMSS OID.
     fn section(&self) -> Vec<u8> {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(levels) => {
                 let mut section = alloc::vec![levels.len() as u8];
 
@@ -273,6 +298,7 @@ impl Parameters {
 
                 section
             }
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => p.oid.to_be_bytes().to_vec(),
         }
     }
@@ -280,7 +306,9 @@ impl Parameters {
     // A level's position in a tree cache: the HSS level, or the XMSS layer.
     fn position(&self, level: usize) -> u8 {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(_) => level as u8,
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => (p.d as usize - 1 - level) as u8,
         }
     }
@@ -291,7 +319,9 @@ impl Parameters {
         let levels = self.levels();
 
         (position < levels).then(|| match self {
+            #[cfg(feature = "lms")]
             Self::Hss(_) => position,
+            #[cfg(feature = "xmss")]
             Self::Xmss(_) => levels - 1 - position,
         })
     }
@@ -299,7 +329,9 @@ impl Parameters {
     // PUB_SEED, which every XMSS tree of a key hashes with; HSS has none.
     fn pub_seed<'a>(&self, top: &'a [u8]) -> &'a [u8] {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(_) => &[],
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => &top[2 * p.n..],
         }
     }
@@ -307,7 +339,9 @@ impl Parameters {
     // PUB_SEED as the raw public key holds it.
     fn public_seed<'a>(&self, public_key: &'a [u8]) -> &'a [u8] {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(_) => &[],
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => &public_key[4 + p.n..],
         }
     }
@@ -315,7 +349,9 @@ impl Parameters {
     // The bytes of the raw public key that hold the top root.
     fn top_root<'a>(&self, public_key: &'a [u8]) -> &'a [u8] {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(levels) => &public_key[28..28 + levels[0].0.m],
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => &public_key[4..4 + p.n],
         }
     }
@@ -323,8 +359,11 @@ impl Parameters {
     // What verifies the signatures of a level's tree: its LMS public key, or its root.
     fn tree_key(&self, level: usize, public_key: &[u8], record: Option<&Record>) -> Vec<u8> {
         match (self, record) {
+            #[cfg(feature = "lms")]
             (Self::Hss(_), None) => public_key[4..].to_vec(),
+            #[cfg(feature = "xmss")]
             (Self::Xmss(_), None) => self.top_root(public_key).to_vec(),
+            #[cfg(feature = "lms")]
             (Self::Hss(levels), Some(record)) => {
                 let (lms, ots) = &levels[level];
 
@@ -338,6 +377,7 @@ impl Parameters {
                 ]
                 .concat()
             }
+            #[cfg(feature = "xmss")]
             (Self::Xmss(_), Some(record)) => record.root.clone(),
         }
     }
@@ -352,11 +392,13 @@ impl Parameters {
         nodes: Option<&[u8]>,
     ) -> Result<Tree, Error> {
         Ok(match self {
+            #[cfg(feature = "lms")]
             Self::Hss(levels) => {
                 let (lms, ots) = levels[level];
 
                 Tree::Lms(lms::Tree::new(lms, ots, secrets, nodes)?)
             }
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => {
                 let layer = p.d - 1 - level as u32;
 
@@ -382,10 +424,12 @@ impl Parameters {
         signature: &[u8],
     ) -> bool {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(_) => {
                 signature.get(..4) == Some(&self.parent_leaf(level, tree).to_be_bytes()[..])
                     && lms::verify(parent_key, child_key, signature)
             }
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => {
                 let address = (
                     p.d - level as u32,
@@ -403,6 +447,7 @@ impl Parameters {
     // public.
     fn matches_secrets(&self, top: &[u8], public_key: &[u8]) -> bool {
         match self {
+            #[cfg(feature = "lms")]
             Self::Hss(levels) => {
                 let (lms, ots) = levels[0];
 
@@ -416,6 +461,7 @@ impl Parameters {
 
                 ct::declassify_value(ct::equal(&public_key[..expected.len()], &expected))
             }
+            #[cfg(feature = "xmss")]
             Self::Xmss(p) => {
                 public_key[..4] == p.oid.to_be_bytes()
                     && ct::declassify_value(ct::equal(&public_key[4 + p.n..], &top[2 * p.n..]))
@@ -425,6 +471,7 @@ impl Parameters {
 }
 
 // 1 to 8 levels with the same hash function and output size and at most 60 levels of height.
+#[cfg(feature = "lms")]
 fn valid_levels(levels: &[(LmsType, OtsType)]) -> bool {
     let Some((top, _)) = levels.first() else {
         return false;
@@ -441,21 +488,27 @@ fn valid_levels(levels: &[(LmsType, OtsType)]) -> bool {
 
 // One tree that a key holds, with its secrets.
 enum Tree {
+    #[cfg(feature = "lms")]
     Lms(lms::Tree),
+    #[cfg(feature = "xmss")]
     Xmss(xmss::Tree),
 }
 
 impl Tree {
     const fn merkle(&self) -> &MerkleTree {
         match self {
+            #[cfg(feature = "lms")]
             Self::Lms(tree) => tree.merkle(),
+            #[cfg(feature = "xmss")]
             Self::Xmss(tree) => tree.merkle(),
         }
     }
 
     fn root(&self) -> &[u8] {
         match self {
+            #[cfg(feature = "lms")]
             Self::Lms(tree) => tree.root(),
+            #[cfg(feature = "xmss")]
             Self::Xmss(tree) => tree.root(),
         }
     }
@@ -463,7 +516,9 @@ impl Tree {
     // What verifies the tree's signatures: its LMS public key, or its root.
     fn key(&self) -> &[u8] {
         match self {
+            #[cfg(feature = "lms")]
             Self::Lms(tree) => tree.public_key(),
+            #[cfg(feature = "xmss")]
             Self::Xmss(tree) => tree.root(),
         }
     }
@@ -472,7 +527,9 @@ impl Tree {
     // WOTS+ of an n-byte message.
     fn sign(&mut self, pub_seed: &[u8], leaf: u32, randomizer: &[u8], message: &[u8]) -> Vec<u8> {
         match self {
+            #[cfg(feature = "lms")]
             Self::Lms(tree) => tree.sign(leaf, randomizer, message),
+            #[cfg(feature = "xmss")]
             Self::Xmss(tree) => tree.sign(pub_seed, leaf, message),
         }
     }
@@ -668,6 +725,7 @@ impl StatefulSignatureAlgorithm {
 
     pub(crate) fn parameters(&self, parameters: StatefulParameters) -> Result<Parameters, Error> {
         match (self.kind, parameters) {
+            #[cfg(feature = "lms")]
             (Kind::Hss, StatefulParameters::Levels(names)) => {
                 let levels = names
                     .iter()
@@ -678,6 +736,7 @@ impl StatefulSignatureAlgorithm {
 
                 Ok(Parameters::Hss(levels))
             }
+            #[cfg(feature = "xmss")]
             (Kind::Xmss | Kind::XmssMt, StatefulParameters::Name(name)) => {
                 let p = xmss::by_name(self.sets(), name).ok_or(Error::InvalidOption)?;
 
@@ -730,7 +789,9 @@ impl StatefulSignatureAlgorithm {
         let tree = key.parameters.build(pub_seed, 0, 0, &key.top, None)?;
 
         key.public_key = match &key.parameters {
+            #[cfg(feature = "lms")]
             Parameters::Hss(_) => [&(levels as u32).to_be_bytes()[..], tree.key()].concat(),
+            #[cfg(feature = "xmss")]
             Parameters::Xmss(p) => [&p.oid.to_be_bytes()[..], tree.root(), pub_seed].concat(),
         };
 
@@ -760,22 +821,29 @@ impl StatefulSignatureAlgorithm {
 
     const fn kind_byte(&self) -> u8 {
         match self.kind {
+            #[cfg(feature = "lms")]
             Kind::Hss => 1,
+            #[cfg(feature = "xmss")]
             Kind::Xmss => 2,
+            #[cfg(feature = "xmss")]
             Kind::XmssMt => 3,
         }
     }
 
     const fn oid(&self) -> &'static [u8] {
         match self.kind {
+            #[cfg(feature = "lms")]
             Kind::Hss => &[
                 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x03, 0x11,
             ],
+            #[cfg(feature = "xmss")]
             Kind::Xmss => &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x06, 0x22],
+            #[cfg(feature = "xmss")]
             Kind::XmssMt => &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x06, 0x23],
         }
     }
 
+    #[cfg(feature = "xmss")]
     fn sets(&self) -> &'static [xmss::Parameters] {
         if self.kind == Kind::XmssMt {
             &xmss::XMSS_MT_SETS
@@ -810,6 +878,7 @@ impl StatefulSignatureAlgorithm {
         };
 
         let parameters = match self.kind {
+            #[cfg(feature = "lms")]
             Kind::Hss => {
                 let count = reader.byte()?;
 
@@ -830,6 +899,7 @@ impl StatefulSignatureAlgorithm {
 
                 Parameters::Hss(levels)
             }
+            #[cfg(feature = "xmss")]
             Kind::Xmss | Kind::XmssMt => {
                 let oid = reader.number(4)? as u32;
 
@@ -887,6 +957,7 @@ impl StatefulSignatureAlgorithm {
 
         // I of every HSS tree and PUB_SEED are parts of public keys.
         match &parameters {
+            #[cfg(feature = "lms")]
             Parameters::Hss(_) => {
                 ct::declassify(&top[..16]);
 
@@ -894,6 +965,7 @@ impl StatefulSignatureAlgorithm {
                     ct::declassify(&secrets[..16]);
                 }
             }
+            #[cfg(feature = "xmss")]
             Parameters::Xmss(_) => ct::declassify(parameters.pub_seed(&top)),
         }
 
@@ -909,7 +981,9 @@ impl StatefulSignatureAlgorithm {
 
     fn check_public_key(&self, key: &[u8]) -> bool {
         match self.kind {
+            #[cfg(feature = "lms")]
             Kind::Hss => lms::check_public_key(key),
+            #[cfg(feature = "xmss")]
             Kind::Xmss | Kind::XmssMt => key
                 .get(..4)
                 .and_then(|oid| xmss::by_oid(self.sets(), read_u32(oid)))
@@ -919,7 +993,9 @@ impl StatefulSignatureAlgorithm {
 
     fn verifies(&self, public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
         match self.kind {
+            #[cfg(feature = "lms")]
             Kind::Hss => lms::hss_verify(public_key, message, signature),
+            #[cfg(feature = "xmss")]
             Kind::Xmss | Kind::XmssMt => public_key
                 .get(..4)
                 .and_then(|oid| xmss::by_oid(self.sets(), read_u32(oid)))
@@ -1446,7 +1522,9 @@ impl<S> StatefulPrivateKey<S> {
                 let secrets = random_bytes(p.child_secrets_size())?;
 
                 let randomizer = match p {
+                    #[cfg(feature = "lms")]
                     Parameters::Hss(_) => random_bytes(p.node_size())?,
+                    #[cfg(feature = "xmss")]
                     Parameters::Xmss(_) => SecretBytes::zeroed(0),
                 };
 
@@ -1486,6 +1564,7 @@ impl<S> StatefulPrivateKey<S> {
 
             let (secrets, randomizer) = match (fresh.next(), &*parent) {
                 (Some(drawn), _) => drawn,
+                #[cfg(feature = "lms")]
                 (None, Tree::Lms(tree)) => {
                     let randomizer = tree.derived_randomizer(leaf);
 
@@ -1494,6 +1573,7 @@ impl<S> StatefulPrivateKey<S> {
                         SecretBytes::concat(&[&randomizer[..p.node_size()]]),
                     )
                 }
+                #[cfg(feature = "xmss")]
                 (None, Tree::Xmss(_)) => (
                     SecretBytes::concat(&[&self.top[..p.node_size()]]),
                     SecretBytes::zeroed(0),
@@ -1726,12 +1806,14 @@ impl<S: StateStore> StatefulPrivateKey<S> {
         let mut signature = Vec::new();
 
         match p {
+            #[cfg(feature = "lms")]
             Parameters::Hss(_) => {
                 let tree = self.trees[bottom]
                     .as_mut()
                     .expect("the bottom level is current");
 
                 let randomizer = match (&*tree, self.deterministic) {
+                    #[cfg(feature = "lms")]
                     (Tree::Lms(tree), true) => {
                         SecretBytes::concat(&[&tree.derived_randomizer(leaf)[..p.node_size()]])
                     }
@@ -1756,6 +1838,7 @@ impl<S: StateStore> StatefulPrivateKey<S> {
                 // Only the copy in the signature remains, which sign wipes if it does not verify.
                 wipe(&mut bottom);
             }
+            #[cfg(feature = "xmss")]
             Parameters::Xmss(xp) => {
                 let n = xp.n;
 
@@ -1813,6 +1896,7 @@ impl<S: StateStore> StatefulPrivateKey<S> {
         };
 
         match p {
+            #[cfg(feature = "lms")]
             Parameters::Hss(levels) => {
                 let (lms, ots) = &levels[bottom];
 
@@ -1826,6 +1910,7 @@ impl<S: StateStore> StatefulPrivateKey<S> {
 
                 part[..4] == leaf.to_be_bytes() && lms::verify(tree.key(), message, part)
             }
+            #[cfg(feature = "xmss")]
             Parameters::Xmss(xp) => {
                 let (n, size) = (xp.n, xp.index_size());
 

@@ -59,11 +59,13 @@ use x86_64 as arch;
 mod arch {
     // Nothing is accelerated: the portable build, and every other architecture.
     #[inline(always)]
+    #[cfg(feature = "frodokem")]
     pub(crate) fn aes_expand(_: &[u8], _: &mut [[u8; 16]; 15]) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "frodokem")]
     pub(crate) fn aes_encrypt(_: &[[u8; 16]], _: &mut [[u8; 16]]) -> bool {
         false
     }
@@ -127,31 +129,61 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg(feature = "ascon")]
     pub(crate) fn ascon(_: &mut [u64; 5]) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ascon")]
     pub(crate) fn ascon_digest(_: &[u64; 5], _: &[u8], _: &mut [u8]) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ))]
     pub(crate) fn permute_many(_: &mut [&mut [u64; 25]]) -> usize {
         0
     }
 
     #[inline(always)]
+    #[cfg(any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ))]
     pub(crate) fn absorb(_: &mut [u64; 25], _: usize, _: &[u8]) -> usize {
         0
     }
 
     #[inline(always)]
+    #[cfg(any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ))]
     pub(crate) fn digest(_: Option<&[u64; 25]>, _: usize, _: u8, _: &[u8], _: &mut [u8]) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "blake2")]
     pub(crate) fn blake2b(
         _: &mut [u64; 8],
         _: Option<&[u64; 16]>,
@@ -163,6 +195,7 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg(feature = "blake2")]
     pub(crate) fn blake2s(
         _: &mut [u32; 8],
         _: Option<&[u32; 16]>,
@@ -174,36 +207,51 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg(feature = "blake2")]
     pub(crate) fn blake2b_digest(_: &[u64; 8], _: &[u8], _: &mut [u8]) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "blake2")]
     pub(crate) fn blake2s_digest(_: &[u32; 8], _: &[u8], _: &mut [u8]) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "blake2")]
     pub(crate) fn blake2s_mac(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ))]
     pub(crate) const fn keccak_group() -> usize {
         4
     }
 
     #[inline(always)]
+    #[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
     pub(crate) fn ntt(_: &mut [i32; 256], _: &super::Field) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
     pub(crate) fn inverse_ntt(_: &mut [i32; 256], _: &super::Field) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-dsa")]
     pub(crate) fn multiply(
         _: &mut [i32; 256],
         _: &[i32; 256],
@@ -214,6 +262,7 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-dsa")]
     pub(crate) fn multiply_add(
         _: &mut [i32; 256],
         _: &[[i32; 256]],
@@ -224,6 +273,7 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn base_multiply_add(
         _: &mut [i32; 256],
         _: &[u16; 256],
@@ -234,11 +284,13 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn ntt16(_: &mut [u16; 256], _: &super::Field16) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn mlkem_multiply_cache(
         _: &[u16; 256],
         _: &[i16; 128],
@@ -249,6 +301,7 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn mlkem_inner_product(
         _: &mut [u16; 256],
         _: &[&[u16; 256]],
@@ -260,31 +313,37 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn inverse_ntt16(_: &[i32; 256], _: &mut [u16; 256], _: &super::Field16) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn binomial(_: usize, _: &[u64], _: u16, _: &mut [u16; 256]) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-dsa")]
     pub(crate) fn mldsa_add(_: &mut [i32; 256], _: &[i32; 256], _: &[i32; 256], _: i32) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-dsa")]
     pub(crate) fn mldsa_sub(_: &mut [i32; 256], _: &[i32; 256], _: &[i32; 256], _: i32) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-dsa")]
     pub(crate) fn mldsa_norm(_: &[i32; 256], _: i32, _: Option<i32>, _: i32) -> Option<i32> {
         None
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-dsa")]
     pub(crate) fn mldsa_hints(
         _: &mut [i32; 256],
         _: &[i32; 256],
@@ -296,21 +355,25 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-dsa")]
     pub(crate) fn mldsa_w1(_: &mut [u8], _: &[i32; 256], _: i32, _: i32) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-dsa")]
     pub(crate) fn mldsa_mask(_: &mut [i32; 256], _: &[u8], _: u32, _: i32, _: i32) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-dsa")]
     pub(crate) fn mldsa_pack(_: &mut [u8], _: &[i32; 256], _: u32, _: super::Pack, _: i32) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn mlkem_matrix_vector(
         _: &mut [[u16; 256]],
         _: &[[u16; 256]],
@@ -323,21 +386,25 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn reduce(_: &[i32; 256], _: i32, _: &super::Field, _: &mut [u16; 256]) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn encode12(_: &[u16; 256], _: &mut [u8; 384]) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn decode12(_: &[u8; 384], _: u16, _: &mut [u16; 256]) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn mlkem_compress(
         _: &[u16; 256],
         _: &[u16; 256],
@@ -350,40 +417,75 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn mlkem_decompress(_: &[u8], _: u32, _: u16, _: &mut [u16; 256]) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn mlkem_message(_: &[u16; 256], _: &[u16; 256], _: u16, _: &mut [u8; 32]) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
     pub(crate) fn uniform12(_: &[u64; 21], _: u16, _: &mut [u16; 256], _: &mut usize) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-dsa")]
     pub(crate) fn uniform23(_: &[u64; 21], _: i32, _: &mut [i32; 256], _: &mut usize) -> bool {
         false
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-dsa")]
     pub(crate) fn bounded(_: &[u64; 17], _: i32, _: &mut [i32; 256], _: &mut usize) -> bool {
         false
     }
 }
 
 pub(crate) use arch::{
-    absorb, aes_encrypt, aes_expand, ascon, ascon_digest, base_multiply_add, binomial, blake2b,
-    blake2b_digest, blake2s, blake2s_digest, blake2s_mac, bounded, compress256, compress256_lanes,
-    compress256_pair, compress512, compress512_pair, decode12, digest, encode12, finish256,
-    finish512, hmac256, hmac256_keyed, hmac512, hmac512_keyed, inverse_ntt, inverse_ntt16,
-    keccak_group, mldsa_add, mldsa_hints, mldsa_mask, mldsa_norm, mldsa_pack, mldsa_sub, mldsa_w1,
-    mlkem_compress, mlkem_decompress, mlkem_inner_product, mlkem_matrix_vector, mlkem_message,
-    mlkem_multiply_cache, multiply, multiply_add, ntt, ntt16, permute_many, reduce, uniform12,
-    uniform23,
+    compress256, compress256_lanes, compress256_pair, compress512, compress512_pair, finish256,
+    finish512, hmac256, hmac256_keyed, hmac512, hmac512_keyed,
+};
+
+#[cfg(feature = "frodokem")]
+pub(crate) use arch::{aes_encrypt, aes_expand};
+
+#[cfg(feature = "ascon")]
+pub(crate) use arch::{ascon, ascon_digest};
+
+#[cfg(feature = "blake2")]
+pub(crate) use arch::{blake2b, blake2b_digest, blake2s, blake2s_digest, blake2s_mac};
+
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+pub(crate) use arch::{absorb, digest, keccak_group, permute_many};
+
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
+pub(crate) use arch::{inverse_ntt, ntt};
+
+#[cfg(feature = "ml-kem")]
+pub(crate) use arch::{
+    base_multiply_add, binomial, decode12, encode12, inverse_ntt16, mlkem_compress,
+    mlkem_decompress, mlkem_inner_product, mlkem_matrix_vector, mlkem_message,
+    mlkem_multiply_cache, ntt16, reduce, uniform12,
+};
+
+#[cfg(feature = "ml-dsa")]
+pub(crate) use arch::{
+    bounded, mldsa_add, mldsa_hints, mldsa_mask, mldsa_norm, mldsa_pack, mldsa_sub, mldsa_w1,
+    multiply, multiply_add, uniform23,
 };
 
 // What the transform kernels need of the field of ML-KEM or ML-DSA, so that they compute exactly
@@ -391,6 +493,7 @@ pub(crate) use arch::{
 // high(a, b) - high(a * (b * q^-1 mod 2^32), q). The twiddle factors are in Montgomery form, in
 // the order in which the forward and the inverse transform take them, each with its product by
 // q^-1. The fields are read only by the kernels, so they are unused where there are none.
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 #[cfg_attr(
     not(any(
         all(
@@ -423,6 +526,7 @@ pub(crate) struct Field {
 // How ML-DSA maps each coefficient as it packs it: power2round's r1 (t1 of a public key), 2^12
 // minus its r0 (t0 of a private key), eta - x (the signed coefficients of s1 and s2), or gamma1
 // minus the centered coefficient (z of a signature).
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 #[derive(Clone, Copy)]
 pub(crate) enum Pack {
     High,
@@ -433,6 +537,7 @@ pub(crate) enum Pack {
 
 // The first step of the inverse transform: ML-DSA's x - ((x + 2^22) >> 23) q, or ML-KEM's
 // Montgomery product with a constant.
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 #[cfg_attr(
     not(any(
         all(
@@ -454,6 +559,7 @@ pub(crate) enum Prepare {
     Montgomery(i32),
 }
 
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 impl Field {
     // zetas[m] multiplies butterfly group m of the forward transform, counted from 1 across the
     // layers; the inverse takes them in the reverse order. After its layers the forward transform
@@ -557,6 +663,7 @@ pub fn enable_data_independent_timing() -> bool {
 // coefficients 4 and 2 apart take their factors as whole vectors, one factor per lane. Only the
 // arm64 kernels read every field: the x86-64 ones have their own (below), and canonical,
 // inverse_scale, reduce32 and qinv32 are unused there.
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 #[cfg_attr(
     not(all(
         target_arch = "aarch64",
@@ -592,6 +699,7 @@ pub(crate) struct Field16 {
     pub(crate) inverse_scale_x86: i16,
 }
 
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 impl Field16 {
     // zetas[m] in Montgomery form for 2^16 multiplies forward group m; canonical is 2^16 mod q,
     // inverse_scale is 2^16 / 128 mod q, and reduce32 is 2^32 mod q, whose 32-bit Montgomery

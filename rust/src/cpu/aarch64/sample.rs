@@ -76,6 +76,7 @@ static ACCEPTED: [u8; 256] = {
 };
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-kem")]
 pub(crate) fn uniform12(lanes: &[u64; 21], q: u16, a: &mut [u16; 256], count: &mut usize) -> bool {
     // SAFETY: NEON is part of every target this module is built for.
     unsafe { uniform12_neon(lanes, q, a, count) };
@@ -84,6 +85,7 @@ pub(crate) fn uniform12(lanes: &[u64; 21], q: u16, a: &mut [u16; 256], count: &m
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn uniform23(lanes: &[u64; 21], q: i32, a: &mut [i32; 256], count: &mut usize) -> bool {
     // SAFETY: as in uniform12.
     unsafe { uniform23_neon(lanes, q, a, count) };
@@ -92,6 +94,7 @@ pub(crate) fn uniform23(lanes: &[u64; 21], q: i32, a: &mut [i32; 256], count: &m
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
 pub(crate) fn bounded(lanes: &[u64; 17], eta: i32, a: &mut [i32; 256], count: &mut usize) -> bool {
     if eta != 2 && eta != 4 {
         return false;
