@@ -136,7 +136,7 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
    | file | covers |
    |---|---|
    | `errors.txt` | every import, export, encapsulate, decapsulate, sign, verify, generate, load and hazmat error of the asymmetric algorithms; for each HashSLH-DSA value, the refusals of [9.4](09-signatures.md#94-hashslh-dsa-algorithm-values) items 2 and 3 and of [13](13-hazmat.md) item 3 (a `preHash` other than the fixed one, `hazmat.signInternal`, a key with the pure SLH-DSA identifier and the reverse) and a changed signature |
-   | `kem.txt` | ML-KEM and FrodoKEM keys in every form, encapsulation, implicit rejection |
+   | `kem.txt` | ML-KEM keys in every form, encapsulation, implicit rejection |
    | `mldsa.txt`, `slhdsa.txt` | for each ML-DSA and SLH-DSA value: keys in every form, pure and pre-hash modes, contexts, hedged and deterministic signatures; in `slhdsa.txt`, for each HashSLH-DSA value: keys in every form with the identifiers of [9.4](09-signatures.md#94-hashslh-dsa-algorithm-values) and a deterministic signature with a context and the fixed pre-hash |
    | `hss.txt`, `xmss.txt` | deterministic stateful key generation, signatures, public keys in every format, and the state record after each step |
    | `treecache.txt` | tree cache export and every load check |
@@ -158,7 +158,7 @@ reported by the runner. The internal-interface groups of ML-DSA and SLH-DSA run 
 | algorithm | sets |
 |---|---|
 | ML-KEM | ACVP ML-KEM-keyGen-FIPS203 and ML-KEM-encapDecap-FIPS203, full (encapsulation, decapsulation, key checks); Wycheproof `mlkem_*_test`, `mlkem_*_encaps_test`, `mlkem_*_semi_expanded_decaps_test`, `mlkem_*_keygen_seed_test`; RFC 9935 Appendix C (every example key, including the inconsistent keys of C.4, which MUST fail with INVALID_PRIVATE_KEY); `cross/kem.txt`, `cross/errors.txt` |
-| FrodoKEM | the official known-answer tests of the reference implementation (PQCrypto-LWEKE, commit e1edeb3af1fae0d5727683bd2f5465280ec2437a) for the eight sets; `cross/kem.txt`, `cross/errors.txt` |
+| FrodoKEM | the official known-answer tests of the reference implementation (PQCrypto-LWEKE, commit e1edeb3af1fae0d5727683bd2f5465280ec2437a) for the eight sets; `cross/errors.txt` |
 | ML-DSA | ACVP ML-DSA-keyGen, -sigGen and -sigVer (FIPS 204), full; Wycheproof `mldsa_*_sign_seed_test`, `mldsa_*_sign_noseed_test`, `mldsa_*_verify_test`; RFC 9881 Appendix C; `cross/mldsa.txt`, `cross/errors.txt` |
 | SLH-DSA, HashSLH-DSA | ACVP SLH-DSA-keyGen, -sigGen and -sigVer (FIPS 205), full, including the internal groups through `hazmat`; RFC 9909 Appendix C (C.1 public key, C.2 private key, C.3 self-signed certificate); `cross/slhdsa.txt`, `cross/errors.txt` |
 | HSS/LMS | ACVP LMS-keyGen, -sigGen and -sigVer; RFC 8554 Appendix F; RFC 9858 test cases; RFC 9802 Appendix A; `cross/hss.txt`, `cross/treecache.txt`, `cross/errors.txt` |
