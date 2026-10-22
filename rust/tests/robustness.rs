@@ -1345,8 +1345,10 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
 // A state record of version 2 (SPEC 11.7) read by the format rules alone.
 #[derive(PartialEq, Eq)]
 struct ParsedState {
-    // The height of each level, top first, and the hash calls that building its tree takes.
+    // The height of each level, top first, the type codes that its tree is built with (HSS: LMS
+    // and LM-OTS type, XMSS: the OID) and the hash calls that building its tree takes.
     heights: Vec<u32>,
+    codes: Vec<u64>,
     costs: Vec<u64>,
     next: u64,
     top: Vec<u8>,
@@ -1443,16 +1445,16 @@ fn parse_state(algorithm: StatefulSignatureAlgorithm, state: &[u8]) -> Result<Pa
     // The heights and costs of the levels, the sizes of the top secrets, the public key, a child's
     // secrets and root, the parent signature of each lower level, and the public key bytes that
     // the top secrets give.
-    let (heights, costs, top_size, key_size, child, node, signatures, pattern);
+    let (heights, codes, costs, top_size, key_size, child, node, signatures, pattern);
 
     if algorithm == HSS_LMS {
         let count = usize::from(take(1)?[0]);
 
-        let codes = take(8 * count)?;
+        let types = take(8 * count)?;
 
         let mut levels = Vec::new();
 
-        for code in codes.chunks(8) {
+        for code in types.chunks(8) {
             let lms = lms_type(read_u32(code, 0)).ok_or(invalid)?;
 
             let ots = ots_type(read_u32(code, 4)).ok_or(invalid)?;
@@ -1469,6 +1471,11 @@ fn parse_state(algorithm: StatefulSignatureAlgorithm, state: &[u8]) -> Result<Pa
             });
 
         heights = levels.iter().map(|((_, h, _), _)| *h).collect::<Vec<_>>();
+
+        codes = types
+            .chunks(8)
+            .map(|code| u64::from_be_bytes(code.try_into().expect("eight bytes")))
+            .collect();
 
         if mixed || count > 8 || heights.iter().sum::<u32>() > 60 {
             return Err(invalid);
@@ -1488,7 +1495,7 @@ fn parse_state(algorithm: StatefulSignatureAlgorithm, state: &[u8]) -> Result<Pa
 
         (top_size, key_size, child, node) = (16 + m, 28 + m, 16 + m, m);
 
-        pattern = [&(count as u32).to_be_bytes()[..], &codes[..8]].concat();
+        pattern = [&(count as u32).to_be_bytes()[..], &types[..8]].concat();
     } else {
         let oid = take(4)?;
 
@@ -1497,6 +1504,8 @@ fn parse_state(algorithm: StatefulSignatureAlgorithm, state: &[u8]) -> Result<Pa
         let height = h / d;
 
         heights = vec![height; d as usize];
+
+        codes = vec![u64::from(read_u32(oid, 0)); d as usize];
 
         costs = vec![((2 * n as u64 + 3) * 16) << height; d as usize];
 
@@ -1531,6 +1540,7 @@ fn parse_state(algorithm: StatefulSignatureAlgorithm, state: &[u8]) -> Result<Pa
 
     let parsed = ParsedState {
         heights,
+        codes,
         costs,
         next,
         top,
@@ -1596,9 +1606,12 @@ fn expected_state(
 
     let cost = parsed.costs[..current].iter().sum();
 
-    // The fields that the current trees are built and checked from, as the key stored them.
+    // The fields that the current trees are built and checked from, as the key stored them: a
+    // lower level's types are not part of the public key, and changing its LM-OTS type keeps every
+    // length.
     let same = parse_state(algorithm, original).is_ok_and(|original| {
         parsed.heights == original.heights
+            && parsed.codes[..current] == original.codes[..current]
             && parsed.top == original.top
             && parsed.public_key == original.public_key
             && (1..current).all(|level| parsed.records[level - 1] == original.records[level - 1])
@@ -1855,6 +1868,50 @@ fn random_states() {
 
         check_state(algorithm, &state, &original, 1 << 18);
     }
+}
+
+// The record that a long run of random_states found: the two-level seed with the bottom level's
+// LM-OTS type changed from LMOTS_SHA256_N24_W1 to LMOTS_SHA256_N24_W2, sealed again. Every length
+// stays exact, but the bottom tree built from the record is not the tree whose key the stored
+// parent signature signs, so the load fails (SPEC 11.9 item 6).
+#[test]
+fn changed_lower_level_type() {
+    let original = hss_state(
+        &[
+            ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W4"),
+            ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W1"),
+        ],
+        &pattern(40, 0),
+        3,
+    );
+
+    let mut body = original[..original.len() - 16].to_vec();
+
+    // The low byte of level 1's LM-OTS type: after the version, the kind, L and level 0's types.
+    body[18] = 6;
+
+    let state = sealed(&body);
+
+    assert_eq!(
+        hex(&SHA_256.digest(&state)),
+        "04ad4dcf0040b1fcabc39911c8c620ae738d9c661317a5c769d1bcab07f276a5"
+    );
+
+    let expected = expected_state(HSS_LMS, &state, &original).expect("format");
+
+    assert!(!expected.exact);
+
+    let loaded = HSS_LMS.load_private_key(
+        MemoryStore::holding(&state),
+        &StatefulLoadOptions::default(),
+    );
+
+    assert!(matches!(
+        loaded.err(),
+        Some(Error::InvalidPrivateKey | Error::SelfTestFailed)
+    ));
+
+    check_state(HSS_LMS, &state, &original, 1 << 18);
 }
 
 #[test]
