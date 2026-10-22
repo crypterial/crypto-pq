@@ -830,7 +830,7 @@ fn concurrent_first_use() {
 
 // RFC 9935, Appendix C: every example key, its public key and what it exports as; the
 // inconsistent seed and expanded keys of C.4 must be refused, example 2 (a changed secret vector
-// under a valid H(ek)) by the pairwise test of SPEC 8.1.4 check (4).
+// under a valid H(ek)) by the checks of the secret vector, SPEC 8.1.4 checks (4) and (5).
 #[test]
 fn rfc9935_example_keys() {
     example_keys("rfc/mlkem_keys.txt", |record, data, format| {

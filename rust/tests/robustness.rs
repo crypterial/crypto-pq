@@ -627,9 +627,27 @@ fn stable_kem_public(algorithm: KemAlgorithm, key: &KemPublicKey) {
     }
 }
 
+// A raw expanded or FrodoKEM key whose secret lies outside the range that key generation samples
+// is refused every time (SPEC 8.1.4 check (4), 8.2.4 item 3).
 fn check_kem_private(algorithm: KemAlgorithm, data: &[u8], format: KeyFormat) {
+    let result = algorithm.import_private_key(data, format);
+
+    if format == KeyFormat::Raw
+        && vectors::kem_secret_in_range(algorithm.name(), data) == Some(false)
+    {
+        assert_eq!(
+            result.err(),
+            Some(Error::InvalidPrivateKey),
+            "{}: {}",
+            algorithm.name(),
+            hex(data)
+        );
+
+        return;
+    }
+
     if let Some(key) = expect_codes(
-        algorithm.import_private_key(data, format),
+        result,
         &kem_codes(algorithm, format, Error::InvalidPrivateKey),
         algorithm.name(),
         data,
@@ -648,9 +666,17 @@ fn check_kem_key(algorithm: KemAlgorithm, key: &KemPrivateKey, data: &[u8], form
 
     let raw = key.export_key(KeyFormat::Raw).expect("export");
 
-    // The pairwise test of an expanded or FrodoKEM key uses fresh randomness (SPEC 8.1.4 check (4),
-    // 8.2.4 item 3): a key with another secret that decapsulates some ciphertexts rightly can pass
-    // one import and fail the next. A key held as its seed has no such test.
+    assert_ne!(
+        vectors::kem_secret_in_range(algorithm.name(), &raw),
+        Some(false),
+        "{}: {}",
+        algorithm.name(),
+        hex(data)
+    );
+
+    // The pairwise test of an expanded or FrodoKEM key uses fresh randomness (SPEC 8.1.4 check (5),
+    // 8.2.4 item 3): a key with another secret within the range that decapsulates some ciphertexts
+    // rightly can pass one import and fail the next. A key held as its seed has no such test.
     for format in FORMATS {
         if let Ok(exported) = key.export_key(format) {
             match algorithm.import_private_key(&exported, format) {
@@ -697,13 +723,18 @@ fn expanded_key(algorithm: KemAlgorithm) -> Vec<u8> {
 }
 
 // FIPS 203 checks only the hash of the public part of an expanded key, so one whose secret vector
-// was changed passes them; the pairwise test of the import refuses it (SPEC 8.1.4 check (4)).
+// was changed passes them; the range check of s refuses it (SPEC 8.1.4 check (4)).
 #[test]
 fn inconsistent_expanded_kem_key() {
     for algorithm in [ML_KEM_512, ML_KEM_768, ML_KEM_1024] {
         let mut dk = expanded_key(algorithm);
 
         dk[0] ^= 1;
+
+        assert_eq!(
+            vectors::kem_secret_in_range(algorithm.name(), &dk),
+            Some(false)
+        );
 
         assert_eq!(
             algorithm.import_private_key(&dk, KeyFormat::Raw).err(),
@@ -714,11 +745,12 @@ fn inconsistent_expanded_kem_key() {
 
 // The key that a long run of kem_import found: a FrodoKEM key whose S^T has the top bit of one
 // coefficient flipped. That adds 2^15 times an entry of B' to each of 8 entries of one column of
-// B'S, so the pairwise test of the import (SPEC 8.2.4 item 3) passes for about 2^-8 of its fresh
-// encapsulations: one import accepted the key and the re-import refused it. The long run imports
-// it until it is accepted.
+// B'S, so the pairwise test alone passed for about 2^-8 of its fresh encapsulations, and one
+// import accepted the key that the re-import refused. The range check of S^T (SPEC 8.2.4 item 3)
+// now refuses it every time. Within the range a changed entry is left to the pairwise test, which
+// passes for about 2^-32 of its encapsulations here.
 #[test]
-fn kem_key_accepted_by_chance() {
+fn kem_secret_out_of_range() {
     let algorithm = FRODOKEM_1344_AES;
 
     let (seed, _) = kem_sizes(algorithm);
@@ -731,34 +763,36 @@ fn kem_key_accepted_by_chance() {
         .expect("export")
         .to_vec();
 
-    // The high byte of coefficient 3900 of S^T, which follows s, seedA and b.
-    data[32 + 16 + 2 * 1344 * 8 + 2 * 3900 + 1] ^= 0x80;
+    // Coefficient 3900 of S^T, which follows s, seedA and b: 2, with its top bit flipped.
+    let at = 32 + 16 + 2 * 1344 * 8 + 2 * 3900;
+
+    data[at + 1] ^= 0x80;
 
     assert_eq!(
         hex(&SHA_256.digest(&data)),
         "31cd6503652ed4b3ab207ba14821d28e142cbb65b77a01010cef96f9ffa00de4"
     );
 
-    let attempts = if fuzz() { 4096 } else { 1 };
+    assert_eq!(
+        vectors::kem_secret_in_range(algorithm.name(), &data),
+        Some(false)
+    );
 
-    let mut accepted = None;
-
-    for _ in 0..attempts {
-        match algorithm.import_private_key(&data, KeyFormat::Raw) {
-            Ok(key) => {
-                accepted = Some(key);
-
-                break;
-            }
-            Err(error) => assert_eq!(error, Error::InvalidPrivateKey),
-        }
+    for _ in 0..if fuzz() { 4096 } else { 16 } {
+        assert_eq!(
+            algorithm.import_private_key(&data, KeyFormat::Raw).err(),
+            Some(Error::InvalidPrivateKey)
+        );
     }
 
-    assert!(accepted.is_some() || !fuzz());
+    data[at..at + 2].copy_from_slice(&(-2i16).to_le_bytes());
 
-    if let Some(key) = accepted {
-        check_kem_key(algorithm, &key, &data, KeyFormat::Raw);
-    }
+    assert_eq!(
+        vectors::kem_secret_in_range(algorithm.name(), &data),
+        Some(true)
+    );
+
+    check_kem_private(algorithm, &data, KeyFormat::Raw);
 }
 
 #[test]

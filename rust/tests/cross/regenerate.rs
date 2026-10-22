@@ -10,20 +10,24 @@
 use std::collections::HashSet;
 
 use crypto_pq::{
-    HASH_SLH_DSA_SHA2_128F_WITH_SHA256, HASH_SLH_DSA_SHA2_128S_WITH_SHA256,
-    HASH_SLH_DSA_SHA2_192F_WITH_SHA512, HASH_SLH_DSA_SHA2_192S_WITH_SHA512,
-    HASH_SLH_DSA_SHA2_256F_WITH_SHA512, HASH_SLH_DSA_SHA2_256S_WITH_SHA512,
-    HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128, HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128,
-    HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256, HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256,
-    HASH_SLH_DSA_SHAKE_256F_WITH_SHAKE256, HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256, HMAC_SHA_256,
-    HSS_LMS, KeyFormat, SHA_256, SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F,
-    SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F,
-    SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F,
-    SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, SignatureKeyPair, StatefulKeyGenOptions,
-    StatefulLoadOptions, StatefulParameters, StatefulSignatureAlgorithm, XMSS, XMSS_MT, hazmat,
+    FRODOKEM_976_AES, FRODOKEM_1344_SHAKE, HASH_SLH_DSA_SHA2_128F_WITH_SHA256,
+    HASH_SLH_DSA_SHA2_128S_WITH_SHA256, HASH_SLH_DSA_SHA2_192F_WITH_SHA512,
+    HASH_SLH_DSA_SHA2_192S_WITH_SHA512, HASH_SLH_DSA_SHA2_256F_WITH_SHA512,
+    HASH_SLH_DSA_SHA2_256S_WITH_SHA512, HASH_SLH_DSA_SHAKE_128F_WITH_SHAKE128,
+    HASH_SLH_DSA_SHAKE_128S_WITH_SHAKE128, HASH_SLH_DSA_SHAKE_192F_WITH_SHAKE256,
+    HASH_SLH_DSA_SHAKE_192S_WITH_SHAKE256, HASH_SLH_DSA_SHAKE_256F_WITH_SHAKE256,
+    HASH_SLH_DSA_SHAKE_256S_WITH_SHAKE256, HMAC_SHA_256, HSS_LMS, KemAlgorithm, KeyFormat, SHA_256,
+    SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F,
+    SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F, SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F,
+    SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F, SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm,
+    SignatureKeyPair, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
+    StatefulSignatureAlgorithm, XMSS, XMSS_MT, hazmat,
 };
 
-use super::vectors::{Fields, Group, Record, der, fixture, get, groups, header, hex, remove, set};
+use super::vectors::{
+    Fields, Group, Record, der, fixture, get, groups, header, hex, kem_secret_in_range,
+    ml_kem_decode12, ml_kem_encode12, ml_kem_inverse_ntt, ml_kem_ntt, remove, set, unhex,
+};
 use super::{MemoryStore, execute};
 
 // splitmix64, the fixed generator of the inputs of the earlier files; the same seed gives the same
@@ -445,6 +449,11 @@ fn hss_states(seed_check: &str) -> Vec<StateCase> {
 
     let other_shake = u32_bytes(ots_code("LMOTS_SHAKE_N24_W4"));
 
+    // The LM-OTS type of the bottom level, which no length depends on.
+    let lower_type = edited(&eight, |body| {
+        body[63..67].copy_from_slice(&u32_bytes(ots_code("LMOTS_SHA256_N24_W2")));
+    });
+
     let invalid = "INVALID_PRIVATE_KEY";
 
     let mismatch = "ALGORITHM_MISMATCH";
@@ -600,6 +609,14 @@ fn hss_states(seed_check: &str) -> Vec<StateCase> {
         ),
         ("load levels of two output sizes", two_sizes, None, invalid),
         ("load total height 65", tall, None, invalid),
+        // 11.9 item 6 [D-73]: the tree of that level built from the record's secrets has another
+        // root than the record holds.
+        (
+            "load lower level of another lm-ots type",
+            lower_type,
+            None,
+            invalid,
+        ),
         (
             "sign at the capacity",
             with_next(&state, 32),
@@ -862,9 +879,178 @@ fn regenerate_errors(keys: &[HashGroup]) {
 
     println!("{name}: {written} decided records");
 
+    regenerate_secret_ranges(&mut found);
+
     regenerate_hash_slh_dsa_errors(&mut found, keys);
 
     fixture(name, &found);
+}
+
+// SPEC 8.1.4 check (4) and 8.2.4 item 3 [D-74]: a raw private key whose secret lies beyond the
+// range that key generation samples. Each ML-KEM section gains its expanded key with the first
+// coefficient of s at -eta1 or eta1 moved one further, after the case of the coefficient 4095.
+// The FrodoKEM sections, one for each n, follow the ML-KEM sections: the first key of a
+// splitmix64 stream of seeds that has an entry of S^T at -d or d, as it is and with that entry
+// moved one further.
+const SECRET_RANGES: [&str; 3] = [
+    "private key raw secret coefficient beyond eta",
+    "private key raw secret entry at the bound",
+    "private key raw secret entry beyond the bound",
+];
+
+fn regenerate_secret_ranges(found: &mut Vec<Group>) {
+    for group in found.iter_mut() {
+        let algorithm = header(group, "algorithm").to_owned();
+
+        if !algorithm.starts_with("ML-KEM-") {
+            continue;
+        }
+
+        group
+            .records
+            .retain(|record| !SECRET_RANGES.contains(&get(record, "name").unwrap()));
+
+        let expanded = unhex(&input_of(group, "private key raw expanded key"));
+
+        let mut record = record(&[
+            ("name", SECRET_RANGES[0].into()),
+            ("operation", "importPrivateKey".into()),
+            ("format", "raw".into()),
+            ("input", hex(&beyond_eta(&algorithm, &expanded))),
+        ]);
+
+        run_into(&algorithm, &mut record, "INVALID_PRIVATE_KEY");
+
+        let after = group
+            .records
+            .iter()
+            .position(|record| {
+                get(record, "name") == Some("private key raw secret coefficient 4095")
+            })
+            .unwrap();
+
+        group.records.insert(after + 1, record);
+    }
+
+    found.retain(|group| !header(group, "algorithm").starts_with("FrodoKEM-"));
+
+    let last = found
+        .iter()
+        .rposition(|group| header(group, "algorithm").starts_with("ML-KEM-"))
+        .unwrap();
+
+    let sections = [FRODOKEM_976_AES, FRODOKEM_1344_SHAKE].map(frodo_range_group);
+
+    found.splice(last + 1..last + 1, sections);
+}
+
+// The expanded key with the first coefficient of s that is -eta or eta moved one further.
+fn beyond_eta(algorithm: &str, expanded: &[u8]) -> Vec<u8> {
+    let k = (expanded.len() - 96) / 768;
+
+    let eta = if k == 2 { 3 } else { 2 };
+
+    let mut s = ml_kem_decode12(&expanded[..384 * k]);
+
+    for f in &mut s {
+        ml_kem_inverse_ntt(f);
+    }
+
+    let x = s
+        .as_flattened_mut()
+        .iter_mut()
+        .find(|x| **x == eta || **x == 3329 - eta)
+        .unwrap();
+
+    *x = if *x == eta { eta + 1 } else { 3329 - eta - 1 };
+
+    for f in &mut s {
+        ml_kem_ntt(f);
+    }
+
+    let out = [&ml_kem_encode12(&s)[..], &expanded[384 * k..]].concat();
+
+    assert_eq!(kem_secret_in_range(algorithm, &out), Some(false));
+
+    out
+}
+
+fn frodo_range_group(algorithm: KemAlgorithm) -> Group {
+    let name = algorithm.name();
+
+    let (n, d) = if name.contains("976") {
+        (976, 10)
+    } else {
+        (1344, 6)
+    };
+
+    let secret = algorithm.shared_secret_size();
+
+    let start = secret + 16 + 16 * n;
+
+    let mut stream = Stream(0x5345_4352_4554);
+
+    let (sk, at) = loop {
+        let seed = stream.bytes(3 * secret + 16);
+
+        let pair = hazmat::generate_kem_key_pair(algorithm, &seed).unwrap();
+
+        let sk = pair
+            .private_key
+            .export_key(KeyFormat::Raw)
+            .unwrap()
+            .to_vec();
+
+        let found = sk[start..start + 16 * n]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&x| u16::from_le_bytes(x))
+            .position(|x| x == d || x == 0u16.wrapping_sub(d));
+
+        if let Some(position) = found {
+            break (sk, start + 2 * position);
+        }
+    };
+
+    let entry = u16::from_le_bytes([sk[at], sk[at + 1]]);
+
+    let mut beyond = sk.clone();
+
+    let moved = if entry == d {
+        d + 1
+    } else {
+        entry.wrapping_sub(1)
+    };
+
+    beyond[at..at + 2].copy_from_slice(&moved.to_le_bytes());
+
+    assert_eq!(kem_secret_in_range(name, &sk), Some(true));
+
+    assert_eq!(kem_secret_in_range(name, &beyond), Some(false));
+
+    let mut records = Vec::new();
+
+    for (case, input, result) in [
+        (SECRET_RANGES[1], &sk, "ok"),
+        (SECRET_RANGES[2], &beyond, "INVALID_PRIVATE_KEY"),
+    ] {
+        let mut record = record(&[
+            ("name", case.into()),
+            ("operation", "importPrivateKey".into()),
+            ("format", "raw".into()),
+            ("input", hex(input)),
+        ]);
+
+        run_into(name, &mut record, result);
+
+        records.push(record);
+    }
+
+    Group {
+        header: vec![format!("[algorithm = {name}]")],
+        records,
+    }
 }
 
 // hss.txt and xmss.txt: the state record a key stores at generation and after its signature.

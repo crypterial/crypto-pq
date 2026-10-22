@@ -211,7 +211,7 @@ impl KemAlgorithm {
     ///
     /// A raw ML-KEM key is the 64-byte seed or the expanded decapsulation key; a raw FrodoKEM key
     /// is the standard secret key. An imported key without its seed, and every FrodoKEM key, must
-    /// pass a pairwise test.
+    /// have its secret in the range that key generation samples and pass a pairwise test.
     pub fn import_private_key(
         &self,
         data: &[u8],
@@ -232,7 +232,8 @@ impl KemAlgorithm {
     }
 
     // A raw FrodoKEM private key is the standard sk, with no seed form: its length must be exact,
-    // its pkh must match the public key inside it, and it must pass the pairwise test.
+    // its pkh must match the public key inside it, S^T must lie in the support of chi, and it must
+    // pass the pairwise test.
     fn import_raw(&self, raw: &[u8]) -> Result<KemPrivateKey, Error> {
         match self.scheme {
             #[cfg(feature = "frodokem")]
@@ -283,7 +284,8 @@ impl KemAlgorithm {
         Err(Error::Unsupported)
     }
 
-    // SPEC 8.1.4: the checks of the encoding, then a pairwise test with fresh randomness.
+    // SPEC 8.1.4: the checks of the encoding and of the range of the secret, then a pairwise test
+    // with fresh randomness.
     #[cfg(feature = "ml-kem")]
     fn key_from_expanded(&self, p: Parameters, dk: &[u8]) -> Result<KemPrivateKey, Error> {
         if !mlkem::check_decapsulation_key(dk, &p) {

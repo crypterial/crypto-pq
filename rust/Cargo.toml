@@ -82,7 +82,17 @@ required-features = ["blake3"]
 
 [[test]]
 name = "cross"
-required-features = ["ml-kem", "ml-dsa", "slh-dsa", "lms", "xmss", "hmac", "sha3", "hazmat"]
+required-features = [
+    "ml-kem",
+    "frodokem",
+    "ml-dsa",
+    "slh-dsa",
+    "lms",
+    "xmss",
+    "hmac",
+    "sha3",
+    "hazmat",
+]
 
 [[test]]
 name = "ct"

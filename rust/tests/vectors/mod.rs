@@ -364,3 +364,157 @@ pub fn fixture(name: &str, groups: &[Group]) {
         "{name} differs from what its generator writes; run the generator with CRYPTO_PQ_REGENERATE=1"
     );
 }
+
+// The NTT of ML-KEM as FIPS 203 writes it (Algorithms 9 and 10), on coefficients modulo q, for the
+// tests that read or build the secret vector of an expanded key.
+const ML_KEM_Q: u32 = 3329;
+
+fn ml_kem_zeta(i: u32) -> u32 {
+    let exponent = i.reverse_bits() >> 25;
+
+    (0..exponent).fold(1, |zeta, _| zeta * 17 % ML_KEM_Q)
+}
+
+pub fn ml_kem_ntt(f: &mut [u32; 256]) {
+    let mut i = 1;
+
+    let mut length = 128;
+
+    while length >= 2 {
+        for start in (0..256).step_by(2 * length) {
+            let zeta = ml_kem_zeta(i);
+
+            i += 1;
+
+            for j in start..start + length {
+                let t = zeta * f[j + length] % ML_KEM_Q;
+
+                f[j + length] = (f[j] + ML_KEM_Q - t) % ML_KEM_Q;
+
+                f[j] = (f[j] + t) % ML_KEM_Q;
+            }
+        }
+
+        length /= 2;
+    }
+}
+
+pub fn ml_kem_inverse_ntt(f: &mut [u32; 256]) {
+    let mut i = 127;
+
+    let mut length = 2;
+
+    while length <= 128 {
+        for start in (0..256).step_by(2 * length) {
+            let zeta = ml_kem_zeta(i);
+
+            i -= 1;
+
+            for j in start..start + length {
+                let t = f[j];
+
+                f[j] = (t + f[j + length]) % ML_KEM_Q;
+
+                f[j + length] = zeta * ((f[j + length] + ML_KEM_Q - t) % ML_KEM_Q) % ML_KEM_Q;
+            }
+        }
+
+        length *= 2;
+    }
+
+    for x in f.iter_mut() {
+        *x = *x * 3303 % ML_KEM_Q;
+    }
+}
+
+// ByteDecode12 and ByteEncode12 of k polynomials, without reducing the decoded values.
+pub fn ml_kem_decode12(data: &[u8]) -> Vec<[u32; 256]> {
+    data.as_chunks::<384>()
+        .0
+        .iter()
+        .map(|chunk| {
+            let mut f = [0; 256];
+
+            for (pair, bytes) in f
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(chunk.as_chunks::<3>().0)
+            {
+                let [b0, b1, b2] = bytes.map(u32::from);
+
+                pair[0] = b0 | (b1 & 0x0F) << 8;
+
+                pair[1] = b1 >> 4 | b2 << 4;
+            }
+
+            f
+        })
+        .collect()
+}
+
+pub fn ml_kem_encode12(polynomials: &[[u32; 256]]) -> Vec<u8> {
+    polynomials
+        .iter()
+        .flat_map(|f| {
+            f.as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|&[a, b]| [a as u8, (a >> 8 | b << 4) as u8, (b >> 4) as u8])
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+// Whether the secret of a raw KEM private key lies in the range that key generation samples
+// (SPEC 8.1.4 check (4), 8.2.4 item 3): every coefficient of s = NTT^-1(ŝ) of an ML-KEM expanded
+// key in [-eta1, eta1], with ŝ canonical; every entry of the S^T of a FrodoKEM key in [-d, d] modulo
+// 2^16, d = 10 for n = 976 and 6 for n = 1344. None for any other length or algorithm.
+pub fn kem_secret_in_range(name: &str, raw: &[u8]) -> Option<bool> {
+    let ml_kem = [
+        ("ML-KEM-512", 2, 3),
+        ("ML-KEM-768", 3, 2),
+        ("ML-KEM-1024", 4, 2),
+    ];
+
+    if let Some(&(_, k, eta)) = ml_kem.iter().find(|(set, _, _)| *set == name) {
+        if raw.len() != 768 * k + 96 {
+            return None;
+        }
+
+        let s_hat = ml_kem_decode12(&raw[..384 * k]);
+
+        if s_hat.iter().flatten().any(|&x| x >= ML_KEM_Q) {
+            return Some(false);
+        }
+
+        return Some(s_hat.into_iter().all(|mut f| {
+            ml_kem_inverse_ntt(&mut f);
+
+            f.iter().all(|&x| x <= eta || x >= ML_KEM_Q - eta)
+        }));
+    }
+
+    let (n, secret, d) = if name.contains("FrodoKEM-976") {
+        (976, 24, 10)
+    } else if name.contains("FrodoKEM-1344") {
+        (1344, 32, 6)
+    } else {
+        return None;
+    };
+
+    let start = secret + 16 + 16 * n;
+
+    if raw.len() != start + 16 * n + secret {
+        return None;
+    }
+
+    Some(
+        raw[start..start + 16 * n]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&x| u16::from_le_bytes(x))
+            .all(|x| x <= d || x >= 0u16.wrapping_sub(d)),
+    )
+}

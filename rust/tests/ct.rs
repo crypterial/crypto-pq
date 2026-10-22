@@ -117,7 +117,7 @@ fn frodokem() {
 }
 
 // A FrodoKEM private key from outside is secret as a whole: the import declassifies only its public
-// key and pkh.
+// key and pkh, and of the range check of S^T only its outcome, which refuses an entry beyond it.
 #[test]
 fn imported_frodokem_keys() {
     for (algorithm, seed_size, _) in FRODO {
@@ -128,6 +128,20 @@ fn imported_frodokem_keys() {
         secret(&sk);
 
         let imported = algorithm.import_private_key(&sk, KeyFormat::Raw).unwrap();
+
+        // The high byte of the last entry of S^T, just before pkh.
+        let mut beyond = sk.to_vec();
+
+        let at = beyond.len() - algorithm.shared_secret_size() - 1;
+
+        beyond[at] ^= 0x40;
+
+        secret(&beyond);
+
+        assert_eq!(
+            algorithm.import_private_key(&beyond, KeyFormat::Raw).err(),
+            Some(Error::InvalidPrivateKey)
+        );
 
         for decapsulator in [&pair.private_key, &imported] {
             let encapsulation = imported.public_key().encapsulate().unwrap();
@@ -317,6 +331,21 @@ fn imported_kem_keys() {
                 KeyFormat::Raw,
             )
             .unwrap();
+
+        // Coefficient 0 of ŝ set to another canonical value, which leaves s outside [-eta1, eta1]:
+        // only the outcome of the range check is declassified.
+        let mut beyond = expanded.clone();
+
+        beyond[0] = u8::from(beyond[0] == 0 && beyond[1] & 0x0F == 0);
+
+        beyond[1] &= 0xF0;
+
+        secret(&beyond);
+
+        assert_eq!(
+            algorithm.import_private_key(&beyond, KeyFormat::Raw).err(),
+            Some(Error::InvalidPrivateKey)
+        );
 
         secret(&expanded);
 

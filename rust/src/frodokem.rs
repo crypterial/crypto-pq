@@ -688,18 +688,75 @@ pub(crate) fn decapsulate(p: &Parameters, sk: &[u8], ciphertext: &[u8]) -> [u8; 
     shared_secret
 }
 
-// The import check of a raw private key: pkh must be SHAKE(pk) of the public key inside it. Both
-// are public.
+// The import checks of a raw private key before its pairwise test (SPEC 8.2.4 item 3): pkh must be
+// SHAKE(pk) of the public key inside it, both public, and S^T must lie in the support of chi.
 pub(crate) fn check_private_key(p: &Parameters, sk: &[u8]) -> bool {
     let secret = p.secret_size;
 
-    let pk = &sk[secret..secret + p.public_key_size()];
+    let (pk, rest) = sk[secret..].split_at(p.public_key_size());
 
-    let pkh = &sk[sk.len() - secret..];
+    let (st, pkh) = rest.split_at(2 * BAR * p.n);
 
     declassify(pk);
 
     declassify(pkh);
 
-    ct::equal(&public_key_hash(p, pk)[..secret], pkh)
+    ct::equal(&public_key_hash(p, pk)[..secret], pkh) && short_secret(p, st)
+}
+
+// Whether every entry of S^T lies in [-d, d] modulo q = 2^16, for the d entries of T_chi that
+// Sample reads: the values that KeyGen samples (draft 6.5, 7.1.1) [D-74]. Every entry is compared
+// without a branch; only the outcome is declassified, as the import fails on it.
+fn short_secret(p: &Parameters, st: &[u8]) -> bool {
+    let bound = p.cdf.len() as u32;
+
+    let mut outside = 0;
+
+    // x + d mod 2^16 is at most 2d exactly when x is in [-d, d] modulo 2^16.
+    for x in st.as_chunks::<2>().0 {
+        outside |= (2 * bound).wrapping_sub((u32::from(u16::from_le_bytes(*x)) + bound) & 0xFFFF);
+    }
+
+    ct::declassify_value(black_box(outside) >> 31) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // S^T of a private key: every entry at -d or d passes, one beyond either bound or with its top
+    // bit flipped fails, at any position.
+    #[test]
+    fn secret_range() {
+        for p in [FRODOKEM_976_AES, FRODOKEM_1344_SHAKE] {
+            let d = p.cdf.len() as i32;
+
+            let entries = BAR * p.n;
+
+            let encoded = |values: &[i32]| -> Vec<u8> {
+                values
+                    .iter()
+                    .flat_map(|&x| (x as u16).to_le_bytes())
+                    .collect()
+            };
+
+            let mut st: Vec<i32> = (0..entries)
+                .map(|i| if i % 2 == 0 { d } else { -d })
+                .collect();
+
+            assert!(short_secret(&p, &encoded(&st)));
+
+            for position in [0, 1, entries / 2, entries - 1] {
+                let original = st[position];
+
+                for beyond in [d + 1, -d - 1, original ^ 0x8000, 0x7FFF] {
+                    st[position] = beyond;
+
+                    assert!(!short_secret(&p, &encoded(&st)), "{beyond}");
+                }
+
+                st[position] = original;
+            }
+        }
+    }
 }

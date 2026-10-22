@@ -519,3 +519,18 @@ root, so a root that its own secrets do not give means a damaged or inconsistent
 example a lower level whose LM-OTS type was changed, which keeps every length; that is the meaning of
 INVALID_PRIVATE_KEY ([7.1](07-errors.md#71-error-codes)), and the top root already follows the same rule ([11.9](11-stateful-signatures.md#119-loading) item 3).
 SELF_TEST_FAILED stays for a parent signature that does not verify a root that matches.
+
+## Decision D-74
+
+Importing a KEM private key that holds no seed refuses every secret that key generation cannot
+produce: every coefficient of s = NTT^−1(ŝ) of an ML-KEM expanded key lies in [−η1, η1], and every
+entry of the S^T of a FrodoKEM key lies in the support {−d, …, d} of χ ([8.1.4](08-key-encapsulation.md#814-private-key-import) check (4),
+[8.2.4](08-key-encapsulation.md#824-keys-and-import) item 3). Both checks examine every coefficient without a secret-dependent branch and
+declassify only their result, the outcome of a validity check that fails the call ([14.1](14-security.md#141-constant-time) item 5).
+The pairwise tests of [D-06](#decision-d-06) and [D-47](#decision-d-47) stay: they also check that the secret belongs to the
+public key. Rationale: a pairwise test with fresh randomness can accept a key that is wrong for
+some ciphertexts and refuse it on the next import; a FrodoKEM key with the top bit of one entry of
+S^T flipped passes it for about 2^−8 of the encapsulations. The range checks give the same result
+every time. A secret changed within the range is left to the pairwise test, which one changed entry
+of S^T passes for about 2^−24 (n = 976) or 2^−32 (n = 1344) of the encapsulations. The cost is one
+inverse NTT per polynomial of ŝ and one pass over S^T.

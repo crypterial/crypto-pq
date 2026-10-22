@@ -34,13 +34,15 @@
 | form | checks, in order | failure |
 |---|---|---|
 | seed (64 bytes) | none beyond the length; the keys are computed with ML-KEM.KeyGen_internal | |
-| expanded key only (768k + 96 bytes) | (1) the hash check of FIPS 203 §7.3: H(ek) equals the stored h; (2) the modulus check of FIPS 203 §7.2 on the embedded ek; (3) the same check on the first 384k bytes (the encoding of the secret vector ŝ): every 12-bit coefficient is less than q, checked without a secret-dependent branch and with only the overall result declassified [[D-61](decisions.md#decision-d-61)]; (4) a pairwise consistency test [[D-06](decisions.md#decision-d-06)]: encapsulate under the embedded ek with fresh randomness, decapsulate with the key, and compare the two shared secrets in constant time | INVALID_PRIVATE_KEY; RNG_FAILURE if the entropy source fails |
+| expanded key only (768k + 96 bytes) | (1) the hash check of FIPS 203 §7.3: H(ek) equals the stored h; (2) the modulus check of FIPS 203 §7.2 on the embedded ek; (3) the same check on the first 384k bytes (the encoding of the secret vector ŝ): every 12-bit coefficient is less than q, checked without a secret-dependent branch and with only the overall result declassified [[D-61](decisions.md#decision-d-61)]; (4) the range check of the secret vector: every coefficient of s = NTT^−1(ŝ) (FIPS 203 §4.3, Algorithm 10) lies in [−η1, η1] modulo q, the values that SamplePolyCBD_η1 gives in K-PKE.KeyGen (FIPS 203 Algorithms 8 and 13), checked without a secret-dependent branch and with only the overall result declassified [[D-74](decisions.md#decision-d-74)]; (5) a pairwise consistency test [[D-06](decisions.md#decision-d-06)]: encapsulate under the embedded ek with fresh randomness, decapsulate with the key, and compare the two shared secrets in constant time | INVALID_PRIVATE_KEY; RNG_FAILURE if the entropy source fails |
 | both (PKCS#8 `both`) | the seed consistency check of RFC 9935 §8: the expanded key computed from the seed equals the given expanded key, compared in constant time | INVALID_PRIVATE_KEY |
 | any PKCS#8 form with a `publicKey` field | the field equals the public key of the imported private key | INVALID_PRIVATE_KEY |
 
-Rationale for check (4): an expanded key with a modified secret vector and an unchanged H(ek) passes
-the FIPS 203 checks but decapsulates wrongly (RFC 9935 Appendix C.4, second example). The test detects
-it. Its result is declassified because the import fails on it.
+Rationale for checks (4) and (5): an expanded key with a modified secret vector and an unchanged H(ek)
+passes the FIPS 203 checks but decapsulates wrongly (RFC 9935 Appendix C.4, second example). Check (4)
+refuses, every time, each such key whose secret key generation cannot produce; check (5) detects the
+others, which decapsulate almost every ciphertext wrongly. Their results are declassified because the
+import fails on them.
 
 ### 8.1.5 Raw private key export
 
@@ -86,8 +88,12 @@ as their seed and randomness (Section [13](13-hazmat.md)).
 2. The private key is sk = s || seedA || b || S^T || pkh ([FRODO-DRAFT] §7.1). There is no seed form;
    export always returns sk.
 3. Private import MUST check, in order: the exact length (INVALID_LENGTH); pkh equals
-   SHAKE256(seedA || b) truncated to len_sec/8 bytes (INVALID_PRIVATE_KEY); a pairwise consistency
-   test as in [8.1.4](#814-private-key-import) (4) (INVALID_PRIVATE_KEY, or RNG_FAILURE) [[D-47](decisions.md#decision-d-47)].
+   SHAKE256(seedA || b) truncated to len_sec/8 bytes (INVALID_PRIVATE_KEY); every entry of S^T, a
+   signed 16-bit integer ([FRODO-DRAFT] §7.1.1), lies in the support S_χ = {−d, …, d} of the error
+   distribution ([FRODO-DRAFT] §6.5), d = 10 for n = 976 and 6 for n = 1344 (§9.1, Table 1), checked
+   without a secret-dependent branch and with only the overall result declassified
+   (INVALID_PRIVATE_KEY) [[D-74](decisions.md#decision-d-74)]; a pairwise consistency test as in [8.1.4](#814-private-key-import) (5) (INVALID_PRIVATE_KEY, or
+   RNG_FAILURE) [[D-47](decisions.md#decision-d-47)].
 
 ### 8.2.5 Formats
 

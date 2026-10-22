@@ -204,8 +204,8 @@ fn api() {
             );
         }
 
-        // A changed public key fails the pkh check, and a changed S^T, which passes it, the
-        // pairwise test (SPEC 8.2.4 item 3).
+        // A changed public key fails the pkh check, and a changed S^T, which passes it, the range
+        // check of S^T or the pairwise test (SPEC 8.2.4 item 3).
         for position in [
             secret_size,
             secret_size + public_size - 1,

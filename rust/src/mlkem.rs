@@ -1121,8 +1121,9 @@ pub(crate) fn check_encapsulation_key(ek: &[u8], p: &Parameters) -> bool {
         })
 }
 
-// SPEC 8.1.4, checks (1) to (3) of an expanded key: H(ek) is the stored h, ek passes the modulus
-// check, and so does the encoding of the secret vector, which is checked without a branch on it.
+// SPEC 8.1.4, checks (1) to (4) of an expanded key: H(ek) is the stored h, ek passes the modulus
+// check, and so does the encoding of the secret vector, whose coefficients lie in the range that
+// key generation samples; the last two are checked without a branch on the secret.
 pub(crate) fn check_decapsulation_key(dk: &[u8], p: &Parameters) -> bool {
     let k = p.k;
 
@@ -1138,6 +1139,7 @@ pub(crate) fn check_decapsulation_key(dk: &[u8], p: &Parameters) -> bool {
     ct::equal(&sha3_256(&[ek]), &dk[768 * k + 32..768 * k + 64])
         && check_encapsulation_key(ek, p)
         && canonical_secret(&dk[..384 * k])
+        && short_secret(&dk[..384 * k], p.eta1 as u32)
 }
 
 // Whether every 12-bit coefficient of the encoded secret vector is below q: q - 1 - d wraps to a
@@ -1159,6 +1161,37 @@ fn canonical_secret(s: &[u8]) -> bool {
     }
 
     ct::declassify_value(high >> 31) == 0
+}
+
+// Whether s = NTT^-1(ŝ) of a canonical encoding has every coefficient in [-eta, eta], as
+// SamplePolyCBD gives them (FIPS 203, Algorithms 8 and 13) [D-74]. The transform and the
+// comparisons run on every coefficient; only the outcome is declassified, as the import fails on
+// it.
+fn short_secret(s: &[u8], eta: u32) -> bool {
+    let mut outside = 0;
+
+    for polynomial in s.as_chunks::<384>().0 {
+        let mut s_hat = decode12(polynomial);
+
+        let mut w: Wide = s_hat.map(i32::from);
+
+        let mut f = inverse_ntt(&w);
+
+        // x + eta mod q is at most 2 eta exactly when x is in [-eta, eta] modulo q.
+        for &x in &f {
+            outside |= (2 * eta).wrapping_sub(u32::from(subtract_q(u32::from(x) + eta)));
+        }
+
+        outside = black_box(outside);
+
+        wipe(&mut s_hat);
+
+        wipe(&mut w);
+
+        wipe(&mut f);
+    }
+
+    ct::declassify_value(outside >> 31) == 0
 }
 
 pub(crate) fn public_key_of<'a>(dk: &'a [u8], p: &Parameters) -> &'a [u8] {
@@ -1695,6 +1728,47 @@ mod tests {
                 let exact = (((u32::from(x) << d) + 1664) / Q) & ((1 << d) - 1);
 
                 assert_eq!(u32::from(compress(x, d)), exact, "x = {x}, d = {d}");
+            }
+        }
+    }
+
+    // The secret vector of an expanded key: every coefficient at -eta or eta passes, one beyond
+    // either bound fails, in any polynomial and at any position.
+    #[test]
+    fn secret_range() {
+        let encoded = |s: &[Poly]| {
+            let mut out = vec![0; 384 * s.len()];
+
+            for (f, chunk) in s.iter().zip(out.as_chunks_mut::<384>().0) {
+                let mut f = *f;
+
+                ntt(&mut f);
+
+                byte_encode(&f, 12, chunk);
+            }
+
+            out
+        };
+
+        let modulo = |x: i32| x.rem_euclid(Q as i32) as u16;
+
+        for eta in [2, 3] {
+            let mut s = vec![[0; 256]; 3];
+
+            for (i, x) in s.as_flattened_mut().iter_mut().enumerate() {
+                *x = modulo(if i % 2 == 0 { eta } else { -eta });
+            }
+
+            assert!(short_secret(&encoded(&s), eta as u32));
+
+            for (polynomial, position) in [(0, 0), (1, 77), (2, 255)] {
+                for beyond in [eta + 1, -eta - 1, 1664, -1664] {
+                    let mut changed = s.clone();
+
+                    changed[polynomial][position] = modulo(beyond);
+
+                    assert!(!short_secret(&encoded(&changed), eta as u32), "{beyond}");
+                }
             }
         }
     }
