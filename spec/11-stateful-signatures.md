@@ -254,9 +254,11 @@ records were written only by pre-release versions.
      INVALID_PRIVATE_KEY.
 5. If i = N, apply [11.12](#1112-exhaustion) item 2, ignore the tree cache, build no tree, and continue with item 7.
 6. If `treeCache` is present, open it as in [11.10](#1110-tree-cache). Then build the tree t_l(i) of every level l that is
-   current for i, from the cached nodes where the cache holds that tree, and verify every signed
-   record that is current for i (its parent signature against its parent); fail with
-   SELF_TEST_FAILED if one does not verify.
+   current for i, from the cached nodes where the cache holds that tree. A child tree built from the
+   secrets of its record MUST have the root that the record stores; a mismatch fails with
+   INVALID_PRIVATE_KEY, as for the top root (item 3) [[D-73](decisions.md#decision-d-73)]; a cached tree follows [11.10](#1110-tree-cache) item 4. Then
+   verify every signed record that is current for i (its parent signature against its parent); fail
+   with SELF_TEST_FAILED if one does not verify.
 7. Return the key object. The skip of item 4 is made durable by the next claim write.
 
 `remainingSignatures()` returns N − i for the in-memory index i. Indices in [i, next) that were

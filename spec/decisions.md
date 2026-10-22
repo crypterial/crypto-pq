@@ -508,3 +508,14 @@ secret, and only the decision to reject is public. Side channels on the challeng
 attempts are a demonstrated threat: [KARABULUT21] recovers their signs, and [ZHOU25] recovers the
 private key from rejected challenges together with the rejected responses. The declassified bit is
 expected fewer than 2^−23 times in 2^64 attempts, and no fixed amount of stream avoids it entirely.
+
+## Decision D-73
+
+At load, a child tree that is current for the loaded index and is built from the secrets of its
+level record has the root that the record stores; a mismatch fails with INVALID_PRIVATE_KEY
+before any parent signature is verified ([11.9](11-stateful-signatures.md#119-loading) item 6). A tree taken from a tree cache keeps
+the rule of [11.10](11-stateful-signatures.md#1110-tree-cache) item 4 (INVALID_ENCODING). Rationale: the record is the only source of a child
+root, so a root that its own secrets do not give means a damaged or inconsistent record, for
+example a lower level whose LM-OTS type was changed, which keeps every length; that is the meaning of
+INVALID_PRIVATE_KEY ([7.1](07-errors.md#71-error-codes)), and the top root already follows the same rule ([11.9](11-stateful-signatures.md#119-loading) item 3).
+SELF_TEST_FAILED stays for a parent signature that does not verify a root that matches.
