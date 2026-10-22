@@ -628,29 +628,40 @@ fn stable_kem_public(algorithm: KemAlgorithm, key: &KemPublicKey) {
 }
 
 fn check_kem_private(algorithm: KemAlgorithm, data: &[u8], format: KeyFormat) {
-    let Some(key) = expect_codes(
+    if let Some(key) = expect_codes(
         algorithm.import_private_key(data, format),
         &kem_codes(algorithm, format, Error::InvalidPrivateKey),
         algorithm.name(),
         data,
-    ) else {
-        return;
-    };
+    ) {
+        check_kem_key(algorithm, &key, data, format);
+    }
+}
 
+// A private key that the import of `data` accepted.
+fn check_kem_key(algorithm: KemAlgorithm, key: &KemPrivateKey, data: &[u8], format: KeyFormat) {
     if format == KeyFormat::Raw {
         assert_eq!(*key.export_key(format).expect("export"), *data);
     }
 
+    let (seed, randomness) = kem_sizes(algorithm);
+
+    let raw = key.export_key(KeyFormat::Raw).expect("export");
+
+    // The pairwise test of an expanded or FrodoKEM key uses fresh randomness (SPEC 8.1.4 check (4),
+    // 8.2.4 item 3): a key with another secret that decapsulates some ciphertexts rightly can pass
+    // one import and fail the next. A key held as its seed has no such test.
     for format in FORMATS {
         if let Ok(exported) = key.export_key(format) {
-            let again = algorithm
-                .import_private_key(&exported, format)
-                .expect("re-import");
-
-            assert_eq!(
-                *again.export_key(KeyFormat::Raw).expect("export"),
-                *key.export_key(KeyFormat::Raw).expect("export")
-            );
+            match algorithm.import_private_key(&exported, format) {
+                Ok(again) => assert_eq!(*again.export_key(KeyFormat::Raw).expect("export"), *raw),
+                Err(error) => assert!(
+                    raw.len() != seed && error == Error::InvalidPrivateKey,
+                    "{}: re-import: {error} for {}",
+                    algorithm.name(),
+                    hex(data)
+                ),
+            }
         }
     }
 
@@ -658,8 +669,6 @@ fn check_kem_private(algorithm: KemAlgorithm, data: &[u8], format: KeyFormat) {
     // hash of the public part of an expanded key, so one with another secret vector is accepted
     // and gives the implicit rejection, SHAKE256(z || c); FrodoKEM checks pkh and gives
     // SHAKE256(c || s) with another S^T.
-    let (seed, randomness) = kem_sizes(algorithm);
-
     let encapsulation =
         hazmat::encapsulate(&key.public_key(), &vec![0; randomness]).expect("encapsulation");
 
@@ -668,8 +677,6 @@ fn check_kem_private(algorithm: KemAlgorithm, data: &[u8], format: KeyFormat) {
         .expect("decapsulation");
 
     if *secret != *encapsulation.shared_secret {
-        let raw = key.export_key(KeyFormat::Raw).expect("export");
-
         assert_ne!(raw.len(), seed);
 
         let size = algorithm.shared_secret_size();
@@ -702,6 +709,55 @@ fn inconsistent_expanded_kem_key() {
             algorithm.import_private_key(&dk, KeyFormat::Raw).err(),
             Some(Error::InvalidPrivateKey)
         );
+    }
+}
+
+// The key that a long run of kem_import found: a FrodoKEM key whose S^T has the top bit of one
+// coefficient flipped. That adds 2^15 times an entry of B' to each of 8 entries of one column of
+// B'S, so the pairwise test of the import (SPEC 8.2.4 item 3) passes for about 2^-8 of its fresh
+// encapsulations: one import accepted the key and the re-import refused it. The long run imports
+// it until it is accepted.
+#[test]
+fn kem_key_accepted_by_chance() {
+    let algorithm = FRODOKEM_1344_AES;
+
+    let (seed, _) = kem_sizes(algorithm);
+
+    let pair = hazmat::generate_kem_key_pair(algorithm, &pattern(seed, 0)).expect("key");
+
+    let mut data = pair
+        .private_key
+        .export_key(KeyFormat::Raw)
+        .expect("export")
+        .to_vec();
+
+    // The high byte of coefficient 3900 of S^T, which follows s, seedA and b.
+    data[32 + 16 + 2 * 1344 * 8 + 2 * 3900 + 1] ^= 0x80;
+
+    assert_eq!(
+        hex(&SHA_256.digest(&data)),
+        "31cd6503652ed4b3ab207ba14821d28e142cbb65b77a01010cef96f9ffa00de4"
+    );
+
+    let attempts = if fuzz() { 4096 } else { 1 };
+
+    let mut accepted = None;
+
+    for _ in 0..attempts {
+        match algorithm.import_private_key(&data, KeyFormat::Raw) {
+            Ok(key) => {
+                accepted = Some(key);
+
+                break;
+            }
+            Err(error) => assert_eq!(error, Error::InvalidPrivateKey),
+        }
+    }
+
+    assert!(accepted.is_some() || !fuzz());
+
+    if let Some(key) = accepted {
+        check_kem_key(algorithm, &key, &data, KeyFormat::Raw);
     }
 }
 
