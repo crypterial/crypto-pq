@@ -69,12 +69,11 @@ const MACS: [MacAlgorithm; 9] = [
 
 const KDFS: [KdfAlgorithm; 4] = [HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512, BLAKE3_KDF];
 
-// Every key the dictionary of SPEC 19.3 gives these files; zeroAbsentResult is for Go alone.
-const KEYS: [&str; 18] = [
+// Every key the dictionary of SPEC 19.3 gives these files.
+const KEYS: [&str; 17] = [
     "name",
     "operation",
     "result",
-    "zeroAbsentResult",
     "output",
     "message",
     "key",

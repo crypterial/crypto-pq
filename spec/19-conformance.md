@@ -13,7 +13,7 @@ An implementation conforms to this specification when:
 ## 19.2 Compliance suite
 
 The compliance suite is the content of the `vectors/` directory, fixed by `vectors/SHA256SUMS`. An
-implementation MUST run all of it; a record MUST NOT be skipped except as [19.3](#193-cross-check-files) item 6 allows. Each file records
+implementation MUST run all of it; a record MUST NOT be skipped. Each file records
 its source URL and SHA-256 in the fetch or generation tool that produced it.
 
 | directory | content |
@@ -76,7 +76,6 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
    | `operation` | text | the operation of the record; see the operation table below |
    | `format` | text | `raw`, `der` or `pem`: the format of `input` (import) or of `output` (export) |
    | `result` | text | item 3 |
-   | `zeroAbsentResult` | text | item 6 |
    | `mode` | text | `hazmat`: `hazmat.sign` with `randomness` and without the strength rule; `deterministic`: the public `sign` with `deterministic = true` |
    | `preHash` | text | `none`, or the ACVP name of the pre-hash: `SHA2-224`, `SHA2-256`, `SHA2-384`, `SHA2-512`, `SHA2-512/224`, `SHA2-512/256`, `SHA3-224`, `SHA3-256`, `SHA3-384`, `SHA3-512`, `SHAKE-128`, `SHAKE-256`, naming `SHA_224` … `SHAKE256` |
    | `parameters` | text | an XMSS or XMSS^MT parameter set name ([5.3](05-algorithms.md#53-stateful-hash-based-signatures)); error cases use invalid names on purpose |
@@ -143,11 +142,6 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
    | `treecache.txt` | tree cache export and every load check |
    | `symmetric.txt` | every hash, XOF, MAC and KDF operation, option, limit, streaming order and error |
    | `blake3.txt` | BLAKE3-256, the BLAKE3 XOF, BLAKE3-MAC and BLAKE3-KDF: digests, tags and their verification, derived keys, option and length errors, and the `extract` and `expand` that BLAKE3-KDF refuses |
-
-6. A record that sets a numeric option to 0 MAY carry a field `zeroAbsentResult`: the expected result
-   for an implementation that cannot express an explicit option of 0 and reads 0 as "absent". The
-   runner of such an implementation MUST check that field instead of `result`; every other runner
-   checks `result`. No other exception exists.
 
 ## 19.4 Official vector sets
 
