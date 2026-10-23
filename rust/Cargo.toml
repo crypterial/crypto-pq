@@ -5,11 +5,12 @@ edition = "2024"
 rust-version = "1.88"
 description = "Fast, secure post-quantum cryptography in pure Rust with no dependencies: ML-KEM, ML-DSA, SLH-DSA, FrodoKEM, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF."
 license = "Apache-2.0 OR MIT"
-homepage = "https://crypterial.com"
+homepage = "https://crypterial.com/crypto-pq"
 repository = "https://github.com/crypterial/crypto-pq"
+readme = "README.md"
 keywords = ["post-quantum", "cryptography", "ml-kem", "ml-dsa", "slh-dsa"]
 categories = ["cryptography", "no-std"]
-include = ["/src", "/LICENSE-APACHE", "/LICENSE-MIT"]
+include = ["/src", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
 
 # Every algorithm family is a feature, and the default set enables them all. hazmat, the
 # deterministic operations for test vectors that take the caller's seeds and randomness, is opt-in.

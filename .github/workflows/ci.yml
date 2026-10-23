@@ -100,8 +100,8 @@ jobs:
       - run: rustup target add ${{ matrix.target }}
       - run: cargo test --locked --release --all-features --target ${{ matrix.target }}
 
-  # The crate that would be published builds from its declared contents alone, with the
-  # repository's license files and the default features.
+  # The crate that would be published builds from its declared contents alone, with its README,
+  # the repository's license files and the default features.
   package:
     name: crate builds cleanly
     runs-on: ubuntu-latest
@@ -114,6 +114,7 @@ jobs:
       - run: |
           cargo package --locked
           cargo package --locked --list | tee "$RUNNER_TEMP/crate-files"
+          grep -qx README.md "$RUNNER_TEMP/crate-files"
           grep -qx LICENSE-APACHE "$RUNNER_TEMP/crate-files"
           grep -qx LICENSE-MIT "$RUNNER_TEMP/crate-files"
           cmp ../LICENSE-APACHE LICENSE-APACHE

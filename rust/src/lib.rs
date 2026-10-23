@@ -522,6 +522,19 @@ pub use stateful::{XMSS, XMSS_MT};
 ))]
 pub use wipe::SecretBytes;
 
+// The examples of README.md run as doc tests.
+#[cfg(all(
+    doctest,
+    feature = "ml-kem",
+    feature = "ml-dsa",
+    feature = "lms",
+    feature = "sha3",
+    feature = "blake3",
+    feature = "hkdf"
+))]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
 // What the constant-time check of tests/ct.rs needs; it exists only under the crypto_pq_ct cfg.
 #[cfg(crypto_pq_ct)]
 #[doc(hidden)]
