@@ -4,7 +4,7 @@
 [![docs.rs](https://img.shields.io/docsrs/crypto-pq)](https://docs.rs/crypto-pq)
 [![license](https://img.shields.io/crates/l/crypto-pq.svg)](#license)
 
-Fast, secure post-quantum cryptography in pure Rust with no dependencies: ML-KEM, FrodoKEM, ML-DSA,
+Secure, optimized post-quantum cryptography in pure Rust with no dependencies: ML-KEM, FrodoKEM, ML-DSA,
 SLH-DSA, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF. The crate is
 `no_std` with `alloc` and needs Rust 1.88 or later.
 

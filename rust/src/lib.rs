@@ -1,4 +1,4 @@
-//! Fast, secure post-quantum cryptography in pure Rust with no dependencies: ML-KEM, ML-DSA,
+//! Secure, optimized post-quantum cryptography in pure Rust with no dependencies: ML-KEM, ML-DSA,
 //! SLH-DSA, FrodoKEM, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF.
 //!
 //! The crate is `no_std` and needs `alloc`. Every operation is a synchronous function; fallible
