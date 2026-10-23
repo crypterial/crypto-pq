@@ -20,7 +20,7 @@ them; [Appendix B](principles-review.md) checks the document against each one.
 | P11 | **Security first, then standards, then speed.** A check is never weakened to gain speed. |
 | P12 | **Post-quantum only.** Every asymmetric algorithm is post-quantum. No hybrid with a classical algorithm and no classical asymmetric algorithm, so X-Wing and X25519 are not part of the library. Symmetric primitives stay, at quantum-resistant sizes. |
 | P13 | **Production first.** The first release requires exact conformance to the standards, a final algorithm set and the security requirements of Section [14](14-security.md); performance work that they do not need follows the release. |
-| P14 | **Wording.** Text published by the project uses precise, professional terms. It may describe crypto-pq as secure and optimized; it never uses informal or promotional words such as "fast", or superlatives such as "fastest" or "most secure". |
+| P14 | **Wording.** Text published by the project uses precise, professional terms. It describes crypto-pq with terms such as secure and optimized, and never uses informal or promotional words such as "fast", or superlatives such as "fastest" or "most secure". |
 
 Related design decisions that this document applies:
 
