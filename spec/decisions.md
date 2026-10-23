@@ -104,8 +104,7 @@ child root again, and a fault during it can yield a different root signed by a o
 already signed the original root in every released signature (the grafting fault that SP 800-208
 §8.1 footnote 9 guards against); the parent-signature check cannot detect it, because the signature
 over the faulty root is valid. A migrated key would also keep deterministically derived child trees,
-contrary to SP 800-208 §6. Version 1 records were written only by pre-release versions, so refusing
-strands no key of a released version.
+contrary to SP 800-208 §6.
 
 ## Decision D-15
 

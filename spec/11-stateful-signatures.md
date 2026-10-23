@@ -219,15 +219,14 @@ c23b1f47ea54749876876b76a2e8f461       checksum
 
 ## 11.8 State record, version 1
 
-Records written before crypto-pq 1.0 have version 0x01. crypto-pq 1.0 MUST NOT load them:
-`loadPrivateKey` fails with INVALID_PRIVATE_KEY, as for any unknown version ([11.9](#119-loading) item 2) [[D-14](decisions.md#decision-d-14)]. It
-MUST NOT convert, rewrite or delete such a record.
+Version 0x01 is an earlier record layout that this document does not define. crypto-pq 1.0 MUST NOT
+load such a record: `loadPrivateKey` fails with INVALID_PRIVATE_KEY, as for any unknown version
+([11.9](#119-loading) item 2) [[D-14](decisions.md#decision-d-14)]. It MUST NOT convert, rewrite or delete such a record.
 
 Rationale: version 1 derived the child trees from the top secrets and signed the child roots again
 after every load, which SP 800-208 §6 and §8.1 (footnote 9) do not allow. A migration would sign each
 current child root once more; a fault during that computation could produce a different root signed
-by a one-time key that has already signed the original root in every released signature. Version 1
-records were written only by pre-release versions.
+by a one-time key that has already signed the original root in every released signature.
 
 ## 11.9 Loading
 
@@ -270,7 +269,7 @@ never reuses an index.
    entry for each level l that is current for the in-memory index i ([11.5.1](#1151-current-levels)), top first, with tree
    number t_l(i); levels that are not current are omitted [[D-17](decisions.md#decision-d-17)]. The key holds these trees from
    `generateKeyPair` or `loadPrivateKey` onward ([11.9](#119-loading) item 6) and after every successful `sign`.
-2. Format, version 1 (unchanged from the pre-1.0 format) [[D-17](decisions.md#decision-d-17)]:
+2. Format, version 1 [[D-17](decisions.md#decision-d-17)]:
 
    | field | size | value |
    |---|---|---|

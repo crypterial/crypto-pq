@@ -4,7 +4,7 @@
 
 1. The package follows Semantic Versioning 2.0.0 [[D-66](decisions.md#decision-d-66-revised-by-d-71)]. Its MAJOR.MINOR equals the version of this
    specification it implements (1.0.x implements SPEC 1.0); PATCH is independent of the
-   specification. The first production release is 1.0.0, preceded by release candidates 1.0.0-rc.N.
+   specification. The first release is 1.0.0.
 2. The package manifests (`Cargo.toml` and `Cargo.lock`) carry the release version; CI checks that
    they agree.
 
@@ -24,7 +24,7 @@
 3. A 1.x release MAY add error codes (for example `DECRYPTION_FAILED` with AEAD in 1.1). Callers MUST handle
    codes they do not know; the Rust `Error` enum is non-exhaustive ([23.1](profiles/rust.md#231-public-api-idiom) item 2).
 4. Byte formats change only by a new version number, and every 1.x release reads every format version
-   that an earlier 1.x release wrote. Formats written before 1.0 are not covered ([11.8](11-stateful-signatures.md#118-state-record-version-1)).
+   that an earlier 1.x release wrote. State record version 1 is not covered ([11.8](11-stateful-signatures.md#118-state-record-version-1)).
 5. `name` strings are never reused for another algorithm.
 
 ## 20.4 Release process

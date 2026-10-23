@@ -177,7 +177,7 @@ fn with_next(state: &[u8], next: u64) -> Vec<u8> {
 // A level record claimed for tree 0: a tree number and status 0x00 (SPEC 11.7).
 const CLAIMED: [u8; 9] = [0; 9];
 
-// The layout of crypto-pq before 1.0, which 1.0 refuses (SPEC 11.8): version 1, the kind, the
+// The earlier state record layout, which 1.0 refuses (SPEC 11.8): version 1, the kind, the
 // parameters, then for HSS the seed and the index, for XMSS and XMSS^MT the index and the seed.
 fn version_1_hss(levels: &Levels, seed: &[u8], next: u64) -> Vec<u8> {
     seal(&[&[1, 1][..], &hss_section(levels), seed, &next.to_be_bytes()].concat())

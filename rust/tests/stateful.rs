@@ -1214,11 +1214,11 @@ fn state_record_layout() {
     assert_eq!((parts.kind, parts.next, parts.levels.len()), (2, 3, 0));
 }
 
-// SPEC 11.8: a version 1 record, as crypto-pq wrote before 1.0, is refused and left as it is; so is
-// every other version.
+// SPEC 11.8: a version 1 record, the earlier layout, is refused and left as it is; so is every
+// other version.
 #[test]
 fn version_1_records_are_refused() {
-    // A version 1 HSS record, as a pre-release version wrote it.
+    // A version 1 HSS record.
     let version_1 = unhex(concat!(
         "0101010000000a00000005000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c",
         "1d1e1f2021222324252627000000000000000332b414e1d42dc2866aeed26f724a5be7",

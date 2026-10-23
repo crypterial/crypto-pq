@@ -5,7 +5,7 @@
 | Document | crypto-pq Specification |
 | Version | 1.0 |
 | Applies to | crypto-pq 1.0.x, the Rust crate `crypto-pq` ([20.1](20-versioning.md#201-versions)) |
-| Status | Release candidate |
+| Status | Published |
 | Date | 2026-10-21 |
 | Editor | Crypterial Labs |
 | License | This document is licensed under the Apache License, Version 2.0, or the MIT license, at your option (`LICENSE-APACHE`, `LICENSE-MIT`). |
