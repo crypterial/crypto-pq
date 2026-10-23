@@ -49,5 +49,6 @@
 | [ACVP] | NIST ACVP-Server, gen-val/json-files. |
 | [WYCHEPROOF] | C2SP Wycheproof, testvectors_v1. |
 | [LWEKE] | microsoft/PQCrypto-LWEKE, the FrodoKEM reference implementation. |
+| [BSI-MCELIECE] | Federal Office for Information Security (BSI), note on Classic McEliece, 2026-10-01, https://www.bsi.bund.de/SharedDocs/Downloads/EN/BSI/Crypto/Notes_Classic_McEliece.pdf, with the press release https://www.bsi.bund.de/DE/Service-Navi/Presse/Alle-Meldungen-News/Meldungen/2026/Classic-McEliece_261001.html. |
 | [KARABULUT21] | E. Karabulut, E. Alkim, A. Aysu, Single-Trace Side-Channel Attacks on ω-Small Polynomial Sampling: With Applications to NTRU, NTRU Prime, and CRYSTALS-DILITHIUM, IEEE HOST 2021 (Cryptology ePrint Archive, Paper 2022/494). |
 | [ZHOU25] | Y. Zhou, W. Wang, Y. Sun, Y. Yu, Rejected Signatures' Challenges Pose New Challenges: Key Recovery of CRYSTALS-Dilithium via Side-Channel Attacks, IACR Transactions on Cryptographic Hardware and Embedded Systems 2025 (Cryptology ePrint Archive, Paper 2025/214). |
