@@ -7,4 +7,5 @@
    build, packaging and platforms; and the conformance checklist.
 3. Rust is the reference implementation and is released first (P13). The other profiles describe the
    same behaviour in their languages: Section 24 Go, 25 Zig, 26 TypeScript and 27 Python. The Rust
-   profile is part of this repository; profiles for other languages are maintained with their implementations.
+   profile is part of this repository; profiles for other languages are maintained with their
+   implementations, and the references of this document to Sections 24 to 27 point to them.

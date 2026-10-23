@@ -26,7 +26,7 @@ it names the standard and section that is authoritative, and it specifies only:
 - the choices that a standard leaves to the implementation (for example parameter selection, the
   randomness source, error behaviour);
 - the formats that no standard defines (the stateful state record and the tree cache);
-- the API, the error model and the engineering rules shared by the five implementations.
+- the API, the error model and the engineering rules shared by every implementation.
 
 Where this document and a cited standard disagree on the algorithm itself, the standard governs and
 the disagreement is a defect in this document.

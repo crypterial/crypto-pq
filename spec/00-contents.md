@@ -12,9 +12,11 @@
 
 ## Abstract
 
-crypto-pq is a post-quantum cryptography library implemented independently in five programming
-languages (Rust, Go, Zig, TypeScript and Python) with one shared vocabulary. This document is the
-contract that every implementation conforms to and is verified against. Part I specifies the
+crypto-pq is a post-quantum cryptography library specified for independent implementation in five
+programming languages (Rust, Go, Zig, TypeScript and Python) with one shared vocabulary. This
+document is the contract that every implementation conforms to and is verified against. The Rust
+implementation, the reference, is developed with this document; each other implementation is
+developed in its own repository (Section [17](17-implementation-conventions.md) item 8). Part I specifies the
 algorithms, the application programming interface (API) model, the byte formats, the error model,
 the security requirements, the conformance test suite and the release rules that are common to every
 language. Part II adds one profile per language that tightens Part I for that language and never
