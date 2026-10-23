@@ -2,7 +2,7 @@
 
 | specification | status | date |
 |---|---|---|
-| SPEC 1.0 | published | 2026-10-21 |
+| SPEC 1.0 | published | 2026-10-23 |
 
 ## Specification versions and package versions
 

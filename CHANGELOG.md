@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 the [crypto-pq specification](spec/00-contents.md) that it implements
 ([Section 20.1](spec/20-versioning.md)).
 
-## [1.0.0] - Unreleased
+## [1.0.0] - 2026-10-23
 
 The first release, implementing specification 1.0.
 
