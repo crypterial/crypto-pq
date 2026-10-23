@@ -23,8 +23,8 @@ pub enum Error {
     InvalidOption,
     /// The operating-system entropy source failed or does not exist on the platform.
     RngFailure,
-    /// A pairwise consistency test, or the verification of a stateful signature before its
-    /// release, failed.
+    /// A pairwise consistency test failed, or a stateful signature did not verify: a new one
+    /// before its release, or a stored one when its key was loaded.
     SelfTestFailed,
     /// Every signature index of a stateful key has been used.
     KeyExhausted,

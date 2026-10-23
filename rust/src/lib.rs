@@ -1,12 +1,14 @@
 //! Fast, secure post-quantum cryptography in pure Rust with no dependencies: ML-KEM, ML-DSA,
-//! SLH-DSA, FrodoKEM, LMS/HSS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF.
+//! SLH-DSA, FrodoKEM, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF.
 //!
 //! The crate is `no_std` and needs `alloc`. Every operation is a synchronous function; fallible
 //! ones return [`Result`] with [`Error`]. Algorithms are constants of `Copy` types, such as
 //! `ML_KEM_768` or `SHA_256`, and keys are objects made from them. Secret outputs are
-//! `SecretBytes`, which wipe themselves when dropped. Operations on secret data run in constant
-//! time. CPU-specific code for x86-64 and ARM64 is chosen at run time, with a portable fallback on
-//! every target.
+//! `SecretBytes`, which wipe themselves when dropped. Code that handles secret data has no branch
+//! or memory access that depends on a secret, which CI checks under valgrind; on ARM64 CPUs with
+//! FEAT_DIT, the asymmetric operations also run in the data-independent timing mode (see
+//! [`enable_data_independent_timing`]). CPU-specific code for x86-64 and ARM64 is chosen at run
+//! time, with a portable fallback on every target.
 //!
 //! # Features
 //!
@@ -38,6 +40,15 @@
 //!
 //! `hazmat` takes seeds and randomness from the caller instead of the operating-system entropy
 //! source, where a reused value breaks the scheme, so it is opt-in.
+//!
+//! # Randomness
+//!
+//! Randomness comes from the operating system: `getrandom` on Linux, Android, FreeBSD, NetBSD,
+//! DragonFly, illumos and Solaris, `getentropy` on Apple platforms and OpenBSD, `ProcessPrng` on
+//! Windows and `random_get` on WASI preview 1. On every other target, such as
+//! `wasm32-unknown-unknown` or bare metal, every operation that draws randomness fails with
+//! [`Error::RngFailure`]; hashes, XOFs, MACs, KDFs, verification, decapsulation and
+//! deterministic signing need no randomness.
 //!
 //! # Examples
 //!
@@ -170,6 +181,7 @@
 //! of crypto-pq follow; `spec/profiles/rust.md` is the profile of this crate.
 
 #![no_std]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 // A build without every algorithm family compiles out enum variants and the code that only they

@@ -3,7 +3,7 @@ name = "crypto-pq"
 version = "1.0.0-rc.1"
 edition = "2024"
 rust-version = "1.88"
-description = "Fast, secure post-quantum cryptography in pure Rust with no dependencies: ML-KEM, ML-DSA, SLH-DSA, FrodoKEM, LMS/HSS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF."
+description = "Fast, secure post-quantum cryptography in pure Rust with no dependencies: ML-KEM, ML-DSA, SLH-DSA, FrodoKEM, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF."
 license = "Apache-2.0 OR MIT"
 homepage = "https://crypterial.com"
 repository = "https://github.com/crypterial/crypto-pq"
@@ -44,9 +44,10 @@ hmac = ["sha2"]
 hkdf = ["hmac"]
 hazmat = []
 
-# docs.rs documents every feature, hazmat included.
+# docs.rs documents every feature, hazmat included, and shows the features that each item needs.
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [[bench]]
 name = "bench"

@@ -84,7 +84,9 @@ impl fmt::Debug for MacAlgorithm {
 #[non_exhaustive]
 pub struct MacOptions<'a> {
     /// The tag size in bytes; `None` for the default: the hash output for HMAC, 32 for KMAC128, 64
-    /// for KMAC256 and BLAKE2b, 32 for BLAKE2s. HMAC and KMAC tags have at least 4 bytes.
+    /// for KMAC256 and BLAKE2b, 32 for BLAKE2s. HMAC and KMAC tags have at least 4 bytes; a tag
+    /// shorter than 8 bytes needs a careful risk analysis, and the key needs at least the security
+    /// strength that the MAC is to provide.
     pub length: Option<usize>,
     /// The KMAC customization string.
     pub customization: &'a [u8],

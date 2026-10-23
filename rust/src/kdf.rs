@@ -457,7 +457,9 @@ pub const HKDF_SHA_512: KdfAlgorithm = KdfAlgorithm {
     kind: KdfKind::Hkdf(SHA_512),
 };
 
-/// BLAKE3-KDF: BLAKE3's `derive_key` mode, with the `info` option as its context string.
+/// BLAKE3-KDF: BLAKE3's `derive_key` mode, with the `info` option as its context string. As the
+/// BLAKE3 specification advises, the context string should be hard-coded, globally unique and
+/// specific to the application.
 #[cfg(feature = "blake3")]
 pub const BLAKE3_KDF: KdfAlgorithm = KdfAlgorithm {
     name: "BLAKE3-KDF",

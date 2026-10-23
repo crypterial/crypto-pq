@@ -139,6 +139,9 @@ impl Fixed {
 }
 
 /// The options of signing.
+///
+/// Use one key with only one of the hedged and deterministic variants, and with only one of the
+/// pure and pre-hash modes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SignOptions<'a> {
