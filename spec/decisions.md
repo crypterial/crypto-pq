@@ -8,21 +8,20 @@ and its rationale. The criteria are, in order: security, the standards, simplici
 
 Any `read` of an XOF, including `read(0)`, ends absorbing; a
 later `update` fails with UNSUPPORTED ([12.2](12-symmetric-primitives.md#122-xof-streaming)). Rationale: one state transition with no special case is
-the simplest rule to implement identically in five languages and to test.
+the simplest rule to implement and to test.
 
 ## Decision D-02
 
 The KMAC `length` option is 4 to 2^32 − 1 bytes for KMAC and
 KMACXOF ([6.5](06-api.md#65-configuration), [12.6](12-symmetric-primitives.md#126-mac-algorithms)). Rationale: 32 bits is the minimum of SP 800-185 §8.4.2; one upper bound that every
-language can represent (including TypeScript numbers and 32-bit Go) keeps results identical.
+platform can represent, including 32-bit ones, keeps results identical.
 
 ## Decision D-03
 
 Caller input never causes a panic. Wrong buffer sizes, `update`
 after `read`, and MAC keys of an unaccepted length return errors; MAC verification returns `false`
-([6.2](06-api.md#62-inputs-and-outputs), [12.6](12-symmetric-primitives.md#126-mac-algorithms)). The Rust, Go and Zig signatures follow from it ([23.1](profiles/rust.md#231-public-api-idiom), 24.1, 25.1). Rationale: a panic
-on input is a denial-of-service vector in servers and differs between languages; one error model is
-easier to audit.
+([6.2](06-api.md#62-inputs-and-outputs), [12.6](12-symmetric-primitives.md#126-mac-algorithms)). The Rust signatures follow from it ([23.1](profiles/rust.md#231-public-api-idiom)). Rationale: a panic
+on input is a denial-of-service vector in servers; one error model is easier to audit.
 
 ## Decision D-04
 
@@ -33,8 +32,8 @@ with no new error.
 
 ## Decision D-05
 
-PEM export returns ASCII bytes in every language; TypeScript and
-Python import also accept text ([10.4](10-key-formats.md#104-pem)). Rationale: one return type for `exportKey` in every language and
+PEM export returns ASCII bytes, and PEM import takes bytes
+([10.4](10-key-formats.md#104-pem)). Rationale: one byte-string type for `exportKey` and the import operations in every
 format.
 
 ## Decision D-06
@@ -125,30 +124,24 @@ requires a validated hardware module, which a software library cannot be.
 
 The tree cache format stays at version 1; child-tree roots in a
 cache are checked against the state record, and a cache holds exactly one entry per current level,
-top first ([11.10](11-stateful-signatures.md#1110-tree-cache)). Rationale: the format already carries every needed field and its tag. Defining the entries makes `exportTreeCache` byte-identical in every language, which
+top first ([11.10](11-stateful-signatures.md#1110-tree-cache)). Rationale: the format already carries every needed field and its tag. Defining the entries fixes every byte of the `exportTreeCache` output, which
 the compliance suite tests.
 
 ## Decision D-18
 
-In Go, a zero numeric option means "absent" (KMAC `Length`,
-`Reserve`); the compliance files carry `zeroAbsentResult` for these cases ([6.3](06-api.md#63-options), [19.3](19-conformance.md#193-cross-language-files)). Rationale: Go
-option structs cannot tell zero from absent; requiring callers to set `Reserve: 1` would be
-error-prone.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-19
 
-Go `KeyGenOptions.SelfTest` is a typed value whose zero value is
-`SELF_TEST_ON` (24.1). Rationale: the keyword stays `SelfTest` (P4) while the zero value stays safe.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-20
 
-Go exports the type `HazmatFunctions`, with the package value
-`Hazmat` (24.1). Rationale: documentation tools show methods of exported types only.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-21
 
-Go algorithm values are typed constants in every category
-(24.1). Rationale: package variables can be reassigned by any importer.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-22
 
@@ -158,39 +151,29 @@ outside its crate, even with `..Default::default()`; setters keep 1.x additions 
 
 ## Decision D-23
 
-Rust returns secret outputs as `SecretBytes` (wipe on drop) and
-Zig returns KEM secrets as `SharedSecret` ([23.1](profiles/rust.md#231-public-api-idiom), 25.1). Rationale: these languages can guarantee
-wiping of returned secrets; the others document the caller's duty.
+Rust returns secret outputs as `SecretBytes`, which wipes its bytes
+on drop ([23.1](profiles/rust.md#231-public-api-idiom)). Rationale: a returned secret is then wiped when the caller drops it, with no
+further action by the caller ([14.5](14-security.md#145-wiping) item 2).
 
 ## Decision D-24
 
-The PRK size accessor is `prkSize` in every language
-(`prk_size()` Rust, `PrkSize()` Go, `prk_size` field Zig, `prkSize` TypeScript, `prk_size` Python)
+The PRK size accessor is `prkSize` (`prk_size()` in Rust)
 ([16.4.2](16-naming.md#1642-operations)). Rationale: P4.
 
 ## Decision D-25
 
 The hazmat key-generation functions are
-`generateKemKeyPair`, `generateSignatureKeyPair` and `generateStatefulKeyPair` in every language, and
-the stateful one takes algorithm, seed, index, then the language's `generateKeyPair` arguments ([13](13-hazmat.md),
-[16.4.4](16-naming.md#1644-hazmat)). Rationale: P4; one order in every language; Rust, Go and Zig cannot overload a
-single name.
+`generateKemKeyPair`, `generateSignatureKeyPair` and `generateStatefulKeyPair`, and
+the stateful one takes algorithm, seed, index, then the arguments of `generateKeyPair` ([13](13-hazmat.md),
+[16.4.4](16-naming.md#1644-hazmat)). Rationale: P4; Rust cannot overload a single name.
 
 ## Decision D-26
 
-Python keeps named tuples for key pairs and encapsulations
-(27.1). Rationale: idiomatic and immutable.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-27
 
-A backend built from the core runs a known-answer
-test at first load. A module that cannot be loaded on the platform makes automatic selection use the
-pure backend and records the reason; a backend that the caller selected explicitly then gives SELF_TEST_FAILED. A module that
-loads but fails its known-answer test makes every operation that uses it fail with SELF_TEST_FAILED,
-with no fallback ([14.4](14-security.md#144-self-tests) item 4). Rationale: a module that cannot run is a platform limit, and falling
-back keeps the package universal; a module that runs and computes wrong results is corrupted or
-defective, and silently replacing it with the pure backend, which is not constant time, would hide
-the fault and weaken the default.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-28
 
@@ -242,14 +225,14 @@ L > 0 for the function; §5.4 defines streaming without a total length.
 ## Decision D-35
 
 Per-call output lengths of XOFs and BLAKE3-KDF are at most
-2^32 − 1 bytes ([12.8](12-symmetric-primitives.md#128-limits)). Rationale: one bound representable in every language keeps results identical;
+2^32 − 1 bytes ([12.8](12-symmetric-primitives.md#128-limits)). Rationale: one bound representable on every platform keeps results identical;
 larger single outputs have no use case.
 
 ## Decision D-36
 
 A fixed order of checks decides which error is reported when
-several apply ([7.3](07-errors.md#73-order-of-checks), [10.6](10-key-formats.md#106-import-order), [11.9](11-stateful-signatures.md#119-loading)). Rationale: identical results across languages are testable only
-with a defined order.
+several apply ([7.3](07-errors.md#73-order-of-checks), [10.6](10-key-formats.md#106-import-order), [11.9](11-stateful-signatures.md#119-loading)). Rationale: the compliance suite can fix one expected result for an
+input only with a defined order.
 
 ## Decision D-37
 
@@ -272,9 +255,7 @@ exhausted key has erased the secrets that key the cache tag and has no tree left
 
 ## Decision D-40
 
-C ABI version 3 for 1.0; identifiers are append-only, X-Wing's
-KEM identifier 3 stays retired (25.5). Rationale: an old binding can never call a different algorithm
-by mistake.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-41
 
@@ -285,14 +266,11 @@ threat; the checksum detects damage.
 ## Decision D-42
 
 HKDF `extract` and `expand` refuse a misplaced `info` or `salt`
-with INVALID_OPTION in every language, and Go's `Extract` has an error result ([12.7.1](12-symmetric-primitives.md#1271-hkdf), 24.1).
-Rationale: silent ignoring of an option hides caller bugs.
+with INVALID_OPTION ([12.7.1](12-symmetric-primitives.md#1271-hkdf)). Rationale: silent ignoring of an option hides caller bugs.
 
 ## Decision D-43 (revised by D-66)
 
-One signed tag `vX.Y.Z` releases all five packages, and the
-mirror repositories receive the same tag ([20.4](20-versioning.md#204-release-process)). Rationale: lockstep versions with one gate.
-[D-66](#decision-d-66-revised-by-d-71) and [D-71](#decision-d-71) replace this decision; it is kept for the record.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-44
 
@@ -307,8 +285,7 @@ keyed uses go through MAC or KDF values.
 
 ## Decision D-46
 
-An invalid `CRYPTO_PQ_BACKEND` value makes the Python import fail
-with INVALID_OPTION (27.1). Rationale: a typo would otherwise select a backend silently.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-47
 
@@ -317,9 +294,7 @@ the pkh check ([8.2.4](08-key-encapsulation.md#824-keys-and-import)). Rationale:
 
 ## Decision D-48
 
-Concurrent misuse of one streaming object in Python or
-TypeScript can give wrong output but never crashes or corrupts memory ([6.6](06-api.md#66-concurrency)). Rationale: the free-threaded
-CPython build and native extensions make memory safety the minimum guarantee.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-49
 
@@ -330,8 +305,8 @@ Rationale: diagnosable without leaking.
 ## Decision D-50
 
 The AES-128 core used by FrodoKEM is constant time although its
-FrodoKEM inputs are public ([8.2.3](08-key-encapsulation.md#823-constant-time-and-memory)). Rationale: one AES core per language serves later AEAD use with
-secret keys; no variable-time AES core exists in the code base.
+FrodoKEM inputs are public ([8.2.3](08-key-encapsulation.md#823-constant-time-and-memory)). Rationale: one AES core serves later AEAD use with secret keys; no
+variable-time AES core exists in the code base.
 
 ## Decision D-51
 
@@ -348,9 +323,7 @@ state.
 
 ## Decision D-53
 
-TypeScript refuses unknown option keys with INVALID_OPTION
-([6.3](06-api.md#63-options)). Rationale: a misspelled `context` or `preHash` would otherwise sign in a different mode
-silently.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-54
 
@@ -360,33 +333,23 @@ secrets; erasing them removes the reuse risk after a rollback.
 
 ## Decision D-55
 
-Zig has the two option types `StatefulKeyGenOptions` and
-`StatefulLoadOptions` (25.1). Rationale: type names are identical in every language (P4).
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-56
 
-Go stateful parameters are a `StatefulParameters` struct with
-`Name` and `Levels` (24.1). Rationale: P4; one keyword `parameters` as in the other languages.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-57
 
-Python returns secret outputs as `bytearray` (27.1). Rationale:
-`bytes` cannot be wiped; `bytearray` lets the caller wipe.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-58
 
-Go key objects wipe their secrets in a `runtime.AddCleanup`
-callback; there is no explicit destroy method in 1.0 (24.1). Rationale: this is what Go's runtime
-allows without a new keyword; an explicit method can be added in 1.x.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-59
 
-Go uses `crypto/rand.Read`, which terminates the process when the
-operating system's source fails, instead of returning RNG_FAILURE ([14.3](14-security.md#143-entropy) item 2, 24.2). With
-`GODEBUG=fips140=on` or `only`, its bytes come from the Go runtime's SP 800-90A DRBG, which crypto-pq
-accepts as the runtime's entropy service and documents. Rationale: failing closed is safe; reading
-the operating system directly would need `unsafe` or reimplementing the system calls of every Go
-platform, which adds risk; the FIPS mode is the program's own choice of runtime entropy service.
+Withdrawn on 2026-10-23: it concerned implementations in other languages, which are no longer part of crypto-pq.
 
 ## Decision D-60
 
@@ -447,13 +410,11 @@ algorithms cannot be reached through the pure or pre-hash interfaces.
 
 ## Decision D-66 (revised by D-71)
 
-Packages are released one language at a time.
-Each package follows SemVer; its MAJOR.MINOR equals the version of this specification it implements
-(1.0.x implements SPEC 1.0), and PATCH is counted per package. A release is a signed annotated tag
-`<language>-vX.Y.Z` (`rust-v1.0.0`); for Go the mirror repository also carries `vX.Y.Z`, which Go
-modules require. This replaces the single lockstep `vX.Y.Z` tag of [D-43](#decision-d-43-revised-by-d-66). Rationale: Rust is
-released first (P13); tying MAJOR.MINOR to the specification keeps every 1.0.x package
-interchangeable without forcing simultaneous releases.
+The package follows SemVer; its MAJOR.MINOR equals the version of
+this specification it implements (1.0.x implements SPEC 1.0), and PATCH is independent of the
+specification. A release is a signed annotated tag `rust-vX.Y.Z` (`rust-v1.0.0`) ([20.1](20-versioning.md#201-versions),
+[20.4](20-versioning.md#204-release-process)). Rationale: tying MAJOR.MINOR to the specification states which version of
+this document a release implements, and patch releases need no new specification.
 
 ## Decision D-67
 
@@ -462,8 +423,8 @@ END boundary lines each start a line (no leading whitespace) and hold nothing bu
 optionally followed by spaces or tabs as the RFC 7468 grammar allows (`*WSP` before the line end);
 any other text on a boundary line, or a block written on one line, gives INVALID_ENCODING. Text before the BEGIN line and after the END line is ignored ([D-32](#decision-d-32)). Decoding
 a private key does not branch on or index by the value of a base64 digit; the positions of boundaries,
-whitespace and padding are layout and are public. Rationale: RFC 7468 §2 and §5; one exact rule keeps
-every language's results identical, and the layout carries no secret.
+whitespace and padding are layout and are public. Rationale: RFC 7468 §2 and §5; one exact rule leaves no choice to
+an implementation, and the layout carries no secret.
 
 ## Decision D-68
 
@@ -489,12 +450,9 @@ contains it.
 ## Decision D-71
 
 The repository `crypterial/crypto-pq` holds this specification, the compliance suite and the Rust
-package. Every other package is developed and released from the repository that its profile names;
-the mirror repositories of [D-43](#decision-d-43-revised-by-d-66) and [D-66](#decision-d-66-revised-by-d-71) are dropped. A release tag sits on
-the default branch of the package's repository, and where a package manager reads versions from
-repository tags (Go modules), the release also creates the tag that it requires
-([20.4](20-versioning.md#204-release-process)). Rationale: Rust is released first and alone (P13); a package released
-later fixes its repository in its profile, and no release depends on a generated mirror.
+package, and the release tag of [D-66](#decision-d-66-revised-by-d-71) sits on a commit of its default branch
+([17](17-implementation-conventions.md) item 8, [20.4](20-versioning.md#204-release-process)). Rationale: the specification, the tests that define its behaviour
+and the package that implements it change together in one history.
 
 ## Decision D-72
 
