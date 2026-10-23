@@ -21,7 +21,7 @@
 1. No public item is removed or renamed, and no behaviour specified here changes, before 2.0.0.
 2. A 1.x release MAY add algorithm values, options and operations. Options are added only in forms that do not
    break existing callers ([23.1](profiles/rust.md#231-public-api-idiom) item 4).
-3. A 1.x release MAY add error codes (for example `DECRYPTION_FAILED` with AEAD in 1.1). Callers MUST handle
+3. A 1.x release MAY add error codes. Callers MUST handle
    codes they do not know; the Rust `Error` enum is non-exhaustive ([23.1](profiles/rust.md#231-public-api-idiom) item 2).
 4. Byte formats change only by a new version number, and every 1.x release reads every format version
    that an earlier 1.x release wrote. State record version 1 is not covered ([11.8](11-stateful-signatures.md#118-state-record-version-1)).

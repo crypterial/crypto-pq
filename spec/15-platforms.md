@@ -25,8 +25,8 @@ its result is kept in an atomic.
 3. ARM64 tiers: NEON (baseline), the AES, SHA-2, SHA-3 and SHA-512 extensions, and DIT. Detection reads the
    hardware capabilities on Linux and Android, `IsProcessorFeaturePresent` on Windows, and assumes the
    Apple baseline on Apple systems. Other systems run the portable code.
-4. RISC-V: portable code only in 1.0; vector or scalar-crypto kernels can be added in a later version, enabled
-   only when the processor reports the extensions.
+4. RISC-V: portable code only. A RISC-V kernel is enabled only when the processor reports its
+   extensions.
 5. Every kernel MUST have a test that compares it with its portable twin on random inputs, and the
    official vectors MUST pass on every tier ([18.3](18-testing.md#183-platforms)).
 6. The implementation MUST offer a way to force the portable code, used by CI (Part II).

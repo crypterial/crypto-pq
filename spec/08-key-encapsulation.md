@@ -79,7 +79,7 @@ as their seed and randomness (Section [13](13-hazmat.md)).
    table of [FRODO-DRAFT] §6.5, with no secret-dependent branch or index.
 3. Key objects MUST NOT cache matrix A (P8). A public key object MAY cache pkh.
 4. The AES variants use the implementation's single AES-128 core ([4.3](04-scope.md#43-internal-components)), which MUST be constant time
-   even though matrix A is public, because the same core is the basis of later AES uses [[D-50](decisions.md#decision-d-50)].
+   even though matrix A is public, because one constant-time core serves every AES use [[D-50](decisions.md#decision-d-50)].
 
 ### 8.2.4 Keys and import
 

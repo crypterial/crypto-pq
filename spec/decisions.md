@@ -274,7 +274,7 @@ Withdrawn on 2026-10-23: it concerned implementations in other languages, which 
 ## Decision D-44
 
 crypto-pq 1.0 contains no AVX-512 code ([15.3](15-platforms.md#153-cpu-specific-code)). Rationale: P13;
-the AVX2 kernels run on AVX-512 processors, and the AVX-512 work is not yet verified for release.
+the AVX2 kernels run on AVX-512 processors.
 
 ## Decision D-45
 
@@ -304,8 +304,8 @@ Rationale: diagnosable without leaking.
 ## Decision D-50
 
 The AES-128 core used by FrodoKEM is constant time although its
-FrodoKEM inputs are public ([8.2.3](08-key-encapsulation.md#823-constant-time-and-memory)). Rationale: one AES core serves later AEAD use with secret keys; no
-variable-time AES core exists in the code base.
+FrodoKEM inputs are public ([8.2.3](08-key-encapsulation.md#823-constant-time-and-memory)). Rationale: one constant-time AES core serves every use, with public or
+secret keys; no variable-time AES core exists in the code base.
 
 ## Decision D-51
 

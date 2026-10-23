@@ -27,7 +27,7 @@ Related design decisions that this document applies:
 - Hand-written per-ISA acceleration is permitted (CPU instructions are not libraries) and is limited to
   x86-64, ARM64 and RISC-V, with run-time detection and a portable fallback.
 - Key objects MAY cache the expanded public matrix and expanded secrets.
-- Multi-threading is an additive, opt-in option for later releases; the default is single-threaded and
+- Operations are single-threaded; any multi-threading is additive and opt-in, and
   outputs never depend on the thread count.
 
 ## 3.2 Priority
