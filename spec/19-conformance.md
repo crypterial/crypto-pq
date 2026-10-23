@@ -2,17 +2,18 @@
 
 ## 19.1 Definition
 
-An implementation of one language conforms to this specification when:
+An implementation conforms to this specification when:
 
 1. it meets every requirement of Part I and of its profile in Part II;
-2. every backend passes every record of the compliance suite ([19.2](#192-compliance-suite)) on every platform of [18.3](18-testing.md#183-platforms);
+2. it passes every record of the compliance suite ([19.2](#192-compliance-suite)) in every build mode of its profile, on every
+   platform of [18.3](18-testing.md#183-platforms);
 3. its constant-time check ([14.1](14-security.md#141-constant-time) item 7) passes for every secret-handling path;
 4. its CI runs the checks of Section [18](18-testing.md).
 
 ## 19.2 Compliance suite
 
-The compliance suite is the content of the `vectors/` directory, fixed by `vectors/SHA256SUMS`. Every
-language MUST run all of it; a record MUST NOT be skipped except as [19.3](#193-cross-language-files) item 6 allows. Each file records
+The compliance suite is the content of the `vectors/` directory, fixed by `vectors/SHA256SUMS`. An
+implementation MUST run all of it; a record MUST NOT be skipped except as [19.3](#193-cross-check-files) item 6 allows. Each file records
 its source URL and SHA-256 in the fetch or generation tool that produced it.
 
 | directory | content |
@@ -27,9 +28,9 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
 | `blake3/` | BLAKE3 `test_vectors.json`, pinned ([19.4](#194-official-vector-sets)) |
 | `frodokem/` | FrodoKEM known-answer tests ([19.4](#194-official-vector-sets)) |
 | `xmss/` | XMSS and XMSS^MT vectors produced by the RFC 8391 reference implementation |
-| `cross/` | the cross-language files ([19.3](#193-cross-language-files)) |
+| `cross/` | the cross-check files ([19.3](#193-cross-check-files)) |
 
-## 19.3 Cross-language files
+## 19.3 Cross-check files
 
 1. The files of `vectors/cross/` define the behaviour that no official vector covers: every error
    case, every option, formats, stateful records, tree caches and the edge cases of Sections [6](06-api.md) to [13](13-hazmat.md).
@@ -75,7 +76,7 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
    | `operation` | text | the operation of the record; see the operation table below |
    | `format` | text | `raw`, `der` or `pem`: the format of `input` (import) or of `output` (export) |
    | `result` | text | item 3 |
-   | `zeroAbsentResult` | text | item 6 (Go only) |
+   | `zeroAbsentResult` | text | item 6 |
    | `mode` | text | `hazmat`: `hazmat.sign` with `randomness` and without the strength rule; `deterministic`: the public `sign` with `deterministic = true` |
    | `preHash` | text | `none`, or the ACVP name of the pre-hash: `SHA2-224`, `SHA2-256`, `SHA2-384`, `SHA2-512`, `SHA2-512/224`, `SHA2-512/256`, `SHA3-224`, `SHA3-256`, `SHA3-384`, `SHA3-512`, `SHAKE-128`, `SHAKE-256`, naming `SHA_224` … `SHAKE256` |
    | `parameters` | text | an XMSS or XMSS^MT parameter set name ([5.3](05-algorithms.md#53-stateful-hash-based-signatures)); error cases use invalid names on purpose |
@@ -143,13 +144,14 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
    | `symmetric.txt` | every hash, XOF, MAC and KDF operation, option, limit, streaming order and error |
    | `blake3.txt` | BLAKE3-256, the BLAKE3 XOF, BLAKE3-MAC and BLAKE3-KDF: digests, tags and their verification, derived keys, option and length errors, and the `extract` and `expand` that BLAKE3-KDF refuses |
 
-6. Go cannot express an explicit numeric option of 0 ([6.3](06-api.md#63-options) item 6). A record that sets such an option
-   to 0 carries a field `zeroAbsentResult` with the expected result when 0 means "absent"; the Go
-   runner MUST check that field instead of `result`. No other exception exists.
+6. A record that sets a numeric option to 0 MAY carry a field `zeroAbsentResult`: the expected result
+   for an implementation that cannot express an explicit option of 0 and reads 0 as "absent". The
+   runner of such an implementation MUST check that field instead of `result`; every other runner
+   checks `result`. No other exception exists.
 
 ## 19.4 Official vector sets
 
-Each algorithm MUST pass these sets in every language and backend. "Full" means every test group of
+Each algorithm MUST pass these sets in every build mode. "Full" means every test group of
 the file, including groups that the 1.0 API reaches only through `hazmat`. Groups for interfaces that
 crypto-pq does not expose (external μ) are the only permitted omissions and MUST be counted and
 reported by the runner. The internal-interface groups of ML-DSA and SLH-DSA run through
@@ -183,7 +185,7 @@ are part of the release gate ([19.5](#195-release-gate)).
 A release MUST NOT be published unless, for the release commit:
 
 1. every CI check passes, and the latest weekly fuzz run and weekly full-vector run passed;
-2. the compliance suite passes in every backend of the package;
+2. the compliance suite passes in every build mode of the package;
 3. the constant-time checks pass;
 4. the release artifacts are reproducible ([18.5](18-testing.md#185-supply-chain) item 3);
 5. the package conforms to this specification ([19.1](#191-definition));

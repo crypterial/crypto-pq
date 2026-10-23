@@ -79,7 +79,7 @@ the seed form, has 54 bytes:
    `PRIVATE KEY` for OneAsymmetricKey.
 2. Export MUST produce exactly: `-----BEGIN <label>-----` LF, the base64 encoding (RFC 4648 §4, with
    padding) of the DER in lines of 64 characters, each followed by LF (only the last line can be shorter),
-   then `-----END <label>-----` LF. The output is ASCII bytes in every language [[D-05](decisions.md#decision-d-05)].
+   then `-----END <label>-----` LF. The output is ASCII bytes [[D-05](decisions.md#decision-d-05)].
 
    Example: the PEM encoding of the SubjectPublicKeyInfo of the example in [10.2](#102-subjectpublickeyinfo). Every line, including
    the last, ends with LF.
@@ -90,8 +90,7 @@ the seed form, has 54 bytes:
    adw=
    -----END PUBLIC KEY-----
    ```
-3. Import accepts bytes in every language, and also a text string in TypeScript and Python. It MUST
-   [[D-32](decisions.md#decision-d-32), [D-67](decisions.md#decision-d-67)]:
+3. Import takes bytes [[D-05](decisions.md#decision-d-05)]. It MUST [[D-32](decisions.md#decision-d-32), [D-67](decisions.md#decision-d-67)]:
    - recognise the BEGIN and END boundary lines only where each starts a line, with no leading
      whitespace, and holds only the boundary (`-----BEGIN <label>-----` or `-----END <label>-----`),
      optionally followed by spaces or tabs before the line end (`*WSP` in the grammar of RFC 7468
@@ -145,4 +144,4 @@ Import of a private key runs with DIT set on ARM64 ([14.2](14-security.md#142-da
 
 `exportKey(format)` returns the encoding of [10.1](#101-formats) to [10.4](#104-pem). FrodoKEM with `der` or `pem` fails with
 UNSUPPORTED. Exporting a private key runs with DIT set on ARM64 and returns a secret that belongs to
-the caller ([14.5](14-security.md#145-wiping) item 2); Part II states how each language lets the caller wipe it.
+the caller ([14.5](14-security.md#145-wiping) item 2); Part II states how the caller wipes it.

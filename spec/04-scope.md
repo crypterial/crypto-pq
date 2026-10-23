@@ -27,7 +27,7 @@ private key encoding (raw, DER, PEM) for the algorithms that have a standard enc
 
 ## 4.3 Internal components
 
-The following are implemented by every language but are not public: Keccak-f[1600], the SHA-2
-compression functions, the AES-128 block cipher (used only by the FrodoKEM AES variants), MGF and
-WOTS+/LM-OTS internals, DER, PEM and base64 codecs, constant-time helpers, wiping, CPU detection and the
-operating-system entropy source.
+The following are implemented but are not public: Keccak-f[1600], the SHA-2 compression functions,
+the AES-128 block cipher (used only by the FrodoKEM AES variants), MGF and WOTS+/LM-OTS internals,
+DER, PEM and base64 codecs, constant-time helpers, wiping, CPU detection and the operating-system
+entropy source.

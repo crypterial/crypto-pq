@@ -2,21 +2,20 @@
 
 ## 1.1 Purpose
 
-This document specifies crypto-pq 1.0. An implementer in any of the five languages MUST be able to
-build a conforming implementation from this document and the standards it cites, without reading the
-code of another language.
+This document specifies crypto-pq 1.0. An implementer MUST be able to build a conforming
+implementation from this document and the standards it cites, without reading the code of an existing
+implementation.
 
 ## 1.2 Audience
 
-Maintainers, implementers of each language, auditors, and the authors of the public
-documentation.
+Maintainers, implementers, auditors, and the authors of the public documentation.
 
 ## 1.3 Structure
 
-Part I is normative for every language. Part II holds one profile per language. A profile MAY add
-requirements or narrow a choice that Part I leaves open; it MUST NOT contradict Part I. Where a rule
-in this document is a project decision rather than a requirement of a cited standard, it carries a
-reference of the form [D-nn] to its entry in [Appendix A](decisions.md).
+Part I specifies the behaviour without reference to a programming language. Part II holds the Rust
+profile. A profile MAY add requirements or narrow a choice that Part I leaves open; it MUST NOT
+contradict Part I. Where a rule in this document is a project decision rather than a requirement of
+a cited standard, it carries a reference of the form [D-nn] to its entry in [Appendix A](decisions.md).
 
 ## 1.4 Relation to the standards
 
@@ -26,7 +25,7 @@ it names the standard and section that is authoritative, and it specifies only:
 - the choices that a standard leaves to the implementation (for example parameter selection, the
   randomness source, error behaviour);
 - the formats that no standard defines (the stateful state record and the tree cache);
-- the API, the error model and the engineering rules shared by every implementation.
+- the API, the error model and the engineering rules of the implementation.
 
 Where this document and a cited standard disagree on the algorithm itself, the standard governs and
 the disagreement is a defect in this document.
@@ -35,8 +34,8 @@ the disagreement is a defect in this document.
 
 This section is informative.
 
-- Implementers of one language read Part I and the profile of their language (Sections [23](profiles/rust.md) to 27; profiles for other languages are maintained with their implementations).
-  Part I gives the behaviour; the profile gives its form in the language.
+- Implementers read Part I and the Rust profile (Section [23](profiles/rust.md)). Part I gives the behaviour; the
+  profile gives its form in Rust.
 - Users of the library read Sections [5](05-algorithms.md) to [13](13-hazmat.md) for the behaviour of each operation and Section [14.8](14-security.md#148-security-considerations) for
   the duties that the library leaves to its callers.
 - Auditors start with Section [14](14-security.md), Section [11](11-stateful-signatures.md) and Section [19](19-conformance.md).

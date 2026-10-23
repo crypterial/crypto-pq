@@ -1,15 +1,14 @@
 # 6. Common API model
 
 This section defines the operations of every category in language-neutral form. Section [16](16-naming.md) gives the
-spelling of every name in each language; Part II gives each language's types.
+Rust spelling of every name; Part II gives the Rust types.
 
 ## 6.1 Algorithm values
 
 1. Every algorithm and parameter set of Section [5](05-algorithms.md) is a public, immutable algorithm value of its
    category type (`HashAlgorithm`, `XofAlgorithm`, `MacAlgorithm`, `KdfAlgorithm`, `KemAlgorithm`,
    `SignatureAlgorithm`, `StatefulSignatureAlgorithm`).
-2. Every algorithm value has a `name`, the exact string of Section [5](05-algorithms.md). Names are ASCII and identical in
-   every language.
+2. Every algorithm value has a `name`, the exact string of Section [5](05-algorithms.md). Names are ASCII.
 3. An algorithm value MUST NOT be reassignable or mutable by the caller.
 4. `configure(options)` ([6.5](#65-configuration)) returns a new algorithm value of the same category with the options
    applied. It never changes the value it is called on, and the returned value holds no reference to
@@ -22,9 +21,9 @@ spelling of every name in each language; Part II gives each language's types.
    particular inputs longer than 2^32 bytes MUST be processed correctly on 64-bit platforms.
 2. An implementation MUST NOT modify a caller's input, except where Section [11.6](11-stateful-signatures.md#116-state-store-contract) transfers ownership
    of a state record.
-3. Operations return new byte strings. Rust, Go and Zig also offer forms that write into a caller
-   buffer (the `_into` forms, Section [16.4](16-naming.md#164-name-map)). A caller buffer of the wrong length fails with
-   INVALID_LENGTH, and the buffer is left unchanged.
+3. Operations return new byte strings. The `_into` forms (Section [16.4](16-naming.md#164-name-map)) write into a caller buffer
+   instead. A caller buffer of the wrong length fails with INVALID_LENGTH, and the buffer is left
+   unchanged.
 4. Aliasing [[D-04](decisions.md#decision-d-04)]: when an output buffer overlaps any input of the same call, the result MUST be
    identical to the result of the same call with every input copied before the first output byte is
    written. No error is raised for overlap.
@@ -35,23 +34,18 @@ spelling of every name in each language; Part II gives each language's types.
    implementation MAY abort on the violation of an internal invariant that no caller input can reach.
 6. Failure to allocate memory is reported in the language's own way (Part II); it is not one of the 13
    codes.
-7. A value of the wrong language type (for example a string where bytes are expected in TypeScript or
-   Python) is reported with the language's native type error; it is not one of the 13 codes.
+7. A value of the wrong type (for example a string where bytes are expected) is refused by the type
+   checking of the language; it is not one of the 13 codes.
 
 ## 6.3 Options
 
-1. Each operation that takes options takes them as one options argument (or keyword arguments in
-   Python). Every option has a default. An absent option has its default value.
+1. Each operation that takes options takes them as one options argument. Every option has a
+   default. An absent option has its default value.
 2. For byte-string options, an empty value is the same as an absent value.
 3. A numeric option outside its allowed range fails with INVALID_OPTION.
 4. An option that the algorithm or operation does not take fails with INVALID_OPTION when it holds a
    non-default value; the default value is accepted. Examples: a salt for SHA-256, an `info` for
    `extract`, a `salt` for `expand`.
-5. In TypeScript, where options are a dynamic object, an unknown key fails with INVALID_OPTION
-   [[D-53](decisions.md#decision-d-53)]. In Python, options are keyword-only arguments and an unknown name raises the language's
-   `TypeError`.
-6. Go cannot tell an absent numeric field from a zero one. In Go, the zero value of a numeric option
-   field means "absent" [[D-18](decisions.md#decision-d-18)]; Section 24 (the Go profile) gives the rule for each field.
 
 ## 6.4 Operations by category
 
@@ -182,10 +176,9 @@ SP 800-185 §3.3 reserves N for functions defined by NIST.
 ## 6.6 Concurrency
 
 1. Algorithm values, KEM and signature key objects, and stateful public keys MUST be safe for
-   concurrent use from several threads in languages that have threads.
+   concurrent use from several threads.
 2. A `Hasher`, `Xof` or `Mac` object is a sequence of calls. Two threads MUST NOT use one such object at
-   the same time; doing so is a caller error. The Python and TypeScript implementations MUST NOT crash
-   or corrupt memory under such misuse; the result is then unspecified [[D-48](decisions.md#decision-d-48)].
+   the same time; doing so is a caller error.
 3. Stateful private keys follow Section [11.13](11-stateful-signatures.md#1113-concurrency).
 4. No operation waits for another thread. No operation creates threads in 1.0.
 

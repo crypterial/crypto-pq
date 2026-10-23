@@ -116,5 +116,5 @@ SP 800-232 §5.3); a longer value fails `configure` with INVALID_OPTION.
 | signature context | 0..255 | INVALID_CONTEXT (`verify`: `false`) |
 | message, data, ikm, info, salt, customization (where unbounded) | platform maximum | |
 
-The 2^32 − 1 bound applies on every platform so that results are identical across languages; on
+The 2^32 − 1 bound applies on every platform, so that results do not depend on the platform; on
 platforms whose buffers cannot reach it, the platform's allocation limit applies first ([6.2](06-api.md#62-inputs-and-outputs) item 6).

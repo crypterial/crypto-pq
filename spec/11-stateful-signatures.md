@@ -335,7 +335,7 @@ never reuses an index.
 ## 11.11 Reserve
 
 1. `reserve` is the number of indices that one store write claims. It is an integer of 1 to 2^64 − 1;
-   the default is 1. A value of 0 fails with INVALID_OPTION (in Go, see 24.1).
+   the default is 1. A value of 0 fails with INVALID_OPTION.
 2. `reserve` is not stored in the state record; each key object takes it as an option.
 3. Larger reserves reduce store writes and lose up to reserve − 1 indices when a key object is dropped.
 

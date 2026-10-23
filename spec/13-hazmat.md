@@ -14,7 +14,7 @@
    | `hazmat.verify(publicKey, signature, message, {context, preHash})` | | |
    | `hazmat.signInternal(privateKey, messageRepresentative, randomness)` | `ML_DSA_*` or `SLH_DSA_*` key; M′ of FIPS 204 Algorithm 7 or FIPS 205 Algorithm 19 | randomness as for `hazmat.sign` |
    | `hazmat.verifyInternal(publicKey, signature, messageRepresentative)` | as above; FIPS 204 Algorithm 8 or FIPS 205 Algorithm 20 | |
-   | `hazmat.generateStatefulKeyPair(algorithm, seed, index, …)` | the remaining arguments are those of `generateKeyPair` in the language | [11.14](11-stateful-signatures.md#1114-deterministic-mode-hazmat) |
+   | `hazmat.generateStatefulKeyPair(algorithm, seed, index, …)` | the remaining arguments are those of `generateKeyPair` | [11.14](11-stateful-signatures.md#1114-deterministic-mode-hazmat) |
    | `hazmat.configureCshake(algorithm, functionName, customization)` | `CSHAKE128` or `CSHAKE256` | any lengths |
 
 3. A seed or randomness of the wrong length fails with INVALID_LENGTH. `hazmat.sign` and
@@ -30,5 +30,4 @@
    exactly [[D-37](decisions.md#decision-d-37)]. It MUST still validate its inputs.
 5. Hazmat operations follow every constant-time, DIT and wiping rule of Section [14](14-security.md).
 6. The positional order of `generateStatefulKeyPair` is algorithm, seed, index, then the arguments of
-   the language's `generateKeyPair` [[D-25](decisions.md#decision-d-25)]. Python takes `index` as a keyword-only argument with
-   default 0.
+   `generateKeyPair` [[D-25](decisions.md#decision-d-25)].

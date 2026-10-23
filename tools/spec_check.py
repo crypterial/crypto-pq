@@ -18,8 +18,7 @@ CHAPTERS = [
     "22-profile-rules.md", "profiles/rust.md", "decisions.md", "principles-review.md",
 ]
 
-# The profiles of the other languages are maintained with their implementations; this repository
-# holds the Rust one.
+# Part II holds one profile, for Rust.
 PROFILES = {"rust": 23}
 
 LINK_RE = re.compile(r"\[([^\[\]]*)\]\(([^)\s]*)\)")
