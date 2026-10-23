@@ -333,7 +333,7 @@ pub const ML_DSA_87: SignatureAlgorithm = ml_dsa("ML-DSA-87", mldsa::ML_DSA_87, 
 pub const SLH_DSA_SHA2_128S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-128s", slhdsa::SHA2_128S, 20);
 
-/// SLH-DSA-SHA2-128f (FIPS 205), security category 1, the set for less signing work.
+/// SLH-DSA-SHA2-128f (FIPS 205), security category 1, the set for shorter signing time.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_128F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-128f", slhdsa::SHA2_128F, 21);
@@ -343,7 +343,7 @@ pub const SLH_DSA_SHA2_128F: SignatureAlgorithm =
 pub const SLH_DSA_SHA2_192S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-192s", slhdsa::SHA2_192S, 22);
 
-/// SLH-DSA-SHA2-192f (FIPS 205), security category 3, the set for less signing work.
+/// SLH-DSA-SHA2-192f (FIPS 205), security category 3, the set for shorter signing time.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_192F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-192f", slhdsa::SHA2_192F, 23);
@@ -353,7 +353,7 @@ pub const SLH_DSA_SHA2_192F: SignatureAlgorithm =
 pub const SLH_DSA_SHA2_256S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-256s", slhdsa::SHA2_256S, 24);
 
-/// SLH-DSA-SHA2-256f (FIPS 205), security category 5, the set for less signing work.
+/// SLH-DSA-SHA2-256f (FIPS 205), security category 5, the set for shorter signing time.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_256F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-256f", slhdsa::SHA2_256F, 25);
@@ -363,7 +363,7 @@ pub const SLH_DSA_SHA2_256F: SignatureAlgorithm =
 pub const SLH_DSA_SHAKE_128S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-128s", slhdsa::SHAKE_128S, 26);
 
-/// SLH-DSA-SHAKE-128f (FIPS 205), security category 1, the set for less signing work.
+/// SLH-DSA-SHAKE-128f (FIPS 205), security category 1, the set for shorter signing time.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_128F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-128f", slhdsa::SHAKE_128F, 27);
@@ -373,7 +373,7 @@ pub const SLH_DSA_SHAKE_128F: SignatureAlgorithm =
 pub const SLH_DSA_SHAKE_192S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-192s", slhdsa::SHAKE_192S, 28);
 
-/// SLH-DSA-SHAKE-192f (FIPS 205), security category 3, the set for less signing work.
+/// SLH-DSA-SHAKE-192f (FIPS 205), security category 3, the set for shorter signing time.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_192F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-192f", slhdsa::SHAKE_192F, 29);
@@ -383,7 +383,7 @@ pub const SLH_DSA_SHAKE_192F: SignatureAlgorithm =
 pub const SLH_DSA_SHAKE_256S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-256s", slhdsa::SHAKE_256S, 30);
 
-/// SLH-DSA-SHAKE-256f (FIPS 205), security category 5, the set for less signing work.
+/// SLH-DSA-SHAKE-256f (FIPS 205), security category 5, the set for shorter signing time.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_256F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-256f", slhdsa::SHAKE_256F, 31);
