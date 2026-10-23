@@ -1,0 +1,57 @@
+name: Bug report
+description: Report incorrect behaviour, a build failure or a documentation error in crypto-pq.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Report security vulnerabilities privately through [GitHub Security Advisories](https://github.com/crypterial/crypto-pq/security/advisories/new), not here.
+
+        Never paste private keys, state records, seeds or other secrets into an issue.
+  - type: input
+    id: version
+    attributes:
+      label: crypto-pq version
+      description: The version in your Cargo.lock.
+      placeholder: 1.0.0-rc.1
+    validations:
+      required: true
+  - type: input
+    id: rust
+    attributes:
+      label: Rust version
+      description: The output of `rustc --version`.
+      placeholder: rustc 1.88.0 (6b00bc388 2025-06-23)
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: Target
+      description: The target triple, and the CPU model if the bug may depend on it.
+      placeholder: x86_64-unknown-linux-gnu, AMD EPYC 9654
+    validations:
+      required: true
+  - type: input
+    id: features
+    attributes:
+      label: Features and build flags
+      description: The crate features you enable, and any RUSTFLAGS such as `--cfg crypto_pq_portable`.
+      placeholder: default-features = false, features = ["ml-kem"]
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: The smallest program that shows the bug, with its inputs.
+      render: rust
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behaviour
+      description: What you expected, what happened instead, and any error or panic message.
+    validations:
+      required: true
