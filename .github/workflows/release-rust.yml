@@ -169,7 +169,7 @@ jobs:
     name: publish to crates.io
     needs: [gate, attest]
     runs-on: ubuntu-latest
-    # Needs the owner's approval; the environment restricts the tags that may deploy.
+    # Needs a maintainer's approval; the environment restricts the tags that may deploy.
     environment: crates-io
     # attestations: read for gh attestation verify.
     permissions:

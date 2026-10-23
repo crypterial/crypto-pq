@@ -51,6 +51,7 @@ jobs:
           - { os: ubuntu-24.04-arm, rust: stable }
           - { os: macos-latest, rust: stable }
           - { os: windows-latest, rust: stable }
+          - { os: windows-11-arm, rust: stable }
     defaults:
       run:
         shell: bash
@@ -82,6 +83,8 @@ jobs:
             packages: gcc-s390x-linux-gnu libc6-dev-s390x-cross qemu-user
           - target: riscv64gc-unknown-linux-gnu
             packages: gcc-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user
+          - target: x86_64-unknown-linux-musl
+            packages: musl-tools
     defaults:
       run:
         shell: bash
