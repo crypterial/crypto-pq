@@ -1,0 +1,78 @@
+# Changelog
+
+All notable changes to the `crypto-pq` crate are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The crate follows
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html), and its MAJOR.MINOR is the version of
+the [crypto-pq specification](spec/00-contents.md) that it implements
+([Section 20.1](spec/20-versioning.md)).
+
+## [Unreleased]
+
+## [1.0.0-rc.1] - Unreleased
+
+The first release candidate of the 1.0 line, implementing specification 1.0. It replaces the
+withdrawn 0.1.x prototype, which is not supported. The code has not had a third-party audit yet.
+
+### Added
+
+- Key encapsulation: ML-KEM-512, ML-KEM-768 and ML-KEM-1024 (FIPS 203); FrodoKEM-976 and
+  FrodoKEM-1344 and their ephemeral eFrodoKEM forms, each with AES or SHAKE
+  (ISO/IEC 18033-2:2006/Amd 2:2026).
+- Signatures: ML-DSA-44, ML-DSA-65 and ML-DSA-87 (FIPS 204) and the 12 SLH-DSA sets (FIPS 205), in
+  pure and pre-hash (HashML-DSA, HashSLH-DSA) modes, with hedged or deterministic signing and a
+  context string; the 12 HashSLH-DSA values of RFC 9909.
+- Stateful hash-based signatures: HSS/LMS (RFC 8554, RFC 9858) and XMSS and XMSS^MT (RFC 8391), with
+  the parameter sets of NIST SP 800-208, an application-provided `StateStore`, an authenticated tree
+  cache, a `reserve` option and erasure of the secrets when a key is exhausted.
+- Hash functions and XOFs: SHA-2 (FIPS 180-4); SHA-3, SHAKE and cSHAKE (FIPS 202, NIST SP 800-185);
+  BLAKE2b and BLAKE2s (RFC 7693); BLAKE3; Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128
+  (NIST SP 800-232).
+- MACs: HMAC with SHA-2 (FIPS 198-1), KMAC128 and KMAC256, BLAKE2b-MAC, BLAKE2s-MAC and BLAKE3-MAC.
+- KDFs: HKDF with SHA-2 (RFC 5869) and BLAKE3-KDF.
+- Key formats: raw, DER (SubjectPublicKeyInfo and PKCS #8) and PEM for ML-KEM, ML-DSA and SLH-DSA
+  keys and for HSS/LMS and XMSS public keys; raw for FrodoKEM.
+- One Cargo feature per algorithm family, all enabled by default, and the opt-in `hazmat` feature
+  with the deterministic operations for known-answer and interoperability tests.
+- `no_std` with `alloc`, no dependencies, Rust 1.88 or later.
+- CPU-specific code for x86-64 (AVX2, SSE4.1, SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2, SHA-3,
+  SHA-512), selected at run time, with portable code on every target.
+- `SecretBytes` for every secret output, wiped on drop; private keys wiped on drop.
+- Pairwise consistency tests at key generation (on by default) and in the ML-KEM and FrodoKEM
+  private-key import checks, and verification of every stateful signature before its release.
+- Operating-system randomness only, with `Error::RngFailure` on targets without a source.
+- `enable_data_independent_timing()`, which extends the ARM64 DIT mode to MACs and KDFs.
+
+### Security
+
+The policies that the package documentation states ([Section 20.4](spec/20-versioning.md) item 7):
+
+- **Pre-hash policy** ([9.1.3](spec/09-signatures.md)). HashML-DSA and HashSLH-DSA accept only
+  SHA-2, SHA-3, SHAKE128 and SHAKE256, and only a function with at least the collision strength of
+  the signature (128, 192 or 256 bits by category). SHA-224, SHA-512/224 and SHA3-224 are never
+  accepted. Signing with a refused pre-hash fails with `Error::InvalidOption`; verification returns
+  `false`. The policy is fixed, and only the hazmat functions skip the strength rule.
+- **No external μ** ([9.1.5](spec/09-signatures.md)). No public function accepts μ, the message
+  representative or a precomputed digest in place of the message. Only the hazmat test functions
+  take the message representative, for the ACVP test groups.
+- **State store contract** ([11.6](spec/11-stateful-signatures.md)). `StateStore::update` must be an
+  atomic compare-and-swap and must make the new record durable before it returns `true`. The record
+  contains secrets and must be protected like a private key. It must never be restored from a copy
+  or a backup, cloned, or used by two key objects or processes at once; compare-and-swap cannot
+  detect a rollback of the storage itself.
+- **eFrodoKEM usage limit** ([8.2.6](spec/08-key-encapsulation.md)). An eFrodoKEM public key must be
+  used for fewer than 2^8 ciphertexts. The crate does not enforce the limit and never chooses an
+  eFrodoKEM set by default.
+
+Also:
+
+- Code that handles secret data has no secret-dependent branch or memory access; CI checks it with
+  valgrind memcheck on x86-64 and ARM64. On ARM64 CPUs with FEAT_DIT, asymmetric secret operations
+  run with DIT set.
+- The crate offers no constant-time equality; compare secrets through MAC verification, as the
+  `SecretBytes` documentation shows.
+- crypto-pq implements the SP 800-208 algorithms but claims neither SP 800-208 nor FIPS 140
+  validation.
+
+[Unreleased]: https://github.com/crypterial/crypto-pq/compare/rust-v1.0.0-rc.1...HEAD
+[1.0.0-rc.1]: https://github.com/crypterial/crypto-pq/tree/rust-v1.0.0-rc.1
