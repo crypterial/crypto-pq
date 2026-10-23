@@ -54,8 +54,8 @@
    threads.
 5. Entropy without `std`: `getrandom(2)` (Linux, Android, FreeBSD, NetBSD, DragonFly, illumos,
    Solaris), `getentropy` in chunks of 256 bytes (Apple, OpenBSD), `ProcessPrng` from
-   `bcryptprimitives.dll` (Windows, linked with `raw-dylib`), `random_get` (WASI). Every other target
-   returns RNG_FAILURE.
+   `bcryptprimitives.dll` (Windows, linked with `raw-dylib`), `random_get` (WASI preview 1). Every
+   other target, including WASI preview 2, returns RNG_FAILURE.
 6. Constant-time verification: `RUSTFLAGS="--cfg crypto_pq_ct"` and the `ct` test under valgrind
    memcheck, on x86-64 and ARM64, in the default and `crypto_pq_portable` builds, on the minimum and
    stable toolchains. The `crypto_pq_ct` build leaves out the instructions valgrind cannot execute.
@@ -92,9 +92,9 @@
    | `xmss` | `XMSS`, `XMSS_MT`; the stateful types | |
    | `sha2` | `SHA_*`; the hash types | |
    | `sha3` | `SHA3_*`, `SHAKE*`, `CSHAKE*`, `KMAC*`; the hash, XOF and MAC types | |
-   | `blake2` | `BLAKE2B_*`, `BLAKE2S_*`, `BLAKE2B_MAC`, `BLAKE2S_MAC` | |
-   | `blake3` | `BLAKE3`, `BLAKE3_256`, `BLAKE3_MAC`, `BLAKE3_KDF` | |
-   | `ascon` | `ASCON_HASH256`, `ASCON_XOF128`, `ASCON_CXOF128` | |
+   | `blake2` | `BLAKE2B_*`, `BLAKE2S_*`, `BLAKE2B_MAC`, `BLAKE2S_MAC`; the hash and MAC types | |
+   | `blake3` | `BLAKE3`, `BLAKE3_256`, `BLAKE3_MAC`, `BLAKE3_KDF`; the hash, XOF, MAC and KDF types | |
+   | `ascon` | `ASCON_HASH256`, `ASCON_XOF128`, `ASCON_CXOF128`; the hash and XOF types | |
    | `hmac` | `HMAC_SHA_*`; the MAC types | `sha2` |
    | `hkdf` | `HKDF_SHA_*`; the KDF types | `hmac` |
    | `hazmat` | the `hazmat` module ([13](../13-hazmat.md#13-the-hazmat-namespace)), with the operations of the enabled families | |
@@ -131,11 +131,13 @@
 
 ## 23.5 Conformance checklist
 
-- [ ] Part I behaviour.
-- [ ] Compliance suite: all of `vectors/` in the default, portable and `crypto_pq_ct` builds.
-- [ ] `cargo fmt --check`, `cargo clippy -D warnings` for every cfg and cross target, with the default
+A conforming Rust implementation meets each item:
+
+- Part I behaviour.
+- Compliance suite: all of `vectors/` in the default, portable and `crypto_pq_ct` builds.
+- `cargo fmt --check`, `cargo clippy -D warnings` for every cfg and cross target, with the default
   features and with every feature.
-- [ ] `cargo clippy -D warnings` with no feature, each feature alone and each family with `hazmat`.
-- [ ] `cargo doc` without a warning.
-- [ ] valgrind constant-time check on x86-64 and ARM64, default and portable.
-- [ ] x86-64 CPU models of [18.2](../18-testing.md#182-cpu-tiers) under emulation.
+- `cargo clippy -D warnings` with no feature, each feature alone and each family with `hazmat`.
+- `cargo doc` without a warning.
+- valgrind constant-time check on x86-64 and ARM64, default and portable.
+- x86-64 CPU models of [18.2](../18-testing.md#182-cpu-tiers) under emulation.

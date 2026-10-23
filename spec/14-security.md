@@ -74,7 +74,7 @@ piece, which is the case for lattice and hash-based private keys and not for key
    and no operation continues without fresh randomness.
 3. Sources (Part II gives the details): `getrandom(2)` on Linux and Android and the BSD and illumos
    systems that provide it; `getentropy` (in chunks of at most 256 bytes) on Apple systems and
-   OpenBSD; `ProcessPrng` on Windows; `random_get` on WASI; `crypto.getRandomValues` (in chunks of at
+   OpenBSD; `ProcessPrng` on Windows; `random_get` on WASI preview 1; `crypto.getRandomValues` (in chunks of at
    most 65536 bytes) in JavaScript; Go's `crypto/rand.Read` and Python's `os.urandom`, which are used
    for operating-system access only (P1).
 4. A source can block until the operating system has initialized its pool at boot; this is an

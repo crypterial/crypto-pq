@@ -26,9 +26,9 @@ module SHOULD stay small and families SHOULD be split into separate modules.
 1. CPU-specific code exists only for x86-64, ARM64 and RISC-V (P9) and is always selected at run time
    by feature detection, with a portable twin in the same language.
 2. x86-64 tiers: AVX2 with BMI1 and BMI2 and operating-system support for the YMM state (checked with
-   XGETBV); SSE4.1; SHA-NI. Processors without them run the portable code. crypto-pq 1.0 contains no
+   XGETBV); SSE4.1; SHA-NI; AES-NI. Processors without them run the portable code. crypto-pq 1.0 contains no
    AVX-512 code [[D-44](decisions.md#decision-d-44)]. CPU-specific code is not used inside an SGX enclave target.
-3. ARM64 tiers: NEON (baseline), the SHA-2, SHA-3 and SHA-512 extensions, and DIT. Detection reads the
+3. ARM64 tiers: NEON (baseline), the AES, SHA-2, SHA-3 and SHA-512 extensions, and DIT. Detection reads the
    hardware capabilities on Linux and Android, `IsProcessorFeaturePresent` on Windows, and assumes the
    Apple baseline on Apple systems. Other systems run the portable code.
 4. RISC-V: portable code only in 1.0; vector or scalar-crypto kernels can be added in a later version, enabled
