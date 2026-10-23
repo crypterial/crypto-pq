@@ -19,7 +19,7 @@ private key encoding (raw, DER, PEM) for the algorithms that have a standard enc
 | FrodoKEM-640 and eFrodoKEM-640 | Not in ISO/IEC 18033-2:2006/Amd 2:2026 (no ISO object identifier); see [8.2](08-key-encapsulation.md#82-frodokem) [[D-28](decisions.md#decision-d-28)]. |
 | HPKE (RFC 9180) with post-quantum KEMs | P2: the post-quantum HPKE profiles are drafts. |
 | AEAD (AES-GCM, ChaCha20-Poly1305, Ascon-AEAD128) | Deferred to crypto-pq 1.1. There is no AEAD category and no `DECRYPTION_FAILED` error in 1.0. |
-| SHA-1, MD5 | Not quantum-resistant at their sizes and not needed by any included algorithm. |
+| SHA-1, MD5 | Broken: practical collision attacks are published for both, and no included algorithm needs them. |
 | TupleHash and ParallelHash (SP 800-185); HMAC and HKDF over SHA-3 | Not in 1.0: no included algorithm uses them, and KMAC is the SHA-3 based MAC. |
 | External μ (ExternalMu-ML-DSA) | Not exposed; see [9.1.5](09-signatures.md#915-no-external-μ). |
 | JSON Web Key and other key formats | Only raw, DER and PEM (Section [10](10-key-formats.md)). |

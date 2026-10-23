@@ -292,10 +292,11 @@ Rationale: silent ignoring of an option hides caller bugs.
 
 One signed tag `vX.Y.Z` releases all five packages, and the
 mirror repositories receive the same tag ([20.4](20-versioning.md#204-release-process)). Rationale: lockstep versions with one gate.
+[D-66](#decision-d-66-revised-by-d-71) and [D-71](#decision-d-71) replace this decision; it is kept for the record.
 
 ## Decision D-44
 
-Crypto-pq 1.0 contains no AVX-512 code ([15.3](15-platforms.md#153-cpu-specific-code)). Rationale: P13;
+crypto-pq 1.0 contains no AVX-512 code ([15.3](15-platforms.md#153-cpu-specific-code)). Rationale: P13;
 the AVX2 kernels run on AVX-512 processors, and the AVX-512 work is not yet verified for release.
 
 ## Decision D-45

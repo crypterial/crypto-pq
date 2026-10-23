@@ -81,9 +81,8 @@ below it is current.
       need ([11.4](#114-randomness-d-11)). On failure, fail with RNG_FAILURE; nothing has changed.
    2. Claim write: build a state record in which each level l in T has the record {tree t_l(i),
       status claimed}, `next` is max(next, i), and every other field is unchanged, and store it with
-      `update(previous, new)`
-      ([11.6](#116-state-store-contract)). On an error, fail with STATE_PERSIST_FAILED; on `false`, fail with STATE_CONFLICT. In
-      both cases nothing was signed.
+      `update(previous, new)` ([11.6](#116-state-store-contract)). On an error, fail with STATE_PERSIST_FAILED; on `false`,
+      fail with STATE_CONFLICT. In both cases nothing was signed.
    3. For each level l in T, from the top down: build the child tree of number t = t_l(i) from its
       secrets; compute its public key (HSS: u32(lmsType_l) || u32(otsType_l) || I_l || root; XMSS^MT:
       root); sign it with the parent leaf ([11.3](#113-levels-indices-and-trees) item 4); verify that signature against the parent
@@ -117,8 +116,7 @@ below it is current.
 Rationale: the claim write makes the use of a parent leaf durable before the leaf signs anything.
 Each root is therefore signed once (SP 800-208 §8.1 and its footnote 9), and a crash between the
 claim and the signed write, or a failure there (step 3.5), leads to a skip ([11.9](#119-loading)), never to a second
-signature by the same leaf. The
-store holds every signature of a child root, so no root is signed again after a load. Step 4 makes the
+signature by the same leaf. The store holds every signature of a child root, so no root is signed again after a load. Step 4 makes the
 index durable before the signature is released (SP 800-208 §8.1). Step 7 is a fault countermeasure:
 a faulty signature, which can reveal one-time secret values, is never released. It does not detect a
 fault that changes a child root before the root is signed; the sign-once rule of footnote 9 is what

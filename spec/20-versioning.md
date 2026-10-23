@@ -45,5 +45,5 @@
    publishing or provenance, the release uses it.
 5. After publishing, the published artifacts are downloaded and verified against `SHA256SUMS`.
 6. Every package contains `LICENSE-APACHE` and `LICENSE-MIT`; the license is `Apache-2.0 OR MIT`.
-7. Package descriptions and release notes follow P14 and state the policies of [9.1.3](09-signatures.md#913-pre-hash-hashml-dsa-and-hashslh-dsa), [9.1.5](09-signatures.md#915-no-external-μ), [11.6](11-stateful-signatures.md#116-state-store-contract) and
-   [8.2.6](08-key-encapsulation.md#826-efrodokem-usage-limit).
+7. Package descriptions and release notes follow P14. The package documentation states the policies
+   of [9.1.3](09-signatures.md#913-pre-hash-hashml-dsa-and-hashslh-dsa), [9.1.5](09-signatures.md#915-no-external-μ), [11.6](11-stateful-signatures.md#116-state-store-contract) and [8.2.6](08-key-encapsulation.md#826-efrodokem-usage-limit).

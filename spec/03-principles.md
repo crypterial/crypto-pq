@@ -19,7 +19,7 @@ them; [Appendix B](principles-review.md) checks the document against each one.
 | P10 | **Data-independent timing.** On ARM64, DIT is always set around asymmetric secret operations. MAC and KDF operations run without DIT unless the process calls the one-way, process-wide switch `enable_data_independent_timing()`, which returns true only where DIT is active. |
 | P11 | **Security first, then standards, then speed.** A check is never weakened to gain speed. |
 | P12 | **Post-quantum only.** Every asymmetric algorithm is post-quantum. No hybrid with a classical algorithm and no classical asymmetric algorithm, so X-Wing and X25519 are not part of the library. Symmetric primitives stay, at quantum-resistant sizes. |
-| P13 | **Production first, then perfect.** The first release requires exact conformance to the standards, a final algorithm set and assured security; speed work resumes after the release. Rust is the reference implementation and is released first; the other languages follow this specification. |
+| P13 | **Production first.** The first release requires exact conformance to the standards, a final algorithm set and the security requirements of Section [14](14-security.md); performance work that they do not need follows the release. Rust is the reference implementation and is released first; the other languages follow this specification. |
 | P14 | **Wording.** Text published by the project describes crypto-pq as "fast" and "secure", never with superlatives such as "fastest" or "most secure". |
 
 Related design decisions that this document applies:

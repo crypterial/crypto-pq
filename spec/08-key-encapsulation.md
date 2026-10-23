@@ -40,8 +40,8 @@
 
 Rationale for checks (4) and (5): an expanded key with a modified secret vector and an unchanged H(ek)
 passes the FIPS 203 checks but decapsulates wrongly (RFC 9935 Appendix C.4, second example). Check (4)
-refuses, every time, each such key whose secret key generation cannot produce; check (5) detects the
-others, which decapsulate almost every ciphertext wrongly. Their results are declassified because the
+refuses, on every import, each such key whose secret vector key generation cannot produce; check (5)
+detects the others, which decapsulate almost every ciphertext wrongly. Their results are declassified because the
 import fails on them.
 
 ### 8.1.5 Raw private key export
