@@ -1,5 +1,5 @@
-//! Secure, optimized post-quantum cryptography in pure Rust with no dependencies: ML-KEM, ML-DSA,
-//! SLH-DSA, FrodoKEM, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF.
+//! Secure, optimized post-quantum cryptography in pure Rust with no dependencies: ML-KEM, FrodoKEM,
+//! ML-DSA, SLH-DSA, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF.
 //!
 //! The crate is `no_std` and needs `alloc`. Every operation is a synchronous function; fallible
 //! ones return [`Result`] with [`Error`]. Algorithms are constants of `Copy` types, such as
@@ -176,6 +176,23 @@
 //! # }
 //! # Ok::<(), crypto_pq::Error>(())
 //! ```
+//!
+//! # Usage requirements
+//!
+//! These rules are part of the API contract; the items named state them in full.
+//!
+//! - The `StateStore` of an HSS/LMS, XMSS or XMSS^MT key replaces its record by an atomic
+//!   compare-and-swap and makes the new record durable before `update` returns `true`. It protects
+//!   the record like a private key, and never restores an older record, a backup or a snapshot,
+//!   clones it, or shares it between two key objects or processes.
+//! - The `hazmat` operations are for test vectors only. A seed or randomness is never reused with a
+//!   different key, message or ciphertext.
+//! - An eFrodoKEM public key is used for fewer than 2^8 ciphertexts; the crate does not count them.
+//! - Each ML-DSA or SLH-DSA key is used with one of the hedged and deterministic variants, and one
+//!   of the pure and pre-hash modes, only (`SignOptions`).
+//! - A pre-hash is SHA-2, SHA-3, SHAKE128 or SHAKE256 with at least the collision strength of the
+//!   signature (`PreHash`). Outside `hazmat`, the API takes the message itself, never μ, the
+//!   message representative or a precomputed digest.
 //!
 //! # Specification
 //!

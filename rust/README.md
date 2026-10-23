@@ -4,14 +4,13 @@
 [![docs.rs](https://img.shields.io/docsrs/crypto-pq)](https://docs.rs/crypto-pq)
 [![license](https://img.shields.io/crates/l/crypto-pq.svg)](#license)
 
-Secure, optimized post-quantum cryptography in pure Rust with no dependencies: ML-KEM, FrodoKEM, ML-DSA,
-SLH-DSA, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF. The crate is
-`no_std` with `alloc` and needs Rust 1.88 or later.
-
-**Status:** 1.0.0-rc.1, a release candidate. The code has not had a third-party audit yet.
+Secure, optimized post-quantum cryptography in pure Rust with no dependencies: ML-KEM, FrodoKEM,
+ML-DSA, SLH-DSA, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF. The crate
+is `no_std` with `alloc` and needs Rust 1.88 or later.
 
 - API documentation: [docs.rs/crypto-pq](https://docs.rs/crypto-pq)
-- Repository, security notes and platforms: [github.com/crypterial/crypto-pq](https://github.com/crypterial/crypto-pq)
+- Project page: [crypterial.com/projects/crypto-pq](https://crypterial.com/projects/crypto-pq/)
+- Repository: [github.com/crypterial/crypto-pq](https://github.com/crypterial/crypto-pq)
 - Specification: [`spec/`](https://github.com/crypterial/crypto-pq/tree/main/spec), with the Rust
   profile in [`spec/profiles/rust.md`](https://github.com/crypterial/crypto-pq/blob/main/spec/profiles/rust.md)
 
@@ -19,7 +18,7 @@ SLH-DSA, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HK
 
 ```toml
 [dependencies]
-crypto-pq = "1.0.0-rc.1"
+crypto-pq = "1"
 ```
 
 The default features enable every algorithm family. To build only some, turn the defaults off and
@@ -27,15 +26,15 @@ name the families:
 
 ```toml
 [dependencies]
-crypto-pq = { version = "1.0.0-rc.1", default-features = false, features = ["ml-kem", "ml-dsa"] }
+crypto-pq = { version = "1", default-features = false, features = ["ml-kem", "ml-dsa"] }
 ```
 
 | feature | algorithms |
 |---|---|
 | `ml-kem` | ML-KEM-512, ML-KEM-768, ML-KEM-1024 |
-| `frodokem` | FrodoKEM and eFrodoKEM, 976 and 1344, AES and SHAKE |
-| `ml-dsa` | ML-DSA-44, ML-DSA-65, ML-DSA-87, pure and HashML-DSA |
-| `slh-dsa` | the 12 SLH-DSA sets and the 12 HashSLH-DSA sets |
+| `frodokem` | FrodoKEM-976, FrodoKEM-1344, eFrodoKEM-976, eFrodoKEM-1344, each with AES or SHAKE |
+| `ml-dsa` | ML-DSA-44, ML-DSA-65, ML-DSA-87; pure and HashML-DSA |
+| `slh-dsa` | the 12 SLH-DSA sets, pure and HashSLH-DSA, and the 12 HashSLH-DSA values of RFC 9909 |
 | `lms` | HSS/LMS |
 | `xmss` | XMSS, XMSS^MT |
 | `sha2` | SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224, SHA-512/256 |
@@ -45,7 +44,7 @@ crypto-pq = { version = "1.0.0-rc.1", default-features = false, features = ["ml-
 | `ascon` | Ascon-Hash256, Ascon-XOF128, Ascon-CXOF128 |
 | `hmac` | HMAC-SHA-224, HMAC-SHA-256, HMAC-SHA-384, HMAC-SHA-512; enables `sha2` |
 | `hkdf` | HKDF-SHA-256, HKDF-SHA-384, HKDF-SHA-512; enables `hmac` |
-| `hazmat` | deterministic operations for test vectors; never enabled by default |
+| `hazmat` | deterministic operations for test vectors; not a default feature |
 
 ## Examples
 
@@ -169,9 +168,9 @@ A store must:
 - make `next` durable, surviving a crash and a power loss, before `update` returns `true`;
 - protect the record like a private key, since it contains the key's secrets;
 - never restore the record from a copy, a backup or a virtual machine or disk snapshot, never clone
-  it, and never let two key objects or processes use it at once. An old record signs again with
-  one-time keys that were already used, which breaks the scheme. Compare-and-swap detects another
-  writer on the same store, not a rollback of the storage itself.
+  it, and never let two key objects or processes use it at once: an older record would sign again
+  with one-time keys that are already used. Compare-and-swap detects another writer on the same
+  store, not a rollback of the storage itself.
 
 Hashes, XOFs, MACs and key derivation:
 
@@ -216,26 +215,27 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-## Security in brief
+## Usage requirements
 
-- Code that handles secret data has no branch or memory access that depends on a secret, which CI
-  checks under valgrind on x86-64 and ARM64. On ARM64 CPUs with FEAT_DIT, the asymmetric operations
-  also run in the data-independent timing mode; `enable_data_independent_timing()` extends it to
-  MACs and KDFs.
-- Secret outputs are `SecretBytes`, which wipe themselves when dropped. Copies in registers or on the
-  stack, and copies that the caller makes, are outside the crate's reach.
-- Randomness comes only from the operating system. On targets without a supported source, such as
-  `wasm32-unknown-unknown` or bare metal, every operation that needs randomness fails with
-  `Error::RngFailure`.
-- `hazmat` takes seeds and randomness from the caller, for test vectors only: reusing one with a
-  different key, message or ciphertext breaks the scheme.
-- An eFrodoKEM public key must encapsulate fewer than 2^8 ciphertexts. The crate cannot count them
-  and does not enforce the limit.
-- crypto-pq implements the SP 800-208 algorithms but claims neither SP 800-208 nor FIPS 140
-  validation.
+- `hazmat` operations are for test vectors only. Never reuse a seed or randomness with a different
+  key, message or ciphertext.
+- Use an eFrodoKEM public key for fewer than 2^8 ciphertexts; the crate does not count them.
+- Use each ML-DSA or SLH-DSA key with only one of the hedged and deterministic variants, and only
+  one of the pure and pre-hash modes.
+- HashML-DSA and HashSLH-DSA accept only SHA-2, SHA-3, SHAKE128 and SHAKE256 with at least the
+  collision strength of the signature; any other pre-hash fails with `Error::InvalidOption`. The API
+  takes the message itself, never μ or a precomputed digest, outside the `hazmat` test functions.
 
-The [repository README](https://github.com/crypterial/crypto-pq#security) covers these points in
-full, with the signature policies. Report vulnerabilities privately through
+## Design
+
+Code that handles secret data has no branch or memory access that depends on a secret, which CI
+checks under valgrind on x86-64 and ARM64. On ARM64 CPUs with FEAT_DIT, the asymmetric secret
+operations run with DIT set. Private keys and `SecretBytes`, the type of every secret output, wipe
+their memory when dropped. Randomness comes only from the operating system; on a target without a
+source, operations that need it return `Error::RngFailure`. CPU-specific code for x86-64 and ARM64 is
+selected at run time, with portable code on every target.
+
+Report vulnerabilities privately through
 [GitHub Security Advisories](https://github.com/crypterial/crypto-pq/security/advisories/new).
 
 ## License

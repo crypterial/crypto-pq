@@ -40,6 +40,17 @@ enum PreHashKind {
 /// The hash function of HashML-DSA or HashSLH-DSA, made from a [`HashAlgorithm`] or an
 /// [`XofAlgorithm`] with `From`. FIPS 204 and FIPS 205 allow SHA-2, SHA-3, SHAKE128 and SHAKE256;
 /// the others are refused.
+///
+/// The function must also give at least the collision strength of the signature: 128 bits for
+/// ML-DSA-44 and the SLH-DSA 128 sets (SHA-256, SHA-384, SHA-512, SHA-512/256, SHA3-256, SHA3-384,
+/// SHA3-512, SHAKE128, SHAKE256), 192 bits for ML-DSA-65 and the 192 sets (SHA-384, SHA-512,
+/// SHA3-384, SHA3-512, SHAKE256) and 256 bits for ML-DSA-87 and the 256 sets (SHA-512, SHA3-512,
+/// SHAKE256). SHA-224, SHA-512/224 and SHA3-224 are never accepted. A refused pre-hash fails
+/// signing with [`Error::InvalidOption`] and makes verification return `false`; the policy has no
+/// switch.
+///
+/// The crate computes the pre-hash from the message. Outside the `hazmat` test functions, no
+/// operation takes μ, the message representative or a precomputed digest in place of the message.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PreHash(PreHashKind);
 
@@ -322,7 +333,7 @@ pub const ML_DSA_87: SignatureAlgorithm = ml_dsa("ML-DSA-87", mldsa::ML_DSA_87, 
 pub const SLH_DSA_SHA2_128S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-128s", slhdsa::SHA2_128S, 20);
 
-/// SLH-DSA-SHA2-128f (FIPS 205), security category 1, the set for fast signing.
+/// SLH-DSA-SHA2-128f (FIPS 205), security category 1, the set for less signing work.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_128F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-128f", slhdsa::SHA2_128F, 21);
@@ -332,7 +343,7 @@ pub const SLH_DSA_SHA2_128F: SignatureAlgorithm =
 pub const SLH_DSA_SHA2_192S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-192s", slhdsa::SHA2_192S, 22);
 
-/// SLH-DSA-SHA2-192f (FIPS 205), security category 3, the set for fast signing.
+/// SLH-DSA-SHA2-192f (FIPS 205), security category 3, the set for less signing work.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_192F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-192f", slhdsa::SHA2_192F, 23);
@@ -342,7 +353,7 @@ pub const SLH_DSA_SHA2_192F: SignatureAlgorithm =
 pub const SLH_DSA_SHA2_256S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-256s", slhdsa::SHA2_256S, 24);
 
-/// SLH-DSA-SHA2-256f (FIPS 205), security category 5, the set for fast signing.
+/// SLH-DSA-SHA2-256f (FIPS 205), security category 5, the set for less signing work.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHA2_256F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHA2-256f", slhdsa::SHA2_256F, 25);
@@ -352,7 +363,7 @@ pub const SLH_DSA_SHA2_256F: SignatureAlgorithm =
 pub const SLH_DSA_SHAKE_128S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-128s", slhdsa::SHAKE_128S, 26);
 
-/// SLH-DSA-SHAKE-128f (FIPS 205), security category 1, the set for fast signing.
+/// SLH-DSA-SHAKE-128f (FIPS 205), security category 1, the set for less signing work.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_128F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-128f", slhdsa::SHAKE_128F, 27);
@@ -362,7 +373,7 @@ pub const SLH_DSA_SHAKE_128F: SignatureAlgorithm =
 pub const SLH_DSA_SHAKE_192S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-192s", slhdsa::SHAKE_192S, 28);
 
-/// SLH-DSA-SHAKE-192f (FIPS 205), security category 3, the set for fast signing.
+/// SLH-DSA-SHAKE-192f (FIPS 205), security category 3, the set for less signing work.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_192F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-192f", slhdsa::SHAKE_192F, 29);
@@ -372,7 +383,7 @@ pub const SLH_DSA_SHAKE_192F: SignatureAlgorithm =
 pub const SLH_DSA_SHAKE_256S: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-256s", slhdsa::SHAKE_256S, 30);
 
-/// SLH-DSA-SHAKE-256f (FIPS 205), security category 5, the set for fast signing.
+/// SLH-DSA-SHAKE-256f (FIPS 205), security category 5, the set for less signing work.
 #[cfg(feature = "slh-dsa")]
 pub const SLH_DSA_SHAKE_256F: SignatureAlgorithm =
     slh_dsa("SLH-DSA-SHAKE-256f", slhdsa::SHAKE_256F, 31);

@@ -7,12 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 the [crypto-pq specification](spec/00-contents.md) that it implements
 ([Section 20.1](spec/20-versioning.md)).
 
-## [Unreleased]
+## [1.0.0] - Unreleased
 
-## [1.0.0-rc.1] - Unreleased
-
-The first release candidate of the 1.0 line, implementing specification 1.0. It replaces the
-withdrawn 0.1.x prototype, which is not supported. The code has not had a third-party audit yet.
+The first release, implementing specification 1.0.
 
 ### Added
 
@@ -37,15 +34,17 @@ withdrawn 0.1.x prototype, which is not supported. The code has not had a third-
 - `no_std` with `alloc`, no dependencies, Rust 1.88 or later.
 - CPU-specific code for x86-64 (AVX2, SSE4.1, SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2, SHA-3,
   SHA-512), selected at run time, with portable code on every target.
+- Constant-time code for secret data, checked in CI with valgrind memcheck on x86-64 and ARM64, and
+  the ARM64 data-independent timing mode (DIT) around asymmetric secret operations.
 - `SecretBytes` for every secret output, wiped on drop; private keys wiped on drop.
 - Pairwise consistency tests at key generation (on by default) and in the ML-KEM and FrodoKEM
   private-key import checks, and verification of every stateful signature before its release.
 - Operating-system randomness only, with `Error::RngFailure` on targets without a source.
-- `enable_data_independent_timing()`, which extends the ARM64 DIT mode to MACs and KDFs.
+- `enable_data_independent_timing()`, which extends DIT to MACs and KDFs.
 
-### Security
+### Usage requirements
 
-The policies that the package documentation states ([Section 20.4](spec/20-versioning.md) item 7):
+These rules are part of the API contract:
 
 - **Pre-hash policy** ([9.1.3](spec/09-signatures.md)). HashML-DSA and HashSLH-DSA accept only
   SHA-2, SHA-3, SHAKE128 and SHAKE256, and only a function with at least the collision strength of
@@ -63,16 +62,9 @@ The policies that the package documentation states ([Section 20.4](spec/20-versi
 - **eFrodoKEM usage limit** ([8.2.6](spec/08-key-encapsulation.md)). An eFrodoKEM public key must be
   used for fewer than 2^8 ciphertexts. The crate does not enforce the limit and never chooses an
   eFrodoKEM set by default.
+- **Hazmat** ([13](spec/13-hazmat.md)). The `hazmat` operations are for test vectors only; a seed
+  or randomness must never be reused with a different key, message or ciphertext.
+- **One key, one mode** ([9.1.2](spec/09-signatures.md)). Each ML-DSA or SLH-DSA key is used with
+  only one of the hedged and deterministic variants, and only one of the pure and pre-hash modes.
 
-Also:
-
-- Code that handles secret data has no secret-dependent branch or memory access; CI checks it with
-  valgrind memcheck on x86-64 and ARM64. On ARM64 CPUs with FEAT_DIT, asymmetric secret operations
-  run with DIT set.
-- The crate offers no constant-time equality; compare secrets through MAC verification, as the
-  `SecretBytes` documentation shows.
-- crypto-pq implements the SP 800-208 algorithms but claims neither SP 800-208 nor FIPS 140
-  validation.
-
-[Unreleased]: https://github.com/crypterial/crypto-pq/compare/rust-v1.0.0-rc.1...HEAD
-[1.0.0-rc.1]: https://github.com/crypterial/crypto-pq/tree/rust-v1.0.0-rc.1
+[1.0.0]: https://github.com/crypterial/crypto-pq/tree/rust-v1.0.0
