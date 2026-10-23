@@ -105,7 +105,7 @@ jobs:
           cp "target/package/$CRATE-$VERSION.crate" "$RUNNER_TEMP/out/"
           cd "$RUNNER_TEMP/out"
           sha256sum "$CRATE-$VERSION.crate" | tee SHA256SUMS
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: crate-${{ matrix.arch }}
           path: ${{ runner.temp }}/out
@@ -136,7 +136,7 @@ jobs:
           mkdir crate
           cp "x64/$CRATE-$VERSION.crate" x64/SHA256SUMS crate/
           (cd crate && sha256sum -c SHA256SUMS)
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: crate
           path: crate
@@ -159,7 +159,7 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: crate/*.crate
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: attestation
           path: ${{ steps.attest.outputs.bundle-path }}
