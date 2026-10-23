@@ -1123,7 +1123,7 @@ impl<S> StatefulPrivateKey<S> {
     /// [`Error::KeyExhausted`] when the key can make no more signatures.
     // SPEC 11.10: the public nodes of the tree of every level that is current for the next index,
     // top first, for StatefulLoadOptions::tree_cache to skip their build. sign takes &mut self, so
-    // no export can overlap a signature: the StateConflict of the other languages cannot happen
+    // no export can overlap a signature: the StateConflict of SPEC 11.13 item 1 cannot happen
     // here.
     //
     // A tree cache holds public nodes only, but the key trusts the root of a cached tree as the

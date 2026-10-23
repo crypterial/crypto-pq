@@ -345,7 +345,8 @@ impl MacAlgorithm {
     }
 
     /// The tag of `data` under `key`, written into `out`, which must be
-    /// [`digest_size`](Self::digest_size) bytes.
+    /// [`digest_size`](Self::digest_size) bytes. Fails with [`Error::InvalidLength`] if the key
+    /// length is not accepted or `out` has another length.
     pub fn digest_into(&self, key: &[u8], data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         self.check_key(key)?;
 
@@ -608,7 +609,8 @@ impl Mac {
         out
     }
 
-    /// The tag written into `out`, which must be the tag size of the algorithm.
+    /// The tag written into `out`, which must be the tag size of the algorithm. Fails with
+    /// [`Error::InvalidLength`] if `out` has another length.
     pub fn digest_into(&self, out: &mut [u8]) -> Result<(), Error> {
         check_length(out.len(), self.size)?;
 

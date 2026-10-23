@@ -102,9 +102,8 @@ static ACCEPTED: [u8; 256] = {
 // The SHA extensions together with the SSSE3 and SSE4.1 shuffles that the kernel needs.
 const SHA: u32 = 1;
 
-// AVX2 with ymm state that the operating system saves, together with BMI1 and BMI2, as Go's
-// standard library also requires them: every CPU with AVX2 has them, and the kernels that the
-// flag selects use either.
+// AVX2 with ymm state that the operating system saves, together with BMI1 and BMI2: every CPU
+// with AVX2 has them, and the kernels that the flag selects use either.
 const AVX2: u32 = 1 << 1;
 
 // SSSE3 and SSE4.1.

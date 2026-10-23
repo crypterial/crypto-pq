@@ -38,8 +38,7 @@ pub enum Error {
 }
 
 impl Error {
-    /// The error code of the specification, such as `"INVALID_LENGTH"`, the same in every
-    /// language.
+    /// The error code that the specification gives this error, such as `"INVALID_LENGTH"`.
     pub const fn code(&self) -> &'static str {
         match self {
             Self::InvalidLength => "INVALID_LENGTH",

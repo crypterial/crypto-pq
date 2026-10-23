@@ -277,7 +277,7 @@ impl HashAlgorithm {
     }
 
     /// The digest of `data` written into `out`, which must be [`digest_size`](Self::digest_size)
-    /// bytes, without allocating.
+    /// bytes, without allocating. Fails with [`Error::InvalidLength`] if `out` has another length.
     // Inline, so that a caller's buffer of the right size needs no check at run time.
     #[inline]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
@@ -411,7 +411,8 @@ impl Hasher {
         out
     }
 
-    /// The digest written into `out`, which must be the digest size of the algorithm.
+    /// The digest written into `out`, which must be the digest size of the algorithm. Fails with
+    /// [`Error::InvalidLength`] if `out` has another length.
     pub fn digest_into(&self, out: &mut [u8]) -> Result<(), Error> {
         check_length(out.len(), self.size)?;
 
@@ -587,7 +588,9 @@ impl XofAlgorithm {
         Ok(out)
     }
 
-    /// `out.len()` bytes of output for `data`, without allocating.
+    /// `out.len()` bytes of output for `data`, without allocating. Fails with
+    /// [`Error::InvalidLength`] if `out` is longer than 2^32 - 1 bytes or, for the Ascon XOFs,
+    /// empty.
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         self.check_output(out.len())?;
 

@@ -52,11 +52,13 @@
 //!
 //! # Examples
 //!
-//! Key encapsulation:
+//! Key encapsulation, with key confirmation: the two sides hold the same secret when a MAC tag made
+//! with one copy verifies with the other, which compares in constant time. Secrets are never
+//! compared with `==`: see "Comparing secrets" in the `SecretBytes` documentation.
 //!
 //! ```
-//! # #[cfg(feature = "ml-kem")] {
-//! use crypto_pq::{KeyGenOptions, ML_KEM_768};
+//! # #[cfg(all(feature = "ml-kem", feature = "hmac"))] {
+//! use crypto_pq::{HMAC_SHA_256, KeyGenOptions, ML_KEM_768};
 //!
 //! let pair = ML_KEM_768.generate_key_pair(&KeyGenOptions::default())?;
 //!
@@ -64,7 +66,9 @@
 //!
 //! let shared_secret = pair.private_key.decapsulate(&encapsulation.ciphertext)?;
 //!
-//! assert_eq!(*shared_secret, *encapsulation.shared_secret);
+//! let tag = HMAC_SHA_256.digest(&encapsulation.shared_secret, b"key confirmation")?;
+//!
+//! assert!(HMAC_SHA_256.verify(&shared_secret, b"key confirmation", &tag));
 //! # }
 //! # Ok::<(), crypto_pq::Error>(())
 //! ```
@@ -177,8 +181,9 @@
 //!
 //! The behaviour of every operation, the sizes, the key formats, the errors and the security
 //! requirements are specified in the `spec/` directory of the
-//! [repository](https://github.com/crypterial/crypto-pq), which all the language implementations
-//! of crypto-pq follow; `spec/profiles/rust.md` is the profile of this crate.
+//! [repository](https://github.com/crypterial/crypto-pq), and `spec/profiles/rust.md` states how
+//! this crate expresses them in Rust. The crate's MAJOR.MINOR version is the version of the
+//! specification that it implements.
 
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]

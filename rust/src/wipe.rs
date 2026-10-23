@@ -93,8 +93,15 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
 /// secrets, derived keys and exported private keys.
 ///
 /// It dereferences to `[u8]` and prints as redacted. It implements neither `Clone`, so that every
-/// copy is one the caller makes, nor `PartialEq`: compare secrets in constant time, never with
-/// `==`. Copies that the compiler makes in registers or on the stack cannot be wiped.
+/// copy is one the caller makes, nor `PartialEq`. Copies that the compiler makes in registers or on
+/// the stack cannot be wiped, and copies that the caller makes are the caller's to wipe.
+///
+/// # Comparing secrets
+///
+/// The crate offers no constant-time equality, and `==` on the bytes is not constant time, so
+/// never compare secrets with it. To check that two parties hold the same secret, use each copy
+/// as a MAC key over the same data and verify the tag from one with the other (key
+/// confirmation): MAC verification, such as `HMAC_SHA_256.verify`, compares in constant time.
 // The buffer never grows after creation, so no reallocation leaves an unwiped copy behind.
 pub struct SecretBytes(Vec<u8>);
 
