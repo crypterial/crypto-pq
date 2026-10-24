@@ -1,0 +1,12 @@
+[package]
+name = "fbench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+pr = { package = "crypto-pq", path = "/pr/rust", features = ["hazmat"] }
+main = { package = "crypto-pq-main", path = "/main/rust", features = ["hazmat"] }
+
+[profile.release]
+codegen-units = 1

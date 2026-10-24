@@ -1,0 +1,73 @@
+name: bench-frodokem
+
+# Temporary (branch bench/frodokem only): FrodoKEM A/B of main 7267bf3 against perf/frodokem, with
+# liboqs 0.16.0 in its default and native builds, on GitHub's x86-64 and arm64 runners. Outputs are
+# byte-checked before anything is timed. Delete the branch and its runs when done.
+on:
+  push:
+    branches: [bench/frodokem]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bench:
+    name: frodokem (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: pr
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 7267bf3
+          path: main
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: open-quantum-safe/liboqs
+          ref: e6b9e783747536f34700aab4bd10718c2fecab3f
+          path: liboqs
+      - run: lscpu | grep -E '^(Model name|Flags)' | cut -c1-900
+      - run: rustup toolchain install 1.99.0 --profile minimal
+      - name: liboqs default and native
+        run: |
+          for cfg in default native; do
+            case $cfg in default) fl="-DOQS_DIST_BUILD=ON" ;; native) fl="-DOQS_DIST_BUILD=OFF -DOQS_OPT_TARGET=auto" ;; esac
+            CMAKE=cmake sh pr/bench/oqs/build-liboqs.sh "$PWD/liboqs" $cfg $fl | grep -E "OQS_DIST_BUILD|OQS_OPT_TARGET|built"
+            cp /tmp/cmp-$cfg "$RUNNER_TEMP/cmp-liboqs-$cfg"
+          done
+      - name: harness
+        run: |
+          sed -i 's/^name = "crypto-pq"$/name = "crypto-pq-main"/' main/rust/Cargo.toml
+          sed -e "s#\"/pr/rust\"#\"$PWD/pr/rust\"#; s#\"/main/rust\"#\"$PWD/main/rust\"#" pr/bench/fbench/Cargo.toml > pr/bench/fbench/Cargo.toml.new
+          mv pr/bench/fbench/Cargo.toml.new pr/bench/fbench/Cargo.toml
+          cd pr/bench/fbench && cargo +1.99.0 build --release && cp target/release/fbench "$RUNNER_TEMP/fbench"
+      - name: outputs
+        run: |
+          "$RUNNER_TEMP/fbench" --rounds=0 > fp-fbench.txt
+          grep CHECK fp-fbench.txt
+          for cfg in default native; do
+            "$RUNNER_TEMP/cmp-liboqs-$cfg" --check > fp-oqs-$cfg.txt
+            python3 -I pr/bench/fpcmp.py fp-oqs-$cfg.txt fp-fbench.txt
+          done
+      - name: timing
+        run: |
+          for r in 1 2 3; do
+            case $((r % 3)) in 1) list="fbench default native";; 2) list="default native fbench";; 0) list="native fbench default";; esac
+            for b in $list; do
+              echo "=== $b round $r load $(cut -d' ' -f1-3 /proc/loadavg)"
+              case $b in
+                fbench) "$RUNNER_TEMP/fbench" --rounds=1 | sed "s/^R1/R$r/" | grep -v "^FP\|^CHECK" ;;
+                *) IMPL="liboqs $b" "$RUNNER_TEMP/cmp-liboqs-$b" --rounds=1 --offset=$((r-1)) FrodoKEM | grep -v "^FP\|^ENTRY\|^CHECK\|^NOTE" ;;
+              esac
+            done
+          done | tee timing.txt
+          python3 -I pr/bench/table.py timing.txt | tee -a "$GITHUB_STEP_SUMMARY"
