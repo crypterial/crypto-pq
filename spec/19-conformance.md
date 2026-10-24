@@ -19,7 +19,7 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
 | directory | content |
 |---|---|
 | `acvp/` | NIST ACVP-Server vectors, pinned at commit 975de31eb83d87039ec88934fdc47d8c312b892d |
-| `cavp/` | NIST CAVP SHA-2, SHA-3, SHAKE and HMAC response files |
+| `cavp/` | NIST CAVP SHA-2, SHA-3, SHAKE and HMAC response files, and the AESAVS ECB known-answer tests of the internal AES core ([4.3](04-scope.md#43-internal-components)) |
 | `wycheproof/` | C2SP Wycheproof vectors (pin: [19.4](#194-official-vector-sets)) |
 | `rfc/` | test vectors and examples from RFCs |
 | `nist-examples/` | NIST example values for cSHAKE and KMAC |
@@ -166,6 +166,7 @@ reported by the runner. The internal-interface groups of ML-DSA and SLH-DSA run 
 | BLAKE2 | RFC 7693 Appendix and the BLAKE2 reference known-answer tests; parameter (salt, personalization, length) tests; data above 4 GiB weekly |
 | BLAKE3 | `test_vectors.json` of the BLAKE3 repository at commit f55849f89cd85083c1c9daa2c5de20766f309c00 (SHA-256 dcb91ea8accc77e6d6e632af7cdc1a99a9f3ae78cf648da595c7d064db32f624): hash, keyed_hash and derive_key at every listed length; `cross/blake3.txt` |
 | Ascon | ACVP Ascon (SP 800-232) and the Ascon known-answer tests for Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128 |
+| AES (internal, [4.3](04-scope.md#43-internal-components)) | CAVP AESAVS ECB known-answer tests (GFSbox, KeySbox, VarKey, VarTxt), through the AES instructions and the portable code |
 | all symmetric | `cross/symmetric.txt` |
 
 The Wycheproof pin is commit 7a32593 (the full commit hash is recorded with the vectors).

@@ -12,7 +12,7 @@ Decisions [D-66](decisions.md#decision-d-66-revised-by-d-71) and [D-71](decision
 1. The crypto-pq package, the Rust crate `crypto-pq`, follows Semantic Versioning 2.0.0.
 2. Its MAJOR.MINOR equals the version of this specification that it implements: every 1.0.x release
    implements SPEC 1.0. PATCH is independent of the specification.
-3. The first release is 1.0.0.
+3. The first release that implements this specification is 1.0.0.
 4. A release starts from a signed, annotated tag `rust-vX.Y.Z` (for example `rust-v1.0.0`) on the
    default branch of the repository `crypterial/crypto-pq`
    ([Section 20.4](20-versioning.md#204-release-process)).
