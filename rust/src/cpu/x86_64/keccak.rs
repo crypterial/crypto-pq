@@ -5,6 +5,8 @@
 
 use core::arch::x86_64::*;
 
+#[cfg(feature = "frodokem")]
+use super::memory::store256;
 use crate::keccak::{self, ROUND_CONSTANTS};
 use crate::sha2::last_bytes;
 use crate::wipe::wipe;
@@ -180,6 +182,124 @@ pub(super) fn permute4_avx2(states: &mut [&mut [u64; 25]]) {
     }
 
     scatter4(&a, states);
+}
+
+// The 24 rounds on four states that stay in vectors. Inlined, they unroll in full: 2.20 ms for the
+// rows of FrodoKEM-976 on Haswell, against 2.36 ms as a call around the loop of rounds.
+#[cfg(feature = "frodokem")]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn permute4_in_place(a: &mut [__m256i; 25], e: &mut [__m256i; 25]) {
+    let mut parities = core::array::from_fn(|x| {
+        _mm256_xor_si256(
+            _mm256_xor_si256(
+                _mm256_xor_si256(a[x], a[x + 5]),
+                _mm256_xor_si256(a[x + 10], a[x + 15]),
+            ),
+            a[x + 20],
+        )
+    });
+
+    for constants in ROUND_CONSTANTS.as_chunks::<2>().0 {
+        round4(a, e, &mut parities, constants[0]);
+
+        round4(e, a, &mut parities, constants[1]);
+    }
+}
+
+// Four rows of FrodoKEM's matrix A, rows i0 to i0 + 3 of n entries each: row i is the output of
+// SHAKE128(i || seedA) as little-endian 16-bit values (frodokem.rs, shake_rows). The four sponges
+// stay in vectors from one block to the next, and each group of four lanes is transposed into
+// sixteen entries of every row. (Two groups interleaved round by round spilled more than they
+// overlapped: 94 instead of 70 cycles a round per group on Haswell, by llvm-mca.) A is public.
+#[cfg(feature = "frodokem")]
+#[target_feature(enable = "avx2")]
+pub(super) fn matrix_rows4(seed_a: &[u8; 16], rows: &mut [u16], n: usize, i0: usize) {
+    let word = |bytes: &[u8]| {
+        let mut word = [0; 8];
+
+        word[..bytes.len()].copy_from_slice(bytes);
+
+        u64::from_le_bytes(word)
+    };
+
+    // The 18-byte message i || seedA, SHAKE's suffix and the padding at the end of the rate.
+    let first = word(&seed_a[..6]) << 16;
+
+    let row = |r: usize| ((i0 + r) as u64 | first) as i64;
+
+    let mut a = [_mm256_setzero_si256(); 25];
+
+    a[0] = _mm256_set_epi64x(row(3), row(2), row(1), row(0));
+
+    a[1] = _mm256_set1_epi64x(word(&seed_a[6..14]) as i64);
+
+    a[2] = _mm256_set1_epi64x((word(&seed_a[14..]) | 0x1F << 16) as i64);
+
+    a[20] = _mm256_set1_epi64x((0x80u64 << 56) as i64);
+
+    let mut e = [_mm256_setzero_si256(); 25];
+
+    let mut out = rows.chunks_exact_mut(n);
+
+    let mut out: [&mut [u16]; 4] = core::array::from_fn(|_| out.next().expect("four rows"));
+
+    let mut offset = 0;
+
+    while offset < n {
+        permute4_in_place(&mut a, &mut e);
+
+        let lanes = (n - offset).min(4 * 21) / 4;
+
+        let (groups, rest) = a[..lanes].as_chunks::<4>();
+
+        for (q, v) in groups.iter().enumerate() {
+            let low = [
+                _mm256_unpacklo_epi64(v[0], v[1]),
+                _mm256_unpacklo_epi64(v[2], v[3]),
+            ];
+
+            let high = [
+                _mm256_unpackhi_epi64(v[0], v[1]),
+                _mm256_unpackhi_epi64(v[2], v[3]),
+            ];
+
+            let states = [
+                _mm256_permute2x128_si256::<0x20>(low[0], low[1]),
+                _mm256_permute2x128_si256::<0x20>(high[0], high[1]),
+                _mm256_permute2x128_si256::<0x31>(low[0], low[1]),
+                _mm256_permute2x128_si256::<0x31>(high[0], high[1]),
+            ];
+
+            let at = offset + 16 * q;
+
+            for (row, state) in out.iter_mut().zip(states) {
+                let entries: &mut [u16; 16] =
+                    (&mut row[at..at + 16]).try_into().expect("16 entries");
+
+                store256(state, entries);
+            }
+        }
+
+        for (l, v) in rest.iter().enumerate() {
+            let at = offset + 16 * groups.len() + 4 * l;
+
+            let words = [
+                _mm256_extract_epi64::<0>(*v),
+                _mm256_extract_epi64::<1>(*v),
+                _mm256_extract_epi64::<2>(*v),
+                _mm256_extract_epi64::<3>(*v),
+            ];
+
+            for (row, word) in out.iter_mut().zip(words) {
+                for (k, entry) in row[at..at + 4].iter_mut().enumerate() {
+                    *entry = (word as u64 >> (16 * k)) as u16;
+                }
+            }
+        }
+
+        offset += 4 * lanes;
+    }
 }
 
 // The portable rounds, two per step from the state into a copy and back.
