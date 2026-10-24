@@ -132,7 +132,7 @@ Rust spelling of every name; Part II gives the Rust types.
 | operation | output | errors |
 |---|---|---|
 | `ALG.generateKeyPair({parameters, stateStore, reserve = 1})` | `StatefulKeyPair {publicKey, privateKey}` | INVALID_OPTION, RNG_FAILURE, STATE_PERSIST_FAILED, STATE_CONFLICT, SELF_TEST_FAILED ([11.5.3](11-stateful-signatures.md#1153-key-generation)) |
-| `ALG.loadPrivateKey(stateStore, {reserve = 1, treeCache = none})` | `StatefulPrivateKey` | INVALID_OPTION, INVALID_PRIVATE_KEY, ALGORITHM_MISMATCH, INVALID_ENCODING, STATE_PERSIST_FAILED, STATE_CONFLICT, SELF_TEST_FAILED ([11.9](11-stateful-signatures.md#119-loading)) |
+| `ALG.loadPrivateKey(stateStore, {reserve = 1, treeCache = none})` | `StatefulPrivateKey` | INVALID_OPTION, INVALID_PRIVATE_KEY, ALGORITHM_MISMATCH, INVALID_ENCODING, STATE_PERSIST_FAILED, SELF_TEST_FAILED ([11.9](11-stateful-signatures.md#119-loading)) |
 | `ALG.importPublicKey(data, format)` | `StatefulPublicKey` | INVALID_LENGTH, INVALID_ENCODING, ALGORITHM_MISMATCH, INVALID_PUBLIC_KEY |
 | `privateKey.sign(message)` | signature | STATE_CONFLICT, KEY_EXHAUSTED, RNG_FAILURE, STATE_PERSIST_FAILED, SELF_TEST_FAILED ([11.5](11-stateful-signatures.md#115-signing)) |
 | `privateKey.remainingSignatures()` | unsigned 64-bit integer | none |

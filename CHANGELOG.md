@@ -9,7 +9,7 @@ the [crypto-pq specification](spec/00-contents.md) that it implements
 
 ## [1.0.0] - 2026-10-23
 
-The first release, implementing specification 1.0.
+The first release that implements specification 1.0.
 
 ### Added
 

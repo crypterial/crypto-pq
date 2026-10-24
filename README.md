@@ -12,7 +12,7 @@ and HKDF. It is `no_std` with `alloc`, has no dependencies, and implements a
 [specification](spec/00-contents.md) that fixes every operation, size, format and error.
 
 - API documentation: [docs.rs/crypto-pq](https://docs.rs/crypto-pq)
-- Project page: [crypterial.com/projects/crypto-pq](https://crypterial.com/projects/crypto-pq/)
+- Project page: [crypterial.com/research/crypto-pq](https://crypterial.com/research/crypto-pq/)
 - Changes: [CHANGELOG.md](CHANGELOG.md)
 
 ## Algorithms
@@ -274,7 +274,8 @@ specification state them in full.
   value, and the `_into` forms allocate nothing.
 
 CI builds and tests the crate on Linux x86-64 and ARM64, macOS ARM64, Windows x86-64 and ARM64 and
-Linux musl, and under emulation on 32-bit x86, RISC-V 64 and big-endian s390x, on Rust 1.88 and stable.
+Linux musl, and under emulation on 32-bit x86, RISC-V 64 and big-endian s390x, with stable Rust,
+and on Linux x86-64 with Rust 1.88 as well.
 
 ## Specification and test vectors
 

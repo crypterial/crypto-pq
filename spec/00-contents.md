@@ -7,6 +7,7 @@
 | Applies to | crypto-pq 1.0.x, the Rust crate `crypto-pq` ([20.1](20-versioning.md#201-versions)) |
 | Status | Published |
 | Date | 2026-10-23 |
+| Corrections | [VERSIONS.md](VERSIONS.md#corrections-to-spec-10) |
 | Editor | Crypterial Labs |
 | License | This document is licensed under the Apache License, Version 2.0, or the MIT license, at your option (`LICENSE-APACHE`, `LICENSE-MIT`). |
 

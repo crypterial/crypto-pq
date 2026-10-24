@@ -9,7 +9,7 @@ ML-DSA, SLH-DSA, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMA
 is `no_std` with `alloc` and needs Rust 1.88 or later.
 
 - API documentation: [docs.rs/crypto-pq](https://docs.rs/crypto-pq)
-- Project page: [crypterial.com/projects/crypto-pq](https://crypterial.com/projects/crypto-pq/)
+- Project page: [crypterial.com/research/crypto-pq](https://crypterial.com/research/crypto-pq/)
 - Repository: [github.com/crypterial/crypto-pq](https://github.com/crypterial/crypto-pq)
 - Specification: [`spec/`](https://github.com/crypterial/crypto-pq/tree/main/spec), with the Rust
   profile in [`spec/profiles/rust.md`](https://github.com/crypterial/crypto-pq/blob/main/spec/profiles/rust.md)
