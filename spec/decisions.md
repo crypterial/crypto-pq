@@ -303,8 +303,8 @@ Rationale: diagnosable without leaking.
 
 ## Decision D-50
 
-The AES-128 core used by FrodoKEM is constant time although its
-FrodoKEM inputs are public ([8.2.3](08-key-encapsulation.md#823-constant-time-and-memory)). Rationale: one constant-time AES core serves every use, with public or
+The AES-128 code used by FrodoKEM, the AES instructions or the bitsliced code, is constant time
+although its FrodoKEM inputs are public ([8.2.3](08-key-encapsulation.md#823-constant-time-and-memory)). Rationale: one constant-time AES core serves every use, with public or
 secret keys; no variable-time AES core exists in the code base.
 
 ## Decision D-51

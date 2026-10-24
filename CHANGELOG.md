@@ -7,6 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 the [crypto-pq specification](spec/00-contents.md) that it implements
 ([Section 20.1](spec/20-versioning.md)).
 
+## [Unreleased]
+
+### Changed
+
+- FrodoKEM: matrix A and its products with the secret matrices use CPU kernels selected at run
+  time, each with its portable twin: on ARM64, AES-128 rows with the ARMv8 AES instructions
+  (eight blocks in flight) and the products with NEON; on x86-64, AES-128 rows with AES-NI and,
+  on AVX2 CPUs, four SHAKE128 rows at a time and the products with AVX2. Noise sampling and the
+  SHAKE128 rows of the portable code run on whole blocks. Outputs are unchanged.
+
 ## [1.0.0] - 2026-10-23
 
 The first release, implementing specification 1.0.

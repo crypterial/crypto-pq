@@ -1,11 +1,13 @@
-// SHA-256 with the SHA extensions (SHA256RNDS2, SHA256MSG1, SHA256MSG2); with AVX2, BMI1 and BMI2
-// (the AVX2 tier): the SHA-256 lanes, SHA-256 without the SHA extensions and SHA-512,
-// Keccak-f[1600] on four states and on one, BLAKE2b and BLAKE2s, Ascon, and the ML-KEM and ML-DSA
-// arithmetic, sampling and encodings; BLAKE2b and BLAKE2s without AVX2 with SSE4.1. Every
-// instruction used is on Intel's list of data-operand-independent timing instructions, and the code
-// around them has no branch or address that depends on secret data. The kernels are safe code
-// inside #[target_feature] functions, apart from the loads and stores of memory.rs and the assembly
-// of the SHA-2 rounds and of single shuffles and blends; what is unsafe is calling one once its
+// SHA-256 with the SHA extensions (SHA256RNDS2, SHA256MSG1, SHA256MSG2); AES-128 and AES-256 with
+// AES-NI, which also builds the AES rows of FrodoKEM's matrix A in registers; with AVX2, BMI1 and
+// BMI2 (the AVX2 tier): the SHA-256 lanes, SHA-256 without the SHA extensions and SHA-512,
+// Keccak-f[1600] on four states and on one, BLAKE2b and BLAKE2s, Ascon, the ML-KEM and ML-DSA
+// arithmetic, sampling and encodings, and FrodoKEM's SHAKE128 rows of A and its products of A with
+// the secret matrices; BLAKE2b and BLAKE2s without AVX2 with SSE4.1. Every instruction used is on
+// Intel's list of data-operand-independent timing instructions, and the code around them has no
+// branch or address that depends on secret data. The kernels are safe code inside
+// #[target_feature] functions, apart from the loads and stores of memory.rs and the assembly of
+// the SHA-2 rounds and of single shuffles and blends; what is unsafe is calling one once its
 // feature is known to be there, and CPUID with XGETBV.
 
 use core::arch::x86_64::*;
@@ -50,6 +52,9 @@ mod ascon;
 
 #[cfg(feature = "blake2")]
 mod blake2;
+
+#[cfg(feature = "frodokem")]
+mod frodo;
 
 #[cfg(feature = "ml-dsa")]
 mod dsa;
@@ -848,6 +853,90 @@ pub(crate) fn aes_encrypt(round_keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) -> b
 
     // SAFETY: as in aes_expand.
     unsafe { aes::encrypt_blocks(round_keys, blocks) };
+
+    true
+}
+
+// The rows of FrodoKEM's matrix A, n entries each.
+#[allow(unsafe_code)]
+#[cfg(feature = "frodokem")]
+pub(crate) fn frodo_aes_rows(
+    round_keys: &[[u8; 16]],
+    rows: &mut [u16],
+    n: usize,
+    i0: usize,
+) -> bool {
+    if !has(AES) || !n.is_multiple_of(8) || n > usize::from(u16::MAX) {
+        return false;
+    }
+
+    // SAFETY: as in aes_expand.
+    unsafe { aes::matrix_rows(round_keys, rows, n, i0) };
+
+    true
+}
+
+// Rows of FrodoKEM's matrix A from SHAKE128, four at a time; the number of rows must be a
+// multiple of four.
+#[allow(unsafe_code)]
+#[cfg(feature = "frodokem")]
+pub(crate) fn frodo_shake_rows(seed_a: &[u8], rows: &mut [u16], n: usize, i0: usize) -> bool {
+    let Ok(seed_a) = <&[u8; 16]>::try_from(seed_a) else {
+        return false;
+    };
+
+    if n == 0
+        || !n.is_multiple_of(4)
+        || !rows.len().is_multiple_of(4 * n)
+        || i0 + rows.len() / n > 1 << 16
+        || !has(AVX2)
+    {
+        return false;
+    }
+
+    for (g, group) in rows.chunks_exact_mut(4 * n).enumerate() {
+        // SAFETY: as in permute_many.
+        unsafe { keccak::matrix_rows4(seed_a, group, n, i0 + 4 * g) };
+    }
+
+    true
+}
+
+// FrodoKEM's products of eight rows of A with S, which the AVX2 kernel reads in the form S^T of
+// the private key, and with S'.
+#[allow(unsafe_code)]
+#[cfg(feature = "frodokem")]
+pub(crate) fn frodo_mul_add_as(
+    acc: &mut [[u16; 8]; 8],
+    rows: &[u16],
+    _: &[u16],
+    st: &[u8],
+    n: usize,
+) -> bool {
+    if !n.is_multiple_of(16) || rows.len() != 8 * n || st.len() != 16 * n || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in permute_many.
+    unsafe { frodo::mul_add_as(acc, rows, st, n) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+#[cfg(feature = "frodokem")]
+pub(crate) fn frodo_mul_add_sa(
+    acc: &mut [u16],
+    rows: &[u16],
+    column: &[[u16; 8]; 8],
+    n: usize,
+) -> bool {
+    if !n.is_multiple_of(16) || rows.len() != 8 * n || acc.len() != 8 * n || !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in permute_many.
+    unsafe { frodo::mul_add_sa(acc, rows, column, n) };
 
     true
 }

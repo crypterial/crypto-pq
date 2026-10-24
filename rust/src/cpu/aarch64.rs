@@ -1,12 +1,14 @@
-// SHA-256 with the ARMv8 SHA2 instructions, SHA-512 with the ARMv8.2 SHA512 instructions and
-// Keccak-f[1600] with the ARMv8.2 SHA3 instructions; the NEON transforms of ML-KEM and ML-DSA and
-// their noise and rejection sampling are in the submodules. All of them are on Arm's list of
-// instructions whose timing does not depend on their data (FEAT_DIT), and the code around them
-// has no branch or address that depends on secret data (sample.rs explains the one pattern it
-// declassifies). The kernels are safe code inside #[target_feature] functions, apart from the
-// loads and stores of memory.rs and the rounds of SHA-256 and Keccak that are written in
-// assembly; what is otherwise unsafe is calling one once its feature is known to be there,
-// asking the operating system for the features, and setting the DIT bit.
+// SHA-256 with the ARMv8 SHA2 instructions, SHA-512 with the ARMv8.2 SHA512 instructions,
+// Keccak-f[1600] with the ARMv8.2 SHA3 instructions and the AES-128 rows of FrodoKEM's matrix A
+// with the ARMv8 AES instructions; the NEON transforms of ML-KEM and ML-DSA, their noise and
+// rejection sampling, and FrodoKEM's products of A with the secret matrices are in the
+// submodules. All of them are on Arm's list of instructions whose timing does not depend on their
+// data (FEAT_DIT), and the code around them has no branch or address that depends on secret data
+// (sample.rs explains the one pattern it declassifies). The kernels are safe code inside
+// #[target_feature] functions, apart from the loads and stores of memory.rs and the rounds of
+// SHA-256 and Keccak that are written in assembly; what is otherwise unsafe is calling one once
+// its feature is known to be there, asking the operating system for the features, and setting the
+// DIT bit.
 
 use core::arch::aarch64::*;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -29,6 +31,9 @@ mod aes;
 
 #[cfg(feature = "ascon")]
 mod ascon;
+
+#[cfg(feature = "frodokem")]
+mod frodo;
 
 #[cfg(feature = "ml-kem")]
 mod binomial;
@@ -390,6 +395,47 @@ pub(crate) fn aes_encrypt(round_keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) -> b
 
     // SAFETY: as in aes_expand.
     unsafe { aes::encrypt_blocks(round_keys, blocks) };
+
+    true
+}
+
+// FrodoKEM's products of eight rows of A with S, which the NEON kernel reads in the form s, and
+// with S'.
+#[cfg(feature = "frodokem")]
+pub(crate) fn frodo_mul_add_as(
+    acc: &mut [[u16; 8]; 8],
+    rows: &[u16],
+    s: &[u16],
+    _: &[u8],
+    n: usize,
+) -> bool {
+    frodo::mul_add_as(acc, rows, s, n)
+}
+
+#[cfg(feature = "frodokem")]
+pub(crate) use frodo::mul_add_sa as frodo_mul_add_sa;
+
+// The SHAKE rows of FrodoKEM's matrix A run on the sponges, whose Keccak kernels serve them.
+#[cfg(feature = "frodokem")]
+pub(crate) fn frodo_shake_rows(_: &[u8], _: &mut [u16], _: usize, _: usize) -> bool {
+    false
+}
+
+// The rows of FrodoKEM's matrix A, n entries each.
+#[allow(unsafe_code)]
+#[cfg(feature = "frodokem")]
+pub(crate) fn frodo_aes_rows(
+    round_keys: &[[u8; 16]],
+    rows: &mut [u16],
+    n: usize,
+    i0: usize,
+) -> bool {
+    if !has(AES) || !n.is_multiple_of(8) || n > usize::from(u16::MAX) {
+        return false;
+    }
+
+    // SAFETY: as in aes_expand.
+    unsafe { aes::matrix_rows(round_keys, rows, n, i0) };
 
     true
 }

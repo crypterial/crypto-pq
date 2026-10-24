@@ -78,8 +78,9 @@ as their seed and randomness (Section [13](13-hazmat.md)).
    mask) MUST be constant time. Error sampling MUST use the arithmetic comparison against the CDF
    table of [FRODO-DRAFT] §6.5, with no secret-dependent branch or index.
 3. Key objects MUST NOT cache matrix A (P8). A public key object MAY cache pkh.
-4. The AES variants use the implementation's single AES-128 core ([4.3](04-scope.md#43-internal-components)), which MUST be constant time
-   even though matrix A is public, because one constant-time core serves every AES use [[D-50](decisions.md#decision-d-50)].
+4. The AES variants compute matrix A with the implementation's AES-128 code ([4.3](04-scope.md#43-internal-components)): the AES instructions
+   or the bitsliced code of [14.1](14-security.md#141-constant-time) item 3. That code MUST be constant time even though matrix A
+   is public, because the same constant-time code serves every AES use [[D-50](decisions.md#decision-d-50)].
 
 ### 8.2.4 Keys and import
 

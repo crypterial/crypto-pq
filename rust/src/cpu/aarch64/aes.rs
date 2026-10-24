@@ -4,7 +4,7 @@
 
 use core::arch::aarch64::*;
 
-use super::memory::{load_u8, store_u8};
+use super::memory::{load_u8, store_u8, store_u16};
 
 // SubWord: AESE with a zero round key on the word in every column, where ShiftRows moves nothing.
 #[target_feature(enable = "neon,aes")]
@@ -98,5 +98,48 @@ pub(super) fn encrypt_blocks(keys: &[[u8; 16]], blocks: &mut [[u8; 16]]) {
         encrypt(keys, &mut x);
 
         store_u8(x[0], block);
+    }
+}
+
+// The rows of FrodoKEM's matrix A from row i0 on (frodokem.rs, aes_rows): block j / 8 of row i is
+// i || j || 0...0, built in a register, and its ciphertext is entries j to j + 7. Eight blocks are
+// in flight, as AESE and AESMC take three cycles together on recent cores and issue on several
+// pipes. The rows follow one another in memory, so block m of the call holds entries 8m to 8m + 7.
+#[target_feature(enable = "neon,aes")]
+pub(super) fn matrix_rows(keys: &[[u8; 16]], rows: &mut [u16], n: usize, i0: usize) {
+    let (mut i, mut j) = (i0 as u64, 0);
+
+    let mut counter = || {
+        let block = vreinterpretq_u8_u64(vsetq_lane_u64::<0>(i | j << 16, vdupq_n_u64(0)));
+
+        j += 8;
+
+        if j == n as u64 {
+            (i, j) = (i + 1, 0);
+        }
+
+        block
+    };
+
+    let (blocks, _) = rows.as_chunks_mut::<8>();
+
+    let (groups, rest) = blocks.as_chunks_mut::<8>();
+
+    for group in groups {
+        let mut x: [uint8x16_t; 8] = core::array::from_fn(|_| counter());
+
+        encrypt(keys, &mut x);
+
+        for (vector, block) in x.iter().zip(group.iter_mut()) {
+            store_u16(vreinterpretq_u16_u8(*vector), block);
+        }
+    }
+
+    for block in rest {
+        let mut x = [counter()];
+
+        encrypt(keys, &mut x);
+
+        store_u16(vreinterpretq_u16_u8(x[0]), block);
     }
 }

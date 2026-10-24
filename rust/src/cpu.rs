@@ -2,9 +2,10 @@
 // instructions (cfg(target_feature)), or when the operating system or CPUID reports them; that
 // answer is found once, without allocating or blocking, and kept in an atomic, so a check costs
 // one load. Each function here returns whether it did the work (permute_many, how many states it
-// permuted), and the caller runs the portable code for the rest. --cfg crypto_pq_portable
-// compiles every kernel out, which is how CI tests the fallback on machines that have the
-// instructions.
+// permuted), and the caller runs the portable code for the rest; FrodoKEM's kernels (the AES and
+// SHAKE128 rows of matrix A and the products of A with the secret matrices) do the same, with
+// the portable twins in frodokem.rs. --cfg crypto_pq_portable compiles every kernel out, which
+// is how CI tests the fallback on machines that have the instructions.
 //
 // The constant-time check (--cfg crypto_pq_ct) runs under valgrind, which cannot execute every
 // instruction: its build leaves out SHA3, SHA512 and DIT on arm64 and the SHA extensions on
@@ -67,6 +68,36 @@ mod arch {
     #[inline(always)]
     #[cfg(feature = "frodokem")]
     pub(crate) fn aes_encrypt(_: &[[u8; 16]], _: &mut [[u8; 16]]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "frodokem")]
+    pub(crate) fn frodo_aes_rows(_: &[[u8; 16]], _: &mut [u16], _: usize, _: usize) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "frodokem")]
+    pub(crate) fn frodo_shake_rows(_: &[u8], _: &mut [u16], _: usize, _: usize) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "frodokem")]
+    pub(crate) fn frodo_mul_add_as(
+        _: &mut [[u16; 8]; 8],
+        _: &[u16],
+        _: &[u16],
+        _: &[u8],
+        _: usize,
+    ) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "frodokem")]
+    pub(crate) fn frodo_mul_add_sa(_: &mut [u16], _: &[u16], _: &[[u16; 8]; 8], _: usize) -> bool {
         false
     }
 
@@ -453,7 +484,9 @@ pub(crate) use arch::{
 };
 
 #[cfg(feature = "frodokem")]
-pub(crate) use arch::{aes_encrypt, aes_expand};
+pub(crate) use arch::{
+    aes_encrypt, aes_expand, frodo_aes_rows, frodo_mul_add_as, frodo_mul_add_sa, frodo_shake_rows,
+};
 
 #[cfg(feature = "ascon")]
 pub(crate) use arch::{ascon, ascon_digest};

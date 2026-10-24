@@ -12,6 +12,7 @@ use core::hint::black_box;
 use core::ops::{Deref, DerefMut};
 
 use crate::aes::Aes;
+use crate::cpu;
 use crate::ct::{self, declassify};
 use crate::keccak::{Keccak, MAX_SPONGES, Sponges};
 use crate::primitives::shake256_into;
@@ -19,7 +20,8 @@ use crate::wipe::{SecretBytes, wipe};
 
 const BAR: usize = 8;
 
-// The rows of A generated at once: one batch of the Keccak kernels.
+// The rows of A generated at once: one batch of the Keccak kernels, and the rows that the matrix
+// kernels take.
 const ROWS: usize = 8;
 
 const MAX_N: usize = 1344;
@@ -152,6 +154,7 @@ impl Drop for Entries {
 
 // Sample (draft 6.5): the magnitude counts the entries of T_chi below r >> 1, all of them compared
 // arithmetically, and bit 0 of r gives the sign.
+#[inline(always)]
 fn sample(r: u16, cdf: &[u16]) -> u16 {
     let t = r >> 1;
 
@@ -164,6 +167,26 @@ fn sample(r: u16, cdf: &[u16]) -> u16 {
     let sign = (r & 1).wrapping_neg();
 
     (e ^ sign).wrapping_sub(sign)
+}
+
+// Sample of each little-endian 16-bit value in bytes, into out. Each table is passed on as an
+// array, so that its length is known at compile time: the comparisons unroll and the loop runs on
+// vectors.
+fn sample_all(out: &mut [u16], bytes: &[u8], cdf: &[u16]) {
+    #[inline(always)]
+    fn each(out: &mut [u16], bytes: &[u8], cdf: &[u16]) {
+        for (value, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            *value = sample(u16::from_le_bytes(*pair), cdf);
+        }
+    }
+
+    if let Ok(cdf) = <&[u16; 10]>::try_from(cdf) {
+        each(out, bytes, cdf);
+    } else if let Ok(cdf) = <&[u16; 6]>::try_from(cdf) {
+        each(out, bytes, cdf);
+    } else {
+        each(out, bytes, cdf);
+    }
 }
 
 // The 16-bit values of SHAKE256(domain || seedSE) (draft 7.1.1, 7.2 and 7.3), squeezed two blocks
@@ -191,24 +214,23 @@ impl Stream {
         }
     }
 
-    fn next(&mut self) -> u16 {
-        if self.position == self.blocks.len() {
-            self.sponge.read(&mut self.blocks);
+    fn fill(&mut self, mut out: &mut [u16]) {
+        while !out.is_empty() {
+            if self.position == self.blocks.len() {
+                self.sponge.read(&mut self.blocks);
 
-            self.position = 0;
-        }
+                self.position = 0;
+            }
 
-        let value =
-            u16::from_le_bytes([self.blocks[self.position], self.blocks[self.position + 1]]);
+            let count = out.len().min((self.blocks.len() - self.position) / 2);
 
-        self.position += 2;
+            let (now, rest) = out.split_at_mut(count);
 
-        sample(value, self.cdf)
-    }
+            sample_all(now, &self.blocks[self.position..], self.cdf);
 
-    fn fill(&mut self, out: &mut [u16]) {
-        for value in out {
-            *value = self.next();
+            self.position += 2 * count;
+
+            out = rest;
         }
     }
 }
@@ -256,8 +278,23 @@ impl<'a> Matrix<'a> {
     }
 }
 
-// One SHAKE128 sponge per row, all of them in lockstep.
+// One SHAKE128 sponge per row, all of them in lockstep. The AVX2 kernel keeps its sponges in
+// vectors from one block to the next.
 fn shake_rows(sponges: &mut Sponges, seed_a: &[u8], rows: &mut [u16], n: usize, i0: usize) {
+    if cpu::frodo_shake_rows(seed_a, rows, n, i0) {
+        return;
+    }
+
+    shake_rows_portable(sponges, seed_a, rows, n, i0);
+}
+
+fn shake_rows_portable(
+    sponges: &mut Sponges,
+    seed_a: &[u8],
+    rows: &mut [u16],
+    n: usize,
+    i0: usize,
+) {
     let count = rows.len() / n;
 
     let indices: [[u8; 2]; ROWS] = array::from_fn(|l| ((i0 + l) as u16).to_le_bytes());
@@ -272,22 +309,34 @@ fn shake_rows(sponges: &mut Sponges, seed_a: &[u8], rows: &mut [u16], n: usize, 
 
     active[..count].fill(true);
 
+    // n is a multiple of 4, so each lane gives four whole entries.
     for offset in (0..n).step_by(4 * 21) {
         sponges.squeeze(active);
 
         for (l, row) in rows.chunks_exact_mut(n).enumerate() {
             let lanes = sponges.lanes::<21>(l);
 
-            for (i, entry) in row[offset..].iter_mut().take(4 * 21).enumerate() {
-                *entry = (lanes[i / 4] >> (16 * (i % 4))) as u16;
+            for (entries, &lane) in row[offset..].as_chunks_mut::<4>().0.iter_mut().zip(lanes) {
+                *entries = array::from_fn(|k| (lane >> (16 * k)) as u16);
             }
         }
     }
 }
 
 // Entries j to j + 7 of row i are AES128(seedA, i || j || 0...0) as little-endian 16-bit values,
-// i and j little-endian 16-bit values too: a row is n / 8 blocks, encrypted in one call.
+// i and j little-endian 16-bit values too: a row is n / 8 blocks, encrypted in one call. With the
+// AES instructions, the kernel builds the blocks in registers and runs them through the same core.
 fn aes_rows(aes: &Aes, rows: &mut [u16], n: usize, i0: usize) {
+    if let Some(keys) = aes.hardware_keys()
+        && cpu::frodo_aes_rows(keys, rows, n, i0)
+    {
+        return;
+    }
+
+    aes_rows_portable(aes, rows, n, i0);
+}
+
+fn aes_rows_portable(aes: &Aes, rows: &mut [u16], n: usize, i0: usize) {
     let mut blocks = [[0u8; 16]; MAX_N / BAR];
 
     for (r, row) in rows.chunks_exact_mut(n).enumerate() {
@@ -311,34 +360,44 @@ fn aes_rows(aes: &Aes, rows: &mut [u16], n: usize, i0: usize) {
     }
 }
 
-// out = rows S + E for consecutive rows of A, packed into out: s holds S and e the matching rows of
-// E, n̄ entries per row of either.
-fn mul_add_rows(out: &mut [u8], rows: &[u16], s: &[u16], e: &[u16], n: usize) {
-    let (s, _) = s.as_chunks::<BAR>();
+// acc += rows S for ROWS consecutive rows of A, acc holding n̄ entries per row: s holds S, n̄
+// entries per row, and st the same entries as S^T, n little-endian 16-bit values per row, as the
+// private key stores it; each kernel reads the form that suits it.
+fn mul_add_rows(acc: &mut [[u16; BAR]; ROWS], rows: &[u16], s: &[u16], st: &[u8], n: usize) {
+    if cpu::frodo_mul_add_as(acc, rows, s, st, n) {
+        return;
+    }
 
-    let (e, _) = e.as_chunks::<BAR>();
+    mul_add_rows_portable(acc, rows, s, n);
+}
 
-    let (out, _) = out.as_chunks_mut::<{ 2 * BAR }>();
+// Column by column, for all the rows at once: the rows' sums do not wait on each other.
+fn mul_add_rows_portable(acc: &mut [[u16; BAR]; ROWS], rows: &[u16], s: &[u16], n: usize) {
+    let rows: [&[u16]; ROWS] = array::from_fn(|r| &rows[r * n..(r + 1) * n]);
 
-    for ((row, e), out) in rows.chunks_exact(n).zip(e).zip(out) {
-        let mut acc = *e;
+    for (j, s) in s.as_chunks::<BAR>().0.iter().enumerate().take(n) {
+        for (acc, row) in acc.iter_mut().zip(&rows) {
+            let a = row[j];
 
-        for (&a, s) in row.iter().zip(s) {
             for (acc, &s) in acc.iter_mut().zip(s) {
                 *acc = acc.wrapping_add(a.wrapping_mul(s));
             }
         }
-
-        pack(out, &acc);
     }
 }
 
-// acc += S'[:, i0 : i0 + rows] rows for consecutive rows of A starting at row i0: acc holds n̄ rows
-// of n entries, and spt holds S'^T, n̄ entries per row.
-fn mul_add_columns(acc: &mut [u16], rows: &[u16], spt: &[u16], n: usize, i0: usize) {
-    for (r, row) in rows.chunks_exact(n).enumerate() {
-        let column = &spt[BAR * (i0 + r)..][..BAR];
+// acc += S'[:, i0 : i0 + ROWS] rows for ROWS consecutive rows of A: acc holds n̄ rows of n
+// entries, and column the n̄ entries of S'^T for each of the rows.
+fn mul_add_columns(acc: &mut [u16], rows: &[u16], column: &[[u16; BAR]; ROWS], n: usize) {
+    if cpu::frodo_mul_add_sa(acc, rows, column, n) {
+        return;
+    }
 
+    mul_add_columns_portable(acc, rows, column, n);
+}
+
+fn mul_add_columns_portable(acc: &mut [u16], rows: &[u16], column: &[[u16; BAR]; ROWS], n: usize) {
+    for (row, column) in rows.chunks_exact(n).zip(column) {
         for (dst, &c) in acc.chunks_exact_mut(n).zip(column) {
             for (d, &a) in dst.iter_mut().zip(row) {
                 *d = d.wrapping_add(c.wrapping_mul(a));
@@ -436,25 +495,40 @@ fn decode(p: &Parameters, u: &mut [u8], m: &[u16; BAR * BAR]) {
     }
 }
 
-// b = A S + E packed, for S and E with n̄ entries per row; rows holds ROWS rows of A at a time.
-fn mul_add_as(a: &mut Matrix, b: &mut [u8], s: &[u16], e: &[u16], rows: &mut [u16]) {
+// b = A S + E packed, for S and E with n̄ entries per row and st as in mul_add_rows; rows holds
+// ROWS rows of A at a time.
+fn mul_add_as(a: &mut Matrix, b: &mut [u8], s: &[u16], st: &[u8], e: &[u16], rows: &mut [u16]) {
     let n = a.p.n;
+
+    let mut acc = [[0u16; BAR]; ROWS];
 
     for i in (0..n).step_by(ROWS) {
         a.rows(rows, i);
 
-        mul_add_rows(&mut b[2 * BAR * i..], rows, s, &e[BAR * i..], n);
+        for (acc, e) in acc.iter_mut().zip(e[BAR * i..].as_chunks::<BAR>().0) {
+            *acc = *e;
+        }
+
+        mul_add_rows(&mut acc, rows, s, st, n);
+
+        pack(&mut b[2 * BAR * i..], acc.as_flattened());
     }
+
+    wipe(acc.as_flattened_mut());
 }
 
 // acc += S' A, for S'^T in spt and acc with n̄ rows of n entries.
 fn mul_add_sa(a: &mut Matrix, acc: &mut [u16], spt: &[u16], rows: &mut [u16]) {
     let n = a.p.n;
 
+    let (spt, _) = spt.as_chunks::<BAR>();
+
     for i in (0..n).step_by(ROWS) {
         a.rows(rows, i);
 
-        mul_add_columns(acc, rows, spt, n, i);
+        let column = spt[i..i + ROWS].try_into().expect("ROWS rows");
+
+        mul_add_columns(acc, rows, column, n);
     }
 }
 
@@ -489,8 +563,11 @@ pub(crate) fn keygen(p: &Parameters, seed: &[u8]) -> SecretBytes {
     {
         let mut stream = Stream::new(0x5f, &seed[secret..secret + p.seed_se_size], p.cdf);
 
-        for x in st_bytes.as_chunks_mut::<2>().0 {
-            *x = stream.next().to_le_bytes();
+        // S^T first, through e.
+        stream.fill(e);
+
+        for (x, &v) in st_bytes.as_chunks_mut::<2>().0.iter_mut().zip(e.iter()) {
+            *x = v.to_le_bytes();
         }
 
         stream.fill(e);
@@ -498,7 +575,14 @@ pub(crate) fn keygen(p: &Parameters, seed: &[u8]) -> SecretBytes {
 
     transpose_bytes(s, st_bytes, n);
 
-    mul_add_as(&mut Matrix::new(p, seed_a), b, s, e, &mut rows[..ROWS * n]);
+    mul_add_as(
+        &mut Matrix::new(p, seed_a),
+        b,
+        s,
+        st_bytes,
+        e,
+        &mut rows[..ROWS * n],
+    );
 
     declassify(b);
 
@@ -527,9 +611,12 @@ fn encrypt(
 
     let v: &mut [u16; BAR * BAR] = v.try_into().expect("n̄ x n̄ entries");
 
-    for k in 0..BAR {
-        for i in 0..n {
-            spt[BAR * i + k] = stream.next();
+    // S' first, through bp.
+    stream.fill(bp);
+
+    for (k, row) in bp.chunks_exact(n).enumerate() {
+        for (column, &x) in spt.as_chunks_mut::<BAR>().0.iter_mut().zip(row) {
+            column[k] = x;
         }
     }
 
@@ -756,6 +843,121 @@ mod tests {
                 }
 
                 st[position] = original;
+            }
+        }
+    }
+
+    // Random 16-bit entries, with runs of the extreme values 0 and 0xFFFF, which drive the
+    // wrapping products to their limits.
+    fn entries(inputs: &mut crate::cpu::testing::Inputs, count: usize) -> Vec<u16> {
+        let edge = inputs.next() % 4;
+
+        (0..count)
+            .map(|i| match (edge, i % 3) {
+                (0, 0) => 0,
+                (1, _) => 0xFFFF,
+                _ => inputs.next() as u16,
+            })
+            .collect()
+    }
+
+    // The kernels for A against the portable code: the AES rows on random keys, from any row and
+    // for any number of rows (whole groups of eight blocks and a rest), the SHAKE rows from any
+    // row, and both products on random and extreme entries, for both matrix sizes and sizes that
+    // the kernels refuse.
+    #[test]
+    fn matrix_kernels_match_portable() {
+        let mut inputs = crate::cpu::testing::Inputs::new(0xF20D0);
+
+        for case in 0..40 {
+            let n = [976, 1344][case % 2];
+
+            let key: [u8; 16] = inputs.bytes();
+
+            let count = [ROWS, 1, 3, 5][case % 4];
+
+            let i0 = (inputs.next() as usize) % (n - count + 1);
+
+            let mut kernel = vec![0u16; count * n];
+
+            let mut expected = kernel.clone();
+
+            aes_rows(&Aes::new(&key), &mut kernel, n, i0);
+
+            aes_rows_portable(&Aes::portable(&key), &mut expected, n, i0);
+
+            assert_eq!(kernel, expected, "AES rows, case {case}");
+
+            // The SHAKE kernel takes four rows at a time.
+            let count = [ROWS, 4][case % 2];
+
+            let mut kernel = vec![0u16; count * n];
+
+            let mut expected = kernel.clone();
+
+            let i0 = (inputs.next() as usize) % (n - count + 1);
+
+            shake_rows(&mut Sponges::empty(), &key, &mut kernel, n, i0);
+
+            shake_rows_portable(&mut Sponges::empty(), &key, &mut expected, n, i0);
+
+            assert_eq!(kernel, expected, "SHAKE rows, case {case}");
+        }
+
+        for case in 0..60 {
+            let n = [976, 1344, 16, 32, 8, 24][case % 6];
+
+            let rows = entries(&mut inputs, ROWS * n);
+
+            let s = entries(&mut inputs, BAR * n);
+
+            let mut st = vec![0u8; 2 * BAR * n];
+
+            for (j, row) in s.as_chunks::<BAR>().0.iter().enumerate() {
+                for (k, &x) in row.iter().enumerate() {
+                    st[2 * (n * k + j)..][..2].copy_from_slice(&x.to_le_bytes());
+                }
+            }
+
+            let start: [[u16; BAR]; ROWS] =
+                array::from_fn(|_| array::from_fn(|_| inputs.next() as u16));
+
+            let (mut kernel, mut expected) = (start, start);
+
+            mul_add_rows(&mut kernel, &rows, &s, &st, n);
+
+            mul_add_rows_portable(&mut expected, &rows, &s, n);
+
+            assert_eq!(kernel, expected, "A S, case {case}");
+
+            let column: [[u16; BAR]; ROWS] =
+                array::from_fn(|_| array::from_fn(|_| inputs.next() as u16));
+
+            let mut kernel = entries(&mut inputs, BAR * n);
+
+            let mut expected = kernel.clone();
+
+            mul_add_columns(&mut kernel, &rows, &column, n);
+
+            mul_add_columns_portable(&mut expected, &rows, &column, n);
+
+            assert_eq!(kernel, expected, "S' A, case {case}");
+        }
+    }
+
+    // Sampling in bulk against Sample on its own, for every 16-bit value and both tables, and the
+    // generic path of a table of another length.
+    #[test]
+    fn bulk_sampling_matches_sample() {
+        let bytes: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+
+        for cdf in [CDF_976, CDF_1344, &CDF_976[..7]] {
+            let mut out = vec![0u16; 1 << 16];
+
+            sample_all(&mut out, &bytes, cdf);
+
+            for (r, &value) in out.iter().enumerate() {
+                assert_eq!(value, sample(r as u16, cdf), "{r}");
             }
         }
     }
