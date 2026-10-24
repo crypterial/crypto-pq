@@ -28,7 +28,7 @@ jobs:
           path: pr
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 7267bf3
+          ref: 7267bf314790b774b968fde26c083a7b071994ee
           path: main
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
