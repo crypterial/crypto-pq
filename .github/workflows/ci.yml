@@ -70,8 +70,11 @@ jobs:
       - if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
         run: cargo test --locked --release --all-features --test cross --test symmetric -- --ignored regenerate
 
+  # Under emulation the s390x suite takes about two hours in one job, so its unit tests,
+  # integration tests and doctests run as three jobs, which together make the `cargo test` of the
+  # other targets.
   rust-cross:
-    name: rust ${{ matrix.target }}
+    name: rust ${{ matrix.target }} ${{ matrix.part }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -81,6 +84,13 @@ jobs:
             packages: gcc-multilib
           - target: s390x-unknown-linux-gnu
             packages: gcc-s390x-linux-gnu libc6-dev-s390x-cross qemu-user
+            part: --lib
+          - target: s390x-unknown-linux-gnu
+            packages: gcc-s390x-linux-gnu libc6-dev-s390x-cross qemu-user
+            part: --test '*'
+          - target: s390x-unknown-linux-gnu
+            packages: gcc-s390x-linux-gnu libc6-dev-s390x-cross qemu-user
+            part: --doc
           - target: riscv64gc-unknown-linux-gnu
             packages: gcc-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user
           - target: x86_64-unknown-linux-musl
@@ -98,7 +108,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update -q && sudo apt-get install -yq ${{ matrix.packages }}
       - run: rustup target add ${{ matrix.target }}
-      - run: cargo test --locked --release --all-features --target ${{ matrix.target }}
+      - run: cargo test --locked --release --all-features --target ${{ matrix.target }} ${{ matrix.part }}
 
   # The crate that would be published builds from its declared contents alone, with its README,
   # the repository's license files and the default features.
