@@ -1198,43 +1198,61 @@ struct Table {
     flags: [[u32; 16]; 16],
 }
 
-fn table<const L: usize>(many: &Many, [low, high]: &[[u32; L]; 2]) -> Table {
-    let mut table = Table {
-        head: [[0; 8]; 10],
-        flags: [[0; 16]; 16],
-    };
+// Word i of a rotation's byte control, repeated over 32 bytes.
+const fn control(rotate: &[u8; 16], i: usize) -> u32 {
+    let k = 4 * (i % 4);
 
-    for (row, control) in table.head.iter_mut().zip(&CONTROLS) {
-        for (word, bytes) in row.iter_mut().zip(control.as_chunks::<4>().0) {
-            *word = u32::from_le_bytes(*bytes);
-        }
-    }
+    u32::from_le_bytes([rotate[k], rotate[k + 1], rotate[k + 2], rotate[k + 3]])
+}
 
-    for (row, &word) in table.head[2..6].iter_mut().zip(&IV_256[..4]) {
-        *row = [word; 8];
-    }
+// The table's head as every call starts it: the rotations' controls, the IV and the block length,
+// the counters zero.
+static HEAD: [[u32; 8]; 10] = {
+    let mut head = [[0; 8]; 10];
 
-    table.head[6][..L].copy_from_slice(low);
+    let mut i = 0;
 
-    table.head[7][..L].copy_from_slice(high);
+    while i < 8 {
+        head[0][i] = control(&ROTATE16, i);
 
-    table.head[8] = [64; 8];
+        head[1][i] = control(&ROTATE8, i);
 
-    for (b, row) in table.flags.iter_mut().enumerate().take(many.blocks) {
-        let mut f = many.flags;
+        let mut row = 0;
 
-        if b == 0 {
-            f |= many.start;
+        while row < 4 {
+            head[2 + row][i] = IV_256[row];
+
+            row += 1;
         }
 
-        if b + 1 == many.blocks {
-            f |= many.end;
-        }
+        head[8][i] = 64;
 
-        row[..8].copy_from_slice(&[f; 8]);
+        i += 1;
     }
 
-    table
+    head
+};
+
+// The flags of the blocks into the table, once per hash_many_avx2 call: every block's row gets
+// the same value, then start and end go into the first and the last. Chosen block by block,
+// LLVM 20 vectorized the choice with a vmovq from xmm8 to xmm4 encoded with opcode D6, which
+// valgrind before 3.24 does not decode (KDE bug 391148).
+#[target_feature(enable = "avx2")]
+#[inline]
+fn flags(table: &mut Table, many: &Many) {
+    let rows = &mut table.flags[..many.blocks];
+
+    for row in rows.iter_mut() {
+        row[..8].fill(many.flags);
+    }
+
+    for word in &mut rows[0][..8] {
+        *word |= many.start;
+    }
+
+    for word in &mut rows[many.blocks - 1][..8] {
+        *word |= many.end;
+    }
 }
 
 // The inputs of the lanes, `first` on: an index past the last input repeats the last one.
@@ -1251,13 +1269,11 @@ fn lanes<'a, const L: usize>(
     })
 }
 
-// The counters of the lanes, low and high words.
-fn counters<const L: usize>(many: &Many, first: usize, count: usize) -> [[u32; L]; 2] {
-    let mut words = [[0; L]; 2];
+// The counters of the lanes into the table, low and high words.
+fn counters<const L: usize>(table: &mut Table, many: &Many, first: usize, count: usize) {
+    let [_, _, _, _, _, _, low, high, _, _] = &mut table.head;
 
-    let [low, high] = &mut words;
-
-    for (l, (low, high)) in low.iter_mut().zip(high.iter_mut()).enumerate() {
+    for (l, (low, high)) in low.iter_mut().zip(high.iter_mut()).take(L).enumerate() {
         let lane = (first + l).min(count - 1);
 
         let counter = if many.increment {
@@ -1270,19 +1286,17 @@ fn counters<const L: usize>(many: &Many, first: usize, count: usize) -> [[u32; L
 
         *high = (counter >> 32) as u32;
     }
-
-    words
 }
 
 // hash_many's inputs `first` to `first + 7` with AVX2, every block in one loop of assembly.
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
-fn hash8(input: &[[u8; 64]], many: &Many, first: usize, out: &mut [[u8; 32]]) {
+fn hash8(input: &[[u8; 64]], many: &Many, table: &mut Table, first: usize, out: &mut [[u8; 32]]) {
     let count = out.len();
 
     let lanes = lanes::<8>(input, many, first, count);
 
-    let table = table(many, &counters::<8>(many, first, count));
+    counters::<8>(table, many, first, count);
 
     let mut h = many.key.map(|word| _mm256_set1_epi32(word as i32));
 
@@ -1302,7 +1316,7 @@ fn hash8(input: &[[u8; 64]], many: &Many, first: usize, out: &mut [[u8; 32]]) {
             asm_hash!("ymm", "ymmword", 32, asm_quarter8, "{m} + 32 * 16"),
             h = in(reg) h.as_mut_ptr(),
             m = in(reg) m.as_mut_ptr(),
-            table = in(reg) &raw const table,
+            table = in(reg) &raw const *table,
             in("rcx") 64 * many.blocks,
             out("rax") _,
             in("r8") l0, in("r9") l1, in("r10") l2, in("r11") l3,
@@ -1328,12 +1342,12 @@ fn hash8(input: &[[u8; 64]], many: &Many, first: usize, out: &mut [[u8; 32]]) {
 // hash_many's inputs `first` to `first + 3` with AVX2 on xmm registers.
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
-fn hash4(input: &[[u8; 64]], many: &Many, first: usize, out: &mut [[u8; 32]]) {
+fn hash4(input: &[[u8; 64]], many: &Many, table: &mut Table, first: usize, out: &mut [[u8; 32]]) {
     let count = out.len();
 
     let lanes = lanes::<4>(input, many, first, count);
 
-    let table = table(many, &counters::<4>(many, first, count));
+    counters::<4>(table, many, first, count);
 
     let mut h = many.key.map(|word| _mm_set1_epi32(word as i32));
 
@@ -1347,7 +1361,7 @@ fn hash4(input: &[[u8; 64]], many: &Many, first: usize, out: &mut [[u8; 32]]) {
             asm_hash!("xmm", "xmmword", 16, asm_quarter4, "{m} + 16 * 16"),
             h = in(reg) h.as_mut_ptr(),
             m = in(reg) m.as_mut_ptr(),
-            table = in(reg) &raw const table,
+            table = in(reg) &raw const *table,
             in("rcx") 64 * many.blocks,
             out("rax") _,
             in("r8") l0, in("r9") l1, in("r10") l2, in("r11") l3,
@@ -1953,26 +1967,33 @@ pub(super) fn hash_many_avx2(input: &[u8], many: &Many, out: &mut [[u8; 32]]) ->
 
     let mut done = 0;
 
-    while count - done >= 5 {
-        hash8(input, many, done, out);
+    if count >= 3 {
+        let mut table = Table {
+            head: HEAD,
+            flags: [[0; 16]; 16],
+        };
 
-        done = count.min(done + 8);
+        flags(&mut table, many);
+
+        while count - done >= 5 {
+            hash8(input, many, &mut table, done, out);
+
+            done = count.min(done + 8);
+        }
+
+        if count - done >= 3 {
+            hash4(input, many, &mut table, done, out);
+
+            done = count;
+        }
     }
 
-    match count - done {
-        2 => {
-            let pair = (&mut out[done..done + 2]).try_into().expect("two inputs");
+    if count - done == 2 {
+        let pair = (&mut out[done..done + 2]).try_into().expect("two inputs");
 
-            rows_pair::chain2(input, many, done, pair);
+        rows_pair::chain2(input, many, done, pair);
 
-            done = count;
-        }
-        3 | 4 => {
-            hash4(input, many, done, out);
-
-            done = count;
-        }
-        _ => {}
+        done = count;
     }
 
     done
