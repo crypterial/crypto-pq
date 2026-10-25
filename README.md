@@ -273,9 +273,10 @@ specification state them in full.
 - **Allocation.** Every operation is synchronous. Fixed-size operations allocate only their returned
   value, and the `_into` forms allocate nothing.
 
-CI builds and tests the crate with stable Rust on Linux x86-64 and ARM64, macOS ARM64, Windows
-x86-64 and ARM64 and Linux musl, and under emulation on 32-bit x86, RISC-V 64 and big-endian s390x.
-On Linux x86-64 it also runs with Rust 1.88, the minimum supported version.
+CI builds and tests the crate with stable Rust on Linux x86-64, ARM64 and 32-bit x86, macOS ARM64,
+Windows x86-64 and ARM64 and Linux musl, and under emulation on 32-bit ARM, RISC-V 64 and big-endian
+s390x. On Linux x86-64 it also runs with Rust 1.88, the minimum supported version. Clippy also
+checks the library for Android, iOS, WebAssembly and bare-metal Arm and RISC-V.
 
 ## Specification and test vectors
 

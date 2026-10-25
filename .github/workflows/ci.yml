@@ -93,6 +93,8 @@ jobs:
             part: --doc
           - target: riscv64gc-unknown-linux-gnu
             packages: gcc-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user
+          - target: armv7-unknown-linux-gnueabihf
+            packages: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross qemu-user
           - target: x86_64-unknown-linux-musl
             packages: musl-tools
     defaults:
@@ -104,6 +106,8 @@ jobs:
       CARGO_TARGET_S390X_UNKNOWN_LINUX_GNU_RUNNER: qemu-s390x -L /usr/s390x-linux-gnu
       CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
       CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUNNER: qemu-riscv64 -L /usr/riscv64-linux-gnu
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUNNER: qemu-arm -L /usr/arm-linux-gnueabihf
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update -q && sudo apt-get install -yq ${{ matrix.packages }}
@@ -152,6 +156,7 @@ jobs:
       - run: rustup toolchain install ${{ matrix.rust }} --profile minimal --component clippy,rustfmt
       - run: rustup override set ${{ matrix.rust }}
       - run: rustup target add aarch64-unknown-linux-gnu aarch64-apple-darwin aarch64-pc-windows-msvc x86_64-pc-windows-msvc
+      - run: rustup target add aarch64-linux-android armv7-linux-androideabi aarch64-apple-ios wasm32-wasip1 wasm32-wasip2 wasm32-unknown-unknown thumbv7em-none-eabihf riscv32imac-unknown-none-elf
       - if: matrix.rust == 'stable' && matrix.cfg == ''
         run: cargo fmt --check
       # The API documentation builds without a warning, broken links included, for the default
@@ -171,6 +176,16 @@ jobs:
           for target in aarch64-unknown-linux-gnu aarch64-apple-darwin aarch64-pc-windows-msvc x86_64-pc-windows-msvc; do
             for features in "" --all-features; do
               cargo clippy --all-targets --locked $features --target "$target" -- -D warnings
+            done
+          done
+      # Targets that CI does not run: Android, iOS, WebAssembly and bare-metal Arm and RISC-V. The
+      # library alone, since the tests need std; the crypto_pq_ct build exists only for valgrind on
+      # x86-64 and ARM64.
+      - if: matrix.cfg != '--cfg crypto_pq_ct'
+        run: |
+          for target in aarch64-linux-android armv7-linux-androideabi aarch64-apple-ios wasm32-wasip1 wasm32-wasip2 wasm32-unknown-unknown thumbv7em-none-eabihf riscv32imac-unknown-none-elf; do
+            for features in "" --all-features; do
+              cargo clippy --lib --locked $features --target "$target" -- -D warnings
             done
           done
 
