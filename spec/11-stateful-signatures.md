@@ -242,7 +242,9 @@ by a one-time key that has already signed the original root in every released si
    is 0x00 or 0x01; next ≤ N; unless next = N, the public-key fields that the top secrets determine
    (HSS: L, the top types and I_0; XMSS and XMSS^MT: the OID and SEED) equal the stored public key,
    compared in constant time with only the result declassified. The stored root is checked when the
-   top tree is built or restored ([11.10](#1110-tree-cache) item 4); a mismatch fails with INVALID_PRIVATE_KEY.
+   top tree is built (item 6): a top tree built from the top secrets whose root differs from the stored
+   root fails with INVALID_PRIVATE_KEY, and a top tree taken from a tree cache follows
+   [11.10](#1110-tree-cache) item 4 (INVALID_ENCODING).
 4. Set the in-memory index i = next. Then, for each level l from 1 to L − 1, top first:
    - if the record's tree is greater than t_l(i), fail with INVALID_PRIVATE_KEY;
    - if its status is claimed and its tree equals t_l(i), set i = (tree + 1) << H_l (skip the

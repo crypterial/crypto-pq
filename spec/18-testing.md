@@ -40,6 +40,7 @@ RISC-V 64 and big-endian s390x under emulation; Linux musl; the minimum and the 
 
 1. Every CI dependency (actions, container images, test tools) is pinned by commit hash, digest or
    version.
-2. CI runs only the CI platform's own actions and an allow-listed set of toolchain actions.
+2. CI runs only the CI platform's own actions; toolchains are installed from their official
+   distributions (P1).
 3. Builds of the package are reproducible: two builds on different host architectures produce
    identical bytes.

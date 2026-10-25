@@ -34,6 +34,9 @@
    `fn update(&mut self, previous: Option<&[u8]>, next: &[u8]) -> Result<bool, Error>`; `&mut T`
    implements it for `T: StateStore`. Any `Err` from the store becomes STATE_PERSIST_FAILED.
 10. `StatefulParameters` is `enum { Levels(&[(&str, &str)]), Name(&str) }`.
+11. A failure to allocate memory goes to the Rust allocation error handler
+    (`alloc::alloc::handle_alloc_error`); it is not reported as an `Error`
+    ([6.2](../06-api.md#62-inputs-and-outputs) item 6).
 
 ## 23.2 Security mechanics
 
@@ -57,8 +60,9 @@
    `bcryptprimitives.dll` (Windows, linked with `raw-dylib`), `random_get` (WASI preview 1). Every
    other target, including WASI preview 2, returns RNG_FAILURE.
 6. Constant-time verification: `RUSTFLAGS="--cfg crypto_pq_ct"` and the `ct` test under valgrind
-   memcheck, on x86-64 and ARM64, in the default and `crypto_pq_portable` builds, on the minimum and
-   stable toolchains. The `crypto_pq_ct` build leaves out the instructions valgrind cannot execute.
+   memcheck, in the default and `crypto_pq_portable` builds, on x86-64 with the minimum and the stable
+   toolchain and on ARM64 with the stable toolchain. The `crypto_pq_ct` build leaves out the
+   instructions valgrind cannot execute.
 
 ## 23.3 Performance mechanics
 
@@ -117,14 +121,15 @@
    5. Features are additive: enabling one never changes the behaviour of an item that another feature
       provides. An item keeps its whole interface in every build that has it; for example
       `BLAKE3_KDF.extract` fails with UNSUPPORTED with or without `hkdf`.
-   6. Every combination of features builds. CI builds no feature, each feature alone and each family
-      with `hazmat` with `cargo clippy -D warnings`, on x86-64 and ARM64, and tests the default
+   6. Every combination of features builds. CI builds no feature, each feature alone, and `hazmat`
+      with each family whose operations it extends (`ml-kem`, `frodokem`, `ml-dsa`, `slh-dsa`, `lms`,
+      `xmss`, `sha3`) with `cargo clippy -D warnings`, on x86-64 and ARM64, and tests the default
       features, every feature, and each family with `hazmat` and the families that its tests also
       use. A build without every family allows only the lints that compiled-out
       code causes (unused items and parameters, unreachable or irrefutable patterns); the default
       build keeps them all.
 5. The crate as published provides the whole of Part I; its features select what a build compiles.
-   The compliance suite and the checks of Section 18 run with every feature, `hazmat` included.
+   The compliance suite and the checks of Section [18](../18-testing.md) run with every feature, `hazmat` included.
 6. API documentation is rustdoc: the crate root has an overview, the feature table and an example
    for each category, and every public item has a doc comment (`missing_docs`). `cargo doc` runs
    without a warning, broken links included, for the default features, every feature and none.
@@ -137,7 +142,8 @@ A conforming Rust implementation meets each item:
 - Compliance suite: all of `vectors/` in the default, portable and `crypto_pq_ct` builds.
 - `cargo fmt --check`, `cargo clippy -D warnings` for every cfg and cross target, with the default
   features and with every feature.
-- `cargo clippy -D warnings` with no feature, each feature alone and each family with `hazmat`.
+- `cargo clippy -D warnings` with no feature, each feature alone, and `hazmat` with each family whose
+  operations it extends ([23.4](#234-build-packaging-and-platforms) item 4).
 - `cargo doc` without a warning.
 - valgrind constant-time check on x86-64 and ARM64, default and portable.
 - x86-64 CPU models of [18.2](../18-testing.md#182-cpu-tiers) under emulation.
