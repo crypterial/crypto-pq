@@ -256,7 +256,8 @@ jobs:
 
   # Each x86-64 path whatever the runner's CPU: QEMU user mode runs the suite on a CPU with AVX2
   # and no SHA-NI, one with SHA-NI and SSE4.1 (BLAKE2 and BLAKE3) but no AVX, and one with none of
-  # them. The runner itself covers the CPU it has, usually SHA-NI with AVX2. The tests link
+  # them, and the kernel count test fails unless each selects its expected number of kernels
+  # (SPEC 18.2). The runner itself covers the CPU it has, usually SHA-NI with AVX2. The tests link
   # statically with musl, so that QEMU runs none of the runner's libraries: the Ubuntu 26.04 runner
   # has their x86-64-v3 builds, which Denverton and qemu64 cannot execute.
   rust-x86-models:
@@ -265,13 +266,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cpu: [Haswell-v4, Denverton, qemu64]
+        include:
+          - { cpu: Haswell-v4, kernels: 59 }
+          - { cpu: Denverton, kernels: 12 }
+          - { cpu: qemu64, kernels: 0 }
     defaults:
       run:
         shell: bash
         working-directory: rust
     env:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUNNER: qemu-x86_64 -cpu ${{ matrix.cpu }}
+      CRYPTO_PQ_KERNELS: ${{ matrix.kernels }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update -q && sudo apt-get install -yq qemu-user

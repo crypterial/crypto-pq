@@ -8,7 +8,7 @@ use crate::keccak::{self, Keccak, MAX_SPONGES, Sponges};
 use crate::primitives::{sha3_256, sha3_512, shake256_into};
 use crate::wipe::{SecretBytes, wipe};
 
-const Q: u32 = 3329;
+pub(crate) const Q: u32 = 3329;
 
 const SHA3: u8 = 0x06;
 
@@ -52,7 +52,7 @@ const QINV: i32 = {
     inverse as i32
 };
 
-const R_MOD_Q: u16 = ((1u64 << 32) % Q as u64) as u16;
+pub(crate) const R_MOD_Q: u16 = ((1u64 << 32) % Q as u64) as u16;
 
 // x * 2^32 mod q in (-q / 2, q / 2], so that one Montgomery reduction of a product with it gives
 // the plain product modulo q.
@@ -209,7 +209,7 @@ fn add_assign(f: &mut Poly, g: &Poly) {
 
 // The twiddle factors as the CPU kernels take them; the forward transform ends with the
 // canonical form, as ntt does.
-static FIELD: Field = Field::new(
+pub(crate) static FIELD: Field = Field::new(
     Q as i32,
     QINV,
     7,
@@ -232,7 +232,7 @@ static FIELD: Field = Field::new(
 );
 
 // The same factors for the 16-bit kernels, in Montgomery form for 2^16 instead of 2^32.
-static FIELD16: Field16 = Field16::new(
+pub(crate) static FIELD16: Field16 = Field16::new(
     Q as i16,
     {
         let mut zetas = [0; 128];
@@ -368,7 +368,7 @@ fn inverse_ntt_portable(w: &mut Wide) -> Poly {
 type Cache = [u16; 128];
 
 // GAMMAS in Montgomery form for 2^16, in (-q / 2, q / 2], for the 16-bit kernels.
-const GAMMAS16: [i16; 128] = {
+pub(crate) const GAMMAS16: [i16; 128] = {
     let mut table = [0; 128];
 
     let mut i = 0;

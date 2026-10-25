@@ -994,3 +994,579 @@ mod tests {
         assert!(!crate::enable_data_independent_timing());
     }
 }
+
+// SPEC 18.2: each entry point once, with inputs that meet its preconditions, so that a false is
+// a kernel left out and never a refused call. CI gives each CPU model its expected count in
+// CRYPTO_PQ_KERNELS; elsewhere the count is printed, as native runners differ. keccak_group is a
+// group size rather than a kernel, and permute_many covers the feature that sets it.
+#[cfg(test)]
+mod kernel_count {
+    use alloc::vec::Vec;
+
+    use super::testing::Inputs;
+
+    #[derive(Default)]
+    struct Tally {
+        total: usize,
+        selected: Vec<&'static str>,
+    }
+
+    impl Tally {
+        fn note(&mut self, name: &'static str, ran: bool) {
+            self.total += 1;
+
+            if ran {
+                self.selected.push(name);
+            }
+        }
+    }
+
+    fn sha2(tally: &mut Tally, inputs: &mut Inputs) {
+        use crate::sha2::{IV_256, IV_512};
+
+        let blocks256: [[u8; 64]; 2] = [inputs.bytes(), inputs.bytes()];
+
+        let blocks512: [[u8; 128]; 2] = [inputs.bytes(), inputs.bytes()];
+
+        let data: [u8; 200] = inputs.bytes();
+
+        let key: [u8; 32] = inputs.bytes();
+
+        let mut state = IV_256;
+
+        tally.note(
+            "compress256",
+            super::compress256(&mut state, &blocks256, &[]),
+        );
+
+        let mut states = [[0; 16]; 8];
+
+        let mut w = [[0; 16]; 16];
+
+        for word in states
+            .as_flattened_mut()
+            .iter_mut()
+            .chain(w.as_flattened_mut())
+        {
+            *word = inputs.next() as u32;
+        }
+
+        tally.note(
+            "compress256_lanes",
+            super::compress256_lanes(&mut states, &mut w),
+        );
+
+        let mut pair = [IV_256; 2];
+
+        tally.note(
+            "compress256_pair",
+            super::compress256_pair(&mut pair, &blocks256),
+        );
+
+        let mut state = IV_512;
+
+        tally.note(
+            "compress512",
+            super::compress512(&mut state, &blocks512, &[]),
+        );
+
+        let mut pair = [IV_512; 2];
+
+        tally.note(
+            "compress512_pair",
+            super::compress512_pair(&mut pair, &blocks512),
+        );
+
+        let mut state = IV_256;
+
+        let bits = 8 * data.len() as u64;
+
+        tally.note("finish256", super::finish256(&mut state, &data, bits));
+
+        let mut state = IV_512;
+
+        tally.note(
+            "finish512",
+            super::finish512(&mut state, &data, u128::from(bits)),
+        );
+
+        let mut tag = [0; 64];
+
+        tally.note(
+            "hmac256",
+            super::hmac256(&IV_256, &key, &data, &mut tag[..32]),
+        );
+
+        tally.note(
+            "hmac256_keyed",
+            super::hmac256_keyed(&[IV_256; 2], &data, &mut tag[..32]),
+        );
+
+        tally.note("hmac512", super::hmac512(&IV_512, &key, &data, &mut tag));
+
+        tally.note(
+            "hmac512_keyed",
+            super::hmac512_keyed(&[IV_512; 2], &data, &mut tag),
+        );
+    }
+
+    // FrodoKEM-976: one row of AES, four of SHAKE128 and eight in each product.
+    #[cfg(feature = "frodokem")]
+    fn frodokem(tally: &mut Tally, inputs: &mut Inputs) {
+        const N: usize = 976;
+
+        let key: [u8; 16] = inputs.bytes();
+
+        let mut round_keys = [[0; 16]; 15];
+
+        tally.note("aes_expand", super::aes_expand(&key, &mut round_keys));
+
+        let mut blocks: [[u8; 16]; 4] = core::array::from_fn(|_| inputs.bytes());
+
+        tally.note(
+            "aes_encrypt",
+            super::aes_encrypt(&round_keys[..11], &mut blocks),
+        );
+
+        let mut rows = alloc::vec![0; 8 * N];
+
+        tally.note(
+            "frodo_aes_rows",
+            super::frodo_aes_rows(&round_keys[..11], &mut rows[..N], N, 0),
+        );
+
+        tally.note(
+            "frodo_shake_rows",
+            super::frodo_shake_rows(&key, &mut rows[..4 * N], N, 0),
+        );
+
+        let s: Vec<u16> = (0..8 * N).map(|_| inputs.next() as u16).collect();
+
+        let st: Vec<u8> = (0..16 * N).map(|_| inputs.next() as u8).collect();
+
+        let mut acc = [[0; 8]; 8];
+
+        tally.note(
+            "frodo_mul_add_as",
+            super::frodo_mul_add_as(&mut acc, &rows, &s, &st, N),
+        );
+
+        let mut acc = alloc::vec![0; 8 * N];
+
+        let column = [[1; 8]; 8];
+
+        tally.note(
+            "frodo_mul_add_sa",
+            super::frodo_mul_add_sa(&mut acc, &rows, &column, N),
+        );
+    }
+
+    #[cfg(feature = "ascon")]
+    fn ascon(tally: &mut Tally, inputs: &mut Inputs) {
+        let start: [u64; 5] = inputs.words();
+
+        let data: [u8; 40] = inputs.bytes();
+
+        let mut s = start;
+
+        tally.note("ascon", super::ascon(&mut s));
+
+        let mut out = [0; 32];
+
+        tally.note("ascon_digest", super::ascon_digest(&start, &data, &mut out));
+    }
+
+    #[cfg(feature = "blake2")]
+    fn blake2(tally: &mut Tally, inputs: &mut Inputs) {
+        let h64: [u64; 8] = inputs.words();
+
+        let h32 = h64.map(|x| x as u32);
+
+        let last64: [u64; 16] = inputs.words();
+
+        let last32 = last64.map(|x| x as u32);
+
+        let blocks128: [[u8; 128]; 2] = [inputs.bytes(), inputs.bytes()];
+
+        let blocks64: [[u8; 64]; 2] = [inputs.bytes(), inputs.bytes()];
+
+        let data: [u8; 200] = inputs.bytes();
+
+        let key: [u8; 32] = inputs.bytes();
+
+        let mut out = [0; 64];
+
+        let mut h = h64;
+
+        tally.note(
+            "blake2b",
+            super::blake2b(&mut h, None, &blocks128, 0, Some((&last64, 300))),
+        );
+
+        tally.note(
+            "blake2b_digest",
+            super::blake2b_digest(&h64, &data, &mut out),
+        );
+
+        let mut h = h32;
+
+        tally.note(
+            "blake2s",
+            super::blake2s(&mut h, None, &blocks64, 0, Some((&last32, 150))),
+        );
+
+        tally.note(
+            "blake2s_digest",
+            super::blake2s_digest(&h32, &data, &mut out[..32]),
+        );
+
+        tally.note(
+            "blake2s_mac",
+            super::blake2s_mac(&h32, &key, &data, &mut out[..32]),
+        );
+    }
+
+    // Eight whole chunks and eight output blocks, which every kernel width takes whole.
+    #[cfg(feature = "blake3")]
+    fn blake3(tally: &mut Tally, inputs: &mut Inputs) {
+        use crate::blake3::{CHUNK_END, CHUNK_START, Many, ROOT};
+
+        let key = crate::sha2::IV_256;
+
+        let input: Vec<u8> = (0..8 * 1024).map(|_| inputs.next() as u8).collect();
+
+        let blocks: [[u8; 64]; 16] = core::array::from_fn(|_| inputs.bytes());
+
+        let block: [u32; 16] = core::array::from_fn(|_| inputs.next() as u32);
+
+        let many = Many {
+            key: &key,
+            blocks: 16,
+            counter: 0,
+            increment: true,
+            flags: 0,
+            start: CHUNK_START,
+            end: CHUNK_END,
+        };
+
+        let mut out = [[0; 32]; 8];
+
+        tally.note(
+            "blake3_many",
+            super::blake3_many(&input, &many, &mut out) > 0,
+        );
+
+        let mut cv = key;
+
+        let last = Some((&blocks[15], 64, CHUNK_END));
+
+        tally.note(
+            "blake3_blocks",
+            super::blake3_blocks(&mut cv, &blocks[..15], 0, 0, [CHUNK_START, 0], last),
+        );
+
+        let mut words = [0; 16];
+
+        tally.note(
+            "blake3_compress",
+            super::blake3_compress(&key, &blocks[0], 0, [64, CHUNK_START], &mut words),
+        );
+
+        let mut digest = [0; 32];
+
+        let flags = CHUNK_START | CHUNK_END | ROOT;
+
+        tally.note(
+            "blake3_digest1",
+            super::blake3_digest1(&key, flags, &blocks[0], &mut digest),
+        );
+
+        let mut out = [[0; 64]; 8];
+
+        tally.note(
+            "blake3_xof",
+            super::blake3_xof(&key, &block, 0, [64, flags], &mut out) > 0,
+        );
+    }
+
+    #[cfg(any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ))]
+    fn keccak(tally: &mut Tally, inputs: &mut Inputs) {
+        let mut states: [[u64; 25]; 4] = core::array::from_fn(|_| inputs.words());
+
+        let data: [u8; 200] = inputs.bytes();
+
+        tally.note(
+            "permute_many",
+            super::permute_many(&mut states.each_mut()) > 0,
+        );
+
+        let mut state = states[0];
+
+        tally.note("absorb", super::absorb(&mut state, 168, &data) > 0);
+
+        let mut out = [0; 32];
+
+        tally.note("digest", super::digest(None, 136, 0x06, &data, &mut out));
+    }
+
+    // ML-DSA's field where there is one, ML-KEM's otherwise; canonical coefficients go in.
+    #[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
+    fn transforms(tally: &mut Tally, inputs: &mut Inputs) {
+        #[cfg(feature = "ml-dsa")]
+        let field = &crate::mldsa::FIELD;
+
+        #[cfg(not(feature = "ml-dsa"))]
+        let field = &crate::mlkem::FIELD;
+
+        let mut w: [i32; 256] = core::array::from_fn(|_| (inputs.next() % field.q as u64) as i32);
+
+        tally.note("ntt", super::ntt(&mut w, field));
+
+        let mut w: [i32; 256] = core::array::from_fn(|_| (inputs.next() % field.q as u64) as i32);
+
+        tally.note("inverse_ntt", super::inverse_ntt(&mut w, field));
+    }
+
+    // The sizes of ML-KEM-512: k = 2, d = 10 and eta2 = 2.
+    #[cfg(feature = "ml-kem")]
+    fn mlkem(tally: &mut Tally, inputs: &mut Inputs) {
+        use crate::mlkem::{FIELD, FIELD16, GAMMAS16, Q, R_MOD_Q};
+
+        let q = Q as u16;
+
+        let mut canonical =
+            || -> [u16; 256] { core::array::from_fn(|_| (inputs.next() % u64::from(Q)) as u16) };
+
+        let (f, g) = (canonical(), canonical());
+
+        let polys: [[u16; 256]; 4] = core::array::from_fn(|_| canonical());
+
+        let cache: [u16; 128] = core::array::from_fn(|i| f[i]);
+
+        let caches = [cache, cache];
+
+        let mut out = [0; 256];
+
+        let mut acc: [i32; 256] = core::array::from_fn(|i| i32::from(f[i]));
+
+        tally.note(
+            "base_multiply_add",
+            super::base_multiply_add(&mut acc, &f, &g, &cache),
+        );
+
+        let lanes: [u64; 24] = inputs.words();
+
+        tally.note("binomial", super::binomial(2, &lanes[..16], q, &mut out));
+
+        let data: [u8; 384] = inputs.bytes();
+
+        tally.note("decode12", super::decode12(&data, q, &mut out));
+
+        let mut encoded = [0; 384];
+
+        tally.note("encode12", super::encode12(&f, &mut encoded));
+
+        tally.note(
+            "inverse_ntt16",
+            super::inverse_ntt16(&acc, &mut out, &FIELD16),
+        );
+
+        let message: [u8; 32] = inputs.bytes();
+
+        tally.note(
+            "mlkem_compress",
+            super::mlkem_compress(&f, &g, Some(&message), 10, q, &mut encoded[..320]),
+        );
+
+        tally.note(
+            "mlkem_decompress",
+            super::mlkem_decompress(&data[..320], 10, q, &mut out),
+        );
+
+        tally.note(
+            "mlkem_inner_product",
+            super::mlkem_inner_product(&mut out, &[&f, &g], &polys[..2], &caches, &FIELD16),
+        );
+
+        let mut t = [[0; 256]; 2];
+
+        tally.note(
+            "mlkem_matrix_vector",
+            super::mlkem_matrix_vector(&mut t, &polys, &[f, g], &caches, &[f, g], q),
+        );
+
+        let mut bits = [0; 32];
+
+        tally.note("mlkem_message", super::mlkem_message(&f, &g, q, &mut bits));
+
+        let mut computed = [0; 128];
+
+        tally.note(
+            "mlkem_multiply_cache",
+            super::mlkem_multiply_cache(&g, &GAMMAS16, q, &mut computed),
+        );
+
+        let mut transformed = f;
+
+        tally.note("ntt16", super::ntt16(&mut transformed, &FIELD16));
+
+        tally.note(
+            "reduce",
+            super::reduce(&acc, i32::from(R_MOD_Q), &FIELD, &mut out),
+        );
+
+        let block: [u64; 21] = inputs.words();
+
+        let mut count = 0;
+
+        tally.note(
+            "uniform12",
+            super::uniform12(&block, q, &mut out, &mut count),
+        );
+    }
+
+    // gamma2 = (q - 1) / 32, the one value that the arm64 encoding of w1 takes; 18-bit masks and
+    // eta = 2.
+    #[cfg(feature = "ml-dsa")]
+    fn mldsa(tally: &mut Tally, inputs: &mut Inputs) {
+        use crate::mldsa::{FIELD, Q};
+
+        let mut canonical =
+            || -> [i32; 256] { core::array::from_fn(|_| (inputs.next() % Q as u64) as i32) };
+
+        let (a, b) = (canonical(), canonical());
+
+        let row = [canonical(), canonical()];
+
+        let gamma2 = (Q - 1) / 32;
+
+        let mut out = [0; 256];
+
+        let mut count = 0;
+
+        let lanes: [u64; 17] = inputs.words();
+
+        tally.note("bounded", super::bounded(&lanes, 2, &mut out, &mut count));
+
+        tally.note("mldsa_add", super::mldsa_add(&mut out, &a, &b, Q));
+
+        tally.note(
+            "mldsa_hints",
+            super::mldsa_hints(&mut out, &a, &b, gamma2, Q).is_some(),
+        );
+
+        let bytes: [u8; 576] = core::array::from_fn(|_| inputs.next() as u8);
+
+        tally.note(
+            "mldsa_mask",
+            super::mldsa_mask(&mut out, &bytes, 18, 1 << 17, Q),
+        );
+
+        tally.note(
+            "mldsa_norm",
+            super::mldsa_norm(&a, 1 << 17, None, Q).is_some(),
+        );
+
+        let mut packed = [0; 320];
+
+        tally.note(
+            "mldsa_pack",
+            super::mldsa_pack(&mut packed, &a, 10, super::Pack::High, Q),
+        );
+
+        tally.note("mldsa_sub", super::mldsa_sub(&mut out, &a, &b, Q));
+
+        tally.note(
+            "mldsa_w1",
+            super::mldsa_w1(&mut packed[..128], &a, gamma2, Q),
+        );
+
+        tally.note("multiply", super::multiply(&mut out, &a, &b, &FIELD));
+
+        let mut acc = [0; 256];
+
+        tally.note(
+            "multiply_add",
+            super::multiply_add(&mut acc, &row, &[a, b], &FIELD),
+        );
+
+        let block: [u64; 21] = inputs.words();
+
+        let mut count = 0;
+
+        tally.note(
+            "uniform23",
+            super::uniform23(&block, Q, &mut out, &mut count),
+        );
+    }
+
+    #[test]
+    fn kernel_count_matches_the_model() {
+        let mut inputs = Inputs::new(18);
+
+        let mut tally = Tally::default();
+
+        sha2(&mut tally, &mut inputs);
+
+        #[cfg(feature = "frodokem")]
+        frodokem(&mut tally, &mut inputs);
+
+        #[cfg(feature = "ascon")]
+        ascon(&mut tally, &mut inputs);
+
+        #[cfg(feature = "blake2")]
+        blake2(&mut tally, &mut inputs);
+
+        #[cfg(feature = "blake3")]
+        blake3(&mut tally, &mut inputs);
+
+        #[cfg(any(
+            feature = "ml-kem",
+            feature = "frodokem",
+            feature = "ml-dsa",
+            feature = "slh-dsa",
+            feature = "lms",
+            feature = "xmss",
+            feature = "sha3"
+        ))]
+        keccak(&mut tally, &mut inputs);
+
+        #[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
+        transforms(&mut tally, &mut inputs);
+
+        #[cfg(feature = "ml-kem")]
+        mlkem(&mut tally, &mut inputs);
+
+        #[cfg(feature = "ml-dsa")]
+        mldsa(&mut tally, &mut inputs);
+
+        let count = tally.selected.len();
+
+        let names = if count == 0 {
+            "none".into()
+        } else {
+            tally.selected.join(", ")
+        };
+
+        // One write, so that QEMU's warnings on stderr do not split the line.
+        let line = alloc::format!("kernels: {count} of {} selected: {names}\n", tally.total);
+
+        std::eprint!("{line}");
+
+        if let Ok(expected) = std::env::var("CRYPTO_PQ_KERNELS")
+            && !expected.is_empty()
+        {
+            let expected: usize = expected.parse().expect("CRYPTO_PQ_KERNELS is a count");
+
+            assert_eq!(count, expected, "kernels selected: {names}");
+        }
+    }
+}

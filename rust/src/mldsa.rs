@@ -9,7 +9,7 @@ use crate::keccak::{self, Keccak, MAX_SPONGES, Sponges};
 use crate::primitives::{shake256, shake256_into};
 use crate::wipe::{SecretBytes, wipe};
 
-const Q: i32 = 8380417;
+pub(crate) const Q: i32 = 8380417;
 
 const SHAKE: u8 = 0x1F;
 
@@ -219,7 +219,7 @@ const fn centered(a: i32) -> i32 {
 }
 
 // The twiddle factors as the CPU kernels take them.
-static FIELD: Field = Field::new(
+pub(crate) static FIELD: Field = Field::new(
     Q,
     QINV,
     8,
