@@ -109,7 +109,17 @@ fn permute(s: &mut [u64; 5]) {
     round(s, 0);
 }
 
+// The kernel takes less time than the portable code on Apple cores only. The constant-time build
+// runs it on every core, so that valgrind checks it.
+fn selected() -> bool {
+    cfg!(crypto_pq_ct) || super::has(super::ASCON)
+}
+
 pub(crate) fn ascon(s: &mut [u64; 5]) -> bool {
+    if !selected() {
+        return false;
+    }
+
     permute(s);
 
     true
@@ -118,6 +128,10 @@ pub(crate) fn ascon(s: &mut [u64; 5]) -> bool {
 // crate::ascon's digest with the state in registers throughout: the whole eight-byte blocks of
 // data, its padded last block, then out.len() bytes.
 pub(crate) fn ascon_digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) -> bool {
+    if !selected() {
+        return false;
+    }
+
     let mut s = *start;
 
     let (blocks, tail) = data.as_chunks::<8>();

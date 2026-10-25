@@ -103,6 +103,11 @@ const DIT: u32 = 1 << 3;
 // FEAT_AES: AESE and AESMC.
 const AES: u32 = 1 << 4;
 
+// The scalar Ascon kernel, on a core where an EOR with a rotated operand is slower than an EOR and
+// a ROR: Apple cores. On Neoverse N2 the portable code, whose rotations the compiler folds into
+// the EORs, takes 7% less time at 1 KiB, so other cores keep it.
+const ASCON: u32 = 1 << 5;
+
 const READY: u32 = 1 << 31;
 
 // What the build guarantees needs no detection, and its check folds away. On Apple targets every
@@ -119,6 +124,7 @@ const fn guaranteed(feature: u32) -> bool {
         KECCAK => cfg!(all(target_vendor = "apple", target_feature = "sha3")),
         DIT => cfg!(target_feature = "dit"),
         AES => cfg!(target_feature = "aes"),
+        ASCON => cfg!(target_vendor = "apple"),
         _ => false,
     }
 }
@@ -189,6 +195,8 @@ fn probe() -> u32 {
     #[allow(clippy::useless_conversion)]
     let hwcap = u64::from(hwcap);
 
+    let apple = hwcap & HWCAP_CPUID != 0 && implementer() == APPLE;
+
     let mut found = 0;
 
     if hwcap & HWCAP_SHA2 != 0 {
@@ -204,9 +212,13 @@ fn probe() -> u32 {
     if hwcap & (HWCAP_SHA3 | HWCAP_SHA512) == HWCAP_SHA3 | HWCAP_SHA512 {
         found |= SHA3;
 
-        if hwcap & HWCAP_CPUID != 0 && implementer() == APPLE {
+        if apple {
             found |= KECCAK;
         }
+    }
+
+    if apple {
+        found |= ASCON;
     }
 
     if hwcap & HWCAP_DIT != 0 {
@@ -241,7 +253,7 @@ fn implementer() -> u64 {
 
 // winnt.h: PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE (AES and SHA-256),
 // PF_ARM_SHA3_INSTRUCTIONS_AVAILABLE and PF_ARM_SHA512_INSTRUCTIONS_AVAILABLE. Windows reports no
-// core, so Keccak stays scalar.
+// core, so Keccak stays scalar and Ascon portable.
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn probe() -> u32 {

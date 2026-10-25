@@ -20,6 +20,9 @@ the [crypto-pq specification](spec/00-contents.md) that it implements
   time with CPU kernels selected at run time, each with its portable twin: NEON on ARM64, AVX2 or
   SSE4.1 on x86-64. The extended output is computed several blocks at a time. Outputs are
   unchanged.
+- Ascon on ARM64: the scalar kernel runs on Apple cores only, where it takes less time than the
+  portable code; other cores, such as Neoverse N2, on which the portable code takes less time,
+  run it. Outputs are unchanged.
 
 ## [1.0.0] - 2026-10-23
 
