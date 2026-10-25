@@ -1,14 +1,15 @@
 // SHA-256 with the SHA extensions (SHA256RNDS2, SHA256MSG1, SHA256MSG2); AES-128 and AES-256 with
 // AES-NI, which also builds the AES rows of FrodoKEM's matrix A in registers; with AVX2, BMI1 and
 // BMI2 (the AVX2 tier): the SHA-256 lanes, SHA-256 without the SHA extensions and SHA-512,
-// Keccak-f[1600] on four states and on one, BLAKE2b and BLAKE2s, Ascon, the ML-KEM and ML-DSA
-// arithmetic, sampling and encodings, and FrodoKEM's SHAKE128 rows of A and its products of A with
-// the secret matrices; BLAKE2b and BLAKE2s without AVX2 with SSE4.1. Every instruction used is on
-// Intel's list of data-operand-independent timing instructions, and the code around them has no
-// branch or address that depends on secret data. The kernels are safe code inside
-// #[target_feature] functions, apart from the loads and stores of memory.rs and the assembly of
-// the SHA-2 rounds and of single shuffles and blends; what is unsafe is calling one once its
-// feature is known to be there, and CPUID with XGETBV.
+// Keccak-f[1600] on four states and on one, BLAKE2b, BLAKE2s and BLAKE3, Ascon, the ML-KEM and
+// ML-DSA arithmetic, sampling and encodings, and FrodoKEM's SHAKE128 rows of A and its products of
+// A with the secret matrices; BLAKE2b, BLAKE2s and BLAKE3 without AVX2 with SSE4.1. Every
+// instruction used is on Intel's list of data-operand-independent timing instructions, and the
+// code around them has no branch or address that depends on secret data. The kernels are safe
+// code inside #[target_feature] functions, apart from the loads and stores of memory.rs, the
+// assembly of the SHA-2 rounds, of BLAKE3's transposed rounds and of single shuffles and blends,
+// and the volatile stores that clear BLAKE3's vector buffers; what is unsafe is calling one once
+// its feature is known to be there, and CPUID with XGETBV.
 
 use core::arch::x86_64::*;
 use core::mem::MaybeUninit;
@@ -19,7 +20,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 // 16 into two of them on both of its operands, which doubled the work of the one port that runs
 // shuffles on Intel cores, and in SHA-512 a lane-crossing pair into a permutation that takes two
 // operations and twice the latency on AMD cores. An instruction in assembly is opaque to it.
-#[cfg(feature = "blake2")]
+#[cfg(any(feature = "blake2", feature = "blake3"))]
 macro_rules! instruction {
     ($name:ident, $vector:ty, $class:ident, $template:literal, $($input:ident),+) => {
         #[target_feature(enable = "avx2")]
@@ -53,11 +54,14 @@ mod ascon;
 #[cfg(feature = "blake2")]
 mod blake2;
 
-#[cfg(feature = "frodokem")]
-mod frodo;
+#[cfg(feature = "blake3")]
+mod blake3;
 
 #[cfg(feature = "ml-dsa")]
 mod dsa;
+
+#[cfg(feature = "frodokem")]
+mod frodo;
 
 #[cfg(any(
     feature = "ml-kem",
@@ -143,8 +147,13 @@ const fn guaranteed(feature: u32) -> bool {
 }
 
 // The constant-time check runs under valgrind, which cannot execute the SHA extensions, so its
-// build leaves them out and checks the AVX2, SSE4.1 and AES-NI paths.
+// build leaves them out and checks the AVX2, SSE4.1 and AES-NI paths. --cfg crypto_pq_sse41 leaves
+// out AVX2 and the SHA extensions too, so that a CPU with them runs the SSE4.1 kernels.
 const fn usable(feature: u32) -> bool {
+    if cfg!(crypto_pq_sse41) && (feature == AVX2 || feature == SHA) {
+        return false;
+    }
+
     if cfg!(crypto_pq_ct) {
         return feature != SHA;
     }
@@ -222,6 +231,125 @@ fn probe() -> u32 {
     }
 
     found
+}
+
+// BLAKE3's hash_many and extended output: eight lanes with AVX2, four with SSE4.1.
+#[inline]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_many(input: &[u8], many: &crate::blake3::Many, out: &mut [[u8; 32]]) -> usize {
+    if has(AVX2) {
+        // SAFETY: the CPU has AVX2 and the operating system saves its registers.
+        return unsafe { blake3::hash_many_avx2(input, many, out) };
+    }
+
+    if has(SSE41) {
+        // SAFETY: the CPU has SSSE3 and SSE4.1, all that the kernel needs.
+        return unsafe { blake3::hash_many_sse41(input, many, out) };
+    }
+
+    0
+}
+
+#[inline]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_xof(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    info: [u32; 2],
+    out: &mut [[u8; 64]],
+) -> usize {
+    if has(AVX2) {
+        // SAFETY: as in blake3_many.
+        return unsafe { blake3::xof_avx2(cv, block, counter, info, out) };
+    }
+
+    if has(SSE41) {
+        // SAFETY: as in blake3_many.
+        return unsafe { blake3::xof_sse41(cv, block, counter, info, out) };
+    }
+
+    0
+}
+
+// BLAKE3's chain over a chunk's blocks and its single compression, a row of the state per vector.
+#[inline]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_blocks(
+    cv: &mut [u32; 8],
+    blocks: &[[u8; 64]],
+    counter: u64,
+    flags: u32,
+    edges: [u32; 2],
+    last: crate::blake3::Last,
+) -> bool {
+    if has(AVX2) {
+        // SAFETY: as in blake3_many.
+        unsafe { blake3::chain_avx2(cv, blocks, counter, flags, edges, last) };
+
+        return true;
+    }
+
+    if has(SSE41) {
+        // SAFETY: as in blake3_many.
+        unsafe { blake3::chain_sse41(cv, blocks, counter, flags, edges, last) };
+
+        return true;
+    }
+
+    false
+}
+
+// A one-block digest of at most 32 bytes in one call.
+#[inline]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_digest1(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) -> bool {
+    if has(AVX2) {
+        // SAFETY: as in blake3_many.
+        unsafe { blake3::digest1_avx2(key, flags, data, out) };
+
+        return true;
+    }
+
+    if has(SSE41) {
+        // SAFETY: as in blake3_many.
+        unsafe { blake3::digest1_sse41(key, flags, data, out) };
+
+        return true;
+    }
+
+    false
+}
+
+#[inline]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_compress(
+    cv: &[u32; 8],
+    block: &[u8; 64],
+    counter: u64,
+    [length, flags]: [u32; 2],
+    out: &mut [u32; 16],
+) -> bool {
+    if has(AVX2) {
+        // SAFETY: as in blake3_many.
+        unsafe { blake3::compress_avx2(cv, block, counter, length, flags, out) };
+
+        return true;
+    }
+
+    if has(SSE41) {
+        // SAFETY: as in blake3_many.
+        unsafe { blake3::compress_sse41(cv, block, counter, length, flags, out) };
+
+        return true;
+    }
+
+    false
 }
 
 #[allow(unsafe_code)]

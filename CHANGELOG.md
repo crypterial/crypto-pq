@@ -16,6 +16,10 @@ the [crypto-pq specification](spec/00-contents.md) that it implements
   (eight blocks in flight) and the products with NEON; on x86-64, AES-128 rows with AES-NI and,
   on AVX2 CPUs, four SHAKE128 rows at a time and the products with AVX2. Noise sampling and the
   SHAKE128 rows of the portable code run on whole blocks. Outputs are unchanged.
+- BLAKE3, BLAKE3-256, BLAKE3-MAC and BLAKE3-KDF hash several chunks, and several parents, at a
+  time with CPU kernels selected at run time, each with its portable twin: NEON on ARM64, AVX2 or
+  SSE4.1 on x86-64. The extended output is computed several blocks at a time. Outputs are
+  unchanged.
 
 ## [1.0.0] - 2026-10-23
 

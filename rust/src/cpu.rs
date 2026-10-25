@@ -10,8 +10,9 @@
 // The constant-time check (--cfg crypto_pq_ct) runs under valgrind, which cannot execute every
 // instruction: its build leaves out SHA3, SHA512 and DIT on arm64 and the SHA extensions on
 // x86-64, ignores what the build guarantees, and detects the rest at run time, so that it checks
-// the SHA-256 instructions and NEON on arm64 and AVX2 and SSE4.1 on x86-64. The portable build
-// checks the fallback.
+// the SHA-256 instructions and NEON on arm64 and AVX2 and AES-NI on x86-64. --cfg crypto_pq_sse41
+// caps x86-64 detection at SSE4.1 and AES-NI, so that the check also covers the SSE4.1 kernels
+// (BLAKE2 and BLAKE3) on runners that have AVX2. The portable build checks the fallback.
 
 #[cfg(all(
     target_arch = "aarch64",
@@ -211,6 +212,55 @@ mod arch {
     ))]
     pub(crate) fn digest(_: Option<&[u64; 25]>, _: usize, _: u8, _: &[u8], _: &mut [u8]) -> bool {
         false
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "blake3")]
+    pub(crate) fn blake3_many(_: &[u8], _: &crate::blake3::Many, _: &mut [[u8; 32]]) -> usize {
+        0
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "blake3")]
+    pub(crate) fn blake3_blocks(
+        _: &mut [u32; 8],
+        _: &[[u8; 64]],
+        _: u64,
+        _: u32,
+        _: [u32; 2],
+        _: crate::blake3::Last,
+    ) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "blake3")]
+    pub(crate) fn blake3_compress(
+        _: &[u32; 8],
+        _: &[u8; 64],
+        _: u64,
+        _: [u32; 2],
+        _: &mut [u32; 16],
+    ) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "blake3")]
+    pub(crate) fn blake3_digest1(_: &[u32; 8], _: u32, _: &[u8], _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "blake3")]
+    pub(crate) fn blake3_xof(
+        _: &[u32; 8],
+        _: &[u32; 16],
+        _: u64,
+        _: [u32; 2],
+        _: &mut [[u8; 64]],
+    ) -> usize {
+        0
     }
 
     #[inline(always)]
@@ -493,6 +543,9 @@ pub(crate) use arch::{ascon, ascon_digest};
 
 #[cfg(feature = "blake2")]
 pub(crate) use arch::{blake2b, blake2b_digest, blake2s, blake2s_digest, blake2s_mac};
+
+#[cfg(feature = "blake3")]
+pub(crate) use arch::{blake3_blocks, blake3_compress, blake3_digest1, blake3_many, blake3_xof};
 
 #[cfg(any(
     feature = "ml-kem",

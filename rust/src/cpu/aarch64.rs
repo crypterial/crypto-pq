@@ -1,14 +1,14 @@
 // SHA-256 with the ARMv8 SHA2 instructions, SHA-512 with the ARMv8.2 SHA512 instructions,
 // Keccak-f[1600] with the ARMv8.2 SHA3 instructions and the AES-128 rows of FrodoKEM's matrix A
 // with the ARMv8 AES instructions; the NEON transforms of ML-KEM and ML-DSA, their noise and
-// rejection sampling, and FrodoKEM's products of A with the secret matrices are in the
-// submodules. All of them are on Arm's list of instructions whose timing does not depend on their
-// data (FEAT_DIT), and the code around them has no branch or address that depends on secret data
-// (sample.rs explains the one pattern it declassifies). The kernels are safe code inside
-// #[target_feature] functions, apart from the loads and stores of memory.rs and the rounds of
-// SHA-256 and Keccak that are written in assembly; what is otherwise unsafe is calling one once
-// its feature is known to be there, asking the operating system for the features, and setting the
-// DIT bit.
+// rejection sampling, FrodoKEM's products of A with the secret matrices, and BLAKE3 on four and
+// eight inputs are in the submodules. All of them are on Arm's list of instructions whose timing
+// does not depend on their data (FEAT_DIT), and the code around them has no branch or address that
+// depends on secret data (sample.rs explains the one pattern it declassifies). The kernels are safe
+// code inside #[target_feature] functions, apart from the loads and stores of memory.rs and the
+// rounds of SHA-256 and Keccak that are written in assembly; what is otherwise unsafe is calling
+// one once its feature is known to be there, asking the operating system for the features, and
+// setting the DIT bit.
 
 use core::arch::aarch64::*;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -32,14 +32,17 @@ mod aes;
 #[cfg(feature = "ascon")]
 mod ascon;
 
-#[cfg(feature = "frodokem")]
-mod frodo;
-
 #[cfg(feature = "ml-kem")]
 mod binomial;
 
+#[cfg(feature = "blake3")]
+mod blake3;
+
 #[cfg(feature = "ml-dsa")]
 mod dsa;
+
+#[cfg(feature = "frodokem")]
+mod frodo;
 
 mod memory;
 
@@ -829,6 +832,59 @@ pub(crate) fn blake2s_digest(_: &[u32; 8], _: &[u8], _: &mut [u8]) -> bool {
 #[cfg(feature = "blake2")]
 pub(crate) fn blake2s_mac(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
     false
+}
+
+#[allow(unsafe_code)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_many(input: &[u8], many: &crate::blake3::Many, out: &mut [[u8; 32]]) -> usize {
+    // SAFETY: NEON is part of every target this module is built for.
+    unsafe { blake3::hash_many(input, many, out) }
+}
+
+// BLAKE3's chain of one chunk's blocks runs best on the scalar pipes as compiled: NEON's
+// two-cycle instructions lengthen the chain of each step, as in BLAKE2.
+#[inline(always)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_blocks(
+    _: &mut [u32; 8],
+    _: &[[u8; 64]],
+    _: u64,
+    _: u32,
+    _: [u32; 2],
+    _: crate::blake3::Last,
+) -> bool {
+    false
+}
+
+#[inline(always)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_digest1(_: &[u32; 8], _: u32, _: &[u8], _: &mut [u8]) -> bool {
+    false
+}
+
+#[inline(always)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_compress(
+    _: &[u32; 8],
+    _: &[u8; 64],
+    _: u64,
+    _: [u32; 2],
+    _: &mut [u32; 16],
+) -> bool {
+    false
+}
+
+#[allow(unsafe_code)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_xof(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    info: [u32; 2],
+    out: &mut [[u8; 64]],
+) -> usize {
+    // SAFETY: as in blake3_many.
+    unsafe { blake3::xof(cv, block, counter, info, out) }
 }
 
 #[target_feature(enable = "neon")]

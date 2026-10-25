@@ -670,15 +670,16 @@ fn hkdf() {
 }
 
 // BLAKE3: keyed_hash under a secret key and derive_key from secret key material, over more than
-// two chunks, whose chaining values merge into parents, and over a partial block; the hash and
-// the XOF of the same secret input.
+// two chunks, whose chaining values merge into parents, over ten, which the kernels hash eight
+// and more at a time, and over a partial block; the hash and the XOF of the same secret input,
+// whose sixteen output blocks the kernels compute side by side.
 #[test]
 fn blake3() {
     let key = secret_bytes(32, 5);
 
-    let long = secret_bytes(2100, 6);
+    let long = secret_bytes(9 * 1024 + 100, 6);
 
-    for data in [&long[..], &long[..10]] {
+    for data in [&long[..2100], &long[..], &long[..10]] {
         let tag = BLAKE3_MAC.digest(&key, data).unwrap();
 
         let mut incremental = BLAKE3_MAC.create(&key).unwrap();
@@ -695,13 +696,13 @@ fn blake3() {
 
         let options = KdfOptions::default().with_info(b"context");
 
-        let okm = BLAKE3_KDF.derive(data, 300, &options).unwrap();
+        let okm = BLAKE3_KDF.derive(data, 1030, &options).unwrap();
 
         let short = BLAKE3_KDF.derive(data, 32, &options).unwrap();
 
         assert!(same(&short, &okm[..32]));
 
-        let output = BLAKE3.digest(data, 130).unwrap();
+        let output = BLAKE3.digest(data, 1030).unwrap();
 
         let mut xof = BLAKE3.create();
 
@@ -709,7 +710,7 @@ fn blake3() {
 
         let mut read = xof.read(1).unwrap();
 
-        read.extend(xof.read(129).unwrap());
+        read.extend(xof.read(1029).unwrap());
 
         assert!(same(&read, &output));
 

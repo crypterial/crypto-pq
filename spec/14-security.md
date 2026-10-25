@@ -23,7 +23,8 @@
 7. The implementation MUST verify item 1 mechanically in CI for every secret-handling path, including
    every CPU-specific kernel that the checker can execute. The Rust implementation runs valgrind
    memcheck with every secret marked undefined through client requests (`--cfg crypto_pq_ct`), on
-   x86-64 and ARM64, in the default and the forced-portable build ([23.2](profiles/rust.md#232-security-mechanics) item 6).
+   x86-64 and ARM64, in the default and the forced-portable build, and on x86-64 in a build capped at
+   SSE4.1 ([23.2](profiles/rust.md#232-security-mechanics) item 6).
 
 ## 14.2 Data-independent timing (DIT)
 

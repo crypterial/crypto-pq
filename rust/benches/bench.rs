@@ -3,15 +3,16 @@ use std::time::{Duration, Instant};
 
 use crypto_pq::{
     ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_512, BLAKE2B_MAC, BLAKE2S_256, BLAKE2S_MAC,
-    CSHAKE128, CSHAKE256, Error, HKDF_SHA_256, HKDF_SHA_384, HKDF_SHA_512, HMAC_SHA_256, HSS_LMS,
-    HashAlgorithm, KMAC128, KMAC256, KdfAlgorithm, KdfOptions, KemAlgorithm, ML_DSA_44, ML_DSA_65,
-    ML_DSA_87, ML_KEM_512, ML_KEM_768, ML_KEM_1024, MacAlgorithm, MacOptions, SHA_256, SHA_512,
-    SHA3_256, SHAKE128, SHAKE256, SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F,
-    SLH_DSA_SHA2_192S, SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F,
-    SLH_DSA_SHAKE_128S, SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F,
-    SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, StateStore, StatefulKeyGenOptions,
-    StatefulLoadOptions, StatefulParameters, StatefulPrivateKey, StatefulSignatureAlgorithm,
-    VerifyOptions, XMSS, XMSS_MT, XofAlgorithm, XofOptions, hazmat,
+    BLAKE3, BLAKE3_256, BLAKE3_KDF, BLAKE3_MAC, CSHAKE128, CSHAKE256, Error, HKDF_SHA_256,
+    HKDF_SHA_384, HKDF_SHA_512, HMAC_SHA_256, HSS_LMS, HashAlgorithm, KMAC128, KMAC256,
+    KdfAlgorithm, KdfOptions, KemAlgorithm, ML_DSA_44, ML_DSA_65, ML_DSA_87, ML_KEM_512,
+    ML_KEM_768, ML_KEM_1024, MacAlgorithm, MacOptions, SHA_256, SHA_512, SHA3_256, SHAKE128,
+    SHAKE256, SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S,
+    SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F, SLH_DSA_SHAKE_128S,
+    SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F, SLH_DSA_SHAKE_256S, SignOptions,
+    SignatureAlgorithm, StateStore, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
+    StatefulPrivateKey, StatefulSignatureAlgorithm, VerifyOptions, XMSS, XMSS_MT, XofAlgorithm,
+    XofOptions, hazmat,
 };
 
 const MIN_TIME: Duration = Duration::from_secs(1);
@@ -199,6 +200,19 @@ fn hashes(runner: &Runner) {
         }
     }
 
+    // BLAKE3 over one block, one chunk, sixteen chunks and as an XOF of sixteen output blocks.
+    let wide = bytes(16384);
+
+    for (name, input) in [
+        ("blake3-256/64B", &data[..64]),
+        ("blake3-256/1KiB", &data[..]),
+        ("blake3-256/16KiB", &wide[..]),
+    ] {
+        hash(runner, name, BLAKE3_256, input);
+    }
+
+    xof(runner, "blake3/1KiB", BLAKE3, &data, 1024);
+
     let options = XofOptions::default().with_customization(b"crypto-pq benchmark");
 
     for (name, algorithm, size) in [
@@ -253,6 +267,7 @@ fn macs(runner: &Runner) {
         ("kmac256", KMAC256.configure(&options).unwrap()),
         ("blake2b-mac", BLAKE2B_MAC),
         ("blake2s-mac", BLAKE2S_MAC),
+        ("blake3-mac", BLAKE3_MAC),
     ] {
         for (size, suffix) in [(64, "64B"), (1024, "1KiB")] {
             mac(
@@ -305,6 +320,20 @@ fn kdfs(runner: &Runner) {
                 &options,
             );
         }
+    }
+
+    // BLAKE3-KDF takes the context string as its info and no salt.
+    let context = KdfOptions::default().with_info(b"crypto-pq benchmark 2026-10-25 key derivation");
+
+    for size in [32, 64] {
+        kdf(
+            runner,
+            &format!("blake3-kdf/{size}B"),
+            BLAKE3_KDF,
+            &ikm,
+            size,
+            &context,
+        );
     }
 }
 
