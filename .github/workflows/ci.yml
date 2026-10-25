@@ -288,7 +288,8 @@ jobs:
   # that depends on one fails the job; values the specifications make public are declassified.
   # The crypto_pq_ct build leaves out what valgrind cannot execute (SHA-NI on x86-64; SHA3,
   # SHA512 and DIT on arm64) and detects the rest; the portable run checks the fallback, and the
-  # crypto_pq_sse41 run the SSE4.1 kernels, which a runner with AVX2 would not select.
+  # crypto_pq_sse41 run the SSE4.1 kernels, which a runner with AVX2 would not select. Each run
+  # first passes the whole suite, the compliance vectors included, in its build (SPEC 18.4 item 1).
   rust-ct:
     name: rust ${{ matrix.rust }} constant time (valgrind, ${{ matrix.os }}) '${{ matrix.cfg }}'
     runs-on: ${{ matrix.os }}
@@ -311,6 +312,10 @@ jobs:
       - run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends valgrind jq
       - run: rustup toolchain install ${{ matrix.rust }} --profile minimal
       - run: rustup override set ${{ matrix.rust }}
+      - env:
+          RUSTFLAGS: --cfg crypto_pq_ct ${{ matrix.cfg }}
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+        run: cargo test --locked --release --all-features
       - env:
           RUSTFLAGS: --cfg crypto_pq_ct ${{ matrix.cfg }}
           CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
