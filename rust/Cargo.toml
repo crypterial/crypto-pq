@@ -1,6 +1,6 @@
 [package]
 name = "crypto-pq"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Secure, optimized post-quantum cryptography in pure Rust with no dependencies: ML-KEM, FrodoKEM, ML-DSA, SLH-DSA, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF."
