@@ -231,7 +231,9 @@ jobs:
 
   # Each x86-64 path whatever the runner's CPU: QEMU user mode runs the suite on a CPU with AVX2
   # and no SHA-NI, one with SHA-NI and SSE4.1 (BLAKE2 and BLAKE3) but no AVX, and one with none of
-  # them. The runner itself covers the CPU it has, usually SHA-NI with AVX2.
+  # them. The runner itself covers the CPU it has, usually SHA-NI with AVX2. The tests link
+  # statically with musl, so that QEMU runs none of the runner's libraries: the Ubuntu 26.04 runner
+  # has their x86-64-v3 builds, which Denverton and qemu64 cannot execute.
   rust-x86-models:
     name: rust x86-64 -cpu ${{ matrix.cpu }}
     runs-on: ubuntu-latest
@@ -244,12 +246,13 @@ jobs:
         shell: bash
         working-directory: rust
     env:
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: qemu-x86_64 -cpu ${{ matrix.cpu }}
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUNNER: qemu-x86_64 -cpu ${{ matrix.cpu }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update -q && sudo apt-get install -yq qemu-user
-      - run: cargo test --locked --release --all-features -- --nocapture kernel
-      - run: cargo test --locked --release --all-features
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo test --locked --release --all-features --target x86_64-unknown-linux-musl -- --nocapture kernel
+      - run: cargo test --locked --release --all-features --target x86_64-unknown-linux-musl
 
   # Every secret is marked uninitialised under valgrind's memcheck, so a branch or a memory index
   # that depends on one fails the job; values the specifications make public are declassified.
