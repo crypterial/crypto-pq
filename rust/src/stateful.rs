@@ -2029,6 +2029,7 @@ mod tests {
     use alloc::rc::Rc;
     use alloc::vec::Vec;
     use core::cell::{Cell, RefCell};
+    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::collections::HashSet;
     use std::panic::AssertUnwindSafe;
 
@@ -2324,29 +2325,60 @@ mod tests {
             ),
         ];
 
-        // One thread per case, each with its own count of one-time signatures.
-        std::thread::scope(|scope| {
-            for (algorithm, parameters, start, count) in cases {
-                scope.spawn(move || crash_everywhere(algorithm, parameters, start, count));
-            }
+        // A first run of each case counts the writes of its store.
+        let writes: Vec<usize> = std::thread::scope(|scope| {
+            let runs: Vec<_> = cases
+                .iter()
+                .map(|&(algorithm, parameters, start, count)| {
+                    scope.spawn(move || {
+                        let store = CrashingStore::default();
+
+                        run(algorithm, parameters, start, count, &store, true).1
+                    })
+                })
+                .collect();
+
+            runs.into_iter().map(|run| run.join().unwrap()).collect()
         });
+
+        // Each trial makes its own store and key and counts the one-time signatures of its own
+        // thread, so the trials of every case share the cores.
+        let trials: Vec<_> = cases
+            .iter()
+            .zip(writes)
+            .flat_map(|(&case, writes)| {
+                let (_, _, _, count) = case;
+
+                trials(writes, count).map(move |trial| (case, trial))
+            })
+            .collect();
+
+        parallel(
+            &trials,
+            |&((algorithm, parameters, start, count), trial)| {
+                check_trial(algorithm, parameters, start, count, trial);
+            },
+        );
     }
 
-    fn crash_everywhere(
-        algorithm: StatefulSignatureAlgorithm,
-        parameters: StatefulParameters,
-        start: Start,
-        count: usize,
-    ) {
-        let (_, writes) = run(
-            algorithm,
-            parameters,
-            start,
-            count,
-            &CrashingStore::default(),
-            true,
-        );
+    // A run with the store crashing at write `crash`, or with a fault in the new one-time
+    // signature of sign call `call`; `reload` is that of `run`.
+    #[derive(Clone, Copy)]
+    enum Trial {
+        Crash {
+            crash: usize,
+            stored: bool,
+            reload: bool,
+            panic: bool,
+        },
+        Fault {
+            call: usize,
+            kind: Fault,
+            reload: bool,
+        },
+    }
 
+    fn trials(writes: usize, count: usize) -> impl Iterator<Item = Trial> {
         // A panic of the store with a reload after it is a crash; without one, the caller signs
         // on with the key object that the panic left.
         let variants = [
@@ -2358,62 +2390,91 @@ mod tests {
             (true, false, true),
         ];
 
-        for crash in 1..=writes {
-            for (stored, reload, panic) in variants {
-                ONE_TIME_SIGNATURES.with(|signatures| signatures.borrow_mut().clear());
+        let crashes = (1..=writes).flat_map(move |crash| {
+            variants.map(|(stored, reload, panic)| Trial::Crash {
+                crash,
+                stored,
+                reload,
+                panic,
+            })
+        });
 
-                let store = CrashingStore {
+        // A fault in the new one-time signature of every call, with and without a reload after
+        // it: never released, and the one-time key that computed it signs nothing else.
+        let faults = (0..count).flat_map(|call| {
+            [Fault::Message, Fault::ChildRoot]
+                .into_iter()
+                .flat_map(move |kind| {
+                    [true, false].map(|reload| Trial::Fault { call, kind, reload })
+                })
+        });
+
+        crashes.chain(faults)
+    }
+
+    fn check_trial(
+        algorithm: StatefulSignatureAlgorithm,
+        parameters: StatefulParameters,
+        start: Start,
+        count: usize,
+        trial: Trial,
+    ) {
+        ONE_TIME_SIGNATURES.with(|signatures| signatures.borrow_mut().clear());
+
+        let (store, reload, context) = match trial {
+            Trial::Crash {
+                crash,
+                stored,
+                reload,
+                panic,
+            } => (
+                CrashingStore {
                     crash,
                     stored,
                     panic,
                     ..CrashingStore::default()
-                };
+                },
+                reload,
+                std::format!("{} {crash} {stored} {reload} {panic}", algorithm.name()),
+            ),
+            Trial::Fault { call, kind, reload } => (
+                CrashingStore {
+                    fault: Some((call, kind)),
+                    ..CrashingStore::default()
+                },
+                reload,
+                std::format!("{} {call} {kind:?} {reload}", algorithm.name()),
+            ),
+        };
 
-                let (released, _) = run(algorithm, parameters, start, count, &store, reload);
+        let (released, _) = run(algorithm, parameters, start, count, &store, reload);
 
-                let context =
-                    std::format!("{} {crash} {stored} {reload} {panic}", algorithm.name());
+        let signed = ONE_TIME_SIGNATURES.with(|signatures| signatures.take());
 
-                let signed = ONE_TIME_SIGNATURES.with(|signatures| signatures.take());
+        let keys: HashSet<&Vec<u8>> = signed.iter().collect();
 
-                let keys: HashSet<&Vec<u8>> = signed.iter().collect();
+        assert_eq!(keys.len(), signed.len(), "{context}");
 
-                assert_eq!(keys.len(), signed.len(), "{context}");
+        let distinct: HashSet<&Vec<u8>> = released.iter().collect();
 
-                let distinct: HashSet<&Vec<u8>> = released.iter().collect();
+        assert_eq!(distinct.len(), released.len(), "{context}");
+    }
 
-                assert_eq!(distinct.len(), released.len(), "{context}");
+    // Checks the items on every core; a failed assertion in any worker fails the test.
+    fn parallel<T: Sync>(items: &[T], check: impl Fn(&T) + Sync) {
+        let next = AtomicUsize::new(0);
+
+        let workers = std::thread::available_parallelism().map_or(1, usize::from);
+
+        std::thread::scope(|scope| {
+            for _ in 0..workers.min(items.len()) {
+                scope.spawn(|| {
+                    while let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        check(item);
+                    }
+                });
             }
-        }
-
-        // A fault in the new one-time signature of every call, with and without a reload after
-        // it: never released, and the one-time key that computed it signs nothing else.
-        for call in 0..count {
-            for kind in [Fault::Message, Fault::ChildRoot] {
-                for reload in [true, false] {
-                    ONE_TIME_SIGNATURES.with(|signatures| signatures.borrow_mut().clear());
-
-                    let store = CrashingStore {
-                        fault: Some((call, kind)),
-                        ..CrashingStore::default()
-                    };
-
-                    let (released, _) = run(algorithm, parameters, start, count, &store, reload);
-
-                    let context = std::format!("{} {call} {kind:?} {reload}", algorithm.name());
-
-                    let signed = ONE_TIME_SIGNATURES.with(|signatures| signatures.take());
-
-                    let keys: HashSet<&Vec<u8>> = signed.iter().collect();
-
-                    assert_eq!(keys.len(), signed.len(), "{context}");
-
-                    let distinct: HashSet<&Vec<u8>> = released.iter().collect();
-
-                    assert_eq!(distinct.len(), released.len(), "{context}");
-                }
-            }
-        }
+        });
     }
 
     // SPEC 11.5.2 steps 3.3, 3.5 and 7 [D-63]: a fault in the message signature fails the call
