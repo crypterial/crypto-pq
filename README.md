@@ -251,9 +251,9 @@ specification state them in full.
 ## Design
 
 - **Pure Rust, no dependencies.** Every algorithm is implemented in the crate, with no build
-  script. `unsafe` code is confined to the entropy source, the wipe, one-time initialization and the
-  CPU modules, plus the valgrind requests of the constant-time check build, and each block states
-  why it is sound.
+  script. `unsafe` code is confined to the entropy source, memory wiping, one-time initialization,
+  the CPU modules and the valgrind client requests of the constant-time check build, and each block
+  states why it is sound.
 - **Constant-time code.** Code that handles secret data has no branch or memory access that depends
   on a secret. CI checks this with valgrind memcheck, every secret marked as undefined, on x86-64
   and ARM64, in the default and the portable build.
@@ -264,18 +264,18 @@ specification state them in full.
 - **Self-tests.** Key generation runs a pairwise consistency test by default, private-key import
   validates the key, and every stateful signature is verified before it is released.
 - **Randomness** comes only from the operating system: `getrandom` on Linux, Android, FreeBSD,
-  NetBSD, DragonFly, illumos and Solaris, `getentropy` on Apple platforms and OpenBSD, `ProcessPrng` on Windows, and
-  `random_get` on WASI preview 1. On a target without one, operations that need randomness return
-  `Error::RngFailure`.
+  NetBSD, DragonFly, illumos and Solaris, `getentropy` on Apple platforms and OpenBSD,
+  `ProcessPrng` on Windows, and `random_get` on WASI preview 1. On a target without one, operations
+  that need randomness return `Error::RngFailure`.
 - **CPU paths.** Kernels for x86-64 (AVX2, SSE4.1, SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2,
   SHA-3, SHA-512) are selected at run time, with portable code on every target and no target CPU
   flag needed. `RUSTFLAGS="--cfg crypto_pq_portable"` builds the portable code only.
 - **Allocation.** Every operation is synchronous. Fixed-size operations allocate only their returned
   value, and the `_into` forms allocate nothing.
 
-CI builds and tests the crate on Linux x86-64 and ARM64, macOS ARM64, Windows x86-64 and ARM64 and
-Linux musl, and under emulation on 32-bit x86, RISC-V 64 and big-endian s390x, with stable Rust,
-and on Linux x86-64 with Rust 1.88 as well.
+CI builds and tests the crate with stable Rust on Linux x86-64 and ARM64, macOS ARM64, Windows
+x86-64 and ARM64 and Linux musl, and under emulation on 32-bit x86, RISC-V 64 and big-endian s390x.
+On Linux x86-64 it also runs with Rust 1.88, the minimum supported version.
 
 ## Specification and test vectors
 
@@ -296,6 +296,12 @@ and on Linux x86-64 with Rust 1.88 as well.
 - Releases are published from signed tags `rust-vX.Y.Z` on `main`. The crate is built on x86-64 and
   ARM64 hosts and the two builds are compared byte for byte; it carries a build provenance
   attestation and is published through crates.io trusted publishing.
+
+## Contributing
+
+Contributions follow [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[code of conduct](CODE_OF_CONDUCT.md). Report vulnerabilities privately, as
+[SECURITY.md](SECURITY.md) describes.
 
 ## License
 

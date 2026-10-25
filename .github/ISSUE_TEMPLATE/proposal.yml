@@ -1,0 +1,32 @@
+name: Proposal
+description: An algorithm, option, operation or format to add or change
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        An algorithm is in scope only if it is standardized, or used in production by major vendors
+        and proven there, and only if it is post-quantum when it is asymmetric. Section 4.2 of the
+        [specification](https://github.com/crypterial/crypto-pq/blob/main/spec/04-scope.md#42-excluded)
+        lists what is excluded and why.
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What to add or change, as it would read in the specification.
+    validations:
+      required: true
+  - type: textarea
+    id: reference
+    attributes:
+      label: Standard or reference
+      description: The standard, RFC or published specification, with its section.
+    validations:
+      required: true
+  - type: textarea
+    id: reason
+    attributes:
+      label: Reason
+      description: The use it serves, and why the current API does not cover it.
+    validations:
+      required: true

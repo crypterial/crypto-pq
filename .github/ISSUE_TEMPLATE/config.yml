@@ -3,3 +3,6 @@ contact_links:
   - name: Report a security vulnerability
     url: https://github.com/crypterial/crypto-pq/security/advisories/new
     about: Report security issues privately through a GitHub Security Advisory. Do not open a public issue.
+  - name: API documentation
+    url: https://docs.rs/crypto-pq
+    about: Every operation, with the rules that are part of the API contract.
