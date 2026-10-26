@@ -902,28 +902,53 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) -> [u8; 32
 
     let mut hashed = 0;
 
-    let (mut row, mut t) = ([[0; 256]; 4], [[0; 256]; 1]);
+    let (mut matrix, mut t) = ([[0; 256]; 4], [[0; 256]; 1]);
 
-    for i in 0..k {
-        let mut blocks = ek[hashed..384 * i].as_chunks::<136>().0.iter();
+    // Where Â fills one group of sponges exactly (k = 2 with groups of four), it is sampled at
+    // once and H(ek) runs after it, in fewer permutation calls than two rows of two beside H(ek).
+    // Otherwise row by row, with a block of H(ek) beside each squeeze while there is one, which
+    // fills the slot after a row of three (k = 3), or after a row of two in a group of six.
+    let whole = k * k == keccak::group();
 
+    if whole {
         sample_ntt(
             &mut sponges,
             rho,
             k,
-            k * i,
-            &mut row[..k],
-            |sponges, active| match blocks.next() {
-                Some(block) => {
-                    hash.update_block_with(block, |state| sponges.squeeze_beside(active, state));
-
-                    hashed += 136;
-                }
-                None => sponges.squeeze(active),
-            },
+            0,
+            &mut matrix[..k * k],
+            Sponges::squeeze,
         );
+    }
 
-        matrix_vector(&mut t, &row[..k], s, &caches[..k], &e[i..=i]);
+    for i in 0..k {
+        let row = if whole {
+            &matrix[k * i..k * (i + 1)]
+        } else {
+            let mut blocks = ek[hashed..384 * i].as_chunks::<136>().0.iter();
+
+            sample_ntt(
+                &mut sponges,
+                rho,
+                k,
+                k * i,
+                &mut matrix[..k],
+                |sponges, active| match blocks.next() {
+                    Some(block) => {
+                        hash.update_block_with(block, |state| {
+                            sponges.squeeze_beside(active, state)
+                        });
+
+                        hashed += 136;
+                    }
+                    None => sponges.squeeze(active),
+                },
+            );
+
+            &matrix[..k]
+        };
+
+        matrix_vector(&mut t, row, s, &caches[..k], &e[i..=i]);
 
         byte_encode(&t[0], 12, &mut ek[384 * i..384 * (i + 1)]);
 

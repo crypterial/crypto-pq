@@ -9,10 +9,11 @@
 //
 // The constant-time check (--cfg crypto_pq_ct) runs under valgrind, which cannot execute every
 // instruction: its build leaves out SHA3, SHA512 and DIT on arm64 and the SHA extensions and
-// AVX-512 on x86-64, ignores what the build guarantees, and detects the rest at run time, so that it checks
-// the SHA-256 instructions and NEON on arm64 and AVX2 and AES-NI on x86-64. --cfg crypto_pq_sse41
-// caps x86-64 detection at SSE4.1 and AES-NI, so that the check also covers the SSE4.1 kernels
-// (BLAKE2 and BLAKE3) on runners that have AVX2. The portable build checks the fallback.
+// AVX-512 on x86-64, ignores what the build guarantees, and detects the rest at run time, so that
+// it checks the SHA-256 instructions and NEON on arm64 and AVX2 and AES-NI on x86-64.
+// --cfg crypto_pq_sse41 caps x86-64 detection at SSE4.1 and AES-NI, so that the check also covers
+// the SSE4.1 kernels (BLAKE2 and BLAKE3) on runners that have AVX2. The portable build checks the
+// fallback.
 
 #[cfg(all(
     target_arch = "aarch64",
@@ -557,6 +558,119 @@ pub(crate) use arch::{blake3_blocks, blake3_compress, blake3_digest1, blake3_man
     feature = "sha3"
 ))]
 pub(crate) use arch::{absorb, digest, keccak_group, permute_many};
+
+// The vector form of Sponges (x86_64.rs, squeeze_wide); elsewhere there is none, and Sponges
+// keeps its own path.
+#[cfg(all(
+    any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ),
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+pub(crate) use x86_64::{Wide, squeeze_wide, squeezes_wide};
+
+#[derive(Clone, Copy)]
+#[cfg(all(
+    any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ),
+    not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))
+))]
+pub(crate) struct Wide;
+
+#[cfg(all(
+    any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ),
+    not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))
+))]
+impl Wide {
+    pub(crate) const fn new() -> Self {
+        Self
+    }
+
+    #[inline(always)]
+    pub(crate) fn restart(&mut self, _: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn wipe(&mut self) {}
+}
+
+#[cfg(all(
+    any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ),
+    not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))
+))]
+#[inline(always)]
+pub(crate) fn squeezes_wide() -> bool {
+    false
+}
+
+#[cfg(all(
+    any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ),
+    not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))
+))]
+#[inline(always)]
+pub(crate) fn squeeze_wide(
+    _: &mut Wide,
+    _: &mut [[u64; 25]],
+    _: usize,
+    _: &[bool],
+    _: Option<&mut [u64; 25]>,
+) {
+    unreachable!("no vector form without its kernel")
+}
 
 // Whether the AVX-512VL kernels run, for four states and for one, which the Keccak kernel test
 // reports: CI checks that some runner had them, as no emulator it uses does.
@@ -1355,6 +1469,18 @@ mod kernel_count {
         let mut out = [0; 32];
 
         tally.note("digest", super::digest(None, 136, 0x06, &data, &mut out));
+
+        let mut wide = super::Wide::new();
+
+        let wide_kernel = super::squeezes_wide();
+
+        if wide_kernel {
+            super::squeeze_wide(&mut wide, &mut states, 21, &[true; 4], None);
+        }
+
+        tally.note("squeeze_wide", wide_kernel);
+
+        wide.wipe();
     }
 
     // ML-DSA's field where there is one, ML-KEM's otherwise; canonical coefficients go in.

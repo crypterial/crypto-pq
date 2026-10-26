@@ -44,7 +44,7 @@ SP 800-232 §5.3); a longer value fails `configure` with INVALID_OPTION.
 
 ## 12.5 BLAKE3
 
-1. BLAKE3 follows [BLAKE3] at the pinned revision ([21.1](21-references.md#211-normative-references)). It runs single-threaded in 1.0.
+1. BLAKE3 follows [BLAKE3] at the pinned revision ([21.1](21-references.md#211-normative-references)). It runs single-threaded in 1.1.
 2. `BLAKE3_256` is the hash mode with a 32-byte output; `BLAKE3` is the hash mode with extended
    output from offset 0, read as a stream ([12.2](#122-xof-streaming)); `BLAKE3_MAC` is keyed_hash with a 32-byte key and a
    32-byte tag; `BLAKE3_KDF` is derive_key ([12.7.2](#1272-blake3-kdf)).

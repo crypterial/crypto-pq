@@ -63,6 +63,23 @@ pub(super) fn store256<T: Plain, const N: usize>(vector: __m256i, out: &mut [T; 
     unsafe { _mm256_storeu_si256(out.as_mut_ptr().cast(), vector) }
 }
 
+// A vector into element i of an array of vectors that may not hold values yet, as store256_at
+// does for arrays of words. The index is checked.
+#[target_feature(enable = "avx")]
+#[inline]
+#[allow(unsafe_code)]
+pub(super) fn store_vector_at<const M: usize>(
+    vector: __m256i,
+    out: &mut MaybeUninit<[__m256i; M]>,
+    i: usize,
+) {
+    assert!(i < M, "vector {i} of {M}");
+
+    // SAFETY: element i < M of out is writable and aligned for a vector, which then holds a
+    // value.
+    unsafe { out.as_mut_ptr().cast::<__m256i>().add(i).write(vector) }
+}
+
 // store256 into element i of an array that may not hold values yet, such as a buffer that is not
 // zeroed before use because every element is written before it is read. The index is checked.
 #[target_feature(enable = "avx")]

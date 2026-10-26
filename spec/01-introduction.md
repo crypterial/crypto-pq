@@ -2,7 +2,7 @@
 
 ## 1.1 Purpose
 
-This document specifies crypto-pq 1.0. An implementer MUST be able to build a conforming
+This document specifies crypto-pq 1.1. An implementer MUST be able to build a conforming
 implementation from this document and the standards it cites, without reading the code of an existing
 implementation.
 

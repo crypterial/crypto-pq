@@ -9,14 +9,20 @@ the [crypto-pq specification](spec/00-contents.md) that it implements
 
 ## [Unreleased]
 
+Implements specification 1.1 (draft).
+
 ### Changed
 
-- Keccak-f[1600] on x86-64 CPUs with AVX-512F and AVX-512VL: a kernel for four states side by
-  side and, on AMD CPUs, one for a single state, selected at run time, use the EVEX instructions on
-  256-bit registers only (three-input logic and 64-bit rotations, 32 registers); no code uses a
-  512-bit register. They
-  serve SHA-3, SHAKE, cSHAKE, KMAC and the Keccak of ML-KEM, ML-DSA, SLH-DSA and FrodoKEM. The AVX2
-  kernels and the portable code stay their twins, and outputs are unchanged.
+- Keccak-f[1600] on x86-64 CPUs with AVX-512F and AVX-512VL: a kernel for four states side by side
+  and, on the CPUs that run it in less time than the scalar code (AMD Zen 4 and Zen 5, Intel Ice
+  Lake Xeon), one for a single state, selected at run time, use the EVEX instructions on 256-bit
+  registers only (three-input logic and 64-bit rotations, 32 registers); in a build for the baseline
+  target, no code uses a 512-bit register. Sponges squeezed side by side, as in ML-KEM, ML-DSA and
+  SLH-DSA, stay in the kernel's vector layout from one block to the next. The kernels serve SHA-3,
+  SHAKE, cSHAKE, KMAC and the Keccak of ML-KEM, ML-DSA, SLH-DSA and FrodoKEM. The AVX2 kernels and
+  the portable code stay their twins, and outputs are unchanged.
+- ML-KEM-512 key generation samples all four entries of the matrix in one group of sponges where
+  the CPU's group has four, and then hashes the encapsulation key. Outputs are unchanged.
 - The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
   intrinsics are stable.
 

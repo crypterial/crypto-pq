@@ -131,7 +131,7 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
    Records without `operation` (`kem.txt`, `mldsa.txt`, `slhdsa.txt`, `hss.txt`, `xmss.txt`) list the
    keys, encodings and signatures that the hazmat functions produce from `seed`, and for stateful
    algorithms the state records before and after one signature; a runner checks every listed field.
-5. Files and coverage in 1.0:
+5. Files and coverage in 1.1:
 
    | file | covers |
    |---|---|
@@ -146,7 +146,7 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
 ## 19.4 Official vector sets
 
 Each algorithm MUST pass these sets in every build mode. "Full" means every test group of
-the file, including groups that the 1.0 API reaches only through `hazmat`. Groups for interfaces that
+the file, including groups that the 1.1 API reaches only through `hazmat`. Groups for interfaces that
 crypto-pq does not expose (external μ) are the only permitted omissions and MUST be counted and
 reported by the runner. The internal-interface groups of ML-DSA and SLH-DSA run through
 `hazmat.signInternal` and `hazmat.verifyInternal` [[D-65](decisions.md#decision-d-65)].

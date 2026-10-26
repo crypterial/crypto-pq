@@ -5,12 +5,15 @@
 // ML-DSA arithmetic, sampling and encodings, and FrodoKEM's SHAKE128 rows of A and its products of
 // A with the secret matrices; with AVX-512F and AVX-512VL besides, Keccak-f[1600] on four states
 // and on one in 256-bit registers; BLAKE2b, BLAKE2s and BLAKE3 without AVX2 with SSE4.1. Every
-// instruction used is on Intel's list of data-operand-independent timing instructions, and the
-// code around them has no branch or address that depends on secret data. The kernels are safe
-// code inside #[target_feature] functions, apart from the loads and stores of memory.rs, the
-// assembly of the SHA-2 rounds, of BLAKE3's transposed rounds and of single shuffles and blends,
-// and the volatile stores that clear BLAKE3's vector buffers; what is unsafe is calling one once
-// its feature is known to be there, and CPUID with XGETBV.
+// instruction that takes secret data is on Intel's list of data-operand-independent timing
+// instructions (VMOVAPS and VMOVUPS, of register spills, under their legacy names MOVAPS and
+// MOVUPS); branches, divisions and the other instructions take public values only, such as lengths
+// and counts, so no branch or address depends on secret data. The kernels are safe code inside
+// #[target_feature] functions, apart from the loads and stores of memory.rs, the assembly of the
+// SHA-2 rounds, of BLAKE3's transposed rounds and of single shuffles and blends, and the volatile
+// stores that clear BLAKE3's vector buffers and the vector form of Sponges; what is unsafe is
+// calling one once its feature is known to be there, reading a group of that vector form once it is
+// written, and CPUID with XGETBV.
 
 use core::arch::x86_64::*;
 use core::mem::MaybeUninit;
@@ -128,11 +131,13 @@ const AES: u32 = 1 << 3;
 // gain sixteen more registers, three-input logic and 64-bit rotations.
 const AVX512: u32 = 1 << 4;
 
-// AVX512 on an AMD core, where the one-state Keccak kernel in vector registers takes less time than
-// the scalar BMI kernel (Zen 4 208 against 257 ns, Zen 5 186 against 201). Intel's cores run the
-// scalar kernel as fast or faster (Xeon 8573C 248 against 253 ns), so they keep it; four states
-// take the AVX-512VL kernel on both.
+// AVX512 on a core that runs the one-state Keccak kernel in vector registers in less time than the
+// scalar BMI kernel, by the table in one_state(). Four states take the AVX-512VL kernel on every
+// core with AVX512.
 const AVX512_ONE: u32 = 1 << 5;
+
+// AVX512 on an AMD core, whose kernels take theta's values per column (keccak.rs, round_avx512).
+const AVX512_AMD: u32 = 1 << 6;
 
 const READY: u32 = 1 << 31;
 
@@ -155,7 +160,7 @@ const fn guaranteed(feature: u32) -> bool {
         )),
         SSE41 => cfg!(all(target_feature = "ssse3", target_feature = "sse4.1")),
         AES => cfg!(all(target_feature = "aes", target_feature = "sse4.1")),
-        // AVX512_ONE also depends on the vendor, which no target feature states.
+        // AVX512_ONE and AVX512_AMD also depend on the core, which no target feature states.
         AVX512 => cfg!(all(
             target_feature = "avx512f",
             target_feature = "avx512vl",
@@ -172,7 +177,7 @@ const fn guaranteed(feature: u32) -> bool {
 // kernels are constant-time by construction instead (keccak.rs). --cfg crypto_pq_sse41 leaves out
 // AVX2, AVX-512 and the SHA extensions too, so that a CPU with them runs the SSE4.1 kernels.
 const fn usable(feature: u32) -> bool {
-    let avx512 = feature == AVX512 || feature == AVX512_ONE;
+    let avx512 = feature == AVX512 || feature == AVX512_ONE || feature == AVX512_AMD;
 
     if cfg!(crypto_pq_sse41) && (feature == AVX2 || avx512 || feature == SHA) {
         return false;
@@ -265,12 +270,46 @@ fn probe() -> u32 {
             found |= AVX512;
 
             if amd {
+                found |= AVX512_AMD;
+            }
+
+            if one_state(amd, leaf1.eax) {
                 found |= AVX512_ONE;
             }
         }
     }
 
     found
+}
+
+// Whether a core with AVX512 runs the one-state AVX-512VL Keccak kernel in less time than the
+// scalar BMI kernel, from the family and model in CPUID leaf 1 EAX. Measured per state, AVX-512VL
+// against BMI: AMD Zen 4 (family 19h) 208 against 257 ns and Zen 5 (1Ah) 186 against 201; Intel
+// Ice Lake Xeon (family 6, model 6Ah; 6Ch is its other die) 18-23% less time on SHA-3. Intel's
+// later cores have a fifth integer ALU and run the scalar kernel as fast or faster: Emerald Rapids
+// (CFh) 247-254 against 254-257 ns, Granite Rapids (ADh) 194 against 194-203. Cores not in the
+// table, measured or not, keep the scalar kernel, as before this tier.
+fn one_state(amd: bool, eax: u32) -> bool {
+    let base = (eax >> 8) & 0xF;
+
+    let family = if base == 0xF {
+        base + ((eax >> 20) & 0xFF)
+    } else {
+        base
+    };
+
+    let model = ((eax >> 4) & 0xF)
+        | if base == 0x6 || base == 0xF {
+            (eax >> 12) & 0xF0
+        } else {
+            0
+        };
+
+    if amd {
+        family == 0x19 || family == 0x1A
+    } else {
+        family == 0x6 && (model == 0x6A || model == 0x6C)
+    }
 }
 
 // XCR0 bits 5, 6 and 7 say that the operating system saves the opmask registers, the upper
@@ -335,6 +374,82 @@ fn sysctl_flag(name: &core::ffi::CStr) -> bool {
 ))]
 pub(crate) fn avx512vl() -> (bool, bool) {
     (has(AVX512), has(AVX512_ONE))
+}
+
+// The vector form of Sponges: two groups of four sponges, lane i of sponge s of a group in word
+// s of vector i. A group holds values once squeeze_wide has built it, which written records;
+// ready marks the groups that hold the current sponges, and nothing reads a group before.
+#[derive(Clone, Copy)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+pub(crate) struct Wide {
+    groups: [MaybeUninit<[__m256i; 25]>; 2],
+    ready: u8,
+    written: u8,
+}
+
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+impl Wide {
+    pub(crate) const fn new() -> Self {
+        Self {
+            groups: [MaybeUninit::uninit(); 2],
+            ready: 0,
+            written: 0,
+        }
+    }
+
+    // For Sponges::start of `count` sponges: no group holds them yet. The groups that they will
+    // use are written in full by their first squeeze, so only the others are wiped now; wipe wipes
+    // the rest when Sponges is dropped.
+    pub(crate) fn restart(&mut self, count: usize) {
+        self.ready = 0;
+
+        let reused = (1u8 << count.div_ceil(4)) - 1;
+
+        self.clear(self.written & !reused);
+    }
+
+    // Wipes every group that holds sponges.
+    pub(crate) fn wipe(&mut self) {
+        self.ready = 0;
+
+        self.clear(self.written);
+    }
+
+    #[allow(unsafe_code)]
+    fn clear(&mut self, groups: u8) {
+        for (g, group) in self.groups.iter_mut().enumerate() {
+            if groups & (1 << g) != 0 {
+                // SAFETY: written marks the groups that wide_in has written, and each store goes
+                // to one of their vectors, so it is valid, aligned and exclusive; all zero bits
+                // are a vector. Volatile, as the compiler must keep the stores.
+                unsafe {
+                    for vector in group.assume_init_mut() {
+                        core::ptr::write_volatile(vector, core::mem::zeroed());
+                    }
+                }
+            }
+        }
+
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+
+        self.written &= !groups;
+    }
 }
 
 // BLAKE3's hash_many and extended output: eight lanes with AVX2, four with SSE4.1.
@@ -1126,15 +1241,17 @@ pub(crate) fn frodo_shake_rows(seed_a: &[u8], rows: &mut [u16], n: usize, i0: us
         return false;
     }
 
-    let wide = has(AVX512);
+    let (wide, amd) = (has(AVX512), has(AVX512_AMD));
 
     for (g, group) in rows.chunks_exact_mut(4 * n).enumerate() {
+        let i = i0 + 4 * g;
+
         // SAFETY: as in permute_many.
         unsafe {
-            if wide {
-                keccak::matrix_rows4_avx512(seed_a, group, n, i0 + 4 * g);
-            } else {
-                keccak::matrix_rows4(seed_a, group, n, i0 + 4 * g);
+            match (wide, amd) {
+                (true, true) => keccak::matrix_rows4_avx512::<false, true>(seed_a, group, n, i),
+                (true, false) => keccak::matrix_rows4_avx512::<true, false>(seed_a, group, n, i),
+                _ => keccak::matrix_rows4(seed_a, group, n, i),
             }
         }
     }
@@ -1248,15 +1365,22 @@ pub(crate) fn absorb(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
     feature = "sha3"
 ))]
 fn absorb_avx512(state: &mut [u64; 25], rate: usize, blocks: &[u8]) -> usize {
+    let amd = has(AVX512_AMD);
+
     // SAFETY: absorb found AVX512_ONE: the CPU has AVX2, AVX-512F and AVX-512VL, and the operating
     // system saves the registers.
     unsafe {
         match rate {
-            72 => keccak::absorb_avx512::<72>(state, blocks.as_chunks().0),
-            104 => keccak::absorb_avx512::<104>(state, blocks.as_chunks().0),
-            136 => keccak::absorb_avx512::<136>(state, blocks.as_chunks().0),
-            144 => keccak::absorb_avx512::<144>(state, blocks.as_chunks().0),
-            168 => keccak::absorb_avx512::<168>(state, blocks.as_chunks().0),
+            72 if amd => keccak::absorb_avx512::<72, false>(state, blocks.as_chunks().0),
+            72 => keccak::absorb_avx512::<72, true>(state, blocks.as_chunks().0),
+            104 if amd => keccak::absorb_avx512::<104, false>(state, blocks.as_chunks().0),
+            104 => keccak::absorb_avx512::<104, true>(state, blocks.as_chunks().0),
+            136 if amd => keccak::absorb_avx512::<136, false>(state, blocks.as_chunks().0),
+            136 => keccak::absorb_avx512::<136, true>(state, blocks.as_chunks().0),
+            144 if amd => keccak::absorb_avx512::<144, false>(state, blocks.as_chunks().0),
+            144 => keccak::absorb_avx512::<144, true>(state, blocks.as_chunks().0),
+            168 if amd => keccak::absorb_avx512::<168, false>(state, blocks.as_chunks().0),
+            168 => keccak::absorb_avx512::<168, true>(state, blocks.as_chunks().0),
             _ => return 0,
         }
     }
@@ -1325,15 +1449,22 @@ fn digest_avx512(
     data: &[u8],
     out: &mut [u8],
 ) -> bool {
+    let amd = has(AVX512_AMD);
+
     // SAFETY: digest found AVX512_ONE: the CPU has AVX2, AVX-512F and AVX-512VL, and the operating
     // system saves the registers.
     unsafe {
         match rate {
-            72 => keccak::digest_avx512::<72>(initial, data, suffix, out),
-            104 => keccak::digest_avx512::<104>(initial, data, suffix, out),
-            136 => keccak::digest_avx512::<136>(initial, data, suffix, out),
-            144 => keccak::digest_avx512::<144>(initial, data, suffix, out),
-            168 => keccak::digest_avx512::<168>(initial, data, suffix, out),
+            72 if amd => keccak::digest_avx512::<72, false>(initial, data, suffix, out),
+            72 => keccak::digest_avx512::<72, true>(initial, data, suffix, out),
+            104 if amd => keccak::digest_avx512::<104, false>(initial, data, suffix, out),
+            104 => keccak::digest_avx512::<104, true>(initial, data, suffix, out),
+            136 if amd => keccak::digest_avx512::<136, false>(initial, data, suffix, out),
+            136 => keccak::digest_avx512::<136, true>(initial, data, suffix, out),
+            144 if amd => keccak::digest_avx512::<144, false>(initial, data, suffix, out),
+            144 => keccak::digest_avx512::<144, true>(initial, data, suffix, out),
+            168 if amd => keccak::digest_avx512::<168, false>(initial, data, suffix, out),
+            168 => keccak::digest_avx512::<168, true>(initial, data, suffix, out),
             _ => return false,
         }
     }
@@ -1512,7 +1643,7 @@ pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8])
 // Four states per vector call, and two or three with lanes idle, which still costs less than
 // their scalar permutations. One alone, as the fifth of five, takes the one-state AVX-512VL kernel
 // on AMD cores (AVX512_ONE), and otherwise the scalar permutation built for BMI1 and BMI2: four in
-// vectors beside one in general registers measured no faster than one after the other, as both
+// vectors beside one in general registers took no less time than one after the other, as both
 // compete for the same ports.
 #[inline]
 #[cfg(any(
@@ -1567,10 +1698,10 @@ fn permute1(state: &mut [u64; 25]) {
     // SAFETY: permute_many found AVX2, BMI1 and BMI2, has AVX-512F and AVX-512VL where AVX512_ONE
     // is set, and the operating system saves the registers.
     unsafe {
-        if has(AVX512_ONE) {
-            keccak::permute1_avx512(state);
-        } else {
-            keccak::permute_bmi(state);
+        match (has(AVX512_ONE), has(AVX512_AMD)) {
+            (true, true) => keccak::permute1_avx512::<false>(state),
+            (true, false) => keccak::permute1_avx512::<true>(state),
+            _ => keccak::permute_bmi(state),
         }
     }
 }
@@ -1589,10 +1720,114 @@ fn permute1(state: &mut [u64; 25]) {
 fn permute4(group: &mut [&mut [u64; 25]]) {
     // SAFETY: as in permute1, with AVX512 for the AVX-512VL kernel.
     unsafe {
-        if has(AVX512) {
-            keccak::permute4_avx512(group);
-        } else {
+        if !has(AVX512) {
             keccak::permute4_avx2(group);
+
+            return;
+        }
+
+        let mut vectors = MaybeUninit::uninit();
+
+        keccak::wide_in(&keccak::four(group), &mut vectors);
+
+        // wide_in wrote every element.
+        let vectors = vectors.assume_init_mut();
+
+        if has(AVX512_AMD) {
+            keccak::rounds4_avx512::<false, true>(vectors);
+        } else {
+            keccak::rounds4_avx512::<true, false>(vectors);
+        }
+
+        keccak::scatter4_transposed(vectors, group);
+    }
+}
+
+// Whether Sponges squeezes in the vector form.
+#[inline]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+pub(crate) fn squeezes_wide() -> bool {
+    has(AVX512)
+}
+
+// Sponges::squeeze in the vector form, with the AVX-512VL kernel: each group of four sponges of
+// which one is active, or which holds the spare state, is permuted in place, and the first `lanes`
+// lanes of each of its sponges are written into its state for the caller to read; the other lanes
+// of the states are then out of date. ready marks the groups in the vector form, which the first
+// squeeze after Sponges::start builds from the states. The spare state, if any, takes the slot
+// after the sponges, and its lane of the vector form is wiped after use, as it lies outside the
+// sponges. squeezes_wide says where there is such a kernel; elsewhere Sponges keeps its own path.
+#[allow(unsafe_code)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+pub(crate) fn squeeze_wide(
+    wide: &mut Wide,
+    states: &mut [[u64; 25]],
+    lanes: usize,
+    active: &[bool],
+    mut spare: Option<&mut [u64; 25]>,
+) {
+    assert!(has(AVX512), "the vector form needs the AVX-512VL kernel");
+
+    let amd = has(AVX512_AMD);
+
+    let count = states.len();
+
+    for (g, group) in wide.groups.iter_mut().enumerate() {
+        let sponges = (4 * g).min(count)..count.min(4 * g + 4);
+
+        let slot = spare.is_some() && count / 4 == g;
+
+        if !slot && !active[sponges.clone()].contains(&true) {
+            continue;
+        }
+
+        // SAFETY: the CPU has AVX2, AVX-512F and AVX-512VL, and the operating system saves the
+        // registers. A group is read only after wide_in has written every element of it, which
+        // ready records.
+        unsafe {
+            if wide.ready & (1 << g) == 0 {
+                keccak::wide_in(&keccak::four_of(&states[sponges.clone()]), group);
+
+                wide.ready |= 1 << g;
+
+                wide.written |= 1 << g;
+            }
+
+            let group = group.assume_init_mut();
+
+            let lane = spare.as_deref_mut().filter(|_| slot);
+
+            if let Some(state) = &lane {
+                keccak::spare_in(group, count % 4, state);
+            }
+
+            if amd {
+                keccak::rounds4_avx512::<false, true>(group);
+            } else {
+                keccak::rounds4_avx512::<true, false>(group);
+            }
+
+            if let Some(state) = lane {
+                keccak::spare_out(group, count % 4, state);
+            }
+
+            keccak::rows_out(group, &mut states[sponges.clone()], &active[sponges], lanes);
         }
     }
 }

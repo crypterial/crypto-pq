@@ -2,7 +2,7 @@
 
 ## 4.1 Included
 
-crypto-pq 1.0 provides the algorithms of Section [5](05-algorithms.md) in seven categories: key encapsulation mechanisms
+crypto-pq 1.1 provides the algorithms of Section [5](05-algorithms.md) in seven categories: key encapsulation mechanisms
 (KEM), signatures, stateful hash-based signatures, hash functions, extendable-output functions (XOF),
 message authentication codes (MAC) and key derivation functions (KDF). It also provides public and
 private key encoding (raw, DER, PEM) for the algorithms that have a standard encoding.
@@ -18,12 +18,12 @@ private key encoding (raw, DER, PEM) for the algorithms that have a standard enc
 | Classic McEliece | P11: although it is in ISO/IEC 18033-2:2006/Amd 2:2026, the German BSI advised on 2026-10-01 against its use in new developments, because published key-recovery estimates fall below the claimed security [BSI-MCELIECE]. Excluded until the position is settled. |
 | FrodoKEM-640 and eFrodoKEM-640 | Not in ISO/IEC 18033-2:2006/Amd 2:2026 (no ISO object identifier); see [8.2](08-key-encapsulation.md#82-frodokem) [[D-28](decisions.md#decision-d-28)]. |
 | HPKE (RFC 9180) with post-quantum KEMs | P2: the post-quantum HPKE profiles are drafts. |
-| AEAD (AES-GCM, ChaCha20-Poly1305, Ascon-AEAD128) | Not in 1.0: there is no AEAD category and no `DECRYPTION_FAILED` error. |
+| AEAD (AES-GCM, ChaCha20-Poly1305, Ascon-AEAD128) | Not in 1.1: there is no AEAD category and no `DECRYPTION_FAILED` error. |
 | SHA-1, MD5 | Broken: practical collision attacks are published for both, and no included algorithm needs them. |
-| TupleHash and ParallelHash (SP 800-185); HMAC and HKDF over SHA-3 | Not in 1.0: no included algorithm uses them, and KMAC is the SHA-3 based MAC. |
+| TupleHash and ParallelHash (SP 800-185); HMAC and HKDF over SHA-3 | Not in 1.1: no included algorithm uses them, and KMAC is the SHA-3 based MAC. |
 | External μ (ExternalMu-ML-DSA) | Not exposed; see [9.1.5](09-signatures.md#915-no-external-μ). |
 | JSON Web Key and other key formats | Only raw, DER and PEM (Section [10](10-key-formats.md)). |
-| Streaming signatures, multi-threaded operations | Not in 1.0. |
+| Streaming signatures, multi-threaded operations | Not in 1.1. |
 
 ## 4.3 Internal components
 

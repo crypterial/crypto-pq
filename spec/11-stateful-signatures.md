@@ -164,7 +164,7 @@ signs.
 
 ## 11.7 State record, version 2
 
-The state record is the byte string written to the store. Version 2 is written by crypto-pq 1.0
+The state record is the byte string written to the store. Version 2 is written by crypto-pq 1.1
 [[D-10](decisions.md#decision-d-10)]. All integers are big-endian.
 
 | field | size | value |
@@ -219,7 +219,7 @@ c23b1f47ea54749876876b76a2e8f461       checksum
 
 ## 11.8 State record, version 1
 
-Version 0x01 is an earlier record layout that this document does not define. crypto-pq 1.0 MUST NOT
+Version 0x01 is an earlier record layout that this document does not define. crypto-pq 1.1 MUST NOT
 load such a record: `loadPrivateKey` fails with INVALID_PRIVATE_KEY, as for any unknown version
 ([11.9](#119-loading) item 2) [[D-14](decisions.md#decision-d-14)]. It MUST NOT convert, rewrite or delete such a record.
 

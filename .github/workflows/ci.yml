@@ -180,16 +180,22 @@ jobs:
             cargo clippy --all-targets --locked $features -- -D warnings
           done
       # The AVX-512VL kernels use 256-bit registers only, and nothing else uses AVX-512: the
-      # release build of every feature has no instruction on a 512-bit register.
+      # build of every feature at each optimization level has no instruction on a 512-bit register.
+      # The kernels' three-input logic shows that the disassembly read their code.
       - if: matrix.cfg == ''
         run: |
-          cargo build --locked --release --lib --all-features
-          mkdir -p "$RUNNER_TEMP/objects"
-          (cd "$RUNNER_TEMP/objects" && ar x "$GITHUB_WORKSPACE/rust/target/release/libcrypto_pq.rlib")
-          if objdump -d "$RUNNER_TEMP"/objects/*.o | grep -m 20 %zmm; then
-            echo "an instruction on a 512-bit register"
-            exit 1
-          fi
+          for level in 0 1 2 3 s z; do
+            CARGO_PROFILE_RELEASE_OPT_LEVEL=$level cargo build --locked --release --lib --all-features
+            rm -rf "$RUNNER_TEMP/objects"
+            mkdir "$RUNNER_TEMP/objects"
+            (cd "$RUNNER_TEMP/objects" && ar x "$GITHUB_WORKSPACE/rust/target/release/libcrypto_pq.rlib")
+            objdump -d "$RUNNER_TEMP"/objects/*.o > "$RUNNER_TEMP/objects.txt"
+            grep -q vpternlogq "$RUNNER_TEMP/objects.txt"
+            if grep -m 20 %zmm "$RUNNER_TEMP/objects.txt"; then
+              echo "an instruction on a 512-bit register at opt-level $level"
+              exit 1
+            fi
+          done
       - run: |
           for target in aarch64-unknown-linux-gnu aarch64-apple-darwin aarch64-pc-windows-msvc x86_64-pc-windows-msvc; do
             for features in "" --all-features; do
@@ -303,7 +309,7 @@ jobs:
       - run: cargo test --locked --release --all-features --target x86_64-unknown-linux-musl
 
   # The AVX-512VL kernels on real hardware: QEMU's user mode does not emulate AVX-512, and the
-  # x86-64 runners are a mix of CPUs with and without it, so eight copies of the suite run, each
+  # x86-64 runners are a mix of CPUs with and without it, so twelve copies of the suite run, each
   # recording its CPU and whether it took the AVX-512VL paths, and the next job fails unless one
   # took the four-state path and one the one-state path, which only AMD cores select.
   rust-avx512:
@@ -312,7 +318,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        copy: [1, 2, 3, 4, 5, 6, 7, 8]
+        copy: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     defaults:
       run:
         shell: bash
@@ -323,6 +329,10 @@ jobs:
       - run: rustup override set stable
       - run: lscpu | grep -E '^(Model name|Flags)' | cut -c1-800
       - run: cargo test --locked --release --all-features --lib -- --nocapture kernel 2>&1 | tee "$RUNNER_TEMP/kernels.txt"
+      # The kernels as built at opt-level 2, whose code differs from opt-level 3.
+      - env:
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: 2
+        run: cargo test --locked --release --all-features --lib -- --nocapture kernel
       - run: cargo test --locked --release --all-features
       - run: |
           mkdir -p "$RUNNER_TEMP/avx512"
@@ -346,14 +356,15 @@ jobs:
           merge-multiple: true
       - run: |
           cat copy-*.txt
-          grep -q '^four=yes ' copy-*.txt || { echo "no runner took the four-state AVX-512VL kernel"; exit 1; }
-          grep -q ' one=yes ' copy-*.txt || { echo "no runner took the one-state AVX-512VL kernels"; exit 1; }
+          retry="no runner with the CPU that this path needs was assigned, so its kernels went untested: re-run the rust-avx512 jobs and this one; this is not a failure of the code"
+          grep -q '^four=yes ' copy-*.txt || { echo "four-state AVX-512VL kernel: $retry"; exit 1; }
+          grep -q ' one=yes ' copy-*.txt || { echo "one-state AVX-512VL kernels: $retry"; exit 1; }
 
   # Every secret is marked uninitialised under valgrind's memcheck, so a branch or a memory index
   # that depends on one fails the job; values the specifications make public are declassified.
-  # The crypto_pq_ct build leaves out what valgrind cannot execute (SHA-NI on x86-64; SHA3,
-  # SHA512 and DIT on arm64) and detects the rest; the portable run checks the fallback, and the
-  # crypto_pq_sse41 run the SSE4.1 kernels, which a runner with AVX2 would not select. Each run
+  # The crypto_pq_ct build leaves out what valgrind cannot execute (SHA-NI and AVX-512 on x86-64;
+  # SHA3, SHA512 and DIT on arm64) and detects the rest; the portable run checks the fallback, and
+  # the crypto_pq_sse41 run the SSE4.1 kernels, which a runner with AVX2 would not select. Each run
   # first passes the whole suite, the compliance vectors included, in its build (SPEC 18.4 item 1).
   rust-ct:
     name: rust ${{ matrix.rust }} constant time (valgrind, ${{ matrix.os }}) '${{ matrix.cfg }}'

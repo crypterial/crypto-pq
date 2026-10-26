@@ -1,20 +1,25 @@
 // Keccak-f[1600] on four states with AVX2, on four states and on one with AVX-512VL, and on one
 // state with the scalar code built for BMI1 and BMI2: ANDN takes chi's complement and AND in one
-// instruction and RORX rotates into another register, so neither needs a copy first. The
-// one-state kernels keep the state on the stack, or in registers, from one block to the next, as
-// the portable code does, without a call per block.
+// instruction and RORX rotates into another register, so neither needs a copy first. The one-state
+// kernels keep the state on the stack, or in registers, from one block to the next, as the portable
+// code does, without a call per block. With AVX-512VL, sponges squeezed side by side stay in a
+// vector form, one vector per lane of four states, from one block to the next (x86_64.rs,
+// squeeze_wide).
 //
-// Every instruction here is a logical operation, a shift, a rotation, a shuffle, a broadcast, or a
-// load or store at an address that depends only on public lengths, whose time does not depend on
-// the data, and no branch depends on a lane: the kernels are constant-time by construction, which
-// matters for the states of the PRFs that sample secret vectors. The AVX-512VL kernels rest on
-// this alone, as valgrind cannot run them; they use 256-bit registers only, and LLVM must not be
-// left room to pick 512-bit ones, so they hold no arrays of plain words that it could copy or
-// clear in 512-bit moves.
+// Every instruction here is a logical operation, a shift, a rotation, a shuffle, a blend, a
+// broadcast, a compare of public indices, or a load or store at an address that depends only on
+// public lengths, whose time does not depend on the data, and no branch depends on a lane: the
+// kernels are constant-time by construction, which matters for the states of the PRFs that sample
+// secret vectors. The AVX-512VL kernels rest on this alone, as valgrind cannot run them. They use
+// 256-bit registers only, and LLVM must not be left room to pick 512-bit ones: the functions built
+// with AVX-512 hold no arrays of plain words that it could copy or clear in 512-bit moves, and the
+// code that moves states between memory and vectors around them is built with AVX2 alone.
 
 use core::arch::x86_64::*;
 
-use super::memory::store256;
+use core::mem::MaybeUninit;
+
+use super::memory::{store_vector_at, store128, store256};
 use crate::keccak::{self, ROUND_CONSTANTS};
 use crate::sha2::last_bytes;
 use crate::wipe::wipe;
@@ -146,15 +151,7 @@ fn gather4(states: &[&mut [u64; 25]]) -> ([__m256i; 25], [__m256i; 5]) {
         *vector = _mm256_set_epi64x(lane(3, i), lane(2, i), lane(1, i), lane(0, i));
     }
 
-    let parities = core::array::from_fn(|x| {
-        _mm256_xor_si256(
-            _mm256_xor_si256(
-                _mm256_xor_si256(a[x], a[x + 5]),
-                _mm256_xor_si256(a[x + 10], a[x + 15]),
-            ),
-            a[x + 20],
-        )
-    });
+    let parities = parities4(&a);
 
     (a, parities)
 }
@@ -176,59 +173,118 @@ fn scatter4(a: &[__m256i; 25], states: &mut [&mut [u64; 25]]) {
     }
 }
 
-// gather4's lanes without the parities, for the AVX-512VL kernel, with missing states read from
-// a zero state: the same loads whatever the count, and no array to clear, which LLVM cleared with
-// 512-bit stores there.
+// The lanes of up to four states in vectors, lane i of each in vector i: each word broadcast from
+// memory, which takes only a load, and the four blended together, which no shuffle port has to
+// run. Each vector is then whole, so that a store of it is one 32-byte store, which a later load of
+// the vector takes directly; LLVM split vectors built by inserts into two 16-byte stores.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn lanes4(states: &[&mut [u64; 25]]) -> [__m256i; 25] {
-    static ZERO: [u64; 25] = [0; 25];
+fn lane4(s: &[&[u64; 25]; 4], i: usize) -> __m256i {
+    let word = |k: usize| _mm256_set1_epi64x(s[k][i] as i64);
 
-    let s: [&[u64; 25]; 4] = core::array::from_fn(|i| states.get(i).map_or(&ZERO, |s| &**s));
+    let low = _mm256_blend_epi32::<0x0C>(word(0), word(1));
 
-    let lane = |i: usize| {
-        _mm256_set_epi64x(
-            s[3][i] as i64,
-            s[2][i] as i64,
-            s[1][i] as i64,
-            s[0][i] as i64,
-        )
-    };
+    let high = _mm256_blend_epi32::<0xC0>(word(2), word(3));
 
-    // Written out, as LLVM kept a loop that built the vectors in memory, in halves, and read them
-    // back whole, which stalls the loads.
-    macro_rules! lanes {
-        ($($i:literal)*) => {
-            [$(lane($i)),*]
-        };
+    _mm256_blend_epi32::<0xF0>(low, high)
+}
+
+// Up to four states, the missing ones read as a zero state.
+static ZERO: [u64; 25] = [0; 25];
+
+#[inline]
+pub(super) fn four<'a>(states: &'a [&mut [u64; 25]]) -> [&'a [u64; 25]; 4] {
+    core::array::from_fn(|i| states.get(i).map_or(&ZERO, |s| &**s))
+}
+
+#[inline]
+pub(super) fn four_of(states: &[[u64; 25]]) -> [&[u64; 25]; 4] {
+    core::array::from_fn(|i| states.get(i).unwrap_or(&ZERO))
+}
+
+// The first `lanes` lanes of the active ones of up to four sponges in the vector form, into their
+// states: four lanes of each sponge at a time by a 4 x 4 transposition, and the rest one by one.
+// Each sponge is written out separately, by its index: LLVM built a loop over the iterators of
+// states and active with the rows in memory, which took twice as long.
+#[target_feature(enable = "avx2")]
+pub(super) fn rows_out(
+    vectors: &[__m256i; 25],
+    states: &mut [[u64; 25]],
+    active: &[bool],
+    lanes: usize,
+) {
+    let whole = lanes / 4;
+
+    let on = |s: usize| active.get(s) == Some(&true);
+
+    let ons = [on(0), on(1), on(2), on(3)];
+
+    for k in 0..whole {
+        let rows = transpose4([
+            vectors[4 * k],
+            vectors[4 * k + 1],
+            vectors[4 * k + 2],
+            vectors[4 * k + 3],
+        ]);
+
+        macro_rules! store {
+            ($($s:literal)*) => {
+                $(
+                    if ons[$s] {
+                        store256(rows[$s], &mut states[$s].as_chunks_mut::<4>().0[k]);
+                    }
+                )*
+            };
+        }
+
+        store!(0 1 2 3);
     }
 
-    lanes!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24)
+    for (i, vector) in vectors.iter().enumerate().take(lanes).skip(4 * whole) {
+        macro_rules! store {
+            ($($s:literal)*) => {
+                $(
+                    if ons[$s] {
+                        states[$s][i] = _mm256_extract_epi64::<$s>(*vector) as u64;
+                    }
+                )*
+            };
+        }
+
+        store!(0 1 2 3);
+    }
+}
+
+// A 4 x 4 matrix of 64-bit words in four vectors, transposed: four lanes of four states, one
+// state per vector, become one lane per vector, and back.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn transpose4(v: [__m256i; 4]) -> [__m256i; 4] {
+    let low = [
+        _mm256_unpacklo_epi64(v[0], v[1]),
+        _mm256_unpacklo_epi64(v[2], v[3]),
+    ];
+
+    let high = [
+        _mm256_unpackhi_epi64(v[0], v[1]),
+        _mm256_unpackhi_epi64(v[2], v[3]),
+    ];
+
+    [
+        _mm256_permute2x128_si256::<0x20>(low[0], low[1]),
+        _mm256_permute2x128_si256::<0x20>(high[0], high[1]),
+        _mm256_permute2x128_si256::<0x31>(low[0], low[1]),
+        _mm256_permute2x128_si256::<0x31>(high[0], high[1]),
+    ]
 }
 
 // The lanes of up to four states from vectors, four lanes of each state at a time by a 4 x 4
 // transposition and one store, and the last lane by extraction. As whole vectors, the stores give
 // LLVM no runs of words that it could merge into 512-bit stores in the AVX-512VL kernel.
 #[target_feature(enable = "avx2")]
-#[inline]
-fn scatter4_transposed(a: &[__m256i; 25], states: &mut [&mut [u64; 25]]) {
+pub(super) fn scatter4_transposed(a: &[__m256i; 25], states: &mut [&mut [u64; 25]]) {
     for (k, v) in a.as_chunks::<4>().0.iter().enumerate() {
-        let low = [
-            _mm256_unpacklo_epi64(v[0], v[1]),
-            _mm256_unpacklo_epi64(v[2], v[3]),
-        ];
-
-        let high = [
-            _mm256_unpackhi_epi64(v[0], v[1]),
-            _mm256_unpackhi_epi64(v[2], v[3]),
-        ];
-
-        let rows = [
-            _mm256_permute2x128_si256::<0x20>(low[0], low[1]),
-            _mm256_permute2x128_si256::<0x20>(high[0], high[1]),
-            _mm256_permute2x128_si256::<0x31>(low[0], low[1]),
-            _mm256_permute2x128_si256::<0x31>(high[0], high[1]),
-        ];
+        let rows = transpose4(*v);
 
         for (state, row) in states.iter_mut().zip(rows) {
             store256(row, &mut state.as_chunks_mut::<4>().0[k]);
@@ -269,15 +325,7 @@ pub(super) fn permute4_avx2(states: &mut [&mut [u64; 25]]) {
 #[target_feature(enable = "avx2")]
 #[inline]
 fn permute4_in_place(a: &mut [__m256i; 25], e: &mut [__m256i; 25]) {
-    let mut parities = core::array::from_fn(|x| {
-        _mm256_xor_si256(
-            _mm256_xor_si256(
-                _mm256_xor_si256(a[x], a[x + 5]),
-                _mm256_xor_si256(a[x + 10], a[x + 15]),
-            ),
-            a[x + 20],
-        )
-    });
+    let mut parities = parities4(a);
 
     for constants in ROUND_CONSTANTS.as_chunks::<2>().0 {
         round4(a, e, &mut parities, constants[0]);
@@ -388,31 +436,25 @@ fn rows4_with(
     }
 }
 
-// x ^ y ^ z, and chi's x ^ (!y & z), each in one three-input logic instruction.
+// x ^ y ^ z in one three-input logic instruction.
 #[target_feature(enable = "avx512f,avx512vl")]
 #[inline]
 fn xor3(x: __m256i, y: __m256i, z: __m256i) -> __m256i {
     _mm256_ternarylogic_epi64::<0x96>(x, y, z)
 }
 
-#[target_feature(enable = "avx512f,avx512vl")]
-#[inline]
-fn chi(x: __m256i, y: __m256i, z: __m256i) -> __m256i {
-    _mm256_ternarylogic_epi64::<0xD2>(x, y, z)
-}
-
 // One round on up to four states held in 25 of the 32 registers: the column parities, every lane
 // of the rho-pi output with theta's value added and rotated, then chi plane by plane, which writes
-// the new state. Lane x of plane y of the rho-pi output comes from lane (x + 3y) % 5 + 5x.
+// the new state; LLVM turns chi's ANDN and XOR into one three-input instruction. Lane x of plane y
+// of the rho-pi output comes from lane (x + 3y) % 5 + 5x.
 //
-// Two forms of the same round. With SPLIT unset, theta's value goes into each lane and chi into
-// each output in one three-input instruction, the fewest instructions. With SPLIT set, theta's
-// values are computed once per column and added with XOR, and chi takes ANDN and XOR: more
-// instructions, but fewer of them three-input ones, which AMD's cores run on fewer pipes; one
-// state takes 186 instead of 215 ns on Zen 5 and 208 instead of 232 on Zen 4.
+// Two forms of theta, chosen per vendor in x86_64.rs from the times measured: with THETA3, theta's
+// value goes into each lane in one three-input instruction, the fewest instructions, which Intel's
+// cores run best; without it, theta's values are computed once per column and added with XOR,
+// which AMD's cores run best (four states: Zen 5 172 against 185 ns, Zen 4 204 against 227).
 #[target_feature(enable = "avx512f,avx512vl")]
 #[inline]
-fn round_avx512<const SPLIT: bool>(a: &mut [__m256i; 25], constant: u64) {
+fn round_avx512<const THETA3: bool>(a: &mut [__m256i; 25], constant: u64) {
     let c: [__m256i; 5] =
         core::array::from_fn(|x| xor3(xor3(a[x], a[x + 5], a[x + 10]), a[x + 15], a[x + 20]));
 
@@ -424,10 +466,10 @@ fn round_avx512<const SPLIT: bool>(a: &mut [__m256i; 25], constant: u64) {
     // Theta's value of column x is c[x - 1] ^ rotated[x + 1].
     macro_rules! theta {
         ($source:literal) => {
-            if SPLIT {
-                _mm256_xor_si256(a[$source], d[$source % 5])
-            } else {
+            if THETA3 {
                 xor3(a[$source], c[($source + 4) % 5], rotated[($source + 1) % 5])
+            } else {
+                _mm256_xor_si256(a[$source], d[$source % 5])
             }
         };
     }
@@ -468,67 +510,146 @@ fn round_avx512<const SPLIT: bool>(a: &mut [__m256i; 25], constant: u64) {
 
     for y in 0..5 {
         for x in 0..5 {
-            let (x0, x1, x2) = (b[x + 5 * y], b[(x + 1) % 5 + 5 * y], b[(x + 2) % 5 + 5 * y]);
-
-            a[x + 5 * y] = if SPLIT {
-                _mm256_xor_si256(x0, _mm256_andnot_si256(x1, x2))
-            } else {
-                chi(x0, x1, x2)
-            };
+            a[x + 5 * y] = _mm256_xor_si256(
+                b[x + 5 * y],
+                _mm256_andnot_si256(b[(x + 1) % 5 + 5 * y], b[(x + 2) % 5 + 5 * y]),
+            );
         }
     }
 
     a[0] = _mm256_xor_si256(a[0], _mm256_set1_epi64x(constant as i64));
 }
 
-// The 24 rounds. The constants are read by reference: a copy of them on the stack was made with
-// 512-bit moves.
+// The 24 rounds, two per loop step with PAIRS, which LLVM schedules across the pair. The
+// constants are read by reference: a copy of them on the stack was made with 512-bit moves.
 #[target_feature(enable = "avx2,avx512f,avx512vl")]
 #[inline]
-fn rounds_avx512<const SPLIT: bool>(a: &mut [__m256i; 25]) {
-    for &constant in &ROUND_CONSTANTS {
-        round_avx512::<SPLIT>(a, constant);
+fn rounds_avx512<const THETA3: bool, const PAIRS: bool>(a: &mut [__m256i; 25]) {
+    if PAIRS {
+        for constants in ROUND_CONSTANTS.as_chunks::<2>().0 {
+            round_avx512::<THETA3>(a, constants[0]);
+
+            round_avx512::<THETA3>(a, constants[1]);
+        }
+    } else {
+        for &constant in &ROUND_CONSTANTS {
+            round_avx512::<THETA3>(a, constant);
+        }
     }
 }
 
-// One to four states; missing ones run as zeros in their lanes and are not stored.
+// The column parities of four states.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn parities4(a: &[__m256i; 25]) -> [__m256i; 5] {
+    core::array::from_fn(|x| {
+        _mm256_xor_si256(
+            _mm256_xor_si256(
+                _mm256_xor_si256(a[x], a[x + 5]),
+                _mm256_xor_si256(a[x + 10], a[x + 15]),
+            ),
+            a[x + 20],
+        )
+    })
+}
+
+// The 24 rounds on four states in memory, one vector per lane, out of line: inlined, the rounds
+// of two to a step left LLVM with a call of its own anyway, and copies of the states around it.
+// Every caller writes the vectors with whole 32-byte stores, which the loads here take directly.
 #[target_feature(enable = "avx2,avx512f,avx512vl")]
-pub(super) fn permute4_avx512(states: &mut [&mut [u64; 25]]) {
-    let mut a = lanes4(states);
+#[inline(never)]
+pub(super) fn rounds4_avx512<const THETA3: bool, const PAIRS: bool>(a: &mut [__m256i; 25]) {
+    rounds_avx512::<THETA3, PAIRS>(a);
+}
 
-    rounds_avx512::<false>(&mut a);
+// Up to four states into the vector form of rounds4_avx512, the missing ones as zero states:
+// every element of group is written. Built without AVX-512, as are the other functions around
+// rounds4_avx512, so that LLVM cannot join their stores into 512-bit ones.
+#[target_feature(enable = "avx2")]
+pub(super) fn wide_in(s: &[&[u64; 25]; 4], group: &mut MaybeUninit<[__m256i; 25]>) {
+    for i in 0..25 {
+        store_vector_at(lane4(s, i), group, i);
+    }
+}
 
-    scatter4_transposed(&a, states);
+// The state given as spare into lane j of the vector form for a permutation, and out of it after,
+// which leaves that lane zero.
+#[target_feature(enable = "avx2")]
+pub(super) fn spare_in(group: &mut [__m256i; 25], j: usize, state: &[u64; 25]) {
+    let mask = lane_mask(j);
+
+    for (vector, &word) in group.iter_mut().zip(state) {
+        *vector = _mm256_blendv_epi8(*vector, _mm256_set1_epi64x(word as i64), mask);
+    }
+}
+
+#[target_feature(enable = "avx2")]
+pub(super) fn spare_out(group: &mut [__m256i; 25], j: usize, state: &mut [u64; 25]) {
+    let mask = lane_mask(j);
+
+    let index = _mm256_setr_epi32(2 * j as i32, 2 * j as i32 + 1, 0, 0, 0, 0, 0, 0);
+
+    for (vector, word) in group.iter_mut().zip(state) {
+        let moved = _mm256_permutevar8x32_epi32(*vector, index);
+
+        *word = _mm_cvtsi128_si64(_mm256_castsi256_si128(moved)) as u64;
+
+        *vector = _mm256_andnot_si256(mask, *vector);
+    }
+}
+
+// All ones in 64-bit lane j, zeros elsewhere.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn lane_mask(j: usize) -> __m256i {
+    _mm256_cmpeq_epi64(_mm256_setr_epi64x(0, 1, 2, 3), _mm256_set1_epi64x(j as i64))
 }
 
 // One state with AVX-512VL, each lane in the low quarter of its own register, as the four-state
-// kernel holds four, in the split form of the round: on AMD's cores this takes less time than the
-// scalar rounds, and nothing is transposed. x86_64.rs selects it on AMD cores only (AVX512_ONE).
+// kernel holds four: nothing is transposed. x86_64.rs selects it on the cores that run it in less
+// time than the scalar rounds (AVX512_ONE).
+// The lanes are loaded as written out and stored two to a 128-bit store: below opt-level 3, LLVM
+// built from_fn's vectors through memory and merged the extractions into 512-bit stores.
 #[target_feature(enable = "avx2,avx512f,avx512vl")]
 #[inline]
 fn load1(state: &[u64; 25]) -> [__m256i; 25] {
-    core::array::from_fn(|i| _mm256_set_epi64x(0, 0, 0, state[i] as i64))
+    macro_rules! lanes {
+        ($($i:literal)*) => {
+            [$(_mm256_set_epi64x(0, 0, 0, state[$i] as i64)),*]
+        };
+    }
+
+    lanes!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24)
 }
 
 #[target_feature(enable = "avx2,avx512f,avx512vl")]
 #[inline]
 fn store1(a: &[__m256i; 25], state: &mut [u64; 25]) {
-    for (lane, vector) in state.iter_mut().zip(a) {
-        *lane = _mm256_extract_epi64::<0>(*vector) as u64;
+    let (pairs, last) = state.as_chunks_mut::<2>();
+
+    for (pair, v) in pairs.iter_mut().zip(a.as_chunks::<2>().0) {
+        let low = _mm_unpacklo_epi64(_mm256_castsi256_si128(v[0]), _mm256_castsi256_si128(v[1]));
+
+        store128(low, pair);
     }
+
+    last[0] = _mm256_extract_epi64::<0>(a[24]) as u64;
 }
 
 #[target_feature(enable = "avx2,avx512f,avx512vl")]
-pub(super) fn permute1_avx512(state: &mut [u64; 25]) {
+pub(super) fn permute1_avx512<const THETA3: bool>(state: &mut [u64; 25]) {
     let mut a = load1(state);
 
-    rounds_avx512::<true>(&mut a);
+    rounds_avx512::<THETA3, false>(&mut a);
 
     store1(&a, state);
 }
 
 #[target_feature(enable = "avx2,avx512f,avx512vl")]
-pub(super) fn absorb_avx512<const RATE: usize>(state: &mut [u64; 25], blocks: &[[u8; RATE]]) {
+pub(super) fn absorb_avx512<const RATE: usize, const THETA3: bool>(
+    state: &mut [u64; 25],
+    blocks: &[[u8; RATE]],
+) {
     let mut a = load1(state);
 
     for block in blocks {
@@ -538,17 +659,10 @@ pub(super) fn absorb_avx512<const RATE: usize>(state: &mut [u64; 25], blocks: &[
             *lane = _mm256_xor_si256(*lane, word);
         }
 
-        rounds_avx512::<true>(&mut a);
+        rounds_avx512::<THETA3, false>(&mut a);
     }
 
     store1(&a, state);
-}
-
-// The four states of matrix_rows4_avx512 through the AVX-512VL rounds, from memory and back.
-#[cfg(feature = "frodokem")]
-#[target_feature(enable = "avx2,avx512f,avx512vl")]
-fn permute4_vectors_avx512(a: &mut [__m256i; 25]) {
-    rounds_avx512::<false>(a);
 }
 
 #[cfg(feature = "frodokem")]
@@ -565,10 +679,15 @@ pub(super) fn matrix_rows4(seed_a: &[u8; 16], rows: &mut [u16], n: usize, i0: us
 #[cfg(feature = "frodokem")]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
-pub(super) unsafe fn matrix_rows4_avx512(seed_a: &[u8; 16], rows: &mut [u16], n: usize, i0: usize) {
+pub(super) unsafe fn matrix_rows4_avx512<const THETA3: bool, const PAIRS: bool>(
+    seed_a: &[u8; 16],
+    rows: &mut [u16],
+    n: usize,
+    i0: usize,
+) {
     // SAFETY: the caller's guarantee above.
     rows4_with(seed_a, rows, n, i0, |a, _| unsafe {
-        permute4_vectors_avx512(a)
+        rounds4_avx512::<THETA3, PAIRS>(a)
     });
 }
 
@@ -615,14 +734,20 @@ pub(super) fn absorb_bmi<const RATE: usize>(state: &mut [u64; 25], blocks: &[[u8
 // permutations, so that the code of each is what it would be on its own.
 macro_rules! digest {
     ($(#[$attribute:meta])* fn $name:ident, $state:ident => $permute:expr) => {
-        digest!(@ $(#[$attribute])* [] $name, $state => $permute);
+        digest!(@ $(#[$attribute])* [] $name [], $state => $permute);
     };
-    ($(#[$attribute:meta])* unsafe fn $name:ident, $state:ident => $permute:expr) => {
-        digest!(@ $(#[$attribute])* [unsafe] $name, $state => $permute);
+    (
+        $(#[$attribute:meta])* unsafe fn $name:ident<$($form:ident),*>,
+        $state:ident => $permute:expr
+    ) => {
+        digest!(@ $(#[$attribute])* [unsafe] $name [$($form),*], $state => $permute);
     };
-    (@ $(#[$attribute:meta])* [$($unsafe:ident)?] $name:ident, $state:ident => $permute:expr) => {
+    (
+        @ $(#[$attribute:meta])* [$($unsafe:ident)?] $name:ident [$($form:ident),*],
+        $state:ident => $permute:expr
+    ) => {
         $(#[$attribute])*
-        pub(super) $($unsafe)? fn $name<const RATE: usize>(
+        pub(super) $($unsafe)? fn $name<const RATE: usize $(, const $form: bool)*>(
             initial: Option<&[u64; 25]>,
             data: &[u8],
             suffix: u8,
@@ -642,7 +767,6 @@ macro_rules! digest {
 
                 let $state = &mut state;
 
-
                 $permute;
             }
 
@@ -650,14 +774,14 @@ macro_rules! digest {
                 *lane ^= u64::from_le_bytes(*bytes);
             }
 
-            let marker = last_bytes(data, rest.len()) as u64 | u64::from(suffix) << (8 * rest.len());
+            let marker =
+                last_bytes(data, rest.len()) as u64 | u64::from(suffix) << (8 * rest.len());
 
             state[lanes.len()] ^= marker;
 
             state[RATE / 8 - 1] ^= 0x80 << 56;
 
             let $state = &mut state;
-
 
             $permute;
 
@@ -704,12 +828,12 @@ digest!(
 // as LLVM would copy and clear its buffers in 512-bit registers; the state passes through memory
 // once per permutation.
 //
-// SAFETY: the caller makes sure that the CPU has AVX2, AVX-512F and AVX-512VL and that the
+// SAFETY: the caller makes sure that the CPU has BMI1, BMI2, AVX-512F and AVX-512VL and that the
 // operating system saves their registers.
 digest!(
     #[target_feature(enable = "bmi1,bmi2")]
     #[allow(unsafe_code)]
-    unsafe fn digest_avx512,
+    unsafe fn digest_avx512<THETA3>,
     // SAFETY: the caller's guarantee above.
-    state => unsafe { permute1_avx512(state) }
+    state => unsafe { permute1_avx512::<THETA3>(state) }
 );

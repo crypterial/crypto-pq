@@ -1,6 +1,6 @@
 # 5. Algorithm catalogue
 
-Each table lists the algorithm values of crypto-pq 1.0, their `name` strings, the authoritative
+Each table lists the algorithm values of crypto-pq 1.1, their `name` strings, the authoritative
 standard and the sizes. All sizes are in bytes and are normative: an implementation MUST report and
 enforce exactly these sizes.
 
@@ -32,7 +32,7 @@ seedSE of 2·len_sec bits and a salt of 2·len_sec bits ([FRODO-DRAFT] §8). ISO
 (arc 1.0.18033.2.2.7, [FRODO-CERT] §3): 1 FrodoKEM-976-SHAKE, 2 FrodoKEM-1344-SHAKE,
 3 eFrodoKEM-976-SHAKE, 4 eFrodoKEM-1344-SHAKE, 5 FrodoKEM-976-AES, 6 FrodoKEM-1344-AES,
 7 eFrodoKEM-976-AES, 8 eFrodoKEM-1344-AES. These identifiers are recorded for reference; crypto-pq
-1.0 defines no DER encoding for FrodoKEM ([10.1](10-key-formats.md#101-formats)).
+1.1 defines no DER encoding for FrodoKEM ([10.1](10-key-formats.md#101-formats)).
 
 ## 5.2 Signatures
 

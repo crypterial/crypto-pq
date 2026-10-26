@@ -73,7 +73,7 @@ piece, which is the case for lattice and hash-based private keys and not for key
    fixed message and verify it. Failure wipes the keys and fails with SELF_TEST_FAILED.
 2. The import checks of [8.1.4](08-key-encapsulation.md#814-private-key-import) and [8.2.4](08-key-encapsulation.md#824-keys-and-import) include a pairwise consistency test that cannot be disabled.
 3. Stateful signatures are verified before release ([11.5](11-stateful-signatures.md#115-signing)) and cannot be disabled.
-4. crypto-pq 1.0 is not a validated module and runs no power-on self-tests.
+4. crypto-pq 1.1 is not a validated module and runs no power-on self-tests.
 
 ## 14.5 Wiping
 
@@ -100,7 +100,7 @@ piece, which is the case for lattice and hash-based private keys and not for key
 
 ## 14.7 Fault countermeasures
 
-crypto-pq 1.0 includes: the key-generation pairwise tests ([14.4](#144-self-tests)), the import consistency tests ([8.1.4](08-key-encapsulation.md#814-private-key-import),
+crypto-pq 1.1 includes: the key-generation pairwise tests ([14.4](#144-self-tests)), the import consistency tests ([8.1.4](08-key-encapsulation.md#814-private-key-import),
 [8.2.4](08-key-encapsulation.md#824-keys-and-import), [9.2](09-signatures.md#92-ml-dsa), [9.3](09-signatures.md#93-slh-dsa)), and verification before release of stateful signatures ([11.5](11-stateful-signatures.md#115-signing)). Verifying an SLH-DSA
 signature before release is not an effective countermeasure (RFC 9909 §9), and this document does
 not require it.
@@ -125,7 +125,7 @@ leaves to callers and deployments. The sections cited define the rules.
 5. **SP 800-208 in software.** A software library cannot meet the module requirements of SP 800-208
    §8.1: a hardware module validated at FIPS 140 level 3, an entropy source inside the module boundary
    and no export of private keying material. crypto-pq claims neither SP 800-208 nor FIPS 140
-   validation ([11.15](11-stateful-signatures.md#1115-statement-of-conformance-to-sp-800-208)), and crypto-pq 1.0 is not a validated module ([14.4](#144-self-tests) item 4).
+   validation ([11.15](11-stateful-signatures.md#1115-statement-of-conformance-to-sp-800-208)), and crypto-pq 1.1 is not a validated module ([14.4](#144-self-tests) item 4).
 6. **eFrodoKEM.** An eFrodoKEM public key is limited to fewer than 2^8 ciphertexts. The library does
    not enforce the limit ([8.2.6](08-key-encapsulation.md#826-efrodokem-usage-limit)).
 7. **Pre-hash and X.509.** A key object does not record whether its encoding used a pure or a

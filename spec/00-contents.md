@@ -3,10 +3,10 @@
 | field | value |
 |---|---|
 | Document | crypto-pq Specification |
-| Version | 1.0 |
-| Applies to | crypto-pq 1.0.x, the Rust crate `crypto-pq` ([20.1](20-versioning.md#201-versions)) |
-| Status | Published |
-| Date | 2026-10-23 |
+| Version | 1.1 (draft) |
+| Applies to | crypto-pq 1.1.x, the Rust crate `crypto-pq`, once released; 1.0.x implement SPEC 1.0 ([20.1](20-versioning.md#201-versions), [VERSIONS.md](VERSIONS.md)) |
+| Status | Draft |
+| Date | 2026-10-26 |
 | Corrections | [VERSIONS.md](VERSIONS.md#corrections-to-spec-10) |
 | Editor | Crypterial Labs |
 | License | This document is licensed under the Apache License, Version 2.0, or the MIT license, at your option (`LICENSE-APACHE`, `LICENSE-MIT`). |

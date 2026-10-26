@@ -273,20 +273,25 @@ Withdrawn on 2026-10-23: it concerned implementations in other languages, which 
 
 ## Decision D-44
 
-Revised on 2026-10-26; it said that crypto-pq 1.0 contains no AVX-512 code, as 1.0.0 and 1.0.1 do.
-On x86-64 processors with AVX-512F and AVX-512VL, whose opmask and ZMM state the operating system
-saves (XCR0 bits 1, 2 and 5 to 7, or the `hw.optional.avx512f` and `hw.optional.avx512vl` sysctl
-values on macOS), the Keccak-f[1600] kernels on four states, and on AMD processors those on one
-state, use the EVEX instructions on 256-bit registers only; no code uses a 512-bit register. Other
-processors run one state with the scalar kernel, which takes them less time. The tier is detected at run time, and the
-AVX2 kernels and the portable code stay its twins ([15.3](15-platforms.md#153-cpu-specific-code)). valgrind cannot execute AVX-512, so the
-constant-time check's build leaves the tier out ([14.1](14-security.md#141-constant-time) item 7), and its kernels are constant
-time by construction: logic, rotations, shuffles and loads and stores at addresses that depend on
-public lengths only, with no branch, address or variable-latency instruction that depends on the
-data. CI runs them on native runners ([18.2](18-testing.md#182-cpu-tiers)). The minimum Rust version is 1.89, the first
-in which these target features and intrinsics are stable ([15.2](15-platforms.md#152-supported-platforms)). Rationale: sixteen more
-registers, three-input logic and 64-bit rotations take fewer instructions per Keccak round than
-AVX2 does, and 256-bit registers keep the clock at which the core runs AVX2 code.
+Revised for specification 1.1 on 2026-10-26; specification 1.0, which 1.0.0 and 1.0.1 implement,
+said that crypto-pq contains no AVX-512 code. On x86-64 processors with AVX-512F and AVX-512VL,
+whose opmask and ZMM state the operating system saves (XCR0 bits 1, 2 and 5 to 7, or the
+`hw.optional.avx512f` and `hw.optional.avx512vl` sysctl values on macOS), the Keccak-f[1600] kernel
+on four states uses the EVEX instructions on 256-bit registers only, and so does the kernel on one
+state on the processors that run it in less time than the scalar kernel, by a table of families and
+models: AMD families 19h and 1Ah and Intel's Ice Lake Xeon; other processors run one state with the
+scalar kernel. In a build for the baseline target, no code uses a 512-bit register. The round takes
+theta in the form that each vendor's cores run in less time. Sponges squeezed side by side keep
+their states in the vector layout of the kernel from one block to the next. The tier is detected at
+run time, and the AVX2 kernels and the portable code stay its twins ([15.3](15-platforms.md#153-cpu-specific-code)). valgrind cannot execute
+AVX-512, so the constant-time check's build leaves the tier out ([14.1](14-security.md#141-constant-time) item 7), and its kernels are
+constant time by construction: logic, rotations, shuffles and loads and stores at addresses that
+depend on public lengths only, with no branch, address or variable-latency instruction that depends
+on the data; which kernel runs depends only on the processor. CI runs them on native runners ([18.2](18-testing.md#182-cpu-tiers)).
+The minimum Rust version is 1.89, the first in which these target features and intrinsics are stable
+([15.2](15-platforms.md#152-supported-platforms)). Rationale: sixteen more registers, three-input logic and 64-bit rotations take fewer
+instructions per Keccak round than AVX2 does, and 256-bit registers keep the clock at which the core
+runs AVX2 code.
 
 ## Decision D-45
 

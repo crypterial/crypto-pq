@@ -268,8 +268,9 @@ specification state them in full.
   `ProcessPrng` on Windows, and `random_get` on WASI preview 1. On a target without one, operations
   that need randomness return `Error::RngFailure`.
 - **CPU paths.** Kernels for x86-64 (AVX2, AVX-512VL on 256-bit registers for Keccak, SSE4.1,
-  SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2, SHA-3, SHA-512) are selected at run time, with portable code on every target and no target CPU
-  flag needed. `RUSTFLAGS="--cfg crypto_pq_portable"` builds the portable code only.
+  SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2, SHA-3, SHA-512) are selected at run time, with
+  portable code on every target and no target CPU flag needed.
+  `RUSTFLAGS="--cfg crypto_pq_portable"` builds the portable code only.
 - **Allocation.** Every operation is synchronous. Fixed-size operations allocate only their returned
   value, and the `_into` forms allocate nothing.
 

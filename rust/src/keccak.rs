@@ -197,9 +197,16 @@ pub(crate) fn group() -> usize {
 // Up to MAX_SPONGES sponges of one rate and suffix, each fed a message shorter than a block and
 // then squeezed one block at a time in lockstep, so that their permutations run side by side:
 // the independent XOF and PRF calls of matrix and noise sampling and of SLH-DSA's F.
+//
+// Where the CPU has a kernel for it (cpu::squeeze_wide), the sponges stay in its vector form,
+// wide, from one block to the next, and each squeeze writes only the rate of each sponge into its
+// state, which is all that lanes and read return.
 pub(crate) struct Sponges {
     states: [[u64; 25]; MAX_SPONGES],
     count: usize,
+    rate: usize,
+    done: u8,
+    wide: cpu::Wide,
 }
 
 impl Sponges {
@@ -208,6 +215,9 @@ impl Sponges {
         Self {
             states: [[0; 25]; MAX_SPONGES],
             count: 0,
+            rate: 0,
+            done: 0,
+            wide: cpu::Wide::new(),
         }
     }
 
@@ -224,7 +234,13 @@ impl Sponges {
 
         wipe(self.states[..self.count].as_flattened_mut());
 
+        self.wide.restart(messages.len());
+
         self.count = messages.len();
+
+        self.rate = rate;
+
+        self.done = 0;
 
         for (state, parts) in self.states.iter_mut().zip(messages) {
             let mut position = 0;
@@ -243,8 +259,16 @@ impl Sponges {
     }
 
     // Squeezes the sponges marked active, which skips the permutations of those that already
-    // have all the output they need.
+    // have all the output they need. A sponge left out keeps the block it squeezed last; in the
+    // vector form, which may permute it beside the others, it is done and is not squeezed again
+    // until the next start.
     pub(crate) fn squeeze(&mut self, active: [bool; MAX_SPONGES]) {
+        if cpu::squeezes_wide() {
+            self.squeeze_wide(&active, None);
+
+            return;
+        }
+
         let mut states = self.states.each_mut();
 
         let mut chosen = 0;
@@ -269,6 +293,12 @@ impl Sponges {
             spare < MAX_SPONGES,
             "a free slot is needed beside the sponges"
         );
+
+        if cpu::squeezes_wide() {
+            self.squeeze_wide(&active, Some(other));
+
+            return;
+        }
 
         self.states[spare] = *other;
 
@@ -296,8 +326,39 @@ impl Sponges {
         wipe(&mut self.states[spare]);
     }
 
+    // The kernel's squeeze of the vector form, where the CPU has one: the states then hold only
+    // the rate, and the sponges left out are done.
+    fn squeeze_wide(&mut self, active: &[bool; MAX_SPONGES], other: Option<&mut [u64; 25]>) {
+        self.retire(active);
+
+        cpu::squeeze_wide(
+            &mut self.wide,
+            &mut self.states[..self.count],
+            self.rate / 8,
+            &active[..self.count],
+            other,
+        );
+    }
+
+    // Marks the sponges left out of a squeeze as done, after checking that none is squeezed again.
+    fn retire(&mut self, active: &[bool; MAX_SPONGES]) {
+        let mask = active[..self.count]
+            .iter()
+            .enumerate()
+            .fold(0, |mask, (i, &active)| mask | u8::from(active) << i);
+
+        assert!(
+            mask & self.done == 0,
+            "a sponge left out is not squeezed again"
+        );
+
+        self.done |= !mask;
+    }
+
     // The lanes of the block that sponge i squeezed last, in output order on every target.
     pub(crate) fn lanes<const LANES: usize>(&self, i: usize) -> &[u64; LANES] {
+        debug_assert!(8 * LANES <= self.rate, "lanes beyond the rate");
+
         self.states[i]
             .first_chunk()
             .expect("the rate is at most 21 lanes")
@@ -305,6 +366,8 @@ impl Sponges {
 
     // The first out.len() bytes of the block that sponge i squeezed last.
     pub(crate) fn read(&self, i: usize, out: &mut [u8]) {
+        assert!(out.len() <= self.rate, "at most one block");
+
         let (chunks, tail) = out.as_chunks_mut::<8>();
 
         for (chunk, lane) in chunks.iter_mut().zip(&self.states[i]) {
@@ -322,6 +385,8 @@ impl Sponges {
 impl Drop for Sponges {
     fn drop(&mut self) {
         wipe(self.states[..self.count].as_flattened_mut());
+
+        self.wide.wipe();
     }
 }
 
@@ -757,6 +822,9 @@ mod tests {
                         let mut copy = Sponges {
                             states: sponges.states,
                             count: sponges.count,
+                            rate: sponges.rate,
+                            done: sponges.done,
+                            wide: sponges.wide,
                         };
 
                         for block in expected[..3 * rate].chunks(rate) {
