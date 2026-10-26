@@ -25,9 +25,9 @@
    memcheck with every secret marked undefined through client requests (`--cfg crypto_pq_ct`), on
    x86-64 and ARM64, in the default and the forced-portable build, and on x86-64 in a build capped at
    SSE4.1 ([23.2](profiles/rust.md#232-security-mechanics) item 6). Kernels that the checker cannot execute, the AVX-512 kernels, are
-   constant time by construction [[D-44](decisions.md#decision-d-44)]. On x86-64, an instruction of the floating-point
-   domain that does no arithmetic counts as its integer form on Intel's list of
-   data-operand-independent timing instructions [[D-75](decisions.md#decision-d-75)].
+   constant time by construction [[D-44](decisions.md#decision-d-44)]. On x86-64, a floating-point-domain logic, move,
+   unpack, shuffle or blend instruction counts as on Intel's list of data-operand-independent timing
+   instructions only as [[D-75](decisions.md#decision-d-75)] lists it.
 
 ## 14.2 Data-independent timing (DIT)
 

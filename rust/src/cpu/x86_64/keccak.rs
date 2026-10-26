@@ -557,8 +557,8 @@ fn parities4(a: &[__m256i; 25]) -> [__m256i; 5] {
 // The 24 rounds on four states in memory, one vector per lane, out of line: inlined, the rounds
 // of two to a step left LLVM with a call of its own anyway, and copies of the states around it.
 // The loads here take whole 32-byte stores directly, as the previous rounds, spare_in, rows4_with
-// and wide_in by rows leave them; the halves that wide_in stores otherwise cost a stall on the
-// first load of each vector.
+// and wide_in by rows leave them, the last vector of wide_in apart; the halves that wide_in stores
+// otherwise cost a stall on the first load of each vector.
 #[target_feature(enable = "avx2,avx512f,avx512vl")]
 #[inline(never)]
 pub(super) fn rounds4_avx512<const THETA3: bool, const PAIRS: bool>(a: &mut [__m256i; 25]) {

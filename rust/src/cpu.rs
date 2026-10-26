@@ -10,10 +10,10 @@
 // The constant-time check (--cfg crypto_pq_ct) runs under valgrind, which cannot execute every
 // instruction: its build leaves out SHA3, SHA512 and DIT on arm64 and the SHA extensions and
 // AVX-512 on x86-64, ignores what the build guarantees, and detects the rest at run time, so that
-// it checks the SHA-256 instructions, NEON and, on Neoverse N2, the scalar Keccak with lazy
-// rotation on arm64, and AVX2 and AES-NI on x86-64. --cfg crypto_pq_sse41 caps x86-64 detection at
-// SSE4.1 and AES-NI, so that the check also covers the SSE4.1 kernels (BLAKE2 and BLAKE3) on
-// runners that have AVX2. The portable build checks the fallback.
+// it checks the SHA-256 instructions, NEON and the scalar Keccak with lazy rotation, which it
+// selects on every core, on arm64, and AVX2 and AES-NI on x86-64. --cfg crypto_pq_sse41 caps
+// x86-64 detection at SSE4.1 and AES-NI, so that the check also covers the SSE4.1 kernels (BLAKE2
+// and BLAKE3) on runners that have AVX2. The portable build checks the fallback.
 
 #[cfg(all(
     target_arch = "aarch64",

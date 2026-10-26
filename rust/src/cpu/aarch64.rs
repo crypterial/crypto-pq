@@ -245,7 +245,9 @@ fn probe() -> u32 {
         found |= ASCON;
     }
 
-    if neoverse_n2 {
+    // valgrind hides HWCAP_CPUID, so the constant-time check's build takes LAZY on every core:
+    // its rounds are plain AArch64 and run on any core as on Neoverse N2.
+    if neoverse_n2 || cfg!(crypto_pq_ct) {
         found |= LAZY;
     }
 
@@ -649,7 +651,8 @@ pub(crate) fn keccak_group() -> usize {
 }
 
 // Permutes every state, three at a time where that leaves no single state over, then two, then
-// one in vector registers, which is still faster than the scalar permutation; returns how many.
+// one in vector registers, which still takes less time than the scalar permutation; returns how
+// many.
 #[allow(unsafe_code)]
 #[cfg(any(
     feature = "ml-kem",
@@ -912,9 +915,9 @@ pub(crate) fn mlkem_message(_: &[u16; 256], _: &[u16; 256], _: u16, _: &mut [u8;
     false
 }
 
-// BLAKE2 runs best on the scalar pipes as compiled: four independent G functions per step keep
-// them busy, a hand-ordered assembly version measured the same, and NEON's two-cycle instructions
-// and two-instruction rotations lengthen the chain.
+// BLAKE2 stays on the scalar pipes as compiled, measured ahead of NEON: four independent G
+// functions per step keep them busy, a hand-ordered assembly version measured the same, and
+// NEON's two-cycle instructions and two-instruction rotations lengthen the chain.
 #[inline(always)]
 #[cfg(feature = "blake2")]
 pub(crate) fn blake2b(
@@ -964,8 +967,8 @@ pub(crate) fn blake3_many(input: &[u8], many: &crate::blake3::Many, out: &mut [[
     unsafe { blake3::hash_many(input, many, out) }
 }
 
-// BLAKE3's chain of one chunk's blocks runs best on the scalar pipes as compiled: NEON's
-// two-cycle instructions lengthen the chain of each step, as in BLAKE2.
+// BLAKE3's chain of one chunk's blocks stays on the scalar pipes as compiled, measured ahead of
+// NEON: NEON's two-cycle instructions lengthen the chain of each step, as in BLAKE2.
 #[inline(always)]
 #[cfg(feature = "blake3")]
 pub(crate) fn blake3_blocks(
@@ -2150,7 +2153,31 @@ fn permute2_sha3(first: &mut [u64; 25], second: &mut [u64; 25]) {
     }
 }
 
-// One state in both halves of the vectors: the instructions of a pair, for a state alone.
+// A state alone in the low halves of the vectors, by plain loads, which LLVM pairs: loads that fill
+// both halves took 1-1.5% longer per permutation on an Apple M3. Only the low halves are read out;
+// the high halves permute the zero state beside it.
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+#[target_feature(enable = "neon")]
+#[inline]
+fn load_low(state: &[u64; 25]) -> [uint64x2_t; 25] {
+    let mut a = [vdupq_n_u64(0); 25];
+
+    for (lane, x) in a.iter_mut().zip(state) {
+        *lane = vcombine_u64(vcreate_u64(*x), vcreate_u64(0));
+    }
+
+    a
+}
+
+// One state with the instructions of a pair.
 #[cfg(any(
     feature = "ml-kem",
     feature = "frodokem",
@@ -2162,11 +2189,7 @@ fn permute2_sha3(first: &mut [u64; 25], second: &mut [u64; 25]) {
 ))]
 #[target_feature(enable = "sha3")]
 fn permute1_sha3(state: &mut [u64; 25]) {
-    let mut a = [vdupq_n_u64(0); 25];
-
-    for (lane, x) in a.iter_mut().zip(state.iter()) {
-        *lane = vdupq_n_u64(*x);
-    }
+    let mut a = load_low(state);
 
     rounds(&mut a);
 
@@ -2269,11 +2292,7 @@ fn permute3_lazy(first: &mut [u64; 25], second: &mut [u64; 25], third: &mut [u64
 ))]
 #[target_feature(enable = "sha3")]
 fn absorb_sha3<const RATE: usize>(state: &mut [u64; 25], blocks: &[[u8; RATE]]) {
-    let mut a = [vdupq_n_u64(0); 25];
-
-    for (lane, x) in a.iter_mut().zip(state.iter()) {
-        *lane = vdupq_n_u64(*x);
-    }
+    let mut a = load_low(state);
 
     for block in blocks {
         xor_block(&mut a, block);
@@ -2473,8 +2492,8 @@ fn digest_sha3<const RATE: usize>(
 }
 
 // digest_sha3 from initial if START and from zero otherwise, one copy for each: with one copy,
-// LLVM joined the two starts through a copy of the state on the stack. The output is read from
-// the low halves of the vectors only, so the initial state goes into those alone, by plain loads.
+// LLVM joined the two starts through a copy of the state on the stack. The initial state goes into
+// the low halves, as load_low does.
 #[cfg(any(
     feature = "ml-kem",
     feature = "frodokem",
@@ -2518,13 +2537,11 @@ fn digest_sha3_from<const RATE: usize, const START: bool>(
         chunks[end] = (0x80u64 << 56).to_le_bytes();
     }
 
-    let mut a = [vdupq_n_u64(0); 25];
-
-    if START {
-        for (lane, x) in a.iter_mut().zip(initial) {
-            *lane = vcombine_u64(vcreate_u64(*x), vcreate_u64(0));
-        }
-    }
+    let mut a = if START {
+        load_low(initial)
+    } else {
+        [vdupq_n_u64(0); 25]
+    };
 
     for block in blocks {
         xor_block(&mut a, block);

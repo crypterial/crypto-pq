@@ -6,16 +6,14 @@
 // A with the secret matrices; with AVX-512F and AVX-512VL besides, Keccak-f[1600] on four states
 // and on one in 256-bit registers; BLAKE2b, BLAKE2s and BLAKE3 without AVX2 with SSE4.1. Every
 // instruction that takes secret data is on Intel's list of data-operand-independent timing
-// instructions, where a move, unpack, shuffle, insert, extract or blend of the floating-point
-// domain that LLVM emits for an integer intrinsic counts as its integer form (SPEC D-75): VMOVAPS
-// and VMOVUPS as MOVAPS and MOVUPS, VUNPCKLPD and VMOVLHPS as VPUNPCKLQDQ, VUNPCKHPD as
-// VPUNPCKHQDQ, VBLENDPS as VPBLENDD, VSHUFPS as SHUFPS; branches, divisions and the other
-// instructions take public values only, such as lengths and counts, so no branch or address depends
-// on secret data. The kernels are safe code inside #[target_feature] functions, apart from the
-// loads and stores of memory.rs, the assembly of the SHA-2 rounds, of BLAKE3's transposed rounds
-// and of single shuffles and blends, and the volatile stores that clear BLAKE3's vector buffers and
-// the vector form of Sponges; what is unsafe is calling one once its feature is known to be there,
-// reading a group of that vector form once it is written, and CPUID with XGETBV.
+// instructions or is a floating-point-domain logic, move, unpack, shuffle or blend instruction that
+// SPEC D-75 counts with it, as LLVM emits some for integer intrinsics; branches, divisions and the
+// other instructions take public values only, such as lengths and counts, so no branch or address
+// depends on secret data. The kernels are safe code inside #[target_feature] functions, apart from
+// the loads and stores of memory.rs, the assembly of the SHA-2 rounds, of BLAKE3's transposed
+// rounds and of single shuffles and blends, and the volatile stores that clear BLAKE3's vector
+// buffers and the vector form of Sponges; what is unsafe is calling one once its feature is known
+// to be there, reading a group of that vector form once it is written, and CPUID with XGETBV.
 
 use core::arch::x86_64::*;
 use core::mem::MaybeUninit;
@@ -2161,6 +2159,164 @@ mod tests {
             let (ebx, edx, ecx) = words(name);
 
             assert_eq!(super::Vendor::of(ebx, edx, ecx), vendor, "{name:?}");
+        }
+    }
+
+    // wide_in by rows, the form of AMD cores, against the form by broadcasts, for groups of zero to
+    // four states: the CPU models run both, where the native runners may all be Intel cores.
+    #[test]
+    #[allow(unsafe_code)]
+    #[cfg(any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ))]
+    fn wide_in_rows_match_broadcasts() {
+        use super::{keccak, memory::store256};
+        use core::mem::MaybeUninit;
+
+        if !super::has(super::AVX2) {
+            return;
+        }
+
+        let mut inputs = crate::cpu::testing::Inputs::new(25);
+
+        let states: [[u64; 25]; 4] = core::array::from_fn(|_| inputs.words());
+
+        for count in 0..=4 {
+            let four = keccak::four_of(&states[..count]);
+
+            let mut rows = MaybeUninit::uninit();
+
+            let mut lanes = MaybeUninit::uninit();
+
+            let mut words = [[[0u64; 4]; 25]; 2];
+
+            // SAFETY: the CPU has AVX2, and wide_in writes every element of both groups.
+            unsafe {
+                keccak::wide_in::<true>(&four, &mut rows);
+
+                keccak::wide_in::<false>(&four, &mut lanes);
+
+                let groups = [rows.assume_init(), lanes.assume_init()];
+
+                for (group, out) in groups.iter().zip(&mut words) {
+                    for (vector, lane) in group.iter().zip(out) {
+                        store256(*vector, lane);
+                    }
+                }
+            }
+
+            for (i, (by_rows, by_lanes)) in words[0].iter().zip(&words[1]).enumerate() {
+                let expected: [u64; 4] =
+                    core::array::from_fn(|s| if s < count { states[s][i] } else { 0 });
+
+                assert_eq!(*by_rows, expected, "{count} states, lane {i}");
+
+                assert_eq!(*by_lanes, expected, "{count} states, lane {i}");
+            }
+        }
+    }
+
+    // Every form of the AVX-512VL kernels against the portable permutation, whichever vendor's
+    // core runs the test: both theta forms of the four-state rounds, each fed by both forms of
+    // wide_in, for one to four states, and both forms of the one-state kernel.
+    #[test]
+    #[allow(unsafe_code)]
+    #[cfg(any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ))]
+    fn avx512_forms_match_portable() {
+        use super::keccak;
+        use core::mem::MaybeUninit;
+
+        if !super::has(super::AVX512) {
+            return;
+        }
+
+        let mut inputs = crate::cpu::testing::Inputs::new(25);
+
+        let states: [[u64; 25]; 4] = core::array::from_fn(|_| inputs.words());
+
+        let mut expected = states;
+
+        for state in &mut expected {
+            crate::keccak::permute(state);
+        }
+
+        type Rounds = unsafe fn(&mut [core::arch::x86_64::__m256i; 25]);
+
+        let forms: [(&str, Rounds); 2] = [
+            ("theta per lane", keccak::rounds4_avx512::<true, false>),
+            ("theta per column", keccak::rounds4_avx512::<false, true>),
+        ];
+
+        for count in 1..=4 {
+            for (name, rounds) in forms {
+                for by_rows in [true, false] {
+                    let mut out = states;
+
+                    let mut group = MaybeUninit::uninit();
+
+                    // SAFETY: the CPU has AVX2, AVX-512F and AVX-512VL with their state saved,
+                    // and wide_in writes every element of the group.
+                    unsafe {
+                        if by_rows {
+                            keccak::wide_in::<true>(&keccak::four_of(&states[..count]), &mut group);
+                        } else {
+                            keccak::wide_in::<false>(
+                                &keccak::four_of(&states[..count]),
+                                &mut group,
+                            );
+                        }
+
+                        let group = group.assume_init_mut();
+
+                        rounds(group);
+
+                        let mut refs = out.each_mut();
+
+                        keccak::scatter4_transposed(group, &mut refs[..count]);
+                    }
+
+                    assert_eq!(
+                        out[..count],
+                        expected[..count],
+                        "{name}, rows {by_rows}, {count} states"
+                    );
+                }
+            }
+        }
+
+        for state in &states {
+            let mut expected_one = *state;
+
+            crate::keccak::permute(&mut expected_one);
+
+            for theta3 in [true, false] {
+                let mut one = *state;
+
+                // SAFETY: as above.
+                unsafe {
+                    if theta3 {
+                        keccak::permute1_avx512::<true>(&mut one);
+                    } else {
+                        keccak::permute1_avx512::<false>(&mut one);
+                    }
+                }
+
+                assert_eq!(one, expected_one, "one state, theta3 {theta3}");
+            }
         }
     }
 }

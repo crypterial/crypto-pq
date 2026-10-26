@@ -28,7 +28,8 @@ Implements specification 1.1 (draft).
   beside one in general registers, in place of the portable code. Other Arm cores keep the kernels
   they had. Outputs are unchanged.
 - One-shot SHA-3, SHAKE, cSHAKE and KMAC on Apple cores keep the Keccak state in registers from the
-  start, also from the precomputed state of cSHAKE and KMAC, with no copy of it on the stack.
+  start, also from the precomputed state of cSHAKE and KMAC, with no copy of it on the stack. A
+  state permuted or absorbed alone is loaded into one half of each vector register by plain loads.
   Outputs are unchanged.
 - The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
   intrinsics are stable.
