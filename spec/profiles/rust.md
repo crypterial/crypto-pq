@@ -63,12 +63,13 @@
    memcheck, in the default and `crypto_pq_portable` builds, on x86-64 with the minimum and the stable
    toolchain and on ARM64 with the stable toolchain, and on x86-64 in the `crypto_pq_sse41` build with
    the stable toolchain. The `crypto_pq_ct` build leaves out the instructions valgrind cannot
-   execute.
+   execute, AVX-512 among them [[D-44](../decisions.md#decision-d-44)].
 
 ## 23.3 Performance mechanics
 
 1. Kernels use `core::arch` intrinsics and inline assembly behind `#[target_feature]`, selected at run
-   time by CPUID with XGETBV (x86-64) or the hardware capabilities (ARM64). The crate is built for the
+   time by CPUID with XGETBV (x86-64; the AVX-512 state from `sysctl` on macOS) or the hardware
+   capabilities (ARM64). The crate is built for the
    baseline target of each architecture; no target CPU flag is needed.
 2. `--cfg crypto_pq_portable` removes every kernel and every use of DIT. `--cfg crypto_pq_sse41` caps
    x86-64 detection at SSE4.1 and AES-NI, so that CI runners with AVX2 run the SSE4.1 kernels.
@@ -79,7 +80,7 @@
 
 ## 23.4 Build, packaging and platforms
 
-1. Minimum Rust 1.88, edition 2024.
+1. Minimum Rust 1.89, edition 2024.
 2. No `[dependencies]`. Dev-dependencies are not permitted either: tests use only the standard library
    (vectors are plain text).
 3. The published crate contains the sources, `Cargo.toml`, `Cargo.lock`, `LICENSE-APACHE` and
@@ -149,4 +150,5 @@ A conforming Rust implementation meets each item:
 - `cargo doc` without a warning.
 - valgrind constant-time check on x86-64 and ARM64, default and portable, and on x86-64 with
   `crypto_pq_sse41`.
-- x86-64 CPU models of [18.2](../18-testing.md#182-cpu-tiers) under emulation.
+- x86-64 CPU models of [18.2](../18-testing.md#182-cpu-tiers) under emulation, and the AVX-512 tier on native runners, with no
+  instruction on a 512-bit register in the release build.

@@ -570,7 +570,12 @@ mod tests {
 
         assert!(states_checked >= 20_000);
 
-        std::eprintln!("Keccak: {accelerated} of {states_checked} states through a CPU kernel");
+        let (four, one) = cpu::avx512vl();
+
+        std::eprintln!(
+            "Keccak: {accelerated} of {states_checked} states through a CPU kernel \
+             (AVX-512VL: {four}, one state: {one})"
+        );
     }
 
     // The absorbing kernel against XOR and the portable permutation block by block, for every

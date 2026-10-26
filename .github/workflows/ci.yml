@@ -46,7 +46,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        rust: ["1.88", stable]
+        rust: ["1.89", stable]
         include:
           - { os: ubuntu-24.04-arm, rust: stable }
           - { os: macos-latest, rust: stable }
@@ -150,7 +150,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.88", stable]
+        rust: ["1.89", stable]
         cfg: ["", "--cfg crypto_pq_ct", "--cfg crypto_pq_portable"]
     defaults:
       run:
@@ -179,6 +179,17 @@ jobs:
           for features in "" --all-features; do
             cargo clippy --all-targets --locked $features -- -D warnings
           done
+      # The AVX-512VL kernels use 256-bit registers only, and nothing else uses AVX-512: the
+      # release build of every feature has no instruction on a 512-bit register.
+      - if: matrix.cfg == ''
+        run: |
+          cargo build --locked --release --lib --all-features
+          mkdir -p "$RUNNER_TEMP/objects"
+          (cd "$RUNNER_TEMP/objects" && ar x "$GITHUB_WORKSPACE/rust/target/release/libcrypto_pq.rlib")
+          if objdump -d "$RUNNER_TEMP"/objects/*.o | grep -m 20 %zmm; then
+            echo "an instruction on a 512-bit register"
+            exit 1
+          fi
       - run: |
           for target in aarch64-unknown-linux-gnu aarch64-apple-darwin aarch64-pc-windows-msvc x86_64-pc-windows-msvc; do
             for features in "" --all-features; do
@@ -205,7 +216,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.88", stable]
+        rust: ["1.89", stable]
     defaults:
       run:
         shell: bash
@@ -244,7 +255,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        rust: ["1.88", stable]
+        rust: ["1.89", stable]
         include:
           - { os: ubuntu-24.04-arm, rust: stable }
           - { os: macos-latest, rust: stable }
@@ -291,6 +302,53 @@ jobs:
       - run: cargo test --locked --release --all-features --target x86_64-unknown-linux-musl -- --nocapture kernel
       - run: cargo test --locked --release --all-features --target x86_64-unknown-linux-musl
 
+  # The AVX-512VL kernels on real hardware: QEMU's user mode does not emulate AVX-512, and the
+  # x86-64 runners are a mix of CPUs with and without it, so eight copies of the suite run, each
+  # recording its CPU and whether it took the AVX-512VL paths, and the next job fails unless one
+  # took the four-state path and one the one-state path, which only AMD cores select.
+  rust-avx512:
+    name: rust AVX-512VL kernels (runner ${{ matrix.copy }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [1, 2, 3, 4, 5, 6, 7, 8]
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup override set stable
+      - run: lscpu | grep -E '^(Model name|Flags)' | cut -c1-800
+      - run: cargo test --locked --release --all-features --lib -- --nocapture kernel 2>&1 | tee "$RUNNER_TEMP/kernels.txt"
+      - run: cargo test --locked --release --all-features
+      - run: |
+          mkdir -p "$RUNNER_TEMP/avx512"
+          four=no one=no
+          if grep -q 'AVX-512VL: true' "$RUNNER_TEMP/kernels.txt"; then four=yes; fi
+          if grep -q 'one state: true' "$RUNNER_TEMP/kernels.txt"; then one=yes; fi
+          echo "four=$four one=$one $(lscpu | sed -n 's/^Model name: *//p')" | tee "$RUNNER_TEMP/avx512/copy-${{ matrix.copy }}.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: avx512-${{ matrix.copy }}
+          path: ${{ runner.temp }}/avx512
+
+  rust-avx512-ran:
+    name: rust AVX-512VL kernels ran on a CPU that has them
+    needs: rust-avx512
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: avx512-*
+          merge-multiple: true
+      - run: |
+          cat copy-*.txt
+          grep -q '^four=yes ' copy-*.txt || { echo "no runner took the four-state AVX-512VL kernel"; exit 1; }
+          grep -q ' one=yes ' copy-*.txt || { echo "no runner took the one-state AVX-512VL kernels"; exit 1; }
+
   # Every secret is marked uninitialised under valgrind's memcheck, so a branch or a memory index
   # that depends on one fails the job; values the specifications make public are declassified.
   # The crypto_pq_ct build leaves out what valgrind cannot execute (SHA-NI on x86-64; SHA3,
@@ -304,7 +362,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        rust: ["1.88", stable]
+        rust: ["1.89", stable]
         cfg: ["", "--cfg crypto_pq_portable"]
         include:
           - { os: ubuntu-latest, rust: stable, cfg: "--cfg crypto_pq_sse41" }

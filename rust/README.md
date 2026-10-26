@@ -6,7 +6,7 @@
 
 Secure, optimized post-quantum cryptography in pure Rust with no dependencies: ML-KEM, FrodoKEM,
 ML-DSA, SLH-DSA, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF. The crate
-is `no_std` with `alloc` and needs Rust 1.88 or later.
+is `no_std` with `alloc` and needs Rust 1.89 or later.
 
 - API documentation: [docs.rs/crypto-pq](https://docs.rs/crypto-pq)
 - Project page: [crypterial.com/research/crypto-pq](https://crypterial.com/research/crypto-pq/)
@@ -232,8 +232,9 @@ Code that handles secret data has no branch or memory access that depends on a s
 checks under valgrind on x86-64 and ARM64. On ARM64 CPUs with FEAT_DIT, the asymmetric secret
 operations run with DIT set. Private keys and `SecretBytes`, the type of every secret output, wipe
 their memory when dropped. Randomness comes only from the operating system; on a target without a
-source, operations that need it return `Error::RngFailure`. CPU-specific code for x86-64 and ARM64 is
-selected at run time, with portable code on every target.
+source, operations that need it return `Error::RngFailure`. CPU-specific code for x86-64 (AVX2,
+AVX-512VL, SSE4.1, SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2, SHA-3, SHA-512) is selected at run
+time, with portable code on every target.
 
 Report vulnerabilities privately through
 [GitHub Security Advisories](https://github.com/crypterial/crypto-pq/security/advisories/new).

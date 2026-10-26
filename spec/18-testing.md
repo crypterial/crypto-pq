@@ -17,7 +17,11 @@ The CI MUST run:
 
 CI MUST run the tests on processor models, emulated where necessary, that together select every
 CPU-specific tier of [15.3](15-platforms.md#153-cpu-specific-code) and the portable code, and on native x86-64 and ARM64 hardware. A test
-counts the kernels each model selects and fails if the count differs from the expected one.
+counts the kernels each model selects and fails if the count differs from the expected one. The
+AVX-512 tier, which the emulators do not execute, runs on native runners: CI runs the tests on
+several x86-64 runners, each records whether it selected the tier, and the run fails unless at
+least one did. CI also checks that the release build contains no instruction on a 512-bit register
+[[D-44](decisions.md#decision-d-44)].
 
 ## 18.3 Platforms
 

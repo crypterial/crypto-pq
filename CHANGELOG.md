@@ -7,6 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 the [crypto-pq specification](spec/00-contents.md) that it implements
 ([Section 20.1](spec/20-versioning.md)).
 
+## [Unreleased]
+
+### Changed
+
+- Keccak-f[1600] on x86-64 CPUs with AVX-512F and AVX-512VL: a kernel for four states side by
+  side and, on AMD CPUs, one for a single state, selected at run time, use the EVEX instructions on
+  256-bit registers only (three-input logic and 64-bit rotations, 32 registers); no code uses a
+  512-bit register. They
+  serve SHA-3, SHAKE, cSHAKE, KMAC and the Keccak of ML-KEM, ML-DSA, SLH-DSA and FrodoKEM. The AVX2
+  kernels and the portable code stay their twins, and outputs are unchanged.
+- The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
+  intrinsics are stable.
+
 ## [1.0.1] - 2026-10-26
 
 Implements specification 1.0, as 1.0.0 does. The API and every output are unchanged.

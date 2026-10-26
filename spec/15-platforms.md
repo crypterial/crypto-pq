@@ -13,15 +13,17 @@ its result is kept in an atomic.
 | operating systems | Linux (glibc and musl), macOS, Windows; other systems with an entropy source of [14.3](14-security.md#143-entropy) |
 | processors with CPU-specific code | x86-64, ARM64 (little-endian); RISC-V 64 runs portable code |
 | portable only | every other architecture, including 32-bit and big-endian; MUST stay correct |
-| Rust | 1.88 or later, edition 2024, `no_std` with `alloc` |
+| Rust | 1.89 or later, edition 2024, `no_std` with `alloc` |
 
 ## 15.3 CPU-specific code
 
 1. CPU-specific code exists only for x86-64, ARM64 and RISC-V (P9) and is always selected at run time
    by feature detection, with a portable twin.
 2. x86-64 tiers: AVX2 with BMI1 and BMI2 and operating-system support for the YMM state (checked with
-   XGETBV); SSE4.1; SHA-NI; AES-NI. Processors without them run the portable code. crypto-pq 1.0 contains no
-   AVX-512 code [[D-44](decisions.md#decision-d-44)]. CPU-specific code is not used inside an SGX enclave target.
+   XGETBV); AVX-512F and AVX-512VL on top of the AVX2 tier, with operating-system support for the
+   opmask and ZMM state, for Keccak-f[1600] [[D-44](decisions.md#decision-d-44)]; SSE4.1; SHA-NI; AES-NI. Processors without
+   them run the portable code. The AVX-512 kernels use 256-bit registers only, and no code uses a
+   512-bit register. CPU-specific code is not used inside an SGX enclave target.
 3. ARM64 tiers: NEON (baseline), the AES, SHA-2, SHA-3 and SHA-512 extensions, and DIT. Detection reads the
    hardware capabilities on Linux and Android, `IsProcessorFeaturePresent` on Windows, and assumes the
    Apple baseline on Apple systems. Other systems run the portable code.

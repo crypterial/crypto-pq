@@ -8,8 +8,8 @@
 // is how CI tests the fallback on machines that have the instructions.
 //
 // The constant-time check (--cfg crypto_pq_ct) runs under valgrind, which cannot execute every
-// instruction: its build leaves out SHA3, SHA512 and DIT on arm64 and the SHA extensions on
-// x86-64, ignores what the build guarantees, and detects the rest at run time, so that it checks
+// instruction: its build leaves out SHA3, SHA512 and DIT on arm64 and the SHA extensions and
+// AVX-512 on x86-64, ignores what the build guarantees, and detects the rest at run time, so that it checks
 // the SHA-256 instructions and NEON on arm64 and AVX2 and AES-NI on x86-64. --cfg crypto_pq_sse41
 // caps x86-64 detection at SSE4.1 and AES-NI, so that the check also covers the SSE4.1 kernels
 // (BLAKE2 and BLAKE3) on runners that have AVX2. The portable build checks the fallback.
@@ -557,6 +557,46 @@ pub(crate) use arch::{blake3_blocks, blake3_compress, blake3_digest1, blake3_man
     feature = "sha3"
 ))]
 pub(crate) use arch::{absorb, digest, keccak_group, permute_many};
+
+// Whether the AVX-512VL kernels run, for four states and for one, which the Keccak kernel test
+// reports: CI checks that some runner had them, as no emulator it uses does.
+#[cfg(all(
+    test,
+    any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ),
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+pub(crate) use x86_64::avx512vl;
+
+#[cfg(all(
+    test,
+    any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ),
+    not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))
+))]
+pub(crate) fn avx512vl() -> (bool, bool) {
+    (false, false)
+}
 
 #[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 pub(crate) use arch::{inverse_ntt, ntt};

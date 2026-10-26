@@ -3,7 +3,8 @@
 // BMI2 (the AVX2 tier): the SHA-256 lanes, SHA-256 without the SHA extensions and SHA-512,
 // Keccak-f[1600] on four states and on one, BLAKE2b, BLAKE2s and BLAKE3, Ascon, the ML-KEM and
 // ML-DSA arithmetic, sampling and encodings, and FrodoKEM's SHAKE128 rows of A and its products of
-// A with the secret matrices; BLAKE2b, BLAKE2s and BLAKE3 without AVX2 with SSE4.1. Every
+// A with the secret matrices; with AVX-512F and AVX-512VL besides, Keccak-f[1600] on four states
+// and on one in 256-bit registers; BLAKE2b, BLAKE2s and BLAKE3 without AVX2 with SSE4.1. Every
 // instruction used is on Intel's list of data-operand-independent timing instructions, and the
 // code around them has no branch or address that depends on secret data. The kernels are safe
 // code inside #[target_feature] functions, apart from the loads and stores of memory.rs, the
@@ -121,6 +122,18 @@ const SSE41: u32 = 1 << 2;
 // AES-NI, with SSE4.1 as on every CPU that has it.
 const AES: u32 = 1 << 3;
 
+// AVX-512F and AVX-512VL with the AVX2 tier, and an operating system that saves the opmask
+// registers and all 32 vector registers in full. Its kernels use the EVEX forms on 256-bit
+// registers only, never 512-bit ones, so that the core keeps the clock it runs AVX2 code at; they
+// gain sixteen more registers, three-input logic and 64-bit rotations.
+const AVX512: u32 = 1 << 4;
+
+// AVX512 on an AMD core, where the one-state Keccak kernel in vector registers takes less time than
+// the scalar BMI kernel (Zen 4 208 against 257 ns, Zen 5 186 against 201). Intel's cores run the
+// scalar kernel as fast or faster (Xeon 8573C 248 against 253 ns), so they keep it; four states
+// take the AVX-512VL kernel on both.
+const AVX512_ONE: u32 = 1 << 5;
+
 const READY: u32 = 1 << 31;
 
 // What the build guarantees needs no detection, and its check folds away.
@@ -142,20 +155,31 @@ const fn guaranteed(feature: u32) -> bool {
         )),
         SSE41 => cfg!(all(target_feature = "ssse3", target_feature = "sse4.1")),
         AES => cfg!(all(target_feature = "aes", target_feature = "sse4.1")),
+        // AVX512_ONE also depends on the vendor, which no target feature states.
+        AVX512 => cfg!(all(
+            target_feature = "avx512f",
+            target_feature = "avx512vl",
+            target_feature = "avx2",
+            target_feature = "bmi1",
+            target_feature = "bmi2"
+        )),
         _ => false,
     }
 }
 
-// The constant-time check runs under valgrind, which cannot execute the SHA extensions, so its
-// build leaves them out and checks the AVX2, SSE4.1 and AES-NI paths. --cfg crypto_pq_sse41 leaves
-// out AVX2 and the SHA extensions too, so that a CPU with them runs the SSE4.1 kernels.
+// The constant-time check runs under valgrind, which cannot execute the SHA extensions or
+// AVX-512, so its build leaves them out and checks the AVX2, SSE4.1 and AES-NI paths. The AVX-512
+// kernels are constant-time by construction instead (keccak.rs). --cfg crypto_pq_sse41 leaves out
+// AVX2, AVX-512 and the SHA extensions too, so that a CPU with them runs the SSE4.1 kernels.
 const fn usable(feature: u32) -> bool {
-    if cfg!(crypto_pq_sse41) && (feature == AVX2 || feature == SHA) {
+    let avx512 = feature == AVX512 || feature == AVX512_ONE;
+
+    if cfg!(crypto_pq_sse41) && (feature == AVX2 || avx512 || feature == SHA) {
         return false;
     }
 
     if cfg!(crypto_pq_ct) {
-        return feature != SHA;
+        return feature != SHA && !avx512;
     }
 
     true
@@ -186,8 +210,8 @@ fn has(feature: u32) -> bool {
 }
 
 // CPUID leaf 1 ECX: SSSE3 bit 9, SSE4.1 bit 19, AES bit 25, OSXSAVE bit 27, AVX
-// bit 28; leaf 7 EBX: BMI1 bit 3, AVX2 bit 5, BMI2 bit 8, SHA bit 29. Newer Rust makes __cpuid
-// safe, hence unused_unsafe.
+// bit 28; leaf 7 EBX: BMI1 bit 3, AVX2 bit 5, BMI2 bit 8, AVX-512F bit 16, SHA bit 29, AVX-512VL
+// bit 31. Newer Rust makes __cpuid safe, hence unused_unsafe.
 // Out of line, as CPUID's registers made every kernel's caller save six, for the first call only.
 #[cold]
 #[inline(never)]
@@ -195,7 +219,12 @@ fn has(feature: u32) -> bool {
 fn probe() -> u32 {
     // SAFETY: every x86-64 CPU has CPUID; the one environment where it faults, an SGX enclave,
     // compiles this module out.
-    let (max, leaf1) = unsafe { (__cpuid(0).eax, __cpuid(1)) };
+    let (leaf0, leaf1) = unsafe { (__cpuid(0), __cpuid(1)) };
+
+    let max = leaf0.eax;
+
+    // "AuthenticAMD" in EBX, EDX, ECX.
+    let amd = leaf0.ebx == 0x6874_7541 && leaf0.edx == 0x6974_6E65 && leaf0.ecx == 0x444D_4163;
 
     let mut found = 0;
 
@@ -230,7 +259,82 @@ fn probe() -> u32 {
         found |= AVX2;
     }
 
+    if found & AVX2 != 0 && leaf7.ebx & (1 << 16) != 0 && leaf7.ebx & (1 << 31) != 0 {
+        // SAFETY: XGETBV exists, as AVX2 was found with OSXSAVE.
+        if avx512_state(unsafe { _xgetbv(0) }) {
+            found |= AVX512;
+
+            if amd {
+                found |= AVX512_ONE;
+            }
+        }
+    }
+
     found
+}
+
+// XCR0 bits 5, 6 and 7 say that the operating system saves the opmask registers, the upper
+// halves of zmm0-15 and zmm16-31, with bits 1 and 2 for the rest; without them an EVEX
+// instruction faults.
+#[cfg(not(target_os = "macos"))]
+fn avx512_state(xcr0: u64) -> bool {
+    xcr0 & 0xE6 == 0xE6
+}
+
+// Darwin turns the AVX-512 state on only when a thread first uses it, so XCR0 can read it as off
+// while the kernel supports it; the kernel says so in sysctl instead.
+#[cfg(target_os = "macos")]
+fn avx512_state(_: u64) -> bool {
+    sysctl_flag(c"hw.optional.avx512f") && sysctl_flag(c"hw.optional.avx512vl")
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn sysctl_flag(name: &core::ffi::CStr) -> bool {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const core::ffi::c_char,
+            old: *mut core::ffi::c_void,
+            length: *mut usize,
+            new: *mut core::ffi::c_void,
+            new_length: usize,
+        ) -> core::ffi::c_int;
+    }
+
+    let mut value: u32 = 0;
+
+    let mut length = size_of::<u32>();
+
+    // SAFETY: name is a NUL-terminated string, and value is writable for the length passed,
+    // which sysctlbyname updates to what it wrote; nothing is written to the kernel.
+    let result = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut length,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+
+    result == 0 && length == size_of::<u32>() && value == 1
+}
+
+// Whether the AVX-512VL kernels run, for four states and for one, which the kernel tests report.
+#[cfg(all(
+    test,
+    any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    )
+))]
+pub(crate) fn avx512vl() -> (bool, bool) {
+    (has(AVX512), has(AVX512_ONE))
 }
 
 // BLAKE3's hash_many and extended output: eight lanes with AVX2, four with SSE4.1.
@@ -1022,9 +1126,17 @@ pub(crate) fn frodo_shake_rows(seed_a: &[u8], rows: &mut [u16], n: usize, i0: us
         return false;
     }
 
+    let wide = has(AVX512);
+
     for (g, group) in rows.chunks_exact_mut(4 * n).enumerate() {
         // SAFETY: as in permute_many.
-        unsafe { keccak::matrix_rows4(seed_a, group, n, i0 + 4 * g) };
+        unsafe {
+            if wide {
+                keccak::matrix_rows4_avx512(seed_a, group, n, i0 + 4 * g);
+            } else {
+                keccak::matrix_rows4(seed_a, group, n, i0 + 4 * g);
+            }
+        }
     }
 
     true
@@ -1104,6 +1216,10 @@ pub(crate) fn absorb(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
 
     let blocks = &data[..length];
 
+    if has(AVX512_ONE) {
+        return absorb_avx512(state, rate, blocks);
+    }
+
     // SAFETY: the CPU has BMI1 and BMI2, which AVX2 implies here.
     unsafe {
         match rate {
@@ -1117,6 +1233,35 @@ pub(crate) fn absorb(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
     }
 
     length
+}
+
+// absorb with the one-state AVX-512VL kernel, out of line, as permute1 is.
+#[inline(never)]
+#[allow(unsafe_code)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+fn absorb_avx512(state: &mut [u64; 25], rate: usize, blocks: &[u8]) -> usize {
+    // SAFETY: absorb found AVX512_ONE: the CPU has AVX2, AVX-512F and AVX-512VL, and the operating
+    // system saves the registers.
+    unsafe {
+        match rate {
+            72 => keccak::absorb_avx512::<72>(state, blocks.as_chunks().0),
+            104 => keccak::absorb_avx512::<104>(state, blocks.as_chunks().0),
+            136 => keccak::absorb_avx512::<136>(state, blocks.as_chunks().0),
+            144 => keccak::absorb_avx512::<144>(state, blocks.as_chunks().0),
+            168 => keccak::absorb_avx512::<168>(state, blocks.as_chunks().0),
+            _ => return 0,
+        }
+    }
+
+    blocks.len()
 }
 
 // The output of a sponge of the given rate and suffix that absorbs data and is read once into
@@ -1142,6 +1287,10 @@ pub(crate) fn digest(
         return false;
     }
 
+    if has(AVX512_ONE) {
+        return digest_avx512(initial, rate, suffix, data, out);
+    }
+
     // SAFETY: as in absorb.
     unsafe {
         match rate {
@@ -1150,6 +1299,41 @@ pub(crate) fn digest(
             136 => keccak::digest_bmi::<136>(initial, data, suffix, out),
             144 => keccak::digest_bmi::<144>(initial, data, suffix, out),
             168 => keccak::digest_bmi::<168>(initial, data, suffix, out),
+            _ => return false,
+        }
+    }
+
+    true
+}
+
+// digest with the one-state AVX-512VL kernel, out of line, as permute1 is.
+#[inline(never)]
+#[allow(unsafe_code)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+fn digest_avx512(
+    initial: Option<&[u64; 25]>,
+    rate: usize,
+    suffix: u8,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
+    // SAFETY: digest found AVX512_ONE: the CPU has AVX2, AVX-512F and AVX-512VL, and the operating
+    // system saves the registers.
+    unsafe {
+        match rate {
+            72 => keccak::digest_avx512::<72>(initial, data, suffix, out),
+            104 => keccak::digest_avx512::<104>(initial, data, suffix, out),
+            136 => keccak::digest_avx512::<136>(initial, data, suffix, out),
+            144 => keccak::digest_avx512::<144>(initial, data, suffix, out),
+            168 => keccak::digest_avx512::<168>(initial, data, suffix, out),
             _ => return false,
         }
     }
@@ -1325,11 +1509,12 @@ pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8])
     true
 }
 
-// Four states per AVX2 call, and two or three with lanes idle, which still costs less than their
-// scalar permutations. One alone, as the fifth of five, takes the scalar permutation built for
-// BMI1 and BMI2: four in vectors beside one in general registers measured no faster than one after
-// the other, as both compete for the same ports.
-#[allow(unsafe_code)]
+// Four states per vector call, and two or three with lanes idle, which still costs less than
+// their scalar permutations. One alone, as the fifth of five, takes the one-state AVX-512VL kernel
+// on AMD cores (AVX512_ONE), and otherwise the scalar permutation built for BMI1 and BMI2: four in
+// vectors beside one in general registers measured no faster than one after the other, as both
+// compete for the same ports.
+#[inline]
 #[cfg(any(
     feature = "ml-kem",
     feature = "frodokem",
@@ -1353,18 +1538,63 @@ pub(crate) fn permute_many(states: &mut [&mut [u64; 25]]) -> usize {
 
         let (group, tail) = core::mem::take(&mut rest).split_at_mut(size);
 
-        // SAFETY: the CPU has AVX2, BMI1 and BMI2, and the operating system saves the registers.
-        unsafe {
-            match group {
-                [only] => keccak::permute_bmi(only),
-                _ => keccak::permute4_avx2(group),
-            }
+        match group {
+            [only] => permute1(only),
+            _ => permute4(group),
         }
 
         rest = tail;
     }
 
     count
+}
+
+// The kernels of permute_many, chosen out of line: LLVM inlines permute_many into every sponge, and
+// in this form it has the size that it had with the AVX2 kernels alone, so the code around it
+// stays as it was.
+#[inline(never)]
+#[allow(unsafe_code)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+fn permute1(state: &mut [u64; 25]) {
+    // SAFETY: permute_many found AVX2, BMI1 and BMI2, has AVX-512F and AVX-512VL where AVX512_ONE
+    // is set, and the operating system saves the registers.
+    unsafe {
+        if has(AVX512_ONE) {
+            keccak::permute1_avx512(state);
+        } else {
+            keccak::permute_bmi(state);
+        }
+    }
+}
+
+#[inline(never)]
+#[allow(unsafe_code)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+fn permute4(group: &mut [&mut [u64; 25]]) {
+    // SAFETY: as in permute1, with AVX512 for the AVX-512VL kernel.
+    unsafe {
+        if has(AVX512) {
+            keccak::permute4_avx512(group);
+        } else {
+            keccak::permute4_avx2(group);
+        }
+    }
 }
 
 // Four state words as SHA256RNDS2 holds them, the first in the highest lane.
