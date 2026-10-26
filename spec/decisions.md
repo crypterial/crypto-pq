@@ -285,9 +285,10 @@ theta in the form that each vendor's cores run in less time. Sponges squeezed si
 their states in the vector layout of the kernel from one block to the next. The tier is detected at
 run time, and the AVX2 kernels and the portable code stay its twins ([15.3](15-platforms.md#153-cpu-specific-code)). valgrind cannot execute
 AVX-512, so the constant-time check's build leaves the tier out ([14.1](14-security.md#141-constant-time) item 7), and its kernels are
-constant time by construction: logic, rotations, shuffles and loads and stores at addresses that
-depend on public lengths only, with no branch, address or variable-latency instruction that depends
-on the data; which kernel runs depends only on the processor. CI runs them on native runners ([18.2](18-testing.md#182-cpu-tiers)).
+constant time by construction: logic, rotations, shuffles, blends, broadcasts and loads and stores
+at addresses that depend on public lengths only, each on Intel's list of data-operand-independent
+timing instructions as [D-75](#decision-d-75) reads it, with no branch, address or variable-latency
+instruction that depends on the data; which kernel runs depends only on the processor. CI runs them on native runners ([18.2](18-testing.md#182-cpu-tiers)).
 The minimum Rust version is 1.89, the first in which these target features and intrinsics are stable
 ([15.2](15-platforms.md#152-supported-platforms)). Rationale: sixteen more registers, three-input logic and 64-bit rotations take fewer
 instructions per Keccak round than AVX2 does, and 256-bit registers keep the clock at which the core
@@ -509,3 +510,14 @@ S^T flipped passes it for about 2^−8 of the encapsulations. The range checks g
 every time. A secret changed within the range is left to the pairwise test, which one changed entry
 of S^T passes for about 2^−24 (n = 976) or 2^−32 (n = 1344) of the encapsulations. The cost is one
 inverse NTT per polynomial of ŝ and one pass over S^T.
+
+## Decision D-75
+
+On x86-64, an instruction of the floating-point domain that does no arithmetic, a move between
+registers or to or from memory, an unpack, shuffle, insert, extract or blend, counts as its integer
+form on Intel's list of data-operand-independent timing instructions ([14.1](14-security.md#141-constant-time) item 1): VMOVAPS and VMOVUPS
+as MOVAPS and MOVUPS, VUNPCKLPD and VMOVLHPS as VPUNPCKLQDQ, VUNPCKHPD as VPUNPCKHQDQ, VBLENDPS as
+VPBLENDD, and VSHUFPS as SHUFPS or VPSHUFD. Floating-point arithmetic does not count. Rationale:
+LLVM chooses the domain of these instructions for the integer intrinsics of the kernels; they move
+bits between lanes and registers without arithmetic, and a crossing between the integer and the
+floating-point domain has a fixed latency that does not depend on the data.

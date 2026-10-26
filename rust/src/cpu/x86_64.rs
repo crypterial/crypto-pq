@@ -6,14 +6,16 @@
 // A with the secret matrices; with AVX-512F and AVX-512VL besides, Keccak-f[1600] on four states
 // and on one in 256-bit registers; BLAKE2b, BLAKE2s and BLAKE3 without AVX2 with SSE4.1. Every
 // instruction that takes secret data is on Intel's list of data-operand-independent timing
-// instructions (VMOVAPS and VMOVUPS, of register spills, under their legacy names MOVAPS and
-// MOVUPS); branches, divisions and the other instructions take public values only, such as lengths
-// and counts, so no branch or address depends on secret data. The kernels are safe code inside
-// #[target_feature] functions, apart from the loads and stores of memory.rs, the assembly of the
-// SHA-2 rounds, of BLAKE3's transposed rounds and of single shuffles and blends, and the volatile
-// stores that clear BLAKE3's vector buffers and the vector form of Sponges; what is unsafe is
-// calling one once its feature is known to be there, reading a group of that vector form once it is
-// written, and CPUID with XGETBV.
+// instructions, where a move, unpack, shuffle, insert, extract or blend of the floating-point
+// domain that LLVM emits for an integer intrinsic counts as its integer form (SPEC D-75): VMOVAPS
+// and VMOVUPS as MOVAPS and MOVUPS, VUNPCKLPD and VMOVLHPS as VPUNPCKLQDQ, VUNPCKHPD as
+// VPUNPCKHQDQ, VBLENDPS as VPBLENDD, VSHUFPS as SHUFPS; branches, divisions and the other
+// instructions take public values only, such as lengths and counts, so no branch or address depends
+// on secret data. The kernels are safe code inside #[target_feature] functions, apart from the
+// loads and stores of memory.rs, the assembly of the SHA-2 rounds, of BLAKE3's transposed rounds
+// and of single shuffles and blends, and the volatile stores that clear BLAKE3's vector buffers and
+// the vector form of Sponges; what is unsafe is calling one once its feature is known to be there,
+// reading a group of that vector form once it is written, and CPUID with XGETBV.
 
 use core::arch::x86_64::*;
 use core::mem::MaybeUninit;
@@ -228,8 +230,7 @@ fn probe() -> u32 {
 
     let max = leaf0.eax;
 
-    // "AuthenticAMD" in EBX, EDX, ECX.
-    let amd = leaf0.ebx == 0x6874_7541 && leaf0.edx == 0x6974_6E65 && leaf0.ecx == 0x444D_4163;
+    let vendor = Vendor::of(leaf0.ebx, leaf0.edx, leaf0.ecx);
 
     let mut found = 0;
 
@@ -269,11 +270,11 @@ fn probe() -> u32 {
         if avx512_state(unsafe { _xgetbv(0) }) {
             found |= AVX512;
 
-            if amd {
+            if vendor == Vendor::Amd {
                 found |= AVX512_AMD;
             }
 
-            if one_state(amd, leaf1.eax) {
+            if one_state(vendor, leaf1.eax) {
                 found |= AVX512_ONE;
             }
         }
@@ -285,11 +286,12 @@ fn probe() -> u32 {
 // Whether a core with AVX512 runs the one-state AVX-512VL Keccak kernel in less time than the
 // scalar BMI kernel, from the family and model in CPUID leaf 1 EAX. Measured per state, AVX-512VL
 // against BMI: AMD Zen 4 (family 19h) 208 against 257 ns and Zen 5 (1Ah) 186 against 201; Intel
-// Ice Lake Xeon (family 6, model 6Ah; 6Ch is its other die) 18-23% less time on SHA-3. Intel's
-// later cores have a fifth integer ALU and run the scalar kernel as fast or faster: Emerald Rapids
-// (CFh) 247-254 against 254-257 ns, Granite Rapids (ADh) 194 against 194-203. Cores not in the
-// table, measured or not, keep the scalar kernel, as before this tier.
-fn one_state(amd: bool, eax: u32) -> bool {
+// Ice Lake Xeon (family 6, model 6Ah; 6Ch is Ice Lake-D, the same core) 18-23% less time on SHA-3.
+// Intel's later cores have a fifth integer ALU and run the scalar kernel in as little time or
+// less, BMI against AVX-512VL: Emerald Rapids (CFh) 247-254 against 254-257 ns, Granite Rapids
+// (ADh) 194 against 194-203. Cores not in the table, measured or not, keep the scalar kernel, as
+// before this tier, and so do cores of other vendors whatever their family and model.
+fn one_state(vendor: Vendor, eax: u32) -> bool {
     let base = (eax >> 8) & 0xF;
 
     let family = if base == 0xF {
@@ -305,10 +307,29 @@ fn one_state(amd: bool, eax: u32) -> bool {
             0
         };
 
-    if amd {
-        family == 0x19 || family == 0x1A
-    } else {
-        family == 0x6 && (model == 0x6A || model == 0x6C)
+    match vendor {
+        Vendor::Amd => family == 0x19 || family == 0x1A,
+        Vendor::Intel => family == 0x6 && (model == 0x6A || model == 0x6C),
+        Vendor::Other => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
+enum Vendor {
+    Amd,
+    Intel,
+    Other,
+}
+
+impl Vendor {
+    // The vendor string of CPUID leaf 0 in EBX, EDX, ECX: "AuthenticAMD" or "GenuineIntel".
+    fn of(ebx: u32, edx: u32, ecx: u32) -> Self {
+        match (ebx, edx, ecx) {
+            (0x6874_7541, 0x6974_6E65, 0x444D_4163) => Self::Amd,
+            (0x756E_6547, 0x4965_6E69, 0x6C65_746E) => Self::Intel,
+            _ => Self::Other,
+        }
     }
 }
 
@@ -378,8 +399,9 @@ pub(crate) fn avx512vl() -> (bool, bool) {
 
 // The vector form of Sponges: two groups of four sponges, lane i of sponge s of a group in word
 // s of vector i. A group holds values once squeeze_wide has built it, which written records;
-// ready marks the groups that hold the current sponges, and nothing reads a group before.
-#[derive(Clone, Copy)]
+// ready marks the groups that hold the current sponges, and nothing reads a group before. Not
+// Copy outside the tests, so that no copy of the states is made unseen.
+#[cfg_attr(test, derive(Clone, Copy))]
 #[cfg(any(
     feature = "ml-kem",
     feature = "frodokem",
@@ -1642,9 +1664,9 @@ pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8])
 
 // Four states per vector call, and two or three with lanes idle, which still costs less than
 // their scalar permutations. One alone, as the fifth of five, takes the one-state AVX-512VL kernel
-// on AMD cores (AVX512_ONE), and otherwise the scalar permutation built for BMI1 and BMI2: four in
-// vectors beside one in general registers took no less time than one after the other, as both
-// compete for the same ports.
+// on the cores of one_state() (AVX512_ONE), and otherwise the scalar permutation built for BMI1
+// and BMI2: four in vectors beside one in general registers took no less time than one after the
+// other, as both compete for the same ports.
 #[inline]
 #[cfg(any(
     feature = "ml-kem",
@@ -1728,12 +1750,18 @@ fn permute4(group: &mut [&mut [u64; 25]]) {
 
         let mut vectors = MaybeUninit::uninit();
 
-        keccak::wide_in(&keccak::four(group), &mut vectors);
+        let amd = has(AVX512_AMD);
+
+        if amd {
+            keccak::wide_in::<true>(&keccak::four(group), &mut vectors);
+        } else {
+            keccak::wide_in::<false>(&keccak::four(group), &mut vectors);
+        }
 
         // wide_in wrote every element.
         let vectors = vectors.assume_init_mut();
 
-        if has(AVX512_AMD) {
+        if amd {
             keccak::rounds4_avx512::<false, true>(vectors);
         } else {
             keccak::rounds4_avx512::<true, false>(vectors);
@@ -1758,10 +1786,11 @@ pub(crate) fn squeezes_wide() -> bool {
     has(AVX512)
 }
 
-// Sponges::squeeze in the vector form, with the AVX-512VL kernel: each group of four sponges of
-// which one is active, or which holds the spare state, is permuted in place, and the first `lanes`
-// lanes of each of its sponges are written into its state for the caller to read; the other lanes
-// of the states are then out of date. ready marks the groups in the vector form, which the first
+// Sponges::squeeze in the vector form, with the AVX-512VL kernel: each group of four sponges in
+// which one or more are active, or which holds the spare state, is permuted in place, and the
+// first `lanes` lanes of each of its active sponges are written into its state for the caller to
+// read; the other lanes of the states are then out of date, and a sponge left out has moved on
+// with its group in the vector form. ready marks the groups in the vector form, which the first
 // squeeze after Sponges::start builds from the states. The spare state, if any, takes the slot
 // after the sponges, and its lane of the vector form is wiped after use, as it lies outside the
 // sponges. squeezes_wide says where there is such a kernel; elsewhere Sponges keeps its own path.
@@ -1802,7 +1831,13 @@ pub(crate) fn squeeze_wide(
         // ready records.
         unsafe {
             if wide.ready & (1 << g) == 0 {
-                keccak::wide_in(&keccak::four_of(&states[sponges.clone()]), group);
+                let four = keccak::four_of(&states[sponges.clone()]);
+
+                if amd {
+                    keccak::wide_in::<true>(&four, group);
+                } else {
+                    keccak::wide_in::<false>(&four, group);
+                }
 
                 wide.ready |= 1 << g;
 
@@ -2068,4 +2103,64 @@ fn compress256_lanes_moved<const LANES: usize>(
     compress256_lanes_avx2(states, &mut aligned.0);
 
     wipe(aligned.0.as_flattened_mut());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Vendor::{Amd, Intel, Other};
+
+    // CPUID leaf 1 EAX of measured and neighbouring cores, decoded with the extended family and
+    // model fields.
+    #[test]
+    fn one_state_table() {
+        let cases = [
+            (Amd, 0x00A1_0F11, true),    // Zen 4, Genoa: family 19h
+            (Amd, 0x00B0_0F21, true),    // Zen 5, Turin: family 1Ah
+            (Amd, 0x00A0_0F11, true),    // Zen 3, Milan: family 19h, no AVX512 to reach here
+            (Amd, 0x0083_0F10, false),   // Zen 2, Rome: family 17h
+            (Amd, 0x0006_06A6, false),   // an Ice Lake row from AMD
+            (Intel, 0x0006_06A6, true),  // Ice Lake Xeon: model 6Ah
+            (Intel, 0x0006_06C1, true),  // Ice Lake-D: model 6Ch
+            (Intel, 0x0005_0657, false), // Cascade Lake: model 55h
+            (Intel, 0x0008_06F8, false), // Sapphire Rapids: model 8Fh
+            (Intel, 0x000C_06F2, false), // Emerald Rapids: model CFh
+            (Intel, 0x000A_06D1, false), // Granite Rapids: model ADh
+            (Intel, 0x0007_06E5, false), // Ice Lake client: model 7Eh
+            (Intel, 0x00A0_0F11, false), // a Zen 4 row from Intel
+            (Intel, 0x0000_06A6, false), // model Ah without its extended model
+            (Other, 0x0006_06A6, false), // an Ice Lake row from another vendor
+            (Other, 0x00A0_0F11, false), // family 19h from another vendor
+            (Other, 0x00B0_0F21, false), // family 1Ah from another vendor
+        ];
+
+        for (vendor, eax, expected) in cases {
+            assert_eq!(
+                super::one_state(vendor, eax),
+                expected,
+                "{vendor:?} {eax:#010x}"
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_strings() {
+        let words = |name: &[u8; 12]| {
+            let word =
+                |i: usize| u32::from_le_bytes([name[i], name[i + 1], name[i + 2], name[i + 3]]);
+
+            (word(0), word(4), word(8))
+        };
+
+        for (name, vendor) in [
+            (b"AuthenticAMD", Amd),
+            (b"GenuineIntel", Intel),
+            (b"HygonGenuine", Other),
+            (b"CentaurHauls", Other),
+            (b"GenuineIotel", Other),
+        ] {
+            let (ebx, edx, ecx) = words(name);
+
+            assert_eq!(super::Vendor::of(ebx, edx, ecx), vendor, "{name:?}");
+        }
+    }
 }

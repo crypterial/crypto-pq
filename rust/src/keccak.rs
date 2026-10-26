@@ -28,7 +28,7 @@ pub(crate) const ROUND_CONSTANTS: [u64; 24] = [
     0x8000000080008008,
 ];
 
-const ROTATIONS: [u32; 25] = [
+pub(crate) const ROTATIONS: [u32; 25] = [
     0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14,
 ];
 
@@ -189,7 +189,11 @@ pub(crate) fn permute_all(states: &mut [&mut [u64; 25]]) {
 // The most sponges that run side by side; callers with more split them into groups of group().
 pub(crate) const MAX_SPONGES: usize = 8;
 
-// The group size, at most MAX_SPONGES, whose permutations the CPU's kernels run best together.
+// Sponges marks its sponges in the bits of a byte, and the vector form holds two groups of four.
+const _: () = assert!(MAX_SPONGES <= 8);
+
+// The number of sponges that callers run side by side, at most MAX_SPONGES: a multiple of the
+// states that the CPU's widest Keccak kernel permutes in one pass.
 pub(crate) fn group() -> usize {
     cpu::keccak_group()
 }
@@ -199,8 +203,8 @@ pub(crate) fn group() -> usize {
 // the independent XOF and PRF calls of matrix and noise sampling and of SLH-DSA's F.
 //
 // Where the CPU has a kernel for it (cpu::squeeze_wide), the sponges stay in its vector form,
-// wide, from one block to the next, and each squeeze writes only the rate of each sponge into its
-// state, which is all that lanes and read return.
+// wide, from one block to the next, and each squeeze writes only the rate of each active sponge
+// into its state, which is all that lanes and read return.
 pub(crate) struct Sponges {
     states: [[u64; 25]; MAX_SPONGES],
     count: usize,
@@ -259,10 +263,12 @@ impl Sponges {
     }
 
     // Squeezes the sponges marked active, which skips the permutations of those that already
-    // have all the output they need. A sponge left out keeps the block it squeezed last; in the
-    // vector form, which may permute it beside the others, it is done and is not squeezed again
-    // until the next start.
+    // have all the output they need. A sponge left out keeps the block it squeezed last and is
+    // done: the vector form may permute it beside the others, so it is not squeezed again until
+    // the next start, which retire checks on every path.
     pub(crate) fn squeeze(&mut self, active: [bool; MAX_SPONGES]) {
+        self.retire(&active);
+
         if cpu::squeezes_wide() {
             self.squeeze_wide(&active, None);
 
@@ -293,6 +299,8 @@ impl Sponges {
             spare < MAX_SPONGES,
             "a free slot is needed beside the sponges"
         );
+
+        self.retire(&active);
 
         if cpu::squeezes_wide() {
             self.squeeze_wide(&active, Some(other));
@@ -327,10 +335,8 @@ impl Sponges {
     }
 
     // The kernel's squeeze of the vector form, where the CPU has one: the states then hold only
-    // the rate, and the sponges left out are done.
+    // the rate.
     fn squeeze_wide(&mut self, active: &[bool; MAX_SPONGES], other: Option<&mut [u64; 25]>) {
-        self.retire(active);
-
         cpu::squeeze_wide(
             &mut self.wide,
             &mut self.states[..self.count],
@@ -342,10 +348,12 @@ impl Sponges {
 
     // Marks the sponges left out of a squeeze as done, after checking that none is squeezed again.
     fn retire(&mut self, active: &[bool; MAX_SPONGES]) {
-        let mask = active[..self.count]
-            .iter()
-            .enumerate()
-            .fold(0, |mask, (i, &active)| mask | u8::from(active) << i);
+        // Bit i for sponge i: each byte is 0 or 1, and the product gathers byte i into bit 56 + i
+        // with no carry, as no two of its 64 terms land on the same bit.
+        let bits =
+            u64::from_le_bytes(active.map(u8::from)).wrapping_mul(0x0102_0408_1020_4080) >> 56;
+
+        let mask = (bits & ((1 << self.count) - 1)) as u8;
 
         assert!(
             mask & self.done == 0,
@@ -356,8 +364,9 @@ impl Sponges {
     }
 
     // The lanes of the block that sponge i squeezed last, in output order on every target.
+    #[inline(always)]
     pub(crate) fn lanes<const LANES: usize>(&self, i: usize) -> &[u64; LANES] {
-        debug_assert!(8 * LANES <= self.rate, "lanes beyond the rate");
+        assert!(8 * LANES <= self.rate, "lanes beyond the rate");
 
         self.states[i]
             .first_chunk()
@@ -944,6 +953,24 @@ mod tests {
 
                 assert_eq!(sponges.states[..count], expected.states[..count]);
 
+                for (i, message) in messages[..count].iter().enumerate() {
+                    if active[i] {
+                        let mut engine = Keccak::new(168, 0x1F);
+
+                        engine.update(message);
+
+                        let mut stream = [0; 3 * 168];
+
+                        engine.read(&mut stream);
+
+                        let mut block = [0; 168];
+
+                        sponges.read(i, &mut block);
+
+                        assert_eq!(block, stream[2 * 168..], "{count} sponges, sponge {i}");
+                    }
+                }
+
                 let mut alone = Keccak::new(136, 0x06);
 
                 alone.update(&data);
@@ -1001,5 +1028,57 @@ mod tests {
                 assert_eq!(sponges.states[i], before[i]);
             }
         }
+    }
+
+    // retire's mask against the sponges it names, for every pattern and count.
+    #[test]
+    fn retire_marks_exactly_the_left_out() {
+        for count in 0..=MAX_SPONGES {
+            for pattern in 0..=u8::MAX {
+                let active = core::array::from_fn(|i| pattern >> i & 1 == 1);
+
+                let mut sponges = Sponges::empty();
+
+                sponges.count = count;
+
+                sponges.retire(&active);
+
+                let left_out = (0..count).fold(0u8, |m, i| m | u8::from(!active[i]) << i);
+
+                assert_eq!(
+                    sponges.done & mask_of(count),
+                    left_out,
+                    "{count} {pattern:#04x}"
+                );
+
+                assert_eq!(
+                    sponges.done | mask_of(count),
+                    u8::MAX,
+                    "{count} {pattern:#04x}"
+                );
+            }
+        }
+    }
+
+    fn mask_of(count: usize) -> u8 {
+        ((1u16 << count) - 1) as u8
+    }
+
+    // A sponge left out of a squeeze is done on every path, so that no caller relies on squeezing
+    // it again where the vector form would have permuted it.
+    #[test]
+    #[should_panic(expected = "a sponge left out is not squeezed again")]
+    fn sponges_left_out_are_done() {
+        let messages: [[u8; 34]; 4] = core::array::from_fn(|i| [i as u8; 34]);
+
+        let parts = messages.each_ref().map(|message| [&message[..]]);
+
+        let lists = parts.each_ref().map(|list| &list[..]);
+
+        let mut sponges = started(168, 0x1F, &lists);
+
+        sponges.squeeze(core::array::from_fn(|i| i != 2));
+
+        sponges.squeeze([true; MAX_SPONGES]);
     }
 }

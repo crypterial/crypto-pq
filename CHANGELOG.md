@@ -23,6 +23,13 @@ Implements specification 1.1 (draft).
   the portable code stay their twins, and outputs are unchanged.
 - ML-KEM-512 key generation samples all four entries of the matrix in one group of sponges where
   the CPU's group has four, and then hashes the encapsulation key. Outputs are unchanged.
+- Keccak-f[1600] on Arm Neoverse N2: one state takes scalar rounds whose rotations fold into the
+  operands of EOR and BIC, and three states take two in vector registers with the SHA3 instructions
+  beside one in general registers, in place of the portable code. Other Arm cores keep the kernels
+  they had. Outputs are unchanged.
+- One-shot SHA-3, SHAKE, cSHAKE and KMAC on Apple cores keep the Keccak state in registers from the
+  start, also from the precomputed state of cSHAKE and KMAC, with no copy of it on the stack.
+  Outputs are unchanged.
 - The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
   intrinsics are stable.
 

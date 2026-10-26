@@ -44,6 +44,17 @@ mod dsa;
 #[cfg(feature = "frodokem")]
 mod frodo;
 
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+mod lazy;
+
 mod memory;
 
 #[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
@@ -95,7 +106,8 @@ const SHA3: u32 = 1 << 1;
 // SHA3 on a core where two Keccak states in vector registers beat two scalar permutations. Apple
 // cores run EOR3, RAX1, XAR and BCAX on every vector pipe and take half the time per state.
 // Neoverse N2, V1 and V2 run them on one pipe, and published measurements found them slower than
-// scalar code there, so other cores keep the scalar permutation until they are measured.
+// scalar code there, so other cores keep the scalar permutation until they are measured. On N2,
+// now measured, a vector pair runs only beside a scalar state (LAZY).
 const KECCAK: u32 = 1 << 2;
 
 const DIT: u32 = 1 << 3;
@@ -107,6 +119,13 @@ const AES: u32 = 1 << 4;
 // a ROR: Apple cores. On Neoverse N2 the portable code, whose rotations the compiler folds into
 // the EORs, takes 7% less time at 1 KiB, so other cores keep it.
 const ASCON: u32 = 1 << 5;
+
+// Neoverse N2 (implementer 41h, part D49h), whose EOR and BIC take a rotated operand at the cost of
+// a plain one: one state takes the scalar rounds with lazy rotation (lazy.rs, 222 against the
+// portable code's 248 ns), and three states two in vector registers with the SHA3 instructions
+// beside one with lazy rotation (502 ns, against 744 for three portable permutations; four, with
+// two scalar states, took 847). Other cores keep the portable code until they are measured.
+const LAZY: u32 = 1 << 6;
 
 const READY: u32 = 1 << 31;
 
@@ -130,10 +149,11 @@ const fn guaranteed(feature: u32) -> bool {
 }
 
 // The constant-time check runs under valgrind, which cannot execute the SHA3, SHA512 and DIT
-// instructions in every version, so its build leaves them out and checks the rest.
+// instructions in every version, so its build leaves them out and checks the rest, the scalar
+// rounds of LAZY among them.
 const fn usable(feature: u32) -> bool {
     if cfg!(crypto_pq_ct) {
-        return feature == SHA2 || feature == AES;
+        return feature == SHA2 || feature == AES || feature == LAZY;
     }
 
     true
@@ -195,7 +215,11 @@ fn probe() -> u32 {
     #[allow(clippy::useless_conversion)]
     let hwcap = u64::from(hwcap);
 
-    let apple = hwcap & HWCAP_CPUID != 0 && implementer() == APPLE;
+    let midr = if hwcap & HWCAP_CPUID != 0 { midr() } else { 0 };
+
+    let apple = (midr >> 24) & 0xFF == APPLE;
+
+    let neoverse_n2 = (midr >> 24) & 0xFF == ARM && (midr >> 4) & 0xFFF == NEOVERSE_N2;
 
     let mut found = 0;
 
@@ -221,6 +245,10 @@ fn probe() -> u32 {
         found |= ASCON;
     }
 
+    if neoverse_n2 {
+        found |= LAZY;
+    }
+
     if hwcap & HWCAP_DIT != 0 {
         found |= DIT;
     }
@@ -231,11 +259,18 @@ fn probe() -> u32 {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const APPLE: u64 = 0x61;
 
-// Bits 31..24 of MIDR_EL1. All cores of one system share an implementer, even when their parts
-// differ, so the core this thread happens to run on answers for all of them.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ARM: u64 = 0x41;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const NEOVERSE_N2: u64 = 0xD49;
+
+// MIDR_EL1: the implementer in bits 31..24, the part in bits 15..4. All cores of one system share
+// an implementer, so the core this thread happens to run on answers for all of them; the part
+// selects only LAZY, for Neoverse N2, whose servers have one kind of core.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(unsafe_code)]
-fn implementer() -> u64 {
+fn midr() -> u64 {
     let midr: u64;
 
     // SAFETY: only called with HWCAP_CPUID, which means that Linux traps this read of MIDR_EL1
@@ -248,7 +283,7 @@ fn implementer() -> u64 {
         );
     }
 
-    (midr >> 24) & 0xFF
+    midr
 }
 
 // winnt.h: PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE (AES and SHA-256),
@@ -606,7 +641,11 @@ pub(crate) fn compress512_pair(states: &mut [[u64; 8]; 2], blocks: &[[u8; 128]; 
     feature = "sha3"
 ))]
 pub(crate) fn keccak_group() -> usize {
-    if has(KECCAK) { 6 } else { 4 }
+    if has(KECCAK) || has(LAZY) && has(SHA3) {
+        6
+    } else {
+        4
+    }
 }
 
 // Permutes every state, three at a time where that leaves no single state over, then two, then
@@ -623,7 +662,11 @@ pub(crate) fn keccak_group() -> usize {
 ))]
 pub(crate) fn permute_many(states: &mut [&mut [u64; 25]]) -> usize {
     if !has(KECCAK) {
-        return 0;
+        return if has(LAZY) {
+            permute_many_lazy(states)
+        } else {
+            0
+        };
     }
 
     let count = states.len();
@@ -655,6 +698,44 @@ pub(crate) fn permute_many(states: &mut [&mut [u64; 25]]) -> usize {
     count
 }
 
+// permute_many on Neoverse N2: three at a time, two in vector registers beside one in general
+// registers, and the rest one by one with lazy rotation, which took less time for two states
+// (443 ns) than the vector pair (465).
+#[allow(unsafe_code)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+fn permute_many_lazy(states: &mut [&mut [u64; 25]]) -> usize {
+    let count = states.len();
+
+    let three = has(SHA3);
+
+    let mut rest = states;
+
+    while !rest.is_empty() {
+        let size = if three && rest.len() >= 3 { 3 } else { 1 };
+
+        let (group, tail) = core::mem::take(&mut rest).split_at_mut(size);
+
+        match group {
+            // SAFETY: the CPU has SHA3.
+            [first, second, third] => unsafe { permute3_lazy(first, second, third) },
+            [only] => lazy::permute(only),
+            _ => unreachable!("groups have one or three states"),
+        }
+
+        rest = tail;
+    }
+
+    count
+}
+
 // Absorbs the whole blocks of data, rate bytes each, into one state, and returns how many bytes
 // that was. The state stays in vector registers from one block to the next.
 #[allow(unsafe_code)]
@@ -670,11 +751,28 @@ pub(crate) fn permute_many(states: &mut [&mut [u64; 25]]) -> usize {
 pub(crate) fn absorb(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
     let length = data.len() - data.len() % rate;
 
-    if length == 0 || !has(KECCAK) {
+    if length == 0 {
         return 0;
     }
 
     let blocks = &data[..length];
+
+    if !has(KECCAK) {
+        if !has(LAZY) {
+            return 0;
+        }
+
+        match rate {
+            72 => lazy::absorb::<72>(state, blocks.as_chunks().0),
+            104 => lazy::absorb::<104>(state, blocks.as_chunks().0),
+            136 => lazy::absorb::<136>(state, blocks.as_chunks().0),
+            144 => lazy::absorb::<144>(state, blocks.as_chunks().0),
+            168 => lazy::absorb::<168>(state, blocks.as_chunks().0),
+            _ => return 0,
+        }
+
+        return length;
+    }
 
     // SAFETY: KECCAK is only ever found together with SHA3.
     unsafe {
@@ -712,7 +810,20 @@ pub(crate) fn digest(
     out: &mut [u8],
 ) -> bool {
     if !has(KECCAK) {
-        return false;
+        if !has(LAZY) {
+            return false;
+        }
+
+        match rate {
+            72 => lazy::digest::<72>(initial, data, suffix, out),
+            104 => lazy::digest::<104>(initial, data, suffix, out),
+            136 => lazy::digest::<136>(initial, data, suffix, out),
+            144 => lazy::digest::<144>(initial, data, suffix, out),
+            168 => lazy::digest::<168>(initial, data, suffix, out),
+            _ => return false,
+        }
+
+        return true;
     }
 
     // SAFETY: as in absorb.
@@ -2113,6 +2224,50 @@ fn permute3_sha3(first: &mut [u64; 25], second: &mut [u64; 25], third: &mut [u64
     feature = "sha3"
 ))]
 #[target_feature(enable = "sha3")]
+fn permute3_lazy(first: &mut [u64; 25], second: &mut [u64; 25], third: &mut [u64; 25]) {
+    let mut a = [vdupq_n_u64(0); 25];
+
+    for (lane, (x, y)) in a.iter_mut().zip(first.iter().zip(second.iter())) {
+        *lane = vector64(*x, *y);
+    }
+
+    let mut v = *third;
+
+    for constants in ROUND_CONSTANTS.as_chunks::<{ lazy::BLOCK }>().0 {
+        macro_rules! step {
+            ($($r:literal)*) => {
+                $(
+                    round(&mut a, constants[$r]);
+
+                    lazy::round::<$r>(&mut v, constants[$r]);
+                )*
+            };
+        }
+
+        step!(0 1 2 3 4 5 6 7);
+
+        lazy::settle(&mut v);
+    }
+
+    *third = v;
+
+    for (lane, (x, y)) in a.iter().zip(first.iter_mut().zip(second.iter_mut())) {
+        *x = vgetq_lane_u64::<0>(*lane);
+
+        *y = vgetq_lane_u64::<1>(*lane);
+    }
+}
+
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+#[target_feature(enable = "sha3")]
 fn absorb_sha3<const RATE: usize>(state: &mut [u64; 25], blocks: &[[u8; RATE]]) {
     let mut a = [vdupq_n_u64(0); 25];
 
@@ -2311,6 +2466,32 @@ fn digest_sha3<const RATE: usize>(
     suffix: u8,
     out: &mut [u8],
 ) {
+    match initial {
+        Some(initial) => digest_sha3_from::<RATE, true>(initial, data, suffix, out),
+        None => digest_sha3_from::<RATE, false>(&[0; 25], data, suffix, out),
+    }
+}
+
+// digest_sha3 from initial if START and from zero otherwise, one copy for each: with one copy,
+// LLVM joined the two starts through a copy of the state on the stack. The output is read from
+// the low halves of the vectors only, so the initial state goes into those alone, by plain loads.
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+#[target_feature(enable = "sha3")]
+#[inline]
+fn digest_sha3_from<const RATE: usize, const START: bool>(
+    initial: &[u64; 25],
+    data: &[u8],
+    suffix: u8,
+    out: &mut [u8],
+) {
     let (blocks, tail) = data.as_chunks::<RATE>();
 
     let (lanes, rest) = tail.as_chunks::<8>();
@@ -2339,9 +2520,9 @@ fn digest_sha3<const RATE: usize>(
 
     let mut a = [vdupq_n_u64(0); 25];
 
-    if let Some(initial) = initial {
+    if START {
         for (lane, x) in a.iter_mut().zip(initial) {
-            *lane = vdupq_n_u64(*x);
+            *lane = vcombine_u64(vcreate_u64(*x), vcreate_u64(0));
         }
     }
 
@@ -2613,5 +2794,51 @@ mod tests {
         }
 
         KEYED.store(false, Ordering::Relaxed);
+    }
+}
+
+// permute_many_lazy on any core, against the portable permutation, for batches of one to eight
+// states: on Neoverse N2 the dispatch selects it, elsewhere this test is its only check.
+#[cfg(all(
+    test,
+    any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    )
+))]
+mod lazy_tests {
+    use super::*;
+    use crate::cpu::testing::Inputs;
+
+    #[test]
+    fn lazy_batches_match_portable() {
+        let mut inputs = Inputs::new(25);
+
+        for n in 0..400 {
+            let count = 1 + n % 8;
+
+            let mut states = [[0u64; 25]; 8];
+
+            for state in &mut states[..count] {
+                *state = inputs.words();
+            }
+
+            let mut expected = states;
+
+            for state in &mut expected[..count] {
+                keccak::permute(state);
+            }
+
+            let done = permute_many_lazy(&mut states.each_mut()[..count]);
+
+            assert_eq!(done, count);
+
+            assert_eq!(states, expected, "case {n}");
+        }
     }
 }

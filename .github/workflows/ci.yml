@@ -311,7 +311,8 @@ jobs:
   # The AVX-512VL kernels on real hardware: QEMU's user mode does not emulate AVX-512, and the
   # x86-64 runners are a mix of CPUs with and without it, so twelve copies of the suite run, each
   # recording its CPU and whether it took the AVX-512VL paths, and the next job fails unless one
-  # took the four-state path and one the one-state path, which only AMD cores select.
+  # took the four-state path and one the one-state path, which only the cores in the table of
+  # cpu/x86_64.rs one_state() select (AMD Zen 4 and Zen 5, Intel Ice Lake Xeon).
   rust-avx512:
     name: rust AVX-512VL kernels (runner ${{ matrix.copy }})
     runs-on: ubuntu-latest

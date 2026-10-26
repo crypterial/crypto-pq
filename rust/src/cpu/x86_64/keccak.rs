@@ -19,7 +19,7 @@ use core::arch::x86_64::*;
 
 use core::mem::MaybeUninit;
 
-use super::memory::{store_vector_at, store128, store256};
+use super::memory::{load256, store_vector_at, store128, store256};
 use crate::keccak::{self, ROUND_CONSTANTS};
 use crate::sha2::last_bytes;
 use crate::wipe::wipe;
@@ -174,9 +174,9 @@ fn scatter4(a: &[__m256i; 25], states: &mut [&mut [u64; 25]]) {
 }
 
 // The lanes of up to four states in vectors, lane i of each in vector i: each word broadcast from
-// memory, which takes only a load, and the four blended together, which no shuffle port has to
-// run. Each vector is then whole, so that a store of it is one 32-byte store, which a later load of
-// the vector takes directly; LLVM split vectors built by inserts into two 16-byte stores.
+// memory and the four blended together. LLVM still builds each vector in two 128-bit halves and
+// stores them apart (1.89 and 1.99 at opt-levels 2 and 3), so the first squeeze after a start
+// loads each vector from two stores.
 #[target_feature(enable = "avx2")]
 #[inline]
 fn lane4(s: &[&[u64; 25]; 4], i: usize) -> __m256i {
@@ -449,9 +449,10 @@ fn xor3(x: __m256i, y: __m256i, z: __m256i) -> __m256i {
 // of the rho-pi output comes from lane (x + 3y) % 5 + 5x.
 //
 // Two forms of theta, chosen per vendor in x86_64.rs from the times measured: with THETA3, theta's
-// value goes into each lane in one three-input instruction, the fewest instructions, which Intel's
-// cores run best; without it, theta's values are computed once per column and added with XOR,
-// which AMD's cores run best (four states: Zen 5 172 against 185 ns, Zen 4 204 against 227).
+// value goes into each lane in one three-input instruction, in fewer instructions, which Intel's
+// cores run in less time; without it, theta's values are computed once per column and added with
+// XOR, which AMD's cores run in less time (four states: Zen 5 172 against 185 ns, Zen 4 204
+// against 227).
 #[target_feature(enable = "avx512f,avx512vl")]
 #[inline]
 fn round_avx512<const THETA3: bool>(a: &mut [__m256i; 25], constant: u64) {
@@ -555,20 +556,45 @@ fn parities4(a: &[__m256i; 25]) -> [__m256i; 5] {
 
 // The 24 rounds on four states in memory, one vector per lane, out of line: inlined, the rounds
 // of two to a step left LLVM with a call of its own anyway, and copies of the states around it.
-// Every caller writes the vectors with whole 32-byte stores, which the loads here take directly.
+// The loads here take whole 32-byte stores directly, as the previous rounds, spare_in, rows4_with
+// and wide_in by rows leave them; the halves that wide_in stores otherwise cost a stall on the
+// first load of each vector.
 #[target_feature(enable = "avx2,avx512f,avx512vl")]
 #[inline(never)]
 pub(super) fn rounds4_avx512<const THETA3: bool, const PAIRS: bool>(a: &mut [__m256i; 25]) {
     rounds_avx512::<THETA3, PAIRS>(a);
 }
 
-// Up to four states into the vector form of rounds4_avx512, the missing ones as zero states:
-// every element of group is written. Built without AVX-512, as are the other functions around
+// Up to four states into the vector form of rounds4_avx512, the missing ones as zero states: every
+// element of group is written. With ROWS, four lanes of each state at a time by 32-byte loads and a
+// 4 x 4 transposition, stored whole; otherwise lane by lane from broadcasts, which LLVM stores as
+// 16-byte halves. Per four-state permutation, rows against broadcasts, from the previous
+// permutation's stores and then after 8-byte stores to the states: AMD Zen 5 187-202 against
+// 193-208 ns and 199-214 against 207-221, Zen 4 232-240 against 233-242 and 247-257 against
+// 254-263; Intel Emerald Rapids 279-299 against 278-301 and 296-316 against 289-309, Ice Lake 263
+// against 262 and 285 against 281-282. Built without AVX-512, as are the other functions around
 // rounds4_avx512, so that LLVM cannot join their stores into 512-bit ones.
 #[target_feature(enable = "avx2")]
-pub(super) fn wide_in(s: &[&[u64; 25]; 4], group: &mut MaybeUninit<[__m256i; 25]>) {
-    for i in 0..25 {
-        store_vector_at(lane4(s, i), group, i);
+pub(super) fn wide_in<const ROWS: bool>(
+    s: &[&[u64; 25]; 4],
+    group: &mut MaybeUninit<[__m256i; 25]>,
+) {
+    if ROWS {
+        for k in 0..6 {
+            let rows = transpose4(core::array::from_fn(|j| {
+                load256(&s[j].as_chunks::<4>().0[k])
+            }));
+
+            for (i, vector) in rows.into_iter().enumerate() {
+                store_vector_at(vector, group, 4 * k + i);
+            }
+        }
+
+        store_vector_at(lane4(s, 24), group, 24);
+    } else {
+        for i in 0..25 {
+            store_vector_at(lane4(s, i), group, i);
+        }
     }
 }
 
@@ -828,8 +854,8 @@ digest!(
 // as LLVM would copy and clear its buffers in 512-bit registers; the state passes through memory
 // once per permutation.
 //
-// SAFETY: the caller makes sure that the CPU has BMI1, BMI2, AVX-512F and AVX-512VL and that the
-// operating system saves their registers.
+// SAFETY: the caller makes sure that the CPU has AVX2, BMI1, BMI2, AVX-512F and AVX-512VL and that
+// the operating system saves their registers.
 digest!(
     #[target_feature(enable = "bmi1,bmi2")]
     #[allow(unsafe_code)]
