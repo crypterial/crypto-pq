@@ -287,8 +287,8 @@ run time, and the AVX2 kernels and the portable code stay its twins ([15.3](15-p
 AVX-512, so the constant-time check's build leaves the tier out ([14.1](14-security.md#141-constant-time) item 7), and its kernels are
 constant time by construction: logic, rotations, shuffles, blends, broadcasts and loads and stores
 at addresses that depend on public lengths only, each on Intel's list of data-operand-independent
-timing instructions or a floating-point-domain logic, move, unpack, shuffle or blend instruction of
-[D-75](#decision-d-75), with no branch, address or variable-latency
+timing instructions or a floating-point-domain logic, move, unpack, shuffle, insert or blend
+instruction of [D-75](#decision-d-75), with no branch, address or variable-latency
 instruction that depends on the data; which kernel runs depends only on the processor. CI runs them on native runners ([18.2](18-testing.md#182-cpu-tiers)).
 The minimum Rust version is 1.89, the first in which these target features and intrinsics are stable
 ([15.2](15-platforms.md#152-supported-platforms)). Rationale: sixteen more registers, three-input logic and 64-bit rotations take fewer
@@ -514,17 +514,29 @@ inverse NTT per polynomial of ŝ and one pass over S^T.
 
 ## Decision D-75
 
-On x86-64, the following floating-point-domain logic, move, unpack, shuffle and blend instructions,
-which LLVM emits for the integer intrinsics of the kernels, count as on Intel's list of
-data-operand-independent timing instructions ([14.1](14-security.md#141-constant-time) item 1), in their VEX and their legacy SSE
-encodings. Each of these gives the result of an integer instruction on the list: VANDPS, VANDNPS
-and VORPS as VPAND, VPANDN and VPOR; VUNPCKLPS, VUNPCKHPS, VUNPCKLPD and VUNPCKHPD as VPUNPCKLDQ,
-VPUNPCKHDQ, VPUNPCKLQDQ and VPUNPCKHQDQ; VMOVLHPS and VMOVHLPS as VPUNPCKLQDQ and VPUNPCKHQDQ; and
-VBLENDPS and VBLENDPD with an immediate as VPBLENDD. Each of these does on 32-bit or 64-bit
-elements what an instruction on the list does on others, with no integer instruction of the same
-result: VSHUFPS, VSHUFPD and VINSERTPS, which pick elements of registers by an immediate, as
-VPSHUFD; VBLENDVPS and VBLENDVPD, which select each element by its sign bit in a mask register, as
-VPBLENDVB; and VMOVMSKPS and VMOVMSKPD, which gather those sign bits into a general register, as
-VPMOVMSKB. An instruction on the list counts whatever its domain, as XORPS, MOVAPS, MOVUPS, MOVSD,
-VPERM2F128 and VINSERTF128 do. No other floating-point instruction counts. Rationale: none of these
-instructions does arithmetic or reads its operands as numbers.
+On x86-64, the following floating-point-domain logic, move, unpack, shuffle, insert and blend
+instructions, which LLVM emits for the integer intrinsics of the kernels, count as on Intel's list
+of data-operand-independent timing instructions ([14.1](14-security.md#141-constant-time) item 1), in their VEX and their legacy SSE
+encodings. Each of these gives the result of an integer instruction on the list: VANDPS, VANDNPS and
+VORPS as VPAND, VPANDN and VPOR; VUNPCKLPS, VUNPCKHPS, VUNPCKLPD and VUNPCKHPD as VPUNPCKLDQ,
+VPUNPCKHDQ, VPUNPCKLQDQ and VPUNPCKHQDQ; VMOVLHPS as VPUNPCKLQDQ, and VMOVHLPS as VPUNPCKHQDQ with
+its two sources swapped; VBLENDPS as VPBLENDD with the same immediate, and VBLENDPD as VPBLENDD with
+each bit of its immediate doubled. In the legacy SSE encoding, which VPBLENDD and the three-operand
+VPUNPCKHQDQ do not have, BLENDPS and BLENDPD give the result of PBLENDW with each bit of the
+immediate repeated two or four times, and MOVHLPS that of VPUNPCKHQDQ with the destination as its
+second source. Each of these moves 32-bit or 64-bit elements or their sign bits, selected by an
+immediate or by sign bits, as an instruction on the list does for other elements or sources, though
+no integer instruction gives its result for every operand: VSHUFPS and VSHUFPD, which fill the low
+half of each 128-bit lane with elements of the first source and the high half with elements of the
+second, picked by an immediate, as VPSHUFD picks those of one source, whose result VSHUFPS gives
+when both sources are one register; VINSERTPS, which writes a 32-bit element of a register or of
+memory at the position its immediate gives and zeroes the elements the immediate names, as VPINSRD
+writes one from a general register or memory; VBLENDVPS and VBLENDVPD, which select each 32-bit or
+64-bit element by its sign bit in a mask register, as VPBLENDVB selects each byte; and VMOVMSKPS and
+VMOVMSKPD, which gather the sign bits of the 32-bit or 64-bit elements into a general register, as
+VPMOVMSKB gathers those of the bytes. An instruction on the list counts whatever its domain, as
+VMOVSD, VPERM2F128 and VINSERTF128 do, and in its VEX and its legacy SSE encoding where the list
+names one of them: VXORPS, VMOVAPS and VMOVUPS as XORPS, MOVAPS and MOVUPS, and the legacy MOVSD of
+opcodes 10h and 11h as VMOVSD (the MOVSD of the list, opcode A5h, is the string move). No other
+floating-point instruction counts. Rationale: none of these instructions does arithmetic or reads
+its operands as numbers.

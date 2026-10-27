@@ -27,10 +27,10 @@ Implements specification 1.1 (draft).
   operands of EOR and BIC, and three states take two in vector registers with the SHA3 instructions
   beside one in general registers, in place of the portable code. Other Arm cores keep the kernels
   they had. Outputs are unchanged.
-- One-shot SHA-3, SHAKE, cSHAKE and KMAC on Apple cores keep the Keccak state in registers from the
-  start, also from the precomputed state of cSHAKE and KMAC, with no copy of it on the stack. A
-  state permuted or absorbed alone is loaded into one half of each vector register by plain loads.
-  Outputs are unchanged.
+- One-shot SHA-3, SHAKE, cSHAKE and KMAC on Apple cores have one copy of the kernel for a start
+  from zero and one for the precomputed state of cSHAKE and KMAC, so that LLVM no longer joins the
+  two starts through a copy of the state on the stack. A state permuted or absorbed alone is loaded
+  into one half of each vector register by plain loads. Outputs are unchanged.
 - The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
   intrinsics are stable.
 

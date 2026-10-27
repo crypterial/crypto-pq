@@ -6,7 +6,7 @@
 // A with the secret matrices; with AVX-512F and AVX-512VL besides, Keccak-f[1600] on four states
 // and on one in 256-bit registers; BLAKE2b, BLAKE2s and BLAKE3 without AVX2 with SSE4.1. Every
 // instruction that takes secret data is on Intel's list of data-operand-independent timing
-// instructions or is a floating-point-domain logic, move, unpack, shuffle or blend instruction that
+// instructions or is a floating-point-domain logic, move, unpack, shuffle, insert or blend one that
 // SPEC D-75 counts with it, as LLVM emits some for integer intrinsics; branches, divisions and the
 // other instructions take public values only, such as lengths and counts, so no branch or address
 // depends on secret data. The kernels are safe code inside #[target_feature] functions, apart from
@@ -2224,7 +2224,8 @@ mod tests {
 
     // Every form of the AVX-512VL kernels against the portable permutation, whichever vendor's
     // core runs the test: both theta forms of the four-state rounds, each fed by both forms of
-    // wide_in, for one to four states, and both forms of the one-state kernel.
+    // wide_in, for one to four states, and both forms of the one-state kernel, which permute1 and
+    // digest call, and of its absorption at every rate.
     #[test]
     #[allow(unsafe_code)]
     #[cfg(any(
@@ -2318,5 +2319,42 @@ mod tests {
                 assert_eq!(one, expected_one, "one state, theta3 {theta3}");
             }
         }
+
+        let data: [u8; 336] = inputs.bytes();
+
+        macro_rules! absorb {
+            ($($rate:literal)*) => {
+                $(
+                    let blocks = data.as_chunks::<$rate>().0;
+
+                    let mut portable = states[0];
+
+                    for block in blocks {
+                        for (lane, bytes) in portable.iter_mut().zip(block.as_chunks().0) {
+                            *lane ^= u64::from_le_bytes(*bytes);
+                        }
+
+                        crate::keccak::permute(&mut portable);
+                    }
+
+                    for theta3 in [true, false] {
+                        let mut absorbed = states[0];
+
+                        // SAFETY: as above.
+                        unsafe {
+                            if theta3 {
+                                keccak::absorb_avx512::<$rate, true>(&mut absorbed, blocks);
+                            } else {
+                                keccak::absorb_avx512::<$rate, false>(&mut absorbed, blocks);
+                            }
+                        }
+
+                        assert_eq!(absorbed, portable, "rate {}, theta3 {theta3}", $rate);
+                    }
+                )*
+            };
+        }
+
+        absorb!(72 104 136 144 168);
     }
 }
