@@ -712,6 +712,91 @@ fn sample_noise(sponges: &mut Sponges, eta: usize, seed: &[u8], first: usize, ou
     }
 }
 
+// y, e1 and e2 of encryption where eta1 = 3 (k = 2): y takes two blocks of PRF output, e1 and e2
+// one each. y and e1[0] start as three sponges with e1[1] beside them, then y's second blocks run
+// with e2 beside: two permutation calls instead of three, each of at most four states, which
+// keeps the spare state in the first group of the vector form. Out of line: inlined, it grew the
+// frame of pke_encrypt, and with it encapsulation for k = 3 and 4 took up to 15% more time on AVX2
+// cores.
+#[inline(never)]
+fn encryption_noise(
+    sponges: &mut Sponges,
+    p: &Parameters,
+    seed: &[u8],
+    y: &mut [Poly],
+    e: &mut [Poly],
+) {
+    let k = y.len();
+
+    let nonces: [[u8; 1]; 3] = core::array::from_fn(|i| [i as u8]);
+
+    let parts = nonces.each_ref().map(|nonce| [seed, &nonce[..]]);
+
+    let messages = parts.each_ref().map(|parts| &parts[..]);
+
+    sponges.start(136, SHAKE, &messages[..k + 1]);
+
+    let mut beside = Keccak::new(136, SHAKE);
+
+    beside.update(seed);
+
+    beside.update(&[k as u8 + 1]);
+
+    beside.finish_with(|state| sponges.squeeze_beside([true; MAX_SPONGES], state));
+
+    // 192 bytes for each of y: the 17 lanes of the first block and 7 of the second.
+    let mut lanes = [[0u64; 24]; 2];
+
+    for (i, lanes) in lanes[..k].iter_mut().enumerate() {
+        lanes[..17].copy_from_slice(sponges.lanes::<17>(i));
+    }
+
+    binomial(p.eta2, sponges.lanes::<16>(k), &mut e[0]);
+
+    let mut words = [0u64; 16];
+
+    beside_words(&mut beside, &mut words);
+
+    binomial(p.eta2, &words, &mut e[1]);
+
+    let mut last = Keccak::new(136, SHAKE);
+
+    last.update(seed);
+
+    last.update(&[2 * k as u8]);
+
+    let active = core::array::from_fn(|i| i < k);
+
+    last.finish_with(|state| sponges.squeeze_beside(active, state));
+
+    for (i, (f, lanes)) in y.iter_mut().zip(&mut lanes).enumerate() {
+        lanes[17..].copy_from_slice(sponges.lanes::<7>(i));
+
+        binomial(p.eta1, lanes, f);
+    }
+
+    beside_words(&mut last, &mut words);
+
+    binomial(p.eta2, &words, &mut e[k]);
+
+    wipe(lanes[..k].as_flattened_mut());
+
+    wipe(&mut words);
+}
+
+// The first 128 bytes that a finished sponge squeezes, as 64-bit lanes in stream order.
+fn beside_words(sponge: &mut Keccak, words: &mut [u64; 16]) {
+    let mut bytes = [0; 128];
+
+    sponge.read(&mut bytes);
+
+    for (word, bytes) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        *word = u64::from_le_bytes(*bytes);
+    }
+
+    wipe(&mut bytes);
+}
+
 // The PRF output as the sponges' 64-bit lanes in stream order, 64 eta bytes.
 fn binomial(eta: usize, lanes: &[u64], f: &mut Poly) {
     if !cpu::binomial(eta, lanes, Q as u16, f) {
@@ -758,21 +843,27 @@ fn binomial_portable(eta: usize, data: &[u8], f: &mut Poly) {
     }
 }
 
-// Â, with row i and column j at i * k + j, a group of entries at a time.
-fn sample_matrix(rho: &[u8], k: usize) -> Vec<Poly> {
-    let mut matrix = vec![[0; 256]; k * k];
+// The sizes of the runs of Â's k^2 entries that EncapsulationKey::new samples together, in order:
+// first runs of at most group() - 1 entries, enough of them to carry the permutations of H over
+// ek_len bytes beside theirs at three blocks of XOF output per entry (more than 99% of entries
+// need exactly three), then runs of at most group() for the rest; runs of each kind are as even
+// as their count allows.
+fn matrix_runs(k: usize, ek_len: usize) -> impl Iterator<Item = usize> {
+    let (entries, width) = (k * k, keccak::group());
 
-    let mut sponges = Sponges::empty();
+    let hashes = ek_len / 136 + 1;
 
-    let size = keccak::group();
+    let beside = hashes.div_ceil(3).min(entries.div_ceil(width - 1));
 
-    for (first, group) in (0..).step_by(size).zip(matrix.chunks_mut(size)) {
-        sample_ntt(&mut sponges, rho, k, first, group, |sponges, active| {
-            sponges.squeeze(active);
-        });
-    }
+    let carried = entries.min(beside * (width - 1));
 
-    matrix
+    let plain = (entries - carried).div_ceil(width);
+
+    let even = |total: usize, runs: usize| {
+        (0..runs).map(move |r| total * (r + 1) / runs - total * r / runs)
+    };
+
+    even(carried, beside).chain(even(entries - carried, plain))
 }
 
 fn decode_vector(bytes: &[u8]) -> Vec<Poly> {
@@ -798,14 +889,68 @@ pub(crate) struct EncapsulationKey {
 }
 
 impl EncapsulationKey {
-    // For a valid ek (check_encapsulation_key).
+    // For a valid ek (check_encapsulation_key). The permutations of H(ek) run beside those of Â,
+    // in the slot that runs of group() - 1 entries leave, while there are blocks of ek left.
     pub(crate) fn new(ek: &[u8], p: &Parameters) -> Self {
-        let (t, rho) = ek.split_at(384 * p.k);
+        let k = p.k;
+
+        let (t, rho) = ek.split_at(384 * k);
+
+        let mut matrix = vec![[0; 256]; k * k];
+
+        let mut hash = Keccak::new(136, SHA3);
+
+        let (blocks, tail) = ek.as_chunks::<136>();
+
+        let mut blocks = blocks.iter();
+
+        let mut finished = false;
+
+        let mut sponges = Sponges::empty();
+
+        let mut first = 0;
+
+        for size in matrix_runs(k, ek.len()) {
+            let group = &mut matrix[first..first + size];
+
+            sample_ntt(
+                &mut sponges,
+                rho,
+                k,
+                first,
+                group,
+                |sponges, active| match blocks.next() {
+                    Some(block) => {
+                        hash.update_block_with(block, |state| sponges.squeeze_beside(active, state))
+                    }
+                    None if !finished => {
+                        hash.update(tail);
+
+                        hash.finish_with(|state| sponges.squeeze_beside(active, state));
+
+                        finished = true;
+                    }
+                    None => sponges.squeeze(active),
+                },
+            );
+
+            first += size;
+        }
+
+        if !finished {
+            hash.update(blocks.as_slice().as_flattened());
+
+            hash.update(tail);
+        }
+
+        let mut h = [0; 32];
+
+        hash.read(&mut h);
 
         Self {
-            matrix: sample_matrix(rho, p.k),
+            matrix,
             t: decode_vector(t),
-            h: sha3_256(&[ek]),
+            h,
         }
     }
 }
@@ -867,9 +1012,26 @@ fn matrix_vector_portable(
     wipe(&mut acc);
 }
 
-// K-PKE.KeyGen, which also returns H(ek). The rows of the matrix are sampled one at a time, and
-// the blocks of ek that the rows before have completed are hashed beside the squeezes of the
-// next row, where a permutation costs less than alone.
+// The runs of Â's entries, in order, that key generation samples together, each beside a block of
+// H(ek) per squeeze while the rows of t encoded so far have one. Where Â fills one group of sponges
+// (k = 2 with groups of four) it is one run, and H(ek) runs after it, in fewer permutation calls
+// than two rows beside H(ek). With k = 4 and groups of four, the first row is a run of four and
+// the others go in runs of three, so that H(ek) takes the free slot of a four-state call instead
+// of a call of its own: 15 calls of four and 4 of one, against 12 and 12 by rows. Otherwise row by
+// row, where a slot is free beside each (k = 3, or groups of six).
+fn keygen_runs(k: usize, group: usize) -> &'static [usize] {
+    match (k, group) {
+        (2, 4) => &[4],
+        (2, _) => &[2, 2],
+        (3, _) => &[3, 3, 3],
+        (_, 4) => &[4, 3, 3, 3, 3],
+        _ => &[4, 4, 4, 4],
+    }
+}
+
+// K-PKE.KeyGen, which also returns H(ek). The blocks of ek that the rows of t before have
+// completed are hashed beside the squeezes of the next runs of Â (keygen_runs), where a
+// permutation costs less than alone.
 fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) -> [u8; 32] {
     let k = p.k;
 
@@ -907,60 +1069,53 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) -> [u8; 32
 
     let mut hashed = 0;
 
-    let (mut matrix, mut t) = ([[0; 256]; 4], [[0; 256]; 1]);
+    // Entries base, base + 1, ... of Â, those sampled and not yet in a row of t: at most six, with
+    // runs of three after rows of four.
+    let (mut matrix, mut t) = ([[0; 256]; 6], [[0; 256]; 1]);
 
-    // Where Â fills one group of sponges exactly (k = 2 with groups of four), it is sampled at
-    // once and H(ek) runs after it, in fewer permutation calls than two rows of two beside H(ek).
-    // Otherwise row by row, with a block of H(ek) beside each squeeze while there is one, which
-    // fills the slot after a row of three (k = 3), or after a row of two in a group of six.
-    let whole = k * k == keccak::group();
+    let (mut base, mut first, mut rows) = (0, 0, 0);
 
-    if whole {
+    for &size in keygen_runs(k, keccak::group()) {
+        let mut blocks = ek[hashed..384 * rows].as_chunks::<136>().0.iter();
+
         sample_ntt(
             &mut sponges,
             rho,
             k,
-            0,
-            &mut matrix[..k * k],
-            Sponges::squeeze,
+            first,
+            &mut matrix[first - base..first - base + size],
+            |sponges, active| match blocks.next() {
+                Some(block) => {
+                    hash.update_block_with(block, |state| sponges.squeeze_beside(active, state));
+
+                    hashed += 136;
+                }
+                None => sponges.squeeze(active),
+            },
         );
-    }
 
-    for i in 0..k {
-        let row = if whole {
-            &matrix[k * i..k * (i + 1)]
-        } else {
-            let mut blocks = ek[hashed..384 * i].as_chunks::<136>().0.iter();
+        first += size;
 
-            sample_ntt(
-                &mut sponges,
-                rho,
-                k,
-                k * i,
-                &mut matrix[..k],
-                |sponges, active| match blocks.next() {
-                    Some(block) => {
-                        hash.update_block_with(block, |state| {
-                            sponges.squeeze_beside(active, state)
-                        });
+        while k * (rows + 1) <= first {
+            let i = rows;
 
-                        hashed += 136;
-                    }
-                    None => sponges.squeeze(active),
-                },
-            );
+            let row = &matrix[k * i - base..k * (i + 1) - base];
 
-            &matrix[..k]
-        };
+            matrix_vector(&mut t, row, s, &caches[..k], &e[i..=i]);
 
-        matrix_vector(&mut t, row, s, &caches[..k], &e[i..=i]);
+            byte_encode(&t[0], 12, &mut ek[384 * i..384 * (i + 1)]);
 
-        byte_encode(&t[0], 12, &mut ek[384 * i..384 * (i + 1)]);
+            // t is part of the public key.
+            declassify(&ek[384 * i..384 * (i + 1)]);
 
-        // t is part of the public key.
-        declassify(&ek[384 * i..384 * (i + 1)]);
+            byte_encode(&s[i], 12, &mut dk[384 * i..384 * (i + 1)]);
 
-        byte_encode(&s[i], 12, &mut dk[384 * i..384 * (i + 1)]);
+            rows += 1;
+        }
+
+        matrix.copy_within(k * rows - base..first - base, 0);
+
+        base = k * rows;
     }
 
     hash.update(&ek[hashed..]);
@@ -985,9 +1140,14 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
 
     let mut sponges = Sponges::empty();
 
-    let mut y = [[0; 256]; 4];
+    // y from the nonces 0 to k - 1, e1 from k to 2k - 1 and e2 from 2k; for k = 2 all at once.
+    let (mut y, mut noise) = ([[0; 256]; 4], [[0; 256]; 5]);
 
-    sample_noise(&mut sponges, p.eta1, r, 0, &mut y[..k]);
+    if p.eta1 == 3 {
+        encryption_noise(&mut sponges, p, r, &mut y[..k], &mut noise[..k + 1]);
+    } else {
+        sample_noise(&mut sponges, p.eta1, r, 0, &mut y[..k]);
+    }
 
     for y_n in &mut y[..k] {
         ntt(y_n);
@@ -999,10 +1159,9 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
         multiply_cache(y_n, cache);
     }
 
-    // e1 from the nonces k to 2k - 1 and e2 from 2k.
-    let mut noise = [[0; 256]; 5];
-
-    sample_noise(&mut sponges, p.eta2, r, k, &mut noise[..k + 1]);
+    if p.eta1 != 3 {
+        sample_noise(&mut sponges, p.eta2, r, k, &mut noise[..k + 1]);
+    }
 
     let (c1, c2) = c.split_at_mut(32 * p.du as usize * k);
 
@@ -1149,13 +1308,30 @@ pub(crate) fn decaps_internal(
 // FIPS 203, 7.2: every coefficient of the encoded vector must already be reduced modulo q.
 pub(crate) fn check_encapsulation_key(ek: &[u8], p: &Parameters) -> bool {
     ek.len() == p.encapsulation_key_size()
-        && ek[..384 * p.k].as_chunks::<3>().0.iter().all(|chunk| {
-            let d1 = u32::from(chunk[0]) | (u32::from(chunk[1] & 0x0F) << 8);
+        && ek[..384 * p.k].as_chunks::<384>().0.iter().all(canonical12)
+}
 
-            let d2 = u32::from(chunk[1] >> 4) | (u32::from(chunk[2]) << 4);
+// Whether every 12-bit value of an encoded polynomial is below q. Where a CPU kernel decodes, this
+// is the check as FIPS 203 states it, ByteEncode_12(ByteDecode_12(data)) = data, in kernels that
+// take less time than the values one by one.
+fn canonical12(data: &[u8; 384]) -> bool {
+    let mut f = [0; 256];
 
-            d1 < Q && d2 < Q
-        })
+    if cpu::decode12(data, Q as u16, &mut f) {
+        let mut again = [0; 384];
+
+        byte_encode(&f, 12, &mut again);
+
+        return again == *data;
+    }
+
+    data.as_chunks::<3>().0.iter().all(|chunk| {
+        let d1 = u32::from(chunk[0]) | (u32::from(chunk[1] & 0x0F) << 8);
+
+        let d2 = u32::from(chunk[1] >> 4) | (u32::from(chunk[2]) << 4);
+
+        d1 < Q && d2 < Q
+    })
 }
 
 // SPEC 8.1.4, checks (1) to (4) of an expanded key: H(ek) is the stored h, ek passes the modulus
@@ -1369,6 +1545,47 @@ mod tests {
         }
 
         std::eprintln!("ML-KEM: {accelerated} of 20000 cases through the CPU kernels");
+    }
+
+    // The modulus check of an encoded polynomial against the values one by one, on encodings
+    // with values at q - 1, q and 4095 at random places and on random bytes.
+    #[test]
+    fn modulus_check_kernel_matches_portable() {
+        let mut inputs = Inputs::new(384);
+
+        let mut rejected = 0;
+
+        for n in 0..4000 {
+            let mut f: Poly = core::array::from_fn(|_| inputs.next() as u16 % Q as u16);
+
+            for _ in 0..n % 3 {
+                let at = (inputs.next() % 256) as usize;
+
+                f[at] = [Q as u16 - 1, Q as u16, 4095][(inputs.next() % 3) as usize];
+            }
+
+            let mut data = [0; 384];
+
+            encode_bits::<12>(&f, &mut data);
+
+            if n % 7 == 0 {
+                data = inputs.bytes();
+            }
+
+            let expected = data.as_chunks::<3>().0.iter().all(|chunk| {
+                let d1 = u32::from(chunk[0]) | (u32::from(chunk[1] & 0x0F) << 8);
+
+                let d2 = u32::from(chunk[1] >> 4) | (u32::from(chunk[2]) << 4);
+
+                d1 < Q && d2 < Q
+            });
+
+            assert_eq!(canonical12(&data), expected, "case {n}");
+
+            rejected += usize::from(!expected);
+        }
+
+        assert!(rejected > 1000, "{rejected} encodings out of range");
     }
 
     // The rejection kernel against the portable code from every count near the end and from

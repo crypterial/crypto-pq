@@ -21,8 +21,22 @@ Implements specification 1.1 (draft).
   SLH-DSA, stay in the kernel's vector layout from one block to the next. The kernels serve SHA-3,
   SHAKE, cSHAKE, KMAC and the Keccak of ML-KEM, ML-DSA, SLH-DSA and FrodoKEM. The AVX2 kernels and
   the portable code stay their twins, and outputs are unchanged.
-- ML-KEM-512 key generation samples all four entries of the matrix in one group of sponges where
-  the CPU's group has four, and then hashes the encapsulation key. Outputs are unchanged.
+- ML-KEM key generation hashes the encapsulation key beside the sampling of the matrix: each run
+  of entries leaves a slot in the group of sponges for the blocks of the key that the rows of t
+  encoded so far complete. ML-KEM-1024 with groups of four samples a first row of four and then
+  runs of three; ML-KEM-512 samples all four entries in one group where the CPU's group has four,
+  and then hashes the key. Outputs are unchanged.
+- An ML-KEM encapsulation key decoded from bytes is hashed beside the sampling of its matrix, in
+  the slot that runs of one entry less than the group of sponges leave, and its modulus check is
+  ByteEncode_12(ByteDecode_12(ek)) = ek in the CPU's kernels, as FIPS 203 states it. Outputs and
+  the keys accepted are unchanged.
+- ML-KEM-512 encryption samples y, e1 and e2 in two permutation calls in place of three: e1[1]
+  and then e2 are squeezed beside the sponges of y and e1[0]. Outputs are unchanged.
+- ML-KEM on x86-64 with AVX2: the sampling of the matrix reads its 12-bit candidates from the
+  Keccak lanes in place, without a copy into a byte buffer, and the NTT and inverse NTT take the
+  layers within each block of 32 coefficients four blocks at a time, so that four independent
+  butterflies are in flight. The inverse stores each block, transposed, in its output first, so
+  that the compiler keeps no block of secret coefficients on the stack. Outputs are unchanged.
 - Keccak-f[1600] on Arm Neoverse N2: one state takes scalar rounds whose rotations fold into the
   operands of EOR and BIC, and three states take two in vector registers with the SHA3 instructions
   beside one in general registers, in place of the portable code. Other Arm cores keep the kernels

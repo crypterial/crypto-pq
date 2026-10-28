@@ -18,7 +18,7 @@ use core::arch::x86_64::*;
 use super::ACCEPTED;
 #[cfg(not(crypto_pq_optimized))]
 use super::memory::words_of;
-use super::memory::{load128, load256, store128, store256};
+use super::memory::{load128, load128_bytes, load256, store128, store256};
 use crate::cpu::Field16;
 use crate::wipe::wipe_unless_optimized;
 
@@ -174,34 +174,66 @@ pub(super) fn ntt(f: &mut [u16; 256], field: &Field16) {
         wipe_unless_optimized!(words_of(&mut x));
     }
 
-    for (b, block) in vectors.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-        let (a, c) = (load256(&block[0]), load256(&block[1]));
+    // Four blocks at a time, layer by layer, so that four independent butterflies are in flight
+    // at every step, as in the first loop: one block alone is a single chain of dependent
+    // multiplications that the core waits on.
+    for (p, group) in vectors.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        let b: [usize; 4] = core::array::from_fn(|i| 4 * p + i);
 
-        let (a, c) = forward_butterfly(a, c, broadcast(z[8 + b], zq[8 + b]), q);
+        let mut x: [__m256i; 4] = core::array::from_fn(|i| load256(&group[2 * i]));
 
-        let (x, y) = halves(a, c);
+        let mut y: [__m256i; 4] = core::array::from_fn(|i| load256(&group[2 * i + 1]));
 
-        let (x, y) = forward_butterfly(x, y, lanes(&field.forward_x86, 0, b), q);
+        for i in 0..4 {
+            (x[i], y[i]) = forward_butterfly(x[i], y[i], broadcast(z[8 + b[i]], zq[8 + b[i]]), q);
+        }
 
-        let (x, y) = quarters(x, y);
+        for i in 0..4 {
+            (x[i], y[i]) = halves(x[i], y[i]);
+        }
 
-        let (x, y) = forward_butterfly(x, y, lanes(&field.forward_x86, 1, b), q);
+        for i in 0..4 {
+            (x[i], y[i]) = forward_butterfly(x[i], y[i], lanes(&field.forward_x86, 0, b[i]), q);
+        }
 
-        let (x, y) = pairs(x, y);
+        for i in 0..4 {
+            (x[i], y[i]) = quarters(x[i], y[i]);
+        }
 
-        let (x, y) = forward_butterfly(x, y, lanes(&field.forward_x86, 2, b), q);
+        for i in 0..4 {
+            (x[i], y[i]) = forward_butterfly(x[i], y[i], lanes(&field.forward_x86, 1, b[i]), q);
+        }
 
-        let (x, y) = (freeze(barrett(x, v, q), q), freeze(barrett(y, v, q), q));
+        for i in 0..4 {
+            (x[i], y[i]) = pairs(x[i], y[i]);
+        }
 
-        let (x, y) = pairs(x, y);
+        for i in 0..4 {
+            (x[i], y[i]) = forward_butterfly(x[i], y[i], lanes(&field.forward_x86, 2, b[i]), q);
+        }
 
-        let (x, y) = quarters(x, y);
+        for i in 0..4 {
+            (x[i], y[i]) = (
+                freeze(barrett(x[i], v, q), q),
+                freeze(barrett(y[i], v, q), q),
+            );
+        }
 
-        let (a, c) = halves(x, y);
+        for i in 0..4 {
+            (x[i], y[i]) = pairs(x[i], y[i]);
 
-        store256(a, &mut block[0]);
+            (x[i], y[i]) = quarters(x[i], y[i]);
 
-        store256(c, &mut block[1]);
+            (x[i], y[i]) = halves(x[i], y[i]);
+
+            store256(x[i], &mut group[2 * i]);
+
+            store256(y[i], &mut group[2 * i + 1]);
+        }
+
+        wipe_unless_optimized!(words_of(&mut x));
+
+        wipe_unless_optimized!(words_of(&mut y));
     }
 }
 
@@ -252,6 +284,8 @@ fn inverse_layers(
 
     let vectors = out.as_chunks_mut::<16>().0;
 
+    // Each block, transposed, goes to its place in out first: holding four blocks from load at
+    // once made LLVM spill them to the stack, where secrets would stay.
     for (b, block) in vectors.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         let (a, c) = load(b);
 
@@ -261,25 +295,58 @@ fn inverse_layers(
 
         let (x, y) = pairs(x, y);
 
-        let (x, y) = inverse_butterfly(x, y, lanes(&field.inverse_x86, 2, b), q);
+        store256(x, &mut block[0]);
 
-        let (x, y) = pairs(x, y);
+        store256(y, &mut block[1]);
+    }
 
-        let (x, y) = inverse_butterfly(x, y, lanes(&field.inverse_x86, 1, b), q);
+    // Then four blocks at a time, layer by layer, as in ntt.
+    for (p, group) in vectors.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        let b: [usize; 4] = core::array::from_fn(|i| 4 * p + i);
 
-        let (x, y) = quarters(x, y);
+        let mut x: [__m256i; 4] = core::array::from_fn(|i| load256(&group[2 * i]));
 
-        let (x, y) = inverse_butterfly(x, y, lanes(&field.inverse_x86, 0, b), q);
+        let mut y: [__m256i; 4] = core::array::from_fn(|i| load256(&group[2 * i + 1]));
 
-        let (a, c) = halves(x, y);
+        for i in 0..4 {
+            (x[i], y[i]) = inverse_butterfly(x[i], y[i], lanes(&field.inverse_x86, 2, b[i]), q);
+        }
 
-        let (a, c) = (barrett(a, v, q), barrett(c, v, q));
+        for i in 0..4 {
+            (x[i], y[i]) = pairs(x[i], y[i]);
+        }
 
-        let (a, c) = inverse_butterfly(a, c, broadcast(z[112 + b], zq[112 + b]), q);
+        for i in 0..4 {
+            (x[i], y[i]) = inverse_butterfly(x[i], y[i], lanes(&field.inverse_x86, 1, b[i]), q);
+        }
 
-        store256(a, &mut block[0]);
+        for i in 0..4 {
+            (x[i], y[i]) = quarters(x[i], y[i]);
+        }
 
-        store256(c, &mut block[1]);
+        for i in 0..4 {
+            (x[i], y[i]) = inverse_butterfly(x[i], y[i], lanes(&field.inverse_x86, 0, b[i]), q);
+        }
+
+        for i in 0..4 {
+            (x[i], y[i]) = halves(x[i], y[i]);
+
+            (x[i], y[i]) = (barrett(x[i], v, q), barrett(y[i], v, q));
+        }
+
+        for i in 0..4 {
+            let t = broadcast(z[112 + b[i]], zq[112 + b[i]]);
+
+            (x[i], y[i]) = inverse_butterfly(x[i], y[i], t, q);
+
+            store256(x[i], &mut group[2 * i]);
+
+            store256(y[i], &mut group[2 * i + 1]);
+        }
+
+        wipe_unless_optimized!(words_of(&mut x));
+
+        wipe_unless_optimized!(words_of(&mut y));
     }
 
     let t32 = [120, 121, 122, 123].map(|m| broadcast(z[m], zq[m]));
@@ -587,12 +654,19 @@ fn load24(bytes: &[u8; 24]) -> __m256i {
 #[target_feature(enable = "avx2")]
 #[inline]
 fn unpack12(bytes: &[u8; 24]) -> __m256i {
+    spread12(load24(bytes))
+}
+
+// unpack12 of 24 bytes laid out as load24 gives them.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn spread12(group: __m256i) -> __m256i {
     let spread = _mm256_setr_epi8(
         0, 1, 1, 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 10, 10, 11, 4, 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12,
         13, 14, 14, 15,
     );
 
-    let words = _mm256_shuffle_epi8(load24(bytes), spread);
+    let words = _mm256_shuffle_epi8(group, spread);
 
     _mm256_blend_epi16::<0xAA>(
         _mm256_and_si256(words, _mm256_set1_epi16(0x0FFF)),
@@ -1220,20 +1294,12 @@ static COMPACT: [[u8; 16]; 256] = compaction();
 // time, as in the portable code.
 #[target_feature(enable = "avx2")]
 pub(super) fn uniform12(lanes: &[u64; 21], q: u16, a: &mut [u16; 256], count: &mut usize) {
-    let mut bytes = [0u8; 168];
-
-    for (bytes, lane) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(lanes) {
-        *bytes = lane.to_le_bytes();
-    }
-
-    let groups = bytes.as_chunks::<24>().0;
-
     let bound = _mm256_set1_epi16(q as i16);
 
     let (mut step, mut filled) = (0, *count);
 
-    while step < groups.len() && filled <= 256 - 16 {
-        let candidates = unpack12(&groups[step]);
+    while step < 7 && filled <= 256 - 16 {
+        let candidates = candidates12(lanes, step);
 
         let accepted = _mm256_cmpgt_epi16(bound, candidates);
 
@@ -1263,10 +1329,33 @@ pub(super) fn uniform12(lanes: &[u64; 21], q: u16, a: &mut [u16; 256], count: &m
 
     *count = filled;
 
-    for chunk in groups[step..].as_flattened().as_chunks::<3>().0 {
-        let d1 = u16::from(chunk[0]) | (u16::from(chunk[1] & 0x0F) << 8);
+    uniform12_tail(lanes, 24 * step, q, a, count);
+}
 
-        let d2 = u16::from(chunk[1] >> 4) | (u16::from(chunk[2]) << 4);
+// The sixteen candidates of 24-byte group step of the block. The bytes are loaded from the lanes
+// in place, as they are the stream in memory on x86-64: a copy into a byte buffer made each
+// load span two of the copy's stores, which store forwarding cannot serve.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn candidates12(lanes: &[u64; 21], step: usize) -> __m256i {
+    let group = _mm256_inserti128_si256::<1>(
+        _mm256_castsi128_si256(load128_bytes(lanes, 24 * step)),
+        load128_bytes(lanes, 24 * step + 8),
+    );
+
+    spread12(group)
+}
+
+// The candidates of the block from byte start on, one at a time, until a has 256 values.
+fn uniform12_tail(lanes: &[u64; 21], start: usize, q: u16, a: &mut [u16; 256], count: &mut usize) {
+    let byte = |i: usize| (lanes[i / 8] >> (8 * (i % 8))) as u8;
+
+    for start in (start..168).step_by(3) {
+        let (b0, b1, b2) = (byte(start), byte(start + 1), byte(start + 2));
+
+        let d1 = u16::from(b0) | (u16::from(b1 & 0x0F) << 8);
+
+        let d2 = u16::from(b1 >> 4) | (u16::from(b2) << 4);
 
         for candidate in [d1, d2] {
             if *count == 256 {

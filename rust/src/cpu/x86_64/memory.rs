@@ -32,6 +32,24 @@ pub(super) fn load128<T: Plain, const N: usize>(values: &[T; N]) -> __m128i {
     unsafe { _mm_loadu_si128(values.as_ptr().cast()) }
 }
 
+// Sixteen bytes of an array from byte offset on, which the assertion keeps inside it: the bytes
+// in memory order, which for words is their little-endian order on x86-64.
+#[target_feature(enable = "sse2")]
+#[inline]
+#[allow(unsafe_code)]
+pub(super) fn load128_bytes<T: Plain, const N: usize>(values: &[T; N], offset: usize) -> __m128i {
+    // A subtraction, as offset + 16 could wrap where overflow checks are off.
+    assert!(
+        size_of::<[T; N]>()
+            .checked_sub(offset)
+            .is_some_and(|rest| rest >= 16),
+        "sixteen bytes from {offset}"
+    );
+
+    // SAFETY: the sixteen bytes from offset lie inside values, which is readable.
+    unsafe { _mm_loadu_si128(values.as_ptr().cast::<u8>().add(offset).cast()) }
+}
+
 #[target_feature(enable = "sse2")]
 #[inline]
 #[allow(unsafe_code)]

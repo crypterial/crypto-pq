@@ -2181,6 +2181,35 @@ mod tests {
         }
     }
 
+    // load128_bytes at every offset that keeps its sixteen bytes inside the array, and its
+    // assertion at the first offset past them and at offsets where offset + 16 would wrap.
+    #[test]
+    #[allow(unsafe_code)]
+    fn bytes_load_stays_inside() {
+        use super::memory::{load128_bytes, store128};
+
+        let lanes: [u64; 21] =
+            core::array::from_fn(|i| 0x0706_0504_0302_0100 + 0x0808_0808_0808_0808 * i as u64);
+
+        for offset in 0..=152 {
+            let mut out = [0u8; 16];
+
+            // SAFETY: every x86-64 CPU has SSE2.
+            unsafe { store128(load128_bytes(&lanes, offset), &mut out) };
+
+            let expected: [u8; 16] = core::array::from_fn(|i| (offset + i) as u8);
+
+            assert_eq!(out, expected, "offset {offset}");
+        }
+
+        for offset in [153, usize::MAX - 15, usize::MAX] {
+            // SAFETY: as above.
+            let load = std::panic::catch_unwind(|| unsafe { load128_bytes(&lanes, offset) });
+
+            assert!(load.is_err(), "offset {offset}");
+        }
+    }
+
     // wide_in by rows, the form of AMD cores, against the form by broadcasts, for groups of zero to
     // four states: the CPU models run both, where the native runners may all be Intel cores.
     #[test]
