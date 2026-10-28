@@ -1901,6 +1901,85 @@ pub(crate) fn squeeze_wide(
     }
 }
 
+// Up to four sponges of one rate and suffix, each fed a message given as its parts and read once
+// into outs, all of one length of at most 64 bytes: the block is padded in the vector form,
+// permuted and read from it, with no state in memory between them. It takes messages of one shape,
+// the same number of parts and the same part lengths, every part but the last a whole number of
+// words and fewer than rate bytes in all, which SLH-DSA's F and PRF have, and returns whether it
+// did the work. One message alone takes the scalar permutation in less time than the AVX2 rounds,
+// so it is left to the caller there. A missing message runs as a copy of the first, whose output
+// is not read. ONE_BLOCK4: whether this build has such a kernel, which then runs where the CPU
+// has AVX2.
+#[cfg(feature = "slh-dsa")]
+pub(crate) const ONE_BLOCK4: bool = true;
+
+#[allow(unsafe_code)]
+#[cfg(feature = "slh-dsa")]
+pub(crate) fn one_block4(
+    rate: usize,
+    suffix: u8,
+    messages: &[&[&[u8]]],
+    outs: &mut [&mut [u8]],
+) -> bool {
+    let wide = has(AVX512);
+
+    let count = messages.len();
+
+    if !has(AVX2)
+        || !(1..=4).contains(&count)
+        || outs.len() != count
+        || count == 1 && !wide
+        || !rate.is_multiple_of(8)
+        || !(8..=168).contains(&rate)
+    {
+        return false;
+    }
+
+    let shape = messages[0];
+
+    let size = outs[0].len();
+
+    let words = shape
+        .split_last()
+        .is_none_or(|(_, whole)| whole.iter().all(|part| part.len().is_multiple_of(8)));
+
+    let length = shape
+        .iter()
+        .fold(0usize, |total, part| total.saturating_add(part.len()));
+
+    let same = messages.iter().all(|message| {
+        message.len() == shape.len()
+            && message
+                .iter()
+                .zip(shape)
+                .all(|(part, first)| part.len() == first.len())
+    });
+
+    if size > 64
+        || size > rate
+        || outs.iter().any(|out| out.len() != size)
+        || !words
+        || length >= rate
+        || !same
+    {
+        return false;
+    }
+
+    let four = core::array::from_fn(|s| messages.get(s).copied().unwrap_or(shape));
+
+    // SAFETY: the CPU has AVX2, and AVX-512F and AVX-512VL where AVX512 is set, and the operating
+    // system saves the registers.
+    unsafe {
+        match (wide, has(AVX512_AMD)) {
+            (true, true) => keccak::one_block4_avx512::<false, true>(&four, rate, suffix, outs),
+            (true, false) => keccak::one_block4_avx512::<true, false>(&four, rate, suffix, outs),
+            _ => keccak::one_block4_avx2(&four, rate, suffix, outs),
+        }
+    }
+
+    true
+}
+
 // Four state words as SHA256RNDS2 holds them, the first in the highest lane.
 #[target_feature(enable = "sse2")]
 #[inline]

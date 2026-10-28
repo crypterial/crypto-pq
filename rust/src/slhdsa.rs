@@ -308,6 +308,7 @@ impl<'a> Hashes<'a> {
     // F with SHAKE256 for the lanes that have an input, a group of sponges side by side: PK.seed,
     // ADRS and the input fill less than one block. Kept out of f_lanes: inlined there, its sponges
     // made the SHA-2 path of f_lanes about 1% slower. The lanes without input keep their nodes.
+    // Builds with a one-block kernel take one_block_lanes.
     #[inline(never)]
     fn shake_lanes(
         &self,
@@ -329,6 +330,10 @@ impl<'a> Hashes<'a> {
             }
         }
 
+        if keccak::ONE_BLOCK {
+            return self.one_block_lanes(adrs, &inputs, &active[..count], nodes);
+        }
+
         let mut sponges = Sponges::empty();
 
         for group in active[..count].chunks(keccak::group()) {
@@ -347,6 +352,51 @@ impl<'a> Hashes<'a> {
             for (i, &lane) in group.iter().enumerate() {
                 sponges.read(i, &mut nodes[lane][..n]);
             }
+        }
+    }
+
+    // shake_lanes through keccak::one_block, for the lanes of active.
+    #[inline(always)]
+    fn one_block_lanes(
+        &self,
+        adrs: &[Adrs; LANES],
+        inputs: &[Option<&[u8]>; LANES],
+        active: &[usize],
+        nodes: &mut [Node; LANES],
+    ) {
+        let n = self.n;
+
+        // The nodes of the active lanes, in the order of active.
+        let mut targets = nodes
+            .iter_mut()
+            .zip(inputs)
+            .filter(|(_, input)| input.is_some())
+            .map(|(node, _)| &mut node[..n]);
+
+        let mut spare = None;
+
+        for group in active.chunks(keccak::group()) {
+            let parts: [[&[u8]; 3]; MAX_SPONGES] = core::array::from_fn(|i| {
+                let lane = group.get(i).copied().unwrap_or_default();
+
+                [self.pk_seed, &adrs[lane], inputs[lane].unwrap_or_default()]
+            });
+
+            let messages = parts.each_ref().map(|parts| &parts[..]);
+
+            let mut outs: [&mut [u8]; MAX_SPONGES] = Default::default();
+
+            for (out, target) in outs.iter_mut().zip(targets.by_ref().take(group.len())) {
+                *out = target;
+            }
+
+            keccak::one_block(
+                &mut spare,
+                136,
+                0x1F,
+                &messages[..group.len()],
+                &mut outs[..group.len()],
+            );
         }
     }
 

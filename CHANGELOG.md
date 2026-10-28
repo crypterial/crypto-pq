@@ -25,6 +25,11 @@ Implements specification 1.1 (draft).
   loads and stores the lanes of each state four at a time, with transposes, in place of loops over
   the states, so that its state array is indexed with constants only and, at opt-level 3, stays in
   registers. Outputs are unchanged.
+- SLH-DSA-SHAKE on x86-64 CPUs with AVX2: F and PRF of up to four nodes, whose input fits one
+  block, are padded, permuted and read in the four-state kernel's vector layout, from the parts of
+  each message (the public seed shared by all four is broadcast), with no sponge object and no
+  copy of the states, and only the output lanes are read back; with AVX-512VL the kernel's rounds
+  are the AVX-512VL ones. Other CPUs keep the sponges side by side. Outputs are unchanged.
 - ML-KEM key generation hashes the encapsulation key beside the sampling of the matrix: each run
   of entries leaves a slot in the group of sponges for the blocks of the key that the rows of t
   encoded so far complete. ML-KEM-1024 with groups of four samples a first row of four and then

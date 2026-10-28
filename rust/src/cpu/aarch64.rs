@@ -852,6 +852,16 @@ pub(crate) fn digest(
     true
 }
 
+// SLH-DSA's F and PRF go through Sponges, whose permutations take the kernels of permute_many.
+#[cfg(feature = "slh-dsa")]
+pub(crate) const ONE_BLOCK4: bool = false;
+
+#[inline(always)]
+#[cfg(feature = "slh-dsa")]
+pub(crate) fn one_block4(_: usize, _: u8, _: &[&[&[u8]]], _: &mut [&mut [u8]]) -> bool {
+    false
+}
+
 // ML-DSA's packing stays portable.
 #[inline(always)]
 #[cfg(feature = "ml-dsa")]

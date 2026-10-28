@@ -215,6 +215,15 @@ mod arch {
         false
     }
 
+    #[cfg(feature = "slh-dsa")]
+    pub(crate) const ONE_BLOCK4: bool = false;
+
+    #[inline(always)]
+    #[cfg(feature = "slh-dsa")]
+    pub(crate) fn one_block4(_: usize, _: u8, _: &[&[&[u8]]], _: &mut [&mut [u8]]) -> bool {
+        false
+    }
+
     #[inline(always)]
     #[cfg(feature = "blake3")]
     pub(crate) fn blake3_many(_: &[u8], _: &crate::blake3::Many, _: &mut [[u8; 32]]) -> usize {
@@ -572,6 +581,9 @@ pub(crate) use arch::{
     feature = "sha3"
 ))]
 pub(crate) use arch::{absorb, digest, keccak_group, permute_many};
+
+#[cfg(feature = "slh-dsa")]
+pub(crate) use arch::{ONE_BLOCK4, one_block4};
 
 #[cfg(feature = "ml-kem")]
 pub(crate) use arch::keccak_triples;
@@ -1498,6 +1510,22 @@ mod kernel_count {
         tally.note("squeeze_wide", wide_kernel);
 
         wide.wipe();
+
+        #[cfg(feature = "slh-dsa")]
+        {
+            let parts = [&data[..32], &data[32..64], &data[64..96], &data[96..128]];
+
+            let lists = parts.each_ref().map(core::slice::from_ref);
+
+            let mut outs = [[0; 32]; 4];
+
+            let mut outs = outs.each_mut().map(|out| &mut out[..]);
+
+            tally.note(
+                "one_block4",
+                super::one_block4(136, 0x1F, &lists, &mut outs),
+            );
+        }
     }
 
     // ML-DSA's field where there is one, ML-KEM's otherwise; canonical coefficients go in.

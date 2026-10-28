@@ -1003,3 +1003,285 @@ digest!(
     // SAFETY: the caller's guarantee above.
     state => unsafe { permute1_avx512::<THETA3>(state) }
 );
+
+// The padded block of up to four messages of one shape (the same number of parts and the same
+// part lengths, every part but the last a whole number of words, fewer than rate bytes in all),
+// written into group in the vector form of rounds4_avx512, every element by a whole store: a part
+// that all four messages share, as SLH-DSA's PK.seed, by broadcasts, and the others by 32- and
+// 16-byte loads and transpositions. The addresses depend only on the public lengths. Returns how
+// many vectors from the first hold message bytes, which the caller wipes.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn block4_in(
+    messages: &[&[&[u8]]; 4],
+    rate: usize,
+    suffix: u8,
+    group: &mut MaybeUninit<[__m256i; 25]>,
+) -> usize {
+    let word = |part: &[u8], at: usize| {
+        u64::from_le_bytes(*part[at..].first_chunk().expect("a whole word")) as i64
+    };
+
+    let mut w = 0;
+
+    // Below opt-level 3 the vectors here can be kept in memory, so each is a named local that is
+    // wiped after its store (D-76).
+    for p in 0..messages[0].len() {
+        let [m0, m1, m2, m3] = messages.map(|message| message[p]);
+
+        let length = m0.len() - m0.len() % 8;
+
+        let shared = [m1, m2, m3].iter().all(|m| m.as_ptr() == m0.as_ptr());
+
+        let mut at = 0;
+
+        while at < length {
+            if shared || length - at < 16 {
+                #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+                let mut vector = if shared {
+                    _mm256_set1_epi64x(word(m0, at))
+                } else {
+                    _mm256_set_epi64x(word(m3, at), word(m2, at), word(m1, at), word(m0, at))
+                };
+
+                store_vector_at(vector, group, w);
+
+                wipe_unless_optimized!(words_of(&mut vector));
+
+                (at, w) = (at + 8, w + 1);
+            } else if length - at >= 32 {
+                #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+                let mut rows = transpose4([
+                    load256(m0[at..].first_chunk::<32>().expect("32 bytes")),
+                    load256(m1[at..].first_chunk::<32>().expect("32 bytes")),
+                    load256(m2[at..].first_chunk::<32>().expect("32 bytes")),
+                    load256(m3[at..].first_chunk::<32>().expect("32 bytes")),
+                ]);
+
+                store_vector_at(rows[0], group, w);
+
+                store_vector_at(rows[1], group, w + 1);
+
+                store_vector_at(rows[2], group, w + 2);
+
+                store_vector_at(rows[3], group, w + 3);
+
+                wipe_unless_optimized!(words_of(&mut rows));
+
+                (at, w) = (at + 32, w + 4);
+            } else {
+                #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+                let mut halves = [
+                    super::memory::load128(m0[at..].first_chunk::<16>().expect("16 bytes")),
+                    super::memory::load128(m1[at..].first_chunk::<16>().expect("16 bytes")),
+                    super::memory::load128(m2[at..].first_chunk::<16>().expect("16 bytes")),
+                    super::memory::load128(m3[at..].first_chunk::<16>().expect("16 bytes")),
+                ];
+
+                // The two words of messages 0 and 2, and of 1 and 3, then one word of each.
+                #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+                let mut pairs = [
+                    _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(halves[0]), halves[2]),
+                    _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(halves[1]), halves[3]),
+                ];
+
+                #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+                let mut words = [
+                    _mm256_unpacklo_epi64(pairs[0], pairs[1]),
+                    _mm256_unpackhi_epi64(pairs[0], pairs[1]),
+                ];
+
+                store_vector_at(words[0], group, w);
+
+                store_vector_at(words[1], group, w + 1);
+
+                wipe_unless_optimized!(words_of(&mut halves));
+
+                wipe_unless_optimized!(words_of(&mut pairs));
+
+                wipe_unless_optimized!(words_of(&mut words));
+
+                (at, w) = (at + 16, w + 2);
+            }
+        }
+    }
+
+    // The bytes of the last part after its words, the suffix after them and, in the last word of
+    // the rate, the padding's final bit.
+    let tail = messages[0].last().map_or(0, |part| part.len() % 8);
+
+    let last = |s: usize| {
+        let bytes = messages[s]
+            .last()
+            .map_or(0, |part| last_bytes(part, tail) as u64);
+
+        (bytes | u64::from(suffix) << (8 * tail)) as i64
+    };
+
+    let pad = _mm256_set1_epi64x((0x80u64 << 56) as i64);
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut vector = _mm256_set_epi64x(last(3), last(2), last(1), last(0));
+
+    if w == rate / 8 - 1 {
+        vector = _mm256_xor_si256(vector, pad);
+    }
+
+    store_vector_at(vector, group, w);
+
+    wipe_unless_optimized!(words_of(&mut vector));
+
+    let used = w + 1;
+
+    for i in used..25 {
+        let zero = _mm256_setzero_si256();
+
+        store_vector_at(if i == rate / 8 - 1 { pad } else { zero }, group, i);
+    }
+
+    used
+}
+
+// The first bytes of up to four states in the vector form a into outs, all of one length of at
+// most 64 bytes: lanes 0 to 3, then 4 to 7, transposed into one row per state. Macros rather than
+// functions, so that the state stays in the caller's registers: as a function with three callers,
+// LLVM kept it out of line, and the state in memory, at opt-level 3. Each state is written by its
+// index, which is a constant, as in scatter4.
+macro_rules! out4 {
+    ($a:expr, $outs:expr) => {{
+        let a: &[__m256i; 25] = $a;
+
+        let outs: &mut [&mut [u8]] = $outs;
+
+        let size = outs.first().map_or(0, |out| out.len());
+
+        rows_out!(transpose4([a[0], a[1], a[2], a[3]]), outs, 0..size.min(32), 0 1 2 3);
+
+        if size > 32 {
+            rows_out!(transpose4([a[4], a[5], a[6], a[7]]), outs, 32..size, 0 1 2 3);
+        }
+    }};
+}
+
+macro_rules! rows_out {
+    ($rows:expr, $outs:ident, $range:expr, $($s:literal)*) => {{
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut rows = $rows;
+
+        $(
+            if let Some(out) = $outs.get_mut($s) {
+                vector_out!(rows[$s], &mut out[$range]);
+            }
+        )*
+
+        wipe_unless_optimized!(words_of(&mut rows));
+    }};
+}
+
+// The first out.len() bytes, at most 32, of a vector.
+macro_rules! vector_out {
+    ($vector:expr, $out:expr) => {{
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut vector: __m256i = $vector;
+
+        let out: &mut [u8] = $out;
+
+        if let Ok(whole) = <&mut [u8; 32]>::try_from(&mut *out) {
+            store256(vector, whole);
+        } else {
+            let mut half = _mm256_castsi256_si128(vector);
+
+            let (low, out) = out.split_at_mut(if out.len() >= 16 { 16 } else { 0 });
+
+            if let Ok(low) = <&mut [u8; 16]>::try_from(low) {
+                store128(half, low);
+
+                half = _mm256_extracti128_si256::<1>(vector);
+            }
+
+            let (word, out) = out.split_at_mut(if out.len() >= 8 { 8 } else { 0 });
+
+            if let Ok(word) = <&mut [u8; 8]>::try_from(word) {
+                *word = (_mm_cvtsi128_si64(half) as u64).to_le_bytes();
+
+                half = _mm_unpackhi_epi64(half, half);
+            }
+
+            low_bytes(_mm_cvtsi128_si64(half) as u64, out);
+
+            wipe_unless_optimized!(words_of(&mut half));
+        }
+
+        wipe_unless_optimized!(words_of(&mut vector));
+    }};
+}
+
+// Up to four sponges of one rate and suffix, each fed a message shorter than the rate and read
+// once (x86_64.rs, one_block4), with the AVX2 rounds. The block goes through a buffer, which is
+// wiped once it is loaded: its stores take run-time positions, while the state they are loaded
+// into is indexed with constants only, so that at opt-level 3 it is register values (D-76).
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+pub(super) fn one_block4_avx2(
+    messages: &[&[&[u8]]; 4],
+    rate: usize,
+    suffix: u8,
+    outs: &mut [&mut [u8]],
+) {
+    let mut block = MaybeUninit::uninit();
+
+    let used = block4_in(messages, rate, suffix, &mut block);
+
+    // SAFETY: block4_in wrote every element.
+    let block = unsafe { block.assume_init_mut() };
+
+    let mut a = *block;
+
+    super::memory::clear(&mut block[..used], _mm256_setzero_si256());
+
+    let mut parities = parities4(&a);
+
+    let mut e = [_mm256_setzero_si256(); 25];
+
+    for constants in ROUND_CONSTANTS.as_chunks::<2>().0 {
+        round4(&a, &mut e, &mut parities, constants[0]);
+
+        round4(&e, &mut a, &mut parities, constants[1]);
+    }
+
+    out4!(&a, outs);
+
+    wipe_unless_optimized!(words_of(&mut a));
+
+    wipe_unless_optimized!(words_of(&mut e));
+
+    wipe_unless_optimized!(words_of(&mut parities));
+}
+
+// one_block4_avx2 with the AVX-512VL rounds, on the block in place. As digest_avx512, this code
+// itself is built without AVX-512.
+//
+// SAFETY: the caller makes sure that the CPU has AVX2, AVX-512F and AVX-512VL and that the
+// operating system saves their registers.
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+pub(super) unsafe fn one_block4_avx512<const THETA3: bool, const PAIRS: bool>(
+    messages: &[&[&[u8]]; 4],
+    rate: usize,
+    suffix: u8,
+    outs: &mut [&mut [u8]],
+) {
+    let mut group = MaybeUninit::uninit();
+
+    block4_in(messages, rate, suffix, &mut group);
+
+    // SAFETY: block4_in wrote every element.
+    let group = unsafe { group.assume_init_mut() };
+
+    // SAFETY: the caller's guarantee above.
+    unsafe { rounds4_avx512::<THETA3, PAIRS>(group) };
+
+    out4!(group, outs);
+
+    super::memory::clear(group, _mm256_setzero_si256());
+}

@@ -416,6 +416,38 @@ impl Drop for Sponges {
     }
 }
 
+// The first outs[i].len() bytes of the output of a sponge of one rate and suffix fed messages[i],
+// given as its parts and shorter than the rate, for up to group() messages: SLH-DSA's F and PRF.
+// A CPU kernel pads, permutes and reads up to four in its vector form where it has one for them
+// (cpu::one_block4); otherwise they run through the sponges in spare, made on first use, which a
+// caller keeps for all its groups and which wipe their states when dropped. ONE_BLOCK: whether
+// the build has a kernel for it; without one, callers keep their own sponges.
+#[cfg(feature = "slh-dsa")]
+pub(crate) const ONE_BLOCK: bool = cpu::ONE_BLOCK4;
+
+#[cfg(feature = "slh-dsa")]
+pub(crate) fn one_block(
+    spare: &mut Option<Sponges>,
+    rate: usize,
+    suffix: u8,
+    messages: &[&[&[u8]]],
+    outs: &mut [&mut [u8]],
+) {
+    if cpu::one_block4(rate, suffix, messages, outs) {
+        return;
+    }
+
+    let sponges = spare.get_or_insert_with(Sponges::empty);
+
+    sponges.start(rate, suffix, messages);
+
+    sponges.squeeze([true; MAX_SPONGES]);
+
+    for (i, out) in outs.iter_mut().enumerate() {
+        sponges.read(i, out);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Keccak {
     state: [u64; 25],
@@ -916,6 +948,197 @@ mod tests {
                 }
             }
         }
+    }
+
+    // The sponge of one_block alone, for the expected output.
+    #[cfg(feature = "slh-dsa")]
+    fn reference(rate: usize, suffix: u8, parts: &[&[u8]], out: &mut [u8]) {
+        let mut engine = Keccak::new(rate, suffix);
+
+        for part in parts {
+            engine.update(part);
+        }
+
+        engine.read(out);
+    }
+
+    // The one-block kernel and one_block against the one-sponge Keccak, for every rate, two
+    // suffixes, every message length that fits in a block, one to four messages, outputs of 0 to
+    // 64 bytes, and three shapes: one part, three parts of whole words with the first shared by
+    // all messages (SLH-DSA's PK.seed), and three parts split anywhere, which the kernel refuses.
+    #[test]
+    #[cfg(feature = "slh-dsa")]
+    fn one_block_kernel_matches_keccak() {
+        let mut inputs = Inputs::new(0x1B);
+
+        let (mut cases, mut accelerated) = (0, 0);
+
+        let mut spare = None;
+
+        for rate in [72, 104, 136, 144, 168] {
+            for suffix in [0x1F, 0x06] {
+                for length in 0..rate {
+                    let count = 1 + length % 4;
+
+                    let size = [0, 1, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 40, 48, 63, 64]
+                        [(length + rate) % 16]
+                        .min(rate);
+
+                    let messages: [[u8; 168]; 4] = core::array::from_fn(|_| inputs.bytes());
+
+                    let shape = (length + suffix as usize) % 3;
+
+                    let (first, second) = match shape {
+                        0 => (length, length),
+                        1 => {
+                            let first = length / 3 / 8 * 8;
+
+                            (first, first + (length - first) / 2 / 8 * 8)
+                        }
+                        _ => (length / 3, length / 3 + (length - length / 3) / 2),
+                    };
+
+                    let parts = messages.each_ref().map(|message| {
+                        let start = if shape == 1 {
+                            &messages[0][..first]
+                        } else {
+                            &message[..first]
+                        };
+
+                        [start, &message[first..second], &message[second..length]]
+                    });
+
+                    let lists = parts
+                        .each_ref()
+                        .map(|list| if shape == 0 { &list[..1] } else { &list[..] });
+
+                    let mut expected = [[0; 64]; 4];
+
+                    for (list, out) in lists[..count].iter().zip(&mut expected) {
+                        reference(rate, suffix, list, &mut out[..size]);
+                    }
+
+                    // The bytes after each output and the outputs after count stay as they were.
+                    let mut actual = [[0xA5; 64]; 4];
+
+                    let mut outs = actual.each_mut().map(|out| &mut out[..size]);
+
+                    if cpu::one_block4(rate, suffix, &lists[..count], &mut outs[..count]) {
+                        for (s, out) in actual.iter().enumerate() {
+                            let (written, after) = out.split_at(size);
+
+                            if s < count {
+                                assert_eq!(written, &expected[s][..size], "{rate} {length}");
+                            } else {
+                                assert!(written.iter().all(|&byte| byte == 0xA5));
+                            }
+
+                            assert!(after.iter().all(|&byte| byte == 0xA5));
+                        }
+
+                        accelerated += 1;
+                    } else {
+                        assert!(actual.iter().all(|out| *out == [0xA5; 64]));
+                    }
+
+                    let mut actual = [[0; 64]; 4];
+
+                    let mut outs = actual.each_mut().map(|out| &mut out[..size]);
+
+                    one_block(
+                        &mut spare,
+                        rate,
+                        suffix,
+                        &lists[..count],
+                        &mut outs[..count],
+                    );
+
+                    assert_eq!(actual, expected, "one_block: {rate} {length}");
+
+                    cases += 1;
+                }
+            }
+        }
+
+        std::eprintln!("Keccak one-block: {accelerated} of {cases} cases through a CPU kernel");
+    }
+
+    // The CAVP SHAKE128 and SHAKE256 ShortMsg known answers whose message fits in one block, each
+    // as four messages through one_block: one slice for all four, which the kernel broadcasts,
+    // four copies, which it transposes, and the message alone.
+    #[test]
+    #[cfg(feature = "slh-dsa")]
+    fn one_block_kernel_shake_vectors() {
+        let mut checked = 0;
+
+        let mut spare = None;
+
+        for (name, rate) in [("SHAKE128", 168), ("SHAKE256", 136)] {
+            let path = std::format!(
+                "{}/../vectors/cavp/{name}ShortMsg.rsp",
+                env!("CARGO_MANIFEST_DIR")
+            );
+
+            let text = std::fs::read_to_string(&path).unwrap();
+
+            let mut length = 0;
+
+            let mut message = vec![];
+
+            for line in text.lines().map(str::trim) {
+                let Some((field, value)) = line.split_once(" = ") else {
+                    continue;
+                };
+
+                let bytes = || {
+                    (0..value.len() / 2)
+                        .map(|i| u8::from_str_radix(&value[2 * i..2 * i + 2], 16).unwrap())
+                        .collect::<alloc::vec::Vec<u8>>()
+                };
+
+                match field {
+                    "Len" => length = value.parse::<usize>().unwrap() / 8,
+                    "Msg" => message = bytes()[..length].to_vec(),
+                    "Output" if length < rate => {
+                        let expected = bytes();
+
+                        let copies = [message.clone(), message.clone(), message.clone()];
+
+                        let single = [&message[..]];
+
+                        let shared = [&single[..]; 4];
+
+                        let lists = [
+                            [&message[..]],
+                            [&copies[0][..]],
+                            [&copies[1][..]],
+                            [&copies[2][..]],
+                        ];
+
+                        let apart = lists.each_ref().map(|list| &list[..]);
+
+                        for messages in [&shared[..], &apart, &shared[..1]] {
+                            let mut actual = [[0; 64]; 4];
+
+                            let mut outs = actual.each_mut().map(|out| &mut out[..expected.len()]);
+
+                            let count = messages.len();
+
+                            one_block(&mut spare, rate, 0x1F, messages, &mut outs[..count]);
+
+                            for out in &actual[..count] {
+                                assert_eq!(out[..expected.len()], expected, "{name} {length}");
+                            }
+                        }
+
+                        checked += 1;
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
+        assert_eq!(checked, 168 + 136);
     }
 
     #[test]
