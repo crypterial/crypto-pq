@@ -21,7 +21,7 @@ use core::mem::MaybeUninit;
 
 #[cfg(not(crypto_pq_optimized))]
 use super::memory::words_of;
-use super::memory::{load256, store_vector_at, store128, store256};
+use super::memory::{load256, store_vector_at, store128, store256, vector_words};
 use crate::keccak::{self, ROUND_CONSTANTS};
 use crate::sha2::{last_bytes, low_bytes};
 use crate::wipe::{wipe, wipe_unless_optimized};
@@ -303,9 +303,10 @@ pub(super) fn scatter4_transposed(a: &[__m256i; 25], states: &mut [&mut [u64; 25
     wipe_unless_optimized!(&mut last);
 }
 
-// One to four states; missing ones run as zeros in their lanes and are not stored. a and e are
-// indexed with constants only, and gather4 and scatter4 are inlined, so that at opt-level 3 they
-// are register values (D-76), spilled as the rounds need; below it they are wiped.
+// One to four states; missing ones run as zeros in their lanes and are not stored. e and the
+// parities are indexed with constants only, so that at opt-level 3 they are register values
+// (D-76), spilled as the rounds need; below it they are wiped. The loops of gather4 and scatter4
+// index a at run time, which keeps it in memory at every opt-level, so it is always wiped.
 #[target_feature(enable = "avx2")]
 pub(super) fn permute4_avx2(states: &mut [&mut [u64; 25]]) {
     let mut a = [_mm256_setzero_si256(); 25];
@@ -324,7 +325,7 @@ pub(super) fn permute4_avx2(states: &mut [&mut [u64; 25]]) {
 
     scatter4(&a, states);
 
-    wipe_unless_optimized!(words_of(&mut a));
+    wipe(vector_words(&mut a).as_flattened_mut());
 
     wipe_unless_optimized!(words_of(&mut e));
 

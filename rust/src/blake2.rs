@@ -399,13 +399,22 @@ fn process<W: Word>(
         compress(h, first, counter, false);
     }
 
+    // compress takes the message words through memory, where they are wiped: a MAC's key block
+    // comes here as the first buffered block.
+    let mut m = [W::default(); 16];
+
     for block in blocks.chunks_exact(16 * W::BYTES) {
-        let m: [W; 16] =
-            core::array::from_fn(|i| W::from_le(&block[i * W::BYTES..(i + 1) * W::BYTES]));
+        for (word, bytes) in m.iter_mut().zip(block.chunks_exact(W::BYTES)) {
+            *word = W::from_le(bytes);
+        }
 
         counter = counter.wrapping_add(size);
 
         compress(h, &m, counter, false);
+    }
+
+    if !blocks.is_empty() {
+        wipe(&mut m);
     }
 
     if let Some((m, total)) = last {

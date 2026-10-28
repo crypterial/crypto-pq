@@ -1092,7 +1092,7 @@ unsafe impl<T: Vectors, const N: usize> Vectors for [T; N] {}
 #[inline(always)]
 #[allow(unsafe_code)]
 fn vector_lanes<T: Vectors>(value: &mut T) -> &mut [u64] {
-    // SAFETY: a Vectors value is 16-byte vectors with no padding between them, so it is
+    // SAFETY: a Vectors value is 8- or 16-byte vectors with no padding between them, so it is
     // size_of::<T>() / 8 lanes aligned for u64, and every bit pattern is a value of either type;
     // the borrow of value covers the result.
     unsafe {

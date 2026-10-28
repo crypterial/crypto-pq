@@ -341,17 +341,25 @@ pub(super) fn blake2b_digest_avx2(h: &[u64; 8], data: &[u8], out: &mut [u8]) {
 
     let mut counter = 0;
 
+    // compress64 stays out of line, so the message words go to it through memory, where they are
+    // cleared at the end.
+    let mut m: [__m256i; 8];
+
     for block in blocks.as_chunks::<128>().0 {
         counter += 128;
 
-        compress64(&mut state, &block64(block), counter, false);
+        m = block64(block);
+
+        compress64(&mut state, &m, counter, false);
     }
 
     let mut last = [0; 128];
 
     last[..tail.len()].copy_from_slice(tail);
 
-    compress64(&mut state, &block64(&last), data.len() as u128, true);
+    m = block64(&last);
+
+    compress64(&mut state, &m, data.len() as u128, true);
 
     let mut bytes = [0; 64];
 
@@ -371,6 +379,8 @@ pub(super) fn blake2b_digest_avx2(h: &[u64; 8], data: &[u8], out: &mut [u8]) {
 
     // compress64 takes the state through memory.
     clear(&mut state, _mm256_setzero_si256());
+
+    clear(&mut m, _mm256_setzero_si256());
 }
 
 // BLAKE2b with SSE4.1, for x86-64 CPUs without AVX2: each row in two vectors of two words, the
@@ -544,8 +554,8 @@ pub(super) fn blake2b_sse41(
         compress64_sse(&mut state, first, counter, false);
     }
 
-    // The message words, which compress64_sse takes through memory too; cleared after the last block.
-    // A message of one block has none here.
+    // The message words, which compress64_sse takes through memory too; cleared after the last
+    // block. A message of one block has none here.
     if !blocks.is_empty() {
         let mut m = [0u64; 16];
 
