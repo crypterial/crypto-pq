@@ -656,6 +656,9 @@ pub(super) fn spare_in(group: &mut [__m256i; 25], j: usize, state: &[u64; 25]) {
     }
 }
 
+// The lane is cleared by a blend with zero, as spare_in blends: written as an AND NOT of the
+// group's own vectors, it became masked stores (VPMASKMOVQ) at opt-level 3, which are not on the
+// list of data-operand-independent timing instructions.
 #[target_feature(enable = "avx2")]
 pub(super) fn spare_out(group: &mut [__m256i; 25], j: usize, state: &mut [u64; 25]) {
     let mask = lane_mask(j);
@@ -667,7 +670,7 @@ pub(super) fn spare_out(group: &mut [__m256i; 25], j: usize, state: &mut [u64; 2
 
         *word = _mm_cvtsi128_si64(_mm256_castsi256_si128(moved)) as u64;
 
-        *vector = _mm256_andnot_si256(mask, *vector);
+        *vector = _mm256_blendv_epi8(*vector, _mm256_setzero_si256(), mask);
     }
 }
 

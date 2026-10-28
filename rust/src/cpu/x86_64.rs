@@ -2241,6 +2241,81 @@ mod tests {
         }
     }
 
+    // spare_in and spare_out in every lane: the state goes into lane j alone and comes back out,
+    // which leaves lane j zero and the other lanes as they were. Both need AVX2 only, so the CPU
+    // models run them, where the AVX-512VL path that calls them needs a native runner.
+    #[test]
+    #[allow(unsafe_code)]
+    #[cfg(any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    ))]
+    fn keccak_spare_lane_in_and_out() {
+        use super::{keccak, memory::store256};
+        use core::mem::MaybeUninit;
+
+        if !super::has(super::AVX2) {
+            return;
+        }
+
+        let mut inputs = crate::cpu::testing::Inputs::new(25);
+
+        let states: [[u64; 25]; 4] = core::array::from_fn(|_| inputs.words());
+
+        let spare: [u64; 25] = inputs.words();
+
+        let words = |group: &[core::arch::x86_64::__m256i; 25]| {
+            let mut words = [[0u64; 4]; 25];
+
+            for (vector, lane) in group.iter().zip(&mut words) {
+                // SAFETY: the CPU has AVX2.
+                unsafe { store256(*vector, lane) };
+            }
+
+            words
+        };
+
+        for j in 0..4 {
+            let mut group = MaybeUninit::uninit();
+
+            // SAFETY: the CPU has AVX2, and wide_in writes every element of the group.
+            let mut group = unsafe {
+                keccak::wide_in::<false>(&keccak::four_of(&states), &mut group);
+
+                group.assume_init()
+            };
+
+            // SAFETY: the CPU has AVX2.
+            unsafe { keccak::spare_in(&mut group, j, &spare) };
+
+            for (i, lane) in words(&group).iter().enumerate() {
+                let expected: [u64; 4] =
+                    core::array::from_fn(|s| if s == j { spare[i] } else { states[s][i] });
+
+                assert_eq!(*lane, expected, "in, slot {j}, lane {i}");
+            }
+
+            let mut out = [0u64; 25];
+
+            // SAFETY: the CPU has AVX2.
+            unsafe { keccak::spare_out(&mut group, j, &mut out) };
+
+            assert_eq!(out, spare, "out, slot {j}");
+
+            for (i, lane) in words(&group).iter().enumerate() {
+                let expected: [u64; 4] =
+                    core::array::from_fn(|s| if s == j { 0 } else { states[s][i] });
+
+                assert_eq!(*lane, expected, "cleared, slot {j}, lane {i}");
+            }
+        }
+    }
+
     // Every form of the AVX-512VL kernels against the portable permutation, whichever vendor's
     // core runs the test: both theta forms of the four-state rounds, each fed by both forms of
     // wide_in, for one to four states, and both forms of the one-state kernel, which permute1 and
