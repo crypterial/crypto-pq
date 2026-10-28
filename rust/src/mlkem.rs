@@ -847,9 +847,24 @@ fn binomial_portable(eta: usize, data: &[u8], f: &mut Poly) {
 // first runs of at most group() - 1 entries, enough of them to carry the permutations of H over
 // ek_len bytes beside theirs at three blocks of XOF output per entry (more than 99% of entries
 // need exactly three), then runs of at most group() for the rest; runs of each kind are as even
-// as their count allows.
+// as their count allows. Where the CPU permutes three states at a time and the rest one by one
+// (cpu::keccak_triples), fixed runs put H in the third or sixth state of a call while every entry
+// takes three blocks: 2 and 2 entries for k = 2, 5, 2 and 2 for k = 3, and for k = 4 three runs
+// of 5 and then the last entry, beside which H takes the second state, which costs as much as
+// permuting the two alone. On Neoverse N2 a call on five states (four entries and H) cost about
+// as much as two calls on three, and the even runs of four made the import of an ML-KEM-1024 key
+// take 8% more time than with H hashed after the matrix.
 fn matrix_runs(k: usize, ek_len: usize) -> impl Iterator<Item = usize> {
-    let (entries, width) = (k * k, keccak::group());
+    let triples: &[usize] = match (cpu::keccak_triples(), k) {
+        (false, _) => &[],
+        (true, 2) => &[2, 2],
+        (true, 3) => &[5, 2, 2],
+        (true, _) => &[5, 5, 5, 1],
+    };
+
+    let entries = if triples.is_empty() { k * k } else { 0 };
+
+    let width = keccak::group();
 
     let hashes = ek_len / 136 + 1;
 
@@ -863,7 +878,11 @@ fn matrix_runs(k: usize, ek_len: usize) -> impl Iterator<Item = usize> {
         (0..runs).map(move |r| total * (r + 1) / runs - total * r / runs)
     };
 
-    even(carried, beside).chain(even(entries - carried, plain))
+    triples
+        .iter()
+        .copied()
+        .chain(even(carried, beside))
+        .chain(even(entries - carried, plain))
 }
 
 fn decode_vector(bytes: &[u8]) -> Vec<Poly> {
@@ -1307,31 +1326,35 @@ pub(crate) fn decaps_internal(
 
 // FIPS 203, 7.2: every coefficient of the encoded vector must already be reduced modulo q.
 pub(crate) fn check_encapsulation_key(ek: &[u8], p: &Parameters) -> bool {
-    ek.len() == p.encapsulation_key_size()
-        && ek[..384 * p.k].as_chunks::<384>().0.iter().all(canonical12)
+    ek.len() == p.encapsulation_key_size() && canonical12(&ek[..384 * p.k])
 }
 
-// Whether every 12-bit value of an encoded polynomial is below q. Where a CPU kernel decodes, this
-// is the check as FIPS 203 states it, ByteEncode_12(ByteDecode_12(data)) = data, in kernels that
-// take less time than the values one by one.
-fn canonical12(data: &[u8; 384]) -> bool {
-    let mut f = [0; 256];
+// Whether every 12-bit value of polynomials encoded one after another is below q. Where a CPU
+// kernel decodes, this is the check as FIPS 203 states it, ByteEncode_12(ByteDecode_12(data)) =
+// data, in kernels that take less time than the values one by one; elsewhere the values one by
+// one in a single loop over all the polynomials, as a loop per polynomial took more time on Arm.
+fn canonical12(data: &[u8]) -> bool {
+    let (mut f, mut again) = ([0; 256], [0; 384]);
 
-    if cpu::decode12(data, Q as u16, &mut f) {
-        let mut again = [0; 384];
+    for poly in data.as_chunks::<384>().0 {
+        if !cpu::decode12(poly, Q as u16, &mut f) {
+            return data.as_chunks::<3>().0.iter().all(|chunk| {
+                let d1 = u32::from(chunk[0]) | (u32::from(chunk[1] & 0x0F) << 8);
+
+                let d2 = u32::from(chunk[1] >> 4) | (u32::from(chunk[2]) << 4);
+
+                d1 < Q && d2 < Q
+            });
+        }
 
         byte_encode(&f, 12, &mut again);
 
-        return again == *data;
+        if again != *poly {
+            return false;
+        }
     }
 
-    data.as_chunks::<3>().0.iter().all(|chunk| {
-        let d1 = u32::from(chunk[0]) | (u32::from(chunk[1] & 0x0F) << 8);
-
-        let d2 = u32::from(chunk[1] >> 4) | (u32::from(chunk[2]) << 4);
-
-        d1 < Q && d2 < Q
-    })
+    true
 }
 
 // SPEC 8.1.4, checks (1) to (4) of an expanded key: H(ek) is the stored h, ek passes the modulus

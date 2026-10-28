@@ -27,9 +27,12 @@ Implements specification 1.1 (draft).
   runs of three; ML-KEM-512 samples all four entries in one group where the CPU's group has four,
   and then hashes the key. Outputs are unchanged.
 - An ML-KEM encapsulation key decoded from bytes is hashed beside the sampling of its matrix, in
-  the slot that runs of one entry less than the group of sponges leave, and its modulus check is
-  ByteEncode_12(ByteDecode_12(ek)) = ek in the CPU's kernels, as FIPS 203 states it. Outputs and
-  the keys accepted are unchanged.
+  the slot that runs of one entry less than the group of sponges leave. On Neoverse N2, which
+  permutes three states at a time and the rest one by one, the runs are chosen so that the hash
+  takes the third or sixth state of a call, except beside the last entry of ML-KEM-1024, where it
+  takes the second. Its modulus check is ByteEncode_12(ByteDecode_12(ek)) = ek in the CPU's
+  kernels, as FIPS 203 states it, and elsewhere one loop over the whole key. Outputs and the keys
+  accepted are unchanged.
 - ML-KEM-512 encryption samples y, e1 and e2 in two permutation calls in place of three: e1[1]
   and then e2 are squeezed beside the sponges of y and e1[0]. Outputs are unchanged.
 - ML-KEM on x86-64 with AVX2: the sampling of the matrix reads its 12-bit candidates from the

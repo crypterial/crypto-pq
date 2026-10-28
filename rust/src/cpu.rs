@@ -321,6 +321,12 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg(feature = "ml-kem")]
+    pub(crate) const fn keccak_triples() -> bool {
+        false
+    }
+
+    #[inline(always)]
     #[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
     pub(crate) fn ntt(_: &mut [i32; 256], _: &super::Field) -> bool {
         false
@@ -558,6 +564,9 @@ pub(crate) use arch::{blake3_blocks, blake3_compress, blake3_digest1, blake3_man
     feature = "sha3"
 ))]
 pub(crate) use arch::{absorb, digest, keccak_group, permute_many};
+
+#[cfg(feature = "ml-kem")]
+pub(crate) use arch::keccak_triples;
 
 // The vector form of Sponges (x86_64.rs, squeeze_wide); elsewhere there is none, and Sponges
 // keeps its own path.

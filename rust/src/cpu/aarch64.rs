@@ -650,6 +650,14 @@ pub(crate) fn keccak_group() -> usize {
     }
 }
 
+// Whether a group of sponges is permuted three states at a time, with the rest one by one
+// (permute_many_lazy, Neoverse N2): there a call on three or six states took less time per state
+// than one on 1, 2, 4, 5 or 7.
+#[cfg(feature = "ml-kem")]
+pub(crate) fn keccak_triples() -> bool {
+    !has(KECCAK) && has(LAZY) && has(SHA3)
+}
+
 // Permutes every state, three at a time where that leaves no single state over, then two, then
 // one in vector registers, which still takes less time than the scalar permutation; returns how
 // many.

@@ -1332,6 +1332,11 @@ pub(crate) const fn keccak_group() -> usize {
     4
 }
 
+#[cfg(feature = "ml-kem")]
+pub(crate) const fn keccak_triples() -> bool {
+    false
+}
+
 // Absorbs the whole blocks of data, rate bytes each, into one state, and returns how many bytes
 // that was.
 #[allow(unsafe_code)]
