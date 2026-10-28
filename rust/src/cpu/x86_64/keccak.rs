@@ -21,7 +21,7 @@ use core::mem::MaybeUninit;
 
 #[cfg(not(crypto_pq_optimized))]
 use super::memory::words_of;
-use super::memory::{load256, store_vector_at, store128, store256, vector_words};
+use super::memory::{load256, store_vector_at, store128, store256};
 use crate::keccak::{self, ROUND_CONSTANTS};
 use crate::sha2::{last_bytes, low_bytes};
 use crate::wipe::{wipe, wipe_unless_optimized};
@@ -141,33 +141,62 @@ fn round4(a: &[__m256i; 25], e: &mut [__m256i; 25], parities: &mut [__m256i; 5],
     *parities = next;
 }
 
-// The lanes of up to four states into vectors, missing states as zeros. Inlined, it writes the
-// caller's array in place: returned by value, the array was built in a temporary and copied.
+// The lanes of up to four states into vectors, the missing ones as zero states: four lanes of each
+// state at a time by 32-byte loads and a 4 x 4 transposition, and the last lane from broadcasts.
+// Inlined, it writes the caller's array in place, at constant indices only.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn gather4(states: &[&mut [u64; 25]], a: &mut [__m256i; 25]) {
-    let lane = |state: usize, i: usize| states.get(state).map_or(0, |s| s[i] as i64);
+fn gather4(s: &[&[u64; 25]; 4], a: &mut [__m256i; 25]) {
+    for k in 0..6 {
+        // An array expression, which builds the array in place: core::array::from_fn built it in
+        // a temporary below opt-level 3. The loads are written out, as a closure for them was a
+        // call at opt-level z that returned each row through a stack temporary.
+        let rows = transpose4([
+            load256(&s[0].as_chunks::<4>().0[k]),
+            load256(&s[1].as_chunks::<4>().0[k]),
+            load256(&s[2].as_chunks::<4>().0[k]),
+            load256(&s[3].as_chunks::<4>().0[k]),
+        ]);
 
-    for (i, vector) in a.iter_mut().enumerate() {
-        *vector = _mm256_set_epi64x(lane(3, i), lane(2, i), lane(1, i), lane(0, i));
+        a[4 * k..4 * k + 4].copy_from_slice(&rows);
     }
+
+    a[24] = lane4(s, 24);
 }
 
+// The lanes of up to four states out of vectors, four lanes at a time by a 4 x 4 transposition and
+// the last lane by extraction. Each state is written by its index, which is a constant: the loop
+// over the states that zip builds indexes the rows at run time.
 #[target_feature(enable = "avx2")]
 #[inline]
 fn scatter4(a: &[__m256i; 25], states: &mut [&mut [u64; 25]]) {
-    for (i, vector) in a.iter().enumerate() {
-        let words = [
-            _mm256_extract_epi64::<0>(*vector),
-            _mm256_extract_epi64::<1>(*vector),
-            _mm256_extract_epi64::<2>(*vector),
-            _mm256_extract_epi64::<3>(*vector),
-        ];
+    for k in 0..6 {
+        let rows = transpose4([a[4 * k], a[4 * k + 1], a[4 * k + 2], a[4 * k + 3]]);
 
-        for (state, word) in states.iter_mut().zip(words) {
-            state[i] = word as u64;
+        macro_rules! store {
+            ($($s:literal)*) => {
+                $(
+                    if let Some(state) = states.get_mut($s) {
+                        store256(rows[$s], &mut state.as_chunks_mut::<4>().0[k]);
+                    }
+                )*
+            };
         }
+
+        store!(0 1 2 3);
     }
+
+    macro_rules! last {
+        ($($s:literal)*) => {
+            $(
+                if let Some(state) = states.get_mut($s) {
+                    state[24] = _mm256_extract_epi64::<$s>(a[24]) as u64;
+                }
+            )*
+        };
+    }
+
+    last!(0 1 2 3);
 }
 
 // The lanes of up to four states in vectors, lane i of each in vector i: each word broadcast from
@@ -177,11 +206,17 @@ fn scatter4(a: &[__m256i; 25], states: &mut [&mut [u64; 25]]) {
 #[target_feature(enable = "avx2")]
 #[inline]
 fn lane4(s: &[&[u64; 25]; 4], i: usize) -> __m256i {
-    let word = |k: usize| _mm256_set1_epi64x(s[k][i] as i64);
+    // The broadcasts are written out, as in gather4: a closure for them was a call at opt-level
+    // z that returned each word through a stack temporary.
+    let low = _mm256_blend_epi32::<0x0C>(
+        _mm256_set1_epi64x(s[0][i] as i64),
+        _mm256_set1_epi64x(s[1][i] as i64),
+    );
 
-    let low = _mm256_blend_epi32::<0x0C>(word(0), word(1));
-
-    let high = _mm256_blend_epi32::<0xC0>(word(2), word(3));
+    let high = _mm256_blend_epi32::<0xC0>(
+        _mm256_set1_epi64x(s[2][i] as i64),
+        _mm256_set1_epi64x(s[3][i] as i64),
+    );
 
     _mm256_blend_epi32::<0xF0>(low, high)
 }
@@ -303,15 +338,16 @@ pub(super) fn scatter4_transposed(a: &[__m256i; 25], states: &mut [&mut [u64; 25
     wipe_unless_optimized!(&mut last);
 }
 
-// One to four states; missing ones run as zeros in their lanes and are not stored. e and the
+// One to four states; missing ones run as zeros in their lanes and are not stored. a, e and the
 // parities are indexed with constants only, so that at opt-level 3 they are register values
-// (D-76), spilled as the rounds need; below it they are wiped. The loops of gather4 and scatter4
-// index a at run time, which keeps it in memory at every opt-level, so it is always wiped.
+// (D-76), spilled as the rounds need; below it they are wiped. With gather4 and scatter4 as loops
+// over the states, a stayed in memory, and a call on four states took 8 to 11% more time on AMD
+// Zen 3.
 #[target_feature(enable = "avx2")]
 pub(super) fn permute4_avx2(states: &mut [&mut [u64; 25]]) {
     let mut a = [_mm256_setzero_si256(); 25];
 
-    gather4(states, &mut a);
+    gather4(&four(states), &mut a);
 
     let mut parities = parities4(&a);
 
@@ -325,7 +361,7 @@ pub(super) fn permute4_avx2(states: &mut [&mut [u64; 25]]) {
 
     scatter4(&a, states);
 
-    wipe(vector_words(&mut a).as_flattened_mut());
+    wipe_unless_optimized!(words_of(&mut a));
 
     wipe_unless_optimized!(words_of(&mut e));
 
