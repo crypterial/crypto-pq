@@ -2055,7 +2055,8 @@ fn round(a: &mut [uint64x2_t; 25], constant: u64) {
         *c = veor3q_u64(veor3q_u64(a[x], a[x + 5], a[x + 10]), a[x + 15], a[x + 20]);
     }
 
-    let d = [
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut d = [
         vrax1q_u64(c[4], c[1]),
         vrax1q_u64(c[0], c[2]),
         vrax1q_u64(c[1], c[3]),
@@ -2063,7 +2064,8 @@ fn round(a: &mut [uint64x2_t; 25], constant: u64) {
         vrax1q_u64(c[3], c[0]),
     ];
 
-    let b = [
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut b = [
         veorq_u64(a[0], d[0]),
         vxarq_u64::<20>(a[6], d[1]),
         vxarq_u64::<21>(a[12], d[2]),
@@ -2103,6 +2105,12 @@ fn round(a: &mut [uint64x2_t; 25], constant: u64) {
     }
 
     a[0] = veorq_u64(a[0], vdupq_n_u64(constant));
+
+    wipe_unless_optimized!(vector_lanes(&mut c));
+
+    wipe_unless_optimized!(vector_lanes(&mut d));
+
+    wipe_unless_optimized!(vector_lanes(&mut b));
 }
 
 // The 24 rounds of Keccak-f[1600] on the vectors of a, with the instructions of round in

@@ -24,7 +24,7 @@ use super::memory::words_of;
 use super::memory::{load256, store_vector_at, store128, store256};
 use crate::keccak::{self, ROUND_CONSTANTS};
 use crate::sha2::{last_bytes, low_bytes};
-use crate::wipe::{wipe, wipe_unless_optimized};
+use crate::wipe::{registers, values, wipe, wipe_unless_optimized};
 
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -36,7 +36,10 @@ fn rotate<const LEFT: i32, const RIGHT: i32>(x: __m256i) -> __m256i {
 #[target_feature(enable = "avx2")]
 #[inline]
 fn theta4(c: &[__m256i; 5]) -> [__m256i; 5] {
-    core::array::from_fn(|x| _mm256_xor_si256(c[(x + 4) % 5], rotate::<1, 63>(c[(x + 1) % 5])))
+    registers!(
+        |x| _mm256_xor_si256(c[(x + 4) % 5], rotate::<1, 63>(c[(x + 1) % 5]));
+        0 1 2 3 4
+    )
 }
 
 // Output plane Y of a round on four states from a into e, lane i of each in vector i, as the scalar
@@ -68,7 +71,8 @@ fn plane4<const Y: usize>(
         0x0007_0605_0403_0201,
     );
 
-    let b = match Y {
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut b = match Y {
         0 => [
             t(0),
             rotate::<44, 20>(t(6)),
@@ -118,13 +122,16 @@ fn plane4<const Y: usize>(
 
         next[x] = _mm256_xor_si256(next[x], lane);
     }
+
+    wipe_unless_optimized!(words_of(&mut b));
 }
 
 // One round on four states from a into e.
 #[target_feature(enable = "avx2")]
 #[inline]
 fn round4(a: &[__m256i; 25], e: &mut [__m256i; 25], parities: &mut [__m256i; 5], constant: u64) {
-    let d = theta4(parities);
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut d = theta4(parities);
 
     let mut next = [_mm256_setzero_si256(); 5];
 
@@ -139,6 +146,10 @@ fn round4(a: &[__m256i; 25], e: &mut [__m256i; 25], parities: &mut [__m256i; 5],
     plane4::<4>(a, &d, e, &mut next, constant);
 
     *parities = next;
+
+    wipe_unless_optimized!(words_of(&mut d));
+
+    wipe_unless_optimized!(words_of(&mut next));
 }
 
 // The lanes of up to four states into vectors, the missing ones as zero states: four lanes of each
@@ -313,6 +324,7 @@ fn transpose4(v: [__m256i; 4]) -> [__m256i; 4] {
 // The lanes of up to four states from vectors, four lanes of each state at a time by a 4 x 4
 // transposition and one store, and the last lane by extraction. As whole vectors, the stores give
 // LLVM no runs of words that it could merge into 512-bit stores in the AVX-512VL kernel.
+#[cfg(crypto_pq_optimized)]
 #[target_feature(enable = "avx2")]
 pub(super) fn scatter4_transposed(a: &[__m256i; 25], states: &mut [&mut [u64; 25]]) {
     for (k, v) in a.as_chunks::<4>().0.iter().enumerate() {
@@ -323,8 +335,7 @@ pub(super) fn scatter4_transposed(a: &[__m256i; 25], states: &mut [&mut [u64; 25
         }
     }
 
-    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-    let mut last = [
+    let last = [
         _mm256_extract_epi64::<0>(a[24]),
         _mm256_extract_epi64::<1>(a[24]),
         _mm256_extract_epi64::<2>(a[24]),
@@ -334,8 +345,17 @@ pub(super) fn scatter4_transposed(a: &[__m256i; 25], states: &mut [&mut [u64; 25
     for (state, word) in states.iter_mut().zip(last) {
         state[24] = word as u64;
     }
+}
 
-    wipe_unless_optimized!(&mut last);
+// Below opt-level 3, the iterators of the loops above hold copies of the rows and of the last
+// words in memory, which no wipe reaches (D-76), and the same loops over references to them load
+// the references to the states with a masked load (VPMASKMOVQ) with Rust 1.99 at opt-level 2,
+// which is not on the list of data-operand-independent timing instructions. scatter4 writes each
+// state by its index instead.
+#[cfg(not(crypto_pq_optimized))]
+#[target_feature(enable = "avx2")]
+pub(super) fn scatter4_transposed(a: &[__m256i; 25], states: &mut [&mut [u64; 25]]) {
+    scatter4(a, states);
 }
 
 // One to four states; missing ones run as zeros in their lanes and are not stored. a, e and the
@@ -649,6 +669,27 @@ pub(super) fn rounds4_avx512<const THETA3: bool, const PAIRS: bool>(a: &mut [__m
     rounds_avx512::<THETA3, PAIRS>(a);
 }
 
+// store_vector_at of a vector that a call returns. Below opt-level 3, where the call may not be
+// inlined and return the vector through memory, the vector goes into a local that is wiped
+// (D-76); store_vector_at wipes its own copy.
+#[cfg(crypto_pq_optimized)]
+macro_rules! store_returned {
+    ($vector:expr, $group:expr, $i:expr) => {
+        store_vector_at($vector, $group, $i)
+    };
+}
+
+#[cfg(not(crypto_pq_optimized))]
+macro_rules! store_returned {
+    ($vector:expr, $group:expr, $i:expr) => {{
+        let mut vector = $vector;
+
+        store_vector_at(vector, $group, $i);
+
+        wipe(words_of(&mut vector));
+    }};
+}
+
 // Up to four states into the vector form of rounds4_avx512, the missing ones as zero states: every
 // element of group is written. With ROWS, four lanes of each state at a time by 32-byte loads and a
 // 4 x 4 transposition, stored whole; otherwise lane by lane from broadcasts, which LLVM stores as
@@ -665,19 +706,23 @@ pub(super) fn wide_in<const ROWS: bool>(
 ) {
     if ROWS {
         for k in 0..6 {
-            let rows = transpose4(core::array::from_fn(|j| {
-                load256(&s[j].as_chunks::<4>().0[k])
-            }));
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut rows = transpose4(registers!(
+                |j| load256(&s[j].as_chunks::<4>().0[k]);
+                0 1 2 3
+            ));
 
-            for (i, vector) in rows.into_iter().enumerate() {
+            for (i, vector) in values!(rows).enumerate() {
                 store_vector_at(vector, group, 4 * k + i);
             }
+
+            wipe_unless_optimized!(words_of(&mut rows));
         }
 
-        store_vector_at(lane4(s, 24), group, 24);
+        store_returned!(lane4(s, 24), group, 24);
     } else {
         for i in 0..25 {
-            store_vector_at(lane4(s, i), group, i);
+            store_returned!(lane4(s, i), group, i);
         }
     }
 }
@@ -756,6 +801,9 @@ pub(super) fn permute1_avx512<const THETA3: bool>(state: &mut [u64; 25]) {
     rounds_avx512::<THETA3, false>(&mut a);
 
     store1(&a, state);
+
+    #[cfg(not(crypto_pq_optimized))]
+    wipe_baseline(words_of(&mut a));
 }
 
 #[target_feature(enable = "avx2,avx512f,avx512vl")]
@@ -776,6 +824,9 @@ pub(super) fn absorb_avx512<const RATE: usize, const THETA3: bool>(
     }
 
     store1(&a, state);
+
+    #[cfg(not(crypto_pq_optimized))]
+    wipe_baseline(words_of(&mut a));
 }
 
 #[cfg(feature = "frodokem")]

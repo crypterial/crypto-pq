@@ -72,6 +72,11 @@ Implements specification 1.1 (draft).
   memory, those arrays are wiped too; a build script reads the opt-level for this. Copies that the
   compiler makes in registers and spill slots remain, as the documentation states. Outputs are
   unchanged.
+- Keccak-f[1600] in builds below opt-level 3: the arrays of theta and of rho and pi in the rounds
+  of the portable code, of the AVX2 kernel for four states and of the ARM64 kernel with the SHA3
+  instructions, which the compiler kept on the stack, are wiped before each round returns, and the
+  temporaries in which it built some of them are no longer made. At opt-level 3 the machine code is
+  unchanged. Outputs are unchanged.
 
 ## [1.0.1] - 2026-10-26
 

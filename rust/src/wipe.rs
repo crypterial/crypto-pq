@@ -104,6 +104,58 @@ macro_rules! wipe_unless_optimized {
 
 pub(crate) use wipe_unless_optimized;
 
+// An array of secret register values, built by a closure over the indices listed: at opt-level 3
+// by core::array::from_fn, the code that was measured; below it as an array expression with the
+// closure's body written out for each index, which builds the array where it lives, so that
+// wipe_unless_optimized reaches it, while from_fn builds it in a temporary of its own and a call
+// of the closure that is not inlined returns a vector through one (D-76). Each form at its level
+// only, so that the code at 3 is the same as without the macro.
+#[cfg(crypto_pq_optimized)]
+#[allow(unused_macros)]
+macro_rules! registers {
+    (|$x:ident| $body:expr; $($i:literal)+) => {
+        core::array::from_fn(|$x| $body)
+    };
+}
+
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unused_macros)]
+macro_rules! registers {
+    (|$x:ident| $body:expr; $($i:literal)+) => {
+        [$({
+            let $x: usize = $i;
+
+            $body
+        }),+]
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use registers;
+
+// The values of an array of secret register values, for a loop: at opt-level 3 its into_iter(),
+// with the array in registers; below it an iterator over a reference, as an iterator that owns
+// the array is a copy of it in memory, which no wipe reaches, while the array itself is wiped
+// (D-76).
+#[cfg(crypto_pq_optimized)]
+#[allow(unused_macros)]
+macro_rules! values {
+    ($array:expr) => {
+        $array.into_iter()
+    };
+}
+
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unused_macros)]
+macro_rules! values {
+    ($array:expr) => {
+        $array.iter().copied()
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use values;
+
 /// Secret bytes on the heap, wiped when dropped: the type of every secret output, such as shared
 /// secrets, derived keys and exported private keys.
 ///

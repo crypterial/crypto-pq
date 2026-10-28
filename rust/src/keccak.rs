@@ -1,6 +1,6 @@
 use crate::cpu;
 use crate::sha2::low_bytes;
-use crate::wipe::{wipe, wipe_unless_optimized};
+use crate::wipe::{registers, wipe, wipe_unless_optimized};
 
 pub(crate) const ROUND_CONSTANTS: [u64; 24] = [
     0x0000000000000001,
@@ -40,18 +40,23 @@ pub(crate) const ROTATIONS: [u32; 25] = [
 #[inline(always)]
 pub(crate) fn round(a: &[u64; 25], e: &mut [u64; 25], parities: &mut [u64; 5], constant: u64) {
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-    let mut d: [u64; 5] =
-        core::array::from_fn(|x| parities[(x + 4) % 5] ^ parities[(x + 1) % 5].rotate_left(1));
+    let mut d: [u64; 5] = registers!(
+        |x| parities[(x + 4) % 5] ^ parities[(x + 1) % 5].rotate_left(1);
+        0 1 2 3 4
+    );
 
     let mut next = [0; 5];
 
     for y in 0..5 {
         #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-        let mut b: [u64; 5] = core::array::from_fn(|x| {
-            let source = (x + 3 * y) % 5 + 5 * x;
+        let mut b: [u64; 5] = registers!(
+            |x| {
+                let source = (x + 3 * y) % 5 + 5 * x;
 
-            (a[source] ^ d[source % 5]).rotate_left(ROTATIONS[source])
-        });
+                (a[source] ^ d[source % 5]).rotate_left(ROTATIONS[source])
+            };
+            0 1 2 3 4
+        );
 
         for x in 0..5 {
             let lane = b[x] ^ (!b[(x + 1) % 5] & b[(x + 2) % 5]);
@@ -80,9 +85,10 @@ pub(crate) fn round(a: &[u64; 25], e: &mut [u64; 25], parities: &mut [u64; 5], c
 
 // The column parities that the first round's theta needs.
 pub(crate) fn parities(state: &[u64; 25]) -> [u64; 5] {
-    core::array::from_fn(|x| {
-        state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20]
-    })
+    registers!(
+        |x| state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+        0 1 2 3 4
+    )
 }
 
 // Keccak-f[1600] as the specification writes it, for states that constants need at compile time.

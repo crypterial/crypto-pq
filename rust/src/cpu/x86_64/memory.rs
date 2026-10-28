@@ -82,12 +82,16 @@ pub(super) fn store256<T: Plain, const N: usize>(vector: __m256i, out: &mut [T; 
 }
 
 // A vector into element i of an array of vectors that may not hold values yet, as store256_at
-// does for arrays of words. The index is checked.
-#[target_feature(enable = "avx")]
-#[inline]
+// does for arrays of words. The index is checked. Below opt-level 3, where the vector can reach
+// it through memory, it is inlined everywhere and wipes the vector, so that no copy of a secret
+// is left in the caller's frame (D-76).
+#[cfg_attr(crypto_pq_optimized, target_feature(enable = "avx"))]
+#[cfg_attr(crypto_pq_optimized, inline)]
+#[cfg_attr(not(crypto_pq_optimized), inline(always))]
+#[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
 #[allow(unsafe_code)]
 pub(super) fn store_vector_at<const M: usize>(
-    vector: __m256i,
+    mut vector: __m256i,
     out: &mut MaybeUninit<[__m256i; M]>,
     i: usize,
 ) {
@@ -96,6 +100,8 @@ pub(super) fn store_vector_at<const M: usize>(
     // SAFETY: element i < M of out is writable and aligned for a vector, which then holds a
     // value.
     unsafe { out.as_mut_ptr().cast::<__m256i>().add(i).write(vector) }
+
+    crate::wipe::wipe_unless_optimized!(words_of(&mut vector));
 }
 
 // store256 into element i of an array that may not hold values yet, such as a buffer that is not
