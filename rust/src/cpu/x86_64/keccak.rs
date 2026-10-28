@@ -17,6 +17,8 @@
 
 use core::arch::x86_64::*;
 
+use core::hint::black_box;
+
 use core::mem::MaybeUninit;
 
 #[cfg(not(crypto_pq_optimized))]
@@ -53,23 +55,12 @@ fn plane4<const Y: usize>(
     d: &[__m256i; 5],
     e: &mut [__m256i; 25],
     next: &mut [__m256i; 5],
+    constants: &Constants4,
     constant: u64,
 ) {
     let t = |s: usize| _mm256_xor_si256(a[s], d[s % 5]);
 
-    let by8 = _mm256_set_epi64x(
-        0x0E0D_0C0B_0A09_080F,
-        0x0605_0403_0201_0007,
-        0x0E0D_0C0B_0A09_080F,
-        0x0605_0403_0201_0007,
-    );
-
-    let by56 = _mm256_set_epi64x(
-        0x080F_0E0D_0C0B_0A09,
-        0x0007_0605_0403_0201,
-        0x080F_0E0D_0C0B_0A09,
-        0x0007_0605_0403_0201,
-    );
+    let [by8, by56] = constants.shuffles;
 
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
     let mut b = match Y {
@@ -126,24 +117,67 @@ fn plane4<const Y: usize>(
     wipe_unless_optimized!(words_of(&mut b));
 }
 
+// The public constants that the AVX2 rounds load: the byte shuffles that rotate by 8 and by 56, and
+// the round constants. Each kernel copies them into its own stack frame and reads them through
+// black_box, so that LLVM cannot fold them back into loads from the read-only data. Such a load,
+// at bits 11:0 equal to those of a spill slot written just before, waits for that store (4 KiB
+// aliasing): in about one process in six, by where its stack began, the four-state rounds took
+// 1.2 to 2.2 times as long on Haswell and on AMD Zen 3 and Zen 4. Within one frame, smaller than
+// 4 KiB, no two addresses share those bits.
+struct Constants4 {
+    shuffles: [__m256i; 2],
+    rounds: [u64; 24],
+}
+
+impl Constants4 {
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn new() -> Self {
+        let by8 = _mm256_set_epi64x(
+            0x0E0D_0C0B_0A09_080F,
+            0x0605_0403_0201_0007,
+            0x0E0D_0C0B_0A09_080F,
+            0x0605_0403_0201_0007,
+        );
+
+        let by56 = _mm256_set_epi64x(
+            0x080F_0E0D_0C0B_0A09,
+            0x0007_0605_0403_0201,
+            0x080F_0E0D_0C0B_0A09,
+            0x0007_0605_0403_0201,
+        );
+
+        Self {
+            shuffles: [by8, by56],
+            rounds: ROUND_CONSTANTS,
+        }
+    }
+}
+
 // One round on four states from a into e.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn round4(a: &[__m256i; 25], e: &mut [__m256i; 25], parities: &mut [__m256i; 5], constant: u64) {
+fn round4(
+    a: &[__m256i; 25],
+    e: &mut [__m256i; 25],
+    parities: &mut [__m256i; 5],
+    constants: &Constants4,
+    constant: u64,
+) {
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
     let mut d = theta4(parities);
 
     let mut next = [_mm256_setzero_si256(); 5];
 
-    plane4::<0>(a, &d, e, &mut next, constant);
+    plane4::<0>(a, &d, e, &mut next, constants, constant);
 
-    plane4::<1>(a, &d, e, &mut next, constant);
+    plane4::<1>(a, &d, e, &mut next, constants, constant);
 
-    plane4::<2>(a, &d, e, &mut next, constant);
+    plane4::<2>(a, &d, e, &mut next, constants, constant);
 
-    plane4::<3>(a, &d, e, &mut next, constant);
+    plane4::<3>(a, &d, e, &mut next, constants, constant);
 
-    plane4::<4>(a, &d, e, &mut next, constant);
+    plane4::<4>(a, &d, e, &mut next, constants, constant);
 
     *parities = next;
 
@@ -161,8 +195,11 @@ fn gather4(s: &[&[u64; 25]; 4], a: &mut [__m256i; 25]) {
     for k in 0..6 {
         // An array expression, which builds the array in place: core::array::from_fn built it in
         // a temporary below opt-level 3. The loads are written out, as a closure for them was a
-        // call at opt-level z that returned each row through a stack temporary.
-        let rows = transpose4([
+        // call at opt-level z that returned each row through a stack temporary. Below opt-level 3
+        // the copy into a can be a call that takes the rows' address, and lane4 can return its
+        // vector through memory, so both are wiped there (D-76).
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut rows = transpose4([
             load256(&s[0].as_chunks::<4>().0[k]),
             load256(&s[1].as_chunks::<4>().0[k]),
             load256(&s[2].as_chunks::<4>().0[k]),
@@ -170,9 +207,16 @@ fn gather4(s: &[&[u64; 25]; 4], a: &mut [__m256i; 25]) {
         ]);
 
         a[4 * k..4 * k + 4].copy_from_slice(&rows);
+
+        wipe_unless_optimized!(words_of(&mut rows));
     }
 
-    a[24] = lane4(s, 24);
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut last = lane4(s, 24);
+
+    a[24] = last;
+
+    wipe_unless_optimized!(words_of(&mut last));
 }
 
 // The lanes of up to four states out of vectors, four lanes at a time by a 4 x 4 transposition and
@@ -373,10 +417,14 @@ pub(super) fn permute4_avx2(states: &mut [&mut [u64; 25]]) {
 
     let mut e = [_mm256_setzero_si256(); 25];
 
-    for constants in ROUND_CONSTANTS.as_chunks::<2>().0 {
-        round4(&a, &mut e, &mut parities, constants[0]);
+    let constants = Constants4::new();
 
-        round4(&e, &mut a, &mut parities, constants[1]);
+    let constants = black_box(&constants);
+
+    for pair in constants.rounds.as_chunks::<2>().0 {
+        round4(&a, &mut e, &mut parities, constants, pair[0]);
+
+        round4(&e, &mut a, &mut parities, constants, pair[1]);
     }
 
     scatter4(&a, states);
@@ -393,13 +441,13 @@ pub(super) fn permute4_avx2(states: &mut [&mut [u64; 25]]) {
 #[cfg(feature = "frodokem")]
 #[target_feature(enable = "avx2")]
 #[inline]
-fn permute4_in_place(a: &mut [__m256i; 25], e: &mut [__m256i; 25]) {
+fn permute4_in_place(a: &mut [__m256i; 25], e: &mut [__m256i; 25], constants: &Constants4) {
     let mut parities = parities4(a);
 
-    for constants in ROUND_CONSTANTS.as_chunks::<2>().0 {
-        round4(a, e, &mut parities, constants[0]);
+    for pair in constants.rounds.as_chunks::<2>().0 {
+        round4(a, e, &mut parities, constants, pair[0]);
 
-        round4(e, a, &mut parities, constants[1]);
+        round4(e, a, &mut parities, constants, pair[1]);
     }
 }
 
@@ -832,7 +880,13 @@ pub(super) fn absorb_avx512<const RATE: usize, const THETA3: bool>(
 #[cfg(feature = "frodokem")]
 #[target_feature(enable = "avx2")]
 pub(super) fn matrix_rows4(seed_a: &[u8; 16], rows: &mut [u16], n: usize, i0: usize) {
-    rows4_with(seed_a, rows, n, i0, |a, e| permute4_in_place(a, e));
+    let constants = Constants4::new();
+
+    let constants = black_box(&constants);
+
+    rows4_with(seed_a, rows, n, i0, |a, e| {
+        permute4_in_place(a, e, constants)
+    });
 }
 
 // matrix_rows4 with the AVX-512VL permutation. As digest_avx512, this code itself is built without
@@ -1243,10 +1297,14 @@ pub(super) fn one_block4_avx2(
 
     let mut e = [_mm256_setzero_si256(); 25];
 
-    for constants in ROUND_CONSTANTS.as_chunks::<2>().0 {
-        round4(&a, &mut e, &mut parities, constants[0]);
+    let constants = Constants4::new();
 
-        round4(&e, &mut a, &mut parities, constants[1]);
+    let constants = black_box(&constants);
+
+    for pair in constants.rounds.as_chunks::<2>().0 {
+        round4(&a, &mut e, &mut parities, constants, pair[0]);
+
+        round4(&e, &mut a, &mut parities, constants, pair[1]);
     }
 
     out4!(&a, outs);

@@ -25,6 +25,11 @@ Implements specification 1.1 (draft).
   loads and stores the lanes of each state four at a time, with transposes, in place of loops over
   the states, so that its state array is indexed with constants only and, at opt-level 3, stays in
   registers. Outputs are unchanged.
+- Keccak-f[1600] on x86-64 CPUs with AVX2 and without AVX-512: the four-state kernels copy the rho
+  shuffle masks and the round constants into their own frame once per call and read them there, in
+  place of loading the masks from read-only data in every round. In processes whose stack began at
+  some addresses, those loads shared the low 12 address bits with stack stores made just before
+  them and waited for the stores. Outputs are unchanged.
 - SLH-DSA-SHAKE on x86-64 CPUs with AVX2: F and PRF of up to four nodes, whose input fits one
   block, are padded, permuted and read in the four-state kernel's vector layout, from the parts of
   each message (the public seed shared by all four is broadcast), with no sponge object and no
