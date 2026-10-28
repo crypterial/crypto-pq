@@ -16,7 +16,7 @@ use crate::cpu;
 use crate::ct::{self, declassify};
 use crate::keccak::{Keccak, MAX_SPONGES, Sponges};
 use crate::primitives::shake256_into;
-use crate::wipe::{SecretBytes, wipe};
+use crate::wipe::{SecretBytes, wipe, wipe_unless_optimized};
 
 const BAR: usize = 8;
 
@@ -442,6 +442,8 @@ fn mul_sub_bs(w: &mut [u16; BAR * BAR], s: &[u16], c1: &[u8], n: usize) {
         for (w, y) in w[BAR * k..][..BAR].iter_mut().zip(acc) {
             *w = w.wrapping_sub(y);
         }
+
+        wipe_unless_optimized!(&mut acc);
     }
 }
 
@@ -635,14 +637,15 @@ fn encrypt(
     pack(c2, v);
 }
 
-// Encaps (draft 7.2) with the draw u || salt and pkh = SHAKE(pk): the shared secret, in the first
-// secret_size bytes, and the ciphertext.
+// Encaps (draft 7.2) with the draw u || salt and pkh = SHAKE(pk): the ciphertext, and the shared
+// secret written to shared_secret, of secret_size bytes.
 pub(crate) fn encapsulate(
     p: &Parameters,
     pk: &[u8],
     pkh: &[u8],
     randomness: &[u8],
-) -> ([u8; 32], Vec<u8>) {
+    shared_secret: &mut [u8],
+) -> Vec<u8> {
     let (n, secret) = (p.n, p.secret_size);
 
     let (u, salt) = randomness.split_at(secret);
@@ -676,19 +679,17 @@ pub(crate) fn encapsulate(
 
     declassify(&ciphertext);
 
-    let mut shared_secret = [0; 32];
-
-    shake256_into(&[&ciphertext, &k[..secret]], &mut shared_secret[..secret]);
+    shake256_into(&[&ciphertext, &k[..secret]], shared_secret);
 
     wipe(&mut g);
 
-    (shared_secret, ciphertext)
+    ciphertext
 }
 
 // Decaps (draft 7.3) with sk = s || pk || S^T || pkh: the re-encryption of the decoded u' must give
 // B' || C again, compared in full without an early exit; otherwise the shared secret comes from s
-// instead of k', chosen with a mask.
-pub(crate) fn decapsulate(p: &Parameters, sk: &[u8], ciphertext: &[u8]) -> [u8; 32] {
+// instead of k', chosen with a mask. The shared secret, of secret_size bytes, goes to shared_secret.
+pub(crate) fn decapsulate(p: &Parameters, sk: &[u8], ciphertext: &[u8], shared_secret: &mut [u8]) {
     let (n, secret) = (p.n, p.secret_size);
 
     let (s, rest) = sk.split_at(secret);
@@ -755,12 +756,7 @@ pub(crate) fn decapsulate(p: &Parameters, sk: &[u8], ciphertext: &[u8]) -> [u8; 
         &mut k_hat[..secret],
     );
 
-    let mut shared_secret = [0; 32];
-
-    shake256_into(
-        &[ciphertext, &k_hat[..secret]],
-        &mut shared_secret[..secret],
-    );
+    shake256_into(&[ciphertext, &k_hat[..secret]], shared_secret);
 
     wipe(&mut m);
 
@@ -771,8 +767,6 @@ pub(crate) fn decapsulate(p: &Parameters, sk: &[u8], ciphertext: &[u8]) -> [u8; 
     wipe(&mut c2_prime);
 
     wipe(&mut k_hat);
-
-    shared_secret
 }
 
 // The import checks of a raw private key before its pairwise test (SPEC 8.2.4 item 3): pkh must be

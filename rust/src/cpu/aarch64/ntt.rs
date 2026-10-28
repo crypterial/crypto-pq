@@ -17,7 +17,10 @@
 use core::arch::aarch64::*;
 
 use super::memory::{load_i16, load_i32, load_u16, store_i32, store_u16};
+#[cfg(not(crypto_pq_optimized))]
+use super::vector_lanes;
 use crate::cpu::{Field, Field16, Prepare};
+use crate::wipe::wipe_unless_optimized;
 
 #[allow(unsafe_code)]
 #[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
@@ -287,6 +290,8 @@ fn forward(w: &mut [i32; 256], field: &Field) {
         for (m, x) in x.iter().enumerate() {
             store(*x, &mut chunks[j + 8 * m]);
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut x));
     }
 
     let scale = field.forward_scale.map(|scale| constant(scale, field.qinv));
@@ -344,6 +349,8 @@ fn forward(w: &mut [i32; 256], field: &Field) {
         for (x, chunk) in x.iter().zip(block.iter_mut()) {
             store(*x, chunk);
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut x));
     }
 }
 
@@ -413,6 +420,8 @@ fn inverse(w: &mut [i32; 256], field: &Field) {
         for (x, chunk) in x.iter().zip(block.iter_mut()) {
             store(*x, chunk);
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut x));
     }
 
     let t32 = [248, 249, 250, 251].map(|m| broadcast(z, zq, m));
@@ -445,6 +454,8 @@ fn inverse(w: &mut [i32; 256], field: &Field) {
         for (m, x) in x.iter().enumerate() {
             store(freeze(montgomery(*x, scale, q), q), &mut chunks[j + 8 * m]);
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut x));
     }
 }
 
@@ -500,6 +511,8 @@ fn products_add(acc: &mut [i32; 256], f: &[[i32; 256]], g: &[[i32; 256]], field:
         for (sum, acc) in sums.iter().zip(acc.as_chunks_mut::<4>().0) {
             store(*sum, acc);
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut sums));
     }
 }
 
@@ -554,7 +567,8 @@ fn base_products(acc: &mut [i32; 256], a: &[u16; 256], b: &[u16; 256], cache: &[
 
         pair_products(&mut sums, a, b, c);
 
-        let products = [
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut products = [
             vzip1q_u32(sums[0], sums[2]),
             vzip2q_u32(sums[0], sums[2]),
             vzip1q_u32(sums[1], sums[3]),
@@ -564,6 +578,10 @@ fn base_products(acc: &mut [i32; 256], a: &[u16; 256], b: &[u16; 256], cache: &[
         for (sums, product) in acc.as_chunks_mut::<4>().0.iter_mut().zip(products) {
             store(vaddq_s32(load(sums), vreinterpretq_s32_u32(product)), sums);
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut sums));
+
+        wipe_unless_optimized!(vector_lanes(&mut products));
     }
 }
 
@@ -602,7 +620,8 @@ fn matrix_vector(
             }
 
             // Below 2q after one Barrett step, then narrowed: even and odd halves of the pairs.
-            let reduced = sums.map(|sum| {
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut reduced = sums.map(|sum| {
                 let sum = vreinterpretq_s32_u32(sum);
 
                 vreinterpretq_u32_s32(vmlsq_s32(sum, vqdmulhq_s32(sum, estimate), q32))
@@ -620,7 +639,8 @@ fn matrix_vector(
                 unreachable!("sixteen values are two groups of eight")
             };
 
-            let pairs = [vzip1q_u16(even, odd), vzip2q_u16(even, odd)];
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut pairs = [vzip1q_u16(even, odd), vzip2q_u16(even, odd)];
 
             for ((out, e), x) in [out_low, out_high]
                 .into_iter()
@@ -633,6 +653,12 @@ fn matrix_vector(
 
                 store_u16(vminq_u16(sum, vsubq_u16(sum, q16)), out);
             }
+
+            wipe_unless_optimized!(vector_lanes(&mut sums));
+
+            wipe_unless_optimized!(vector_lanes(&mut pairs));
+
+            wipe_unless_optimized!(vector_lanes(&mut reduced));
         }
     }
 }
@@ -796,6 +822,8 @@ fn forward16(f: &mut [u16; 256], field: &Field16) {
         for (m, x) in x.iter().enumerate() {
             store16(*x, &mut chunks[j + 4 * m]);
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut x));
     }
 
     let canonical = constant16(field.canonical, field.qinv);
@@ -847,6 +875,8 @@ fn forward16(f: &mut [u16; 256], field: &Field16) {
         for (x, chunk) in x.iter().zip(block.iter_mut()) {
             store16(*x, chunk);
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut x));
     }
 }
 
@@ -926,6 +956,8 @@ fn inverse16(acc: &[i32; 256], out: &mut [u16; 256], field: &Field16) {
         for (x, chunk) in x.iter().zip(block.iter_mut()) {
             store16(*x, chunk);
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut x));
     }
 
     let t32 = [120, 121, 122, 123].map(|m| broadcast16(z, zq, m));
@@ -965,5 +997,7 @@ fn inverse16(acc: &[i32; 256], out: &mut [u16; 256], field: &Field16) {
                 &mut chunks[j + 4 * m],
             );
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut x));
     }
 }

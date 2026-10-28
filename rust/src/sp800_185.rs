@@ -132,11 +132,14 @@ pub(crate) const fn kmac_prefix(rate: usize) -> [u64; 25] {
     state
 }
 
-// The KMAC sponge after its key: the prefix of N = "KMAC" and S, then bytepad(encode_string(K),
-// rate) (4.3). The state holds the key from here on; dropping the engine wipes it.
-pub(crate) fn keyed(prefix: &[u64; 25], rate: usize, key: &[u8]) -> Keccak {
-    let mut engine = Keccak::resume(*prefix, rate, SUFFIX);
+// The KMAC sponge at the start, after the prefix of N = "KMAC" and S.
+pub(crate) const fn unkeyed(prefix: &[u64; 25], rate: usize) -> Keccak {
+    Keccak::resume(*prefix, rate, SUFFIX)
+}
 
+// The KMAC sponge of unkeyed, keyed in place: bytepad(encode_string(K), rate) (4.3). The state holds
+// the key from here on, in place, so that no copy of it is moved; dropping the engine wipes it.
+pub(crate) fn key(engine: &mut Keccak, rate: usize, key: &[u8]) {
     engine.update(left_encode(rate as u128).as_slice());
 
     engine.update(left_encode(8 * key.len() as u128).as_slice());
@@ -144,8 +147,6 @@ pub(crate) fn keyed(prefix: &[u64; 25], rate: usize, key: &[u8]) -> Keccak {
     engine.update(key);
 
     engine.pad_block();
-
-    engine
 }
 
 // right_encode(L) with L in bits, or right_encode(0) for KMACXOF (4.3.1).
@@ -162,7 +163,9 @@ pub(crate) fn kmac(
     xof: bool,
     out: &mut [u8],
 ) {
-    let mut engine = keyed(prefix, rate, key);
+    let mut engine = unkeyed(prefix, rate);
+
+    self::key(&mut engine, rate, key);
 
     engine.update(data);
 

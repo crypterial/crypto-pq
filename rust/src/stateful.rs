@@ -9,7 +9,7 @@ use crate::keys::{KeyFormat, export_public, import_public};
 use crate::lms::{self, LmsType, OtsType};
 use crate::mac::HMAC_SHA_256;
 use crate::merkle::{CACHED_HEIGHT, MerkleTree};
-use crate::primitives::sha256;
+use crate::primitives::sha256_into;
 use crate::rng::random_bytes;
 use crate::wipe::{SecretBytes, wipe};
 #[cfg(feature = "xmss")]
@@ -889,10 +889,17 @@ impl StatefulSignatureAlgorithm {
 
         let (body, checksum) = state.split_at(state.len() - CHECKSUM_SIZE);
 
-        // Whether a stored state is intact is public: loading fails on it.
-        if !ct::declassify_value(ct::equal(&sha256(&[body])[..CHECKSUM_SIZE], checksum))
-            || body[0] != VERSION
-        {
+        // The checksum of the private state, wiped after the comparison. Whether a stored state is
+        // intact is public: loading fails on it.
+        let mut expected = [0; CHECKSUM_SIZE];
+
+        sha256_into(&[body], &mut expected);
+
+        let intact = ct::declassify_value(ct::equal(&expected, checksum));
+
+        wipe(&mut expected);
+
+        if !intact || body[0] != VERSION {
             return Err(Error::InvalidPrivateKey);
         }
 
@@ -1344,9 +1351,9 @@ impl<S> StatefulPrivateKey<S> {
             }
         }
 
-        let checksum = sha256(&[&state[..size - CHECKSUM_SIZE]]);
+        let (body, checksum) = state.split_at_mut(size - CHECKSUM_SIZE);
 
-        state[size - CHECKSUM_SIZE..].copy_from_slice(&checksum[..CHECKSUM_SIZE]);
+        sha256_into(&[body], checksum);
 
         state
     }

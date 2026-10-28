@@ -1,5 +1,5 @@
 use crate::cpu;
-use crate::wipe::wipe;
+use crate::wipe::{wipe, wipe_unless_optimized};
 
 pub(crate) const K256: [u32; 64] = [
     0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
@@ -241,9 +241,19 @@ fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
         return;
     }
 
-    for block in blocks.iter().chain(more) {
-        compress256_block(state, block);
+    compress256_blocks(state, blocks.iter().chain(more));
+}
+
+// The portable compression of each block in turn. The schedule holds words of the message, so one
+// serves every block and is wiped once at the end.
+fn compress256_blocks<'a>(state: &mut [u32; 8], blocks: impl IntoIterator<Item = &'a [u8; 64]>) {
+    let mut w = [0; 16];
+
+    for block in blocks {
+        compress256_block(state, block, &mut w);
     }
+
+    wipe(&mut w);
 }
 
 // One block into each of two states, side by side: a lone stream waits on the latency of its
@@ -285,8 +295,8 @@ fn store256(state: &[u32; 8], out: &mut [u8]) {
         *bytes = word.to_be_bytes();
     }
 
-    if let Some(word) = state.get(words.len()) {
-        rest.copy_from_slice(&word.to_be_bytes()[..rest.len()]);
+    if let Some(&word) = state.get(words.len()) {
+        first_bytes(u64::from(word) << 32, rest);
     }
 }
 
@@ -297,8 +307,23 @@ fn store512(state: &[u64; 8], out: &mut [u8]) {
         *bytes = word.to_be_bytes();
     }
 
-    if let Some(word) = state.get(words.len()) {
-        rest.copy_from_slice(&word.to_be_bytes()[..rest.len()]);
+    if let Some(&word) = state.get(words.len()) {
+        first_bytes(word, rest);
+    }
+}
+
+// The first out.len() bytes of value in big-endian order, at most eight, by shifts. A copy from a
+// runtime-sized slice of value's bytes went through a buffer on the stack, which kept them there.
+pub(crate) fn first_bytes(value: u64, out: &mut [u8]) {
+    for (k, byte) in out.iter_mut().enumerate() {
+        *byte = (value >> (56 - 8 * k)) as u8;
+    }
+}
+
+// The low out.len() bytes of value in little-endian order, at most eight, as first_bytes does.
+pub(crate) fn low_bytes(value: u64, out: &mut [u8]) {
+    for (k, byte) in out.iter_mut().enumerate() {
+        *byte = (value >> (8 * k)) as u8;
     }
 }
 
@@ -405,52 +430,58 @@ pub(crate) fn finish512(state: &[u64; 8], absorbed: u128, data: &[u8], out: &mut
     wipe(&mut state);
 }
 
-// HMAC (RFC 2104) keys: the key, at most a block, padded with zeros to a block and XORed with
-// 0x36 for the inner hash and with 0x5C for the outer one.
-fn pads<const BLOCK: usize>(key: &[u8]) -> [[u8; BLOCK]; 2] {
-    let mut pads = [[0x36; BLOCK], [0x5C; BLOCK]];
+// HMAC (RFC 2104) keys, built in place: the key, at most a block, padded with zeros to a block
+// and XORed with 0x36 for the inner hash and with 0x5C for the outer one.
+fn pads<const BLOCK: usize>(key: &[u8], pads: &mut [[u8; BLOCK]; 2]) {
+    for (pad, value) in pads.iter_mut().zip([0x36, 0x5C]) {
+        pad.fill(value);
 
-    for pad in &mut pads {
         for (byte, key) in pad.iter_mut().zip(key) {
             *byte ^= key;
         }
     }
-
-    pads
 }
 
-// The states after HMAC's inner and outer key blocks, compressed side by side.
-pub(crate) fn keyed256(iv: &[u32; 8], key: &[u8]) -> [[u32; 8]; 2] {
-    let mut pads = pads::<64>(key);
+// The states after HMAC's inner and outer key blocks, compressed side by side into states.
+pub(crate) fn keyed256(iv: &[u32; 8], key: &[u8], states: &mut [[u32; 8]; 2]) {
+    let mut block = [[0; 64]; 2];
 
-    let mut states = [*iv; 2];
+    pads(key, &mut block);
 
-    compress256_pair(&mut states, &pads);
+    *states = [*iv; 2];
 
-    wipe(pads.as_flattened_mut());
+    compress256_pair(states, &block);
 
-    states
+    wipe(block.as_flattened_mut());
 }
 
-pub(crate) fn keyed512(iv: &[u64; 8], key: &[u8]) -> [[u64; 8]; 2] {
-    let mut pads = pads::<128>(key);
+pub(crate) fn keyed512(iv: &[u64; 8], key: &[u8], states: &mut [[u64; 8]; 2]) {
+    let mut block = [[0; 128]; 2];
 
-    let mut states = [*iv; 2];
+    pads(key, &mut block);
 
-    compress512_pair(&mut states, &pads);
+    *states = [*iv; 2];
 
-    wipe(pads.as_flattened_mut());
+    compress512_pair(states, &block);
 
-    states
+    wipe(block.as_flattened_mut());
 }
 
 // HMAC-SHA-256, or HMAC-SHA-224 for a 28-byte tag, under a key of at most a block.
 pub(crate) fn hmac256(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
+    // Checked before any secret exists: no panic below can skip the wipes.
+    assert!(
+        matches!(tag.len(), 28 | 32),
+        "the tag size of HMAC-SHA-224 or HMAC-SHA-256"
+    );
+
     if cpu::hmac256(iv, key, data, tag) {
         return;
     }
 
-    let mut keyed = keyed256(iv, key);
+    let mut keyed = [[0; 8]; 2];
+
+    keyed256(iv, key, &mut keyed);
 
     let mut inner = [0; 32];
 
@@ -466,6 +497,12 @@ pub(crate) fn hmac256(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
 // HMAC-SHA-256 or HMAC-SHA-224 from the states after the inner and the outer key block, for
 // many messages under one key.
 pub(crate) fn hmac256_keyed(keyed: &[[u32; 8]; 2], data: &[u8], tag: &mut [u8]) {
+    // Checked before any secret exists: no panic below can skip the wipes.
+    assert!(
+        matches!(tag.len(), 28 | 32),
+        "the tag size of HMAC-SHA-224 or HMAC-SHA-256"
+    );
+
     if cpu::hmac256_keyed(keyed, data, tag) {
         return;
     }
@@ -480,6 +517,12 @@ pub(crate) fn hmac256_keyed(keyed: &[[u32; 8]; 2], data: &[u8], tag: &mut [u8]) 
 }
 
 pub(crate) fn hmac512_keyed(keyed: &[[u64; 8]; 2], data: &[u8], tag: &mut [u8]) {
+    // Checked before any secret exists: no panic below can skip the wipes.
+    assert!(
+        matches!(tag.len(), 48 | 64),
+        "the tag size of HMAC-SHA-384 or HMAC-SHA-512"
+    );
+
     if cpu::hmac512_keyed(keyed, data, tag) {
         return;
     }
@@ -495,11 +538,19 @@ pub(crate) fn hmac512_keyed(keyed: &[[u64; 8]; 2], data: &[u8], tag: &mut [u8]) 
 
 // HMAC-SHA-512, or HMAC-SHA-384 for a 48-byte tag, under a key of at most a block.
 pub(crate) fn hmac512(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
+    // Checked before any secret exists: no panic below can skip the wipes.
+    assert!(
+        matches!(tag.len(), 48 | 64),
+        "the tag size of HMAC-SHA-384 or HMAC-SHA-512"
+    );
+
     if cpu::hmac512(iv, key, data, tag) {
         return;
     }
 
-    let mut keyed = keyed512(iv, key);
+    let mut keyed = [[0; 8]; 2];
+
+    keyed512(iv, key, &mut keyed);
 
     let mut inner = [0; 64];
 
@@ -512,9 +563,8 @@ pub(crate) fn hmac512(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
     wipe(keyed.as_flattened_mut());
 }
 
-fn compress256_block(state: &mut [u32; 8], block: &[u8; 64]) {
-    let mut w = [0u32; 16];
-
+// w is the caller's schedule buffer, which every block writes in full.
+fn compress256_block(state: &mut [u32; 8], block: &[u8; 64], w: &mut [u32; 16]) {
     for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
         *word = u32::from_be_bytes(*bytes);
     }
@@ -676,13 +726,32 @@ pub(crate) fn compress256_lanes_portable<const LANES: usize>(
         round256_lanes(&b, &c, &d, &mut e, &f, &g, &h, &mut a, k[15], &w[15]);
     }
 
-    let words = [a, b, c, d, e, f, g, h];
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut words = [a, b, c, d, e, f, g, h];
 
     for (state, value) in states.iter_mut().zip(&words) {
         for (word, value) in state.iter_mut().zip(value) {
             *word = word.wrapping_add(*value);
         }
     }
+
+    wipe_unless_optimized!(&mut a);
+
+    wipe_unless_optimized!(&mut b);
+
+    wipe_unless_optimized!(&mut c);
+
+    wipe_unless_optimized!(&mut d);
+
+    wipe_unless_optimized!(&mut e);
+
+    wipe_unless_optimized!(&mut f);
+
+    wipe_unless_optimized!(&mut g);
+
+    wipe_unless_optimized!(&mut h);
+
+    wipe_unless_optimized!(words.as_flattened_mut());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -707,9 +776,18 @@ fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
         return;
     }
 
-    for block in blocks.iter().chain(more) {
-        compress512_block(state, block);
+    compress512_blocks(state, blocks.iter().chain(more));
+}
+
+// compress256_blocks for SHA-512.
+fn compress512_blocks<'a>(state: &mut [u64; 8], blocks: impl IntoIterator<Item = &'a [u8; 128]>) {
+    let mut w = [0; 16];
+
+    for block in blocks {
+        compress512_block(state, block, &mut w);
     }
+
+    wipe(&mut w);
 }
 
 // compress256_pair for SHA-512.
@@ -726,9 +804,7 @@ pub(crate) fn compress512_pair(states: &mut [[u64; 8]; 2], blocks: &[[u8; 128]; 
 // Never inlined: inlined into compress512, its frame and register saves came with every call, the
 // kernel's included, and cost a one-block SHA-512 about 30 ns on an Apple M3.
 #[inline(never)]
-fn compress512_block(state: &mut [u64; 8], block: &[u8; 128]) {
-    let mut w = [0u64; 16];
-
+fn compress512_block(state: &mut [u64; 8], block: &[u8; 128], w: &mut [u64; 16]) {
     for (word, bytes) in w.iter_mut().zip(block.as_chunks::<8>().0) {
         *word = u64::from_be_bytes(*bytes);
     }
@@ -801,6 +877,20 @@ impl Sha256 {
         }
     }
 
+    // A new engine keyed in place for HMAC: through the inner key block, and the state after the
+    // outer one into outer.
+    pub(crate) fn key_hmac(&mut self, key: &[u8], outer: &mut [u32; 8]) {
+        let mut keyed = [[0; 8]; 2];
+
+        keyed256(&self.state, key, &mut keyed);
+
+        [self.state, *outer] = keyed;
+
+        self.length = 64;
+
+        wipe(keyed.as_flattened_mut());
+    }
+
     pub(crate) fn update(&mut self, data: &[u8]) {
         self.length = self.length.wrapping_add(data.len() as u64);
 
@@ -833,22 +923,24 @@ impl Sha256 {
     }
 
     // finish_lanes for messages whose padded last block the caller has already built as words,
-    // word-major (blocks[t][lane]); returns the final states, word-major too. The blocks are
-    // overwritten.
+    // word-major (blocks[t][lane]), into the final states, word-major too. The blocks are
+    // overwritten. Results go to the caller's buffers here and below: returned by value, they
+    // were copied out of a buffer of the function's own, which kept them.
     pub(crate) fn finish_words<const LANES: usize>(
         &self,
         blocks: &mut [[u32; LANES]; 16],
-    ) -> [[u32; LANES]; 8] {
+        states: &mut [[u32; LANES]; 8],
+    ) {
         assert_eq!(
             self.blocks.len, 0,
             "the shared input must fill whole blocks"
         );
 
-        let mut states = self.state.map(|word| [word; LANES]);
+        for (lanes, &word) in states.iter_mut().zip(&self.state) {
+            *lanes = [word; LANES];
+        }
 
-        compress256_lanes(&mut states, blocks);
-
-        states
+        compress256_lanes(states, blocks);
     }
 
     // The digests of LANES messages of `length` bytes, each appended to the input so far, which
@@ -858,7 +950,8 @@ impl Sha256 {
         &self,
         messages: &mut [[u8; SIZE]; LANES],
         length: usize,
-    ) -> [[u8; 32]; LANES] {
+        digests: &mut [[u8; 32]; LANES],
+    ) {
         assert_eq!(
             self.blocks.len, 0,
             "the shared input must fill whole blocks"
@@ -892,8 +985,6 @@ impl Sha256 {
             compress256_lanes(&mut states, &mut words);
         }
 
-        let mut digests = [[0; 32]; LANES];
-
         for (lane, digest) in digests.iter_mut().enumerate() {
             for (bytes, state) in digest.as_chunks_mut::<4>().0.iter_mut().zip(&states) {
                 *bytes = state[lane].to_be_bytes();
@@ -905,8 +996,6 @@ impl Sha256 {
         wipe(states.as_flattened_mut());
 
         wipe(words.as_flattened_mut());
-
-        digests
     }
 }
 
@@ -929,6 +1018,19 @@ impl Sha512 {
             blocks: Blocks::new(),
             length: absorbed,
         }
+    }
+
+    // Sha256::key_hmac.
+    pub(crate) fn key_hmac(&mut self, key: &[u8], outer: &mut [u64; 8]) {
+        let mut keyed = [[0; 8]; 2];
+
+        keyed512(&self.state, key, &mut keyed);
+
+        [self.state, *outer] = keyed;
+
+        self.length = 128;
+
+        wipe(keyed.as_flattened_mut());
     }
 
     pub(crate) fn update(&mut self, data: &[u8]) {
@@ -966,7 +1068,8 @@ impl Sha512 {
         &self,
         message: &mut [u8; SIZE],
         length: usize,
-    ) -> [u8; 64] {
+        out: &mut [u8; 64],
+    ) {
         assert_eq!(
             self.blocks.len, 0,
             "the shared input must fill whole blocks"
@@ -986,15 +1089,11 @@ impl Sha512 {
 
         compress512(&mut state, message[..end].as_chunks::<128>().0, &[]);
 
-        let mut out = [0; 64];
-
-        store512(&state, &mut out);
+        store512(&state, out);
 
         wipe(message);
 
         wipe(&mut state);
-
-        out
     }
 }
 
@@ -1051,9 +1150,7 @@ mod tests {
 
             let mut expected = state;
 
-            for block in blocks {
-                compress256_block(&mut expected, block);
-            }
+            compress256_blocks(&mut expected, blocks);
 
             let mut actual = state;
 
@@ -1159,9 +1256,7 @@ mod tests {
 
             let mut expected = state;
 
-            for block in blocks {
-                compress512_block(&mut expected, block);
-            }
+            compress512_blocks(&mut expected, blocks);
 
             let mut actual = state;
 
@@ -1192,7 +1287,7 @@ mod tests {
             let mut expected = states;
 
             for (state, block) in expected.iter_mut().zip(&pair) {
-                compress256_block(state, block);
+                compress256_blocks(state, [block]);
             }
 
             compress256_pair(&mut states, &pair);
@@ -1208,7 +1303,7 @@ mod tests {
             let mut expected = states;
 
             for (state, block) in expected.iter_mut().zip(&pair) {
-                compress512_block(state, block);
+                compress512_blocks(state, [block]);
             }
 
             compress512_pair(&mut states, &pair);
@@ -1303,7 +1398,9 @@ mod tests {
             for (iv, size) in [(&IV_256, 32), (&IV_224, 28)] {
                 let key = &bytes[..key_length.min(64)];
 
-                let keyed = keyed256(iv, key);
+                let mut keyed = [[0; 8]; 2];
+
+                keyed256(iv, key, &mut keyed);
 
                 let (mut inner, mut expected) = ([0; 32], [0; 32]);
 
@@ -1331,7 +1428,9 @@ mod tests {
             for (iv, size) in [(&IV_512, 64), (&IV_384, 48)] {
                 let key = &bytes[..key_length];
 
-                let keyed = keyed512(iv, key);
+                let mut keyed = [[0; 8]; 2];
+
+                keyed512(iv, key, &mut keyed);
 
                 let (mut inner, mut expected) = ([0; 64], [0; 64]);
 

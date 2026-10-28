@@ -1,5 +1,6 @@
 use crate::cpu;
-use crate::wipe::wipe;
+use crate::sha2::low_bytes;
+use crate::wipe::{wipe, wipe_unless_optimized};
 
 pub(crate) const ROUND_CONSTANTS: [u64; 24] = [
     0x0000000000000001,
@@ -38,13 +39,15 @@ pub(crate) const ROTATIONS: [u32; 25] = [
 // A CPU kernel runs these rounds beside its vector rounds.
 #[inline(always)]
 pub(crate) fn round(a: &[u64; 25], e: &mut [u64; 25], parities: &mut [u64; 5], constant: u64) {
-    let d: [u64; 5] =
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut d: [u64; 5] =
         core::array::from_fn(|x| parities[(x + 4) % 5] ^ parities[(x + 1) % 5].rotate_left(1));
 
     let mut next = [0; 5];
 
     for y in 0..5 {
-        let b: [u64; 5] = core::array::from_fn(|x| {
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut b: [u64; 5] = core::array::from_fn(|x| {
             let source = (x + 3 * y) % 5 + 5 * x;
 
             (a[source] ^ d[source % 5]).rotate_left(ROTATIONS[source])
@@ -64,9 +67,15 @@ pub(crate) fn round(a: &[u64; 25], e: &mut [u64; 25], parities: &mut [u64; 5], c
 
             next[x] ^= lane;
         }
+
+        wipe_unless_optimized!(&mut b);
     }
 
     *parities = next;
+
+    wipe_unless_optimized!(&mut d);
+
+    wipe_unless_optimized!(&mut next);
 }
 
 // The column parities that the first round's theta needs.
@@ -138,6 +147,10 @@ pub(crate) fn permute(state: &mut [u64; 25]) {
 
         round(&e, state, &mut parities, constants[1]);
     }
+
+    wipe_unless_optimized!(&mut e);
+
+    wipe_unless_optimized!(&mut parities);
 }
 
 // One state through a CPU kernel where there is one.
@@ -384,9 +397,7 @@ impl Sponges {
         }
 
         if !tail.is_empty() {
-            let lane = self.states[i][chunks.len()].to_le_bytes();
-
-            tail.copy_from_slice(&lane[..tail.len()]);
+            low_bytes(self.states[i][chunks.len()], tail);
         }
     }
 }
@@ -413,7 +424,8 @@ impl Keccak {
         Self::resume([0; 25], rate, suffix)
     }
 
-    // A sponge whose input so far has left `state` at a block boundary.
+    // A sponge whose input so far has left `state` at a block boundary. resume and state move
+    // states by value, so they are only for public ones: the cSHAKE and KMAC prefixes.
     pub(crate) const fn resume(state: [u64; 25], rate: usize, suffix: u8) -> Self {
         Self {
             state,

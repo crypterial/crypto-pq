@@ -15,8 +15,11 @@
 
 use core::arch::x86_64::*;
 
-use super::memory::{load128, load256, store256};
+#[cfg(not(crypto_pq_optimized))]
+use super::memory::words_of;
+use super::memory::{clear, load128, load256, store256};
 use crate::cpu::{Field, Prepare};
+use crate::wipe::wipe_unless_optimized;
 
 // A factor and its product by q^-1 in the even lanes, and the same for the odd lanes moved down.
 #[derive(Clone, Copy)]
@@ -243,8 +246,13 @@ pub(super) fn forward(w: &mut [i32; 256], field: &Field) {
 
     let t32 = [4, 5, 6, 7].map(|m| broadcast(z, zq, m));
 
+    // The working vectors, which the loops index through memory, are cleared at the end.
+    let zero = _mm256_setzero_si256();
+
+    let (mut x8, mut x4) = ([zero; 8], [zero; 4]);
+
     for j in 0..4 {
-        let mut x = [_mm256_setzero_si256(); 8];
+        let x = &mut x8;
 
         for (m, x) in x.iter_mut().enumerate() {
             *x = load256(&vectors[j + 4 * m]);
@@ -272,7 +280,7 @@ pub(super) fn forward(w: &mut [i32; 256], field: &Field) {
         .map(|scale| constant(scale, scale.wrapping_mul(field.qinv)));
 
     for (b, block) in vectors.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let mut x = [_mm256_setzero_si256(); 4];
+        let x = &mut x4;
 
         for (x, chunk) in x.iter_mut().zip(block.iter()) {
             *x = load256(chunk);
@@ -295,7 +303,7 @@ pub(super) fn forward(w: &mut [i32; 256], field: &Field) {
         }
 
         if let Some(scale) = scale {
-            for x in &mut x {
+            for x in x.iter_mut() {
                 *x = freeze(montgomery(*x, scale, q), q);
             }
         }
@@ -304,6 +312,10 @@ pub(super) fn forward(w: &mut [i32; 256], field: &Field) {
             store256(*x, chunk);
         }
     }
+
+    clear(&mut x8, zero);
+
+    clear(&mut x4, zero);
 }
 
 // The inverse layers that pair coefficients 1, 2 and 4 apart, mirroring forward_tail with the
@@ -361,8 +373,13 @@ pub(super) fn inverse(w: &mut [i32; 256], field: &Field) {
         }
     };
 
+    // The working vectors, which the loops index through memory, are cleared at the end.
+    let zero = _mm256_setzero_si256();
+
+    let (mut x4, mut x8) = ([zero; 4], [zero; 8]);
+
     for (b, block) in vectors.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let mut x = [_mm256_setzero_si256(); 4];
+        let x = &mut x4;
 
         for (x, chunk) in x.iter_mut().zip(block.iter()) {
             *x = prepare(load256(chunk));
@@ -401,7 +418,7 @@ pub(super) fn inverse(w: &mut [i32; 256], field: &Field) {
     );
 
     for j in 0..4 {
-        let mut x = [_mm256_setzero_si256(); 8];
+        let x = &mut x8;
 
         for (m, x) in x.iter_mut().enumerate() {
             *x = load256(&vectors[j + 4 * m]);
@@ -423,6 +440,10 @@ pub(super) fn inverse(w: &mut [i32; 256], field: &Field) {
             store256(freeze(montgomery(*x, scale, q), q), &mut vectors[j + 4 * m]);
         }
     }
+
+    clear(&mut x4, zero);
+
+    clear(&mut x8, zero);
 }
 
 // out = f * g coefficient by coefficient.
@@ -468,5 +489,7 @@ pub(super) fn products_add(
         store256(sums[0], low);
 
         store256(sums[1], high);
+
+        wipe_unless_optimized!(words_of(&mut sums));
     }
 }

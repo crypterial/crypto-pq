@@ -6,6 +6,9 @@
 use core::arch::aarch64::*;
 
 use super::memory::{load_u16, store_u16};
+#[cfg(not(crypto_pq_optimized))]
+use super::vector_lanes;
+use crate::wipe::wipe_unless_optimized;
 
 #[allow(unsafe_code)]
 pub(crate) fn mul_add_as(acc: &mut [[u16; 8]; 8], rows: &[u16], s: &[u16], n: usize) -> bool {
@@ -51,7 +54,8 @@ fn mul_add_as_neon(acc: &mut [[u16; 8]; 8], rows: &[u16], s: &[u16], n: usize) {
     let mut odd = [vdupq_n_u16(0); 8];
 
     for (b, s) in s.iter().enumerate() {
-        let s: [uint16x8_t; 8] = core::array::from_fn(|m| load_u16(&s[m]));
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut s: [uint16x8_t; 8] = core::array::from_fn(|m| load_u16(&s[m]));
 
         for r in 0..8 {
             let a = load_u16(&rows[r][b]);
@@ -72,11 +76,17 @@ fn mul_add_as_neon(acc: &mut [[u16; 8]; 8], rows: &[u16], s: &[u16], n: usize) {
 
             odd[r] = vmlaq_laneq_u16::<7>(odd[r], s[7], a);
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut s));
     }
 
     for (r, acc) in acc.iter_mut().enumerate() {
         store_u16(vaddq_u16(load_u16(acc), vaddq_u16(even[r], odd[r])), acc);
     }
+
+    wipe_unless_optimized!(vector_lanes(&mut odd));
+
+    wipe_unless_optimized!(vector_lanes(&mut even));
 }
 
 // Row k of acc += sum over r of S'[k][i0 + r] A[i0 + r]: the n̄ entries of S'^T for row r of A are

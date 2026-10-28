@@ -166,15 +166,21 @@ impl LmsType {
 }
 
 fn digest(shake: bool, n: usize, parts: &[&[u8]]) -> Node {
-    TruncatedHash::digest(shake, n, parts)
+    let mut node = [0; 32];
+
+    TruncatedHash::digest(shake, n, parts, &mut node);
+
+    node
 }
 
-fn derive(lms: &LmsType, i: &[u8], q: u32, index: u16, seed: &[u8]) -> Node {
-    digest(
+// The derived values are secret, so they go straight into out.
+fn derive(lms: &LmsType, i: &[u8], q: u32, index: u16, seed: &[u8], out: &mut Node) {
+    TruncatedHash::digest(
         lms.shake,
         lms.m,
         &[i, &q.to_be_bytes(), &index.to_be_bytes(), &[0xFF], seed],
-    )
+        out,
+    );
 }
 
 fn coefficient(t: &OtsType, data: &[u8], i: usize) -> u32 {
@@ -207,40 +213,40 @@ fn digits(t: &OtsType, q_hash: &[u8]) -> [u8; MAX_P] {
     out
 }
 
-// The truncated hashes of L messages of length bytes, which fit one SHA-256 block, side by side;
-// with SHAKE the inactive lanes are skipped. The messages are wiped.
+// The truncated hashes of L messages of length bytes, which fit one SHA-256 block, side by side,
+// into nodes; with SHAKE the inactive lanes are skipped and keep their nodes. The messages are
+// wiped.
 fn digest_lanes<const L: usize>(
     shake: bool,
     n: usize,
     messages: &mut [[u8; 64]; L],
     length: usize,
     active: [bool; L],
-) -> [Node; L] {
-    let digests = if shake {
-        let digests = core::array::from_fn(|lane| {
-            let message: &[u8] = &messages[lane][..length];
-
-            if active[lane] {
-                digest(true, n, &[message])
-            } else {
-                [0; 32]
+    nodes: &mut [Node; L],
+) {
+    if shake {
+        for ((node, message), &active) in nodes.iter_mut().zip(&*messages).zip(&active) {
+            if active {
+                TruncatedHash::digest(true, n, &[&message[..length]], node);
             }
-        });
+        }
 
         wipe(messages.as_flattened_mut());
 
-        digests
-    } else {
-        Sha256::new(&IV_256).finish_lanes(messages, length)
-    };
+        return;
+    }
 
-    digests.map(|digest| {
-        let mut out = [0; 32];
+    let mut digests = [[0; 32]; L];
 
-        out[..n].copy_from_slice(&digest[..n]);
+    Sha256::new(&IV_256).finish_lanes(messages, length, &mut digests);
 
-        out
-    })
+    for (node, digest) in nodes.iter_mut().zip(&digests) {
+        node[..n].copy_from_slice(&digest[..n]);
+
+        node[n..].fill(0);
+    }
+
+    wipe(digests.as_flattened_mut());
 }
 
 // I || u32(q) || u16(j) || u8(k) || x: a chain step, or with k = 0xFF and x = SEED a derived value.
@@ -271,7 +277,8 @@ fn chain_lanes<const L: usize>(
     k: [u8; L],
     x: [&[u8]; L],
     active: [bool; L],
-) -> [Node; L] {
+    nodes: &mut [Node; L],
+) {
     if shake {
         let mut messages = [[0; 64]; L];
 
@@ -279,7 +286,7 @@ fn chain_lanes<const L: usize>(
             chain_message(message, i, q[lane], j[lane], k[lane], &x[lane][..n]);
         }
 
-        return digest_lanes(true, n, &mut messages, 23 + n, active);
+        return digest_lanes(true, n, &mut messages, 23 + n, active, nodes);
     }
 
     let mut blocks = [[0; L]; 16];
@@ -306,34 +313,35 @@ fn chain_lanes<const L: usize>(
         blocks[15][lane] = ((23 + n) * 8) as u32;
     }
 
-    let mut states = Sha256::new(&IV_256).finish_words(&mut blocks);
+    let mut states = [[0; L]; 8];
 
-    let nodes = core::array::from_fn(|lane| {
-        let mut node = [0; 32];
+    Sha256::new(&IV_256).finish_words(&mut blocks, &mut states);
 
+    for (lane, node) in nodes.iter_mut().enumerate() {
         for (bytes, state) in node[..n].as_chunks_mut::<4>().0.iter_mut().zip(&states) {
             *bytes = state[lane].to_be_bytes();
         }
 
-        node
-    });
+        node[n..].fill(0);
+    }
 
     wipe(blocks.as_flattened_mut());
 
     wipe(states.as_flattened_mut());
-
-    nodes
 }
 
-// The secret first values x_j = derive(q, j) of L chains.
+// The secret first values x_j = derive(q, j) of L chains, into nodes.
 fn chain_starts<const L: usize>(
     lms: &LmsType,
     i: &[u8],
     q: [u32; L],
     j: [usize; L],
     seed: &[u8],
-) -> [Node; L] {
-    chain_lanes(lms.shake, lms.m, i, q, j, [0xFF; L], [seed; L], [true; L])
+    nodes: &mut [Node; L],
+) {
+    chain_lanes(
+        lms.shake, lms.m, i, q, j, [0xFF; L], [seed; L], [true; L], nodes,
+    );
 }
 
 // The LM-OTS public keys K of the L keys from q = first on, chain by chain for all of them.
@@ -358,21 +366,37 @@ fn ots_public_keys<const L: usize>(
         engine
     });
 
+    // The chain values, secret below the ends: each step reads one buffer and writes the other,
+    // and both are wiped at the end.
+    let mut buffers = [[[0; 32]; L]; 2];
+
+    let [mut x, mut y] = buffers.each_mut();
+
     for j in 0..t.p() {
-        let mut x = chain_starts(lms, i, q, [j; L], seed);
+        chain_starts(lms, i, q, [j; L], seed, x);
 
         for k in 0..(1u32 << t.w) - 1 {
             let inputs = core::array::from_fn(|lane| &x[lane][..n]);
 
-            x = chain_lanes(t.shake, n, i, q, [j; L], [k as u8; L], inputs, [true; L]);
+            chain_lanes(t.shake, n, i, q, [j; L], [k as u8; L], inputs, [true; L], y);
+
+            core::mem::swap(&mut x, &mut y);
         }
 
-        for (engine, value) in engines.iter_mut().zip(&x) {
+        for (engine, value) in engines.iter_mut().zip(x.iter()) {
             engine.update(&value[..n]);
         }
     }
 
-    engines.map(|engine| engine.finish(n))
+    wipe(buffers.as_flattened_mut().as_flattened_mut());
+
+    engines.map(|engine| {
+        let mut node = [0; 32];
+
+        engine.finish(n, &mut node);
+
+        node
+    })
 }
 
 // Advances chain j of the LM-OTS key q from step starts[j] to ends[j], for every chain. The
@@ -391,13 +415,16 @@ fn chains(t: &OtsType, i: &[u8], q: u32, starts: &[u32], ends: &[u32], values: &
 
     let mut lanes: [Option<(usize, u32)>; LANES] = [None; LANES];
 
+    // Chain values, secret in signing, wiped at the end.
+    let mut outputs = [[0; 32]; LANES];
+
     loop {
         for lane in lanes.iter_mut().filter(|lane| lane.is_none()) {
             *lane = pending.next().map(|j| (j, starts[j]));
         }
 
         if lanes.iter().all(Option::is_none) {
-            return;
+            break;
         }
 
         let (j, k) = (
@@ -409,11 +436,21 @@ fn chains(t: &OtsType, i: &[u8], q: u32, starts: &[u32], ends: &[u32], values: &
 
         let active = lanes.map(|lane| lane.is_some());
 
-        let outputs = chain_lanes(t.shake, n, i, [q; LANES], j, k, inputs, active);
+        chain_lanes(
+            t.shake,
+            n,
+            i,
+            [q; LANES],
+            j,
+            k,
+            inputs,
+            active,
+            &mut outputs,
+        );
 
-        for (lane, output) in lanes.iter_mut().zip(outputs) {
+        for (lane, output) in lanes.iter_mut().zip(&outputs) {
             if let Some((j, k)) = lane {
-                values[*j] = output;
+                values[*j] = *output;
 
                 *k += 1;
 
@@ -423,25 +460,32 @@ fn chains(t: &OtsType, i: &[u8], q: u32, starts: &[u32], ends: &[u32], values: &
             }
         }
     }
+
+    wipe(outputs.as_flattened_mut());
 }
 
-// The secret chain starts x_j of the key q, LANES at a time.
-fn secret_values(t: &OtsType, lms: &LmsType, i: &[u8], q: u32, seed: &[u8]) -> [Node; MAX_P] {
-    let mut values = [[0; 32]; MAX_P];
+// The secret chain starts x_j of the key q, LANES at a time, into values.
+fn secret_values(
+    t: &OtsType,
+    lms: &LmsType,
+    i: &[u8],
+    q: u32,
+    seed: &[u8],
+    values: &mut [Node; MAX_P],
+) {
+    let mut starts = [[0; 32]; LANES];
 
     for (first, group) in (0..t.p()).step_by(LANES).zip(values.chunks_mut(LANES)) {
         let j = core::array::from_fn(|lane| first + lane);
 
-        let mut starts = chain_starts::<LANES>(lms, i, [q; LANES], j, seed);
+        chain_starts::<LANES>(lms, i, [q; LANES], j, seed, &mut starts);
 
         for (value, start) in group.iter_mut().zip(&starts) {
             *value = *start;
         }
-
-        wipe(&mut starts);
     }
 
-    values
+    wipe(starts.as_flattened_mut());
 }
 
 // The LM-OTS signature of key q with the randomizer C, which the caller draws or derives.
@@ -472,7 +516,9 @@ fn ots_sign(
 
     let digits = digits(t, &q_hash).map(u32::from);
 
-    let mut values = secret_values(t, lms, i, q, seed);
+    let mut values = [[0; 32]; MAX_P];
+
+    secret_values(t, lms, i, q, seed, &mut values);
 
     chains(t, i, q, &[0; MAX_P][..p], &digits[..p], &mut values[..p]);
 
@@ -521,7 +567,11 @@ fn ots_candidate(t: &OtsType, i: &[u8], q: u32, signature: &[u8], message: &[u8]
         engine.update(&value[..n]);
     }
 
-    engine.finish(n)
+    let mut node = [0; 32];
+
+    engine.finish(n, &mut node);
+
+    node
 }
 
 fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
@@ -663,7 +713,7 @@ struct TreeKey<'a> {
 }
 
 impl TreeKey<'_> {
-    fn leaf_lanes<const L: usize>(&self, first: u32) -> [Node; L] {
+    fn leaf_lanes<const L: usize>(&self, first: u32, leaves: &mut [Node; L]) {
         let keys = ots_public_keys::<L>(self.ots, self.lms, self.i, first, self.seed);
 
         let mut messages = [[0; 64]; L];
@@ -682,7 +732,14 @@ impl TreeKey<'_> {
             message[22..22 + n].copy_from_slice(&key[..n]);
         }
 
-        digest_lanes(self.lms.shake, self.lms.m, &mut messages, 22 + n, [true; L])
+        digest_lanes(
+            self.lms.shake,
+            self.lms.m,
+            &mut messages,
+            22 + n,
+            [true; L],
+            leaves,
+        );
     }
 }
 
@@ -690,10 +747,10 @@ impl TreeHasher for TreeKey<'_> {
     fn leaves(&self, first: u32, out: &mut [Node]) {
         for (start, group) in (first..).step_by(LANES).zip(out.chunks_mut(LANES)) {
             if let Ok(group) = <&mut [Node; LANES]>::try_from(&mut *group) {
-                *group = self.leaf_lanes(start);
+                self.leaf_lanes(start, group);
             } else {
                 for (q, node) in (start..).zip(group) {
-                    [*node] = self.leaf_lanes(q);
+                    self.leaf_lanes(q, core::array::from_mut(node));
                 }
             }
         }
@@ -793,16 +850,29 @@ impl Tree {
 
     // The randomizer C of a signature by leaf q in the deterministic mode.
     pub(crate) fn derived_randomizer(&self, q: u32) -> Node {
-        derive(&self.lms, &self.i, q, RANDOMIZER, &self.seed)
+        let mut c = [0; 32];
+
+        derive(&self.lms, &self.i, q, RANDOMIZER, &self.seed, &mut c);
+
+        c
     }
 
     // The I || SEED of the child tree under leaf q in the deterministic mode.
     pub(crate) fn derived_child(&self, q: u32) -> SecretBytes {
         let m = self.lms.m;
 
-        let mut child_seed = derive(&self.lms, &self.i, q, CHILD_SEED, &self.seed);
+        let (mut child_seed, mut child_i) = ([0; 32], [0; 32]);
 
-        let child_i = derive(&self.lms, &self.i, q, CHILD_I, &self.seed);
+        derive(
+            &self.lms,
+            &self.i,
+            q,
+            CHILD_SEED,
+            &self.seed,
+            &mut child_seed,
+        );
+
+        derive(&self.lms, &self.i, q, CHILD_I, &self.seed, &mut child_i);
 
         let child = SecretBytes::concat(&[&child_i[..16], &child_seed[..m]]);
 

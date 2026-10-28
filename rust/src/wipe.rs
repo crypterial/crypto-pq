@@ -89,6 +89,21 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
     compiler_fence(Ordering::SeqCst);
 }
 
+// wipe for an array that holds secrets and that LLVM keeps in registers at opt-level 3: there the
+// wipe would give the array an address, and so the very memory copy it then clears, while at the
+// other levels the array is in memory and has to be wiped (D-76). build.rs sets
+// crypto_pq_optimized only at 3, so builds whose level it cannot read keep the wipe. A macro, so
+// that at 3 not even a borrow of the array is left: an unused one still changed the code of the
+// SHA-512 kernels on Apple targets.
+macro_rules! wipe_unless_optimized {
+    ($values:expr) => {
+        #[cfg(not(crypto_pq_optimized))]
+        $crate::wipe::wipe($values);
+    };
+}
+
+pub(crate) use wipe_unless_optimized;
+
 /// Secret bytes on the heap, wiped when dropped: the type of every secret output, such as shared
 /// secrets, derived keys and exported private keys.
 ///

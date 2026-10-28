@@ -83,8 +83,8 @@ piece, which is the case for lattice and hash-based private keys and not for key
    compiler and runtime cannot remove (volatile stores or an equivalent barrier). This covers key
    objects when destroyed, seeds, expanded keys, noise and mask vectors, one-time signature secrets,
    chain values derived from secrets, shared secrets inside the library, HMAC pads, PRKs, state record
-   copies, decoded PEM and DER buffers of private keys, and stack buffers. It applies on success and on
-   every error path.
+   copies, decoded PEM and DER buffers of private keys, and stack buffers
+   ([D-76](decisions.md#decision-d-76)). It applies on success and on every error path.
 2. Values returned to the caller belong to the caller. The implementation MUST give the caller a way
    to wipe returned secrets (Part II).
 3. Where the language cannot guarantee wiping (for example copies that the compiler makes in

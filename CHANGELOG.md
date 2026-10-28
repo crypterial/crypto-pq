@@ -34,6 +34,20 @@ Implements specification 1.1 (draft).
 - The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
   intrinsics are stable.
 
+### Fixed
+
+- Secret buffers on the stack are wiped before each function returns, on every path, as
+  specification 14.5 requires ([decision D-76](spec/decisions.md#decision-d-76)): the SHA-2 message
+  schedules, the buffers of the Keccak, BLAKE2, BLAKE3 and NTT kernels on x86-64, copies of partial
+  lanes and words, the base64 buffers of private keys, and the chain values of SLH-DSA, LMS and
+  XMSS. Secrets that were returned by value, such as KEM shared secrets, ML-KEM and ML-DSA
+  polynomials and the key states of one-shot HMAC, HKDF and KMAC, are written into storage that
+  their owner wipes. ML-DSA signing wipes w1 and the products with s1 and s2 of rejected attempts.
+  In builds below opt-level 3, where the compiler keeps the register arrays of the kernels in
+  memory, those arrays are wiped too; a build script reads the opt-level for this. Copies that the
+  compiler makes in registers and spill slots remain, as the documentation states. Outputs are
+  unchanged.
+
 ## [1.0.1] - 2026-10-26
 
 Implements specification 1.0, as 1.0.0 does. The API and every output are unchanged.

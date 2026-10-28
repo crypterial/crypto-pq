@@ -5,7 +5,7 @@ use core::ops::Range;
 
 use crate::ct::{declassify, declassify_value, equal_mask};
 use crate::error::Error;
-use crate::wipe::SecretBytes;
+use crate::wipe::{SecretBytes, wipe};
 
 pub(crate) const SEQUENCE: u8 = 0x30;
 
@@ -328,6 +328,9 @@ fn base64_chunk(chunk: &[u8], out: &mut Vec<u8>) {
             out.push(b'=');
         }
     }
+
+    // The copy of a private key's bytes, which the slice copy keeps in memory.
+    wipe(&mut padded);
 }
 
 fn base64_decode(text: &[u8]) -> Result<SecretBytes, Error> {
@@ -349,6 +352,10 @@ fn base64_decode(text: &[u8]) -> Result<SecretBytes, Error> {
 
     let mut invalid = 0u32;
 
+    // The bytes of each group, a private key's when it is one; kept in memory by the slice copy,
+    // and wiped at the end.
+    let mut bytes = [0u8; 4];
+
     for (index, chunk) in text.as_chunks::<4>().0.iter().enumerate() {
         let used = if index + 1 == chunks { 4 - padding } else { 4 };
 
@@ -369,7 +376,7 @@ fn base64_decode(text: &[u8]) -> Result<SecretBytes, Error> {
         // Canonical padding: the bits that no output byte carries must be zero.
         invalid |= value & ((1 << (8 * (4 - used))) - 1);
 
-        let bytes = value.to_be_bytes();
+        bytes = value.to_be_bytes();
 
         let start = 3 * index;
 
@@ -377,6 +384,8 @@ fn base64_decode(text: &[u8]) -> Result<SecretBytes, Error> {
 
         out[start..end].copy_from_slice(&bytes[1..1 + end - start]);
     }
+
+    wipe(&mut bytes);
 
     // Whether the encoding is valid is the result of the import, so it is public.
     if declassify_value(invalid) != 0 {

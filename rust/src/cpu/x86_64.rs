@@ -93,7 +93,7 @@ use crate::cpu::Pack;
 #[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 use crate::cpu::{Field, Field16};
 use crate::sha2::{K256, compress256_lanes_portable};
-use crate::wipe::wipe;
+use crate::wipe::{wipe, wipe_unless_optimized};
 
 // The number of accepted lanes in each pattern of eight, for the rejection samplers of ML-KEM and
 // ML-DSA.
@@ -1590,21 +1590,19 @@ pub(crate) fn blake2s_digest(h: &[u32; 8], data: &[u8], out: &mut [u8]) -> bool 
 
     let (blocks, tail) = blake2::split32(data);
 
+    // The kernel's working copy of the chaining value, wiped after it.
+    let mut state = *h;
+
     blake2::final32(tail, |last| {
         let total = data.len() as u64;
 
         // SAFETY: the CPU has AVX2 and the operating system saves its registers.
         unsafe {
-            blake2::blake2s_avx2(
-                &mut h.clone(),
-                None,
-                blocks,
-                Some((last, total)),
-                0,
-                Some(out),
-            )
+            blake2::blake2s_avx2(&mut state, None, blocks, Some((last, total)), 0, Some(out))
         };
     });
+
+    wipe(&mut state);
 
     true
 }
@@ -1623,11 +1621,14 @@ pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8])
 
     let total = 64 + data.len() as u64;
 
+    // The kernel's working copy of the chaining value, keyed after the first block; wiped after.
+    let mut state = *h;
+
     if data.is_empty() {
         // SAFETY: the CPU has AVX2 and the operating system saves its registers.
         unsafe {
             blake2::blake2s_avx2(
-                &mut h.clone(),
+                &mut state,
                 None,
                 &[],
                 Some((&key_block, total)),
@@ -1643,19 +1644,14 @@ pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8])
 
             // SAFETY: as above.
             unsafe {
-                blake2::blake2s_avx2(
-                    &mut h.clone(),
-                    first,
-                    blocks,
-                    Some((last, total)),
-                    0,
-                    Some(out),
-                )
+                blake2::blake2s_avx2(&mut state, first, blocks, Some((last, total)), 0, Some(out))
             };
         });
     }
 
     wipe(&mut key_block);
+
+    wipe(&mut state);
 
     true
 }
@@ -1766,6 +1762,8 @@ fn permute4(group: &mut [&mut [u64; 25]]) {
         }
 
         keccak::scatter4_transposed(vectors, group);
+
+        wipe(memory::vector_words(vectors).as_flattened_mut());
     }
 }
 
@@ -1909,6 +1907,13 @@ struct Stream {
     m: [__m128i; 4],
 }
 
+// SAFETY: six vectors in 96 bytes, which the assertion checks, leave no room for padding.
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl memory::Vectors for Stream {}
+
+const _: () = assert!(size_of::<Stream>() == size_of::<[__m128i; 6]>());
+
 // Four rounds of every stream with schedule vector J, two per SHA256RNDS2, which reads its two
 // words of W + K from the low half; then J advances by sixteen words if more are needed. After
 // two rounds the new c, d, g and h are the old a, b, e and f, so each SHA256RNDS2 writes the new
@@ -1939,7 +1944,8 @@ fn quarter<const N: usize, const J: usize>(streams: &mut [Stream; N], k: __m128i
 #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
 #[inline]
 fn rounds256<const N: usize>(streams: &mut [Stream; N]) {
-    let start = *streams;
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut start = *streams;
 
     for (sixteen, k) in K256.as_chunks::<16>().0.iter().enumerate() {
         let k = k.as_chunks::<4>().0;
@@ -1960,6 +1966,8 @@ fn rounds256<const N: usize>(streams: &mut [Stream; N]) {
 
         stream.cdgh = _mm_add_epi32(stream.cdgh, start.cdgh);
     }
+
+    wipe_unless_optimized!(memory::words_of(&mut start));
 }
 
 // The streaming hash: the state stays in registers from one block to the next.
@@ -1995,10 +2003,13 @@ fn compress256_sha(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]])
     let [c, d, g, h] = from_high_first(streams[0].cdgh);
 
     *state = [a, b, c, d, e, f, g, h];
+
+    wipe_unless_optimized!(memory::words_of(&mut streams));
 }
 
 #[target_feature(enable = "sse2")]
 #[inline]
+#[cfg_attr(crypto_pq_optimized, allow(clippy::let_and_return))]
 fn gather<const LANES: usize>(
     states: &[[u32; LANES]; 8],
     w: &[[u32; LANES]; 16],
@@ -2017,11 +2028,15 @@ fn gather<const LANES: usize>(
         ]);
     }
 
-    Stream {
+    let stream = Stream {
         abef: high_first([word(0), word(1), word(4), word(5)]),
         cdgh: high_first([word(2), word(3), word(6), word(7)]),
         m,
-    }
+    };
+
+    wipe_unless_optimized!(memory::words_of(&mut m));
+
+    stream
 }
 
 #[target_feature(enable = "sse4.1")]
@@ -2052,6 +2067,8 @@ fn compress256_lanes_sha<const LANES: usize>(
 
         scatter(states, &streams[1], lane + 1);
 
+        wipe_unless_optimized!(memory::words_of(&mut streams));
+
         lane += 2;
     }
 
@@ -2061,6 +2078,8 @@ fn compress256_lanes_sha<const LANES: usize>(
         rounds256(&mut streams);
 
         scatter(states, &streams[0], lane);
+
+        wipe_unless_optimized!(memory::words_of(&mut streams));
     }
 }
 

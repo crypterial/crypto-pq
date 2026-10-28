@@ -200,8 +200,11 @@ fn address(layer: u32, tree: u64, kind: u32) -> Adrs {
     adrs
 }
 
-fn xor(a: &Node, b: &Node) -> Node {
-    core::array::from_fn(|i| a[i] ^ b[i])
+// out = a ^ b, written in place, as a chain value's is secret.
+fn xor_into(out: &mut [u8], a: &[u8], b: &[u8]) {
+    for ((out, &a), &b) in out.iter_mut().zip(a).zip(b) {
+        *out = a ^ b;
+    }
 }
 
 struct Hashes<'a> {
@@ -248,47 +251,51 @@ impl<'a> Hashes<'a> {
             engine.update(part);
         }
 
-        engine.finish(self.p.n)
+        let mut node = [0; 32];
+
+        engine.finish(self.p.n, &mut node);
+
+        node
     }
 
     // The hashes of L messages of length bytes, side by side, after the shared input of state
-    // if given; with SHAKE the inactive lanes are skipped. The messages are wiped.
+    // if given, into nodes; with SHAKE the inactive lanes are skipped and keep their nodes. The
+    // messages are wiped.
     fn finish_lanes<const L: usize, const SIZE: usize>(
         &self,
         state: Option<&Sha256>,
         messages: &mut [[u8; SIZE]; L],
         length: usize,
         active: [bool; L],
-    ) -> [Node; L] {
+        nodes: &mut [Node; L],
+    ) {
         let n = self.p.n;
 
-        let digests = if self.p.shake {
-            let digests = core::array::from_fn(|lane| {
-                let message: &[u8] = &messages[lane][..length];
-
-                if active[lane] {
-                    TruncatedHash::digest(true, n, &[message])
-                } else {
-                    [0; 32]
+        if self.p.shake {
+            for ((node, message), &active) in nodes.iter_mut().zip(&*messages).zip(&active) {
+                if active {
+                    TruncatedHash::digest(true, n, &[&message[..length]], node);
                 }
-            });
+            }
 
             wipe(messages.as_flattened_mut());
 
-            digests
-        } else {
-            state
-                .unwrap_or(&Sha256::new(&IV_256))
-                .finish_lanes(messages, length)
-        };
+            return;
+        }
 
-        digests.map(|digest| {
-            let mut out = [0; 32];
+        let mut digests = [[0; 32]; L];
 
-            out[..n].copy_from_slice(&digest[..n]);
+        state
+            .unwrap_or(&Sha256::new(&IV_256))
+            .finish_lanes(messages, length, &mut digests);
 
-            out
-        })
+        for (node, digest) in nodes.iter_mut().zip(&digests) {
+            node[..n].copy_from_slice(&digest[..n]);
+
+            node[n..].fill(0);
+        }
+
+        wipe(digests.as_flattened_mut());
     }
 
     // toByte(prefix, padding) || KEY || M for each lane, where write(lane, out) puts KEY || M in
@@ -298,7 +305,8 @@ impl<'a> Hashes<'a> {
         prefix: u32,
         active: [bool; L],
         write: impl Fn(usize, &mut [u8]) -> usize,
-    ) -> [Node; L] {
+        nodes: &mut [Node; L],
+    ) {
         let padding = self.p.padding();
 
         let mut messages = [[0; SIZE]; L];
@@ -311,20 +319,30 @@ impl<'a> Hashes<'a> {
             length = padding + write(lane, &mut message[padding..]);
         }
 
-        self.finish_lanes(None, &mut messages, length, active)
+        self.finish_lanes(None, &mut messages, length, active, nodes);
     }
 
+    // The keys and bitmasks, from PUB_SEED and public addresses: public.
     fn prf_lanes<const L: usize>(&self, adrs: &[Adrs; L], active: [bool; L]) -> [Node; L] {
         let n = self.p.n;
 
+        let mut nodes = [[0; 32]; L];
+
         let Some(state) = &self.prf_state else {
-            return self.hash_lanes::<L, 128>(PRF, active, |lane, out| {
-                out[..n].copy_from_slice(self.pub_seed);
+            self.hash_lanes::<L, 128>(
+                PRF,
+                active,
+                |lane, out| {
+                    out[..n].copy_from_slice(self.pub_seed);
 
-                out[n..n + 32].copy_from_slice(&adrs[lane]);
+                    out[n..n + 32].copy_from_slice(&adrs[lane]);
 
-                n + 32
-            });
+                    n + 32
+                },
+                &mut nodes,
+            );
+
+            return nodes;
         };
 
         let mut messages = [[0; 64]; L];
@@ -333,23 +351,31 @@ impl<'a> Hashes<'a> {
             message[..32].copy_from_slice(adrs);
         }
 
-        self.finish_lanes(Some(state), &mut messages, 32, active)
+        self.finish_lanes(Some(state), &mut messages, 32, active, &mut nodes);
+
+        nodes
     }
 
-    // SP 800-208: secret chain values come from PRF_keygen(SK_SEED, PUB_SEED || ADRS).
-    fn prf_keygen_lanes<const L: usize>(&self, adrs: &[Adrs; L]) -> [Node; L] {
+    // SP 800-208: secret chain values come from PRF_keygen(SK_SEED, PUB_SEED || ADRS), into
+    // nodes.
+    fn prf_keygen_lanes<const L: usize>(&self, adrs: &[Adrs; L], nodes: &mut [Node; L]) {
         let n = self.p.n;
 
         let Some(state) = &self.keygen_state else {
-            return self.hash_lanes::<L, 128>(PRF_KEYGEN, [true; L], |lane, out| {
-                out[..n].copy_from_slice(self.sk_seed);
+            return self.hash_lanes::<L, 128>(
+                PRF_KEYGEN,
+                [true; L],
+                |lane, out| {
+                    out[..n].copy_from_slice(self.sk_seed);
 
-                out[n..2 * n].copy_from_slice(self.pub_seed);
+                    out[n..2 * n].copy_from_slice(self.pub_seed);
 
-                out[2 * n..2 * n + 32].copy_from_slice(&adrs[lane]);
+                    out[2 * n..2 * n + 32].copy_from_slice(&adrs[lane]);
 
-                2 * n + 32
-            });
+                    2 * n + 32
+                },
+                nodes,
+            );
         };
 
         let mut messages = [[0; 128]; L];
@@ -360,17 +386,18 @@ impl<'a> Hashes<'a> {
             message[n..n + 32].copy_from_slice(adrs);
         }
 
-        self.finish_lanes(Some(state), &mut messages, n + 32, [true; L])
+        self.finish_lanes(Some(state), &mut messages, n + 32, [true; L], nodes);
     }
 
-    // One step of each lane's chain, whose hash address is set in its adrs: the key and the
-    // bitmask from PRF, then F (RFC 8391, Algorithm 2).
+    // One step of each lane's chain, whose hash address is set in its adrs, from x into out: the
+    // key and the bitmask from PRF, then F (RFC 8391, Algorithm 2).
     fn chain_lanes<const L: usize>(
         &self,
         x: &[Node; L],
         adrs: &mut [Adrs; L],
         active: [bool; L],
-    ) -> [Node; L] {
+        out: &mut [Node; L],
+    ) {
         let n = self.p.n;
 
         for adrs in adrs.iter_mut() {
@@ -385,13 +412,18 @@ impl<'a> Hashes<'a> {
 
         let masks = self.prf_lanes(adrs, active);
 
-        self.hash_lanes::<L, 128>(F, active, |lane, out| {
-            out[..n].copy_from_slice(&keys[lane][..n]);
+        self.hash_lanes::<L, 128>(
+            F,
+            active,
+            |lane, message| {
+                message[..n].copy_from_slice(&keys[lane][..n]);
 
-            out[n..2 * n].copy_from_slice(&xor(&x[lane], &masks[lane])[..n]);
+                xor_into(&mut message[n..2 * n], &x[lane][..n], &masks[lane][..n]);
 
-            2 * n
-        })
+                2 * n
+            },
+            out,
+        );
     }
 
     fn wots_digits(&self, message: &[u8]) -> [u32; MAX_LEN] {
@@ -418,9 +450,14 @@ impl<'a> Hashes<'a> {
         digits
     }
 
-    // The secret starts of the chains first.. of the key at adrs; the hash and key-and-mask words
-    // are cleared for them, and every chain step sets them again.
-    fn wots_secrets<const L: usize>(&self, adrs: &mut [Adrs; L], chains: [usize; L]) -> [Node; L] {
+    // The secret starts of the chains first.. of the key at adrs, into secrets; the hash and
+    // key-and-mask words are cleared for them, and every chain step sets them again.
+    fn wots_secrets<const L: usize>(
+        &self,
+        adrs: &mut [Adrs; L],
+        chains: [usize; L],
+        secrets: &mut [Node; L],
+    ) {
         for (adrs, i) in adrs.iter_mut().zip(chains) {
             set_word(adrs, 5, i as u32);
 
@@ -429,7 +466,7 @@ impl<'a> Hashes<'a> {
             set_word(adrs, 7, 0);
         }
 
-        self.prf_keygen_lanes(adrs)
+        self.prf_keygen_lanes(adrs, secrets);
     }
 
     // The WOTS+ public keys of L keys, from their OTS addresses, chain by chain for all of them.
@@ -438,21 +475,31 @@ impl<'a> Hashes<'a> {
         adrs: &mut [Adrs; L],
         values: &mut [[Node; MAX_LEN]],
     ) {
+        // The chain values, secret below the ends: each step reads one buffer and writes the
+        // other, and both are wiped at the end.
+        let mut buffers = [[[0; 32]; L]; 2];
+
+        let [mut x, mut y] = buffers.each_mut();
+
         for i in 0..self.p.len() {
-            let mut x = self.wots_secrets(adrs, [i; L]);
+            self.wots_secrets(adrs, [i; L], x);
 
             for k in 0..W - 1 {
                 for adrs in adrs.iter_mut() {
                     set_word(adrs, 6, k);
                 }
 
-                x = self.chain_lanes(&x, adrs, [true; L]);
+                self.chain_lanes(x, adrs, [true; L], y);
+
+                core::mem::swap(&mut x, &mut y);
             }
 
-            for (value, x) in values.iter_mut().zip(x) {
-                value[i] = x;
+            for (value, x) in values.iter_mut().zip(x.iter()) {
+                value[i] = *x;
             }
         }
+
+        wipe(buffers.as_flattened_mut().as_flattened_mut());
     }
 
     // Advances chain i of the WOTS+ key at adrs from step starts[i] to ends[i], for every chain.
@@ -470,9 +517,9 @@ impl<'a> Hashes<'a> {
 
         let mut lanes: [Option<(usize, u32)>; LANES] = [None; LANES];
 
-        // The inputs of the last steps: in a signature, chain values below the signed ones, which
-        // would let anyone sign a smaller digit, so they are wiped.
-        let mut x = [[0; 32]; LANES];
+        // The inputs and outputs of the last steps: in a signature, chain values below the signed
+        // ones, which would let anyone sign a smaller digit, so they are wiped.
+        let (mut x, mut outputs) = ([[0; 32]; LANES], [[0; 32]; LANES]);
 
         loop {
             for lane in lanes.iter_mut().filter(|lane| lane.is_none()) {
@@ -480,9 +527,7 @@ impl<'a> Hashes<'a> {
             }
 
             if lanes.iter().all(Option::is_none) {
-                wipe(x.as_flattened_mut());
-
-                return;
+                break;
             }
 
             let mut lane_adrs = lanes.map(|lane| {
@@ -501,11 +546,13 @@ impl<'a> Hashes<'a> {
                 *x = lane.map_or([0; 32], |(i, _)| values[i]);
             }
 
-            let outputs = self.chain_lanes(&x, &mut lane_adrs, lanes.map(|lane| lane.is_some()));
+            let active = lanes.map(|lane| lane.is_some());
 
-            for (lane, output) in lanes.iter_mut().zip(outputs) {
+            self.chain_lanes(&x, &mut lane_adrs, active, &mut outputs);
+
+            for (lane, output) in lanes.iter_mut().zip(&outputs) {
                 if let Some((i, k)) = lane {
-                    values[*i] = output;
+                    values[*i] = *output;
 
                     *k += 1;
 
@@ -515,6 +562,10 @@ impl<'a> Hashes<'a> {
                 }
             }
         }
+
+        wipe(x.as_flattened_mut());
+
+        wipe(outputs.as_flattened_mut());
     }
 
     fn wots_sign(&self, message: &[u8], adrs: &Adrs, out: &mut Vec<u8>) {
@@ -525,17 +576,19 @@ impl<'a> Hashes<'a> {
 
         let mut values = [[0; 32]; MAX_LEN];
 
+        let mut secrets = [[0; 32]; LANES];
+
         for (first, group) in (0..len).step_by(LANES).zip(values.chunks_mut(LANES)) {
             let chains = core::array::from_fn(|lane| first + lane);
 
-            let mut secrets = self.wots_secrets(&mut [*adrs; LANES], chains);
+            self.wots_secrets(&mut [*adrs; LANES], chains, &mut secrets);
 
             for (value, secret) in group.iter_mut().zip(&secrets) {
                 *value = *secret;
             }
-
-            wipe(&mut secrets);
         }
+
+        wipe(secrets.as_flattened_mut());
 
         self.chains(
             adrs,
@@ -596,15 +649,28 @@ impl<'a> Hashes<'a> {
 
         let (keys, masks0, masks1) = (prf(0), prf(1), prf(2));
 
-        self.hash_lanes::<L, 192>(H, [true; L], |lane, out| {
-            out[..n].copy_from_slice(&keys[lane][..n]);
+        let mut nodes = [[0; 32]; L];
 
-            out[n..2 * n].copy_from_slice(&xor(&left[lane], &masks0[lane])[..n]);
+        self.hash_lanes::<L, 192>(
+            H,
+            [true; L],
+            |lane, out| {
+                out[..n].copy_from_slice(&keys[lane][..n]);
 
-            out[2 * n..3 * n].copy_from_slice(&xor(&right[lane], &masks1[lane])[..n]);
+                xor_into(&mut out[n..2 * n], &left[lane][..n], &masks0[lane][..n]);
 
-            3 * n
-        })
+                xor_into(
+                    &mut out[2 * n..3 * n],
+                    &right[lane][..n],
+                    &masks1[lane][..n],
+                );
+
+                3 * n
+            },
+            &mut nodes,
+        );
+
+        nodes
     }
 
     fn rand_hash(&self, left: &Node, right: &Node, adrs: &mut Adrs) -> Node {

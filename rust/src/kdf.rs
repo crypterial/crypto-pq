@@ -321,7 +321,9 @@ fn expand_unchecked(hash: &HashAlgorithm, prk: &[u8], info: &[u8], out: &mut [u8
 
     let mut hashed = [0; 64];
 
-    let keyed = Keyed::new(hash, block_key(hash, prk, &mut hashed));
+    let mut keyed = Keyed::new(hash);
+
+    keyed.key(hash, block_key(hash, prk, &mut hashed));
 
     wipe(&mut hashed);
 
@@ -375,11 +377,21 @@ enum Keyed {
 
 #[cfg(feature = "hkdf")]
 impl Keyed {
-    fn new(hash: &HashAlgorithm, key: &[u8]) -> Self {
+    // Zero states of the hash's kind, which key fills in place: built and returned by new, the
+    // keyed states would be moved.
+    fn new(hash: &HashAlgorithm) -> Self {
         match hash.kind {
-            Kind::Sha256(iv) => Self::Sha256(sha2::keyed256(iv, key)),
-            Kind::Sha512(iv) => Self::Sha512(sha2::keyed512(iv, key)),
+            Kind::Sha256(_) => Self::Sha256([[0; 8]; 2]),
+            Kind::Sha512(_) => Self::Sha512([[0; 8]; 2]),
             _ => unreachable!("HKDF is defined here over SHA-2 only"),
+        }
+    }
+
+    fn key(&mut self, hash: &HashAlgorithm, key: &[u8]) {
+        match (self, hash.kind) {
+            (Self::Sha256(states), Kind::Sha256(iv)) => sha2::keyed256(iv, key, states),
+            (Self::Sha512(states), Kind::Sha512(iv)) => sha2::keyed512(iv, key, states),
+            _ => unreachable!("the kinds match"),
         }
     }
 

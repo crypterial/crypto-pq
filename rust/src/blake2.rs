@@ -8,7 +8,7 @@ use core::ops::{BitXor, Not};
 
 use crate::cpu;
 use crate::sha2::{IV_256, IV_512, last_bytes};
-use crate::wipe::wipe;
+use crate::wipe::{wipe, wipe_unless_optimized};
 
 pub(crate) const SIGMA: [[usize; 16]; 10] = [
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
@@ -372,6 +372,8 @@ pub(crate) fn compress<W: Word>(h: &mut [W; 8], m: &[W; 16], counter: u128, last
     for (i, word) in h.iter_mut().enumerate() {
         *word = *word ^ v[i] ^ v[i + 8];
     }
+
+    wipe_unless_optimized!(&mut v);
 }
 
 // The first block (the key block of a MAC), then the whole blocks of bytes, then the final block,
@@ -532,17 +534,15 @@ impl<W: Word> Engine<W> {
         }
     }
 
-    // A MAC under a key of 1 to BLOCK bytes, whose padded block is the first block.
-    pub(crate) fn keyed(h: &[W; 8], key: &[u8]) -> Self {
-        let mut engine = Self::new(h);
+    // Turns a new engine into a MAC under a key of 1 to BLOCK bytes, whose padded block is the
+    // first block. The key goes into the engine where it lives, so that no keyed copy of it is
+    // moved.
+    pub(crate) fn key(&mut self, key: &[u8]) {
+        self.h[0] = self.h[0] ^ W::key_length(key.len());
 
-        engine.h[0] = engine.h[0] ^ W::key_length(key.len());
+        self.buffer[..key.len()].copy_from_slice(key);
 
-        engine.buffer[..key.len()].copy_from_slice(key);
-
-        engine.filled = Self::BLOCK;
-
-        engine
+        self.filled = Self::BLOCK;
     }
 
     // The buffered block, once more data shows that it is not the final one.
@@ -876,7 +876,9 @@ mod tests {
 
                 let key = &key[..1 + length % (8 * W::BYTES)];
 
-                let mut engine = Engine::keyed(&h, key);
+                let mut engine = Engine::new(&h);
+
+                engine.key(key);
 
                 for chunk in message.chunks(piece) {
                     engine.update(chunk);

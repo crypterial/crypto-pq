@@ -5,7 +5,10 @@
 
 use core::arch::x86_64::*;
 
+#[cfg(not(crypto_pq_optimized))]
+use super::memory::words_of;
 use super::memory::{load128, load256, store128, store256};
+use crate::wipe::wipe_unless_optimized;
 
 // Rows r and r + 1 of acc += the products of those rows of A with the n̄ rows of S^T, which the
 // private key holds as little-endian 16-bit values: sixteen products per row of S^T at a time,
@@ -46,25 +49,31 @@ pub(super) fn mul_add_as(acc: &mut [[u16; 8]; 8], rows: &[u16], st: &[u8], n: us
                 }
             }
 
-            for (half, sums) in halves.iter_mut().zip(sums) {
+            for (half, sums) in halves.iter_mut().zip(&sums) {
                 half[h] = total4(sums);
             }
+
+            wipe_unless_optimized!(words_of(&mut sums));
         }
 
-        for (acc, half) in acc.iter_mut().zip(halves) {
+        for (acc, half) in acc.iter_mut().zip(&halves) {
             let total = _mm_unpacklo_epi64(half[0], half[1]);
 
             store128(_mm_add_epi16(load128(acc), total), acc);
         }
+
+        wipe_unless_optimized!(words_of(&mut halves));
     }
 }
 
 // The sums of the sixteen lanes of each of four vectors, in lanes 0 to 3: pairs, fours and eights
-// of lanes in each half, then the two halves.
+// of lanes in each half, then the two halves. The sums come by reference, so that no copy of them
+// is left where the caller's wipe does not reach.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn total4(sums: [__m256i; 4]) -> __m128i {
-    let pairs = [
+fn total4(sums: &[__m256i; 4]) -> __m128i {
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut pairs = [
         _mm256_hadd_epi16(sums[0], sums[1]),
         _mm256_hadd_epi16(sums[2], sums[3]),
     ];
@@ -72,6 +81,8 @@ fn total4(sums: [__m256i; 4]) -> __m128i {
     let fours = _mm256_hadd_epi16(pairs[0], pairs[1]);
 
     let eights = _mm256_hadd_epi16(fours, fours);
+
+    wipe_unless_optimized!(words_of(&mut pairs));
 
     _mm_add_epi16(
         _mm256_castsi256_si128(eights),

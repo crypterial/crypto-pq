@@ -184,21 +184,19 @@ const fn freeze(y: i32) -> u16 {
     (y + (Q as i32 & (y >> 31))) as u16
 }
 
-// |w| < 2^31 to the canonical coefficients w mod q.
-fn canonical(w: &Wide) -> Poly {
-    let mut f = [0; 256];
-
-    if !cpu::reduce(w, i32::from(R_MOD_Q), &FIELD, &mut f) {
-        f = canonical_portable(w);
+// |w| < 2^31 to the canonical coefficients w mod q, into f.
+fn canonical(w: &Wide, f: &mut Poly) {
+    if !cpu::reduce(w, i32::from(R_MOD_Q), &FIELD, f) {
+        canonical_portable(w, f);
     }
-
-    f
 }
 
-fn canonical_portable(w: &Wide) -> Poly {
+fn canonical_portable(w: &Wide, f: &mut Poly) {
     let (r, r_qinv) = (i32::from(R_MOD_Q), i32::from(R_MOD_Q).wrapping_mul(QINV));
 
-    w.map(|x| freeze(montgomery(x, r, r_qinv)))
+    for (y, &x) in f.iter_mut().zip(w) {
+        *y = freeze(montgomery(x, r, r_qinv));
+    }
 }
 
 fn add_assign(f: &mut Poly, g: &Poly) {
@@ -267,11 +265,13 @@ fn ntt(f: &mut Poly) {
     let mut w = f.map(i32::from);
 
     if cpu::ntt(&mut w, &FIELD) {
-        *f = w.map(|x| x as u16);
+        for (y, &x) in f.iter_mut().zip(&w) {
+            *y = x as u16;
+        }
     } else {
         ntt_layers(&mut w);
 
-        *f = canonical(&w);
+        canonical(&w, f);
     }
 
     wipe(&mut w);
@@ -304,28 +304,27 @@ fn ntt_layers(w: &mut Wide) {
     }
 }
 
-// The inverse NTT of the accumulated products, as canonical coefficients.
-fn inverse_ntt(acc: &Wide) -> Poly {
-    let mut f = [0; 256];
-
-    if cpu::inverse_ntt16(acc, &mut f, &FIELD16) {
-        return f;
+// The inverse NTT of the accumulated products, as canonical coefficients, into f.
+fn inverse_ntt(acc: &Wide, f: &mut Poly) {
+    if cpu::inverse_ntt16(acc, f, &FIELD16) {
+        return;
     }
 
     let mut w = *acc;
 
-    let f = if cpu::inverse_ntt(&mut w, &FIELD) {
-        w.map(|x| x as u16)
+    if cpu::inverse_ntt(&mut w, &FIELD) {
+        for (y, &x) in f.iter_mut().zip(&w) {
+            *y = x as u16;
+        }
     } else {
-        inverse_ntt_portable(&mut w)
-    };
+        inverse_ntt_portable(&mut w, f);
+    }
 
     wipe(&mut w);
-
-    f
 }
 
-fn inverse_ntt_portable(w: &mut Wide) -> Poly {
+// w is left changed.
+fn inverse_ntt_portable(w: &mut Wide, f: &mut Poly) {
     let (r, r_qinv) = (i32::from(R_MOD_Q), i32::from(R_MOD_Q).wrapping_mul(QINV));
 
     // Below q in absolute value first, so that the sums stay below 128q.
@@ -359,7 +358,9 @@ fn inverse_ntt_portable(w: &mut Wide) -> Poly {
 
     let scale_qinv = INVERSE_SCALE.wrapping_mul(QINV);
 
-    w.map(|x| freeze(montgomery(x, INVERSE_SCALE, scale_qinv)))
+    for (y, &x) in f.iter_mut().zip(w.iter()) {
+        *y = freeze(montgomery(x, INVERSE_SCALE, scale_qinv));
+    }
 }
 
 // The products a1 b1 gamma of FIPS 203, Algorithm 12, take gamma from b's half alone, so a vector
@@ -388,30 +389,30 @@ pub(crate) const GAMMAS16: [i16; 128] = {
     table
 };
 
-fn multiply_cache(b: &Poly) -> Cache {
-    let mut cache = [0; 128];
-
-    if cpu::mlkem_multiply_cache(b, &GAMMAS16, Q as u16, &mut cache) {
-        return cache;
+fn multiply_cache(b: &Poly, cache: &mut Cache) {
+    if !cpu::mlkem_multiply_cache(b, &GAMMAS16, Q as u16, cache) {
+        multiply_cache_portable(b, cache);
     }
-
-    multiply_cache_portable(b)
 }
 
-fn multiply_cache_portable(b: &Poly) -> Cache {
-    core::array::from_fn(|i| {
-        let gamma = GAMMAS[i];
-
-        freeze(montgomery(
-            i32::from(b[2 * i + 1]),
+fn multiply_cache_portable(b: &Poly, cache: &mut Cache) {
+    for ((c, pair), &gamma) in cache.iter_mut().zip(b.as_chunks::<2>().0).zip(&GAMMAS) {
+        *c = freeze(montgomery(
+            i32::from(pair[1]),
             gamma,
             gamma.wrapping_mul(QINV),
-        ))
-    })
+        ));
+    }
 }
 
 fn multiply_caches(vector: &[Poly]) -> Vec<Cache> {
-    vector.iter().map(multiply_cache).collect()
+    let mut caches = vec![[0; 128]; vector.len()];
+
+    for (cache, b) in caches.iter_mut().zip(vector) {
+        multiply_cache(b, cache);
+    }
+
+    caches
 }
 
 // acc += a * b in the NTT domain (FIPS 203, Algorithms 11 and 12) for canonical a and b, with b's
@@ -423,13 +424,11 @@ fn multiply_accumulate(acc: &mut Wide, a: &Poly, b: &Poly, cache: &Cache) {
     }
 }
 
-// InvNTT of the sum of the products a[j] * b[j] in the NTT domain, as canonical coefficients, with
-// the caches of the b[j]; a CPU kernel keeps the sums in registers.
-fn inner_product(a: &[&Poly], b: &[Poly], caches: &[Cache]) -> Poly {
-    let mut f = [0; 256];
-
-    if cpu::mlkem_inner_product(&mut f, a, b, caches, &FIELD16) {
-        return f;
+// InvNTT of the sum of the products a[j] * b[j] in the NTT domain, as canonical coefficients, into
+// f, with the caches of the b[j]; a CPU kernel keeps the sums in registers.
+fn inner_product(f: &mut Poly, a: &[&Poly], b: &[Poly], caches: &[Cache]) {
+    if cpu::mlkem_inner_product(f, a, b, caches, &FIELD16) {
+        return;
     }
 
     let mut acc = [0; 256];
@@ -438,11 +437,9 @@ fn inner_product(a: &[&Poly], b: &[Poly], caches: &[Cache]) -> Poly {
         multiply_accumulate(&mut acc, a, b, cache);
     }
 
-    let f = inverse_ntt(&acc);
+    inverse_ntt(&acc, f);
 
     wipe(&mut acc);
-
-    f
 }
 
 fn multiply_accumulate_portable(acc: &mut Wide, a: &Poly, b: &Poly, cache: &Cache) {
@@ -477,14 +474,14 @@ fn byte_encode(f: &Poly, d: u32, out: &mut [u8]) {
     }
 }
 
-fn byte_decode(data: &[u8], d: u32) -> Poly {
+fn byte_decode(data: &[u8], d: u32, f: &mut Poly) {
     match d {
-        1 => decode_bits::<1>(data),
-        4 => decode_bits::<4>(data),
-        5 => decode_bits::<5>(data),
-        10 => decode_bits::<10>(data),
-        11 => decode_bits::<11>(data),
-        12 => decode_bits::<12>(data),
+        1 => decode_bits::<1>(data, f),
+        4 => decode_bits::<4>(data, f),
+        5 => decode_bits::<5>(data, f),
+        10 => decode_bits::<10>(data, f),
+        11 => decode_bits::<11>(data, f),
+        12 => decode_bits::<12>(data, f),
         _ => unreachable!("no ML-KEM encoding uses {d} bits"),
     }
 }
@@ -508,9 +505,7 @@ fn encode_bits<const D: usize>(f: &Poly, out: &mut [u8]) {
     }
 }
 
-fn decode_bits<const D: usize>(data: &[u8]) -> Poly {
-    let mut f = [0; 256];
-
+fn decode_bits<const D: usize>(data: &[u8], f: &mut Poly) {
     for (group, bytes) in f
         .as_chunks_mut::<8>()
         .0
@@ -526,20 +521,18 @@ fn decode_bits<const D: usize>(data: &[u8]) -> Poly {
             *x = (word >> (D * i)) as u16 & ((1 << D) - 1);
         }
     }
-
-    f
 }
 
-fn decode12(data: &[u8]) -> Poly {
-    let mut f = [0; 256];
-
-    if let Ok(data) = <&[u8; 384]>::try_from(data)
-        && cpu::decode12(data, Q as u16, &mut f)
-    {
-        return f;
+fn decode12(data: &[u8; 384], f: &mut Poly) {
+    if cpu::decode12(data, Q as u16, f) {
+        return;
     }
 
-    byte_decode(data, 12).map(|x| subtract_q(u32::from(x)))
+    byte_decode(data, 12, f);
+
+    for x in f.iter_mut() {
+        *x = subtract_q(u32::from(*x));
+    }
 }
 
 // round(2^d * x / q): q is odd, so adding floor(q / 2) before the floor division never meets a tie.
@@ -552,7 +545,8 @@ const fn decompress(y: u16, d: u32) -> u16 {
 }
 
 // ByteEncode_d(Compress_d(f + e)), with Decompress_1 of the message's bits added first if there
-// is a message: the last steps of K-PKE.Encrypt for u and v. f is left changed.
+// is a message: the last steps of K-PKE.Encrypt for u and v. f is left changed; f and the
+// message's polynomial are worked on in place, as both are secret in the re-encryption.
 fn compress_into(f: &mut Poly, e: &Poly, message: Option<&[u8; 32]>, d: u32, out: &mut [u8]) {
     if cpu::mlkem_compress(f, e, message, d, Q as u16, out) {
         return;
@@ -561,40 +555,50 @@ fn compress_into(f: &mut Poly, e: &Poly, message: Option<&[u8; 32]>, d: u32, out
     add_assign(f, e);
 
     if let Some(message) = message {
-        let mut mu = byte_decode(message, 1).map(|bit| decompress(bit, 1));
+        let mut mu = [0; 256];
+
+        byte_decode(message, 1, &mut mu);
+
+        for x in &mut mu {
+            *x = decompress(*x, 1);
+        }
 
         add_assign(f, &mu);
 
         wipe(&mut mu);
     }
 
-    byte_encode(&f.map(|x| compress(x, d)), d, out);
+    for x in f.iter_mut() {
+        *x = compress(*x, d);
+    }
+
+    byte_encode(f, d, out);
 }
 
-// Decompress_d(ByteDecode_d(data)).
+// Decompress_d(ByteDecode_d(data)), of a public ciphertext.
 fn decompress_from(data: &[u8], d: u32) -> Poly {
     let mut f = [0; 256];
 
     if !cpu::mlkem_decompress(data, d, Q as u16, &mut f) {
-        f = byte_decode(data, d).map(|x| decompress(x, d));
+        byte_decode(data, d, &mut f);
+
+        for x in &mut f {
+            *x = decompress(*x, d);
+        }
     }
 
     f
 }
 
-// ByteEncode_1(Compress_1(v - w)), the message of K-PKE.Decrypt. w is left changed.
-fn message_of(v: &Poly, w: &mut Poly) -> [u8; 32] {
-    let mut m = [0; 32];
-
-    if !cpu::mlkem_message(v, w, Q as u16, &mut m) {
+// ByteEncode_1(Compress_1(v - w)), the message of K-PKE.Decrypt, into m. w is left changed.
+fn message_of(v: &Poly, w: &mut Poly, m: &mut [u8; 32]) {
+    if !cpu::mlkem_message(v, w, Q as u16, m) {
         for (x, y) in w.iter_mut().zip(v) {
             *x = compress(sub(*y, *x), 1);
         }
 
-        byte_encode(w, 1, &mut m);
+        byte_encode(w, 1, m);
     }
-
-    m
 }
 
 // One block of an XOF stream, as the lanes of the sponge, into the coefficients accepted so far.
@@ -717,16 +721,14 @@ fn binomial(eta: usize, lanes: &[u64], f: &mut Poly) {
             *bytes = lane.to_le_bytes();
         }
 
-        *f = binomial_portable(eta, &bytes[..64 * eta]);
+        binomial_portable(eta, &bytes[..64 * eta], f);
 
         wipe(&mut bytes);
     }
 }
 
 // The bits of each half are summed with masks over a whole word, never one secret bit at a time.
-fn binomial_portable(eta: usize, data: &[u8]) -> Poly {
-    let mut f = [0; 256];
-
+fn binomial_portable(eta: usize, data: &[u8], f: &mut Poly) {
     if eta == 2 {
         for (bytes, group) in data.as_chunks::<4>().0.iter().zip(f.as_chunks_mut::<8>().0) {
             let t = u32::from_le_bytes(*bytes);
@@ -754,8 +756,6 @@ fn binomial_portable(eta: usize, data: &[u8]) -> Poly {
             }
         }
     }
-
-    f
 }
 
 // Â, with row i and column j at i * k + j, a group of entries at a time.
@@ -776,12 +776,15 @@ fn sample_matrix(rho: &[u8], k: usize) -> Vec<Poly> {
 }
 
 fn decode_vector(bytes: &[u8]) -> Vec<Poly> {
-    bytes
-        .as_chunks::<384>()
-        .0
-        .iter()
-        .map(|chunk| decode12(chunk))
-        .collect()
+    let chunks = bytes.as_chunks::<384>().0;
+
+    let mut vector = vec![[0; 256]; chunks.len()];
+
+    for (f, chunk) in vector.iter_mut().zip(chunks) {
+        decode12(chunk, f);
+    }
+
+    vector
 }
 
 // What an encapsulation key yields before any message: Â, t̂ and H(ek). Encapsulation and the
@@ -856,7 +859,7 @@ fn matrix_vector_portable(
             multiply_accumulate_portable(&mut acc, a, b, cache);
         }
 
-        *t = canonical_portable(&acc);
+        canonical_portable(&acc, t);
 
         add_assign(t, e);
     }
@@ -870,7 +873,9 @@ fn matrix_vector_portable(
 fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) -> [u8; 32] {
     let k = p.k;
 
-    let mut g = sha3_512(&[d, &[k as u8]]);
+    let mut g = [0; 64];
+
+    sha3_512(&[d, &[k as u8]], &mut g);
 
     let (rho, sigma) = g.split_at(32);
 
@@ -895,7 +900,7 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) -> [u8; 32
     let mut caches = [[0; 128]; 4];
 
     for (cache, s_j) in caches.iter_mut().zip(s) {
-        *cache = multiply_cache(s_j);
+        multiply_cache(s_j, cache);
     }
 
     let mut hash = Keccak::new(136, SHA3);
@@ -991,7 +996,7 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
     let mut caches = [[0; 128]; 4];
 
     for (cache, y_n) in caches.iter_mut().zip(&y[..k]) {
-        *cache = multiply_cache(y_n);
+        multiply_cache(y_n, cache);
     }
 
     // e1 from the nonces k to 2k - 1 and e2 from 2k.
@@ -1006,14 +1011,16 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
     for (i, chunk) in c1.chunks_exact_mut(32 * p.du as usize).enumerate() {
         let column: [&Poly; 4] = core::array::from_fn(|j| &key.matrix[j.min(k - 1) * k + i]);
 
-        u = inner_product(&column[..k], &y[..k], &caches[..k]);
+        inner_product(&mut u, &column[..k], &y[..k], &caches[..k]);
 
         compress_into(&mut u, &noise[i], None, p.du, chunk);
     }
 
     let t: [&Poly; 4] = core::array::from_fn(|j| &key.t[j.min(k - 1)]);
 
-    let mut v = inner_product(&t[..k], &y[..k], &caches[..k]);
+    let mut v = [0; 256];
+
+    inner_product(&mut v, &t[..k], &y[..k], &caches[..k]);
 
     compress_into(&mut v, &noise[k], Some(m), p.dv, c2);
 
@@ -1028,7 +1035,8 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
     wipe(noise[..k + 1].as_flattened_mut());
 }
 
-fn pke_decrypt(secret: &DecapsulationKey, c: &[u8], p: &Parameters) -> [u8; 32] {
+// The message goes to m.
+fn pke_decrypt(secret: &DecapsulationKey, c: &[u8], p: &Parameters, m: &mut [u8; 32]) {
     let k = p.k;
 
     let (c1, c2) = c.split_at(32 * p.du as usize * k);
@@ -1043,13 +1051,13 @@ fn pke_decrypt(secret: &DecapsulationKey, c: &[u8], p: &Parameters) -> [u8; 32] 
 
     let u: [&Poly; 4] = core::array::from_fn(|i| &u[i]);
 
-    let mut w = inner_product(&u[..k], &secret.s, &secret.caches);
+    let mut w = [0; 256];
 
-    let m = message_of(&decompress_from(c2, p.dv), &mut w);
+    inner_product(&mut w, &u[..k], &secret.s, &secret.caches);
+
+    message_of(&decompress_from(c2, p.dv), &mut w, m);
 
     wipe(&mut w);
-
-    m
 }
 
 pub(crate) fn keygen_internal(d: &[u8], z: &[u8], p: &Parameters) -> (Vec<u8>, SecretBytes) {
@@ -1070,12 +1078,16 @@ pub(crate) fn keygen_internal(d: &[u8], z: &[u8], p: &Parameters) -> (Vec<u8>, S
     (ek, dk)
 }
 
+// The shared secret, of 32 bytes, goes to shared_secret.
 pub(crate) fn encaps_internal(
     key: &EncapsulationKey,
     m: &[u8],
     p: &Parameters,
-) -> ([u8; 32], Vec<u8>) {
-    let mut g = sha3_512(&[m, &key.h]);
+    shared_secret: &mut [u8],
+) -> Vec<u8> {
+    let mut g = [0; 64];
+
+    sha3_512(&[m, &key.h], &mut g);
 
     let mut c = vec![0; p.ciphertext_size()];
 
@@ -1083,30 +1095,34 @@ pub(crate) fn encaps_internal(
 
     declassify(&c);
 
-    let mut shared_secret = [0; 32];
-
     shared_secret.copy_from_slice(&g[..32]);
 
     wipe(&mut g);
 
-    (shared_secret, c)
+    c
 }
 
 // Implicit rejection: a ciphertext that does not re-encrypt to itself yields J(z || c), chosen
 // by a mask so that the comparison result never steers a branch. dk supplies z; everything else
-// comes from the decoded forms of the key and of its encapsulation key.
+// comes from the decoded forms of the key and of its encapsulation key. The shared secret, of 32
+// bytes, goes to shared_secret.
 pub(crate) fn decaps_internal(
     public: &EncapsulationKey,
     secret: &DecapsulationKey,
     dk: &[u8],
     c: &[u8],
     p: &Parameters,
-) -> [u8; 32] {
+    shared_secret: &mut [u8],
+) {
     let z = &dk[768 * p.k + 64..];
 
-    let mut m = pke_decrypt(secret, c, p);
+    let mut m = [0; 32];
 
-    let mut g = sha3_512(&[&m, &public.h]);
+    pke_decrypt(secret, c, p, &mut m);
+
+    let mut g = [0; 64];
+
+    sha3_512(&[&m, &public.h], &mut g);
 
     let mut rejected = [0; 32];
 
@@ -1116,13 +1132,11 @@ pub(crate) fn decaps_internal(
 
     pke_encrypt(public, &m, &g[32..], p, &mut reencrypted);
 
-    let mut shared_secret = [0; 32];
-
     ct::select(
         ct::equal_mask(c, &reencrypted),
         &g[..32],
         &rejected,
-        &mut shared_secret,
+        shared_secret,
     );
 
     wipe(&mut m);
@@ -1130,8 +1144,6 @@ pub(crate) fn decaps_internal(
     wipe(&mut g);
 
     wipe(&mut rejected);
-
-    shared_secret
 }
 
 // FIPS 203, 7.2: every coefficient of the encoded vector must already be reduced modulo q.
@@ -1195,12 +1207,16 @@ fn canonical_secret(s: &[u8]) -> bool {
 fn short_secret(s: &[u8], eta: u32) -> bool {
     let mut outside = 0;
 
+    let (mut s_hat, mut w, mut f) = ([0; 256], [0; 256], [0; 256]);
+
     for polynomial in s.as_chunks::<384>().0 {
-        let mut s_hat = decode12(polynomial);
+        decode12(polynomial, &mut s_hat);
 
-        let mut w: Wide = s_hat.map(i32::from);
+        for (y, &x) in w.iter_mut().zip(&s_hat) {
+            *y = i32::from(x);
+        }
 
-        let mut f = inverse_ntt(&w);
+        inverse_ntt(&w, &mut f);
 
         // x + eta mod q is at most 2 eta exactly when x is in [-eta, eta] modulo q.
         for &x in &f {
@@ -1208,13 +1224,13 @@ fn short_secret(s: &[u8], eta: u32) -> bool {
         }
 
         outside = black_box(outside);
-
-        wipe(&mut s_hat);
-
-        wipe(&mut w);
-
-        wipe(&mut f);
     }
+
+    wipe(&mut s_hat);
+
+    wipe(&mut w);
+
+    wipe(&mut f);
 
     ct::declassify_value(outside >> 31) == 0
 }
@@ -1227,6 +1243,31 @@ pub(crate) fn public_key_of<'a>(dk: &'a [u8], p: &Parameters) -> &'a [u8] {
 mod tests {
     use super::*;
     use crate::cpu::testing::Inputs;
+
+    // Value-returning forms of the functions with out-parameters, for the comparisons.
+    fn into<T: Default>(write: impl FnOnce(&mut T)) -> T {
+        let mut out = T::default();
+
+        write(&mut out);
+
+        out
+    }
+
+    fn poly(write: impl FnOnce(&mut Poly)) -> Poly {
+        let mut f = [0; 256];
+
+        write(&mut f);
+
+        f
+    }
+
+    fn cache(write: impl FnOnce(&mut Cache)) -> Cache {
+        let mut c = [0; 128];
+
+        write(&mut c);
+
+        c
+    }
 
     // Values in [low, high): the bounds themselves, alternated, for the first cases, random ones
     // after that.
@@ -1271,7 +1312,7 @@ mod tests {
             if cpu::ntt(&mut actual, &FIELD) {
                 assert_eq!(
                     actual.map(|x| x as u16),
-                    canonical(&expected),
+                    poly(|f| canonical(&expected, f)),
                     "ntt, case {n}"
                 );
 
@@ -1281,12 +1322,16 @@ mod tests {
             let mut actual = f;
 
             if cpu::ntt16(&mut actual, &FIELD16) {
-                assert_eq!(actual, canonical(&expected), "16-bit ntt, case {n}");
+                assert_eq!(
+                    actual,
+                    poly(|f| canonical(&expected, f)),
+                    "16-bit ntt, case {n}"
+                );
             }
 
             let acc = values(&mut inputs, n, i64::from(i32::MIN), 1 << 31, |x| x as i32);
 
-            let expected = inverse_ntt_portable(&mut acc.clone());
+            let expected = poly(|f| inverse_ntt_portable(&mut acc.clone(), f));
 
             let mut actual = acc;
 
@@ -1302,7 +1347,7 @@ mod tests {
 
             let g = values(&mut inputs, n + 1, 0, q, |x| x as u16);
 
-            let cache = multiply_cache_portable(&g);
+            let cache = cache(|c| multiply_cache_portable(&g, c));
 
             assert!(cache.iter().all(|&c| u32::from(c) < Q), "cache, case {n}");
 
@@ -1408,7 +1453,7 @@ mod tests {
 
             let e: [Poly; 4] = core::array::from_fn(|i| canonical(n + i + 2));
 
-            let caches = s.each_ref().map(multiply_cache);
+            let caches = s.each_ref().map(|s| cache(|c| multiply_cache(s, c)));
 
             let rows = 1 + n / 3 % k;
 
@@ -1453,7 +1498,11 @@ mod tests {
             let mut actual = [0; 256];
 
             if cpu::reduce(&w, i32::from(R_MOD_Q), &FIELD, &mut actual) {
-                assert_eq!(actual, canonical_portable(&w), "reduction, case {n}");
+                assert_eq!(
+                    actual,
+                    poly(|f| canonical_portable(&w, f)),
+                    "reduction, case {n}"
+                );
 
                 accelerated += 1;
             }
@@ -1497,7 +1546,7 @@ mod tests {
                 let mut actual = [0; 256];
 
                 if cpu::binomial(eta, &lanes[..8 * eta], Q as u16, &mut actual) {
-                    let expected = binomial_portable(eta, &data[..64 * eta]);
+                    let expected = poly(|f| binomial_portable(eta, &data[..64 * eta], f));
 
                     assert_eq!(actual, expected, "eta {eta}, case {n}");
 
@@ -1548,7 +1597,7 @@ mod tests {
             if let Some(message) = &message {
                 add_assign(
                     &mut portable,
-                    &byte_decode(message, 1).map(|bit| decompress(bit, 1)),
+                    &poly(|f| byte_decode(message, 1, f)).map(|bit| decompress(bit, 1)),
                 );
             }
 
@@ -1593,7 +1642,7 @@ mod tests {
 
             let data = &data[..32 * d as usize];
 
-            let expected = byte_decode(data, d).map(|x| decompress(x, d));
+            let expected = poly(|f| byte_decode(data, d, f)).map(|x| decompress(x, d));
 
             let mut actual = [0; 256];
 
@@ -1638,7 +1687,7 @@ mod tests {
             }
 
             assert_eq!(
-                message_of(&v, &mut w.clone()),
+                into(|m| message_of(&v, &mut w.clone(), m)),
                 expected,
                 "message, case {n}"
             );
@@ -1674,7 +1723,7 @@ mod tests {
                 _ => inputs.bytes(),
             };
 
-            let expected = byte_decode(&data, 12).map(|x| subtract_q(u32::from(x)));
+            let expected = poly(|f| byte_decode(&data, 12, f)).map(|x| subtract_q(u32::from(x)));
 
             let mut actual = [0; 256];
 
@@ -1684,7 +1733,7 @@ mod tests {
                 accelerated += 1;
             }
 
-            assert_eq!(decode12(&data), expected, "case {n}");
+            assert_eq!(poly(|f| decode12(&data, f)), expected, "case {n}");
         }
 
         std::eprintln!("ML-KEM decoding: {accelerated} of 4000 cases through a CPU kernel");
@@ -1709,7 +1758,7 @@ mod tests {
             let b: [Poly; 4] =
                 core::array::from_fn(|i| values(&mut inputs, n / 4 + i + 1, 0, q, |x| x as u16));
 
-            let caches = b.each_ref().map(multiply_cache);
+            let caches = b.each_ref().map(|b| cache(|c| multiply_cache(b, c)));
 
             let mut acc = [0; 256];
 
@@ -1717,7 +1766,7 @@ mod tests {
                 multiply_accumulate_portable(&mut acc, a, b, cache);
             }
 
-            let expected = inverse_ntt_portable(&mut acc);
+            let expected = poly(|f| inverse_ntt_portable(&mut acc, f));
 
             let a: [&Poly; 4] = core::array::from_fn(|i| &a[i]);
 
@@ -1730,7 +1779,7 @@ mod tests {
             }
 
             assert_eq!(
-                inner_product(&a[..k], &b[..k], &caches[..k]),
+                poly(|f| inner_product(f, &a[..k], &b[..k], &caches[..k])),
                 expected,
                 "k = {k}, case {n}"
             );

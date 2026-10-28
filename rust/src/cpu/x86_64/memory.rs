@@ -98,3 +98,62 @@ pub(super) fn store256_at<T: Plain, const N: usize, const M: usize>(
     // hold a value, as every bit pattern of the element type is one.
     unsafe { _mm256_storeu_si256(out.as_mut_ptr().cast::<[T; N]>().add(i).cast(), vector) }
 }
+
+/// Values made of vectors alone, which take any bits: seen as words, they can be wiped.
+///
+/// # Safety
+///
+/// The type has no padding, which words_of relies on.
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+pub(super) unsafe trait Vectors: Copy {}
+
+// SAFETY: one vector, sixteen bytes of any bits.
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl Vectors for __m128i {}
+
+// SAFETY: one vector, thirty-two bytes of any bits.
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl Vectors for __m256i {}
+
+// SAFETY: an array has no padding between its elements.
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl<T: Vectors, const N: usize> Vectors for [T; N] {}
+
+// The 64-bit words of such a value, for wiping it.
+#[cfg(not(crypto_pq_optimized))]
+#[inline(always)]
+#[allow(unsafe_code)]
+pub(super) fn words_of<T: Vectors>(value: &mut T) -> &mut [u64] {
+    // SAFETY: a Vectors value is 16- or 32-byte vectors with no padding between them, so it is
+    // size_of::<T>() / 8 words aligned for u64, and every bit pattern is a value of either type;
+    // the borrow of value covers the result.
+    unsafe {
+        core::slice::from_raw_parts_mut(core::ptr::from_mut(value).cast(), size_of::<T>() / 8)
+    }
+}
+
+// The words of an array of vectors, for wiping it.
+#[inline]
+#[allow(unsafe_code)]
+pub(super) fn vector_words<const M: usize>(vectors: &mut [__m256i; M]) -> &mut [[u64; 4]; M] {
+    // SAFETY: four words take the 32 bytes of a vector and need less alignment, and every bit
+    // pattern is a value of both types; the borrow of vectors covers the result.
+    unsafe { &mut *vectors.as_mut_ptr().cast() }
+}
+
+// Zeros over vectors or words that held secrets, which the compiler must keep: volatile stores,
+// one per value.
+#[inline]
+#[allow(unsafe_code)]
+pub(super) fn clear<T: Copy>(values: &mut [T], zero: T) {
+    for value in values {
+        // SAFETY: value comes from a mutable slice, so it is valid, aligned and exclusive.
+        unsafe { core::ptr::write_volatile(value, zero) };
+    }
+
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}

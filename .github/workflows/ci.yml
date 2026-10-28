@@ -65,6 +65,12 @@ jobs:
       - run: cargo test --locked --release
       - run: cargo test --locked --all-features
       - run: cargo test --locked --release --all-features
+      # At opt-level z the arrays that wipe_unless_optimized takes are in memory and wiped, as
+      # build.rs leaves crypto_pq_optimized unset there (D-76): the library tests on that code.
+      - if: matrix.rust == 'stable' && (matrix.os == 'ubuntu-latest' || matrix.os == 'ubuntu-24.04-arm')
+        env:
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: z
+        run: cargo test --locked --release --lib --all-features
       # The fixtures of vectors/cross that the generators in the tests maintain are exactly what
       # the generators write (SPEC 18.4 item 2).
       - if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
@@ -135,6 +141,7 @@ jobs:
       - run: |
           cargo package --locked
           cargo package --locked --list | tee "$RUNNER_TEMP/crate-files"
+          grep -qx build.rs "$RUNNER_TEMP/crate-files"
           grep -qx README.md "$RUNNER_TEMP/crate-files"
           grep -qx LICENSE-APACHE "$RUNNER_TEMP/crate-files"
           grep -qx LICENSE-MIT "$RUNNER_TEMP/crate-files"
@@ -178,6 +185,14 @@ jobs:
       - run: |
           for features in "" --all-features; do
             cargo clippy --all-targets --locked $features -- -D warnings
+          done
+      # The release profile sets crypto_pq_optimized (build.rs, D-76), which leaves out the wipes
+      # of the register arrays, so clippy also lints that side of the cfg on both architectures.
+      - run: |
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+            for features in "" --all-features; do
+              cargo clippy --all-targets --locked --release $features --target "$target" -- -D warnings
+            done
           done
       # The AVX-512VL kernels use 256-bit registers only, and nothing else uses AVX-512: the
       # build of every feature at each optimization level has no instruction on a 512-bit register.

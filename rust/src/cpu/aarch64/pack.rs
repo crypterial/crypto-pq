@@ -5,7 +5,10 @@
 use core::arch::aarch64::*;
 
 use super::memory::{load_i32, load_u16, store_u16, store3_u8};
+#[cfg(not(crypto_pq_optimized))]
+use super::vector_lanes;
 use crate::cpu::Field;
+use crate::wipe::wipe_unless_optimized;
 
 #[allow(unsafe_code)]
 pub(crate) fn reduce(w: &[i32; 256], factor: i32, field: &Field, out: &mut [u16; 256]) -> bool {
@@ -44,7 +47,8 @@ fn reduce_neon(w: &[i32; 256], factor: i32, field: &Field, out: &mut [u16; 256])
             unreachable!("eight values are two groups of four")
         };
 
-        let reduced = [low, high].map(|values| {
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut reduced = [low, high].map(|values| {
             let x = load_i32(values);
 
             let product = vhsubq_s32(
@@ -58,6 +62,8 @@ fn reduce_neon(w: &[i32; 256], factor: i32, field: &Field, out: &mut [u16; 256])
         let narrow = vcombine_s16(vmovn_s32(reduced[0]), vmovn_s32(reduced[1]));
 
         store_u16(vreinterpretq_u16_s16(narrow), out);
+
+        wipe_unless_optimized!(vector_lanes(&mut reduced));
     }
 }
 

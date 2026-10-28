@@ -7,6 +7,9 @@
 use core::arch::aarch64::*;
 
 use super::memory::{load_u64, load3_u8, store_u16};
+#[cfg(not(crypto_pq_optimized))]
+use super::vector_lanes;
+use crate::wipe::wipe_unless_optimized;
 
 // The PRF output is given as the 64-bit lanes of the sponges, in stream order.
 #[allow(unsafe_code)]
@@ -56,7 +59,8 @@ fn binomial2(lanes: &[u64; 16], q: u16, out: &mut [u16; 256]) {
 
         let (first, second) = (vzip1q_s8(even, odd), vzip2q_s8(even, odd));
 
-        let wide = [
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut wide = [
             vmovl_s8(vget_low_s8(first)),
             vmovl_high_s8(first),
             vmovl_s8(vget_low_s8(second)),
@@ -69,6 +73,8 @@ fn binomial2(lanes: &[u64; 16], q: u16, out: &mut [u16; 256]) {
 
             store_u16(vreinterpretq_u16_s16(canonical), out);
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut wide));
     }
 }
 
@@ -89,7 +95,8 @@ fn binomial3(lanes: &[u64; 24], q: u16, out: &mut [u16; 256]) {
     {
         let uint8x16x3_t(b0, b1, b2) = load3_u8(chunk);
 
-        let fields = [
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut fields = [
             vandq_u8(b0, six),
             vorrq_u8(
                 vshrq_n_u8::<6>(b0),
@@ -145,5 +152,7 @@ fn binomial3(lanes: &[u64; 24], q: u16, out: &mut [u16; 256]) {
                 store_u16(vreinterpretq_u16_s16(canonical), out);
             }
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut fields));
     }
 }

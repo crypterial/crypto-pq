@@ -21,10 +21,12 @@
 
 use core::arch::x86_64::*;
 
-use super::memory::{load128, load256, store128, store256};
+#[cfg(not(crypto_pq_optimized))]
+use super::memory::words_of;
+use super::memory::{clear, load128, load256, store128, store256};
 use crate::blake3::{Many, PERMUTATION};
 use crate::sha2::IV_256;
-use crate::wipe::wipe;
+use crate::wipe::{wipe, wipe_unless_optimized};
 
 // The message word order of each round.
 const fn schedule() -> [[usize; 16]; 7] {
@@ -226,11 +228,15 @@ macro_rules! rows {
                 round::<6>(&mut row, block);
 
                 h = [_mm_xor_si128(row[0], row[2]), _mm_xor_si128(row[1], row[3])];
+
+                wipe_unless_optimized!(words_of(&mut row));
             }
 
             store128(h[0], low);
 
             store128(h[1], high);
+
+            wipe_unless_optimized!(words_of(&mut h));
         }
 
         // At most 32 bytes of the root's output for at most a block of input, whose flags the
@@ -268,7 +274,8 @@ macro_rules! rows {
 
             round::<6>(&mut row, block);
 
-            let h = [_mm_xor_si128(row[0], row[2]), _mm_xor_si128(row[1], row[3])];
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut h = [_mm_xor_si128(row[0], row[2]), _mm_xor_si128(row[1], row[3])];
 
             let mut bytes = [0; 32];
 
@@ -292,6 +299,10 @@ macro_rules! rows {
             }
 
             wipe(&mut copy);
+
+            wipe_unless_optimized!(words_of(&mut row));
+
+            wipe_unless_optimized!(words_of(&mut h));
         }
 
         // All sixteen output words of one compression.
@@ -308,7 +319,8 @@ macro_rules! rows {
                 unreachable!("eight words are two groups of four")
             };
 
-            let h = [load128(low), load128(high)];
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut h = [load128(low), load128(high)];
 
             let mut row = start(h, counter, length, flags);
 
@@ -337,6 +349,10 @@ macro_rules! rows {
             store128(_mm_xor_si128(row[2], h[0]), o2);
 
             store128(_mm_xor_si128(row[3], h[1]), o3);
+
+            wipe_unless_optimized!(words_of(&mut row));
+
+            wipe_unless_optimized!(words_of(&mut h));
         }
     };
 }
@@ -396,7 +412,8 @@ mod rows_sse41 {
             unreachable!("eight words are two groups of four")
         };
 
-        let key = [load128(low), load128(high)];
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut key = [load128(low), load128(high)];
 
         let mut h = [key, key];
 
@@ -461,6 +478,10 @@ mod rows_sse41 {
                 [_mm_xor_si128(rx[0], rx[2]), _mm_xor_si128(rx[1], rx[3])],
                 [_mm_xor_si128(ry[0], ry[2]), _mm_xor_si128(ry[1], ry[3])],
             ];
+
+            wipe_unless_optimized!(words_of(&mut rx));
+
+            wipe_unless_optimized!(words_of(&mut ry));
         }
 
         for (cv, h) in out.iter_mut().zip(h) {
@@ -472,6 +493,10 @@ mod rows_sse41 {
 
             store128(h[1], high);
         }
+
+        wipe_unless_optimized!(words_of(&mut key));
+
+        wipe_unless_optimized!(words_of(&mut h));
     }
 }
 
@@ -776,6 +801,8 @@ mod rows_pair {
                 _mm256_xor_si256(row[0], row[2]),
                 _mm256_xor_si256(row[1], row[3]),
             ];
+
+            wipe_unless_optimized!(words_of(&mut row));
         }
 
         for (l, cv) in out.iter_mut().enumerate() {
@@ -796,6 +823,8 @@ mod rows_pair {
 
             store128(b, second);
         }
+
+        wipe_unless_optimized!(words_of(&mut h));
     }
 }
 
@@ -1383,19 +1412,6 @@ fn hash4(input: &[[u8; 64]], many: &Many, table: &mut Table, first: usize, out: 
     clear(&mut m, _mm_setzero_si128());
 }
 
-// Zeros over vectors that held state or message words, which the compiler must keep: volatile
-// stores, one per vector.
-#[inline]
-#[allow(unsafe_code)]
-fn clear<T: Copy>(values: &mut [T], zero: T) {
-    for value in values {
-        // SAFETY: value comes from a mutable slice, so it is valid, aligned and exclusive.
-        unsafe { core::ptr::write_volatile(value, zero) };
-    }
-
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-}
-
 // The four G functions of a step of the transposed form side by side, instruction by
 // instruction: G k on words a[k], b[k], c[k] and d[k] with message words x[k] and y[k].
 macro_rules! step {
@@ -1508,16 +1524,22 @@ macro_rules! lanes_hash {
         }
 
         // A block of hash_many: the next chaining values from h and the state's other words in
-        // init.
+        // init. The state goes through v, which the caller owns, as rounds, out of line, takes it
+        // in memory.
         #[target_feature(enable = $feature)]
         #[inline]
-        fn block(h: &mut [$vector; 8], init: &[$vector; 8], m: &[$vector; 16]) {
-            let mut v = [
+        fn block(
+            h: &mut [$vector; 8],
+            init: &[$vector; 8],
+            m: &[$vector; 16],
+            v: &mut [$vector; 16],
+        ) {
+            *v = [
                 h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], init[0], init[1], init[2], init[3],
                 init[4], init[5], init[6], init[7],
             ];
 
-            rounds(&mut v, m);
+            rounds(v, m);
 
             for i in 0..8 {
                 h[i] = $xor(v[i], v[i + 8]);
@@ -1576,7 +1598,7 @@ macro_rules! lanes_hash {
                 $zero(),
             ];
 
-            let mut m = [$zero(); 16];
+            let (mut m, mut v) = ([$zero(); 16], [$zero(); 16]);
 
             for b in 0..blocks {
                 let mut flags = many.flags;
@@ -1599,7 +1621,7 @@ macro_rules! lanes_hash {
 
                 m = $message(&rows);
 
-                block(&mut h, &init, &m);
+                block(&mut h, &init, &m, &mut v);
             }
 
             let mut words = $cvs(&h);
@@ -1615,6 +1637,8 @@ macro_rules! lanes_hash {
             clear(&mut h, $zero());
 
             clear(&mut m, $zero());
+
+            clear(&mut v, $zero());
         }
     };
 }

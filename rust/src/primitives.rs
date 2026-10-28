@@ -5,36 +5,36 @@ const SHA3: u8 = 0x06;
 
 const SHAKE: u8 = 0x1F;
 
-fn absorb(mut engine: Keccak, parts: &[&[u8]]) -> Keccak {
+// The engines absorb in place: an absorbed engine moved by value leaves a copy of its state behind,
+// which its Drop does not wipe.
+fn digest(mut engine: Keccak, parts: &[&[u8]], out: &mut [u8]) {
     for part in parts {
         engine.update(part);
     }
 
-    engine
+    engine.read(out);
 }
 
 pub(crate) fn sha3_256(parts: &[&[u8]]) -> [u8; 32] {
     let mut out = [0; 32];
 
-    absorb(Keccak::new(136, SHA3), parts).read(&mut out);
+    digest(Keccak::new(136, SHA3), parts, &mut out);
 
     out
 }
 
-pub(crate) fn sha3_512(parts: &[&[u8]]) -> [u8; 64] {
-    let mut out = [0; 64];
-
-    absorb(Keccak::new(72, SHA3), parts).read(&mut out);
-
-    out
+// Into out, as G of ML-KEM is secret.
+pub(crate) fn sha3_512(parts: &[&[u8]], out: &mut [u8; 64]) {
+    digest(Keccak::new(72, SHA3), parts, out);
 }
 
-pub(crate) fn shake256(parts: &[&[u8]]) -> Keccak {
-    absorb(Keccak::new(136, SHAKE), parts)
+// A SHAKE256 sponge that has absorbed nothing yet.
+pub(crate) const fn shake256() -> Keccak {
+    Keccak::new(136, SHAKE)
 }
 
 pub(crate) fn shake256_into(parts: &[&[u8]], out: &mut [u8]) {
-    shake256(parts).read(out);
+    digest(shake256(), parts, out);
 }
 
 pub(crate) fn sha256(parts: &[&[u8]]) -> [u8; 32] {
@@ -45,6 +45,18 @@ pub(crate) fn sha256(parts: &[&[u8]]) -> [u8; 32] {
     }
 
     engine.digest()
+}
+
+// The leading out.len() bytes, at most 32, of SHA-256 of parts, for a digest that is secret: it
+// goes straight into out, with no copy in a frame of its own.
+pub(crate) fn sha256_into(parts: &[&[u8]], out: &mut [u8]) {
+    let mut engine = Sha256::new(&IV_256);
+
+    for part in parts {
+        engine.update(part);
+    }
+
+    engine.digest_into(out);
 }
 
 pub(crate) fn sha512(parts: &[&[u8]]) -> [u8; 64] {
@@ -80,24 +92,28 @@ impl TruncatedHash {
         }
     }
 
-    pub(crate) fn finish(self, n: usize) -> [u8; 32] {
-        let mut out = [0; 32];
+    // The n-byte digest into out, zeros after it. Into the caller's buffer, here and in digest:
+    // returned by value, the digests of secret chain values were left in this frame.
+    // The engine is used in place, where its Drop wipes it: moved out of self, it would leave a
+    // copy behind.
+    pub(crate) fn finish(mut self, n: usize, out: &mut [u8; 32]) {
+        let (digest, rest) = out.split_at_mut(n);
 
-        match self {
-            Self::Sha256(engine) => out[..n].copy_from_slice(&engine.digest()[..n]),
-            Self::Shake256(mut engine) => engine.read(&mut out[..n]),
+        match &mut self {
+            Self::Sha256(engine) => engine.digest_into(digest),
+            Self::Shake256(engine) => engine.read(digest),
         }
 
-        out
+        rest.fill(0);
     }
 
-    pub(crate) fn digest(shake: bool, n: usize, parts: &[&[u8]]) -> [u8; 32] {
+    pub(crate) fn digest(shake: bool, n: usize, parts: &[&[u8]], out: &mut [u8; 32]) {
         let mut engine = Self::new(shake);
 
         for part in parts {
             engine.update(part);
         }
 
-        engine.finish(n)
+        engine.finish(n, out);
     }
 }

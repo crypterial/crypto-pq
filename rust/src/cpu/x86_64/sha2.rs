@@ -15,9 +15,11 @@
 use core::arch::x86_64::*;
 use core::mem::MaybeUninit;
 
+#[cfg(not(crypto_pq_optimized))]
+use super::memory::words_of;
 use super::memory::{load128, load256, store256_at};
-use crate::sha2::{K256, K512, pad};
-use crate::wipe::wipe;
+use crate::sha2::{K256, K512, first_bytes, pad};
+use crate::wipe::{wipe, wipe_unless_optimized};
 
 // K256 with each group of four constants twice, for both halves of a vector.
 static K256_PAIRS: [[u32; 8]; 16] = {
@@ -395,6 +397,10 @@ fn first256(state: &mut [u32; 8], a: &[u8; 64], b: &[u8; 64], wk: &mut Schedule2
     for (word, value) in state.iter_mut().zip(s) {
         *word = word.wrapping_add(value);
     }
+
+    wipe_unless_optimized!(words_of(&mut x));
+
+    wipe_unless_optimized!(&mut s);
 }
 
 // The 64 rounds of block b from the stored schedule, as a loop over eight rounds at a time.
@@ -477,6 +483,10 @@ fn first512(state: &mut [u64; 8], a: &[u8; 128], b: &[u8; 128], wk: &mut Schedul
     for (word, value) in state.iter_mut().zip(s) {
         *word = word.wrapping_add(value);
     }
+
+    wipe_unless_optimized!(words_of(&mut x));
+
+    wipe_unless_optimized!(&mut s);
 }
 
 // The 80 rounds of block b, as second256's.
@@ -713,9 +723,13 @@ fn store_words<T: Copy + Into<u64>, const N: usize>(state: &[T; N], out: &mut [u
     let size = size_of::<T>();
 
     for (chunk, &word) in out.chunks_mut(size).zip(state) {
-        let bytes = word.into().to_be_bytes();
+        let word = word.into() << (64 - 8 * size);
 
-        chunk.copy_from_slice(&bytes[8 - size..8 - size + chunk.len()]);
+        if chunk.len() == size {
+            chunk.copy_from_slice(&word.to_be_bytes()[..size]);
+        } else {
+            first_bytes(word, chunk);
+        }
     }
 }
 

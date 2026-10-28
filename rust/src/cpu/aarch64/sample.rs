@@ -16,7 +16,10 @@
 use core::arch::aarch64::*;
 
 use super::memory::{load_u8, load_u64, store_i32, store_u16};
+#[cfg(not(crypto_pq_optimized))]
+use super::vector_lanes;
 use crate::ct::declassify_value;
+use crate::wipe::wipe_unless_optimized;
 
 // Shuffle indices that bring the accepted lanes of a vector of LANES lanes, WIDTH bytes each, to
 // its start in order, for every pattern of accepted lanes; 0xFF selects zero for the rest.
@@ -318,7 +321,8 @@ fn bounded_neon(lanes: &[u64; 17], eta: i32, a: &mut [i32; 256], count: &mut usi
 
             let packed = vmovl_s8(vreinterpret_s8_u8(vtbl1_u8(values, indices)));
 
-            let wide = [vmovl_s16(vget_low_s16(packed)), vmovl_high_s16(packed)];
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut wide = [vmovl_s16(vget_low_s16(packed)), vmovl_high_s16(packed)];
 
             for (i, vector) in wide.into_iter().enumerate() {
                 let start = filled + 4 * i;
@@ -327,6 +331,8 @@ fn bounded_neon(lanes: &[u64; 17], eta: i32, a: &mut [i32; 256], count: &mut usi
             }
 
             filled += usize::from(ACCEPTED[pattern]);
+
+            wipe_unless_optimized!(vector_lanes(&mut wide));
         }
 
         step += 1;

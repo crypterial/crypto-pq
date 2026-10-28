@@ -7,6 +7,9 @@
 use core::arch::aarch64::*;
 
 use super::memory::{load_i32, load_u8, store_i32, store_u8};
+#[cfg(not(crypto_pq_optimized))]
+use super::vector_lanes;
+use crate::wipe::wipe_unless_optimized;
 
 #[allow(unsafe_code)]
 pub(crate) fn add(out: &mut [i32; 256], a: &[i32; 256], b: &[i32; 256], q: i32) -> bool {
@@ -206,26 +209,37 @@ fn encode_w1_neon(out: &mut [u8; 128], w: &[i32; 256], gamma2: i32, q: i32) {
                 unreachable!("sixteen values are four groups of four")
             };
 
-            let high = [a, b, c, d]
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut high = [a, b, c, d]
                 .map(|values| vreinterpretq_u32_s32(decompose(load_i32(values), gamma2, q).0));
 
-            let halves = [
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut halves = [
                 vcombine_u16(vmovn_u32(high[0]), vmovn_u32(high[1])),
                 vcombine_u16(vmovn_u32(high[2]), vmovn_u32(high[3])),
             ];
 
             *narrow = vcombine_u8(vmovn_u16(halves[0]), vmovn_u16(halves[1]));
+
+            wipe_unless_optimized!(vector_lanes(&mut halves));
+
+            wipe_unless_optimized!(vector_lanes(&mut high));
         }
 
         // Each 16-bit lane holds a value x in its low byte and y in its high byte, both below 16:
         // x | y << 4 is the lane ORed with itself shifted right by four, in its low byte.
-        let pairs = narrow.map(|bytes| {
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut pairs = narrow.map(|bytes| {
             let lanes = vreinterpretq_u16_u8(bytes);
 
             vmovn_u16(vorrq_u16(lanes, vshrq_n_u16::<4>(lanes)))
         });
 
         store_u8(vcombine_u8(pairs[0], pairs[1]), out);
+
+        wipe_unless_optimized!(vector_lanes(&mut pairs));
+
+        wipe_unless_optimized!(vector_lanes(&mut narrow));
     }
 }
 

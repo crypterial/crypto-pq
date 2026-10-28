@@ -24,7 +24,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 ))]
 use crate::keccak::{self, ROUND_CONSTANTS};
 use crate::sha2::{K256, K512, last_bytes};
-use crate::wipe::wipe;
+use crate::wipe::{wipe, wipe_unless_optimized};
 
 #[cfg(feature = "frodokem")]
 mod aes;
@@ -1044,6 +1044,62 @@ fn vector64(low: u64, high: u64) -> uint64x2_t {
     vcombine_u64(vcreate_u64(low), vcreate_u64(high))
 }
 
+/// Values made of vectors alone, which take any bits: seen as words, they can be wiped.
+///
+/// # Safety
+///
+/// The type has no padding, which vector_lanes relies on.
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe trait Vectors: Copy {}
+
+// SAFETY: one vector of eight or sixteen bytes of any bits, here and in the next six.
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl Vectors for uint8x8_t {}
+
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl Vectors for uint8x16_t {}
+
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl Vectors for uint16x8_t {}
+
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl Vectors for int16x8_t {}
+
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl Vectors for uint32x4_t {}
+
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl Vectors for int32x4_t {}
+
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl Vectors for uint64x2_t {}
+
+// SAFETY: an array has no padding between its elements.
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl<T: Vectors, const N: usize> Vectors for [T; N] {}
+
+// The 64-bit lanes of such a value, for wiping it.
+#[cfg(not(crypto_pq_optimized))]
+#[inline(always)]
+#[allow(unsafe_code)]
+fn vector_lanes<T: Vectors>(value: &mut T) -> &mut [u64] {
+    // SAFETY: a Vectors value is 16-byte vectors with no padding between them, so it is
+    // size_of::<T>() / 8 lanes aligned for u64, and every bit pattern is a value of either type;
+    // the borrow of value covers the result.
+    unsafe {
+        core::slice::from_raw_parts_mut(core::ptr::from_mut(value).cast(), size_of::<T>() / 8)
+    }
+}
+
 // One SHA-256 computation in flight: the state as the instructions hold it, a, b, c, d and e, f,
 // g, h from the lowest lane up, and the sixteen schedule words that are live.
 #[derive(Clone, Copy)]
@@ -1052,6 +1108,13 @@ struct Stream {
     efgh: uint32x4_t,
     m: [uint32x4_t; 4],
 }
+
+// SAFETY: six vectors in 96 bytes, which the assertion checks, leave no room for padding.
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl Vectors for Stream {}
+
+const _: () = assert!(size_of::<Stream>() == size_of::<[uint32x4_t; 6]>());
 
 // Four rounds of every stream with schedule vector J, which then advances by sixteen words if
 // more are needed. Each stream depends only on itself, so the streams' chains of SHA256H and
@@ -1192,7 +1255,8 @@ fn first_quarter(
 #[target_feature(enable = "sha2")]
 #[inline]
 fn rounds256<const N: usize>(streams: &mut [Stream; N]) {
-    let start = *streams;
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut start = *streams;
 
     for (sixteen, k) in K256.as_chunks::<16>().0.iter().enumerate() {
         let k = k.as_chunks::<4>().0;
@@ -1213,6 +1277,8 @@ fn rounds256<const N: usize>(streams: &mut [Stream; N]) {
 
         stream.efgh = vaddq_u32(stream.efgh, start.efgh);
     }
+
+    wipe_unless_optimized!(vector_lanes(&mut start));
 }
 
 // One block of a lone stream, given as its schedule words, with the state in registers.
@@ -1386,6 +1452,8 @@ fn tail256(
     }
 
     block256(abcd, efgh, words256(last), k);
+
+    wipe_unless_optimized!(vector_lanes(&mut last));
 }
 
 #[target_feature(enable = "sha2")]
@@ -1419,7 +1487,8 @@ fn key_block<const N: usize>(key: &[u8], pad: u8) -> [uint8x16_t; N] {
 }
 
 // A tag from the byte vectors of a final state: whole vectors, and for HMAC-SHA-224 twelve bytes
-// of the last one, written without a copy in memory.
+// of the last one, written without a copy in memory. The last vector is named by a constant
+// index: picked at run time, the vectors went to the stack, where nothing wiped them.
 #[target_feature(enable = "neon")]
 #[inline]
 fn store_tag<const N: usize>(vectors: [uint8x16_t; N], tag: &mut [u8]) {
@@ -1429,13 +1498,17 @@ fn store_tag<const N: usize>(vectors: [uint8x16_t; N], tag: &mut [u8]) {
         store_u8(vector, chunk);
     }
 
-    if let Some(&vector) = vectors.get(chunks.len()) {
-        let halves = vreinterpretq_u64_u8(vector);
+    if !rest.is_empty() {
+        assert!(chunks.len() == N - 1, "only the last vector is partial");
 
-        let halves = [vgetq_lane_u64::<0>(halves), vgetq_lane_u64::<1>(halves)];
+        let halves = vreinterpretq_u64_u8(vectors[N - 1]);
+
+        let (low, high) = (vgetq_lane_u64::<0>(halves), vgetq_lane_u64::<1>(halves));
 
         for (i, byte) in rest.iter_mut().enumerate() {
-            *byte = (halves[i / 8] >> (8 * (i % 8))) as u8;
+            let half = if i < 8 { low } else { high };
+
+            *byte = (half >> (8 * (i % 8))) as u8;
         }
     }
 }
@@ -1530,6 +1603,7 @@ fn hmac256_keyed_sha2(keyed: &[[u32; 8]; 2], data: &[u8], tag: &mut [u8]) {
 // A state and a block of bytes as a stream.
 #[target_feature(enable = "neon")]
 #[inline]
+#[cfg_attr(crypto_pq_optimized, allow(clippy::let_and_return))]
 fn stream(state: &[u32; 8], block: &[u8; 64]) -> Stream {
     let [abcd, efgh] = state.as_chunks::<4>().0 else {
         unreachable!("eight words are two groups of four")
@@ -1541,11 +1615,15 @@ fn stream(state: &[u32; 8], block: &[u8; 64]) -> Stream {
         *m = vreinterpretq_u32_u8(vrev32q_u8(load_u8(bytes)));
     }
 
-    Stream {
+    let stream = Stream {
         abcd: load_u32(abcd),
         efgh: load_u32(efgh),
         m,
-    }
+    };
+
+    wipe_unless_optimized!(vector_lanes(&mut m));
+
+    stream
 }
 
 #[target_feature(enable = "sha2")]
@@ -1566,11 +1644,14 @@ fn compress256_pair_sha2(states: &mut [[u32; 8]; 2], blocks: &[[u8; 64]; 2]) {
 
         store_u32(stream.efgh, efgh);
     }
+
+    wipe_unless_optimized!(vector_lanes(&mut streams));
 }
 
 // Lane `lane` of the word-major states and schedule of compress256_lanes.
 #[target_feature(enable = "neon")]
 #[inline]
+#[cfg_attr(crypto_pq_optimized, allow(clippy::let_and_return))]
 fn gather<const LANES: usize>(
     states: &[[u32; LANES]; 8],
     w: &[[u32; LANES]; 16],
@@ -1591,11 +1672,15 @@ fn gather<const LANES: usize>(
         ]);
     }
 
-    Stream {
+    let stream = Stream {
         abcd: vector32(&[word(0), word(1), word(2), word(3)]),
         efgh: vector32(&[word(4), word(5), word(6), word(7)]),
         m,
-    }
+    };
+
+    wipe_unless_optimized!(vector_lanes(&mut m));
+
+    stream
 }
 
 #[target_feature(enable = "neon")]
@@ -1625,6 +1710,8 @@ fn compress256_lanes_sha2<const LANES: usize>(
 
         scatter(states, &streams[1], lane + 1);
 
+        wipe_unless_optimized!(vector_lanes(&mut streams));
+
         lane += 2;
     }
 
@@ -1634,6 +1721,8 @@ fn compress256_lanes_sha2<const LANES: usize>(
         rounds256(&mut streams);
 
         scatter(states, &streams[0], lane);
+
+        wipe_unless_optimized!(vector_lanes(&mut streams));
     }
 }
 
@@ -1721,7 +1810,8 @@ fn double_rounds<const N: usize, const J: usize>(
 #[target_feature(enable = "sha3")]
 #[inline]
 fn rounds512<const N: usize>(s: &mut [[uint64x2_t; 4]; N], m: &mut [[uint64x2_t; 8]; N]) {
-    let start = *s;
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut start = *s;
 
     for (sixteen, k) in K512.as_chunks::<16>().0.iter().enumerate() {
         let k = k.as_chunks::<2>().0;
@@ -1750,6 +1840,8 @@ fn rounds512<const N: usize>(s: &mut [[uint64x2_t; 4]; N], m: &mut [[uint64x2_t;
             *pair = vaddq_u64(*pair, *start);
         }
     }
+
+    wipe_unless_optimized!(vector_lanes(&mut start));
 }
 
 // The blocks and then the more blocks, as one stream, as in compress256_sha2.
@@ -1762,6 +1854,8 @@ fn compress512_sha3(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128
     }
 
     store512(&s[0], state);
+
+    wipe_unless_optimized!(vector_lanes(&mut s));
 }
 
 #[target_feature(enable = "sha3")]
@@ -1776,6 +1870,8 @@ fn compress512_pair_sha3(states: &mut [[u64; 8]; 2], blocks: &[[u8; 128]; 2]) {
     store512(&s[0], &mut states[0]);
 
     store512(&s[1], &mut states[1]);
+
+    wipe_unless_optimized!(vector_lanes(&mut s));
 }
 
 // tail256 for SHA-512, with the whole blocks and the padding in one loop around one compression:
@@ -1821,6 +1917,10 @@ fn tail512(s: &mut [[uint64x2_t; 4]; 1], data: &[u8], bits: u128) {
 
         rounds512(s, &mut [m]);
     }
+
+    wipe_unless_optimized!(vector_lanes(&mut first));
+
+    wipe_unless_optimized!(vector_lanes(&mut second));
 }
 
 #[target_feature(enable = "sha3")]
@@ -1830,6 +1930,8 @@ fn finish512_sha3(state: &mut [u64; 8], data: &[u8], bits: u128) {
     tail512(&mut s, data, bits);
 
     store512(&s[0], state);
+
+    wipe_unless_optimized!(vector_lanes(&mut s));
 }
 
 // hmac256_sha2 for HMAC-SHA-512, or HMAC-SHA-384 for a 48-byte tag.
@@ -1854,6 +1956,10 @@ fn hmac512_sha3(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
     after_keys512(&mut states, data, tag);
 
     wipe(states.as_flattened_mut());
+
+    wipe_unless_optimized!(vector_lanes(&mut inner));
+
+    wipe_unless_optimized!(vector_lanes(&mut outer));
 }
 
 // after_keys256 for SHA-512 and SHA-384.
@@ -2151,6 +2257,8 @@ fn permute2_sha3(first: &mut [u64; 25], second: &mut [u64; 25]) {
 
         *y = vgetq_lane_u64::<1>(*lane);
     }
+
+    wipe_unless_optimized!(vector_lanes(&mut a));
 }
 
 // A state alone in the low halves of the vectors, by plain loads, which LLVM pairs: loads that fill
@@ -2167,6 +2275,7 @@ fn permute2_sha3(first: &mut [u64; 25], second: &mut [u64; 25]) {
 ))]
 #[target_feature(enable = "neon")]
 #[inline]
+#[cfg_attr(crypto_pq_optimized, allow(clippy::let_and_return))]
 fn load_low(state: &[u64; 25]) -> [uint64x2_t; 25] {
     let mut a = [vdupq_n_u64(0); 25];
 
@@ -2174,7 +2283,11 @@ fn load_low(state: &[u64; 25]) -> [uint64x2_t; 25] {
         *lane = vcombine_u64(vcreate_u64(*x), vcreate_u64(0));
     }
 
-    a
+    let low = a;
+
+    wipe_unless_optimized!(vector_lanes(&mut a));
+
+    low
 }
 
 // One state with the instructions of a pair.
@@ -2196,6 +2309,8 @@ fn permute1_sha3(state: &mut [u64; 25]) {
     for (x, lane) in state.iter_mut().zip(&a) {
         *x = vgetq_lane_u64::<0>(*lane);
     }
+
+    wipe_unless_optimized!(vector_lanes(&mut a));
 }
 
 // A pair in the vector pipes and the third state in the scalar ones, their rounds alternating.
@@ -2235,6 +2350,12 @@ fn permute3_sha3(first: &mut [u64; 25], second: &mut [u64; 25], third: &mut [u64
 
         *y = vgetq_lane_u64::<1>(*lane);
     }
+
+    wipe_unless_optimized!(vector_lanes(&mut a));
+
+    wipe_unless_optimized!(&mut e);
+
+    wipe_unless_optimized!(&mut parities);
 }
 
 #[cfg(any(
@@ -2279,6 +2400,10 @@ fn permute3_lazy(first: &mut [u64; 25], second: &mut [u64; 25], third: &mut [u64
 
         *y = vgetq_lane_u64::<1>(*lane);
     }
+
+    wipe_unless_optimized!(vector_lanes(&mut a));
+
+    wipe_unless_optimized!(&mut v);
 }
 
 #[cfg(any(
@@ -2303,6 +2428,8 @@ fn absorb_sha3<const RATE: usize>(state: &mut [u64; 25], blocks: &[[u8; RATE]]) 
     for (x, lane) in state.iter_mut().zip(&a) {
         *x = vgetq_lane_u64::<0>(*lane);
     }
+
+    wipe_unless_optimized!(vector_lanes(&mut a));
 }
 
 // The lanes of a block XORed into the first lanes of the state, in assembly that keeps the state
@@ -2576,6 +2703,8 @@ fn digest_sha3_from<const RATE: usize, const START: bool>(
     }
 
     wipe(&mut last);
+
+    wipe_unless_optimized!(vector_lanes(&mut a));
 }
 
 #[cfg(test)]

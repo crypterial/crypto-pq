@@ -17,10 +17,12 @@
 
 use core::arch::x86_64::*;
 
-use super::memory::{load128, load256, store128, store256};
+#[cfg(not(crypto_pq_optimized))]
+use super::memory::words_of;
+use super::memory::{clear, load128, load256, store128, store256};
 use crate::blake2::SIGMA;
 use crate::sha2::{IV_256, IV_512};
-use crate::wipe::wipe;
+use crate::wipe::{wipe, wipe_unless_optimized};
 
 instruction!(swap32, __m256i, ymm_reg, "vpshufd {out}, {x}, 0xB1", x);
 
@@ -265,6 +267,8 @@ fn compress64(h: &mut [__m256i; 2], m: &[__m256i; 8], counter: u128, last: bool)
     h[0] = _mm256_xor_si256(h[0], _mm256_xor_si256(row[0], row[2]));
 
     h[1] = _mm256_xor_si256(h[1], _mm256_xor_si256(row[1], row[3]));
+
+    wipe_unless_optimized!(words_of(&mut row));
 }
 
 #[target_feature(enable = "avx2")]
@@ -279,34 +283,34 @@ pub(super) fn blake2b_avx2(
         unreachable!("eight words are two groups of four")
     };
 
+    // compress64 stays out of line, so the state and the message words, the MAC's key block
+    // among them, go to it through memory, where they are cleared at the end.
     let mut state = [load256(low), load256(high)];
+
+    let mut m = [_mm256_setzero_si256(); 8];
 
     let mut counter = counter;
 
     if let Some(first) = first {
         counter = counter.wrapping_add(128);
 
-        compress64(
-            &mut state,
-            &pairs64(first.as_chunks().0.try_into().expect("eight")),
-            counter,
-            false,
-        );
+        m = pairs64(first.as_chunks().0.try_into().expect("eight"));
+
+        compress64(&mut state, &m, counter, false);
     }
 
     for block in blocks {
         counter = counter.wrapping_add(128);
 
-        compress64(&mut state, &block64(block), counter, false);
+        m = block64(block);
+
+        compress64(&mut state, &m, counter, false);
     }
 
-    if let Some((m, total)) = last {
-        compress64(
-            &mut state,
-            &pairs64(m.as_chunks().0.try_into().expect("eight")),
-            total,
-            true,
-        );
+    if let Some((last, total)) = last {
+        m = pairs64(last.as_chunks().0.try_into().expect("eight"));
+
+        compress64(&mut state, &m, total, true);
     }
 
     let [low, high] = h.as_chunks_mut::<4>().0 else {
@@ -316,6 +320,10 @@ pub(super) fn blake2b_avx2(
     store256(state[0], low);
 
     store256(state[1], high);
+
+    clear(&mut state, _mm256_setzero_si256());
+
+    clear(&mut m, _mm256_setzero_si256());
 }
 
 // The digest of data from the chaining value h, out.len() bytes: the whole blocks straight from
@@ -360,6 +368,9 @@ pub(super) fn blake2b_digest_avx2(h: &[u64; 8], data: &[u8], out: &mut [u8]) {
     wipe(&mut last);
 
     wipe(&mut bytes);
+
+    // compress64 takes the state through memory.
+    clear(&mut state, _mm256_setzero_si256());
 }
 
 // BLAKE2b with SSE4.1, for x86-64 CPUs without AVX2: each row in two vectors of two words, the
@@ -400,7 +411,8 @@ fn half64_sse<const R1: u32, const R2: u32>(
     s: &[usize; 16],
     first: usize,
 ) {
-    let m = [
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut m = [
         pair(m[s[first]], m[s[first + 2]]),
         pair(m[s[first + 4]], m[s[first + 6]]),
     ];
@@ -414,6 +426,8 @@ fn half64_sse<const R1: u32, const R2: u32>(
 
         row[1][i] = rotate64_sse::<R2>(_mm_xor_si128(row[1][i], row[2][i]));
     }
+
+    wipe_unless_optimized!(words_of(&mut m));
 }
 
 // Rows b, c and d rotated left by one, two and three words: (v5, v6, v7, v4) from b, and so on.
@@ -503,6 +517,8 @@ fn compress64_sse(h: &mut [__m128i; 4], m: &[u64; 16], counter: u128, last: bool
     for (i, h) in h.iter_mut().enumerate() {
         *h = _mm_xor_si128(*h, _mm_xor_si128(row[i / 2][i % 2], row[2 + i / 2][i % 2]));
     }
+
+    wipe_unless_optimized!(words_of(&mut row));
 }
 
 #[target_feature(enable = "sse2,ssse3,sse4.1")]
@@ -528,14 +544,22 @@ pub(super) fn blake2b_sse41(
         compress64_sse(&mut state, first, counter, false);
     }
 
-    for block in blocks {
-        let words = block.as_chunks::<8>().0;
+    // The message words, which compress64_sse takes through memory too; cleared after the last block.
+    // A message of one block has none here.
+    if !blocks.is_empty() {
+        let mut m = [0u64; 16];
 
-        let m: [u64; 16] = core::array::from_fn(|i| u64::from_le_bytes(words[i]));
+        for block in blocks {
+            for (word, bytes) in m.iter_mut().zip(block.as_chunks::<8>().0) {
+                *word = u64::from_le_bytes(*bytes);
+            }
 
-        counter = counter.wrapping_add(128);
+            counter = counter.wrapping_add(128);
 
-        compress64_sse(&mut state, &m, counter, false);
+            compress64_sse(&mut state, &m, counter, false);
+        }
+
+        wipe(&mut m);
     }
 
     if let Some((m, total)) = last {
@@ -548,6 +572,9 @@ pub(super) fn blake2b_sse41(
             _mm_extract_epi64::<1>(vector) as u64,
         ];
     }
+
+    // compress64_sse takes the state through memory.
+    clear(&mut state, _mm_setzero_si128());
 }
 
 // Right rotations of each 32-bit lane: by 16 and 8 a byte shuffle, by 12 and 7 two shifts and an
@@ -670,6 +697,8 @@ fn compress32(h: &mut [__m128i; 2], m: &[u32; 16], counter: u64, last: bool) {
     h[0] = _mm_xor_si128(h[0], _mm_xor_si128(row[0], row[2]));
 
     h[1] = _mm_xor_si128(h[1], _mm_xor_si128(row[1], row[3]));
+
+    wipe_unless_optimized!(words_of(&mut row));
 }
 
 #[target_feature(enable = "sse2,ssse3,sse4.1")]
@@ -690,14 +719,22 @@ pub(super) fn blake2s_sse41(
         compress32(&mut state, first, counter, false);
     }
 
-    for block in blocks {
-        let words = block.as_chunks::<4>().0;
+    // The message words, which compress32 takes through memory too; cleared after the last block.
+    // A message of one block has none here.
+    if !blocks.is_empty() {
+        let mut m = [0u32; 16];
 
-        let m: [u32; 16] = core::array::from_fn(|i| u32::from_le_bytes(words[i]));
+        for block in blocks {
+            for (word, bytes) in m.iter_mut().zip(block.as_chunks::<4>().0) {
+                *word = u32::from_le_bytes(*bytes);
+            }
 
-        counter = counter.wrapping_add(64);
+            counter = counter.wrapping_add(64);
 
-        compress32(&mut state, &m, counter, false);
+            compress32(&mut state, &m, counter, false);
+        }
+
+        wipe(&mut m);
     }
 
     if let Some((m, total)) = last {
@@ -712,6 +749,9 @@ pub(super) fn blake2s_sse41(
             _mm_extract_epi32::<3>(vector) as u32,
         ];
     }
+
+    // compress32 takes the state through memory.
+    clear(&mut state, _mm_setzero_si128());
 }
 
 // BLAKE2s with AVX2's three-operand forms. The message words of each half step are broadcast
@@ -887,6 +927,8 @@ fn compress32_avx2(h: &mut [__m128i; 2], block: &[u8; 64], counter: u64, last: b
     h[0] = _mm_xor_si128(h[0], _mm_xor_si128(row[0], row[2]));
 
     h[1] = _mm_xor_si128(h[1], _mm_xor_si128(row[1], row[3]));
+
+    wipe_unless_optimized!(words_of(&mut row));
 }
 
 // The first out.len() bytes of the chaining value in state, a whole digest straight from the
@@ -963,6 +1005,8 @@ pub(super) fn blake2s_avx2(
     if let Some(out) = out {
         output32(&state, out);
 
+        wipe_unless_optimized!(words_of(&mut state));
+
         return;
     }
 
@@ -973,6 +1017,8 @@ pub(super) fn blake2s_avx2(
     store128(state[0], low);
 
     store128(state[1], high);
+
+    wipe_unless_optimized!(words_of(&mut state));
 }
 
 // The bytes of sixteen words, for the blocks that come as words.

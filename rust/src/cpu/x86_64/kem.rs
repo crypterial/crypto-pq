@@ -16,8 +16,11 @@
 use core::arch::x86_64::*;
 
 use super::ACCEPTED;
+#[cfg(not(crypto_pq_optimized))]
+use super::memory::words_of;
 use super::memory::{load128, load256, store128, store256};
 use crate::cpu::Field16;
+use crate::wipe::wipe_unless_optimized;
 
 // A factor and its product by q^-1, the same in every lane or one per lane.
 #[derive(Clone, Copy)]
@@ -167,6 +170,8 @@ pub(super) fn ntt(f: &mut [u16; 256], field: &Field16) {
         for (m, x) in x.iter().enumerate() {
             store256(*x, &mut vectors[j + 2 * m]);
         }
+
+        wipe_unless_optimized!(words_of(&mut x));
     }
 
     for (b, block) in vectors.as_chunks_mut::<2>().0.iter_mut().enumerate() {
@@ -313,6 +318,8 @@ fn inverse_layers(
         for (m, x) in x.iter().enumerate() {
             store256(freeze(montgomery(*x, scale, q), q), &mut vectors[j + 2 * m]);
         }
+
+        wipe_unless_optimized!(words_of(&mut x));
     }
 }
 
@@ -804,10 +811,12 @@ pub(super) fn compress(
             let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
 
             for (i, out) in out.as_chunks_mut::<32>().0.iter_mut().enumerate() {
-                let v: [__m256i; 4] =
+                #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+                let mut v: [__m256i; 4] =
                     core::array::from_fn(|j| compressed::<4>(f, e, message, 4 * i + j, q));
 
-                let pairs = [
+                #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+                let mut pairs = [
                     _mm256_maddubs_epi16(_mm256_packus_epi16(v[0], v[1]), nibbles),
                     _mm256_maddubs_epi16(_mm256_packus_epi16(v[2], v[3]), nibbles),
                 ];
@@ -815,6 +824,10 @@ pub(super) fn compress(
                 let bytes = _mm256_packus_epi16(pairs[0], pairs[1]);
 
                 store256(_mm256_permutevar8x32_epi32(bytes, order), out);
+
+                wipe_unless_optimized!(words_of(&mut v));
+
+                wipe_unless_optimized!(words_of(&mut pairs));
             }
         }
         5 => compress_packed::<5>(f, e, message, q, out),
@@ -1041,7 +1054,8 @@ fn noise_canonical(x: __m256i, q: __m256i) -> __m256i {
 #[target_feature(enable = "avx2")]
 #[inline]
 fn store_noise(bytes: [__m256i; 2], q: __m256i, out: &mut [[u16; 16]]) {
-    let halves = [
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut halves = [
         _mm256_castsi256_si128(bytes[0]),
         _mm256_castsi256_si128(bytes[1]),
         _mm256_extracti128_si256::<1>(bytes[0]),
@@ -1051,6 +1065,8 @@ fn store_noise(bytes: [__m256i; 2], q: __m256i, out: &mut [[u16; 16]]) {
     for (half, out) in halves.into_iter().zip(out) {
         store256(noise_canonical(_mm256_cvtepi8_epi16(half), q), out);
     }
+
+    wipe_unless_optimized!(words_of(&mut halves));
 }
 
 // ML-KEM's centered binomial distribution (FIPS 203, Algorithm 8) from the PRF output, given as
@@ -1090,12 +1106,15 @@ pub(super) fn binomial(eta: usize, lanes: &[u64], q: u16, out: &mut [u16; 256]) 
 
             let odd = difference(_mm256_and_si256(_mm256_srli_epi16::<4>(sums), nibble));
 
-            let bytes = [
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut bytes = [
                 _mm256_unpacklo_epi8(even, odd),
                 _mm256_unpackhi_epi8(even, odd),
             ];
 
             store_noise(bytes, q, out);
+
+            wipe_unless_optimized!(words_of(&mut bytes));
         }
 
         return;
@@ -1145,7 +1164,8 @@ pub(super) fn binomial(eta: usize, lanes: &[u64], q: u16, out: &mut [u16; 256]) 
             _mm256_and_si256(_mm256_srli_epi16::<3>(fields), three),
         );
 
-        let halves = [
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut halves = [
             _mm256_castsi256_si128(coefficients),
             _mm256_extracti128_si256::<1>(coefficients),
         ];
@@ -1153,6 +1173,8 @@ pub(super) fn binomial(eta: usize, lanes: &[u64], q: u16, out: &mut [u16; 256]) 
         for (half, out) in halves.into_iter().zip(out) {
             store256(noise_canonical(_mm256_cvtepi8_epi16(half), q), out);
         }
+
+        wipe_unless_optimized!(words_of(&mut halves));
     }
 
     crate::wipe::wipe(&mut bytes);

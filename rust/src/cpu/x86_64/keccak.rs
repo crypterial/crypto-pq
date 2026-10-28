@@ -19,10 +19,12 @@ use core::arch::x86_64::*;
 
 use core::mem::MaybeUninit;
 
+#[cfg(not(crypto_pq_optimized))]
+use super::memory::words_of;
 use super::memory::{load256, store_vector_at, store128, store256};
 use crate::keccak::{self, ROUND_CONSTANTS};
-use crate::sha2::last_bytes;
-use crate::wipe::wipe;
+use crate::sha2::{last_bytes, low_bytes};
+use crate::wipe::{wipe, wipe_unless_optimized};
 
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -139,21 +141,16 @@ fn round4(a: &[__m256i; 25], e: &mut [__m256i; 25], parities: &mut [__m256i; 5],
     *parities = next;
 }
 
-// The lanes of up to four states in vectors, missing states as zeros, and their column parities.
+// The lanes of up to four states into vectors, missing states as zeros. Inlined, it writes the
+// caller's array in place: returned by value, the array was built in a temporary and copied.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn gather4(states: &[&mut [u64; 25]]) -> ([__m256i; 25], [__m256i; 5]) {
+fn gather4(states: &[&mut [u64; 25]], a: &mut [__m256i; 25]) {
     let lane = |state: usize, i: usize| states.get(state).map_or(0, |s| s[i] as i64);
-
-    let mut a = [_mm256_setzero_si256(); 25];
 
     for (i, vector) in a.iter_mut().enumerate() {
         *vector = _mm256_set_epi64x(lane(3, i), lane(2, i), lane(1, i), lane(0, i));
     }
-
-    let parities = parities4(&a);
-
-    (a, parities)
 }
 
 #[target_feature(enable = "avx2")]
@@ -291,7 +288,8 @@ pub(super) fn scatter4_transposed(a: &[__m256i; 25], states: &mut [&mut [u64; 25
         }
     }
 
-    let last = [
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut last = [
         _mm256_extract_epi64::<0>(a[24]),
         _mm256_extract_epi64::<1>(a[24]),
         _mm256_extract_epi64::<2>(a[24]),
@@ -301,12 +299,20 @@ pub(super) fn scatter4_transposed(a: &[__m256i; 25], states: &mut [&mut [u64; 25
     for (state, word) in states.iter_mut().zip(last) {
         state[24] = word as u64;
     }
+
+    wipe_unless_optimized!(&mut last);
 }
 
-// One to four states; missing ones run as zeros in their lanes and are not stored.
+// One to four states; missing ones run as zeros in their lanes and are not stored. a and e are
+// indexed with constants only, and gather4 and scatter4 are inlined, so that at opt-level 3 they
+// are register values (D-76), spilled as the rounds need; below it they are wiped.
 #[target_feature(enable = "avx2")]
 pub(super) fn permute4_avx2(states: &mut [&mut [u64; 25]]) {
-    let (mut a, mut parities) = gather4(states);
+    let mut a = [_mm256_setzero_si256(); 25];
+
+    gather4(states, &mut a);
+
+    let mut parities = parities4(&a);
 
     let mut e = [_mm256_setzero_si256(); 25];
 
@@ -317,6 +323,12 @@ pub(super) fn permute4_avx2(states: &mut [&mut [u64; 25]]) {
     }
 
     scatter4(&a, states);
+
+    wipe_unless_optimized!(words_of(&mut a));
+
+    wipe_unless_optimized!(words_of(&mut e));
+
+    wipe_unless_optimized!(words_of(&mut parities));
 }
 
 // The 24 rounds on four states that stay in vectors. Inlined, they unroll in full: 2.20 ms for the
@@ -456,13 +468,22 @@ fn xor3(x: __m256i, y: __m256i, z: __m256i) -> __m256i {
 #[target_feature(enable = "avx512f,avx512vl")]
 #[inline]
 fn round_avx512<const THETA3: bool>(a: &mut [__m256i; 25], constant: u64) {
-    let c: [__m256i; 5] =
-        core::array::from_fn(|x| xor3(xor3(a[x], a[x + 5], a[x + 10]), a[x + 15], a[x + 20]));
+    // Array expressions, which build each array where it lives: core::array::from_fn built them
+    // in a temporary and copied it, below opt-level 3 with 512-bit moves.
+    let parity = |x: usize| xor3(xor3(a[x], a[x + 5], a[x + 10]), a[x + 15], a[x + 20]);
 
-    let rotated: [__m256i; 5] = core::array::from_fn(|x| _mm256_rol_epi64::<1>(c[x]));
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut c = [parity(0), parity(1), parity(2), parity(3), parity(4)];
 
-    let d: [__m256i; 5] =
-        core::array::from_fn(|x| _mm256_xor_si256(c[(x + 4) % 5], rotated[(x + 1) % 5]));
+    let rotate = |x: usize| _mm256_rol_epi64::<1>(c[x]);
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut rotated = [rotate(0), rotate(1), rotate(2), rotate(3), rotate(4)];
+
+    let column = |x: usize| _mm256_xor_si256(c[(x + 4) % 5], rotated[(x + 1) % 5]);
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut d = [column(0), column(1), column(2), column(3), column(4)];
 
     // Theta's value of column x is c[x - 1] ^ rotated[x + 1].
     macro_rules! theta {
@@ -481,7 +502,8 @@ fn round_avx512<const THETA3: bool>(a: &mut [__m256i; 25], constant: u64) {
         };
     }
 
-    let b = [
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut b = [
         theta!(0),
         lane!(6, 44),
         lane!(12, 43),
@@ -519,6 +541,27 @@ fn round_avx512<const THETA3: bool>(a: &mut [__m256i; 25], constant: u64) {
     }
 
     a[0] = _mm256_xor_si256(a[0], _mm256_set1_epi64x(constant as i64));
+
+    #[cfg(not(crypto_pq_optimized))]
+    wipe_baseline(words_of(&mut c));
+
+    #[cfg(not(crypto_pq_optimized))]
+    wipe_baseline(words_of(&mut rotated));
+
+    #[cfg(not(crypto_pq_optimized))]
+    wipe_baseline(words_of(&mut d));
+
+    #[cfg(not(crypto_pq_optimized))]
+    wipe_baseline(words_of(&mut b));
+}
+
+// wipe_unless_optimized for the AVX-512 kernels: a call that is never inlined keeps the crate's
+// baseline target features, while wipe inlined into a kernel that enables AVX-512F has its zero
+// stores widened to 512-bit ones, which this code never uses.
+#[cfg(not(crypto_pq_optimized))]
+#[inline(never)]
+fn wipe_baseline(words: &mut [u64]) {
+    wipe(words);
 }
 
 // The 24 rounds, two per loop step with PAIRS, which LLVM schedules across the pair. The
@@ -543,7 +586,7 @@ fn rounds_avx512<const THETA3: bool, const PAIRS: bool>(a: &mut [__m256i; 25]) {
 #[target_feature(enable = "avx2")]
 #[inline]
 fn parities4(a: &[__m256i; 25]) -> [__m256i; 5] {
-    core::array::from_fn(|x| {
+    let column = |x: usize| {
         _mm256_xor_si256(
             _mm256_xor_si256(
                 _mm256_xor_si256(a[x], a[x + 5]),
@@ -551,7 +594,11 @@ fn parities4(a: &[__m256i; 25]) -> [__m256i; 5] {
             ),
             a[x + 20],
         )
-    })
+    };
+
+    // An array expression, which builds the array in place: core::array::from_fn built it in a
+    // temporary and copied it below opt-level 3.
+    [column(0), column(1), column(2), column(3), column(4)]
 }
 
 // The 24 rounds on four states in memory, one vector per lane, out of line: inlined, the rounds
@@ -730,6 +777,10 @@ fn rounds(state: &mut [u64; 25]) {
 
         keccak::round(&e, state, &mut parities, constants[1]);
     }
+
+    wipe_unless_optimized!(&mut e);
+
+    wipe_unless_optimized!(&mut parities);
 }
 
 #[target_feature(enable = "bmi1,bmi2")]
@@ -834,9 +885,7 @@ macro_rules! digest {
             }
 
             if !partial.is_empty() {
-                let lane = state[squeezed].to_le_bytes();
-
-                partial.copy_from_slice(&lane[..partial.len()]);
+                low_bytes(state[squeezed], partial);
             }
 
             wipe(&mut state);

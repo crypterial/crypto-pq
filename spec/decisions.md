@@ -540,3 +540,29 @@ names one of them: VXORPS, VMOVAPS and VMOVUPS as XORPS, MOVAPS and MOVUPS, and 
 opcodes 10h and 11h as VMOVSD (the MOVSD of the list, opcode A5h, is the string move). No other
 floating-point instruction counts. Rationale: none of these instructions does arithmetic or reads
 its operands as numbers.
+
+## Decision D-76
+
+A secret array is a stack buffer in the sense of [14.5](14-security.md#145-wiping) item 1 when the
+code addresses its memory: it is indexed with a run-time value, passed by reference to a function
+that is not inlined, or copied with a run-time length. Such an array is wiped before the function
+returns, on every path. Scratch that a block, a round or a chain step uses belongs to the operation,
+which wipes it once at the end. An array of vector or general registers that the code indexes only
+with constants holds register values, as a scalar variable does, also where it is larger than the
+register file, such as a Keccak state, and a value that the compiler spills is a copy that the
+compiler makes ([14.5](14-security.md#145-wiping) item 3). At opt-level 3, where the compiler
+unrolls the loops over such an array and keeps it in registers, the implementation does not wipe it,
+since the address that a wipe takes would keep the array in memory for its whole life and store
+every secret value in it. At the other opt-levels, 2 among them, the compiler keeps some of these
+arrays in memory, and the implementation wipes them before the function returns, as it does a stack
+buffer. A build script reads the opt-level of the profile and of RUSTFLAGS, the last one named
+winning; a build in which it reads none wipes, and an opt-level given to the compiler by another
+way, such as `cargo rustc --`, is not seen. Secret values are not moved by value: a function that
+computes a secret writes it into storage that its owner wipes. An object that the API returns by
+value, such as a keyed MAC, is moved once into the caller's storage; that copy, as the caller's own
+moves of the object, is a copy that the compiler makes. A function that holds a secret buffer does
+not panic: the lengths it depends on are checked before any secret is computed, so the wipe at its
+end runs on every path that returns. Rationale: keeping such an array in memory, with or without a
+wipe, cost 2 to 7 percent of SHA-3, ML-KEM and SLH-DSA in the measurements for this decision, and
+the spill slots remain either way; a wipe per block of the four-state Keccak cost about 3 percent of
+SHA3-256, where one wipe per operation cost nothing measurable.

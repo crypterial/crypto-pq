@@ -49,10 +49,15 @@
    module, so that the compiler cannot turn them into branches; `==` on secret slices is forbidden;
    slice bounds checks depend only on public lengths; `match` and `if` never take a secret
    operand.
-3. Wiping: volatile writes followed by a compiler fence. `SecretBytes` and the private key types wipe on
-   drop. Secret stack arrays are wiped before the function returns, on every path. Moves of secret
-   values are avoided (secrets live behind a heap pointer or are wiped after the move); copies that the
-   compiler makes in registers or spill slots cannot be controlled, which the documentation states.
+3. Wiping: zero stores that the compiler cannot remove, then a compiler fence. A buffer is filled with
+   zeros and its address goes into an empty assembly block; up to eight values of at most a word, and
+   targets without stable inline assembly, get volatile writes. `SecretBytes` and the private key
+   types wipe on drop. Secret stack arrays are wiped before the function returns, on every path, and
+   arrays that the compiler keeps in registers at opt-level 3 are wiped at the other levels, which
+   the build script detects ([D-76](../decisions.md#decision-d-76)). Moves of secret values are
+   avoided (secrets live behind a heap pointer, or a function writes them into storage that its owner
+   wipes); copies that the compiler makes in registers or spill slots cannot be controlled, which the
+   documentation states.
 4. DIT: a guard object sets DIT and restores it on drop ([14.2](../14-security.md#142-data-independent-timing-dit)); Rust threads are operating-system
    threads.
 5. Entropy without `std`: `getrandom(2)` (Linux, Android, FreeBSD, NetBSD, DragonFly, illumos,

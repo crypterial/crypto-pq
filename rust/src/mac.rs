@@ -368,7 +368,9 @@ impl MacAlgorithm {
         Ok(self.create_unchecked(key))
     }
 
-    // create for a key of an accepted length, under the caller's DIT guard.
+    // create for a key of an accepted length, under the caller's DIT guard. Every engine starts
+    // from public state and takes the key inside the MAC, so that no keyed engine is built apart
+    // and moved into it.
     pub(crate) fn create_unchecked(&self, key: &[u8]) -> Mac {
         let engine = match &self.kind {
             #[cfg(any(
@@ -377,24 +379,50 @@ impl MacAlgorithm {
                 feature = "lms",
                 feature = "xmss"
             ))]
-            MacKind::Hmac(hash) => keyed_hmac(hash, key),
+            MacKind::Hmac(hash) => unkeyed_hmac(hash),
             #[cfg(feature = "sha3")]
             MacKind::Kmac { prefix, rate, xof } => MacEngine::Kmac {
-                engine: sp800_185::keyed(prefix, *rate, key),
+                engine: sp800_185::unkeyed(prefix, *rate),
                 xof: *xof,
             },
             #[cfg(feature = "blake2")]
-            MacKind::Blake2b(h) => MacEngine::Blake2b(blake2::Engine::keyed(h, key)),
+            MacKind::Blake2b(h) => MacEngine::Blake2b(blake2::Engine::new(h)),
             #[cfg(feature = "blake2")]
-            MacKind::Blake2s(h) => MacEngine::Blake2s(blake2::Engine::keyed(h, key)),
+            MacKind::Blake2s(h) => MacEngine::Blake2s(blake2::Engine::new(h)),
             #[cfg(feature = "blake3")]
-            MacKind::Blake3 => MacEngine::Blake3(Box::new(blake3::Hasher::keyed(key))),
+            MacKind::Blake3 => MacEngine::Blake3(Box::new(blake3::Hasher::hash())),
         };
 
-        Mac {
+        let mut mac = Mac {
             engine,
             size: self.size,
+        };
+
+        match (&self.kind, &mut mac.engine) {
+            #[cfg(any(
+                feature = "hmac",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
+            (MacKind::Hmac(hash), MacEngine::Hmac { inner, outer, .. }) => {
+                key_hmac(hash, key, inner, outer);
+            }
+            #[cfg(feature = "sha3")]
+            (MacKind::Kmac { rate, .. }, MacEngine::Kmac { engine, .. }) => {
+                sp800_185::key(engine, *rate, key);
+            }
+            #[cfg(feature = "blake2")]
+            (MacKind::Blake2b(_), MacEngine::Blake2b(engine)) => engine.key(key),
+            #[cfg(feature = "blake2")]
+            (MacKind::Blake2s(_), MacEngine::Blake2s(engine)) => engine.key(key),
+            #[cfg(feature = "blake3")]
+            (MacKind::Blake3, MacEngine::Blake3(hasher)) => hasher.key(key),
+            #[allow(unreachable_patterns)]
+            _ => {}
         }
+
+        mac
     }
 
     /// Whether `tag` is the tag of `data` under `key`, compared in constant time over the whole
@@ -409,7 +437,9 @@ impl MacAlgorithm {
 
         #[cfg(feature = "sha3")]
         if let MacKind::Kmac { prefix, rate, xof } = &self.kind {
-            let mut engine = sp800_185::keyed(prefix, *rate, key);
+            let mut engine = sp800_185::unkeyed(prefix, *rate);
+
+            sp800_185::key(&mut engine, *rate, key);
 
             engine.update(data);
 
@@ -468,53 +498,49 @@ impl MacAlgorithm {
     }
 }
 
-// HMAC's inner engine after the inner key block, and the state after the outer one.
+// HMAC's engines before the key: the inner one at the hash's initial state.
 #[cfg(any(
     feature = "hmac",
     feature = "slh-dsa",
     feature = "lms",
     feature = "xmss"
 ))]
-fn keyed_hmac(hash: &HashAlgorithm, key: &[u8]) -> MacEngine {
+fn unkeyed_hmac(hash: &HashAlgorithm) -> MacEngine {
+    match hash.kind {
+        Kind::Sha256(iv) => MacEngine::Hmac {
+            inner: Engine::Sha256(Sha256::new(iv)),
+            outer: Outer::Sha256([0; 8]),
+            digest_size: hash.digest_size,
+        },
+        Kind::Sha512(iv) => MacEngine::Hmac {
+            inner: Engine::Sha512(Sha512::new(iv)),
+            outer: Outer::Sha512([0; 8]),
+            digest_size: hash.digest_size,
+        },
+        _ => unreachable!("HMAC is defined here over SHA-2 only"),
+    }
+}
+
+// The engines of unkeyed_hmac keyed in place: the inner one after the inner key block, and in
+// outer the state after the outer one.
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+fn key_hmac(hash: &HashAlgorithm, key: &[u8], inner: &mut Engine, outer: &mut Outer) {
     let mut hashed = [0; 64];
 
     let key = block_key(hash, key, &mut hashed);
 
-    let (inner, outer) = match hash.kind {
-        Kind::Sha256(iv) => {
-            let mut keyed = sha2::keyed256(iv, key);
-
-            let engines = (
-                Engine::Sha256(Sha256::resume(keyed[0], 64)),
-                Outer::Sha256(keyed[1]),
-            );
-
-            wipe(keyed.as_flattened_mut());
-
-            engines
-        }
-        Kind::Sha512(iv) => {
-            let mut keyed = sha2::keyed512(iv, key);
-
-            let engines = (
-                Engine::Sha512(Sha512::resume(keyed[0], 128)),
-                Outer::Sha512(keyed[1]),
-            );
-
-            wipe(keyed.as_flattened_mut());
-
-            engines
-        }
-        _ => unreachable!("HMAC is defined here over SHA-2 only"),
-    };
+    match (inner, outer) {
+        (Engine::Sha256(inner), Outer::Sha256(outer)) => inner.key_hmac(key, outer),
+        (Engine::Sha512(inner), Outer::Sha512(outer)) => inner.key_hmac(key, outer),
+        _ => unreachable!("an HMAC engine over SHA-2"),
+    }
 
     wipe(&mut hashed);
-
-    MacEngine::Hmac {
-        inner,
-        outer,
-        digest_size: hash.digest_size,
-    }
 }
 
 // HMAC's state after the outer key block, wiped when dropped.

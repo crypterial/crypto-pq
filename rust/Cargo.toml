@@ -10,7 +10,7 @@ repository = "https://github.com/crypterial/crypto-pq"
 readme = "README.md"
 keywords = ["post-quantum", "cryptography", "ml-kem", "ml-dsa", "slh-dsa"]
 categories = ["cryptography", "no-std"]
-include = ["/src", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
+include = ["/src", "/build.rs", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
 
 # Every algorithm family is a feature, and the default set enables them all. hazmat, the
 # deterministic operations for test vectors that take the caller's seeds and randomness, is opt-in.
@@ -182,4 +182,4 @@ opt-level = 3
 # RUSTFLAGS="--cfg crypto_pq_portable" leaves out every CPU-specific instruction, and
 # RUSTFLAGS="--cfg crypto_pq_sse41" caps x86-64 at SSE4.1 and AES-NI.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(crypto_pq_ct)', 'cfg(crypto_pq_portable)', 'cfg(crypto_pq_sse41)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(crypto_pq_ct)', 'cfg(crypto_pq_portable)', 'cfg(crypto_pq_sse41)', 'cfg(crypto_pq_optimized)'] }

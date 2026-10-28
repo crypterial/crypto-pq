@@ -14,8 +14,11 @@
 use core::arch::aarch64::*;
 
 use super::memory::{load_u8, load_u32, store_u8};
+#[cfg(not(crypto_pq_optimized))]
+use super::vector_lanes;
 use crate::blake3::{Many, PERMUTATION};
 use crate::sha2::IV_256;
+use crate::wipe::wipe_unless_optimized;
 
 // TBL indices that rotate each 32-bit lane right by 8 bits.
 const ROTATE8: [u8; 16] = [1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12];
@@ -125,6 +128,8 @@ fn rounds<const GROUPS: usize>(
             }
         }
     }
+
+    wipe_unless_optimized!(vector_lanes(&mut m));
 }
 
 // The 4x4 transposition of 32-bit words: word i of vector j to word j of vector i.
@@ -232,7 +237,8 @@ fn hash_group<const GROUPS: usize>(
 
         let flags = vdupq_n_u32(flags);
 
-        let m: [[uint32x4_t; 16]; GROUPS] = core::array::from_fn(|g| {
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut m: [[uint32x4_t; 16]; GROUPS] = core::array::from_fn(|g| {
             message(core::array::from_fn(|l| &input[lane(g, l) * blocks + b]))
         });
 
@@ -250,6 +256,10 @@ fn hash_group<const GROUPS: usize>(
                 h[g][i] = veorq_u32(v[g][i], v[g][i + 8]);
             }
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut v));
+
+        wipe_unless_optimized!(vector_lanes(&mut m));
     }
 
     for (g, h) in h.iter().enumerate() {
@@ -271,6 +281,8 @@ fn hash_group<const GROUPS: usize>(
             store_u8(vreinterpretq_u8_u32(*high), &mut pieces[1]);
         }
     }
+
+    wipe_unless_optimized!(vector_lanes(&mut h));
 }
 
 // hash_many for out.len() inputs: eight at a time, a last six or seven as eight, three to five as
@@ -316,9 +328,11 @@ fn xof_group<const GROUPS: usize>(
 ) {
     let table = Rotate8(load_u8(&ROTATE8));
 
-    let m = [block.map(|w| vdupq_n_u32(w)); GROUPS];
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut m = [block.map(|w| vdupq_n_u32(w)); GROUPS];
 
-    let h = cv.map(|w| vdupq_n_u32(w));
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut h = cv.map(|w| vdupq_n_u32(w));
 
     let iv = IV_256.map(|w| vdupq_n_u32(w));
 
@@ -348,7 +362,8 @@ fn xof_group<const GROUPS: usize>(
     rounds(&mut v, &m, table);
 
     for (g, v) in v.iter().enumerate() {
-        let words: [uint32x4_t; 16] = core::array::from_fn(|i| {
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut words: [uint32x4_t; 16] = core::array::from_fn(|i| {
             if i < 8 {
                 veorq_u32(v[i], v[i + 8])
             } else {
@@ -370,7 +385,15 @@ fn xof_group<const GROUPS: usize>(
                 store_u8(vreinterpretq_u8_u32(*column), &mut pieces[quarter]);
             }
         }
+
+        wipe_unless_optimized!(vector_lanes(&mut words));
     }
+
+    wipe_unless_optimized!(vector_lanes(&mut v));
+
+    wipe_unless_optimized!(vector_lanes(&mut h));
+
+    wipe_unless_optimized!(vector_lanes(&mut m));
 }
 
 // Output blocks counter, counter + 1, ... of the root into out, eight and then four at a time;

@@ -17,7 +17,7 @@ use crate::keys::{SeedChoice, decode_seed_choice, encode_expanded, encode_seed};
 use crate::mlkem::{self, Parameters};
 use crate::once::{OnceBox, Shared};
 use crate::rng::random_bytes;
-use crate::wipe::{SecretBytes, wipe};
+use crate::wipe::SecretBytes;
 
 const ML_KEM_SEED_SIZE: usize = 64;
 
@@ -378,15 +378,6 @@ impl KemAlgorithm {
             Scheme::Frodo(_) => None,
         }
     }
-    // The first shared_secret_size() bytes of a secret that the schemes compute in 32 bytes,
-    // which are wiped.
-    fn shared_secret(&self, mut secret: [u8; 32]) -> SecretBytes {
-        let out = SecretBytes::concat(&[&secret[..self.shared_secret_size()]]);
-
-        wipe(&mut secret);
-
-        out
-    }
 }
 
 impl fmt::Debug for KemAlgorithm {
@@ -501,19 +492,26 @@ impl KemPublicKey {
     pub(crate) fn encapsulate_with(&self, randomness: &[u8]) -> Encapsulation {
         let _dit = Dit::new();
 
-        let (shared_secret, ciphertext) = match &self.public {
+        // The schemes write the shared secret here, so that no copy of it is moved.
+        let mut shared_secret = SecretBytes::zeroed(self.algorithm.shared_secret_size());
+
+        let ciphertext = match &self.public {
             #[cfg(feature = "ml-kem")]
             PublicPart::MlKem(part) => {
-                mlkem::encaps_internal(part.form(), randomness, &part.params)
+                mlkem::encaps_internal(part.form(), randomness, &part.params, &mut shared_secret)
             }
             #[cfg(feature = "frodokem")]
-            PublicPart::Frodo(part) => {
-                frodokem::encapsulate(&part.params, &part.key, part.pkh(), randomness)
-            }
+            PublicPart::Frodo(part) => frodokem::encapsulate(
+                &part.params,
+                &part.key,
+                part.pkh(),
+                randomness,
+                &mut shared_secret,
+            ),
         };
 
         Encapsulation {
-            shared_secret: self.algorithm.shared_secret(shared_secret),
+            shared_secret,
             ciphertext,
         }
     }
@@ -604,7 +602,9 @@ impl KemPrivateKey {
             return Err(Error::InvalidLength);
         }
 
-        let shared_secret = match &self.secret {
+        let mut shared_secret = SecretBytes::zeroed(self.algorithm.shared_secret_size());
+
+        match &self.secret {
             #[cfg(feature = "ml-kem")]
             Secret::MlKem {
                 public,
@@ -616,13 +616,22 @@ impl KemPrivateKey {
 
                 let decoded = decoded.get_or_init(|| mlkem::DecapsulationKey::new(dk, p));
 
-                mlkem::decaps_internal(public.form(), decoded, dk, ciphertext, p)
+                mlkem::decaps_internal(
+                    public.form(),
+                    decoded,
+                    dk,
+                    ciphertext,
+                    p,
+                    &mut shared_secret,
+                );
             }
             #[cfg(feature = "frodokem")]
-            Secret::Frodo { public, sk } => frodokem::decapsulate(&public.params, sk, ciphertext),
-        };
+            Secret::Frodo { public, sk } => {
+                frodokem::decapsulate(&public.params, sk, ciphertext, &mut shared_secret);
+            }
+        }
 
-        Ok(self.algorithm.shared_secret(shared_secret))
+        Ok(shared_secret)
     }
 
     // The pairwise consistency test (SPEC 14.4): a fresh encapsulation decapsulates to its shared

@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use crate::ct::declassify;
 use crate::keccak::{self, MAX_SPONGES, Sponges};
 use crate::mac::{HMAC_SHA_256, HMAC_SHA_512};
-use crate::primitives::{sha256, sha512, shake256};
+use crate::primitives::{sha256, sha512, shake256, shake256_into};
 use crate::sha2::{IV_256, IV_512, Sha256, Sha512};
 use crate::wipe::{SecretBytes, wipe};
 
@@ -226,7 +226,11 @@ impl<'a> Hashes<'a> {
     }
 
     fn shake(&self, adrs: &Adrs, parts: &[&[u8]]) -> Node {
-        let mut engine = shake256(&[self.pk_seed, adrs]);
+        let mut engine = shake256();
+
+        engine.update(self.pk_seed);
+
+        engine.update(adrs);
 
         for part in parts {
             engine.update(part);
@@ -303,12 +307,15 @@ impl<'a> Hashes<'a> {
 
     // F with SHAKE256 for the lanes that have an input, a group of sponges side by side: PK.seed,
     // ADRS and the input fill less than one block. Kept out of f_lanes: inlined there, its sponges
-    // made the SHA-2 path of f_lanes about 1% slower.
+    // made the SHA-2 path of f_lanes about 1% slower. The lanes without input keep their nodes.
     #[inline(never)]
-    fn shake_lanes(&self, adrs: &[Adrs; LANES], inputs: [Option<&[u8]>; LANES]) -> [Node; LANES] {
+    fn shake_lanes(
+        &self,
+        adrs: &[Adrs; LANES],
+        inputs: [Option<&[u8]>; LANES],
+        nodes: &mut [Node; LANES],
+    ) {
         let n = self.n;
-
-        let mut nodes = [[0; 32]; LANES];
 
         let mut active = [0; LANES];
 
@@ -341,15 +348,19 @@ impl<'a> Hashes<'a> {
                 sponges.read(i, &mut nodes[lane][..n]);
             }
         }
-
-        nodes
     }
 
-    // F of up to LANES independent inputs, side by side. A lane without input gives nothing
-    // useful; with SHAKE it costs nothing.
-    fn f_lanes(&self, adrs: &[Adrs; LANES], inputs: [Option<&[u8]>; LANES]) -> [Node; LANES] {
+    // F of up to LANES independent inputs, side by side, into nodes, which the caller owns and
+    // wipes where they are secret. A lane without input gives nothing useful; with SHAKE it costs
+    // nothing.
+    fn f_lanes(
+        &self,
+        adrs: &[Adrs; LANES],
+        inputs: [Option<&[u8]>; LANES],
+        nodes: &mut [Node; LANES],
+    ) {
         let Some(states) = &self.sha2 else {
-            return self.shake_lanes(adrs, inputs);
+            return self.shake_lanes(adrs, inputs, nodes);
         };
 
         let n = self.n;
@@ -385,27 +396,23 @@ impl<'a> Hashes<'a> {
             blocks[15][lane] = ((64 + 22 + n) * 8) as u32;
         }
 
-        let mut digests = states.small.finish_words(&mut blocks);
+        let mut digests = [[0; LANES]; 8];
 
-        let nodes = core::array::from_fn(|lane| {
-            let mut node = [0; 32];
+        states.small.finish_words(&mut blocks, &mut digests);
 
+        for (lane, node) in nodes.iter_mut().enumerate() {
             for (bytes, state) in node[..n].as_chunks_mut::<4>().0.iter_mut().zip(&digests) {
                 *bytes = state[lane].to_be_bytes();
             }
-
-            node
-        });
+        }
 
         wipe(blocks.as_flattened_mut());
 
         wipe(digests.as_flattened_mut());
-
-        nodes
     }
 
-    fn prf_lanes(&self, adrs: &[Adrs; LANES]) -> [Node; LANES] {
-        self.f_lanes(adrs, [Some(self.sk_seed); LANES])
+    fn prf_lanes(&self, adrs: &[Adrs; LANES], nodes: &mut [Node; LANES]) {
+        self.f_lanes(adrs, [Some(self.sk_seed); LANES], nodes);
     }
 
     // H of two n-byte nodes: one block of SHA-256 or SHA-512 after the seed.
@@ -419,14 +426,22 @@ impl<'a> Hashes<'a> {
 
                 let length = Self::message(&mut message, adrs, &[left, right]);
 
-                self.truncate(&large.finish_message(&mut message, length))
+                let mut digest = [0; 64];
+
+                large.finish_message(&mut message, length, &mut digest);
+
+                self.truncate(&digest)
             }
             Some(Sha2States { small, large: None }) => {
                 let mut message = [[0; 64]];
 
                 let length = Self::message(&mut message[0], adrs, &[left, right]);
 
-                let [digest] = small.finish_lanes(&mut message, length);
+                let mut digests = [[0; 32]; 1];
+
+                small.finish_lanes(&mut message, length, &mut digests);
+
+                let [digest] = digests;
 
                 self.truncate(&digest)
             }
@@ -550,6 +565,12 @@ impl Context<'_> {
     ) {
         let (n, len, count) = (self.p.n, self.p.len(), leaves.len());
 
+        // The chain values, secret below the ends: each step reads one buffer and writes the
+        // other, and both are wiped at the end.
+        let mut buffers = [[[0; 32]; LANES]; 2];
+
+        let [mut x, mut y] = buffers.each_mut();
+
         for start in (0..count * len).step_by(LANES) {
             let jobs: [Option<(usize, usize)>; LANES] = core::array::from_fn(|lane| {
                 let job = start + lane;
@@ -573,16 +594,17 @@ impl Context<'_> {
                 })
             };
 
-            let mut x = self.hashes.f_lanes(
+            self.hashes.f_lanes(
                 &address(WOTS_PRF),
                 jobs.map(|job| job.map(|_| self.hashes.sk_seed)),
+                x,
             );
 
             let mut chain_adrs = address(WOTS_HASH);
 
             for j in 0..W {
                 if let Some((signer_leaf, digits, signature)) = &mut signer {
-                    for (job, value) in jobs.iter().zip(&x) {
+                    for (job, value) in jobs.iter().zip(x.iter()) {
                         if let Some((leaf, chain)) = *job
                             && leaf == *signer_leaf
                             && digits[chain] == j
@@ -602,15 +624,19 @@ impl Context<'_> {
 
                 let inputs = core::array::from_fn(|lane| jobs[lane].map(|_| &x[lane][..n]));
 
-                x = self.hashes.f_lanes(&chain_adrs, inputs);
+                self.hashes.f_lanes(&chain_adrs, inputs, y);
+
+                core::mem::swap(&mut x, &mut y);
             }
 
-            for (job, value) in jobs.iter().zip(&x) {
+            for (job, value) in jobs.iter().zip(x.iter()) {
                 if let Some((leaf, chain)) = *job {
                     keys[(leaf * len + chain) * n..][..n].copy_from_slice(&value[..n]);
                 }
             }
         }
+
+        wipe(buffers.as_flattened_mut().as_flattened_mut());
 
         for (leaf, node) in leaves.iter_mut().enumerate() {
             let mut pk_adrs = *adrs;
@@ -698,6 +724,9 @@ impl Context<'_> {
 
         let mut lanes: [Option<(usize, u32)>; LANES] = [None; LANES];
 
+        // The values are public: they start from a signature.
+        let mut outputs = [[0; 32]; LANES];
+
         loop {
             for lane in lanes.iter_mut().filter(|lane| lane.is_none()) {
                 *lane = pending.next().map(|i| (i, starts[i]));
@@ -721,11 +750,11 @@ impl Context<'_> {
 
             let inputs = lanes.map(|lane| lane.map(|(i, _)| &values[i][..n]));
 
-            let outputs = self.hashes.f_lanes(&lane_adrs, inputs);
+            self.hashes.f_lanes(&lane_adrs, inputs, &mut outputs);
 
-            for (lane, output) in lanes.iter_mut().zip(outputs) {
+            for (lane, output) in lanes.iter_mut().zip(&outputs) {
                 if let Some((i, j)) = lane {
-                    values[*i] = output;
+                    values[*i] = *output;
 
                     *j += 1;
 
@@ -915,6 +944,9 @@ impl Context<'_> {
 
         let mut roots = [0u8; MAX_K * 32];
 
+        // The FORS secret values, which are wiped at the end, and the leaves over them.
+        let (mut secrets, mut leaves) = ([[0; 32]; LANES], [[0; 32]; LANES]);
+
         let trees = out
             .chunks_exact_mut((a + 1) * n)
             .zip(roots.chunks_exact_mut(n));
@@ -941,7 +973,7 @@ impl Context<'_> {
                     secret_adrs
                 });
 
-                let mut secrets = self.hashes.prf_lanes(&secret_adrs);
+                self.hashes.prf_lanes(&secret_adrs, &mut secrets);
 
                 if (first..first + LANES as u32).contains(&selected) {
                     secret.copy_from_slice(&secrets[(selected - first) as usize][..n]);
@@ -957,15 +989,13 @@ impl Context<'_> {
                     leaf_adrs
                 });
 
-                let leaves = self.hashes.f_lanes(
+                self.hashes.f_lanes(
                     &leaf_adrs,
                     core::array::from_fn(|lane| Some(&secrets[lane][..n])),
+                    &mut leaves,
                 );
 
-                // The FORS secret values of the leaves that are not revealed.
-                wipe(secrets.as_flattened_mut());
-
-                for (lane, leaf) in leaves.into_iter().enumerate() {
+                for (lane, &leaf) in leaves.iter().enumerate() {
                     tree.push(first + lane as u32, leaf, |height, index, left, right| {
                         let mut node_adrs = *adrs;
 
@@ -983,6 +1013,8 @@ impl Context<'_> {
 
             root.copy_from_slice(&tree.root()[..n]);
         }
+
+        wipe(secrets.as_flattened_mut());
 
         self.fors_public_key(adrs, &roots[..self.p.k * n])
     }
@@ -1012,10 +1044,12 @@ impl Context<'_> {
             let inputs =
                 core::array::from_fn(|lane| chunks.get(first + lane).map(|chunk| &chunk[..n]));
 
-            let outputs = self.hashes.f_lanes(&lane_adrs, inputs);
+            let mut outputs = [[0; 32]; LANES];
 
-            for (leaf, output) in leaves[first..k].iter_mut().zip(outputs) {
-                *leaf = output;
+            self.hashes.f_lanes(&lane_adrs, inputs, &mut outputs);
+
+            for (leaf, output) in leaves[first..k].iter_mut().zip(&outputs) {
+                *leaf = *output;
             }
         }
 
@@ -1059,7 +1093,7 @@ fn h_msg(p: &Parameters, r: &[u8], pk_seed: &[u8], pk_root: &[u8], message: &[&[
     parts.extend_from_slice(message);
 
     if p.shake {
-        shake256(&parts).read(&mut digest);
+        shake256_into(&parts, &mut digest);
     } else if p.n == 16 {
         mgf1(&[r, pk_seed, &sha256(&parts)], &mut digest, false);
     } else {
@@ -1073,7 +1107,11 @@ fn prf_msg(p: &Parameters, sk_prf: &[u8], opt_rand: &[u8], message: &[&[u8]]) ->
     let mut out = [0; 32];
 
     if p.shake {
-        let mut engine = shake256(&[sk_prf, opt_rand]);
+        let mut engine = shake256();
+
+        engine.update(sk_prf);
+
+        engine.update(opt_rand);
 
         for part in message {
             engine.update(part);

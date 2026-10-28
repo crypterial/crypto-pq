@@ -929,15 +929,24 @@ impl Hasher {
         Self::new(IV_256, 0)
     }
 
-    // keyed_hash under a key of exactly KEY bytes, which the callers check.
-    pub(crate) fn keyed(key: &[u8]) -> Self {
-        let mut k = key_words(key.try_into().expect("a 32-byte key"));
+    // Turns a new hash() hasher into keyed_hash under a key of exactly KEY bytes, which the
+    // callers check. The key words go into the hasher where it lives, so that no keyed copy of it
+    // is moved.
+    pub(crate) fn key(&mut self, key: &[u8]) {
+        let key: &[u8; KEY] = key.try_into().expect("a 32-byte key");
 
-        let hasher = Self::new(k, KEYED_HASH);
+        for ((word, cv), bytes) in self
+            .key
+            .iter_mut()
+            .zip(&mut self.cv)
+            .zip(key.as_chunks::<4>().0)
+        {
+            *word = u32::from_le_bytes(*bytes);
 
-        wipe(&mut k);
+            *cv = *word;
+        }
 
-        hasher
+        self.flags = KEYED_HASH;
     }
 
     pub(crate) fn update(&mut self, mut data: &[u8]) {
@@ -1682,7 +1691,13 @@ mod tests {
 
                 let mut hasher = match flags {
                     0 => Hasher::hash(),
-                    KEYED_HASH => Hasher::keyed(&key_bytes),
+                    KEYED_HASH => {
+                        let mut hasher = Hasher::hash();
+
+                        hasher.key(&key_bytes);
+
+                        hasher
+                    }
                     _ => Hasher::new(derived, DERIVE_KEY_MATERIAL),
                 };
 

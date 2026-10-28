@@ -7,8 +7,8 @@
 // of the code, so the instructions, their order and their operands never depend on the data.
 
 use crate::keccak::{ROTATIONS, ROUND_CONSTANTS};
-use crate::sha2::last_bytes;
-use crate::wipe::wipe;
+use crate::sha2::{last_bytes, low_bytes};
+use crate::wipe::{wipe, wipe_unless_optimized};
 
 pub(super) const BLOCK: usize = 8;
 
@@ -163,6 +163,8 @@ pub(super) fn permute(state: &mut [u64; 25]) {
     }
 
     *state = v;
+
+    wipe_unless_optimized!(&mut v);
 }
 
 fn xor_block<const RATE: usize>(state: &mut [u64; 25], block: &[u8; RATE]) {
@@ -232,9 +234,7 @@ pub(super) fn digest<const RATE: usize>(
     }
 
     if !partial.is_empty() {
-        let lane = state[squeezed].to_le_bytes();
-
-        partial.copy_from_slice(&lane[..partial.len()]);
+        low_bytes(state[squeezed], partial);
     }
 
     wipe(&mut state);

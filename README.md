@@ -250,17 +250,20 @@ specification state them in full.
 
 ## Design
 
-- **Pure Rust, no dependencies.** Every algorithm is implemented in the crate, with no build
-  script. `unsafe` code is confined to the entropy source, memory wiping, one-time initialization,
-  the CPU modules and the valgrind client requests of the constant-time check build, and each block
-  states why it is sound.
+- **Pure Rust, no dependencies.** Every algorithm is implemented in the crate. The build script
+  only reads the optimization level, to choose which arrays to wipe
+  ([D-76](spec/decisions.md#decision-d-76)). `unsafe` code is confined to the entropy source, memory
+  wiping, one-time initialization, the CPU modules and the valgrind client requests of the
+  constant-time check build, and each block states why it is sound.
 - **Constant-time code.** Code that handles secret data has no branch or memory access that depends
   on a secret. CI checks this with valgrind memcheck, every secret marked as undefined, on x86-64
   and ARM64, in the default and the portable build.
 - **Data-independent timing.** On ARM64 CPUs with FEAT_DIT, the asymmetric secret operations run
   with DIT set; `enable_data_independent_timing()` extends it to MACs and KDFs.
 - **Wiping.** Private keys and `SecretBytes`, the type of every secret output, wipe their memory
-  when dropped, with writes that the compiler cannot remove. Neither implements `Clone`.
+  when dropped, with writes that the compiler cannot remove. Neither implements `Clone`. Secret
+  buffers on the stack are wiped before each function returns; copies that the compiler makes in
+  registers and spill slots cannot be wiped.
 - **Self-tests.** Key generation runs a pairwise consistency test by default, private-key import
   validates the key, and every stateful signature is verified before it is released.
 - **Randomness** comes only from the operating system: `getrandom` on Linux, Android, FreeBSD,
