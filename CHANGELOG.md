@@ -21,6 +21,10 @@ Implements specification 1.1 (draft).
   SLH-DSA, stay in the kernel's vector layout from one block to the next. The kernels serve SHA-3,
   SHAKE, cSHAKE, KMAC and the Keccak of ML-KEM, ML-DSA, SLH-DSA and FrodoKEM. The AVX2 kernels and
   the portable code stay their twins, and outputs are unchanged.
+- Keccak-f[1600] on x86-64 CPUs with AVX2 and without AVX-512: the kernel for up to four states
+  loads and stores the lanes of each state four at a time, with transposes, in place of loops over
+  the states, so that its state array is indexed with constants only and, at opt-level 3, stays in
+  registers. Outputs are unchanged.
 - ML-KEM key generation hashes the encapsulation key beside the sampling of the matrix: each run
   of entries leaves a slot in the group of sponges for the blocks of the key that the rows of t
   encoded so far complete. ML-KEM-1024 with groups of four samples a first row of four and then
@@ -48,6 +52,9 @@ Implements specification 1.1 (draft).
   from zero and one for the precomputed state of cSHAKE and KMAC, so that LLVM no longer joins the
   two starts through a copy of the state on the stack. A state permuted or absorbed alone is loaded
   into one half of each vector register by plain loads. Outputs are unchanged.
+- BLAKE3-MAC on x86-64 with AVX2 or SSE4.1: a message of at most 64 bytes is hashed by the one-block
+  kernel from the key's bytes, so that no converted copy of the key is stored. Outputs are
+  unchanged.
 - The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
   intrinsics are stable.
 
@@ -58,8 +65,9 @@ Implements specification 1.1 (draft).
   schedules, the buffers of the Keccak, BLAKE2, BLAKE3 and NTT kernels on x86-64, copies of partial
   lanes and words, the base64 buffers of private keys, and the chain values of SLH-DSA, LMS and
   XMSS. Secrets that were returned by value, such as KEM shared secrets, ML-KEM and ML-DSA
-  polynomials and the key states of one-shot HMAC, HKDF and KMAC, are written into storage that
-  their owner wipes. ML-DSA signing wipes w1 and the products with s1 and s2 of rejected attempts.
+  polynomials, the chaining values and outputs of BLAKE3, and the key states of one-shot HMAC,
+  HKDF and KMAC, are written into storage that their owner wipes. ML-DSA signing wipes w1 and the
+  products with s1 and s2 of rejected attempts.
   In builds below opt-level 3, where the compiler keeps the register arrays of the kernels in
   memory, those arrays are wiped too; a build script reads the opt-level for this. Copies that the
   compiler makes in registers and spill slots remain, as the documentation states. Outputs are
