@@ -998,6 +998,12 @@ pub(crate) fn blake3_digest1(_: &[u32; 8], _: u32, _: &[u8], _: &mut [u8]) -> bo
 
 #[inline(always)]
 #[cfg(feature = "blake3")]
+pub(crate) fn blake3_digest1_bytes(_: &[u8; 32], _: u32, _: &[u8], _: &mut [u8]) -> bool {
+    false
+}
+
+#[inline(always)]
+#[cfg(feature = "blake3")]
 pub(crate) fn blake3_compress(
     _: &[u32; 8],
     _: &[u8; 64],

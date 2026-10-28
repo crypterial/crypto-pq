@@ -1365,6 +1365,12 @@ pub(crate) fn digest(data: &[u8], out: &mut [u8]) {
 pub(crate) fn keyed_hash(key: &[u8], data: &[u8], out: &mut [u8]) {
     let key = key.try_into().expect("a 32-byte key");
 
+    let root = KEYED_HASH | CHUNK_START | CHUNK_END | ROOT;
+
+    if data.len() <= BLOCK && out.len() <= 32 && cpu::blake3_digest1_bytes(key, root, data, out) {
+        return;
+    }
+
     let mut k = [0; 8];
 
     key_words(key, &mut k);
@@ -1645,6 +1651,23 @@ mod tests {
                 );
 
                 assert_eq!(digest[..size], expected[..size], "digest case {n}");
+
+                let mut from_bytes = [0; 32];
+
+                let ran = cpu::blake3_digest1_bytes(
+                    &cv_bytes(&key),
+                    flags,
+                    &block[..length as usize],
+                    &mut from_bytes[..size],
+                );
+
+                assert!(ran, "digest from bytes case {n}");
+
+                assert_eq!(
+                    from_bytes[..size],
+                    expected[..size],
+                    "digest from bytes case {n}"
+                );
 
                 accelerated[4] += 1;
             }

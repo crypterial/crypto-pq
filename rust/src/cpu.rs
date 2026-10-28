@@ -254,6 +254,12 @@ mod arch {
 
     #[inline(always)]
     #[cfg(feature = "blake3")]
+    pub(crate) fn blake3_digest1_bytes(_: &[u8; 32], _: u32, _: &[u8], _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "blake3")]
     pub(crate) fn blake3_xof(
         _: &[u32; 8],
         _: &[u32; 16],
@@ -552,7 +558,9 @@ pub(crate) use arch::{ascon, ascon_digest};
 pub(crate) use arch::{blake2b, blake2b_digest, blake2s, blake2s_digest, blake2s_mac};
 
 #[cfg(feature = "blake3")]
-pub(crate) use arch::{blake3_blocks, blake3_compress, blake3_digest1, blake3_many, blake3_xof};
+pub(crate) use arch::{
+    blake3_blocks, blake3_compress, blake3_digest1, blake3_digest1_bytes, blake3_many, blake3_xof,
+};
 
 #[cfg(any(
     feature = "ml-kem",

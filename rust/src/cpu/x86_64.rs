@@ -214,6 +214,13 @@ fn has(feature: u32) -> bool {
     found & feature != 0
 }
 
+// As has, without the first call's detection: false until another kernel's dispatch has run it.
+// With no call in it, a caller whose other paths are out of line needs no saved registers.
+#[inline]
+fn known(feature: u32) -> bool {
+    usable(feature) && (guaranteed(feature) || FEATURES.load(Ordering::Relaxed) & feature != 0)
+}
+
 // CPUID leaf 1 ECX: SSSE3 bit 9, SSE4.1 bit 19, AES bit 25, OSXSAVE bit 27, AVX
 // bit 28; leaf 7 EBX: BMI1 bit 3, AVX2 bit 5, BMI2 bit 8, AVX-512F bit 16, SHA bit 29, AVX-512VL
 // bit 31. Newer Rust makes __cpuid safe, hence unused_unsafe.
@@ -544,9 +551,35 @@ pub(crate) fn blake3_blocks(
 
 // A one-block digest of at most 32 bytes in one call.
 #[inline]
-#[allow(unsafe_code)]
 #[cfg(feature = "blake3")]
 pub(crate) fn blake3_digest1(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) -> bool {
+    digest1(has, key, flags, data, out)
+}
+
+// As blake3_digest1, from the key's bytes, which the kernels load as the words, so that the caller
+// stores no converted copy of a secret key. It does not detect the CPU (known): until another
+// dispatch has, it returns false and the caller takes its blake3_digest1 path.
+#[inline]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_digest1_bytes(
+    key: &[u8; 32],
+    flags: u32,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
+    digest1(known, key, flags, data, out)
+}
+
+#[inline(always)]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake3")]
+fn digest1<K: memory::Plain, const N: usize>(
+    has: fn(u32) -> bool,
+    key: &[K; N],
+    flags: u32,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
     if has(AVX2) {
         // SAFETY: as in blake3_many.
         unsafe { blake3::digest1_avx2(key, flags, data, out) };

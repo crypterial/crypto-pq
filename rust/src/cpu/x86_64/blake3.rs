@@ -23,7 +23,7 @@ use core::arch::x86_64::*;
 
 #[cfg(not(crypto_pq_optimized))]
 use super::memory::words_of;
-use super::memory::{clear, load128, load256, store128, store256};
+use super::memory::{Plain, clear, load128, load128_bytes, load256, store128, store256};
 use crate::blake3::{Many, PERMUTATION};
 use crate::sha2::IV_256;
 use crate::wipe::{wipe, wipe_unless_optimized};
@@ -240,9 +240,17 @@ macro_rules! rows {
         }
 
         // At most 32 bytes of the root's output for at most a block of input, whose flags the
-        // caller gives: one compression, from the key to the output in registers.
+        // caller gives: one compression, from the key to the output in registers. The key is
+        // eight words or their 32 bytes in little-endian order, which in memory are the same.
         #[target_feature(enable = $feature)]
-        pub(in crate::cpu) fn digest1(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
+        pub(in crate::cpu::x86_64) fn digest1<K: Plain, const N: usize>(
+            key: &[K; N],
+            flags: u32,
+            data: &[u8],
+            out: &mut [u8],
+        ) {
+            const { assert!(size_of::<[K; N]>() == 32) };
+
             let mut copy = [0; 64];
 
             let block = match <&[u8; 64]>::try_from(data) {
@@ -254,11 +262,9 @@ macro_rules! rows {
                 }
             };
 
-            let [low, high] = key.as_chunks::<4>().0 else {
-                unreachable!("eight words are two groups of four")
-            };
+            let cv = [load128_bytes(key, 0), load128_bytes(key, 16)];
 
-            let mut row = start([load128(low), load128(high)], 0, data.len() as u32, flags);
+            let mut row = start(cv, 0, data.len() as u32, flags);
 
             round::<0>(&mut row, block);
 
