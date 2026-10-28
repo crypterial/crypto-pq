@@ -16,7 +16,7 @@
 
 use crate::cpu;
 use crate::sha2::IV_256;
-use crate::wipe::wipe;
+use crate::wipe::{wipe, wipe_unless_optimized};
 
 pub(crate) const KEY: usize = 32;
 
@@ -187,9 +187,11 @@ fn rounds(cv: &[u32; 8], m: &[u32; 16], counter: u64, length: u32, flags: u32) -
     v
 }
 
-// All sixteen output words of the compression of a block; the first eight are the next chaining
-// value. This and the next two take a kernel where there is one; they are inlined, so that the
-// kernel is called directly.
+// All sixteen output words of the compression of a block into out; the first eight are the next
+// chaining value. This and the next two take a kernel where there is one; they are inlined, so
+// that the kernel is called directly. Every value derived from a chaining value is written into
+// the caller's storage, which the caller wipes: a value returned was copied through a temporary
+// that nothing wiped.
 #[inline]
 fn compress(
     cv: &[u32; 8],
@@ -197,14 +199,13 @@ fn compress(
     counter: u64,
     length: u32,
     flags: u32,
-) -> [u32; 16] {
-    let mut out = [0; 16];
-
-    if cpu::blake3_compress(cv, block, counter, [length, flags], &mut out) {
-        return out;
+    out: &mut [u32; 16],
+) {
+    if cpu::blake3_compress(cv, block, counter, [length, flags], out) {
+        return;
     }
 
-    compress_portable(cv, block, counter, length, flags)
+    compress_portable(cv, block, counter, length, flags, out);
 }
 
 fn compress_portable(
@@ -213,32 +214,40 @@ fn compress_portable(
     counter: u64,
     length: u32,
     flags: u32,
-) -> [u32; 16] {
+    out: &mut [u32; 16],
+) {
     let v = rounds(cv, &words(block), counter, length, flags);
 
-    core::array::from_fn(|i| {
-        if i < 8 {
+    for (i, word) in out.iter_mut().enumerate() {
+        *word = if i < 8 {
             v[i] ^ v[i + 8]
         } else {
             v[i] ^ cv[i - 8]
-        }
-    })
+        };
+    }
 }
 
-// The chaining value: the first eight output words alone.
+// The chaining value, the first eight output words alone, into out.
 #[inline]
-fn chain(cv: &[u32; 8], block: &[u8; BLOCK], counter: u64, length: u32, flags: u32) -> [u32; 8] {
-    let mut out = [0; 16];
+fn chain(
+    cv: &[u32; 8],
+    block: &[u8; BLOCK],
+    counter: u64,
+    length: u32,
+    flags: u32,
+    out: &mut [u32; 8],
+) {
+    let mut all = [0; 16];
 
-    if cpu::blake3_compress(cv, block, counter, [length, flags], &mut out) {
-        let first = *out.first_chunk().expect("sixteen words");
+    if cpu::blake3_compress(cv, block, counter, [length, flags], &mut all) {
+        out.copy_from_slice(&all[..8]);
 
-        wipe(&mut out);
+        wipe(&mut all);
 
-        return first;
+        return;
     }
 
-    chain_portable(cv, block, counter, length, flags)
+    chain_portable(cv, block, counter, length, flags, out);
 }
 
 // The words of the block go from memory straight into the rounds.
@@ -248,17 +257,20 @@ fn chain_portable(
     counter: u64,
     length: u32,
     flags: u32,
-) -> [u32; 8] {
+    out: &mut [u32; 8],
+) {
     let v = rounds(cv, &words(block), counter, length, flags);
 
-    core::array::from_fn(|i| v[i] ^ v[i + 8])
+    for (i, word) in out.iter_mut().enumerate() {
+        *word = v[i] ^ v[i + 8];
+    }
 }
 
 // The final block of a chain, with its length and flags.
 pub(crate) type Last<'a> = Option<(&'a [u8; BLOCK], u32, u32)>;
 
-// The chaining value after whole blocks of one chunk, from cv: the first block with `start`
-// added to the flags and the last with `end`, and then `last` if there is one.
+// The chaining value after whole blocks of one chunk, from cv, into out: the first block with
+// `start` added to the flags and the last with `end`, and then `last` if there is one.
 #[inline]
 fn chain_blocks(
     cv: &[u32; 8],
@@ -267,26 +279,29 @@ fn chain_blocks(
     flags: u32,
     edges: [u32; 2],
     last: Last,
-) -> [u32; 8] {
-    let mut h = *cv;
+    out: &mut [u32; 8],
+) {
+    *out = *cv;
 
-    if cpu::blake3_blocks(&mut h, blocks, counter, flags, edges, last) {
-        return h;
+    if cpu::blake3_blocks(out, blocks, counter, flags, edges, last) {
+        return;
     }
 
-    chain_blocks_portable(cv, blocks, counter, flags, edges, last)
+    chain_blocks_portable(out, cv, blocks, counter, flags, edges, last);
 }
 
 // The chain stays in registers from block to block; a call per block stored it and loaded it
-// back, on the critical path.
+// back, on the critical path. out comes first, where a returned array's address goes: last, it
+// changed the registers of the loop, and a 1 KiB hash took 1 percent longer on Apple M3.
 fn chain_blocks_portable(
+    out: &mut [u32; 8],
     cv: &[u32; 8],
     blocks: &[[u8; BLOCK]],
     counter: u64,
     flags: u32,
     [start, end]: [u32; 2],
     last: Last,
-) -> [u32; 8] {
+) {
     let mut h = *cv;
 
     let whole = blocks.len();
@@ -313,17 +328,20 @@ fn chain_blocks_portable(
         h = core::array::from_fn(|i| v[i] ^ v[i + 8]);
     }
 
-    h
+    *out = h;
+
+    wipe_unless_optimized!(&mut h);
 }
 
-// chain_blocks for two inputs of as many blocks.
+// chain_blocks for two inputs of as many blocks, into out.
 fn chain_blocks_pair(
     key: &[u32; 8],
     inputs: [&[[u8; BLOCK]]; 2],
     counters: [u64; 2],
     flags: u32,
     [start, end]: [u32; 2],
-) -> [[u32; 8]; 2] {
+    out: &mut [[u32; 8]; 2],
+) {
     let mut h = [*key; 2];
 
     for (i, (first, second)) in inputs[0].iter().zip(inputs[1]).enumerate() {
@@ -394,7 +412,9 @@ fn chain_blocks_pair(
         ];
     }
 
-    h
+    *out = h;
+
+    wipe_unless_optimized!(h.as_flattened_mut());
 }
 
 #[inline(always)]
@@ -408,24 +428,16 @@ fn words(block: &[u8; BLOCK]) -> [u32; 16] {
     m
 }
 
-pub(crate) fn key_words(key: &[u8; KEY]) -> [u32; 8] {
-    let mut k = [0; 8];
-
-    for (word, bytes) in k.iter_mut().zip(key.as_chunks::<4>().0) {
+fn key_words(key: &[u8; KEY], out: &mut [u32; 8]) {
+    for (word, bytes) in out.iter_mut().zip(key.as_chunks::<4>().0) {
         *word = u32::from_le_bytes(*bytes);
     }
-
-    k
 }
 
-fn cv_bytes(cv: &[u32; 8]) -> [u8; 32] {
-    let mut bytes = [0; 32];
-
-    for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(cv) {
+fn cv_bytes(cv: &[u32; 8], out: &mut [u8; 32]) {
+    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(cv) {
         *chunk = word.to_le_bytes();
     }
-
-    bytes
 }
 
 // What hash_many's inputs share (the reference implementation's hash_many): each has `blocks`
@@ -464,22 +476,27 @@ fn hash_many(input: &[u8], many: &Many, out: &mut [[u8; 32]]) {
 
         let (first, second) = input[done * size..].split_at(size);
 
-        let mut pair = chain_blocks_pair(
+        let mut pair = [[0; 8]; 2];
+
+        chain_blocks_pair(
             many.key,
             [first.as_chunks().0, second.as_chunks().0],
             [counter(done), counter(done + 1)],
             many.flags,
             [many.start, many.end],
+            &mut pair,
         );
 
-        out[done] = cv_bytes(&pair[0]);
+        cv_bytes(&pair[0], &mut out[done]);
 
-        out[done + 1] = cv_bytes(&pair[1]);
+        cv_bytes(&pair[1], &mut out[done + 1]);
 
         wipe(pair.as_flattened_mut());
 
         done += 2;
     }
+
+    let mut state = [0; 8];
 
     for (i, (cv, bytes)) in out
         .iter_mut()
@@ -495,23 +512,25 @@ fn hash_many(input: &[u8], many: &Many, out: &mut [[u8; 32]]) {
 
         let (blocks, _) = bytes.as_chunks::<BLOCK>();
 
-        let mut state = chain_blocks(
+        chain_blocks(
             many.key,
             blocks,
             counter,
             many.flags,
             [many.start, many.end],
             None,
+            &mut state,
         );
 
-        *cv = cv_bytes(&state);
-
-        wipe(&mut state);
+        cv_bytes(&state, cv);
     }
+
+    wipe(&mut state);
 }
 
 // A node before its chaining value is taken. The root squeezes any number of 64-byte blocks from
-// it, block i with counter i.
+// it, block i with counter i. Nodes are written into the caller's Output, which Drop wipes, so
+// that no move leaves a copy of message bytes or chaining values on the stack.
 #[derive(Clone)]
 struct Output {
     cv: [u32; 8],
@@ -522,8 +541,23 @@ struct Output {
 }
 
 impl Output {
-    fn chaining_value(&self) -> [u32; 8] {
-        chain(&self.cv, &self.block, self.counter, self.length, self.flags)
+    const EMPTY: Self = Self {
+        cv: [0; 8],
+        block: [0; BLOCK],
+        counter: 0,
+        length: 0,
+        flags: 0,
+    };
+
+    fn chaining_value(&self, out: &mut [u32; 8]) {
+        chain(
+            &self.cv,
+            &self.block,
+            self.counter,
+            self.length,
+            self.flags,
+            out,
+        );
     }
 
     // The root's output from byte `offset` on, into out.
@@ -532,7 +566,9 @@ impl Output {
 
         // A digest of at most 32 bytes needs only the chaining value's half of the output.
         if offset == 0 && out.len() <= 32 {
-            let mut v = chain(&self.cv, &self.block, 0, self.length, flags);
+            let mut v = [0; 8];
+
+            chain(&self.cv, &self.block, 0, self.length, flags, &mut v);
 
             write_words(&v, out);
 
@@ -544,6 +580,8 @@ impl Output {
         let mut index = offset / BLOCK as u64;
 
         let mut skip = (offset % BLOCK as u64) as usize;
+
+        let mut v = [0; 16];
 
         let mut bytes = [0; BLOCK];
 
@@ -567,13 +605,11 @@ impl Output {
                 }
             }
 
-            let mut v = compress(&self.cv, &self.block, index, self.length, flags);
+            compress(&self.cv, &self.block, index, self.length, flags, &mut v);
 
             for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&v) {
                 *chunk = word.to_le_bytes();
             }
-
-            wipe(&mut v);
 
             let take = (BLOCK - skip).min(rest.len());
 
@@ -588,9 +624,24 @@ impl Output {
             index = index.wrapping_add(1);
         }
 
+        wipe(&mut v);
+
         wipe(&mut bytes);
 
         wipe(&mut m);
+    }
+
+    // A copy field by field, straight into this node's storage.
+    fn copy_from(&mut self, source: &Self) {
+        self.cv = source.cv;
+
+        self.block = source.block;
+
+        self.counter = source.counter;
+
+        self.length = source.length;
+
+        self.flags = source.flags;
     }
 }
 
@@ -602,18 +653,11 @@ impl Drop for Output {
     }
 }
 
-// The nodes below are built with a zero block that is then filled in place, so that no copy of
-// message bytes or chaining values is left behind on the stack by a move.
-fn parent(key: &[u32; 8], flags: u32, left: &[u32; 8], right: &[u32; 8]) -> Output {
-    let mut output = Output {
-        cv: *key,
-        block: [0; BLOCK],
-        counter: 0,
-        length: BLOCK as u32,
-        flags: flags | PARENT,
-    };
+// The parent of the chaining values left and right, into out.
+fn parent(key: &[u32; 8], flags: u32, left: &[u32; 8], right: &[u32; 8], out: &mut Output) {
+    out.cv = *key;
 
-    for (bytes, word) in output
+    for (bytes, word) in out
         .block
         .as_chunks_mut::<4>()
         .0
@@ -623,7 +667,11 @@ fn parent(key: &[u32; 8], flags: u32, left: &[u32; 8], right: &[u32; 8]) -> Outp
         *bytes = word.to_le_bytes();
     }
 
-    output
+    out.counter = 0;
+
+    out.length = BLOCK as u32;
+
+    out.flags = flags | PARENT;
 }
 
 // The blocks of at most a chunk but the last, which may be partial or empty, and the flags of
@@ -638,39 +686,51 @@ fn split_chunk(data: &[u8], flags: u32) -> (&[[u8; BLOCK]], &[u8], u32) {
     (blocks, last, flags | start | CHUNK_END)
 }
 
-// A chunk of at most CHUNK bytes as a node: every block but the last compressed.
-fn chunk(key: &[u32; 8], flags: u32, counter: u64, data: &[u8]) -> Output {
+// A chunk of at most CHUNK bytes as a node, into out: every block but the last compressed.
+fn chunk(key: &[u32; 8], flags: u32, counter: u64, data: &[u8], out: &mut Output) {
     let (blocks, rest, last_flags) = split_chunk(data, flags);
 
-    let mut output = Output {
-        cv: [0; 8],
-        block: [0; BLOCK],
+    chain_blocks(
+        key,
+        blocks,
         counter,
-        length: rest.len() as u32,
-        flags: last_flags,
-    };
+        flags,
+        [CHUNK_START, 0],
+        None,
+        &mut out.cv,
+    );
 
-    output.cv = chain_blocks(key, blocks, counter, flags, [CHUNK_START, 0], None);
+    let (head, tail) = out.block.split_at_mut(rest.len());
 
-    output.block[..rest.len()].copy_from_slice(rest);
+    head.copy_from_slice(rest);
 
-    output
+    tail.fill(0);
+
+    out.counter = counter;
+
+    out.length = rest.len() as u32;
+
+    out.flags = last_flags;
 }
 
-// The first N output words of the root, N being 8 or 16, for at most a chunk of input: its
-// blocks, then the last one as the root, with no node in memory between them. With whole blocks,
-// the first eight words take a single pass, as the last block's chain is the output.
-fn single<const N: usize>(key: &[u32; 8], flags: u32, data: &[u8]) -> [u32; N] {
+// The chaining value's half of the root's output for at most a chunk of input, into out: its
+// blocks and then the last one as the root, in one pass and with no node in memory between them.
+fn single_chain(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u32; 8]) {
     let (whole, partial) = data.as_chunks::<BLOCK>();
 
-    if N == 8 && partial.is_empty() && !whole.is_empty() {
-        let mut v = chain_blocks(key, whole, 0, flags, [CHUNK_START, CHUNK_END | ROOT], None);
+    // With whole blocks, the last block's chain is the output.
+    if partial.is_empty() && !whole.is_empty() {
+        chain_blocks(
+            key,
+            whole,
+            0,
+            flags,
+            [CHUNK_START, CHUNK_END | ROOT],
+            None,
+            out,
+        );
 
-        let words = core::array::from_fn(|i| v[i]);
-
-        wipe(&mut v);
-
-        return words;
+        return;
     }
 
     let (blocks, rest, last_flags) = split_chunk(data, flags);
@@ -679,41 +739,32 @@ fn single<const N: usize>(key: &[u32; 8], flags: u32, data: &[u8]) -> [u32; N] {
 
     last[..rest.len()].copy_from_slice(rest);
 
-    let length = rest.len() as u32;
+    let tail = Some((&last, rest.len() as u32, last_flags | ROOT));
 
-    // The last block in the same pass as the others, where only the chaining value's half of the
-    // output is needed.
-    if N == 8 {
-        let tail = Some((&last, length, last_flags | ROOT));
+    chain_blocks(key, blocks, 0, flags, [CHUNK_START, 0], tail, out);
 
-        let mut v = chain_blocks(key, blocks, 0, flags, [CHUNK_START, 0], tail);
+    wipe(&mut last);
+}
 
-        let words = core::array::from_fn(|i| v[i]);
+// All sixteen output words of the root for at most a chunk of input, into out.
+fn single_block(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u32; 16]) {
+    let (blocks, rest, last_flags) = split_chunk(data, flags);
 
-        wipe(&mut v);
+    let mut last = [0; BLOCK];
 
-        wipe(&mut last);
-
-        return words;
-    }
+    last[..rest.len()].copy_from_slice(rest);
 
     let mut cv = *key;
 
     if !blocks.is_empty() {
-        cv = chain_blocks(key, blocks, 0, flags, [CHUNK_START, 0], None);
+        chain_blocks(key, blocks, 0, flags, [CHUNK_START, 0], None, &mut cv);
     }
 
-    let mut v = compress(&cv, &last, 0, length, last_flags | ROOT);
-
-    let words = core::array::from_fn(|i| v[i]);
-
-    wipe(&mut v);
+    compress(&cv, &last, 0, rest.len() as u32, last_flags | ROOT, out);
 
     wipe(&mut cv);
 
     wipe(&mut last);
-
-    words
 }
 
 // The first out.len() bytes of output words, at most all of them.
@@ -738,10 +789,10 @@ fn write_words<const N: usize>(v: &[u32; N], out: &mut [u8]) {
 }
 
 // The two children of the root of the subtree of the chunks of `data`, at least two and at most
-// WIDE of them, the first one numbered `counter`: hash_many for the whole chunks, then for each
-// level of parents, with the last value of an odd level carried up to the next, which builds the
-// tree of the specification.
-fn leaves(key: &[u32; 8], flags: u32, counter: u64, data: &[u8]) -> [[u32; 8]; 2] {
+// WIDE of them, the first one numbered `counter`, into out: hash_many for the whole chunks, then
+// for each level of parents, with the last value of an odd level carried up to the next, which
+// builds the tree of the specification.
+fn leaves(key: &[u32; 8], flags: u32, counter: u64, data: &[u8], out: &mut [[u32; 8]; 2]) {
     let mut cvs = [[0; 32]; WIDE];
 
     let whole = data.len() / CHUNK;
@@ -763,9 +814,15 @@ fn leaves(key: &[u32; 8], flags: u32, counter: u64, data: &[u8]) -> [[u32; 8]; 2
     let mut count = whole;
 
     if !last.is_empty() {
-        let mut cv = chunk(key, flags, counter + whole as u64, last).chaining_value();
+        let mut node = Output::EMPTY;
 
-        cvs[count] = cv_bytes(&cv);
+        chunk(key, flags, counter + whole as u64, last, &mut node);
+
+        let mut cv = [0; 8];
+
+        node.chaining_value(&mut cv);
+
+        cv_bytes(&cv, &mut cvs[count]);
 
         wipe(&mut cv);
 
@@ -802,42 +859,46 @@ fn leaves(key: &[u32; 8], flags: u32, counter: u64, data: &[u8]) -> [[u32; 8]; 2
         count = pairs + count % 2;
     }
 
-    let children = [key_words(&cvs[0]), key_words(&cvs[1])];
+    key_words(&cvs[0], &mut out[0]);
+
+    key_words(&cvs[1], &mut out[1]);
 
     wipe(level.as_flattened_mut());
 
     wipe(cvs.as_flattened_mut());
-
-    children
 }
 
-// The top node of at most WIDE chunks whose first one is numbered `counter`: the chunk, or the
-// parent of leaves' two children.
-fn top(key: &[u32; 8], flags: u32, counter: u64, data: &[u8]) -> Output {
+// The top node of at most WIDE chunks whose first one is numbered `counter`, into out: the
+// chunk, or the parent of leaves' two children.
+fn top(key: &[u32; 8], flags: u32, counter: u64, data: &[u8], out: &mut Output) {
     if data.len() <= CHUNK {
-        return chunk(key, flags, counter, data);
+        chunk(key, flags, counter, data, out);
+
+        return;
     }
 
-    let mut halves = leaves(key, flags, counter, data);
+    let mut halves = [[0; 8]; 2];
 
-    let node = parent(key, flags, &halves[0], &halves[1]);
+    leaves(key, flags, counter, data, &mut halves);
+
+    parent(key, flags, &halves[0], &halves[1], out);
 
     wipe(halves.as_flattened_mut());
-
-    node
 }
 
 // The top node of the subtree of `data`, whose first chunk is numbered `counter`, a multiple of
-// the subtree's chunks rounded up to a power of two. The groups of WIDE chunks before the last
-// are hashed one after the other, and their chaining values merge on a stack as each completes a
-// subtree; the last group, whole or not, is the rightmost node, into which the stack then merges
-// from the right, as the tree of the specification does. The stack has a fixed size however long
-// the input: a recursion over the halves took 3.4 KiB of stack per doubling.
-fn node(key: &[u32; 8], flags: u32, counter: u64, data: &[u8]) -> Output {
+// the subtree's chunks rounded up to a power of two, into out. The groups of WIDE chunks before
+// the last are hashed one after the other, and their chaining values merge on a stack as each
+// completes a subtree; the last group, whole or not, is the rightmost node, into which the stack
+// then merges from the right, as the tree of the specification does. The stack has a fixed size
+// however long the input: a recursion over the halves took 3.4 KiB of stack per doubling.
+fn node(key: &[u32; 8], flags: u32, counter: u64, data: &[u8], out: &mut Output) {
     const GROUP: usize = WIDE * CHUNK;
 
     if data.len() <= GROUP {
-        return top(key, flags, counter, data);
+        top(key, flags, counter, data, out);
+
+        return;
     }
 
     let (head, last) = data.split_at(data.len() - ((data.len() - 1) % GROUP + 1));
@@ -846,46 +907,48 @@ fn node(key: &[u32; 8], flags: u32, counter: u64, data: &[u8]) -> Output {
 
     let (mut depth, mut peak) = (0, 0);
 
+    let mut cv = [0; 8];
+
     for (i, group) in head.as_chunks::<GROUP>().0.iter().enumerate() {
-        let mut cv = top(key, flags, counter + (i * WIDE) as u64, group).chaining_value();
+        top(key, flags, counter + (i * WIDE) as u64, group, out);
+
+        out.chaining_value(&mut cv);
 
         let mut total = i + 1;
 
         while total & 1 == 0 {
             depth -= 1;
 
-            cv = parent(key, flags, &stack[depth], &cv).chaining_value();
+            parent(key, flags, &stack[depth], &cv, out);
+
+            out.chaining_value(&mut cv);
 
             total >>= 1;
         }
 
-        stack[depth] = cv;
+        stack[depth].copy_from_slice(&cv);
 
         depth += 1;
 
         peak = peak.max(depth);
-
-        wipe(&mut cv);
     }
 
-    let mut output = top(key, flags, counter + (head.len() / CHUNK) as u64, last);
+    top(key, flags, counter + (head.len() / CHUNK) as u64, last, out);
 
     for left in stack[..depth].iter().rev() {
-        let mut right = output.chaining_value();
+        out.chaining_value(&mut cv);
 
-        output = parent(key, flags, left, &right);
-
-        wipe(&mut right);
+        parent(key, flags, left, &cv, out);
     }
 
-    wipe(stack[..peak].as_flattened_mut());
+    wipe(&mut cv);
 
-    output
+    wipe(stack[..peak].as_flattened_mut());
 }
 
-// The root node of the whole input.
-fn tree(key: &[u32; 8], flags: u32, data: &[u8]) -> Output {
-    node(key, flags, 0, data)
+// The root node of the whole input, into out.
+fn tree(key: &[u32; 8], flags: u32, data: &[u8], out: &mut Output) {
+    node(key, flags, 0, data, out);
 }
 
 // An incremental hash in one of the three modes; once read, the root and the offset of the next
@@ -954,7 +1017,9 @@ impl Hasher {
 
         while !data.is_empty() {
             if self.filled == BLOCK {
-                let mut cv = self.next(core::slice::from_ref(&self.buffer));
+                let mut cv = [0; 8];
+
+                self.next(core::slice::from_ref(&self.buffer), &mut cv);
 
                 self.advance(&mut cv, 1);
 
@@ -975,7 +1040,9 @@ impl Hasher {
 
                     let (blocks, _) = blocks.as_chunks::<BLOCK>();
 
-                    let mut cv = self.next(blocks);
+                    let mut cv = [0; 8];
+
+                    self.next(blocks, &mut cv);
 
                     self.advance(&mut cv, count as u8);
 
@@ -1003,11 +1070,17 @@ impl Hasher {
 
             let (subtree, rest) = data.split_at(CHUNK << level);
 
-            let mut cv = if level == 0 {
-                self.chunk_value(subtree)
+            let mut cv = [0; 8];
+
+            if level == 0 {
+                self.chunk_value(subtree, &mut cv);
             } else {
-                node(&self.key, self.flags, self.chunk, subtree).chaining_value()
-            };
+                let mut output = Output::EMPTY;
+
+                node(&self.key, self.flags, self.chunk, subtree, &mut output);
+
+                output.chaining_value(&mut cv);
+            }
 
             self.push(&mut cv, level);
 
@@ -1017,8 +1090,9 @@ impl Hasher {
         data
     }
 
-    // A whole chunk's chaining value, through hash_many for its kernels' single-chunk paths.
-    fn chunk_value(&self, data: &[u8]) -> [u32; 8] {
+    // A whole chunk's chaining value into out, through hash_many for its kernels' single-chunk
+    // paths.
+    fn chunk_value(&self, data: &[u8], out: &mut [u32; 8]) {
         let mut cv = [[0; 32]; 1];
 
         let many = Many {
@@ -1033,11 +1107,9 @@ impl Hasher {
 
         hash_many(data, &many, &mut cv);
 
-        let words = key_words(&cv[0]);
+        key_words(&cv[0], out);
 
         wipe(cv.as_flattened_mut());
-
-        words
     }
 
     // The chaining value of a complete subtree of 2^level chunks, which merges with every subtree
@@ -1050,12 +1122,22 @@ impl Hasher {
         while total & 1 == 0 {
             self.depth -= 1;
 
-            *cv = parent(&self.key, self.flags, &self.stack[self.depth], cv).chaining_value();
+            let mut output = Output::EMPTY;
+
+            parent(
+                &self.key,
+                self.flags,
+                &self.stack[self.depth],
+                cv,
+                &mut output,
+            );
+
+            output.chaining_value(cv);
 
             total >>= 1;
         }
 
-        self.stack[self.depth] = *cv;
+        self.stack[self.depth].copy_from_slice(cv);
 
         self.depth += 1;
 
@@ -1064,8 +1146,9 @@ impl Hasher {
         wipe(cv);
     }
 
-    // The chaining value after whole blocks of the current chunk that more input follows.
-    fn next(&self, blocks: &[[u8; BLOCK]]) -> [u32; 8] {
+    // The chaining value after whole blocks of the current chunk that more input follows, into
+    // out.
+    fn next(&self, blocks: &[[u8; BLOCK]], out: &mut [u32; 8]) {
         let start = if self.blocks == 0 { CHUNK_START } else { 0 };
 
         let end = if self.blocks as usize + blocks.len() == BLOCKS as usize {
@@ -1074,7 +1157,15 @@ impl Hasher {
             0
         };
 
-        chain_blocks(&self.cv, blocks, self.chunk, self.flags, [start, end], None)
+        chain_blocks(
+            &self.cv,
+            blocks,
+            self.chunk,
+            self.flags,
+            [start, end],
+            None,
+            out,
+        );
     }
 
     // The chain after `count` more blocks; the chunk's last one ends the chunk. Wipes cv.
@@ -1096,34 +1187,42 @@ impl Hasher {
         self.blocks = 0;
     }
 
-    // The root: the current chunk's last block, then the parents up the stack.
-    fn output(&self) -> Output {
+    // The root, into out: the current chunk's last block, then the parents up the stack.
+    fn output(&self, out: &mut Output) {
         let start = if self.blocks == 0 { CHUNK_START } else { 0 };
 
-        let mut output = Output {
-            cv: self.cv,
-            block: [0; BLOCK],
-            counter: self.chunk,
-            length: self.filled as u32,
-            flags: self.flags | start | CHUNK_END,
-        };
+        out.cv = self.cv;
 
-        output.block[..self.filled].copy_from_slice(&self.buffer[..self.filled]);
+        let (head, tail) = out.block.split_at_mut(self.filled);
+
+        head.copy_from_slice(&self.buffer[..self.filled]);
+
+        tail.fill(0);
+
+        out.counter = self.chunk;
+
+        out.length = self.filled as u32;
+
+        out.flags = self.flags | start | CHUNK_END;
+
+        let mut right = [0; 8];
 
         for left in self.stack[..self.depth].iter().rev() {
-            let mut right = output.chaining_value();
+            out.chaining_value(&mut right);
 
-            output = parent(&self.key, self.flags, left, &right);
-
-            wipe(&mut right);
+            parent(&self.key, self.flags, left, &right, out);
         }
 
-        output
+        wipe(&mut right);
     }
 
     // The output from its start, which leaves the state as it was.
     pub(crate) fn finish(&self, out: &mut [u8]) {
-        self.output().root(0, out);
+        let mut root = Output::EMPTY;
+
+        self.output(&mut root);
+
+        root.root(0, out);
     }
 
     // How many more bytes read can give: the output of one hasher ends after 2^64 - 1 bytes.
@@ -1133,8 +1232,14 @@ impl Hasher {
 
     // The next out.len() bytes of the output, at most output_left(); no update follows.
     pub(crate) fn read(&mut self, out: &mut [u8]) {
+        // The root is built in a local and copied into place, as self.output() cannot borrow self
+        // while it writes into self.root; the local is wiped when dropped.
         if self.root.is_none() {
-            self.root = Some(self.output());
+            let mut root = Output::EMPTY;
+
+            self.output(&mut root);
+
+            self.root.insert(Output::EMPTY).copy_from(&root);
         }
 
         if let Some(root) = &self.root {
@@ -1157,21 +1262,26 @@ impl Drop for Hasher {
     }
 }
 
-// The key of derive_key's second stage: the context string hashed in its own mode.
-fn context_key(context: &[u8]) -> [u32; 8] {
+// The key of derive_key's second stage into out: the context string hashed in its own mode.
+fn context_key(context: &[u8], out: &mut [u32; 8]) {
     if context.len() <= CHUNK {
-        return single(&IV_256, DERIVE_KEY_CONTEXT, context);
+        single_chain(&IV_256, DERIVE_KEY_CONTEXT, context, out);
+
+        return;
     }
 
-    let output = tree(&IV_256, DERIVE_KEY_CONTEXT, context);
+    let mut root = Output::EMPTY;
+
+    tree(&IV_256, DERIVE_KEY_CONTEXT, context, &mut root);
 
     chain(
-        &output.cv,
-        &output.block,
+        &root.cv,
+        &root.block,
         0,
-        output.length,
-        output.flags | ROOT,
-    )
+        root.length,
+        root.flags | ROOT,
+        out,
+    );
 }
 
 // At most 32 bytes of the root's output for at most a block of input, whose flags the caller
@@ -1223,19 +1333,27 @@ fn one_shot(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
     }
 
     if data.len() <= CHUNK && out.len() <= 32 {
-        let mut v = single::<8>(key, flags, data);
+        let mut v = [0; 8];
+
+        single_chain(key, flags, data, &mut v);
 
         write_words(&v, out);
 
         wipe(&mut v);
     } else if data.len() <= CHUNK && out.len() <= BLOCK {
-        let mut v = single::<16>(key, flags, data);
+        let mut v = [0; 16];
+
+        single_block(key, flags, data, &mut v);
 
         write_words(&v, out);
 
         wipe(&mut v);
     } else {
-        tree(key, flags, data).root(0, out);
+        let mut root = Output::EMPTY;
+
+        tree(key, flags, data, &mut root);
+
+        root.root(0, out);
     }
 }
 
@@ -1245,7 +1363,11 @@ pub(crate) fn digest(data: &[u8], out: &mut [u8]) {
 }
 
 pub(crate) fn keyed_hash(key: &[u8], data: &[u8], out: &mut [u8]) {
-    let mut k = key_words(key.try_into().expect("a 32-byte key"));
+    let key = key.try_into().expect("a 32-byte key");
+
+    let mut k = [0; 8];
+
+    key_words(key, &mut k);
 
     one_shot(&k, KEYED_HASH, data, out);
 
@@ -1254,7 +1376,9 @@ pub(crate) fn keyed_hash(key: &[u8], data: &[u8], out: &mut [u8]) {
 
 // derive_key(context, key material) into out.
 pub(crate) fn derive_key(context: &[u8], material: &[u8], out: &mut [u8]) {
-    let mut k = context_key(context);
+    let mut k = [0; 8];
+
+    context_key(context, &mut k);
 
     one_shot(&k, DERIVE_KEY_MATERIAL, material, out);
 
@@ -1268,6 +1392,23 @@ mod tests {
 
     use super::*;
     use crate::cpu::testing::{EDGES, Inputs};
+
+    // The conversions by value, which the tests compare.
+    fn cv_bytes(cv: &[u32; 8]) -> [u8; 32] {
+        let mut bytes = [0; 32];
+
+        super::cv_bytes(cv, &mut bytes);
+
+        bytes
+    }
+
+    fn key_words(key: &[u8; KEY]) -> [u32; 8] {
+        let mut words = [0; 8];
+
+        super::key_words(key, &mut words);
+
+        words
+    }
 
     // The portable compression, which every kernel must match.
     fn portable(
