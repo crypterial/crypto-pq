@@ -217,27 +217,36 @@ struct Hashes<'a> {
 
 impl<'a> Hashes<'a> {
     // With n = 32 and SHA-256, toByte(prefix, 32) || KEY fills exactly one block, so the state
-    // after it is computed once per key for PRF (keyed by PUB_SEED) and PRF_keygen (by SK_SEED).
+    // after it is computed once per key for PRF (keyed by PUB_SEED, here, as it is public) and
+    // PRF_keygen (by SK_SEED, in keygen).
     fn new(p: &'a Parameters, pub_seed: &'a [u8], sk_seed: &'a [u8]) -> Self {
-        let keyed = |prefix: u32, key: &[u8]| {
-            (p.n == 32 && !p.shake && !key.is_empty()).then(|| {
-                let mut state = Sha256::new(&IV_256);
+        let mut prf_state = None;
 
-                state.update(&to_byte(u64::from(prefix), 32));
-
-                state.update(key);
-
-                state
-            })
-        };
+        Self::key(p, &mut prf_state, PRF, pub_seed);
 
         Self {
             p,
             pub_seed,
             sk_seed,
-            prf_state: keyed(PRF, pub_seed),
-            keygen_state: keyed(PRF_KEYGEN, sk_seed),
+            prf_state,
+            keygen_state: None,
         }
+    }
+
+    fn key(p: &Parameters, state: &mut Option<Sha256>, prefix: u32, key: &[u8]) {
+        if p.n == 32 && !p.shake && !key.is_empty() {
+            let state = state.insert(Sha256::new(&IV_256));
+
+            state.update(&to_byte(u64::from(prefix), 32));
+
+            state.update(key);
+        }
+    }
+
+    // The PRF_keygen state, keyed in place, where the drop of self wipes it: keyed in new and
+    // moved into Self, the engine that absorbed SK_SEED would leave copies of it behind.
+    fn keygen(&mut self) {
+        Self::key(self.p, &mut self.keygen_state, PRF_KEYGEN, self.sk_seed);
     }
 
     fn hash(&self, prefix: u32, key: &[u8], message: &[&[u8]]) -> Node {
@@ -950,7 +959,9 @@ impl Tree {
     ) -> Result<Self, Error> {
         let s_xmss = SecretBytes::concat(&[s_xmss]);
 
-        let hashes = Hashes::new(p, pub_seed, &s_xmss);
+        let mut hashes = Hashes::new(p, pub_seed, &s_xmss);
+
+        hashes.keygen();
 
         let subtree = Subtree {
             hashes: &hashes,
@@ -988,7 +999,9 @@ impl Tree {
     pub(crate) fn sign(&mut self, pub_seed: &[u8], leaf: u32, message: &[u8]) -> Vec<u8> {
         let p = self.p;
 
-        let hashes = Hashes::new(p, pub_seed, &self.s_xmss);
+        let mut hashes = Hashes::new(p, pub_seed, &self.s_xmss);
+
+        hashes.keygen();
 
         let mut ots = address(self.layer, self.number, OTS);
 
@@ -1025,7 +1038,9 @@ mod tests {
 
             let seeds: Vec<u8> = (0..2 * p.n).map(|i| i as u8).collect();
 
-            let hashes = Hashes::new(p, &seeds[..p.n], &seeds[p.n..]);
+            let mut hashes = Hashes::new(p, &seeds[..p.n], &seeds[p.n..]);
+
+            hashes.keygen();
 
             let batch: [Node; LANES] = hashes.leaf_lanes(0, 0, 32);
 

@@ -87,6 +87,13 @@ Implements specification 1.1 (draft).
   instructions, which the compiler kept on the stack, are wiped before each round returns, and the
   temporaries in which it built some of them are no longer made. At opt-level 3 the machine code is
   unchanged. Outputs are unchanged.
+- The hash engines of LMS, HSS and XMSS that have absorbed input are finished in the storage
+  that wipes them on drop. The last call on a truncated SHA-256 or SHAKE256 hash took the engine
+  by value and wiped only its copy, so that the input it had absorbed stayed on the stack: SEED
+  where LMS derives the randomizer C and the SEED and I of a child tree, and with SHAKE256 the
+  LM-OTS chain starts; SK_PRF where XMSS derives its randomizer; and with SHAKE256 SK_SEED and
+  the secret chain values of XMSS. The XMSS PRF_keygen state, keyed with SK_SEED, was copied
+  when it was moved into the hashes of a tree. Outputs are unchanged.
 
 ## [1.0.1] - 2026-10-26
 

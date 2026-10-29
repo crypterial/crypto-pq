@@ -356,15 +356,15 @@ fn ots_public_keys<const L: usize>(
 
     let q: [u32; L] = core::array::from_fn(|lane| first + lane as u32);
 
-    let mut engines = q.map(|q| {
-        let mut engine = TruncatedHash::new(t.shake);
+    // The engines absorb in place from their empty state on, so that none is moved once it holds
+    // input.
+    let mut engines: [TruncatedHash; L] = core::array::from_fn(|_| TruncatedHash::new(t.shake));
 
+    for (engine, q) in engines.iter_mut().zip(q) {
         for part in [i, &q.to_be_bytes(), &D_PBLC] {
             engine.update(part);
         }
-
-        engine
-    });
+    }
 
     // The chain values, secret below the ends: each step reads one buffer and writes the other,
     // and both are wiped at the end.
@@ -390,13 +390,13 @@ fn ots_public_keys<const L: usize>(
 
     wipe(buffers.as_flattened_mut().as_flattened_mut());
 
-    engines.map(|engine| {
-        let mut node = [0; 32];
+    let mut nodes = [[0; 32]; L];
 
-        engine.finish(n, &mut node);
+    for (engine, node) in engines.iter_mut().zip(&mut nodes) {
+        engine.finish(n, node);
+    }
 
-        node
-    })
+    nodes
 }
 
 // Advances chain j of the LM-OTS key q from step starts[j] to ends[j], for every chain. The

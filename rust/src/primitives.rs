@@ -94,12 +94,13 @@ impl TruncatedHash {
 
     // The n-byte digest into out, zeros after it. Into the caller's buffer, here and in digest:
     // returned by value, the digests of secret chain values were left in this frame.
-    // The engine is used in place, where its Drop wipes it: moved out of self, it would leave a
-    // copy behind.
-    pub(crate) fn finish(mut self, n: usize, out: &mut [u8; 32]) {
+    // By reference, so that the engine stays in its owner's storage, where its Drop wipes it:
+    // taken by value, it is copied into the argument, and the caller's copy of the absorbed input
+    // is never wiped.
+    pub(crate) fn finish(&mut self, n: usize, out: &mut [u8; 32]) {
         let (digest, rest) = out.split_at_mut(n);
 
-        match &mut self {
+        match self {
             Self::Sha256(engine) => engine.digest_into(digest),
             Self::Shake256(engine) => engine.read(digest),
         }
