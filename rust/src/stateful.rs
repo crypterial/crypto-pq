@@ -2490,15 +2490,23 @@ mod tests {
     // The key signs on correctly after either.
     #[test]
     fn a_faulty_new_signature_is_never_released() {
+        #[cfg(feature = "lms")]
         let two = [
             ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W4"),
             ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W2"),
         ];
 
+        #[cfg(feature = "xmss")]
         let mt = StatefulParameters::Name("XMSSMT-SHA2_20/4_192");
 
+        #[cfg(feature = "xmss")]
         let xmss = StatefulParameters::Name("XMSS-SHA2_10_192");
 
+        // A single element in a build with lms and without xmss.
+        #[cfg_attr(
+            all(feature = "lms", not(feature = "xmss")),
+            allow(clippy::single_element_loop)
+        )]
         for (algorithm, parameters, capacity, skip) in [
             #[cfg(feature = "lms")]
             (HSS_LMS, StatefulParameters::Levels(&two), 1 << 10, Some(64)),

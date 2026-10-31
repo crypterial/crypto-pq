@@ -371,3 +371,116 @@ fn cross_symmetric() {
 fn cross_blake3() {
     check("cross/blake3.txt", 110);
 }
+
+fn shareable<T: Send + Sync>() {}
+
+// A MacKey starts each MAC in its state right after create, whatever the MACs made from it before
+// absorbed, digested or verified: for every MAC, configured ones too, under keys of each accepted
+// length, the tag of a MAC from the key is the tag of a new MAC and of the one-shot digest.
+#[test]
+fn mac_key_matches_create() {
+    shareable::<crypto_pq::MacKey>();
+
+    let data: Vec<u8> = (0..1100u32).map(|i| (i * 7 + 3) as u8).collect();
+
+    let lengths = [
+        0, 1, 31, 55, 56, 63, 64, 65, 111, 112, 127, 128, 129, 135, 136, 137, 167, 168, 169, 255,
+        256, 500, 1023, 1024, 1025, 1100,
+    ];
+
+    let mut macs = vec![
+        HMAC_SHA_224,
+        HMAC_SHA_256,
+        HMAC_SHA_384,
+        HMAC_SHA_512,
+        KMAC128,
+        KMAC256,
+        BLAKE2B_MAC,
+        BLAKE2S_MAC,
+        BLAKE3_MAC,
+    ];
+
+    for (mac, options) in [
+        (HMAC_SHA_256, MacOptions::default().with_length(16)),
+        (
+            KMAC128,
+            MacOptions::default()
+                .with_customization(b"key")
+                .with_xof(true)
+                .with_length(40),
+        ),
+        (KMAC256, MacOptions::default().with_length(48)),
+        (
+            BLAKE2B_MAC,
+            MacOptions::default()
+                .with_length(20)
+                .with_salt(&[1; 16])
+                .with_personalization(&[2; 16]),
+        ),
+        (
+            BLAKE2S_MAC,
+            MacOptions::default().with_length(16).with_salt(&[3; 8]),
+        ),
+    ] {
+        macs.push(mac.configure(&options).unwrap());
+    }
+
+    for mac in macs {
+        let mut keys = 0;
+
+        for key_length in [0, 1, 16, 31, 32, 33, 63, 64, 65, 127, 128, 129, 200] {
+            let key: Vec<u8> = (0..key_length).map(|i| (i * 11 + 5) as u8).collect();
+
+            let Ok(keyed) = mac.key(&key) else {
+                assert!(mac.create(&key).is_err());
+
+                continue;
+            };
+
+            keys += 1;
+
+            for (i, &length) in lengths.iter().enumerate() {
+                let mut earlier = keyed.create();
+
+                earlier.update(&data[..(i * 37) % 300]);
+
+                if i % 3 == 0 {
+                    let _ = earlier.digest();
+                }
+
+                let mut reused = keyed.create();
+
+                for piece in data[..length].chunks(1 + i % 70) {
+                    reused.update(piece);
+                }
+
+                let tag = reused.digest();
+
+                let mut fresh = mac.create(&key).unwrap();
+
+                fresh.update(&data[..length]);
+
+                assert_eq!(
+                    tag,
+                    fresh.digest(),
+                    "{} key {key_length} data {length}",
+                    mac.name()
+                );
+
+                assert_eq!(tag, mac.digest(&key, &data[..length]).unwrap());
+
+                earlier.update(&data[..length]);
+
+                assert_eq!(earlier.verify(&tag), (i * 37) % 300 == 0);
+
+                let mut again = keyed.create();
+
+                again.update(&data[..length]);
+
+                assert!(again.verify(&tag), "{} second MAC from the key", mac.name());
+            }
+        }
+
+        assert!(keys > 0, "{}: no accepted key length", mac.name());
+    }
+}

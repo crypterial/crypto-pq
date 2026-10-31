@@ -1764,9 +1764,12 @@ fn compress256_lanes_sha2<const LANES: usize>(
 // Two SHA-512 rounds with schedule vector J, which holds the words of rounds t and t + 1 and then
 // advances by sixteen words if more are needed. The state pairs are ab, cd, ef and gh, the first
 // letter in the low lane. SHA512H yields T1 of both rounds without the d it adds to e, so ef
-// becomes cd plus that; SHA512H2 yields the two new values of a.
+// becomes cd plus that; SHA512H2 yields the two new values of a. The order is fixed in assembly:
+// each schedule step goes right before and after the SHA512H of its own rounds, which keeps the
+// chain from one SHA512H to the next (through cd plus T1 and the two EXTs) free of them.
 #[target_feature(enable = "sha3")]
 #[inline]
+#[allow(unsafe_code)]
 fn double_round<const J: usize>(
     s: &mut [uint64x2_t; 4],
     m: &mut [uint64x2_t; 8],
@@ -1775,23 +1778,80 @@ fn double_round<const J: usize>(
 ) {
     let [ab, cd, ef, gh] = *s;
 
-    let wk = vaddq_u64(m[J], k);
-
-    let t1 = vsha512hq_u64(
-        vaddq_u64(gh, vextq_u64::<1>(wk, wk)),
-        vextq_u64::<1>(ef, gh),
-        vextq_u64::<1>(cd, ef),
+    let (next, middle, after, last) = (
+        m[(J + 1) % 8],
+        m[(J + 4) % 8],
+        m[(J + 5) % 8],
+        m[(J + 7) % 8],
     );
 
-    *s = [vsha512h2q_u64(t1, cd, ab), ab, vaddq_u64(cd, t1), ef];
+    let word = &mut m[J];
+
+    let mut a = gh;
+
+    let e;
 
     if schedule {
-        m[J] = vsha512su1q_u64(
-            vsha512su0q_u64(m[J], m[(J + 1) % 8]),
-            m[(J + 7) % 8],
-            vextq_u64::<1>(m[(J + 4) % 8], m[(J + 5) % 8]),
-        );
+        // SAFETY: instructions on registers only, which the sha3 feature of this function
+        // provides; they read and write no memory, stack or flags.
+        unsafe {
+            core::arch::asm!(
+                "add {wk:v}.2d, {word:v}.2d, {k:v}.2d",
+                "ext {fg:v}.16b, {ef:v}.16b, {a:v}.16b, #8",
+                "ext {de:v}.16b, {cd:v}.16b, {ef:v}.16b, #8",
+                "ext {wk:v}.16b, {wk:v}.16b, {wk:v}.16b, #8",
+                "add {a:v}.2d, {a:v}.2d, {wk:v}.2d",
+                "sha512su0 {word:v}.2d, {next:v}.2d",
+                "ext {wk:v}.16b, {middle:v}.16b, {after:v}.16b, #8",
+                "sha512h {a:q}, {fg:q}, {de:v}.2d",
+                "sha512su1 {word:v}.2d, {last:v}.2d, {wk:v}.2d",
+                "add {e:v}.2d, {cd:v}.2d, {a:v}.2d",
+                "sha512h2 {a:q}, {cd:q}, {ab:v}.2d",
+                a = inout(vreg) a,
+                e = out(vreg) e,
+                word = inout(vreg) *word,
+                ab = in(vreg) ab,
+                cd = in(vreg) cd,
+                ef = in(vreg) ef,
+                next = in(vreg) next,
+                middle = in(vreg) middle,
+                after = in(vreg) after,
+                last = in(vreg) last,
+                k = in(vreg) k,
+                wk = out(vreg) _,
+                fg = out(vreg) _,
+                de = out(vreg) _,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+    } else {
+        // SAFETY: as above.
+        unsafe {
+            core::arch::asm!(
+                "add {wk:v}.2d, {word:v}.2d, {k:v}.2d",
+                "ext {fg:v}.16b, {ef:v}.16b, {a:v}.16b, #8",
+                "ext {de:v}.16b, {cd:v}.16b, {ef:v}.16b, #8",
+                "ext {wk:v}.16b, {wk:v}.16b, {wk:v}.16b, #8",
+                "add {a:v}.2d, {a:v}.2d, {wk:v}.2d",
+                "sha512h {a:q}, {fg:q}, {de:v}.2d",
+                "add {e:v}.2d, {cd:v}.2d, {a:v}.2d",
+                "sha512h2 {a:q}, {cd:q}, {ab:v}.2d",
+                a = inout(vreg) a,
+                e = out(vreg) e,
+                word = in(vreg) *word,
+                ab = in(vreg) ab,
+                cd = in(vreg) cd,
+                ef = in(vreg) ef,
+                k = in(vreg) k,
+                wk = out(vreg) _,
+                fg = out(vreg) _,
+                de = out(vreg) _,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
     }
+
+    *s = [a, ab, e, ef];
 }
 
 // The schedule words of a block, two per vector.
@@ -1841,10 +1901,67 @@ fn double_rounds<const N: usize, const J: usize>(
     }
 }
 
-// One block of each of N streams.
+// Sixteen rounds of every stream, with the schedule for the next sixteen when SCHEDULE.
+#[target_feature(enable = "sha3")]
+#[inline]
+fn sixteen512<const N: usize, const SCHEDULE: bool>(
+    s: &mut [[uint64x2_t; 4]; N],
+    m: &mut [[uint64x2_t; 8]; N],
+    k: &[u64; 16],
+) {
+    let [k0, k1, k2, k3, k4, k5, k6, k7] = k.as_chunks::<2>().0 else {
+        unreachable!("sixteen constants are eight pairs")
+    };
+
+    double_rounds::<N, 0>(s, m, load_u64(k0), SCHEDULE);
+
+    double_rounds::<N, 1>(s, m, load_u64(k1), SCHEDULE);
+
+    double_rounds::<N, 2>(s, m, load_u64(k2), SCHEDULE);
+
+    double_rounds::<N, 3>(s, m, load_u64(k3), SCHEDULE);
+
+    double_rounds::<N, 4>(s, m, load_u64(k4), SCHEDULE);
+
+    double_rounds::<N, 5>(s, m, load_u64(k5), SCHEDULE);
+
+    double_rounds::<N, 6>(s, m, load_u64(k6), SCHEDULE);
+
+    double_rounds::<N, 7>(s, m, load_u64(k7), SCHEDULE);
+}
+
+// One block of each of N streams: four groups of sixteen rounds with the schedule, then the last
+// sixteen without it. The flag is a constant in each loop: in a single loop over the five
+// groups, LLVM branched on it at every double round and moved every message vector.
 #[target_feature(enable = "sha3")]
 #[inline]
 fn rounds512<const N: usize>(s: &mut [[uint64x2_t; 4]; N], m: &mut [[uint64x2_t; 8]; N]) {
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut start = *s;
+
+    let (scheduled, last) = K512.as_chunks::<16>().0.split_at(4);
+
+    for k in scheduled {
+        sixteen512::<N, true>(s, m, k);
+    }
+
+    sixteen512::<N, false>(s, m, &last[0]);
+
+    for (s, start) in s.iter_mut().zip(&start) {
+        for (pair, start) in s.iter_mut().zip(start) {
+            *pair = vaddq_u64(*pair, *start);
+        }
+    }
+
+    wipe_unless_optimized!(vector_lanes(&mut start));
+}
+
+// rounds512 in one loop over the five groups, with the flag tested inside it, for the loop over
+// blocks in tail512. With the split form there, LLVM kept the last group's eight constant vectors
+// in registers across the blocks and moved three other vectors through the stack at every block.
+#[target_feature(enable = "sha3")]
+#[inline]
+fn rounds512_looped<const N: usize>(s: &mut [[uint64x2_t; 4]; N], m: &mut [[uint64x2_t; 8]; N]) {
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
     let mut start = *s;
 
@@ -1884,13 +2001,19 @@ fn rounds512<const N: usize>(s: &mut [[uint64x2_t; 4]; N], m: &mut [[uint64x2_t;
 fn compress512_sha3(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
     let mut s = [load512(state)];
 
+    let mut m = [[vdupq_n_u64(0); 8]];
+
     for block in blocks.iter().chain(more) {
-        rounds512(&mut s, &mut [message512(block)]);
+        m[0] = message512(block);
+
+        rounds512(&mut s, &mut m);
     }
 
     store512(&s[0], state);
 
     wipe_unless_optimized!(vector_lanes(&mut s));
+
+    wipe_unless_optimized!(vector_lanes(&mut m));
 }
 
 #[target_feature(enable = "sha3")]
@@ -1950,7 +2073,7 @@ fn tail512(s: &mut [[uint64x2_t; 4]; 1], data: &[u8], bits: u128) {
             None => words512(second),
         };
 
-        rounds512(s, &mut [m]);
+        rounds512_looped(s, &mut [m]);
     }
 
     wipe_unless_optimized!(vector_lanes(&mut first));
@@ -1976,11 +2099,15 @@ fn hmac512_sha3(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
 
     let mut inner = [start];
 
-    rounds512(&mut inner, &mut [words512(key_block(key, 0x36))]);
+    let mut m = [words512(key_block(key, 0x36))];
+
+    rounds512(&mut inner, &mut m);
 
     let mut outer = [start];
 
-    rounds512(&mut outer, &mut [words512(key_block(key, 0x5C))]);
+    m = [words512(key_block(key, 0x5C))];
+
+    rounds512(&mut outer, &mut m);
 
     let mut states = [[0; 8]; 2];
 
@@ -1995,6 +2122,8 @@ fn hmac512_sha3(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
     wipe_unless_optimized!(vector_lanes(&mut inner));
 
     wipe_unless_optimized!(vector_lanes(&mut outer));
+
+    wipe_unless_optimized!(vector_lanes(&mut m));
 }
 
 // after_keys256 for SHA-512 and SHA-384.
@@ -2016,13 +2145,13 @@ fn after_keys512(states: &mut [[u64; 8]; 2], data: &[u8], tag: &mut [u8]) {
 
     let length = vector64(0, (128 + tag.len() as u64) * 8);
 
-    let block = if tag.len() == 64 {
+    let mut block = [if tag.len() == 64 {
         [ab, cd, ef, gh, marker, zero, zero, length]
     } else {
         [ab, cd, ef, marker, zero, zero, zero, length]
-    };
+    }];
 
-    rounds512(&mut outer, &mut [block]);
+    rounds512(&mut outer, &mut block);
 
     let mut bytes = [vdupq_n_u8(0); 4];
 
@@ -2031,6 +2160,12 @@ fn after_keys512(states: &mut [[u64; 8]; 2], data: &[u8], tag: &mut [u8]) {
     }
 
     store_tag(bytes, tag);
+
+    wipe_unless_optimized!(vector_lanes(&mut outer));
+
+    wipe_unless_optimized!(vector_lanes(&mut block));
+
+    wipe_unless_optimized!(vector_lanes(&mut bytes));
 }
 
 #[target_feature(enable = "sha3")]

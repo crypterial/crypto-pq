@@ -534,6 +534,18 @@ pub(crate) struct Engine<W: Word> {
 impl<W: Word> Engine<W> {
     const BLOCK: usize = 16 * W::BYTES;
 
+    // A copy of other, written field by field into self: a clone moved into place went through
+    // the stack (mac.rs, MacKey).
+    pub(crate) fn copy_from(&mut self, other: &Self) {
+        self.h = other.h;
+
+        self.buffer = other.buffer;
+
+        self.filled = other.filled;
+
+        self.counter = other.counter;
+    }
+
     pub(crate) const fn new(h: &[W; 8]) -> Self {
         Self {
             h: *h,

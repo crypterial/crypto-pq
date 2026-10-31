@@ -9,9 +9,9 @@
    `core::error::Error`.
 3. Operations that can fail because of caller input return `Result` [[D-03](../decisions.md#decision-d-03)], including
    `HashAlgorithm::digest_into`, `Hasher::digest_into`, `XofAlgorithm::digest`, `digest_into`,
-   `Xof::update`, `Xof::read`, `Xof::read_into`, `MacAlgorithm::digest`, `digest_into`, `create`, and
-   `Mac::digest_into`. Operations that cannot fail (`HashAlgorithm::digest`, `Hasher::update`,
-   `Mac::update`, `verify`) return their value directly.
+   `Xof::update`, `Xof::read`, `Xof::read_into`, `MacAlgorithm::digest`, `digest_into`, `create`,
+   `key`, and `Mac::digest_into`. Operations that cannot fail (`HashAlgorithm::digest`,
+   `Hasher::update`, `MacKey::create`, `Mac::update`, `verify`) return their value directly.
 4. Option structs are `#[non_exhaustive]`, implement `Default`, and are built with chained setters,
    for example `SignOptions::default().with_context(b"app").with_deterministic(true)` [[D-22](../decisions.md#decision-d-22)]. The
    setters are named `with_<field>`. Rationale: a non-exhaustive struct cannot be built with a struct
@@ -24,10 +24,10 @@
    prints as redacted, and wipes its bytes on drop. MAC tags, hashes, ciphertexts, public keys and
    signatures are `Vec<u8>`.
 7. Key objects: public keys implement `Clone`, `PartialEq`, `Eq`, `Hash` and `Debug` (algorithm only).
-   Private keys implement `Debug` (algorithm only) and neither `Clone` nor `PartialEq`; their secrets
-   are wiped on drop.
-8. Thread safety: algorithm values and KEM and signature key objects are `Send + Sync`. `Hasher`, `Xof`
-   and `Mac` are `Send` and take `&mut self` to change state.
+   Private keys and `MacKey` implement `Debug` (algorithm only) and neither `Clone` nor `PartialEq`;
+   their secrets are wiped on drop. `Mac` implements neither `Clone` nor `Debug`.
+8. Thread safety: algorithm values, KEM and signature key objects and `MacKey` are `Send + Sync`.
+   `Hasher`, `Xof` and `Mac` are `Send` and take `&mut self` to change state.
 9. Stateful keys: `StatefulPrivateKey<S: StateStore>` owns its store. `sign(&mut self, message)` takes
    exclusive access, so [11.13](../11-stateful-signatures.md#1113-concurrency) item 1 cannot arise; the store cannot reach the key that is calling it.
    The trait is `fn read(&mut self) -> Result<Option<Vec<u8>>, Error>` and

@@ -273,27 +273,37 @@ Withdrawn on 2026-10-23: it concerned implementations in other languages, which 
 
 ## Decision D-44
 
-Revised for specification 1.1 on 2026-10-26; specification 1.0, which 1.0.0 and 1.0.1 implement,
-said that crypto-pq contains no AVX-512 code. On x86-64 processors with AVX-512F and AVX-512VL,
-whose opmask and ZMM state the operating system saves (XCR0 bits 1, 2 and 5 to 7, or the
+Revised for specification 1.1 on 2026-10-26 and 2026-10-28; specification 1.0, which 1.0.0 and 1.0.1
+implement, said that crypto-pq contains no AVX-512 code. On x86-64 processors with AVX-512F and
+AVX-512VL, whose opmask and ZMM state the operating system saves (XCR0 bits 1, 2 and 5 to 7, or the
 `hw.optional.avx512f` and `hw.optional.avx512vl` sysctl values on macOS), the Keccak-f[1600] kernel
 on four states uses the EVEX instructions on 256-bit registers only, and so does the kernel on one
 state on the processors that run it in less time than the scalar kernel, by a table of families and
 models: AMD families 19h and 1Ah and Intel's Ice Lake Xeon; other processors run one state with the
-scalar kernel. In a build for the baseline target, no code uses a 512-bit register. The round takes
-theta in the form that each vendor's cores run in less time. Sponges squeezed side by side keep
-their states in the vector layout of the kernel from one block to the next. The tier is detected at
-run time, and the AVX2 kernels and the portable code stay its twins ([15.3](15-platforms.md#153-cpu-specific-code)). valgrind cannot execute
-AVX-512, so the constant-time check's build leaves the tier out ([14.1](14-security.md#141-constant-time) item 7), and its kernels are
-constant time by construction: logic, rotations, shuffles, blends, broadcasts and loads and stores
-at addresses that depend on public lengths only, each on Intel's list of data-operand-independent
-timing instructions or a floating-point-domain logic, move, unpack, shuffle, insert or blend
-instruction of [D-75](#decision-d-75), with no branch, address or variable-latency
-instruction that depends on the data; which kernel runs depends only on the processor. CI runs them on native runners ([18.2](18-testing.md#182-cpu-tiers)).
-The minimum Rust version is 1.89, the first in which these target features and intrinsics are stable
-([15.2](15-platforms.md#152-supported-platforms)). Rationale: sixteen more registers, three-input logic and 64-bit rotations take fewer
-instructions per Keccak round than AVX2 does, and 256-bit registers keep the clock at which the core
-runs AVX2 code.
+scalar kernel. On the same processors, the kernel that hashes eight lanes of SHA-256 side by side,
+for the chains and trees of LMS and XMSS and the SHA-2 hashes of SLH-DSA, keeps one lane in each
+element of a 256-bit register and uses rotations and three-input logic for Ch, Maj and the sigma
+functions. In a build for the baseline target, no code uses a 512-bit register. The Keccak round
+takes theta in the form that each vendor's cores run in less time. Sponges squeezed side by side
+keep their states in the vector layout of the kernel from one block to the next. The tier is
+detected at run time, and the AVX2 kernels and the portable code stay its twins
+([15.3](15-platforms.md#153-cpu-specific-code)). valgrind cannot execute AVX-512, so the
+constant-time check's build leaves the tier out ([14.1](14-security.md#141-constant-time) item 7),
+and its kernels are constant time by construction: logic, rotations, shifts, additions, shuffles,
+blends, broadcasts and loads and stores at addresses that depend on public lengths only, each on
+Intel's list of data-operand-independent timing instructions or a floating-point-domain logic, move,
+unpack, shuffle, insert or blend instruction of [D-75](#decision-d-75), with no branch, address or
+variable-latency instruction that depends on the data; which kernel runs depends only on the
+processor. CI runs them on native runners ([18.2](18-testing.md#182-cpu-tiers)). The minimum Rust
+version is 1.89, the first in which these target features and intrinsics are stable
+([15.2](15-platforms.md#152-supported-platforms)). Rationale: sixteen more registers, three-input
+logic and 64-bit rotations take fewer instructions per Keccak round than AVX2 does, and 256-bit
+registers keep the clock at which the core runs AVX2 code. For SHA-256 on eight lanes, the block of
+one lane takes 18 to 22 ns on the Zen 4, Zen 5, Ice Lake, Emerald Rapids and Granite Rapids
+processors measured, against 20 to 59 ns with the SHA extensions on two lanes and 31 to 44 ns with
+AVX2. AMD processors with the SHA extensions run SHA-256 lanes with them instead: with the SHA-NI
+rounds of specification 1.1, LMS, XMSS and SLH-DSA-SHA2 took 0.5 to 6 percent less time on Zen 4 and
+Zen 5 than with the eight-lane kernel, and 7 to 14 percent more on Emerald Rapids.
 
 ## Decision D-45
 
@@ -574,3 +584,26 @@ end runs on every path that returns. Rationale: keeping such an array in memory,
 wipe, cost 2 to 7 percent of SHA-3, ML-KEM and SLH-DSA in the measurements for this decision, and
 the spill slots remain either way; a wipe per block of the four-state Keccak cost about 3 percent of
 SHA3-256, where one wipe per operation cost nothing measurable.
+
+## Decision D-77
+
+`MacAlgorithm` gains `key`, which checks a key as `create` does and returns a `MacKey`, a key
+object that holds the keyed state `create` sets up; `MacKey.create` returns a `Mac` in that state
+([12.6](12-symmetric-primitives.md#126-mac-algorithms) item 7). For HMAC that state is the two
+states after the inner and the outer key block, for KMAC the state after the key, for BLAKE2 the
+chaining value and the key block, and for BLAKE3 the key. A `MacKey` is safe for concurrent use
+([6.6](06-api.md#66-concurrency) item 1), has no `Clone`, like `Mac`, and wipes its keyed state when
+it is destroyed ([6.7](06-api.md#67-lifetime-equality-and-printing) item 1,
+[14.5](14-security.md#145-wiping)); `create` copies that state into the new `Mac` in place at
+opt-levels 2 and 3; at the others the compiler may stage it on the stack [[D-76](#decision-d-76)].
+`Mac` itself is unchanged. Rationale: a protocol that tags many messages under one key, and the
+reused-key rows of the rival comparison, paid the key setup for every message: two compressions
+for HMAC and a permutation for KMAC (keyed BLAKE2
+compresses its key block as the first block of each message, with a key object too). The other
+Rust MAC crates key once and reuse the keyed state, and ring and aws-lc-rs do it with a key object,
+as WebCrypto does with CryptoKey. A `Mac.reset` that put back a state saved
+inside the `Mac` was measured first and rejected: the saved state grew every `Mac` from 336 to 448
+bytes on 64-bit targets, and a build of main with only that growth made one-shot BLAKE2 MACs take
+2 to 5 percent more time on Haswell, and KMAC up to 1.5 percent. A key object leaves `Mac`, and so
+every one-shot MAC, as it was. An API addition is a MINOR version change
+([20.1](20-versioning.md#201-versions)).

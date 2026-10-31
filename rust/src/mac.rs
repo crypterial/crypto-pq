@@ -368,6 +368,44 @@ impl MacAlgorithm {
         Ok(self.create_unchecked(key))
     }
 
+    /// A key object under `key`, for many messages: [`MacKey::create`] gives each message a MAC in
+    /// its state right after [`create`](Self::create), without the key setup again. Fails as
+    /// `create` does.
+    pub fn key(&self, key: &[u8]) -> Result<MacKey, Error> {
+        self.check_key(key)?;
+
+        let _dit = Dit::keyed();
+
+        #[cfg(feature = "blake3")]
+        if let MacKind::Blake3 = self.kind {
+            // check_key took a key of KEY bytes. The key goes into the field of the returned value,
+            // with no call between, not into a local moved there.
+            let Some(key) = key.first_chunk() else {
+                return Err(Error::InvalidLength);
+            };
+
+            let mut out = Ok(MacKey {
+                name: self.name,
+                keyed: Keyed::Blake3(Blake3Key([0; blake3::KEY])),
+            });
+
+            if let Ok(MacKey {
+                keyed: Keyed::Blake3(bytes),
+                ..
+            }) = &mut out
+            {
+                bytes.0 = *key;
+            }
+
+            return out;
+        }
+
+        Ok(MacKey {
+            name: self.name,
+            keyed: Keyed::Mac(self.create_unchecked(key)),
+        })
+    }
+
     // create for a key of an accepted length, under the caller's DIT guard. Every engine starts
     // from public state and takes the key inside the MAC, so that no keyed engine is built apart
     // and moved into it.
@@ -724,6 +762,211 @@ impl Mac {
             #[cfg(feature = "blake3")]
             MacEngine::Blake3(hasher) => hasher.finish(out),
         }
+    }
+}
+
+/// A MAC key, made by [`MacAlgorithm::key`]: the keyed state that [`MacAlgorithm::create`] sets
+/// up, from which [`create`](Self::create) starts each MAC, so that HMAC and KMAC process no key
+/// block again. Several threads may use one key at once. The keyed state is wiped when the key is
+/// dropped.
+pub struct MacKey {
+    name: &'static str,
+    keyed: Keyed,
+}
+
+// Boxing the MAC would cost an allocation per key and a load per create.
+#[allow(clippy::large_enum_variant)]
+enum Keyed {
+    // A MAC right after create, which each create copies.
+    Mac(Mac),
+    // BLAKE3's keyed state is the key itself, which create puts in a new hasher on the heap: a
+    // copy of the boxed hasher went through the stack.
+    #[cfg(feature = "blake3")]
+    Blake3(Blake3Key),
+}
+
+#[cfg(feature = "blake3")]
+struct Blake3Key([u8; blake3::KEY]);
+
+#[cfg(feature = "blake3")]
+impl Drop for Blake3Key {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+impl MacKey {
+    /// A MAC in its state right after [`MacAlgorithm::create`] under this key and its options.
+    pub fn create(&self) -> Mac {
+        // No DIT guard: the keyed state is copied, with no arithmetic on it.
+        match &self.keyed {
+            Keyed::Mac(mac) => copy(mac),
+            #[cfg(feature = "blake3")]
+            Keyed::Blake3(key) => create_blake3(&key.0),
+        }
+    }
+}
+
+impl fmt::Debug for MacKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MacKey")
+            .field("algorithm", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+// A copy of a MAC that has absorbed nothing. Each kind of engine is copied in a function of its
+// own, which builds the MAC in the caller's slot: one function for all, or a derived Clone,
+// gathered the engines on the stack and copied them from there (x86-64 and aarch64 asm). The
+// engines with a 128-bit field are copied field by field into a MAC built first from public
+// state, as their clones were moved into place through the stack too.
+#[inline(always)]
+fn copy(mac: &Mac) -> Mac {
+    let size = mac.size;
+
+    match &mac.engine {
+        #[cfg(any(
+            feature = "hmac",
+            feature = "slh-dsa",
+            feature = "lms",
+            feature = "xmss"
+        ))]
+        MacEngine::Hmac {
+            inner: Engine::Sha256(inner),
+            outer: Outer::Sha256(outer),
+            digest_size,
+        } => copy_hmac256(inner, outer, *digest_size, size),
+        #[cfg(any(
+            feature = "hmac",
+            feature = "slh-dsa",
+            feature = "lms",
+            feature = "xmss"
+        ))]
+        MacEngine::Hmac {
+            inner: Engine::Sha512(inner),
+            outer: Outer::Sha512(outer),
+            digest_size,
+        } => copy_hmac512(inner, outer, *digest_size, size),
+        #[cfg(any(
+            feature = "hmac",
+            feature = "slh-dsa",
+            feature = "lms",
+            feature = "xmss"
+        ))]
+        MacEngine::Hmac { .. } => unreachable!("an HMAC engine over SHA-2"),
+        #[cfg(feature = "sha3")]
+        MacEngine::Kmac { engine, xof } => copy_kmac(engine, *xof, size),
+        #[cfg(feature = "blake2")]
+        MacEngine::Blake2b(engine) => copy_blake2b(engine, size),
+        #[cfg(feature = "blake2")]
+        MacEngine::Blake2s(engine) => copy_blake2s(engine, size),
+        #[cfg(feature = "blake3")]
+        MacEngine::Blake3(_) => unreachable!("a BLAKE3 key keeps its key bytes"),
+    }
+}
+
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[inline(never)]
+fn copy_hmac256(inner: &Sha256, outer: &[u32; 8], digest_size: usize, size: usize) -> Mac {
+    Mac {
+        engine: MacEngine::Hmac {
+            inner: Engine::Sha256(inner.clone()),
+            outer: Outer::Sha256(*outer),
+            digest_size,
+        },
+        size,
+    }
+}
+
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[inline(never)]
+fn copy_hmac512(inner: &Sha512, outer: &[u64; 8], digest_size: usize, size: usize) -> Mac {
+    let mut mac = Mac {
+        engine: MacEngine::Hmac {
+            inner: Engine::Sha512(Sha512::new(&[0; 8])),
+            outer: Outer::Sha512([0; 8]),
+            digest_size,
+        },
+        size,
+    };
+
+    if let MacEngine::Hmac {
+        inner: Engine::Sha512(copy),
+        outer: Outer::Sha512(outer_copy),
+        ..
+    } = &mut mac.engine
+    {
+        copy.copy_from(inner);
+
+        *outer_copy = *outer;
+    }
+
+    mac
+}
+
+#[cfg(feature = "sha3")]
+#[inline(never)]
+fn copy_kmac(engine: &Keccak, xof: bool, size: usize) -> Mac {
+    Mac {
+        engine: MacEngine::Kmac {
+            engine: engine.clone(),
+            xof,
+        },
+        size,
+    }
+}
+
+#[cfg(feature = "blake2")]
+#[inline(never)]
+fn copy_blake2b(engine: &blake2::Engine<u64>, size: usize) -> Mac {
+    let mut mac = Mac {
+        engine: MacEngine::Blake2b(blake2::Engine::new(&[0; 8])),
+        size,
+    };
+
+    if let MacEngine::Blake2b(copy) = &mut mac.engine {
+        copy.copy_from(engine);
+    }
+
+    mac
+}
+
+#[cfg(feature = "blake2")]
+#[inline(never)]
+fn copy_blake2s(engine: &blake2::Engine<u32>, size: usize) -> Mac {
+    let mut mac = Mac {
+        engine: MacEngine::Blake2s(blake2::Engine::new(&[0; 8])),
+        size,
+    };
+
+    if let MacEngine::Blake2s(copy) = &mut mac.engine {
+        copy.copy_from(engine);
+    }
+
+    mac
+}
+
+// As create: a new hasher on the heap, keyed in place.
+#[cfg(feature = "blake3")]
+#[inline(never)]
+fn create_blake3(key: &[u8; blake3::KEY]) -> Mac {
+    let mut hasher = Box::new(blake3::Hasher::hash());
+
+    hasher.key(key);
+
+    Mac {
+        engine: MacEngine::Blake3(hasher),
+        size: BLAKE3_MAC.size,
     }
 }
 

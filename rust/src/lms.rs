@@ -411,7 +411,13 @@ fn chains(t: &OtsType, i: &[u8], q: u32, starts: &[u32], ends: &[u32], values: &
 
     order.sort_unstable_by_key(|&j| core::cmp::Reverse(ends[j] - starts[j]));
 
-    let mut pending = order.iter().copied().filter(|&j| starts[j] < ends[j]);
+    let pending = order.iter().copied().filter(|&j| starts[j] < ends[j]);
+
+    if !t.shake {
+        return chains_sha256(n, i, q, starts, ends, pending, values);
+    }
+
+    let mut pending = pending;
 
     let mut lanes: [Option<(usize, u32)>; LANES] = [None; LANES];
 
@@ -462,6 +468,129 @@ fn chains(t: &OtsType, i: &[u8], q: u32, starts: &[u32], ends: &[u32], values: &
     }
 
     wipe(outputs.as_flattened_mut());
+}
+
+// chains with SHA-256. The chain values stay words, word-major, from one step to the next, and
+// x is shifted into the block in words: it starts three bytes into block word 5, so each of its
+// words straddles two block words. The lanes advance by the steps that all active ones have left
+// before the ended chains are stored and the next ones taken. Inactive lanes hash stale values,
+// which are discarded.
+fn chains_sha256(
+    n: usize,
+    i: &[u8],
+    q: u32,
+    starts: &[u32],
+    ends: &[u32],
+    mut pending: impl Iterator<Item = usize>,
+    values: &mut [Node],
+) {
+    let words = n / 4;
+
+    let mut prefix = [q; 5];
+
+    for (word, bytes) in prefix.iter_mut().zip(i.as_chunks::<4>().0) {
+        *word = u32::from_be_bytes(*bytes);
+    }
+
+    let engine = Sha256::new(&IV_256);
+
+    // The chain j of each lane, and its step and end.
+    let mut lanes: [Option<usize>; LANES] = [None; LANES];
+
+    let mut k = [0u32; LANES];
+
+    let mut end = [0u32; LANES];
+
+    // Chain values and blocks, secret in signing, wiped at the end.
+    let mut x = [[0u32; LANES]; 8];
+
+    let mut blocks = [[0u32; LANES]; 16];
+
+    let mut carry = [0u32; LANES];
+
+    loop {
+        for (lane, chain) in lanes.iter_mut().enumerate() {
+            if chain.is_some() {
+                continue;
+            }
+
+            *chain = pending.next();
+
+            if let Some(j) = *chain {
+                (k[lane], end[lane]) = (starts[j], ends[j]);
+
+                for (word, bytes) in x.iter_mut().zip(values[j][..n].as_chunks::<4>().0) {
+                    word[lane] = u32::from_be_bytes(*bytes);
+                }
+            }
+        }
+
+        let steps = lanes
+            .iter()
+            .zip(k.iter().zip(&end))
+            .filter(|(chain, _)| chain.is_some())
+            .map(|(_, (k, end))| end - k)
+            .min();
+
+        let Some(steps) = steps else {
+            break;
+        };
+
+        let j = lanes.map(|chain| chain.unwrap_or_default() as u32);
+
+        for _ in 0..steps {
+            for (word, &value) in blocks.iter_mut().zip(&prefix) {
+                *word = [value; LANES];
+            }
+
+            for ((carry, j), k) in carry.iter_mut().zip(&j).zip(&k) {
+                *carry = (j << 16) | ((k & 0xFF) << 8);
+            }
+
+            for (block, value) in blocks[5..5 + words].iter_mut().zip(&x) {
+                for ((block, carry), value) in block.iter_mut().zip(&mut carry).zip(value) {
+                    *block = *carry | (value >> 24);
+
+                    *carry = value << 8;
+                }
+            }
+
+            for (block, carry) in blocks[5 + words].iter_mut().zip(&carry) {
+                *block = carry | 0x80;
+            }
+
+            for block in &mut blocks[6 + words..15] {
+                *block = [0; LANES];
+            }
+
+            blocks[15] = [((23 + n) * 8) as u32; LANES];
+
+            engine.finish_words(&mut blocks, &mut x);
+
+            for k in &mut k {
+                *k += 1;
+            }
+        }
+
+        for (lane, chain) in lanes.iter_mut().enumerate() {
+            match *chain {
+                Some(j) if k[lane] == end[lane] => {
+                    for (bytes, word) in values[j][..n].as_chunks_mut::<4>().0.iter_mut().zip(&x) {
+                        *bytes = word[lane].to_be_bytes();
+                    }
+
+                    *chain = None;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    wipe(x.as_flattened_mut());
+
+    wipe(blocks.as_flattened_mut());
+
+    wipe(&mut carry);
 }
 
 // The secret chain starts x_j of the key q, LANES at a time, into values.
@@ -909,5 +1038,64 @@ impl Tree {
         declassify(&out);
 
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // chains against one hash per step, for every LM-OTS type, with chain lengths of all sizes,
+    // empty ones too, so that the lanes end and refill at every point.
+    #[test]
+    fn chains_match_steps() {
+        let i = [0xA5; 16];
+
+        let q: u32 = 0x0102_0304;
+
+        for t in OTS_TYPES {
+            let (n, p, top) = (t.n, t.p(), (1u32 << t.w) - 1);
+
+            let mut starts = [0; MAX_P];
+
+            let mut ends = [0; MAX_P];
+
+            let mut values = [[0; 32]; MAX_P];
+
+            for j in 0..p {
+                let draw = digest(false, 32, &[&(j as u32).to_be_bytes(), &[t.w as u8]]);
+
+                let (a, b) = (
+                    u32::from(draw[0]) % (top + 1),
+                    u32::from(draw[1]) % (top + 1),
+                );
+
+                (starts[j], ends[j]) = (a.min(b), a.max(b));
+
+                values[j][..n].copy_from_slice(&digest(false, 32, &[&draw])[..n]);
+            }
+
+            let mut expected = values;
+
+            for (j, value) in expected.iter_mut().enumerate().take(p) {
+                for k in starts[j]..ends[j] {
+                    let step = [k as u8];
+
+                    let parts = [
+                        &i[..],
+                        &q.to_be_bytes(),
+                        &(j as u16).to_be_bytes(),
+                        &step,
+                        &value[..n],
+                    ];
+
+                    *value = digest(t.shake, n, &parts);
+                }
+            }
+
+            chains(&t, &i, q, &starts[..p], &ends[..p], &mut values[..p]);
+
+            assert!(values[..p] == expected[..p], "{}", t.name);
+        }
     }
 }

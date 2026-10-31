@@ -68,12 +68,19 @@ SP 800-232 §5.3); a longer value fails `configure` with INVALID_OPTION.
    parameters of [12.1](#121-hash-functions) item 3. The key has 1 to 64 bytes (BLAKE2b) or 1 to 32 bytes (BLAKE2s); `length`
    is the tag length, 1 to 64 or 1 to 32, default 64 or 32.
 4. BLAKE3-MAC requires a key of exactly 32 bytes.
-5. A key of an unaccepted length fails `digest`, `digestInto` and `create` with INVALID_LENGTH
-   [[D-03](decisions.md#decision-d-03)]. It never panics.
+5. A key of an unaccepted length fails `digest`, `digestInto`, `create` and `key` with
+   INVALID_LENGTH [[D-03](decisions.md#decision-d-03)]. It never panics.
 6. Verification (`ALG.verify(key, data, tag)` and `Mac.verify(tag)`) computes the tag and compares it
    with the given tag over its full length in constant time. It returns `false`, without an error or
    panic, if the key length is not accepted or the tag length is not `digestSize`. `Mac.verify` does not
    consume the object's state.
+7. `ALG.key(key)` checks the key as `create` does and returns a `MacKey`, a key object that holds
+   the keyed state `create` sets up: for HMAC the states after the inner and the outer key block,
+   for KMAC the state after the key, for BLAKE2 the chaining value and the key block, and for BLAKE3
+   the key. `MacKey.create()` returns a `Mac` in that state, as `ALG.create(key)` does, without
+   processing an HMAC or KMAC key block again. The `Mac` objects made from one `MacKey` are
+   independent of each other and of the key. A `MacKey` has no copy operation, and its keyed state
+   is wiped when it is destroyed ([14.5](14-security.md#145-wiping)) [[D-77](decisions.md#decision-d-77)].
 
 ## 12.7 KDF algorithms
 

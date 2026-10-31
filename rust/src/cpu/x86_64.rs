@@ -92,7 +92,7 @@ mod sha2;
 use crate::cpu::Pack;
 #[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
 use crate::cpu::{Field, Field16};
-use crate::sha2::{K256, compress256_lanes_portable};
+use crate::sha2::{K256, compress256_lanes_portable, last_bytes};
 use crate::wipe::{wipe, wipe_unless_optimized};
 
 // The number of accepted lanes in each pattern of eight, for the rejection samplers of ML-KEM and
@@ -643,13 +643,26 @@ pub(crate) fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8
     false
 }
 
-// SHA-NI two lanes at a time where it exists; otherwise the portable lanes compiled for AVX2,
-// eight lanes per vector instead of SSE2's four.
+// Eight lanes per vector with AVX-512VL where the count is a multiple of eight, except on AMD
+// cores with SHA-NI; else SHA-NI two lanes at a time where it exists; otherwise the portable lanes
+// compiled for AVX2, eight lanes per vector instead of SSE2's four. LMS, XMSS and SLH-DSA-SHA2,
+// AVX-512VL against SHA-NI: Emerald Rapids 7-14% less time, Zen 4 0.5-2% and Zen 5 3-6% more.
+// Always inlined: with the AVX-512VL branch LLVM no longer inlined the dispatch into
+// sha2::compress256_lanes, which then paid a call per block of lanes.
 #[allow(unsafe_code)]
+#[inline(always)]
 pub(crate) fn compress256_lanes<const LANES: usize>(
     states: &mut [[u32; LANES]; 8],
     w: &mut [[u32; LANES]; 16],
 ) -> bool {
+    if LANES.is_multiple_of(8) && has(AVX512) && !(has(AVX512_AMD) && has(SHA)) {
+        // SAFETY: the CPU has AVX-512F, AVX-512VL and AVX2, and the operating system saves their
+        // registers.
+        unsafe { sha2::compress256_lanes_avx512(states, w) };
+
+        return true;
+    }
+
     if has(SHA) {
         // SAFETY: as in compress256.
         unsafe { compress256_lanes_sha(states, w) };
@@ -667,11 +680,18 @@ pub(crate) fn compress256_lanes<const LANES: usize>(
     false
 }
 
-// The one-shot hashes build their padding in memory, as the portable code does; with the SHA
-// extensions, the portable code calls compress256 for the blocks.
+// The one-shot hashes and HMAC in one call: with the SHA extensions the padding is built in
+// registers; on the AVX2 path in memory, as the portable code does.
 #[allow(unsafe_code)]
 pub(crate) fn finish256(state: &mut [u32; 8], data: &[u8], bits: u64) -> bool {
-    if has(SHA) || !has(AVX2) {
+    if has(SHA) {
+        // SAFETY: as in compress256.
+        unsafe { finish256_sha(state, data, bits) };
+
+        return true;
+    }
+
+    if !has(AVX2) {
         return false;
     }
 
@@ -693,10 +713,16 @@ pub(crate) fn finish512(state: &mut [u64; 8], data: &[u8], bits: u128) -> bool {
     true
 }
 
-// HMAC in one call on the AVX2 path; with the SHA extensions the generic code calls compress256.
 #[allow(unsafe_code)]
 pub(crate) fn hmac256(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) -> bool {
-    if has(SHA) || !has(AVX2) {
+    if has(SHA) {
+        // SAFETY: as in compress256.
+        unsafe { hmac256_sha(iv, key, data, tag) };
+
+        return true;
+    }
+
+    if !has(AVX2) {
         return false;
     }
 
@@ -720,7 +746,14 @@ pub(crate) fn hmac512(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) ->
 
 #[allow(unsafe_code)]
 pub(crate) fn hmac256_keyed(keyed: &[[u32; 8]; 2], data: &[u8], tag: &mut [u8]) -> bool {
-    if has(SHA) || !has(AVX2) {
+    if has(SHA) {
+        // SAFETY: as in compress256.
+        unsafe { hmac256_keyed_sha(keyed, data, tag) };
+
+        return true;
+    }
+
+    if !has(AVX2) {
         return false;
     }
 
@@ -2158,41 +2191,274 @@ macro_rules! rounds256 {
     }};
 }
 
+// A state as one stream, its schedule words empty: two loads and four shuffles, where the words
+// one at a time took eight loads and as many inserts on the path to the first round.
+#[target_feature(enable = "sse4.1")]
+#[inline]
+fn stream_of(state: &[u32; 8]) -> Stream {
+    let [abcd, efgh] = state.as_chunks::<4>().0 else {
+        unreachable!("eight words are two groups of four")
+    };
+
+    // Lanes b, a, d, c and h, g, f, e.
+    let badc = _mm_shuffle_epi32::<0xB1>(memory::load128(abcd));
+
+    let hgfe = _mm_shuffle_epi32::<0x1B>(memory::load128(efgh));
+
+    Stream {
+        abef: _mm_alignr_epi8::<8>(badc, hgfe),
+        cdgh: _mm_blend_epi16::<0xF0>(hgfe, badc),
+        m: [_mm_setzero_si128(); 4],
+    }
+}
+
+// The inverse of stream_of.
+#[target_feature(enable = "sse4.1")]
+#[inline]
+fn state_of(stream: &Stream, state: &mut [u32; 8]) {
+    let [abcd, efgh] = state.as_chunks_mut::<4>().0 else {
+        unreachable!("eight words are two groups of four")
+    };
+
+    // Lanes a, b, e, f and g, h, c, d.
+    let abef = _mm_shuffle_epi32::<0x1B>(stream.abef);
+
+    let ghcd = _mm_shuffle_epi32::<0xB1>(stream.cdgh);
+
+    memory::store128(_mm_blend_epi16::<0xF0>(abef, ghcd), abcd);
+
+    memory::store128(_mm_alignr_epi8::<8>(ghcd, abef), efgh);
+}
+
+// Sixteen bytes whose little-endian value is `value` as four big-endian schedule words, the first
+// in the lowest lane.
+#[target_feature(enable = "ssse3")]
+#[inline]
+fn value_words(value: u128) -> __m128i {
+    let swap = _mm_set_epi64x(0x0C0D_0E0F_0809_0A0B, 0x0405_0607_0001_0203);
+
+    _mm_shuffle_epi8(_mm_set_epi64x((value >> 64) as i64, value as i64), swap)
+}
+
+#[target_feature(enable = "ssse3")]
+#[inline]
+fn chunk_words(bytes: &[u8; 16]) -> __m128i {
+    value_words(u128::from_le_bytes(*bytes))
+}
+
+// The schedule words of a block.
+#[target_feature(enable = "ssse3")]
+#[inline]
+fn block_words(block: &[u8; 64], m: &mut [__m128i; 4]) {
+    for (m, bytes) in m.iter_mut().zip(block.as_chunks::<16>().0) {
+        *m = chunk_words(bytes);
+    }
+}
+
+// Chunk i of a block whose bytes are whole (whole 16-byte chunks), then the bytes that chunk
+// holds, then zeros: the padded last block of a message, with the marker in chunk, or an HMAC key.
+#[target_feature(enable = "ssse3")]
+#[inline]
+fn last_chunk(whole: &[[u8; 16]], i: usize, chunk: u128) -> __m128i {
+    match whole.get(i) {
+        Some(bytes) => chunk_words(bytes),
+        None if i == whole.len() => value_words(chunk),
+        None => _mm_setzero_si128(),
+    }
+}
+
 // The streaming hash: the state stays in registers from one block to the next.
 #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
 fn compress256_sha(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
-    let [a, b, c, d, e, f, g, h] = *state;
+    let mut streams = [stream_of(state)];
 
-    let mut streams = [Stream {
-        abef: high_first([a, b, e, f]),
-        cdgh: high_first([c, d, g, h]),
-        m: [_mm_setzero_si128(); 4],
-    }];
+    // One loop over both slices, so that the rounds are written out once.
+    for part in [blocks, more] {
+        for block in part {
+            block_words(block, &mut streams[0].m);
 
-    // Reverses the bytes of each 32-bit word: the words of a block are big-endian.
-    let swap = _mm_set_epi64x(0x0C0D_0E0F_0809_0A0B, 0x0405_0607_0001_0203);
-
-    for block in blocks.iter().chain(more) {
-        for (m, bytes) in streams[0].m.iter_mut().zip(block.as_chunks::<16>().0) {
-            let [low, high] = bytes.as_chunks::<8>().0 else {
-                unreachable!("sixteen bytes are two groups of eight")
-            };
-
-            let words = _mm_set_epi64x(i64::from_le_bytes(*high), i64::from_le_bytes(*low));
-
-            *m = _mm_shuffle_epi8(words, swap);
+            rounds256!(streams, 1);
         }
+    }
+
+    state_of(&streams[0], state);
+
+    wipe_unless_optimized!(memory::words_of(&mut streams));
+}
+
+// The whole blocks of data and then its padded last block or two, for a message of `bits` bits
+// that ends with data, the padding built in registers as in the aarch64 tail256. The stream's
+// schedule words keep message words, which are wiped with the stream.
+#[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+fn finish256_sha(state: &mut [u32; 8], data: &[u8], bits: u64) {
+    let mut streams = [stream_of(state)];
+
+    let (blocks, tail) = data.as_chunks::<64>();
+
+    let (whole, rest) = tail.as_chunks::<16>();
+
+    let marker = last_bytes(data, rest.len()) | 0x80 << (8 * rest.len());
+
+    // The length field: words 14 and 15 of the last block.
+    let length = _mm_set_epi32(bits as i32, (bits >> 32) as i32, 0, 0);
+
+    for block in blocks {
+        block_words(block, &mut streams[0].m);
 
         rounds256!(streams, 1);
     }
 
-    let [a, b, e, f] = from_high_first(streams[0].abef);
+    streams[0].m = [
+        last_chunk(whole, 0, marker),
+        last_chunk(whole, 1, marker),
+        last_chunk(whole, 2, marker),
+        last_chunk(whole, 3, marker),
+    ];
 
-    let [c, d, g, h] = from_high_first(streams[0].cdgh);
+    // The padded blocks in a loop of their own, so that the rounds are written out twice, not
+    // three times: the one with the tail and the marker, then, when the length does not fit
+    // there, one of zeros and the length. The tail's words are built after the whole blocks, so
+    // that no copy of them waits on the stack.
+    let mut padded = if tail.len() + 9 > 64 {
+        2
+    } else {
+        streams[0].m[3] = _mm_or_si128(streams[0].m[3], length);
 
-    *state = [a, b, c, d, e, f, g, h];
+        1
+    };
+
+    loop {
+        rounds256!(streams, 1);
+
+        padded -= 1;
+
+        if padded == 0 {
+            break;
+        }
+
+        let zero = _mm_setzero_si128();
+
+        streams[0].m = [zero, zero, zero, length];
+    }
+
+    state_of(&streams[0], state);
 
     wipe_unless_optimized!(memory::words_of(&mut streams));
+}
+
+// The HMAC key block (a key of at most a block, zero-padded) XORed with pad in every byte, as
+// schedule words: the XOR of a byte in every position commutes with the byte swap.
+#[target_feature(enable = "ssse3")]
+#[inline]
+fn key_block(key: &[u8], pad: u8) -> [__m128i; 4] {
+    debug_assert!(key.len() <= 64, "an HMAC key block takes at most 64 bytes");
+
+    let (whole, rest) = key.as_chunks::<16>();
+
+    let partial = last_bytes(key, rest.len());
+
+    let pads = _mm_set1_epi8(pad as i8);
+
+    [
+        _mm_xor_si128(last_chunk(whole, 0, partial), pads),
+        _mm_xor_si128(last_chunk(whole, 1, partial), pads),
+        _mm_xor_si128(last_chunk(whole, 2, partial), pads),
+        _mm_xor_si128(last_chunk(whole, 3, partial), pads),
+    ]
+}
+
+// HMAC-SHA-256, or HMAC-SHA-224 for a 28-byte tag, of data under a key of at most a block, in one
+// call: both key blocks as two streams, the inner hash through data and its padding, and the
+// outer hash of the inner digest, as the aarch64 hmac256_sha2 does. The keyed states wait in
+// `states`, which is wiped, for the call to finish256_sha.
+#[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+fn hmac256_sha(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
+    debug_assert!(key.len() <= 64, "a long key is hashed first");
+
+    let start = stream_of(iv);
+
+    let mut keys = [start, start];
+
+    keys[0].m = key_block(key, 0x36);
+
+    keys[1].m = key_block(key, 0x5C);
+
+    rounds256!(keys, 2);
+
+    let mut states = [[0; 8]; 2];
+
+    state_of(&keys[0], &mut states[0]);
+
+    state_of(&keys[1], &mut states[1]);
+
+    after_keys256_sha(&mut states, data, tag);
+
+    wipe(states.as_flattened_mut());
+
+    wipe_unless_optimized!(memory::words_of(&mut keys));
+}
+
+// HMAC-SHA-256 or HMAC-SHA-224 from the states after the inner and the outer key block, which
+// `states` holds; the inner hash overwrites the first.
+#[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+#[inline]
+fn after_keys256_sha(states: &mut [[u32; 8]; 2], data: &[u8], tag: &mut [u8]) {
+    finish256_sha(
+        &mut states[0],
+        data,
+        (data.len() as u64).wrapping_add(64).wrapping_mul(8),
+    );
+
+    let [first, second] = states[0].as_chunks::<4>().0 else {
+        unreachable!("eight words are two groups of four")
+    };
+
+    let mut outer = [stream_of(&states[1])];
+
+    // The outer block is the inner digest's words, the marker word and the length.
+    let bits = ((64 + tag.len() as u32) * 8) as i32;
+
+    let marker = 0x8000_0000_u32 as i32;
+
+    outer[0].m = if tag.len() == 32 {
+        [
+            memory::load128(first),
+            memory::load128(second),
+            _mm_set_epi32(0, 0, 0, marker),
+            _mm_set_epi32(bits, 0, 0, 0),
+        ]
+    } else {
+        [
+            memory::load128(first),
+            _mm_insert_epi32::<3>(memory::load128(second), marker),
+            _mm_setzero_si128(),
+            _mm_set_epi32(bits, 0, 0, 0),
+        ]
+    };
+
+    rounds256!(outer, 1);
+
+    let mut words = [0; 8];
+
+    state_of(&outer[0], &mut words);
+
+    for (bytes, word) in tag.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
+        *bytes = word.to_be_bytes();
+    }
+
+    wipe(&mut words);
+
+    wipe_unless_optimized!(memory::words_of(&mut outer));
+}
+
+// hmac256_sha from the keyed states, for many messages under one key: HKDF's expansion.
+#[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+fn hmac256_keyed_sha(keyed: &[[u32; 8]; 2], data: &[u8], tag: &mut [u8]) {
+    let mut states = *keyed;
+
+    after_keys256_sha(&mut states, data, tag);
+
+    wipe(states.as_flattened_mut());
 }
 
 #[target_feature(enable = "sse2")]
@@ -2365,6 +2631,52 @@ mod tests {
                 expected,
                 "{vendor:?} {eax:#010x}"
             );
+        }
+    }
+
+    // The AVX-512VL lanes of SHA-256 against the portable lanes, for eight and sixteen lanes over
+    // several blocks on random inputs, edge words included.
+    #[test]
+    #[allow(unsafe_code)]
+    fn sha256_lanes_avx512_kernel_matches_portable() {
+        fn check<const LANES: usize>(inputs: &mut crate::cpu::testing::Inputs) {
+            let mut kernel: [[u32; LANES]; 8] =
+                core::array::from_fn(|_| core::array::from_fn(|_| inputs.next() as u32));
+
+            let mut portable = kernel;
+
+            for block in 0..4 {
+                let w: [[u32; LANES]; 16] = core::array::from_fn(|t| {
+                    core::array::from_fn(|lane| match (block + t + lane) % 7 {
+                        0 => 0,
+                        1 => u32::MAX,
+                        _ => inputs.next() as u32,
+                    })
+                });
+
+                // SAFETY: the caller checked that the CPU has AVX-512F, AVX-512VL and AVX2.
+                unsafe { super::sha2::compress256_lanes_avx512(&mut kernel, &w) };
+
+                crate::sha2::compress256_lanes_portable(&mut portable, &mut w.clone());
+
+                assert_eq!(kernel, portable, "{LANES} lanes, block {block}");
+            }
+        }
+
+        let ran = super::has(super::AVX512);
+
+        std::eprintln!("SHA-256 lanes: AVX-512VL kernel {ran}");
+
+        if !ran {
+            return;
+        }
+
+        let mut inputs = crate::cpu::testing::Inputs::new(256);
+
+        for _ in 0..500 {
+            check::<8>(&mut inputs);
+
+            check::<16>(&mut inputs);
         }
     }
 

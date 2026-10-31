@@ -87,6 +87,8 @@ Rust spelling of every name; Part II gives the Rust types.
 | `Mac.digest()` | | `digestSize` bytes; the object keeps its state | none |
 | `Mac.digestInto(out)` | out | writes `out` | INVALID_LENGTH |
 | `Mac.verify(tag)` | tag | boolean | never |
+| `ALG.key(key)` | key | a `MacKey`, the keyed state of `ALG.create(key)` for many messages ([12.6](12-symmetric-primitives.md#126-mac-algorithms) item 7) | INVALID_LENGTH for an unaccepted key length |
+| `MacKey.create()` | | a `Mac` in its state right after `ALG.create(key)`, under the same key and options | none |
 | `ALG.configure(options)` | `length` (HMAC, KMAC, BLAKE2-MAC), `customization`, `xof`, `salt`, `personalization` | a `MacAlgorithm` | INVALID_OPTION ([6.5](#65-configuration), [12.6](12-symmetric-primitives.md#126-mac-algorithms)) |
 | `ALG.digestSize`, `ALG.name` | | integer (the configured tag length), string | |
 
@@ -175,8 +177,8 @@ SP 800-185 §3.3 reserves N for functions defined by NIST.
 
 ## 6.6 Concurrency
 
-1. Algorithm values, KEM and signature key objects, and stateful public keys MUST be safe for
-   concurrent use from several threads.
+1. Algorithm values, KEM and signature key objects, `MacKey` objects and stateful public keys MUST
+   be safe for concurrent use from several threads.
 2. A `Hasher`, `Xof` or `Mac` object is a sequence of calls. Two threads MUST NOT use one such object at
    the same time; doing so is a caller error.
 3. Stateful private keys follow Section [11.13](11-stateful-signatures.md#1113-concurrency).
@@ -188,5 +190,5 @@ SP 800-185 §3.3 reserves N for functions defined by NIST.
    mechanism is in Part II.
 2. Public keys of the same algorithm compare equal when their raw encodings are equal. Private keys
    have no equality operation.
-3. Printing, formatting or debugging a private key, a `Mac`, a `Hasher`, an `Xof` or an error MUST NOT
-   reveal secret bytes. A private key prints only its algorithm name.
+3. Printing, formatting or debugging a private key, a `MacKey`, a `Mac`, a `Hasher`, an `Xof` or an
+   error MUST NOT reveal secret bytes. A private key and a `MacKey` print only their algorithm name.

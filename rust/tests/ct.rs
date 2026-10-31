@@ -587,6 +587,16 @@ fn mac(algorithm: MacAlgorithm, key_size: usize) {
 
     assert!(incremental.verify(&tag));
 
+    let keyed = algorithm.key(&key).unwrap();
+
+    let mut reused = keyed.create();
+
+    reused.update(&message);
+
+    assert!(same(&reused.digest(), &tag));
+
+    assert!(reused.verify(&tag));
+
     let mut changed = tag.clone();
 
     declassify(&changed);
@@ -596,6 +606,8 @@ fn mac(algorithm: MacAlgorithm, key_size: usize) {
     assert!(!algorithm.verify(&key, &message, &changed));
 
     assert!(!incremental.verify(&changed));
+
+    assert!(!reused.verify(&changed));
 }
 
 #[test]

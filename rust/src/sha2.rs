@@ -188,26 +188,17 @@ impl<const N: usize> Blocks<N> {
             process(blocks);
         }
 
-        self.bytes[..rest.len()].copy_from_slice(rest);
+        // An empty copy would still call memcpy.
+        if !rest.is_empty() {
+            self.bytes[..rest.len()].copy_from_slice(rest);
+        }
 
         self.len = rest.len();
     }
 
-    // FIPS 180-4, 5.1: the 0x80 marker, zeros, then the message length in bits, big-endian.
-    fn finish(&self, bits: &[u8], process: impl FnOnce(&[[u8; N]])) {
-        let mut tail = [[0; N]; 2];
-
-        tail[0][..self.len].copy_from_slice(&self.bytes[..self.len]);
-
-        tail[0][self.len] = 0x80;
-
-        let used = if self.len + 1 + bits.len() > N { 2 } else { 1 };
-
-        tail[used - 1][N - bits.len()..].copy_from_slice(bits);
-
-        process(&tail[..used]);
-
-        wipe(tail.as_flattened_mut());
+    // The buffered bytes: the message after its whole blocks.
+    fn buffered(&self) -> &[u8] {
+        &self.bytes[..self.len]
     }
 }
 
@@ -241,6 +232,14 @@ fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
         return;
     }
 
+    compress256_portable(state, blocks, more);
+}
+
+// Out of line, so that the dispatch above, which a streaming update calls for every block or two,
+// keeps no frame of its own: inlined there, the portable rounds made every call to a CPU kernel
+// save six or seven registers and reserve about 200 bytes of stack first.
+#[inline(never)]
+fn compress256_portable(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
     compress256_blocks(state, blocks.iter().chain(more));
 }
 
@@ -395,18 +394,28 @@ pub(crate) fn finish256(state: &[u32; 8], absorbed: u64, data: &[u8], out: &mut 
     let mut state = *state;
 
     if !cpu::finish256(&mut state, data, bits) {
-        let mut last = [[0; 64]; 2];
-
-        let used = pad(data, u128::from(bits), 8, &mut last);
-
-        compress256(&mut state, data.as_chunks::<64>().0, &last[..used]);
-
-        wipe(last.as_flattened_mut());
+        finish256_portable(&mut state, data, bits);
     }
 
     store256(&state, out);
 
     wipe(&mut state);
+}
+
+// Out of line, as compress256_portable, so that finish256 keeps no frame for the padded blocks
+// when a CPU kernel runs. Not on aarch64, where this body is inlined into finish256: there the
+// out-of-line form ran two instructions fewer for an empty message but took 0.5% more time on
+// Neoverse N2, with its return and output-store branch targets at the last word of a 32-byte fetch
+// block.
+#[cfg_attr(not(target_arch = "aarch64"), inline(never))]
+fn finish256_portable(state: &mut [u32; 8], data: &[u8], bits: u64) {
+    let mut last = [[0; 64]; 2];
+
+    let used = pad(data, u128::from(bits), 8, &mut last);
+
+    compress256(state, data.as_chunks::<64>().0, &last[..used]);
+
+    wipe(last.as_flattened_mut());
 }
 
 // finish256 for SHA-512, whose length field takes 16 bytes.
@@ -416,18 +425,24 @@ pub(crate) fn finish512(state: &[u64; 8], absorbed: u128, data: &[u8], out: &mut
     let mut state = *state;
 
     if !cpu::finish512(&mut state, data, bits) {
-        let mut last = [[0; 128]; 2];
-
-        let used = pad(data, bits, 16, &mut last);
-
-        compress512(&mut state, data.as_chunks::<128>().0, &last[..used]);
-
-        wipe(last.as_flattened_mut());
+        finish512_portable(&mut state, data, bits);
     }
 
     store512(&state, out);
 
     wipe(&mut state);
+}
+
+// finish256_portable for SHA-512.
+#[inline(never)]
+fn finish512_portable(state: &mut [u64; 8], data: &[u8], bits: u128) {
+    let mut last = [[0; 128]; 2];
+
+    let used = pad(data, bits, 16, &mut last);
+
+    compress512(state, data.as_chunks::<128>().0, &last[..used]);
+
+    wipe(last.as_flattened_mut());
 }
 
 // HMAC (RFC 2104) keys, built in place: the key, at most a block, padded with zeros to a block
@@ -783,6 +798,12 @@ fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
         return;
     }
 
+    compress512_portable(state, blocks, more);
+}
+
+// compress256_portable for SHA-512.
+#[inline(never)]
+fn compress512_portable(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
     compress512_blocks(state, blocks.iter().chain(more));
 }
 
@@ -915,18 +936,17 @@ impl Sha256 {
         out
     }
 
-    // The leading out.len() bytes of the digest.
+    // The leading out.len() bytes of the digest: the buffered bytes and the padding, through the
+    // one-call finish256.
     pub(crate) fn digest_into(&self, out: &mut [u8]) {
-        let mut state = self.state;
+        let data = self.blocks.buffered();
 
-        let bits = self.length.wrapping_mul(8).to_be_bytes();
-
-        self.blocks
-            .finish(&bits, |blocks| compress256(&mut state, blocks, &[]));
-
-        store256(&state, out);
-
-        wipe(&mut state);
+        finish256(
+            &self.state,
+            self.length.wrapping_sub(data.len() as u64),
+            data,
+            out,
+        );
     }
 
     // finish_lanes for messages whose padded last block the caller has already built as words,
@@ -1027,6 +1047,18 @@ impl Sha512 {
         }
     }
 
+    // A copy of other, written field by field into self: a clone moved into place went through
+    // the stack (mac.rs, MacKey).
+    pub(crate) fn copy_from(&mut self, other: &Self) {
+        self.state = other.state;
+
+        self.blocks.bytes = other.blocks.bytes;
+
+        self.blocks.len = other.blocks.len;
+
+        self.length = other.length;
+    }
+
     // Sha256::key_hmac.
     pub(crate) fn key_hmac(&mut self, key: &[u8], outer: &mut [u64; 8]) {
         let mut keyed = [[0; 8]; 2];
@@ -1058,16 +1090,14 @@ impl Sha512 {
     }
 
     pub(crate) fn digest_into(&self, out: &mut [u8]) {
-        let mut state = self.state;
+        let data = self.blocks.buffered();
 
-        let bits = self.length.wrapping_mul(8).to_be_bytes();
-
-        self.blocks
-            .finish(&bits, |blocks| compress512(&mut state, blocks, &[]));
-
-        store512(&state, out);
-
-        wipe(&mut state);
+        finish512(
+            &self.state,
+            self.length.wrapping_sub(data.len() as u128),
+            data,
+            out,
+        );
     }
 
     // Sha256::finish_lanes for one message.

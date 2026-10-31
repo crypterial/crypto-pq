@@ -307,7 +307,7 @@ jobs:
       matrix:
         include:
           - { cpu: Haswell-v4, kernels: 61 }
-          - { cpu: Denverton, kernels: 12 }
+          - { cpu: Denverton, kernels: 15 }
           - { cpu: qemu64, kernels: 0 }
     defaults:
       run:
@@ -327,7 +327,8 @@ jobs:
   # x86-64 runners are a mix of CPUs with and without it, so twelve copies of the suite run, each
   # recording its CPU and whether it took the AVX-512VL paths, and the next job fails unless one
   # took the four-state path and one the one-state path, which only the cores in the table of
-  # cpu/x86_64.rs one_state() select (AMD Zen 4 and Zen 5, Intel Ice Lake Xeon).
+  # cpu/x86_64.rs one_state() select (AMD Zen 4 and Zen 5, Intel Ice Lake Xeon), and one the
+  # SHA-256 lane kernel.
   rust-avx512:
     name: rust AVX-512VL kernels (runner ${{ matrix.copy }})
     runs-on: ubuntu-latest
@@ -352,10 +353,11 @@ jobs:
       - run: cargo test --locked --release --all-features
       - run: |
           mkdir -p "$RUNNER_TEMP/avx512"
-          four=no one=no
+          four=no one=no sha256=no
           if grep -q 'AVX-512VL: true' "$RUNNER_TEMP/kernels.txt"; then four=yes; fi
           if grep -q 'one state: true' "$RUNNER_TEMP/kernels.txt"; then one=yes; fi
-          echo "four=$four one=$one $(lscpu | sed -n 's/^Model name: *//p')" | tee "$RUNNER_TEMP/avx512/copy-${{ matrix.copy }}.txt"
+          if grep -q 'SHA-256 lanes: AVX-512VL kernel true' "$RUNNER_TEMP/kernels.txt"; then sha256=yes; fi
+          echo "four=$four one=$one sha256=$sha256 $(lscpu | sed -n 's/^Model name: *//p')" | tee "$RUNNER_TEMP/avx512/copy-${{ matrix.copy }}.txt"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: avx512-${{ matrix.copy }}
@@ -375,6 +377,7 @@ jobs:
           retry="no runner with the CPU that this path needs was assigned, so its kernels went untested: re-run the rust-avx512 jobs and this one; this is not a failure of the code"
           grep -q '^four=yes ' copy-*.txt || { echo "four-state AVX-512VL kernel: $retry"; exit 1; }
           grep -q ' one=yes ' copy-*.txt || { echo "one-state AVX-512VL kernels: $retry"; exit 1; }
+          grep -q ' sha256=yes ' copy-*.txt || { echo "SHA-256 AVX-512VL lanes kernel: $retry"; exit 1; }
 
   # Every secret is marked uninitialised under valgrind's memcheck, so a branch or a memory index
   # that depends on one fails the job; values the specifications make public are declassified.

@@ -440,7 +440,7 @@ pub use hash::{ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128};
     feature = "blake2",
     feature = "blake3"
 ))]
-pub use mac::{Mac, MacAlgorithm, MacOptions};
+pub use mac::{Mac, MacAlgorithm, MacKey, MacOptions};
 
 #[cfg(feature = "hmac")]
 pub use mac::{HMAC_SHA_224, HMAC_SHA_256, HMAC_SHA_384, HMAC_SHA_512};

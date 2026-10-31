@@ -11,6 +11,15 @@ the [crypto-pq specification](spec/00-contents.md) that it implements
 
 Implements specification 1.1 (draft).
 
+### Added
+
+- `MacAlgorithm::key`, which returns a `MacKey`, and `MacKey::create`, which returns a `Mac` in its
+  state right after `MacAlgorithm::create` under the same key and options, for every MAC algorithm
+  ([decision D-77](spec/decisions.md#decision-d-77)). The tags of many messages under one key pay
+  for the key setup once: HMAC and KMAC process no key block again. A `MacKey` may be used from
+  several threads at once, does not implement `Clone`, and wipes its keyed state when dropped.
+  `Mac` is unchanged.
+
 ### Changed
 
 - Keccak-f[1600] on x86-64 CPUs with AVX-512F and AVX-512VL: a kernel for four states side by side
@@ -96,6 +105,24 @@ Implements specification 1.1 (draft).
   start state to the wipe. The customization of Ascon-CXOF128 runs through the CPU kernels at run
   time, and the state for the empty string is a constant. The ARM64 kernel for Apple cores is
   unchanged. Outputs are unchanged.
+- SHA-256 and SHA-224 on x86-64 CPUs with the SHA extensions: a one-shot hash, the digest of a
+  hash object, and HMAC-SHA-256 and HMAC-SHA-224 each take one call that keeps the state in
+  registers from one block to the next and builds the padding in registers, without copying the
+  last bytes into a block buffer; HMAC hashes its two key blocks side by side, and the expansion of
+  HKDF-SHA-256 starts from the keyed states. Outputs are unchanged.
+- SHA-512 and SHA-384, their truncated forms, and HMAC and HKDF over them, on Arm cores with the
+  SHA-512 instructions: the rounds of the blocks that a hash object absorbs and of HMAC's key and
+  outer blocks run as four groups of sixteen with the message schedule and a last group without
+  it, in place of one loop that tested for the schedule at every double round. One-shot hashes and
+  the data of a one-shot HMAC, which the final call takes whole, keep the loop. Outputs are
+  unchanged.
+- SHA-256 on x86-64 CPUs with AVX-512F and AVX-512VL: the messages hashed side by side, eight at a
+  time, in the chains and trees of LMS and XMSS and in the SHA-2 sets of SLH-DSA take a kernel,
+  selected at run time, that keeps one message in each element of a 256-bit register and uses
+  rotations and three-input logic for Ch, Maj and the sigma functions; no code uses a 512-bit
+  register. AMD processors with the SHA extensions keep the SHA-NI kernel, which runs these hashes
+  in less time there. The SHA-NI and AVX2 kernels and the portable code stay its twins, and outputs
+  are unchanged.
 - The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
   intrinsics are stable.
 

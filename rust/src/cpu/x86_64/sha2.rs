@@ -17,7 +17,7 @@ use core::mem::MaybeUninit;
 
 #[cfg(not(crypto_pq_optimized))]
 use super::memory::words_of;
-use super::memory::{load128, load256, store256_at};
+use super::memory::{load128, load256, store256, store256_at};
 use crate::sha2::{K256, K512, first_bytes, pad};
 use crate::wipe::{wipe, wipe_unless_optimized};
 
@@ -61,6 +61,12 @@ static K512_PAIRS: [[u64; 4]; 40] = {
 type Schedule256 = MaybeUninit<[[u32; 8]; 16]>;
 
 type Schedule512 = MaybeUninit<[[u64; 4]; 40]>;
+
+// A schedule buffer at a 32-byte boundary. Its groups are written with 32-byte stores, and at 16
+// bytes past a boundary, where an array aligned to 8 bytes can fall, every other store crosses a
+// cache line; without the alignment, which case a call meets depends on its callers' frames.
+#[repr(C, align(32))]
+struct Aligned<T>(T);
 
 // One round in assembly on the registers holding a to h in their rotated roles, with 32-bit
 // registers (modifier e) for SHA-256 and 64-bit ones (r) for SHA-512: h takes W + K from the
@@ -570,47 +576,47 @@ fn stream512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]], wk:
 // The schedule buffer, which holds words of the message, is wiped at the end.
 #[target_feature(enable = "avx2,bmi1,bmi2")]
 pub(super) fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
-    let mut wk = Schedule256::uninit();
+    let mut wk = Aligned(Schedule256::uninit());
 
-    stream256(state, blocks, more, &mut wk);
+    stream256(state, blocks, more, &mut wk.0);
 
-    wipe(wk.write([[0; 8]; 16]).as_flattened_mut());
+    wipe(wk.0.write([[0; 8]; 16]).as_flattened_mut());
 }
 
 #[target_feature(enable = "avx2,bmi1,bmi2")]
 pub(super) fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
-    let mut wk = Schedule512::uninit();
+    let mut wk = Aligned(Schedule512::uninit());
 
-    stream512(state, blocks, more, &mut wk);
+    stream512(state, blocks, more, &mut wk.0);
 
-    wipe(wk.write([[0; 4]; 40]).as_flattened_mut());
+    wipe(wk.0.write([[0; 4]; 40]).as_flattened_mut());
 }
 
 // One block into each of two states: HMAC's key blocks.
 #[target_feature(enable = "avx2,bmi1,bmi2")]
 pub(super) fn compress256_pair(states: &mut [[u32; 8]; 2], blocks: &[[u8; 64]; 2]) {
-    let mut wk = Schedule256::uninit();
+    let mut wk = Aligned(Schedule256::uninit());
 
     let [first, second] = states;
 
-    first256(first, &blocks[0], &blocks[1], &mut wk);
+    first256(first, &blocks[0], &blocks[1], &mut wk.0);
 
-    second256(second, &wk);
+    second256(second, &wk.0);
 
-    wipe(wk.write([[0; 8]; 16]).as_flattened_mut());
+    wipe(wk.0.write([[0; 8]; 16]).as_flattened_mut());
 }
 
 #[target_feature(enable = "avx2,bmi1,bmi2")]
 pub(super) fn compress512_pair(states: &mut [[u64; 8]; 2], blocks: &[[u8; 128]; 2]) {
-    let mut wk = Schedule512::uninit();
+    let mut wk = Aligned(Schedule512::uninit());
 
     let [first, second] = states;
 
-    first512(first, &blocks[0], &blocks[1], &mut wk);
+    first512(first, &blocks[0], &blocks[1], &mut wk.0);
 
-    second512(second, &wk);
+    second512(second, &wk.0);
 
-    wipe(wk.write([[0; 4]; 40]).as_flattened_mut());
+    wipe(wk.0.write([[0; 4]; 40]).as_flattened_mut());
 }
 
 // The whole blocks of data and then its padding, as one stream, for a message of `bits` bits that
@@ -735,20 +741,20 @@ fn store_words<T: Copy + Into<u64>, const N: usize>(state: &[T; N], out: &mut [u
 
 #[target_feature(enable = "avx2,bmi1,bmi2")]
 pub(super) fn hmac256_keyed(keyed: &[[u32; 8]; 2], data: &[u8], tag: &mut [u8]) {
-    let mut wk = Schedule256::uninit();
+    let mut wk = Aligned(Schedule256::uninit());
 
-    mac256(keyed, data, tag, &mut wk);
+    mac256(keyed, data, tag, &mut wk.0);
 
-    wipe(wk.write([[0; 8]; 16]).as_flattened_mut());
+    wipe(wk.0.write([[0; 8]; 16]).as_flattened_mut());
 }
 
 #[target_feature(enable = "avx2,bmi1,bmi2")]
 pub(super) fn hmac512_keyed(keyed: &[[u64; 8]; 2], data: &[u8], tag: &mut [u8]) {
-    let mut wk = Schedule512::uninit();
+    let mut wk = Aligned(Schedule512::uninit());
 
-    mac512(keyed, data, tag, &mut wk);
+    mac512(keyed, data, tag, &mut wk.0);
 
-    wipe(wk.write([[0; 4]; 40]).as_flattened_mut());
+    wipe(wk.0.write([[0; 4]; 40]).as_flattened_mut());
 }
 
 // HMAC (RFC 2104) under a key of at most a block: the key's two blocks as one pair, then mac256.
@@ -764,21 +770,21 @@ pub(super) fn hmac256(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
 
     let mut keyed = [*iv; 2];
 
-    let mut wk = Schedule256::uninit();
+    let mut wk = Aligned(Schedule256::uninit());
 
     let [inner, outer] = &mut keyed;
 
-    first256(inner, &pads[0], &pads[1], &mut wk);
+    first256(inner, &pads[0], &pads[1], &mut wk.0);
 
-    second256(outer, &wk);
+    second256(outer, &wk.0);
 
-    mac256(&keyed, data, tag, &mut wk);
+    mac256(&keyed, data, tag, &mut wk.0);
 
     wipe(pads.as_flattened_mut());
 
     wipe(keyed.as_flattened_mut());
 
-    wipe(wk.write([[0; 8]; 16]).as_flattened_mut());
+    wipe(wk.0.write([[0; 8]; 16]).as_flattened_mut());
 }
 
 #[target_feature(enable = "avx2,bmi1,bmi2")]
@@ -793,19 +799,251 @@ pub(super) fn hmac512(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
 
     let mut keyed = [*iv; 2];
 
-    let mut wk = Schedule512::uninit();
+    let mut wk = Aligned(Schedule512::uninit());
 
     let [inner, outer] = &mut keyed;
 
-    first512(inner, &pads[0], &pads[1], &mut wk);
+    first512(inner, &pads[0], &pads[1], &mut wk.0);
 
-    second512(outer, &wk);
+    second512(outer, &wk.0);
 
-    mac512(&keyed, data, tag, &mut wk);
+    mac512(&keyed, data, tag, &mut wk.0);
 
     wipe(pads.as_flattened_mut());
 
     wipe(keyed.as_flattened_mut());
 
-    wipe(wk.write([[0; 4]; 40]).as_flattened_mut());
+    wipe(wk.0.write([[0; 4]; 40]).as_flattened_mut());
+}
+
+// The wipes of the AVX-512VL kernels, kept out of them: inlined there, LLVM cleared the 256-bit
+// arrays with 512-bit stores. Without AVX-512 enabled here, it uses at most 128-bit ones.
+#[cfg(not(crypto_pq_optimized))]
+#[inline(never)]
+fn wipe_apart(words: &mut [u64]) {
+    wipe(words);
+}
+
+// The vectors of group `group` of each row of words, built as one array of loads: an array set to
+// zero first and then loaded was cleared with 512-bit stores at opt-levels below 3. There the
+// arrays stay in memory, for their wipes, and with a single group LLVM joined the loads of the
+// whole contiguous state into one copy made of 512-bit moves; each value passes through an empty
+// assembly block there, so it is no longer a plain copy of memory.
+macro_rules! vectors_at {
+    ($words:expr, $group:expr, $chunk:literal; $($i:literal)*) => {
+        [$(opaque256(load256(&$words[$i].as_chunks::<$chunk>().0[$group]))),*]
+    };
+}
+
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn opaque256(mut x: __m256i) -> __m256i {
+    // SAFETY: an empty assembly block on one register, which this function's target feature
+    // provides; it reads and writes no memory, stack or flags.
+    unsafe {
+        core::arch::asm!(
+            "/* {x} */",
+            x = inout(ymm_reg) x,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+
+    x
+}
+
+#[cfg(crypto_pq_optimized)]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn opaque256(x: __m256i) -> __m256i {
+    x
+}
+
+// SHA-256 on eight lanes per vector with AVX-512VL on 256-bit registers only: word i of eight
+// lanes in one vector, as the portable lanes hold them (states[i][lane]). VPRORD rotates and
+// VPTERNLOGD takes the three-input XORs of the sigma functions, Ch and Maj, so a round is about
+// sixteen instructions on eight lanes where AVX2 needs about thirty-five. The eight state words and
+// the sixteen live schedule words fit the thirty-two registers. Every instruction is a logic,
+// rotate, shift, add, broadcast, load or store at an address that depends on LANES alone: none has
+// a data-dependent timing, branch or address.
+
+// The three-way XOR of two rotations and a third rotation (SHIFT false) or shift (SHIFT true),
+// right by R0, R1 and R2: the sigma functions of SHA-256.
+#[target_feature(enable = "avx2,avx512f,avx512vl")]
+#[inline]
+fn sigma<const R0: i32, const R1: i32, const R2: i32, const SHIFT: bool>(x: __m256i) -> __m256i {
+    let third = if SHIFT {
+        _mm256_srli_epi32::<R2>(x)
+    } else {
+        _mm256_ror_epi32::<R2>(x)
+    };
+
+    _mm256_ternarylogic_epi32::<0x96>(_mm256_ror_epi32::<R0>(x), _mm256_ror_epi32::<R1>(x), third)
+}
+
+// One round on eight lanes, the variables in their rotated roles as in the portable round256:
+// only d and h receive new values. VPTERNLOGD 0xCA is Ch (e ? f : g) and 0xE8 is Maj.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2,avx512f,avx512vl")]
+#[inline]
+fn round256x8(
+    a: __m256i,
+    b: __m256i,
+    c: __m256i,
+    d: &mut __m256i,
+    e: __m256i,
+    f: __m256i,
+    g: __m256i,
+    h: &mut __m256i,
+    k: u32,
+    w: __m256i,
+) {
+    let kw = _mm256_add_epi32(w, _mm256_set1_epi32(k as i32));
+
+    let t1 = _mm256_add_epi32(
+        _mm256_add_epi32(*h, kw),
+        _mm256_add_epi32(
+            sigma::<6, 11, 25, false>(e),
+            _mm256_ternarylogic_epi32::<0xCA>(e, f, g),
+        ),
+    );
+
+    *d = _mm256_add_epi32(*d, t1);
+
+    *h = _mm256_add_epi32(
+        _mm256_add_epi32(
+            sigma::<2, 13, 22, false>(a),
+            _mm256_ternarylogic_epi32::<0xE8>(a, b, c),
+        ),
+        t1,
+    );
+}
+
+// Sixteen rounds with the constants k, the variables back in their roles at the end.
+#[target_feature(enable = "avx2,avx512f,avx512vl")]
+#[inline]
+fn sixteen256x8(s: &mut [__m256i; 8], w: &[__m256i; 16], k: &[u32; 16]) {
+    let [a, b, c, d, e, f, g, h] = s;
+
+    round256x8(*a, *b, *c, d, *e, *f, *g, h, k[0], w[0]);
+
+    round256x8(*h, *a, *b, c, *d, *e, *f, g, k[1], w[1]);
+
+    round256x8(*g, *h, *a, b, *c, *d, *e, f, k[2], w[2]);
+
+    round256x8(*f, *g, *h, a, *b, *c, *d, e, k[3], w[3]);
+
+    round256x8(*e, *f, *g, h, *a, *b, *c, d, k[4], w[4]);
+
+    round256x8(*d, *e, *f, g, *h, *a, *b, c, k[5], w[5]);
+
+    round256x8(*c, *d, *e, f, *g, *h, *a, b, k[6], w[6]);
+
+    round256x8(*b, *c, *d, e, *f, *g, *h, a, k[7], w[7]);
+
+    round256x8(*a, *b, *c, d, *e, *f, *g, h, k[8], w[8]);
+
+    round256x8(*h, *a, *b, c, *d, *e, *f, g, k[9], w[9]);
+
+    round256x8(*g, *h, *a, b, *c, *d, *e, f, k[10], w[10]);
+
+    round256x8(*f, *g, *h, a, *b, *c, *d, e, k[11], w[11]);
+
+    round256x8(*e, *f, *g, h, *a, *b, *c, d, k[12], w[12]);
+
+    round256x8(*d, *e, *f, g, *h, *a, *b, c, k[13], w[13]);
+
+    round256x8(*c, *d, *e, f, *g, *h, *a, b, k[14], w[14]);
+
+    round256x8(*b, *c, *d, e, *f, *g, *h, a, k[15], w[15]);
+}
+
+// Schedule word T + 16 over word T: W[T] += sigma0(W[T + 1]) + W[T + 9] + sigma1(W[T + 14]).
+#[target_feature(enable = "avx2,avx512f,avx512vl")]
+#[inline]
+fn step256x8<const T: usize>(w: &mut [__m256i; 16]) {
+    let sum = _mm256_add_epi32(
+        sigma::<7, 18, 3, true>(w[(T + 1) % 16]),
+        sigma::<17, 19, 10, true>(w[(T + 14) % 16]),
+    );
+
+    w[T] = _mm256_add_epi32(w[T], _mm256_add_epi32(sum, w[(T + 9) % 16]));
+}
+
+// The next sixteen schedule words in place, written out so that every index is a constant and
+// the words stay in registers.
+#[target_feature(enable = "avx2,avx512f,avx512vl")]
+#[inline]
+fn schedule256x8(w: &mut [__m256i; 16]) {
+    step256x8::<0>(w);
+
+    step256x8::<1>(w);
+
+    step256x8::<2>(w);
+
+    step256x8::<3>(w);
+
+    step256x8::<4>(w);
+
+    step256x8::<5>(w);
+
+    step256x8::<6>(w);
+
+    step256x8::<7>(w);
+
+    step256x8::<8>(w);
+
+    step256x8::<9>(w);
+
+    step256x8::<10>(w);
+
+    step256x8::<11>(w);
+
+    step256x8::<12>(w);
+
+    step256x8::<13>(w);
+
+    step256x8::<14>(w);
+
+    step256x8::<15>(w);
+}
+
+// compress256_lanes eight lanes at a time; lanes past the last whole group of eight are left
+// alone, so the dispatch sends only multiples of eight. The blocks are read, not overwritten; the
+// caller wipes them.
+#[target_feature(enable = "avx2,avx512f,avx512vl")]
+pub(super) fn compress256_lanes_avx512<const LANES: usize>(
+    states: &mut [[u32; LANES]; 8],
+    blocks: &[[u32; LANES]; 16],
+) {
+    for group in 0..LANES / 8 {
+        let mut s = vectors_at!(states, group, 8; 0 1 2 3 4 5 6 7);
+
+        let mut w = vectors_at!(blocks, group, 8; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
+
+        // One call site for the rounds and one for the schedule, with a branch on the group: with
+        // two, LLVM made a function of the rounds, whose state and words went through the stack.
+        for (i, k) in K256.as_chunks::<16>().0.iter().enumerate() {
+            if i > 0 {
+                schedule256x8(&mut w);
+            }
+
+            sixteen256x8(&mut s, &w, k);
+        }
+
+        // The starting state is loaded again for the final sum: kept in registers, it took eight
+        // of the thirty-two and pushed schedule words to the stack.
+        for (words, vector) in states.iter_mut().zip(&s) {
+            let words = &mut words.as_chunks_mut::<8>().0[group];
+
+            store256(_mm256_add_epi32(*vector, load256(words)), words);
+        }
+
+        #[cfg(not(crypto_pq_optimized))]
+        wipe_apart(words_of(&mut s));
+
+        #[cfg(not(crypto_pq_optimized))]
+        wipe_apart(words_of(&mut w));
+    }
 }
