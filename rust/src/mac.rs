@@ -497,7 +497,61 @@ impl MacAlgorithm {
         ct::declassify_value(equal)
     }
 
-    // The tag into out, which has digest_size() bytes.
+    // The tag into out, which has digest_size() bytes. On aarch64 HMAC and KMAC leave here and the
+    // BLAKE kinds go to mac_other: with BLAKE inlined, the frame moved KMAC's Keccak state by 32
+    // bytes against a cache line, and KMAC128 took 1.0% more time on Neoverse N2.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(never)]
+    fn mac(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
+        match &self.kind {
+            #[cfg(any(
+                feature = "hmac",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
+            MacKind::Hmac(hash) if out.len() == hash.digest_size => hmac(hash, key, data, out),
+            #[cfg(any(
+                feature = "hmac",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
+            MacKind::Hmac(hash) => {
+                let mut full = [0; 64];
+
+                hmac(hash, key, data, &mut full[..hash.digest_size]);
+
+                out.copy_from_slice(&full[..out.len()]);
+
+                wipe(&mut full);
+            }
+            #[cfg(feature = "sha3")]
+            MacKind::Kmac { prefix, rate, xof } => {
+                sp800_185::kmac(prefix, *rate, key, data, *xof, out);
+            }
+            #[allow(unreachable_patterns)]
+            _ => self.mac_other(key, data, out),
+        }
+    }
+
+    // The BLAKE kinds of mac on aarch64.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(never)]
+    fn mac_other(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
+        match &self.kind {
+            #[cfg(feature = "blake2")]
+            MacKind::Blake2b(h) => blake2::mac(h, key, data, out),
+            #[cfg(feature = "blake2")]
+            MacKind::Blake2s(h) => blake2::mac(h, key, data, out),
+            #[cfg(feature = "blake3")]
+            MacKind::Blake3 => blake3::keyed_hash(key, data, out),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("mac takes HMAC and KMAC"),
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
     fn mac(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
         match &self.kind {
             #[cfg(any(

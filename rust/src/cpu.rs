@@ -60,6 +60,9 @@ use x86_64 as arch;
     ),
 )))]
 mod arch {
+    #[cfg(feature = "blake2")]
+    use crate::blake2::Kernel;
+
     // Nothing is accelerated: the portable build, and every other architecture.
     #[inline(always)]
     #[cfg(feature = "frodokem")]
@@ -263,6 +266,24 @@ mod arch {
 
     #[inline(always)]
     #[cfg(feature = "blake3")]
+    pub(crate) fn word() -> u32 {
+        0
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "blake3")]
+    pub(crate) fn blake3_digest1_now(_: u32, _: &[u32; 8], _: u32, _: &[u8], _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "blake3")]
+    pub(crate) fn blake3_portable_now(_: u32) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "blake3")]
     pub(crate) fn blake3_digest1_bytes(_: &[u8; 32], _: u32, _: &[u8], _: &mut [u8]) -> bool {
         false
     }
@@ -305,20 +326,26 @@ mod arch {
 
     #[inline(always)]
     #[cfg(feature = "blake2")]
-    pub(crate) fn blake2b_digest(_: &[u64; 8], _: &[u8], _: &mut [u8]) -> bool {
-        false
+    pub(crate) fn blake2b_digest(_: &[u64; 8], _: &[u8], _: &mut [u8]) -> Kernel {
+        Kernel::Blocks
     }
 
     #[inline(always)]
     #[cfg(feature = "blake2")]
-    pub(crate) fn blake2s_digest(_: &[u32; 8], _: &[u8], _: &mut [u8]) -> bool {
-        false
+    pub(crate) fn blake2s_digest(_: &[u32; 8], _: &[u8], _: &mut [u8]) -> Kernel {
+        Kernel::Blocks
     }
 
     #[inline(always)]
     #[cfg(feature = "blake2")]
-    pub(crate) fn blake2s_mac(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
-        false
+    pub(crate) fn blake2s_mac(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> Kernel {
+        Kernel::Blocks
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "blake2")]
+    pub(crate) fn blake2b_mac(_: &[u64; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> Kernel {
+        Kernel::Blocks
     }
 
     #[inline(always)]
@@ -576,11 +603,24 @@ pub(crate) use arch::{
 pub(crate) use arch::{ascon, ascon_digest};
 
 #[cfg(feature = "blake2")]
-pub(crate) use arch::{blake2b, blake2b_digest, blake2s, blake2s_digest, blake2s_mac};
+pub(crate) use arch::{blake2b, blake2b_digest, blake2b_mac, blake2s, blake2s_digest, blake2s_mac};
 
 #[cfg(feature = "blake3")]
 pub(crate) use arch::{
-    blake3_blocks, blake3_compress, blake3_digest1, blake3_digest1_bytes, blake3_many, blake3_xof,
+    blake3_blocks, blake3_compress, blake3_digest1, blake3_digest1_bytes, blake3_digest1_now,
+    blake3_many, blake3_portable_now, blake3_xof, word,
+};
+
+// The dispatch of blake3.rs's gathered module, x86-64 only.
+#[cfg(all(
+    feature = "blake3",
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+pub(crate) use x86_64::{
+    blake3_gathered, blake3_gathered_blocks, blake3_gathered_compress, blake3_gathered_digest1,
+    blake3_gathered_digest1_bytes,
 };
 
 #[cfg(any(
@@ -1421,6 +1461,8 @@ mod kernel_count {
 
     #[cfg(feature = "blake2")]
     fn blake2(tally: &mut Tally, inputs: &mut Inputs) {
+        use crate::blake2::Kernel;
+
         let h64: [u64; 8] = inputs.words();
 
         let h32 = h64.map(|x| x as u32);
@@ -1448,7 +1490,15 @@ mod kernel_count {
 
         tally.note(
             "blake2b_digest",
-            super::blake2b_digest(&h64, &data, &mut out),
+            matches!(super::blake2b_digest(&h64, &data, &mut out), Kernel::Done),
+        );
+
+        tally.note(
+            "blake2b_mac",
+            matches!(
+                super::blake2b_mac(&h64, &key, &data, &mut out),
+                Kernel::Done
+            ),
         );
 
         let mut h = h32;
@@ -1460,12 +1510,18 @@ mod kernel_count {
 
         tally.note(
             "blake2s_digest",
-            super::blake2s_digest(&h32, &data, &mut out[..32]),
+            matches!(
+                super::blake2s_digest(&h32, &data, &mut out[..32]),
+                Kernel::Done
+            ),
         );
 
         tally.note(
             "blake2s_mac",
-            super::blake2s_mac(&h32, &key, &data, &mut out[..32]),
+            matches!(
+                super::blake2s_mac(&h32, &key, &data, &mut out[..32]),
+                Kernel::Done
+            ),
         );
     }
 

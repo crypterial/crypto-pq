@@ -16,7 +16,7 @@
 
 use crate::cpu;
 use crate::sha2::IV_256;
-use crate::wipe::{wipe, wipe_unless_optimized};
+use crate::wipe::{registers, wipe, wipe_unless_optimized};
 
 pub(crate) const KEY: usize = 32;
 
@@ -33,6 +33,9 @@ const MAX_DEPTH: usize = 54;
 // The chunks of the largest subtree that hash_many hashes at once, a group: their chaining values
 // take 2 KiB of stack, and the parents of each level go through the kernels too.
 const WIDE: usize = 64;
+
+// The chunks of the smaller buffers of leaves, for inputs of at most 16 KiB.
+const SMALL: usize = 16;
 
 pub(crate) const CHUNK_START: u32 = 1;
 
@@ -208,6 +211,9 @@ fn compress(
     compress_portable(cv, block, counter, length, flags, out);
 }
 
+// Out of line, so that compress holds the kernel's tail call alone: with these rounds inlined, it
+// saved six registers and set up a frame before it chose the kernel.
+#[inline(never)]
 fn compress_portable(
     cv: &[u32; 8],
     block: &[u8; BLOCK],
@@ -250,7 +256,9 @@ fn chain(
     chain_portable(cv, block, counter, length, flags, out);
 }
 
-// The words of the block go from memory straight into the rounds.
+// The words of the block go from memory straight into the rounds. Out of line, as
+// compress_portable, so that chain sets up no frame before it chooses the kernel.
+#[inline(never)]
 fn chain_portable(
     cv: &[u32; 8],
     block: &[u8; BLOCK],
@@ -292,7 +300,9 @@ fn chain_blocks(
 
 // The chain stays in registers from block to block; a call per block stored it and loaded it
 // back, on the critical path. out comes first, where a returned array's address goes: last, it
-// changed the registers of the loop, and a 1 KiB hash took 1 percent longer on Apple M3.
+// changed the registers of the loop, and a 1 KiB hash took 1 percent longer on Apple M3. Out of
+// line, as compress_portable.
+#[inline(never)]
 fn chain_blocks_portable(
     out: &mut [u32; 8],
     cv: &[u32; 8],
@@ -752,7 +762,16 @@ fn single_block(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u32; 16]) {
 
     let mut last = [0; BLOCK];
 
-    last[..rest.len()].copy_from_slice(rest);
+    // A full last block is read where it lies: its copy took a call to memcpy, and the kernel's
+    // first loads waited on the copy's stores.
+    let block = match <&[u8; BLOCK]>::try_from(rest) {
+        Ok(block) => block,
+        Err(_) => {
+            last[..rest.len()].copy_from_slice(rest);
+
+            &last
+        }
+    };
 
     let mut cv = *key;
 
@@ -760,7 +779,7 @@ fn single_block(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u32; 16]) {
         chain_blocks(key, blocks, 0, flags, [CHUNK_START, 0], None, &mut cv);
     }
 
-    compress(&cv, &last, 0, rest.len() as u32, last_flags | ROOT, out);
+    compress(&cv, block, 0, rest.len() as u32, last_flags | ROOT, out);
 
     wipe(&mut cv);
 
@@ -769,7 +788,8 @@ fn single_block(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u32; 16]) {
 
 // The first out.len() bytes of output words, at most all of them.
 fn write_words<const N: usize>(v: &[u32; N], out: &mut [u8]) {
-    if let Ok(out) = <&mut [u8; 32]>::try_from(&mut *out) {
+    // Every word, the usual case: a copy of known length, which takes no call to memcpy.
+    if out.len() == 4 * N {
         for (bytes, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(v) {
             *bytes = word.to_le_bytes();
         }
@@ -777,23 +797,34 @@ fn write_words<const N: usize>(v: &[u32; N], out: &mut [u8]) {
         return;
     }
 
-    let mut bytes = [0; BLOCK];
+    // Other lengths: whole words go straight into out and a last partial word byte by byte, so
+    // that no copy of the output is left to wipe.
+    let (whole, tail) = out.as_chunks_mut::<4>();
 
-    for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(v) {
-        *chunk = word.to_le_bytes();
+    for (bytes, word) in whole.iter_mut().zip(v) {
+        *bytes = word.to_le_bytes();
     }
 
-    out.copy_from_slice(&bytes[..out.len()]);
-
-    wipe(&mut bytes);
+    if let Some(word) = v.get(whole.len()) {
+        for (i, byte) in tail.iter_mut().enumerate() {
+            *byte = (word >> (8 * i)) as u8;
+        }
+    }
 }
 
 // The two children of the root of the subtree of the chunks of `data`, at least two and at most
 // WIDE of them, the first one numbered `counter`, into out: hash_many for the whole chunks, then
 // for each level of parents, with the last value of an odd level carried up to the next, which
-// builds the tree of the specification.
-fn leaves(key: &[u32; 8], flags: u32, counter: u64, data: &[u8], out: &mut [[u32; 8]; 2]) {
-    let mut cvs = [[0; 32]; WIDE];
+// builds the tree of the specification. The buffers hold N and H = N / 2 values, N at least the
+// chunks of data: zeroing and wiping those of a whole group cost a 16 KiB input 6 KiB of stores.
+fn leaves<const N: usize, const H: usize>(
+    key: &[u32; 8],
+    flags: u32,
+    counter: u64,
+    data: &[u8],
+    out: &mut [[u32; 8]; 2],
+) {
+    let mut cvs = [[0; 32]; N];
 
     let whole = data.len() / CHUNK;
 
@@ -812,6 +843,8 @@ fn leaves(key: &[u32; 8], flags: u32, counter: u64, data: &[u8], out: &mut [[u32
     hash_many(full, &chunks, &mut cvs[..whole]);
 
     let mut count = whole;
+
+    let written = data.len().div_ceil(CHUNK);
 
     if !last.is_empty() {
         let mut node = Output::EMPTY;
@@ -839,7 +872,7 @@ fn leaves(key: &[u32; 8], flags: u32, counter: u64, data: &[u8], out: &mut [[u32
         end: 0,
     };
 
-    let mut level = [[0; 32]; WIDE / 2];
+    let mut level = [[0; 32]; H];
 
     while count > 2 {
         let pairs = count / 2;
@@ -863,9 +896,10 @@ fn leaves(key: &[u32; 8], flags: u32, counter: u64, data: &[u8], out: &mut [[u32
 
     key_words(&cvs[1], &mut out[1]);
 
-    wipe(level.as_flattened_mut());
+    // Only the values written: the rest are still zero.
+    wipe(level[..written / 2].as_flattened_mut());
 
-    wipe(cvs.as_flattened_mut());
+    wipe(cvs[..written].as_flattened_mut());
 }
 
 // The top node of at most WIDE chunks whose first one is numbered `counter`, into out: the
@@ -879,7 +913,11 @@ fn top(key: &[u32; 8], flags: u32, counter: u64, data: &[u8], out: &mut Output) 
 
     let mut halves = [[0; 8]; 2];
 
-    leaves(key, flags, counter, data, &mut halves);
+    if data.len() <= SMALL * CHUNK {
+        leaves::<SMALL, { SMALL / 2 }>(key, flags, counter, data, &mut halves);
+    } else {
+        leaves::<WIDE, { WIDE / 2 }>(key, flags, counter, data, &mut halves);
+    }
 
     parent(key, flags, &halves[0], &halves[1], out);
 
@@ -1262,31 +1300,35 @@ impl Drop for Hasher {
     }
 }
 
-// The key of derive_key's second stage into out: the context string hashed in its own mode.
-fn context_key(context: &[u8], out: &mut [u32; 8]) {
-    if context.len() <= CHUNK {
-        single_chain(&IV_256, DERIVE_KEY_CONTEXT, context, out);
+// The words of a key, as they are or from its bytes.
+trait KeyWords {
+    fn word(&self, i: usize) -> u32;
+}
 
-        return;
+impl KeyWords for [u32; 8] {
+    #[inline(always)]
+    fn word(&self, i: usize) -> u32 {
+        self[i]
     }
+}
 
-    let mut root = Output::EMPTY;
-
-    tree(&IV_256, DERIVE_KEY_CONTEXT, context, &mut root);
-
-    chain(
-        &root.cv,
-        &root.block,
-        0,
-        root.length,
-        root.flags | ROOT,
-        out,
-    );
+impl KeyWords for [u8; KEY] {
+    #[inline(always)]
+    fn word(&self, i: usize) -> u32 {
+        u32::from_le_bytes(self.as_chunks::<4>().0[i])
+    }
 }
 
 // At most 32 bytes of the root's output for at most a block of input, whose flags the caller
-// gives: one compression, its output words straight into out.
-fn digest1(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
+// gives: one compression, its output words straight into out. A key's bytes go from the caller's
+// slice into the registers of the state, with no copy in memory to wipe. Always inlined: with
+// keyed_hash and derive_key both calling it, it went out of line and the keyed MAC of an empty
+// message took 2 percent more time on Apple M3.
+#[inline(always)]
+fn digest1<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut cv: [u32; 8] = registers!(|i| key.word(i); 0 1 2 3 4 5 6 7);
+
     let mut copy = [0; BLOCK];
 
     let block = match <&[u8; BLOCK]>::try_from(data) {
@@ -1298,7 +1340,9 @@ fn digest1(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
         }
     };
 
-    let v = rounds(key, &words(block), 0, data.len() as u32, flags);
+    let v = rounds(&cv, &words(block), 0, data.len() as u32, flags);
+
+    wipe_unless_optimized!(&mut cv);
 
     let mut bytes = [0; 32];
 
@@ -1321,17 +1365,51 @@ fn digest1(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
 }
 
 // out.len() bytes of output for data in one call.
+// Inlined into its callers with the tests of a short input and of the word of features, so that
+// the kernel's call comes before any frame: out of line, one_shot saved six registers and set up a
+// frame for its other paths before it tail-called the kernel.
+#[inline(always)]
 fn one_shot(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
-    let root = flags | CHUNK_START | CHUNK_END | ROOT;
-
     if data.len() <= BLOCK && out.len() <= 32 {
-        if !cpu::blake3_digest1(key, root, data, out) {
-            digest1(key, root, data, out);
+        let root = flags | CHUNK_START | CHUNK_END | ROOT;
+
+        let word = cpu::word();
+
+        if cpu::blake3_digest1_now(word, key, root, data, out) {
+            return;
         }
+
+        if cpu::blake3_portable_now(word) {
+            digest1_words(key, root, data, out);
+
+            return;
+        }
+
+        short_rest(key, root, data, out);
 
         return;
     }
 
+    one_shot_long(key, flags, data, out);
+}
+
+// one_shot's short path on a word of features not yet probed, or on another kernel.
+#[inline(never)]
+fn short_rest(key: &[u32; 8], root: u32, data: &[u8], out: &mut [u8]) {
+    if !cpu::blake3_digest1(key, root, data, out) {
+        digest1(key, root, data, out);
+    }
+}
+
+// digest1 for a key in words, out of line so that one_shot's callers hold no copy of its rounds.
+#[inline(never)]
+fn digest1_words(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
+    digest1(key, flags, data, out);
+}
+
+// one_shot for more than a block of input or more than 32 bytes of output.
+#[inline(never)]
+fn one_shot_long(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
     if data.len() <= CHUNK && out.len() <= 32 {
         let mut v = [0; 8];
 
@@ -1359,15 +1437,70 @@ fn one_shot(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
 
 // hash: out.len() bytes of output.
 pub(crate) fn digest(data: &[u8], out: &mut [u8]) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))]
+    if cpu::blake3_gathered() {
+        return gathered::one_shot(&IV_256, 0, data, out);
+    }
+
     one_shot(&IV_256, 0, data, out);
 }
 
 pub(crate) fn keyed_hash(key: &[u8], data: &[u8], out: &mut [u8]) {
-    let key = key.try_into().expect("a 32-byte key");
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))]
+    if cpu::blake3_gathered() {
+        return gathered::keyed_hash(key, data, out);
+    }
 
-    let root = KEYED_HASH | CHUNK_START | CHUNK_END | ROOT;
+    keyed(
+        key.try_into().expect("a 32-byte key"),
+        KEYED_HASH,
+        data,
+        out,
+    );
+}
 
-    if data.len() <= BLOCK && out.len() <= 32 && cpu::blake3_digest1_bytes(key, root, data, out) {
+// derive_key(context, key material) into out. The context key is the context string hashed in its
+// own mode, as bytes, so that a short context and short key material take one compression each,
+// and no chain over a single block.
+pub(crate) fn derive_key(context: &[u8], material: &[u8], out: &mut [u8]) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))]
+    if cpu::blake3_gathered() {
+        return gathered::derive_key(context, material, out);
+    }
+
+    // The context key is a hash of the context string, which is public, so it is not wiped. Its
+    // zeroing stays: one_shot writes the key through a byte slice, as the digest kernels write
+    // their output, so the array is initialized before the call (a vector clear and two stores).
+    let mut k = [0; KEY];
+
+    one_shot(&IV_256, DERIVE_KEY_CONTEXT, context, &mut k);
+
+    keyed(&k, DERIVE_KEY_MATERIAL, material, out);
+}
+
+// The mode of flags with key's bytes as the key. A short input goes from the caller's key straight
+// into the registers of one compression.
+#[inline(always)]
+fn keyed(key: &[u8; KEY], flags: u32, data: &[u8], out: &mut [u8]) {
+    let root = flags | CHUNK_START | CHUNK_END | ROOT;
+
+    if data.len() <= BLOCK && out.len() <= 32 {
+        if !cpu::blake3_digest1_bytes(key, root, data, out) {
+            digest1(key, root, data, out);
+        }
+
         return;
     }
 
@@ -1375,20 +1508,310 @@ pub(crate) fn keyed_hash(key: &[u8], data: &[u8], out: &mut [u8]) {
 
     key_words(key, &mut k);
 
-    one_shot(&k, KEYED_HASH, data, out);
+    one_shot(&k, flags, data, out);
 
     wipe(&mut k);
 }
 
-// derive_key(context, key material) into out.
-pub(crate) fn derive_key(context: &[u8], material: &[u8], out: &mut [u8]) {
-    let mut k = [0; 8];
+// The one-shot path of the code before rows_avx2, kept for the GATHER class (cpu/x86_64.rs,
+// gather_rows()) so that those cores run the code they ran before: its functions as they were but
+// for the names of the dispatch, and one_shot and compress out of line by their attributes (they
+// were by LLVM's choice): one_shot so that digest's test stays the only cost on the other cores,
+// compress so that one_shot keeps its registers and frame.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+mod gathered {
+    use super::*;
 
-    context_key(context, &mut k);
+    // All sixteen output words of the compression of a block into out; the first eight are the
+    // next chaining value. This and the next take a kernel where there is one; their dispatch is
+    // inlined, so that the kernel is called directly. Every value derived from a chaining value is
+    // written into the caller's storage, which the caller wipes: a value returned was copied
+    // through a temporary that nothing wiped.
+    #[inline(never)]
+    fn compress(
+        cv: &[u32; 8],
+        block: &[u8; BLOCK],
+        counter: u64,
+        length: u32,
+        flags: u32,
+        out: &mut [u32; 16],
+    ) {
+        if cpu::blake3_gathered_compress(cv, block, counter, [length, flags], out) {
+            return;
+        }
 
-    one_shot(&k, DERIVE_KEY_MATERIAL, material, out);
+        compress_portable(cv, block, counter, length, flags, out);
+    }
 
-    wipe(&mut k);
+    fn compress_portable(
+        cv: &[u32; 8],
+        block: &[u8; BLOCK],
+        counter: u64,
+        length: u32,
+        flags: u32,
+        out: &mut [u32; 16],
+    ) {
+        let v = rounds(cv, &words(block), counter, length, flags);
+
+        for (i, word) in out.iter_mut().enumerate() {
+            *word = if i < 8 {
+                v[i] ^ v[i + 8]
+            } else {
+                v[i] ^ cv[i - 8]
+            };
+        }
+    }
+
+    // The chaining value after whole blocks of one chunk, from cv, into out: the first block with
+    // `start` added to the flags and the last with `end`, and then `last` if there is one.
+    #[inline]
+    fn chain_blocks(
+        cv: &[u32; 8],
+        blocks: &[[u8; BLOCK]],
+        counter: u64,
+        flags: u32,
+        edges: [u32; 2],
+        last: Last,
+        out: &mut [u32; 8],
+    ) {
+        *out = *cv;
+
+        if cpu::blake3_gathered_blocks(out, blocks, counter, flags, edges, last) {
+            return;
+        }
+
+        chain_blocks_portable(out, cv, blocks, counter, flags, edges, last);
+    }
+
+    // The chain stays in registers from block to block; a call per block stored it and loaded it
+    // back, on the critical path. out comes first, where a returned array's address goes: last, it
+    // changed the registers of the loop, and a 1 KiB hash took 1 percent longer on Apple M3.
+    fn chain_blocks_portable(
+        out: &mut [u32; 8],
+        cv: &[u32; 8],
+        blocks: &[[u8; BLOCK]],
+        counter: u64,
+        flags: u32,
+        [start, end]: [u32; 2],
+        last: Last,
+    ) {
+        let mut h = *cv;
+
+        let whole = blocks.len();
+
+        for (i, block) in blocks.iter().enumerate() {
+            let mut f = flags;
+
+            if i == 0 {
+                f |= start;
+            }
+
+            if i + 1 == whole {
+                f |= end;
+            }
+
+            let v = rounds(&h, &words(block), counter, BLOCK as u32, f);
+
+            h = core::array::from_fn(|i| v[i] ^ v[i + 8]);
+        }
+
+        if let Some((block, length, f)) = last {
+            let v = rounds(&h, &words(block), counter, length, f);
+
+            h = core::array::from_fn(|i| v[i] ^ v[i + 8]);
+        }
+
+        *out = h;
+
+        wipe_unless_optimized!(&mut h);
+    }
+
+    // The chaining value's half of the root's output for at most a chunk of input, into out: its
+    // blocks and then the last one as the root, in one pass and with no node in memory between
+    // them.
+    fn single_chain(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u32; 8]) {
+        let (whole, partial) = data.as_chunks::<BLOCK>();
+
+        // With whole blocks, the last block's chain is the output.
+        if partial.is_empty() && !whole.is_empty() {
+            chain_blocks(
+                key,
+                whole,
+                0,
+                flags,
+                [CHUNK_START, CHUNK_END | ROOT],
+                None,
+                out,
+            );
+
+            return;
+        }
+
+        let (blocks, rest, last_flags) = split_chunk(data, flags);
+
+        let mut last = [0; BLOCK];
+
+        last[..rest.len()].copy_from_slice(rest);
+
+        let tail = Some((&last, rest.len() as u32, last_flags | ROOT));
+
+        chain_blocks(key, blocks, 0, flags, [CHUNK_START, 0], tail, out);
+
+        wipe(&mut last);
+    }
+
+    // All sixteen output words of the root for at most a chunk of input, into out.
+    fn single_block(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u32; 16]) {
+        let (blocks, rest, last_flags) = split_chunk(data, flags);
+
+        let mut last = [0; BLOCK];
+
+        last[..rest.len()].copy_from_slice(rest);
+
+        let mut cv = *key;
+
+        if !blocks.is_empty() {
+            chain_blocks(key, blocks, 0, flags, [CHUNK_START, 0], None, &mut cv);
+        }
+
+        compress(&cv, &last, 0, rest.len() as u32, last_flags | ROOT, out);
+
+        wipe(&mut cv);
+
+        wipe(&mut last);
+    }
+
+    // The key of derive_key's second stage into out: the context string hashed in its own mode.
+    fn context_key(context: &[u8], out: &mut [u32; 8]) {
+        if context.len() <= CHUNK {
+            single_chain(&IV_256, DERIVE_KEY_CONTEXT, context, out);
+
+            return;
+        }
+
+        let mut root = Output::EMPTY;
+
+        tree(&IV_256, DERIVE_KEY_CONTEXT, context, &mut root);
+
+        chain(
+            &root.cv,
+            &root.block,
+            0,
+            root.length,
+            root.flags | ROOT,
+            out,
+        );
+    }
+
+    // At most 32 bytes of the root's output for at most a block of input, whose flags the caller
+    // gives: one compression, its output words straight into out.
+    fn digest1(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
+        let mut copy = [0; BLOCK];
+
+        let block = match <&[u8; BLOCK]>::try_from(data) {
+            Ok(block) => block,
+            Err(_) => {
+                copy[..data.len()].copy_from_slice(data);
+
+                &copy
+            }
+        };
+
+        let v = rounds(key, &words(block), 0, data.len() as u32, flags);
+
+        let mut bytes = [0; 32];
+
+        let target = match <&mut [u8; 32]>::try_from(&mut *out) {
+            Ok(whole) => whole,
+            Err(_) => &mut bytes,
+        };
+
+        for (i, chunk) in target.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *chunk = (v[i] ^ v[i + 8]).to_le_bytes();
+        }
+
+        if out.len() < 32 {
+            out.copy_from_slice(&bytes[..out.len()]);
+
+            wipe(&mut bytes);
+        }
+
+        wipe(&mut copy);
+    }
+
+    // out.len() bytes of output for data in one call.
+    #[inline(never)]
+    pub(super) fn one_shot(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
+        let root = flags | CHUNK_START | CHUNK_END | ROOT;
+
+        if data.len() <= BLOCK && out.len() <= 32 {
+            if !cpu::blake3_gathered_digest1(key, root, data, out) {
+                digest1(key, root, data, out);
+            }
+
+            return;
+        }
+
+        if data.len() <= CHUNK && out.len() <= 32 {
+            let mut v = [0; 8];
+
+            single_chain(key, flags, data, &mut v);
+
+            write_words(&v, out);
+
+            wipe(&mut v);
+        } else if data.len() <= CHUNK && out.len() <= BLOCK {
+            let mut v = [0; 16];
+
+            single_block(key, flags, data, &mut v);
+
+            write_words(&v, out);
+
+            wipe(&mut v);
+        } else {
+            let mut root = Output::EMPTY;
+
+            tree(key, flags, data, &mut root);
+
+            root.root(0, out);
+        }
+    }
+
+    pub(super) fn keyed_hash(key: &[u8], data: &[u8], out: &mut [u8]) {
+        let key = key.try_into().expect("a 32-byte key");
+
+        let root = KEYED_HASH | CHUNK_START | CHUNK_END | ROOT;
+
+        if data.len() <= BLOCK
+            && out.len() <= 32
+            && cpu::blake3_gathered_digest1_bytes(key, root, data, out)
+        {
+            return;
+        }
+
+        let mut k = [0; 8];
+
+        key_words(key, &mut k);
+
+        one_shot(&k, KEYED_HASH, data, out);
+
+        wipe(&mut k);
+    }
+
+    // derive_key(context, key material) into out.
+    pub(super) fn derive_key(context: &[u8], material: &[u8], out: &mut [u8]) {
+        let mut k = [0; 8];
+
+        context_key(context, &mut k);
+
+        one_shot(&k, DERIVE_KEY_MATERIAL, material, out);
+
+        wipe(&mut k);
+    }
 }
 
 #[cfg(test)]
@@ -1770,6 +2193,63 @@ mod tests {
         reference(&IV_256, DERIVE_KEY_CONTEXT, context, 0, &mut k);
 
         key_words(&k)
+    }
+
+    // The gathered module, which only the cores of GATHER reach through digest, keyed_hash and
+    // derive_key, against the reference on every core: its dispatch takes rows_gather on any core
+    // with AVX2.
+    #[test]
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))]
+    fn gathered_matches_reference() {
+        let mut inputs = Inputs::new(27);
+
+        let data = random(&mut inputs, 3 * 1024 + 1);
+
+        let key_bytes: [u8; KEY] = inputs.bytes();
+
+        let key = key_words(&key_bytes);
+
+        let context = random(&mut inputs, 1100);
+
+        let lengths = [
+            0, 1, 31, 32, 63, 64, 65, 127, 128, 1023, 1024, 1025, 2049, 3073,
+        ];
+
+        for (n, length) in lengths.into_iter().enumerate() {
+            let data = &data[..length];
+
+            let context = &context[..[0, 47, 1024, 1025, 1100][n % 5]];
+
+            let derived = context_reference(context);
+
+            for size in [1, 16, 31, 32, 33, 64, 65, 300] {
+                let mut expected = vec![0; size];
+
+                let mut actual = vec![0; size];
+
+                reference(&IV_256, 0, data, 0, &mut expected);
+
+                gathered::one_shot(&IV_256, 0, data, &mut actual);
+
+                assert_eq!(actual, expected, "hash of {length} bytes into {size}");
+
+                reference(&key, KEYED_HASH, data, 0, &mut expected);
+
+                gathered::keyed_hash(&key_bytes, data, &mut actual);
+
+                assert_eq!(actual, expected, "keyed hash of {length} bytes into {size}");
+
+                reference(&derived, DERIVE_KEY_MATERIAL, data, 0, &mut expected);
+
+                gathered::derive_key(context, data, &mut actual);
+
+                assert_eq!(actual, expected, "derive_key of {length} bytes into {size}");
+            }
+        }
     }
 
     // The three modes, one-shot, incremental in uneven pieces and read in pieces, against the

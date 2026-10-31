@@ -294,7 +294,15 @@ blends, broadcasts and loads and stores at addresses that depend on public lengt
 Intel's list of data-operand-independent timing instructions or a floating-point-domain logic, move,
 unpack, shuffle, insert or blend instruction of [D-75](#decision-d-75), with no branch, address or
 variable-latency instruction that depends on the data; which kernel runs depends only on the
-processor. CI runs them on native runners ([18.2](18-testing.md#182-cpu-tiers)). The minimum Rust
+processor. CI runs them on native runners ([18.2](18-testing.md#182-cpu-tiers)). On the same
+processors, BLAKE2b, BLAKE2s and BLAKE3 take the tier for one message: the rotations of their AVX2
+row forms that take two shifts and an OR become one VPRORD or VPRORQ (BLAKE2b by 63, BLAKE2s by 12
+and 7, BLAKE3 every rotation), and BLAKE3 moves its message words to the next round's order with
+VPERMT2D, on 128-bit and 256-bit registers, written as inline assembly in the AVX2 code, so that the
+compiler places no value in a 512-bit register. On the processors of a table of families, AMD family
+1Ah, these kernels for one message give way to the portable code in general registers, which takes
+less time there; their kernels for several messages stay. BLAKE2b and BLAKE2s keep their AVX2 forms
+on the other AMD processors with AVX-512, where VPRORD and VPRORQ take two cycles. The minimum Rust
 version is 1.89, the first in which these target features and intrinsics are stable
 ([15.2](15-platforms.md#152-supported-platforms)). Rationale: sixteen more registers, three-input
 logic and 64-bit rotations take fewer instructions per Keccak round than AVX2 does, and 256-bit
@@ -607,3 +615,21 @@ bytes on 64-bit targets, and a build of main with only that growth made one-shot
 2 to 5 percent more time on Haswell, and KMAC up to 1.5 percent. A key object leaves `Mac`, and so
 every one-shot MAC, as it was. An API addition is a MINOR version change
 ([20.1](20-versioning.md#201-versions)).
+
+## Decision D-78
+
+On Intel x86-64 processors of family 6 with Golden Cove or later cores that run without the AVX-512
+tier, by a table of models (8Fh, 97h, 9Ah, AAh, ACh, ADh, AEh, B5h, B7h, BAh, BDh, BFh, C5h, C6h,
+CCh, CFh, D5h and E5h), BLAKE3's one-shot hash, keyed hash and key derivation, of inputs and
+contexts of at most one chunk with at most 64 bytes of output, use the earlier AVX2 row form, which
+loads each half step's message words from the block, and the one-shot path that calls it; longer
+inputs, contexts and outputs and the incremental hasher keep the row form that holds the message in
+registers ([15.3](15-platforms.md#153-cpu-specific-code) item 2). The table reads the CPUID vendor
+string and the family and model of leaf 1, with the extended fields, once at detection; which form
+runs depends otherwise only on the public lengths, never on the data or the key. The constant-time
+and SSE4.1 builds leave the table out, so that their checks run the same kernels on every runner.
+Both forms are tested against the reference code on every processor with AVX2. Rationale: with
+AVX-512 hidden, as on the client processors of these cores, the earlier form took 1.2 and 2.3
+percent less time for 64 bytes on Emerald Rapids and Granite Rapids and 0.6 percent less for 1 KiB
+on both, while on Haswell its kernels took 5 percent more for 1 KiB and on AMD Zen 3 1.1 percent
+more, so other processors keep the newer form; the models not measured are of the same core line.

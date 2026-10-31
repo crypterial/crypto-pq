@@ -61,6 +61,13 @@ mod blake2;
 #[cfg(feature = "blake3")]
 mod blake3;
 
+#[cfg(any(feature = "blake2", feature = "blake3"))]
+mod evex;
+
+// BLAKE's AVX-512VL kernels on every CPU with AVX512, whatever the dispatch chooses.
+#[cfg(all(test, feature = "blake2", feature = "blake3"))]
+mod blake_vl_tests;
+
 #[cfg(feature = "ml-dsa")]
 mod dsa;
 
@@ -88,6 +95,8 @@ mod ntt;
 
 mod sha2;
 
+#[cfg(feature = "blake2")]
+use crate::blake2::Kernel;
 #[cfg(feature = "ml-dsa")]
 use crate::cpu::Pack;
 #[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
@@ -139,6 +148,17 @@ const AVX512_ONE: u32 = 1 << 5;
 // AVX512 on an AMD core, whose kernels take theta's values per column (keccak.rs, round_avx512).
 const AVX512_AMD: u32 = 1 << 6;
 
+// A core that runs BLAKE2 and BLAKE3 on one message in less time in general registers than in
+// the vector row form, by the table in one_message(): their single-message dispatch then chooses
+// the portable code. Kernels on several messages keep the vector code, apart from BLAKE3's two
+// inputs side by side in the row form (hash_many_avx2's pair).
+const ONE_MESSAGE: u32 = 1 << 7;
+
+// A core that runs BLAKE3's one-shot hashes in the code before rows_avx2 (blake3.rs, gathered), by
+// the table in gather_rows(), on a core without AVX512 (whose cores of the table take the
+// AVX-512VL tier). No tier test reads it.
+const GATHER: u32 = 1 << 8;
+
 const READY: u32 = 1 << 31;
 
 // What the build guarantees needs no detection, and its check folds away.
@@ -183,6 +203,14 @@ const fn usable(feature: u32) -> bool {
         return false;
     }
 
+    // The checks of the vector kernels run on whatever runner CI gets, so these builds keep them
+    // on every core.
+    let class = feature == ONE_MESSAGE || feature == GATHER;
+
+    if class && (cfg!(crypto_pq_sse41) || cfg!(crypto_pq_ct)) {
+        return false;
+    }
+
     if cfg!(crypto_pq_ct) {
         return feature != SHA && !avx512;
     }
@@ -192,7 +220,6 @@ const fn usable(feature: u32) -> bool {
 
 static FEATURES: AtomicU32 = AtomicU32::new(0);
 
-// Every thread that finds the cache empty computes the same value, so a relaxed store suffices.
 #[inline]
 fn has(feature: u32) -> bool {
     if !usable(feature) {
@@ -203,6 +230,13 @@ fn has(feature: u32) -> bool {
         return true;
     }
 
+    features() & feature != 0
+}
+
+// The features found, detected on the first call. Every thread that finds the cache empty computes
+// the same value, so a relaxed store suffices.
+#[inline]
+fn features() -> u32 {
     let mut found = FEATURES.load(Ordering::Relaxed);
 
     if found == 0 {
@@ -211,14 +245,135 @@ fn has(feature: u32) -> bool {
         FEATURES.store(found, Ordering::Relaxed);
     }
 
-    found & feature != 0
+    found
 }
 
 // As has, without the first call's detection: false until another kernel's dispatch has run it.
 // With no call in it, a caller whose other paths are out of line needs no saved registers.
 #[inline]
+#[cfg(feature = "blake3")]
 fn known(feature: u32) -> bool {
     usable(feature) && (guaranteed(feature) || FEATURES.load(Ordering::Relaxed) & feature != 0)
+}
+
+// As has, for the features found by one read of them.
+#[inline]
+fn among(found: u32, feature: u32) -> bool {
+    usable(feature) && (guaranteed(feature) || found & feature != 0)
+}
+
+// The kernels of BLAKE2 and BLAKE3 for one message, chosen by one read of the features: a read for
+// each of AVX2, ONE_MESSAGE and AVX512 took a one-block digest of BLAKE3 more time.
+#[cfg(any(feature = "blake2", feature = "blake3"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Blake {
+    Vl,
+    Avx2,
+    Sse41,
+    Portable,
+}
+
+// BLAKE2 takes the AVX-512VL row forms on Intel's cores only. On AMD Zen 4 (family 19h) VPRORD
+// takes two cycles, where each of the two shifts and the OR it replaces takes one, and BLAKE2s-256
+// of 64 bytes took 98.5 ns with VPRORD against 92.2 ns with the AVX2 form (EPYC 9V74, five
+// runners); Zen 5 runs the portable code (ONE_MESSAGE).
+#[inline]
+#[cfg(feature = "blake2")]
+fn blake2(found: u32) -> Blake {
+    match blake(found) {
+        Blake::Vl if among(found, AVX512_AMD) => Blake::Avx2,
+        one => one,
+    }
+}
+
+// Whether the word of FEATURES as read chooses the AVX2 row forms (vl false) or the AVX-512VL ones
+// (vl true), as blake() would: probed, with AVX2, without ONE_MESSAGE, and without or with AVX512.
+// One test of the word, where features() and blake() take a test and a branch for each bit, and
+// Haswell's path to the kernel was three branches longer than before the Blake tiers.
+#[inline(always)]
+#[cfg(any(feature = "blake2", feature = "blake3"))]
+fn tier(word: u32, vl: bool) -> bool {
+    if !usable(AVX2) || vl && !usable(AVX512) {
+        return false;
+    }
+
+    let mut mask = READY;
+
+    let mut want = READY;
+
+    if !guaranteed(AVX2) {
+        mask |= AVX2;
+
+        want |= AVX2;
+    }
+
+    if usable(ONE_MESSAGE) {
+        mask |= ONE_MESSAGE;
+    }
+
+    if guaranteed(AVX512) {
+        if !vl {
+            return false;
+        }
+    } else if usable(AVX512) {
+        mask |= AVX512;
+
+        if vl {
+            want |= AVX512;
+        }
+    }
+
+    word & mask == want
+}
+
+// blake(features()), with the AVX2 and AVX-512VL tiers tested first on the word as read.
+#[inline]
+#[cfg(feature = "blake3")]
+fn blake_now() -> Blake {
+    let word = FEATURES.load(Ordering::Relaxed);
+
+    if tier(word, false) {
+        return Blake::Avx2;
+    }
+
+    if tier(word, true) {
+        return Blake::Vl;
+    }
+
+    blake(features())
+}
+
+// blake2(features()), as blake_now.
+#[inline]
+#[cfg(feature = "blake2")]
+fn blake2_now() -> Blake {
+    if tier(FEATURES.load(Ordering::Relaxed), false) {
+        return Blake::Avx2;
+    }
+
+    blake2(features())
+}
+
+#[inline]
+#[cfg(any(feature = "blake2", feature = "blake3"))]
+fn blake(found: u32) -> Blake {
+    if among(found, AVX2) {
+        if among(found, ONE_MESSAGE) {
+            return Blake::Portable;
+        }
+
+        if among(found, AVX512) {
+            return Blake::Vl;
+        }
+
+        return Blake::Avx2;
+    }
+
+    if among(found, SSE41) {
+        return Blake::Sse41;
+    }
+
+    Blake::Portable
 }
 
 // CPUID leaf 1 ECX: SSSE3 bit 9, SSE4.1 bit 19, AES bit 25, OSXSAVE bit 27, AVX
@@ -270,6 +425,10 @@ fn probe() -> u32 {
         found |= AVX2;
     }
 
+    if one_message(vendor, leaf1.eax) {
+        found |= ONE_MESSAGE;
+    }
+
     if found & AVX2 != 0 && leaf7.ebx & (1 << 16) != 0 && leaf7.ebx & (1 << 31) != 0 {
         // SAFETY: XGETBV exists, as AVX2 was found with OSXSAVE.
         if avx512_state(unsafe { _xgetbv(0) }) {
@@ -285,6 +444,11 @@ fn probe() -> u32 {
         }
     }
 
+    // Only without AVX512: a core of the table with AVX512 takes the AVX-512VL tier.
+    if found & AVX512 == 0 && gather_rows(vendor, leaf1.eax) {
+        found |= GATHER;
+    }
+
     found
 }
 
@@ -297,6 +461,57 @@ fn probe() -> u32 {
 // (ADh) 194 against 194-203. Cores not in the table, measured or not, keep the scalar kernel, as
 // before this tier, and so do cores of other vendors whatever their family and model.
 fn one_state(vendor: Vendor, eax: u32) -> bool {
+    let (family, model) = family_model(eax);
+
+    match vendor {
+        Vendor::Amd => family == 0x19 || family == 0x1A,
+        Vendor::Intel => family == 0x6 && (model == 0x6A || model == 0x6C),
+        Vendor::Other => false,
+    }
+}
+
+// Whether a core runs BLAKE2b, BLAKE2s and BLAKE3 on one message in less time in general registers
+// than in the vector row form, from the family and model in CPUID leaf 1 EAX. The row form is a
+// chain of dependent vector instructions, and the scalar code a chain as long of one-cycle integer
+// instructions. AMD Zen 5 (family 1Ah) takes two cycles for each vector integer instruction
+// (EPYC 9V45: VPADDD, VPXOR and VPSHUFB each two cycles on a dependent chain, against one for
+// ADD), and there the portable code took 81 ns for BLAKE2s-256 of 64 bytes, 95 ns for BLAKE2b-512
+// of 64 bytes and 51 ns for BLAKE3 of 64 bytes, against 118, 141 and 74 ns for the AVX2 row forms
+// (two runners).
+// Cores not in the table keep the vector kernels, and so do cores of other vendors.
+fn one_message(vendor: Vendor, eax: u32) -> bool {
+    let (family, _) = family_model(eax);
+
+    vendor == Vendor::Amd && family == 0x1A
+}
+
+// Whether a core runs BLAKE3's one-shot hashes in less time in the code before rows_avx2 than in
+// rows_avx2 and the inlined short path, from the family and model in CPUID leaf 1 EAX: Intel's
+// cores from Golden Cove on (family 6). With AVX-512 hidden, that code took 1.2% less time for 64
+// bytes on Emerald Rapids (model CFh) and 2.3% less on Granite Rapids (ADh), and 0.6% less for 1
+// KiB on both; its AVX2 kernels took 5% more for 1 KiB on Haswell (3Fh) and 1.1% more on AMD Zen
+// 3. The other models are of the same core line, not measured: Alder Lake (97h, 9Ah), Raptor Lake
+// (B7h, BAh, BFh), Sapphire Rapids (8Fh), Meteor Lake (AAh, ACh), Granite Rapids-D (AEh), Lunar
+// Lake (BDh), Arrow Lake (B5h, C5h, C6h), Panther Lake (CCh, E5h) and Wildcat Lake (D5h). A core
+// of the table runs that code's one-shot path behind one test of the word: its functions copied,
+// its digest1 kernels instruction for instruction, and its chain and compress kernels from the
+// same source, the same instructions in the release build. None of them, the E-cores of the
+// hybrid chips included, falls behind that code. Intel's families 18 and 19 (Nova Lake, Diamond
+// Rapids) are not in the table. Cores not in the table keep rows_avx2, and so do cores of other
+// vendors.
+fn gather_rows(vendor: Vendor, eax: u32) -> bool {
+    const MODELS: [u32; 18] = [
+        0x8F, 0x97, 0x9A, 0xAA, 0xAC, 0xAD, 0xAE, 0xB5, 0xB7, 0xBA, 0xBD, 0xBF, 0xC5, 0xC6, 0xCC,
+        0xCF, 0xD5, 0xE5,
+    ];
+
+    let (family, model) = family_model(eax);
+
+    vendor == Vendor::Intel && family == 0x6 && MODELS.contains(&model)
+}
+
+// The family and model of CPUID leaf 1 EAX, with the extended fields where they apply.
+fn family_model(eax: u32) -> (u32, u32) {
     let base = (eax >> 8) & 0xF;
 
     let family = if base == 0xF {
@@ -312,11 +527,7 @@ fn one_state(vendor: Vendor, eax: u32) -> bool {
             0
         };
 
-    match vendor {
-        Vendor::Amd => family == 0x19 || family == 0x1A,
-        Vendor::Intel => family == 0x6 && (model == 0x6A || model == 0x6C),
-        Vendor::Other => false,
-    }
+    (family, model)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -484,12 +695,16 @@ impl Wide {
 #[allow(unsafe_code)]
 #[cfg(feature = "blake3")]
 pub(crate) fn blake3_many(input: &[u8], many: &crate::blake3::Many, out: &mut [[u8; 32]]) -> usize {
-    if has(AVX2) {
+    let found = features();
+
+    if among(found, AVX2) {
+        let pair = !among(found, ONE_MESSAGE);
+
         // SAFETY: the CPU has AVX2 and the operating system saves its registers.
-        return unsafe { blake3::hash_many_avx2(input, many, out) };
+        return unsafe { blake3::hash_many_avx2(input, many, out, pair) };
     }
 
-    if has(SSE41) {
+    if among(found, SSE41) {
         // SAFETY: the CPU has SSSE3 and SSE4.1, all that the kernel needs.
         return unsafe { blake3::hash_many_sse41(input, many, out) };
     }
@@ -532,16 +747,49 @@ pub(crate) fn blake3_blocks(
     edges: [u32; 2],
     last: crate::blake3::Last,
 ) -> bool {
-    if has(AVX2) {
+    match blake_now() {
+        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2, and the operating system saves
+        // their registers.
+        Blake::Vl => unsafe { blake3::chain_vl(cv, blocks, counter, flags, edges, last) },
+        // SAFETY: as in blake3_many, here and in the next.
+        Blake::Avx2 => unsafe { blake3::chain_avx2(cv, blocks, counter, flags, edges, last) },
+        Blake::Sse41 => unsafe { blake3::chain_sse41(cv, blocks, counter, flags, edges, last) },
+        Blake::Portable => return false,
+    }
+
+    true
+}
+
+// The word of FEATURES as it is, read once for the tests of blake3_digest1_now and
+// blake3_portable_now.
+#[inline(always)]
+#[cfg(feature = "blake3")]
+pub(crate) fn word() -> u32 {
+    FEATURES.load(Ordering::Relaxed)
+}
+
+// blake3_digest1 when the word of FEATURES as read chooses a vector kernel, with no probe: a test
+// and a tail call, which one_shot's callers make before any frame of their own.
+#[inline(always)]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_digest1_now(
+    word: u32,
+    key: &[u32; 8],
+    flags: u32,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
+    if tier(word, false) {
         // SAFETY: as in blake3_many.
-        unsafe { blake3::chain_avx2(cv, blocks, counter, flags, edges, last) };
+        unsafe { blake3::digest1_avx2(key, flags, data, out) };
 
         return true;
     }
 
-    if has(SSE41) {
-        // SAFETY: as in blake3_many.
-        unsafe { blake3::chain_sse41(cv, blocks, counter, flags, edges, last) };
+    if tier(word, true) {
+        // SAFETY: as in blake3_blocks.
+        unsafe { blake3::digest1_vl(key, flags, data, out) };
 
         return true;
     }
@@ -549,16 +797,22 @@ pub(crate) fn blake3_blocks(
     false
 }
 
+// Whether the word of FEATURES as read chooses the portable code for one message (ONE_MESSAGE).
+#[inline(always)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_portable_now(word: u32) -> bool {
+    word & READY != 0 && among(word, AVX2) && among(word, ONE_MESSAGE)
+}
+
 // A one-block digest of at most 32 bytes in one call.
 #[inline]
 #[cfg(feature = "blake3")]
 pub(crate) fn blake3_digest1(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) -> bool {
-    digest1(has, key, flags, data, out)
+    digest1(key, flags, data, out)
 }
 
 // As blake3_digest1, from the key's bytes, which the kernels load as the words, so that the caller
-// stores no converted copy of a secret key. It does not detect the CPU (known): until another
-// dispatch has, it returns false and the caller takes its blake3_digest1 path.
+// stores no converted copy of a secret key.
 #[inline]
 #[cfg(feature = "blake3")]
 pub(crate) fn blake3_digest1_bytes(
@@ -567,13 +821,91 @@ pub(crate) fn blake3_digest1_bytes(
     data: &[u8],
     out: &mut [u8],
 ) -> bool {
-    digest1(known, key, flags, data, out)
+    digest1(key, flags, data, out)
 }
 
 #[inline(always)]
 #[allow(unsafe_code)]
 #[cfg(feature = "blake3")]
 fn digest1<K: memory::Plain, const N: usize>(
+    key: &[K; N],
+    flags: u32,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
+    match blake_now() {
+        // SAFETY: as in blake3_blocks.
+        Blake::Vl => unsafe { blake3::digest1_vl(key, flags, data, out) },
+        // SAFETY: as in blake3_many, here and in the next.
+        Blake::Avx2 => unsafe { blake3::digest1_avx2(key, flags, data, out) },
+        Blake::Sse41 => unsafe { blake3::digest1_sse41(key, flags, data, out) },
+        Blake::Portable => return false,
+    }
+
+    true
+}
+
+#[inline]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_compress(
+    cv: &[u32; 8],
+    block: &[u8; 64],
+    counter: u64,
+    [length, flags]: [u32; 2],
+    out: &mut [u32; 16],
+) -> bool {
+    match blake_now() {
+        // SAFETY: as in blake3_blocks.
+        Blake::Vl => unsafe { blake3::compress_vl(cv, block, counter, length, flags, out) },
+        // SAFETY: as in blake3_many, here and in the next.
+        Blake::Avx2 => unsafe { blake3::compress_avx2(cv, block, counter, length, flags, out) },
+        Blake::Sse41 => unsafe { blake3::compress_sse41(cv, block, counter, length, flags, out) },
+        Blake::Portable => return false,
+    }
+
+    true
+}
+
+// Whether the word of FEATURES as read has GATHER: blake3.rs's digest, keyed_hash and derive_key
+// then take its gathered module, one test and a branch on a word their callers have read.
+#[inline(always)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_gathered() -> bool {
+    usable(GATHER) && usable(AVX2) && FEATURES.load(Ordering::Relaxed) & GATHER != 0
+}
+
+// The dispatch of blake3.rs's gathered module: blake3_digest1, blake3_digest1_bytes,
+// blake3_blocks and blake3_compress of the code before rows_avx2, with its AVX2 kernels
+// (rows_gather).
+#[inline]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_gathered_digest1(
+    key: &[u32; 8],
+    flags: u32,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
+    gathered_digest1(has, key, flags, data, out)
+}
+
+// As blake3_gathered_digest1, from the key's bytes. It does not detect the CPU (known): until
+// another dispatch has, it returns false and the caller takes its blake3_gathered_digest1 path.
+#[inline]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_gathered_digest1_bytes(
+    key: &[u8; 32],
+    flags: u32,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
+    gathered_digest1(known, key, flags, data, out)
+}
+
+#[inline(always)]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake3")]
+fn gathered_digest1<K: memory::Plain, const N: usize>(
     has: fn(u32) -> bool,
     key: &[K; N],
     flags: u32,
@@ -582,7 +914,7 @@ fn digest1<K: memory::Plain, const N: usize>(
 ) -> bool {
     if has(AVX2) {
         // SAFETY: as in blake3_many.
-        unsafe { blake3::digest1_avx2(key, flags, data, out) };
+        unsafe { blake3::digest1_gather(key, flags, data, out) };
 
         return true;
     }
@@ -600,7 +932,35 @@ fn digest1<K: memory::Plain, const N: usize>(
 #[inline]
 #[allow(unsafe_code)]
 #[cfg(feature = "blake3")]
-pub(crate) fn blake3_compress(
+pub(crate) fn blake3_gathered_blocks(
+    cv: &mut [u32; 8],
+    blocks: &[[u8; 64]],
+    counter: u64,
+    flags: u32,
+    edges: [u32; 2],
+    last: crate::blake3::Last,
+) -> bool {
+    if has(AVX2) {
+        // SAFETY: as in blake3_many.
+        unsafe { blake3::chain_gather(cv, blocks, counter, flags, edges, last) };
+
+        return true;
+    }
+
+    if has(SSE41) {
+        // SAFETY: as in blake3_many.
+        unsafe { blake3::chain_sse41(cv, blocks, counter, flags, edges, last) };
+
+        return true;
+    }
+
+    false
+}
+
+#[inline]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_gathered_compress(
     cv: &[u32; 8],
     block: &[u8; 64],
     counter: u64,
@@ -609,7 +969,7 @@ pub(crate) fn blake3_compress(
 ) -> bool {
     if has(AVX2) {
         // SAFETY: as in blake3_many.
-        unsafe { blake3::compress_avx2(cv, block, counter, length, flags, out) };
+        unsafe { blake3::compress_gather(cv, block, counter, length, flags, out) };
 
         return true;
     }
@@ -1588,6 +1948,24 @@ fn digest_avx512(
     true
 }
 
+// Whether the word of FEATURES as read takes BLAKE2's portable code for one message
+// (ONE_MESSAGE).
+#[inline(always)]
+#[cfg(feature = "blake2")]
+fn blake2_portable(word: u32) -> bool {
+    word & READY != 0 && among(word, AVX2) && among(word, ONE_MESSAGE)
+}
+
+// Whether the word of FEATURES as read takes BLAKE2's AVX2 kernels, as blake2(features()) would:
+// the AVX2 tier, or the AVX-512VL one on the AMD cores that blake2() moves to AVX2 (AVX512_AMD).
+#[inline(always)]
+#[cfg(feature = "blake2")]
+fn blake2_avx2(word: u32) -> bool {
+    tier(word, false) || tier(word, true) && among(word, AVX512_AMD)
+}
+
+// The BLAKE2 functions below read FEATURES out of line: a read inlined into the generic engine
+// made FEATURES visible to other crates, and so every read of it in this crate took the GOT.
 #[allow(unsafe_code)]
 #[cfg(feature = "blake2")]
 pub(crate) fn blake2b(
@@ -1597,21 +1975,18 @@ pub(crate) fn blake2b(
     counter: u128,
     last: Option<(&[u64; 16], u128)>,
 ) -> bool {
-    if has(AVX2) {
+    match blake2_now() {
+        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2, and the operating system saves
+        // their registers.
+        Blake::Vl => unsafe { blake2::blake2b_vl(h, first, blocks, counter, last) },
         // SAFETY: the CPU has AVX2 and the operating system saves its registers.
-        unsafe { blake2::blake2b_avx2(h, first, blocks, counter, last) };
-
-        return true;
-    }
-
-    if has(SSE41) {
+        Blake::Avx2 => unsafe { blake2::blake2b_avx2(h, first, blocks, counter, last) },
         // SAFETY: the CPU has SSSE3 and SSE4.1, all that the kernel needs.
-        unsafe { blake2::blake2b_sse41(h, first, blocks, counter, last) };
-
-        return true;
+        Blake::Sse41 => unsafe { blake2::blake2b_sse41(h, first, blocks, counter, last) },
+        Blake::Portable => return false,
     }
 
-    false
+    true
 }
 
 #[allow(unsafe_code)]
@@ -1623,14 +1998,17 @@ pub(crate) fn blake2s(
     counter: u64,
     last: Option<(&[u32; 16], u128)>,
 ) -> bool {
-    if has(AVX2) {
+    let one = blake2_now();
+
+    if let Some(kernel) = blake2s_kernel(one) {
         let mut first = first.map(blake2::bytes32);
 
         let mut last = last.map(|(m, total)| (blake2::bytes32(m), total as u64));
 
-        // SAFETY: the CPU has AVX2 and the operating system saves its registers.
+        // SAFETY: the CPU has AVX2, and AVX-512F and AVX-512VL if blake2s_kernel chose
+        // their kernel; the operating system saves the registers of both.
         unsafe {
-            blake2::blake2s_avx2(
+            kernel(
                 h,
                 first.as_ref(),
                 blocks,
@@ -1651,7 +2029,7 @@ pub(crate) fn blake2s(
         return true;
     }
 
-    if !has(SSE41) {
+    if one != Blake::Sse41 {
         return false;
     }
 
@@ -1663,27 +2041,127 @@ pub(crate) fn blake2s(
 
 // BLAKE2's digest in one call with the state in registers throughout: the generic path's word
 // conversions, chaining value copies and calls cost a 64-byte message a sixth of its time.
-#[allow(unsafe_code)]
 #[cfg(feature = "blake2")]
-pub(crate) fn blake2b_digest(h: &[u64; 8], data: &[u8], out: &mut [u8]) -> bool {
-    if !has(AVX2) {
-        return false;
-    }
-
-    // SAFETY: the CPU has AVX2 and the operating system saves its registers.
-    unsafe { blake2::blake2b_digest_avx2(h, data, out) };
-
-    true
+pub(crate) fn blake2b_digest(h: &[u64; 8], data: &[u8], out: &mut [u8]) -> Kernel {
+    blake2b_keyed(h, &[], data, out)
 }
 
-// BLAKE2s's digest and MAC in one call of the AVX2 code each, with the blocks found here.
+// BLAKE2b's MAC in the same call, the key block first.
+#[cfg(feature = "blake2")]
+pub(crate) fn blake2b_mac(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
+    blake2b_keyed(h, key, data, out)
+}
+
+// The tiers of the word as read, then blake2b_tiers. The portable tier returns Portable, so that
+// the generic code takes the portable code with no second read of FEATURES: with that read and its
+// call, Zen 5 (ONE_MESSAGE) took up to 2.8% more time for a message of 0 or 64 bytes (EPYC 9V45).
+// The rest out of line, so that the digest stays small enough to be inlined into its caller: out
+// of line, it took 1.3 to 3.7% more time for a message of 0 or 64 bytes (EPYC 7763 and 9V74, Xeon
+// 8370C).
+#[inline(always)]
 #[allow(unsafe_code)]
 #[cfg(feature = "blake2")]
-pub(crate) fn blake2s_digest(h: &[u32; 8], data: &[u8], out: &mut [u8]) -> bool {
-    if !has(AVX2) {
-        return false;
+fn blake2b_keyed(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
+    let word = FEATURES.load(Ordering::Relaxed);
+
+    if blake2_avx2(word) {
+        // SAFETY: the CPU has AVX2 (blake2_avx2 tests it) and the operating system saves its
+        // registers.
+        unsafe { blake2::blake2b_digest_avx2(h, key, data, out) };
+
+        return Kernel::Done;
     }
 
+    if tier(word, true) {
+        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2 (tier tests them), and the
+        // operating system saves their registers.
+        unsafe { blake2::blake2b_digest_vl(h, key, data, out) };
+
+        return Kernel::Done;
+    }
+
+    if blake2_portable(word) {
+        return Kernel::Portable;
+    }
+
+    blake2b_tiers(h, key, data, out)
+}
+
+// blake2b_keyed by blake2(features()), which probes the CPU on the first call.
+#[inline(never)]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake2")]
+fn blake2b_tiers(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
+    match blake2(features()) {
+        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2, and the operating system saves
+        // their registers.
+        Blake::Vl => unsafe { blake2::blake2b_digest_vl(h, key, data, out) },
+        // SAFETY: the CPU has AVX2 and the operating system saves its registers.
+        Blake::Avx2 => unsafe { blake2::blake2b_digest_avx2(h, key, data, out) },
+        Blake::Sse41 => return Kernel::Blocks,
+        Blake::Portable => return Kernel::Portable,
+    }
+
+    Kernel::Done
+}
+
+// The BLAKE2s kernel for one message of the AVX2 code, with AVX-512VL or without.
+#[cfg(feature = "blake2")]
+type Blake2sKernel = unsafe fn(
+    &mut [u32; 8],
+    Option<&[u8; 64]>,
+    &[[u8; 64]],
+    Option<(&[u8; 64], u64)>,
+    u64,
+    Option<&mut [u8]>,
+);
+
+#[inline]
+#[cfg(feature = "blake2")]
+fn blake2s_kernel(one: Blake) -> Option<Blake2sKernel> {
+    match one {
+        Blake::Vl => Some(blake2::blake2s_vl),
+        Blake::Avx2 => Some(blake2::blake2s_avx2),
+        Blake::Sse41 | Blake::Portable => None,
+    }
+}
+
+// BLAKE2s's digest and MAC in one call of the AVX2 code each, with the blocks found here. One read
+// of FEATURES picks the AVX2 kernel, else the portable code for one message (ONE_MESSAGE), else
+// the other tiers, and one call reaches the function that calls the kernel, as before these tiers.
+// Each tier calls its kernel directly, as the functions below are inlined with the kernel known.
+// The digest reads FEATURES in that function, as before these tiers: on Zen 4 a read in its
+// caller, then a call of the AVX2 code, took up to 1.4 ns more on a message of 0 or 64 bytes.
+#[inline(never)]
+#[cfg(feature = "blake2")]
+pub(crate) fn blake2s_digest(h: &[u32; 8], data: &[u8], out: &mut [u8]) -> Kernel {
+    let word = FEATURES.load(Ordering::Relaxed);
+
+    if blake2_avx2(word) {
+        return blake2s_digest_with(blake2::blake2s_avx2, h, data, out);
+    }
+
+    if blake2_portable(word) {
+        return Kernel::Portable;
+    }
+
+    blake2s_digest_kernels(h, data, out)
+}
+
+#[cfg(feature = "blake2")]
+fn blake2s_digest_kernels(h: &[u32; 8], data: &[u8], out: &mut [u8]) -> Kernel {
+    match blake2(features()) {
+        Blake::Vl => blake2s_digest_with(blake2::blake2s_vl, h, data, out),
+        Blake::Avx2 => blake2s_digest_with(blake2::blake2s_avx2, h, data, out),
+        Blake::Sse41 => Kernel::Blocks,
+        Blake::Portable => Kernel::Portable,
+    }
+}
+
+#[inline(always)]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake2")]
+fn blake2s_digest_with(kernel: Blake2sKernel, h: &[u32; 8], data: &[u8], out: &mut [u8]) -> Kernel {
     let (blocks, tail) = blake2::split32(data);
 
     // The kernel's working copy of the chaining value, wiped after it.
@@ -1692,24 +2170,58 @@ pub(crate) fn blake2s_digest(h: &[u32; 8], data: &[u8], out: &mut [u8]) -> bool 
     blake2::final32(tail, |last| {
         let total = data.len() as u64;
 
-        // SAFETY: the CPU has AVX2 and the operating system saves its registers.
-        unsafe {
-            blake2::blake2s_avx2(&mut state, None, blocks, Some((last, total)), 0, Some(out))
-        };
+        // SAFETY: the CPU has AVX2, and AVX-512F and AVX-512VL if blake2s_digest_kernels chose
+        // their kernel (blake2_avx2 and blake2 test them); the operating system saves them.
+        unsafe { kernel(&mut state, None, blocks, Some((last, total)), 0, Some(out)) };
     });
 
     wipe(&mut state);
 
-    true
+    Kernel::Done
 }
 
-// The key, zero-padded to a block, comes first, or last for empty data.
+// The key, zero-padded to a block, comes first, or last for empty data. Dispatched as the digest.
+#[inline(never)]
+#[cfg(feature = "blake2")]
+pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
+    let word = FEATURES.load(Ordering::Relaxed);
+
+    if blake2_avx2(word) {
+        return blake2s_mac_with(blake2::blake2s_avx2, h, key, data, out);
+    }
+
+    if blake2_portable(word) {
+        return Kernel::Portable;
+    }
+
+    blake2s_mac_kernels(h, key, data, out)
+}
+
+#[cfg(feature = "blake2")]
+fn blake2s_mac_kernels(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
+    match blake2(features()) {
+        Blake::Vl => blake2s_mac_with(blake2::blake2s_vl, h, key, data, out),
+        Blake::Avx2 => blake2s_mac_with(blake2::blake2s_avx2, h, key, data, out),
+        Blake::Sse41 => Kernel::Blocks,
+        Blake::Portable => Kernel::Portable,
+    }
+}
+
+#[inline(always)]
 #[allow(unsafe_code)]
 #[cfg(feature = "blake2")]
-pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> bool {
-    if !has(AVX2) {
-        return false;
-    }
+fn blake2s_mac_with(
+    kernel: Blake2sKernel,
+    h: &[u32; 8],
+    key: &[u8],
+    data: &[u8],
+    out: &mut [u8],
+) -> Kernel {
+    // The kernel's working copy of the chaining value, keyed here and wiped after it: before the
+    // key's copy, so that its stores reach the cache before the kernel loads them.
+    let mut state = *h;
+
+    state[0] ^= (key.len() as u32) << 8;
 
     let mut key_block = [0; 64];
 
@@ -1717,13 +2229,11 @@ pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8])
 
     let total = 64 + data.len() as u64;
 
-    // The kernel's working copy of the chaining value, keyed after the first block; wiped after.
-    let mut state = *h;
-
     if data.is_empty() {
-        // SAFETY: the CPU has AVX2 and the operating system saves its registers.
+        // SAFETY: the CPU has AVX2, and AVX-512F and AVX-512VL if blake2s_mac_kernels chose
+        // their kernel (blake2_avx2 and blake2 test them); the operating system saves them.
         unsafe {
-            blake2::blake2s_avx2(
+            kernel(
                 &mut state,
                 None,
                 &[],
@@ -1739,9 +2249,7 @@ pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8])
             let first = Some(&key_block);
 
             // SAFETY: as above.
-            unsafe {
-                blake2::blake2s_avx2(&mut state, first, blocks, Some((last, total)), 0, Some(out))
-            };
+            unsafe { kernel(&mut state, first, blocks, Some((last, total)), 0, Some(out)) };
         });
     }
 
@@ -1749,7 +2257,7 @@ pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8])
 
     wipe(&mut state);
 
-    true
+    Kernel::Done
 }
 
 // Four states per vector call, and two or three with lanes idle, which still costs less than
@@ -2678,6 +3186,131 @@ mod tests {
 
             check::<16>(&mut inputs);
         }
+    }
+
+    #[test]
+    fn one_message_table() {
+        let cases = [
+            (Amd, 0x00B0_0F21, true),    // Zen 5, Turin: family 1Ah
+            (Amd, 0x00B4_0F40, true),    // Zen 5 client: family 1Ah, model 44h
+            (Amd, 0x00A1_0F11, false),   // Zen 4, Genoa: family 19h
+            (Amd, 0x00A0_0F11, false),   // Zen 3, Milan: family 19h
+            (Amd, 0x0083_0F10, false),   // Zen 2, Rome: family 17h
+            (Intel, 0x00B0_0F21, false), // a Zen 5 row from Intel
+            (Intel, 0x000C_06F2, false), // Emerald Rapids: model CFh
+            (Other, 0x00B0_0F21, false), // family 1Ah from another vendor
+        ];
+
+        for (vendor, eax, expected) in cases {
+            assert_eq!(
+                super::one_message(vendor, eax),
+                expected,
+                "{vendor:?} {eax:#010x}"
+            );
+        }
+    }
+
+    #[test]
+    fn gather_table() {
+        let cases = [
+            (Intel, 0x000C_06F2, true),  // Emerald Rapids: model CFh
+            (Intel, 0x0008_06F8, true),  // Sapphire Rapids: model 8Fh
+            (Intel, 0x0009_0672, true),  // Alder Lake-S: model 97h
+            (Intel, 0x000B_0671, true),  // Raptor Lake-S: model B7h
+            (Intel, 0x000A_06D1, true),  // Granite Rapids: model ADh
+            (Intel, 0x000C_0662, true),  // Arrow Lake-S: model C6h
+            (Intel, 0x0003_06C3, false), // Haswell: model 3Ch
+            (Intel, 0x0003_06F2, false), // Haswell-E: model 3Fh
+            (Intel, 0x0005_0657, false), // Cascade Lake: model 55h
+            (Intel, 0x0006_06A6, false), // Ice Lake Xeon: model 6Ah
+            (Intel, 0x0009_06A4, true),  // Alder Lake-P: model 9Ah
+            (Intel, 0x000B_0650, true),  // Arrow Lake-U: model B5h
+            (Intel, 0x000D_0650, true),  // Wildcat Lake: model D5h
+            (Intel, 0x000E_0650, true),  // Panther Lake-R: model E5h
+            (Intel, 0x0030_0F10, false), // Nova Lake: family 18
+            (Intel, 0x000B_06E0, false), // Alder Lake-N, E-cores only: model BEh
+            (Intel, 0x000A_06F3, false), // Sierra Forest, E-cores: model AFh
+            (Intel, 0x0000_06F2, false), // model Fh without its extended model
+            (Amd, 0x000C_06F2, false),   // an Emerald Rapids row from AMD
+            (Amd, 0x00A0_0F11, false),   // Zen 3, Milan: family 19h
+            (Other, 0x000C_06F2, false), // an Emerald Rapids row from another vendor
+        ];
+
+        for (vendor, eax, expected) in cases {
+            assert_eq!(
+                super::gather_rows(vendor, eax),
+                expected,
+                "{vendor:?} {eax:#010x}"
+            );
+        }
+    }
+
+    // rows_gather against rows_avx2, which the dispatch reaches on every other AVX2 core, on every
+    // short length, the full block and a chain with and without a partial last block.
+    #[test]
+    #[allow(unsafe_code)]
+    #[cfg(feature = "blake3")]
+    fn rows_gather_matches_rows_avx2() {
+        use super::blake3::{
+            chain_avx2, chain_gather, compress_avx2, compress_gather, digest1_avx2, digest1_gather,
+        };
+
+        if !super::has(super::AVX2) {
+            return;
+        }
+
+        let mut inputs = crate::cpu::testing::Inputs::new(26);
+
+        let key: [u32; 8] = core::array::from_fn(|_| u32::from_le_bytes(inputs.bytes()));
+
+        let data: [u8; 64] = inputs.bytes();
+
+        for n in 0..=64 {
+            for size in [1, 16, 31, 32] {
+                let mut a = [0; 32];
+
+                let mut b = [0; 32];
+
+                // SAFETY: the CPU has AVX2 and the operating system saves its registers.
+                unsafe {
+                    digest1_avx2(&key, 11, &data[..n], &mut a[..size]);
+
+                    digest1_gather(&key, 11, &data[..n], &mut b[..size]);
+                }
+
+                assert_eq!(a, b, "digest1 of {n} bytes into {size}");
+            }
+        }
+
+        let blocks: [[u8; 64]; 5] = core::array::from_fn(|_| inputs.bytes());
+
+        for last in [None, Some((&blocks[4], 23, 10))] {
+            let mut a = key;
+
+            let mut b = key;
+
+            // SAFETY: as above.
+            unsafe {
+                chain_avx2(&mut a, &blocks[..4], 7, 0, [1, 2], last);
+
+                chain_gather(&mut b, &blocks[..4], 7, 0, [1, 2], last);
+            }
+
+            assert_eq!(a, b, "chain, last block {:?}", last.map(|l| l.1));
+        }
+
+        let mut a = [0; 16];
+
+        let mut b = [0; 16];
+
+        // SAFETY: as above.
+        unsafe {
+            compress_avx2(&key, &blocks[0], 9, 40, 27, &mut a);
+
+            compress_gather(&key, &blocks[0], 9, 40, 27, &mut b);
+        }
+
+        assert_eq!(a, b, "compress");
     }
 
     #[test]

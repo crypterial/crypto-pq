@@ -13,6 +13,8 @@
 use core::arch::aarch64::*;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+#[cfg(feature = "blake2")]
+use crate::blake2::Kernel;
 #[cfg(any(
     feature = "ml-kem",
     feature = "frodokem",
@@ -34,6 +36,9 @@ mod ascon;
 
 #[cfg(feature = "ml-kem")]
 mod binomial;
+
+#[cfg(feature = "blake2")]
+mod blake2;
 
 #[cfg(feature = "blake3")]
 mod blake3;
@@ -181,6 +186,91 @@ fn has(feature: u32) -> bool {
     }
 
     found & feature != 0
+}
+
+// BLAKE's detection has its own word and probe, so that no other caller of has() carries BLAKE's
+// probe: an out-of-line probe in has() moved the register allocation of the SHA-2 and Keccak
+// callers, and Apple M3 measured SHA-256 of an empty input 1.4% and SHAKE128 of 64 bytes 0.6%
+// longer. BLAKE asks only for the two features below, both derived from LAZY.
+
+// BLAKE3's vector code in one group of four inputs, on Neoverse N2: a 16 KiB hash took 12.4 us
+// against 13.2 us with two groups, and 1 KiB of extended output 0.78 us against 0.84 us (two
+// runners). Other cores keep two groups until they are measured. Set on the cores with LAZY.
+#[cfg(feature = "blake3")]
+const BLAKE3_NARROW: u32 = 1 << 7;
+
+// Set by BLAKE's probe on a core without LAZY, so that BLAKE's paths reach the portable code with
+// one test of the word as read (lazy()), where blake_has(LAZY) also tests for a word not yet
+// probed.
+#[cfg(any(feature = "blake2", feature = "blake3"))]
+const NO_LAZY: u32 = 1 << 8;
+
+#[cfg(any(feature = "blake2", feature = "blake3"))]
+static BLAKE_FEATURES: AtomicU32 = AtomicU32::new(0);
+
+// usable() for BLAKE's features. Apple targets run on Apple cores, never on Neoverse N2, so their
+// build leaves both out and needs no check at run time; the constant-time check's build takes
+// both, as probe() gives it LAZY.
+#[cfg(any(feature = "blake2", feature = "blake3"))]
+const fn blake_usable() -> bool {
+    !cfg!(target_vendor = "apple") || cfg!(crypto_pq_ct)
+}
+
+// has() for BLAKE's features, on BLAKE's word; neither is guaranteed by any build.
+#[inline]
+#[cfg(any(feature = "blake2", feature = "blake3"))]
+fn blake_has(feature: u32) -> bool {
+    if !blake_usable() {
+        return false;
+    }
+
+    let mut found = BLAKE_FEATURES.load(Ordering::Relaxed);
+
+    if found == 0 {
+        found = blake_probe();
+    }
+
+    found & feature != 0
+}
+
+// Out of line and cold: inlined at every check, the probe lengthened the code around each kernel
+// call.
+#[cold]
+#[inline(never)]
+#[cfg(any(feature = "blake2", feature = "blake3"))]
+fn blake_probe() -> u32 {
+    let mut found = probe() | READY;
+
+    if found & LAZY == 0 {
+        found |= NO_LAZY;
+    } else {
+        #[cfg(feature = "blake3")]
+        {
+            found |= BLAKE3_NARROW;
+        }
+    }
+
+    BLAKE_FEATURES.store(found, Ordering::Relaxed);
+
+    found
+}
+
+// blake_has(LAZY): a probed core without LAZY returns at its first test, one with LAZY at its
+// second, and only a word not yet probed goes on to blake_has().
+#[inline(always)]
+#[cfg(any(feature = "blake2", feature = "blake3"))]
+fn lazy() -> bool {
+    if !blake_usable() {
+        return false;
+    }
+
+    let found = BLAKE_FEATURES.load(Ordering::Relaxed);
+
+    if found & NO_LAZY != 0 {
+        return false;
+    }
+
+    found & LAZY != 0 || blake_has(LAZY)
 }
 
 // The HWCAP bits of the Linux arm64 ABI, which Android shares.
@@ -940,95 +1030,186 @@ pub(crate) fn mlkem_message(_: &[u16; 256], _: &[u16; 256], _: u16, _: &mut [u8;
     false
 }
 
-// BLAKE2 stays on the scalar pipes as compiled, measured ahead of NEON: four independent G
-// functions per step keep them busy, a hand-ordered assembly version measured the same, and
-// NEON's two-cycle instructions and two-instruction rotations lengthen the chain.
+// BLAKE2 stays on the scalar pipes, measured ahead of NEON: four independent G functions per step
+// keep them busy, a hand-ordered assembly version measured the same, and NEON's two-cycle
+// instructions and two-instruction rotations lengthen the chain. A core with LAZY takes each
+// rotation off the chain (blake2.rs); the others run the portable code.
 #[inline(always)]
 #[cfg(feature = "blake2")]
 pub(crate) fn blake2b(
-    _: &mut [u64; 8],
-    _: Option<&[u64; 16]>,
-    _: &[[u8; 128]],
-    _: u128,
-    _: Option<(&[u64; 16], u128)>,
+    h: &mut [u64; 8],
+    first: Option<&[u64; 16]>,
+    blocks: &[[u8; 128]],
+    counter: u128,
+    last: Option<(&[u64; 16], u128)>,
 ) -> bool {
-    false
+    if !lazy() {
+        return false;
+    }
+
+    blake2::process(h, first, blocks.as_flattened(), counter, last);
+
+    true
 }
 
 #[inline(always)]
 #[cfg(feature = "blake2")]
 pub(crate) fn blake2s(
-    _: &mut [u32; 8],
-    _: Option<&[u32; 16]>,
-    _: &[[u8; 64]],
-    _: u64,
-    _: Option<(&[u32; 16], u128)>,
+    h: &mut [u32; 8],
+    first: Option<&[u32; 16]>,
+    blocks: &[[u8; 64]],
+    counter: u64,
+    last: Option<(&[u32; 16], u128)>,
 ) -> bool {
-    false
+    if !lazy() {
+        return false;
+    }
+
+    blake2::process(h, first, blocks.as_flattened(), counter.into(), last);
+
+    true
 }
 
 #[inline(always)]
 #[cfg(feature = "blake2")]
-pub(crate) fn blake2b_digest(_: &[u64; 8], _: &[u8], _: &mut [u8]) -> bool {
-    false
+pub(crate) fn blake2b_digest(_: &[u64; 8], _: &[u8], _: &mut [u8]) -> Kernel {
+    Kernel::Blocks
 }
 
 #[inline(always)]
 #[cfg(feature = "blake2")]
-pub(crate) fn blake2s_digest(_: &[u32; 8], _: &[u8], _: &mut [u8]) -> bool {
-    false
+pub(crate) fn blake2s_digest(_: &[u32; 8], _: &[u8], _: &mut [u8]) -> Kernel {
+    Kernel::Blocks
 }
 
 #[inline(always)]
 #[cfg(feature = "blake2")]
-pub(crate) fn blake2s_mac(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
-    false
+pub(crate) fn blake2s_mac(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> Kernel {
+    Kernel::Blocks
+}
+
+#[inline(always)]
+#[cfg(feature = "blake2")]
+pub(crate) fn blake2b_mac(_: &[u64; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> Kernel {
+    Kernel::Blocks
 }
 
 #[allow(unsafe_code)]
 #[cfg(feature = "blake3")]
 pub(crate) fn blake3_many(input: &[u8], many: &crate::blake3::Many, out: &mut [[u8; 32]]) -> usize {
     // SAFETY: NEON is part of every target this module is built for.
-    unsafe { blake3::hash_many(input, many, out) }
+    unsafe { blake3::hash_many(input, many, out, !blake_has(BLAKE3_NARROW)) }
 }
 
-// BLAKE3's chain of one chunk's blocks stays on the scalar pipes as compiled, measured ahead of
-// NEON: NEON's two-cycle instructions lengthen the chain of each step, as in BLAKE2.
+// BLAKE3's chain of one chunk's blocks stays on the scalar pipes, measured ahead of NEON: NEON's
+// two-cycle instructions lengthen the chain of each step, as in BLAKE2. A core with LAZY takes
+// each rotation off the chain (blake3.rs, scalar); the others run the portable code.
 #[inline(always)]
 #[cfg(feature = "blake3")]
 pub(crate) fn blake3_blocks(
-    _: &mut [u32; 8],
-    _: &[[u8; 64]],
-    _: u64,
-    _: u32,
-    _: [u32; 2],
-    _: crate::blake3::Last,
+    cv: &mut [u32; 8],
+    blocks: &[[u8; 64]],
+    counter: u64,
+    flags: u32,
+    edges: [u32; 2],
+    last: crate::blake3::Last,
 ) -> bool {
-    false
+    if !lazy() {
+        return false;
+    }
+
+    blake3::chain(cv, blocks, counter, flags, edges, last);
+
+    true
 }
 
 #[inline(always)]
 #[cfg(feature = "blake3")]
-pub(crate) fn blake3_digest1(_: &[u32; 8], _: u32, _: &[u8], _: &mut [u8]) -> bool {
-    false
+pub(crate) fn blake3_digest1(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) -> bool {
+    if !lazy() {
+        return false;
+    }
+
+    blake3::digest1(key, flags, data, out);
+
+    true
 }
 
+// BLAKE's word as it is, read once for the tests of blake3_digest1_now and blake3_portable_now.
 #[inline(always)]
 #[cfg(feature = "blake3")]
-pub(crate) fn blake3_digest1_bytes(_: &[u8; 32], _: u32, _: &[u8], _: &mut [u8]) -> bool {
-    false
+pub(crate) fn word() -> u32 {
+    BLAKE_FEATURES.load(Ordering::Relaxed)
+}
+
+// blake3_digest1 when BLAKE's word as read has LAZY, with no probe.
+#[inline(always)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_digest1_now(
+    word: u32,
+    key: &[u32; 8],
+    flags: u32,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
+    if !blake_usable() || word & LAZY == 0 {
+        return false;
+    }
+
+    blake3::digest1(key, flags, data, out);
+
+    true
+}
+
+// Whether BLAKE's word as read, or the build, chooses the portable code for one message.
+#[inline(always)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_portable_now(word: u32) -> bool {
+    !blake_usable() || word & NO_LAZY != 0
+}
+
+// As blake3_digest1, from the key's bytes.
+#[inline(always)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_digest1_bytes(
+    key: &[u8; 32],
+    flags: u32,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
+    if !lazy() {
+        return false;
+    }
+
+    let mut words = [0; 8];
+
+    for (word, bytes) in words.iter_mut().zip(key.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*bytes);
+    }
+
+    blake3::digest1(&words, flags, data, out);
+
+    crate::wipe::wipe(&mut words);
+
+    true
 }
 
 #[inline(always)]
 #[cfg(feature = "blake3")]
 pub(crate) fn blake3_compress(
-    _: &[u32; 8],
-    _: &[u8; 64],
-    _: u64,
-    _: [u32; 2],
-    _: &mut [u32; 16],
+    cv: &[u32; 8],
+    block: &[u8; 64],
+    counter: u64,
+    info: [u32; 2],
+    out: &mut [u32; 16],
 ) -> bool {
-    false
+    if !lazy() {
+        return false;
+    }
+
+    blake3::compress(cv, block, counter, info, out);
+
+    true
 }
 
 #[allow(unsafe_code)]
@@ -1041,7 +1222,7 @@ pub(crate) fn blake3_xof(
     out: &mut [[u8; 64]],
 ) -> usize {
     // SAFETY: as in blake3_many.
-    unsafe { blake3::xof(cv, block, counter, info, out) }
+    unsafe { blake3::xof(cv, block, counter, info, out, !blake_has(BLAKE3_NARROW)) }
 }
 
 #[target_feature(enable = "neon")]

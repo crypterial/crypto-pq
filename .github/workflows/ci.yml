@@ -196,7 +196,9 @@ jobs:
           done
       # The AVX-512VL kernels use 256-bit registers only, and nothing else uses AVX-512: the
       # build of every feature at each optimization level has no instruction on a 512-bit register.
-      # The kernels' three-input logic shows that the disassembly read their code.
+      # The kernels' three-input logic shows that the disassembly read their code. The feature word
+      # (cpu/x86_64.rs, FEATURES) is read relative to the instruction pointer, not through the GOT,
+      # which every read takes once a function that other crates inline exports it.
       - if: matrix.cfg == ''
         run: |
           for level in 0 1 2 3 s z; do
@@ -204,10 +206,15 @@ jobs:
             rm -rf "$RUNNER_TEMP/objects"
             mkdir "$RUNNER_TEMP/objects"
             (cd "$RUNNER_TEMP/objects" && ar x "$GITHUB_WORKSPACE/rust/target/release/libcrypto_pq.rlib")
-            objdump -d "$RUNNER_TEMP"/objects/*.o > "$RUNNER_TEMP/objects.txt"
+            objdump -dr "$RUNNER_TEMP"/objects/*.o > "$RUNNER_TEMP/objects.txt"
             grep -q vpternlogq "$RUNNER_TEMP/objects.txt"
             if grep -m 20 %zmm "$RUNNER_TEMP/objects.txt"; then
               echo "an instruction on a 512-bit register at opt-level $level"
+              exit 1
+            fi
+            grep -q 'R_X86_64_PC32.*FEATURES' "$RUNNER_TEMP/objects.txt"
+            if grep -m 20 'GOTPCREL.*FEATURES' "$RUNNER_TEMP/objects.txt"; then
+              echo "the feature word read through the GOT at opt-level $level"
               exit 1
             fi
           done
@@ -306,7 +313,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { cpu: Haswell-v4, kernels: 61 }
+          - { cpu: Haswell-v4, kernels: 62 }
           - { cpu: Denverton, kernels: 15 }
           - { cpu: qemu64, kernels: 0 }
     defaults:
@@ -326,9 +333,10 @@ jobs:
   # The AVX-512VL kernels on real hardware: QEMU's user mode does not emulate AVX-512, and the
   # x86-64 runners are a mix of CPUs with and without it, so twelve copies of the suite run, each
   # recording its CPU and whether it took the AVX-512VL paths, and the next job fails unless one
-  # took the four-state path and one the one-state path, which only the cores in the table of
-  # cpu/x86_64.rs one_state() select (AMD Zen 4 and Zen 5, Intel Ice Lake Xeon), and one the
-  # SHA-256 lane kernel.
+  # took the four-state path, one the one-state path, which only the cores in the table of
+  # cpu/x86_64.rs one_state() select (AMD Zen 4 and Zen 5, Intel Ice Lake Xeon), one the SHA-256
+  # lane kernel, and one ran BLAKE's AVX-512VL kernels, which every CPU with AVX-512 runs
+  # (cpu/x86_64/blake_vl_tests.rs).
   rust-avx512:
     name: rust AVX-512VL kernels (runner ${{ matrix.copy }})
     runs-on: ubuntu-latest
@@ -353,11 +361,12 @@ jobs:
       - run: cargo test --locked --release --all-features
       - run: |
           mkdir -p "$RUNNER_TEMP/avx512"
-          four=no one=no sha256=no
+          four=no one=no sha256=no vl=no
           if grep -q 'AVX-512VL: true' "$RUNNER_TEMP/kernels.txt"; then four=yes; fi
           if grep -q 'one state: true' "$RUNNER_TEMP/kernels.txt"; then one=yes; fi
           if grep -q 'SHA-256 lanes: AVX-512VL kernel true' "$RUNNER_TEMP/kernels.txt"; then sha256=yes; fi
-          echo "four=$four one=$one sha256=$sha256 $(lscpu | sed -n 's/^Model name: *//p')" | tee "$RUNNER_TEMP/avx512/copy-${{ matrix.copy }}.txt"
+          if grep -Eq 'BLAKE VL kernels: ([1-9][0-9]*) of \1 run' "$RUNNER_TEMP/kernels.txt"; then vl=yes; fi
+          echo "four=$four one=$one sha256=$sha256 vl=$vl $(lscpu | sed -n 's/^Model name: *//p')" | tee "$RUNNER_TEMP/avx512/copy-${{ matrix.copy }}.txt"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: avx512-${{ matrix.copy }}
@@ -378,6 +387,7 @@ jobs:
           grep -q '^four=yes ' copy-*.txt || { echo "four-state AVX-512VL kernel: $retry"; exit 1; }
           grep -q ' one=yes ' copy-*.txt || { echo "one-state AVX-512VL kernels: $retry"; exit 1; }
           grep -q ' sha256=yes ' copy-*.txt || { echo "SHA-256 AVX-512VL lanes kernel: $retry"; exit 1; }
+          grep -q ' vl=yes ' copy-*.txt || { echo "BLAKE AVX-512VL kernels: $retry"; exit 1; }
 
   # Every secret is marked uninitialised under valgrind's memcheck, so a branch or a memory index
   # that depends on one fails the job; values the specifications make public are declassified.

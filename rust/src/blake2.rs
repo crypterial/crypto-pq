@@ -26,6 +26,18 @@ pub(crate) const SIGMA: [[usize; 16]; 10] = [
 // The final block and its counter, the number of bytes hashed in all, the key block included.
 pub(crate) type Last<'a, W> = Option<(&'a [W; 16], u128)>;
 
+// What the CPU kernel of a digest or a MAC did: all the work (Done), or none, leaving it to process
+// (Blocks), whose CPU kernel may take the blocks, or to the portable code that its dispatcher chose
+// (Portable), so that one read of the CPU's features serves the message. Done and Portable come
+// from the x86-64 kernels only.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) enum Kernel {
+    Done,
+    Blocks,
+    Portable,
+}
+
 // The word of BLAKE2b (u64) or BLAKE2s (u32) and what differs between the two functions.
 pub(crate) trait Word:
     Copy + Default + Eq + BitXor<Output = Self> + Not<Output = Self> + 'static
@@ -43,6 +55,9 @@ pub(crate) trait Word:
     fn rotate(self, n: u32) -> Self;
 
     fn from_le(bytes: &[u8]) -> Self;
+
+    // The word into out, BYTES bytes, little-endian.
+    fn write_le(self, out: &mut [u8]);
 
     // The low bytes of a value of at most a word.
     fn from_value(value: u128) -> Self;
@@ -66,11 +81,12 @@ pub(crate) trait Word:
         last: Last<'_, Self>,
     ) -> bool;
 
-    // The CPU kernel of digest, which returns whether it did the work.
-    fn digest_kernel(h: &[Self; 8], data: &[u8], out: &mut [u8]) -> bool;
+    // The CPU kernel of digest.
+    fn digest_kernel(h: &[Self; 8], data: &[u8], out: &mut [u8]) -> Kernel;
 
-    // The CPU kernel of mac, from the chaining value with the key's length in.
-    fn mac_kernel(h: &[Self; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> bool;
+    // The CPU kernel of mac, from the unkeyed chaining value: the kernel puts the key's length in,
+    // in registers.
+    fn mac_kernel(h: &[Self; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel;
 }
 
 impl Word for u64 {
@@ -99,20 +115,25 @@ impl Word for u64 {
     }
 
     #[inline(always)]
+    fn write_le(self, out: &mut [u8]) {
+        out.copy_from_slice(&self.to_le_bytes());
+    }
+
+    #[inline(always)]
     fn from_value(value: u128) -> Self {
         value as Self
     }
 
     #[inline(always)]
     fn store(h: &[Self; 8], out: &mut [u8]) {
-        let (words, rest) = out.as_chunks_mut::<8>();
-
-        for (bytes, word) in words.iter_mut().zip(h) {
-            *bytes = word.to_le_bytes();
-        }
-
-        if let Some(word) = h.get(words.len()) {
-            rest.copy_from_slice(&word.to_le_bytes()[..rest.len()]);
+        // The whole chaining value and half of it (BLAKE2b-256) at a size the compiler knows, as
+        // stores, where the size of out took a call of memcpy.
+        if let Ok(whole) = <&mut [u8; 64]>::try_from(&mut *out) {
+            store_fixed(h, whole);
+        } else if let Ok(half) = <&mut [u8; 32]>::try_from(&mut *out) {
+            store_fixed(h, half);
+        } else {
+            store_any(h, out);
         }
     }
 
@@ -138,14 +159,13 @@ impl Word for u64 {
     }
 
     #[inline(always)]
-    fn digest_kernel(h: &[Self; 8], data: &[u8], out: &mut [u8]) -> bool {
+    fn digest_kernel(h: &[Self; 8], data: &[u8], out: &mut [u8]) -> Kernel {
         cpu::blake2b_digest(h, data, out)
     }
 
-    // BLAKE2b's MAC takes the kernel of process.
     #[inline(always)]
-    fn mac_kernel(_: &[Self; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
-        false
+    fn mac_kernel(h: &[Self; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
+        cpu::blake2b_mac(h, key, data, out)
     }
 }
 
@@ -175,20 +195,23 @@ impl Word for u32 {
     }
 
     #[inline(always)]
+    fn write_le(self, out: &mut [u8]) {
+        out.copy_from_slice(&self.to_le_bytes());
+    }
+
+    #[inline(always)]
     fn from_value(value: u128) -> Self {
         value as Self
     }
 
     #[inline(always)]
     fn store(h: &[Self; 8], out: &mut [u8]) {
-        let (words, rest) = out.as_chunks_mut::<4>();
-
-        for (bytes, word) in words.iter_mut().zip(h) {
-            *bytes = word.to_le_bytes();
-        }
-
-        if let Some(word) = h.get(words.len()) {
-            rest.copy_from_slice(&word.to_le_bytes()[..rest.len()]);
+        // The whole chaining value at a size the compiler knows, as stores, where the size of out
+        // took a call of memcpy.
+        if let Ok(whole) = <&mut [u8; 32]>::try_from(&mut *out) {
+            store_fixed(h, whole);
+        } else {
+            store_any(h, out);
         }
     }
 
@@ -215,13 +238,48 @@ impl Word for u32 {
     }
 
     #[inline(always)]
-    fn digest_kernel(h: &[Self; 8], data: &[u8], out: &mut [u8]) -> bool {
+    fn digest_kernel(h: &[Self; 8], data: &[u8], out: &mut [u8]) -> Kernel {
         cpu::blake2s_digest(h, data, out)
     }
 
     #[inline(always)]
-    fn mac_kernel(h: &[Self; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> bool {
+    fn mac_kernel(h: &[Self; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
         cpu::blake2s_mac(h, key, data, out)
+    }
+}
+
+// The leading N bytes of the chaining value, N a multiple of the word size.
+#[inline(always)]
+fn store_fixed<W: Word, const N: usize>(h: &[W; 8], out: &mut [u8; N]) {
+    for (bytes, word) in out.chunks_exact_mut(W::BYTES).zip(h) {
+        word.write_le(bytes);
+    }
+}
+
+// The leading out.len() bytes of the chaining value, of any length up to the whole: the last
+// partial word only where there is one, as its copy is a call of memcpy.
+#[inline(always)]
+fn store_any<W: Word>(h: &[W; 8], out: &mut [u8]) {
+    let partial = h.get(out.len() / W::BYTES);
+
+    let mut chunks = out.chunks_exact_mut(W::BYTES);
+
+    for (bytes, word) in chunks.by_ref().zip(h) {
+        word.write_le(bytes);
+    }
+
+    let rest = chunks.into_remainder();
+
+    if let Some(word) = partial
+        && !rest.is_empty()
+    {
+        let mut bytes = [0; 8];
+
+        word.write_le(&mut bytes[..W::BYTES]);
+
+        rest.copy_from_slice(&bytes[..rest.len()]);
+
+        wipe(&mut bytes);
     }
 }
 
@@ -298,8 +356,73 @@ fn g<W: Word>(v: &mut [W; 16], [a, b, c, d]: [usize; 4], x: W, y: W) {
     v[b] = (v[b] ^ v[c]).rotate(r4);
 }
 
+// The four G functions of a step side by side, each of g's operations for all four in turn, so
+// that the four independent chains are interleaved in the code.
+#[inline(always)]
+fn step<W: Word>(v: &mut [W; 16], lanes: [[usize; 4]; 4], x: [W; 4], y: [W; 4]) {
+    let [r1, r2, r3, r4] = W::ROTATIONS;
+
+    for k in 0..4 {
+        let [a, b, _, _] = lanes[k];
+
+        v[a] = v[a].add(x[k]).add(v[b]);
+    }
+
+    for [a, _, _, d] in lanes {
+        v[d] = (v[d] ^ v[a]).rotate(r1);
+    }
+
+    for [_, _, c, d] in lanes {
+        v[c] = v[c].add(v[d]);
+    }
+
+    for [_, b, c, _] in lanes {
+        v[b] = (v[b] ^ v[c]).rotate(r2);
+    }
+
+    for k in 0..4 {
+        let [a, b, _, _] = lanes[k];
+
+        v[a] = v[a].add(y[k]).add(v[b]);
+    }
+
+    for [a, _, _, d] in lanes {
+        v[d] = (v[d] ^ v[a]).rotate(r3);
+    }
+
+    for [_, _, c, d] in lanes {
+        v[c] = v[c].add(v[d]);
+    }
+
+    for [_, b, c, _] in lanes {
+        v[b] = (v[b] ^ v[c]).rotate(r4);
+    }
+}
+
+// On x86-64 the G functions of a step side by side: one after another, each chain came as a run
+// of dependent instructions, which filled the scheduler of an AMD Zen core (llvm-mca, Zen 4, one
+// compression: BLAKE2b 436 against 398 cycles, BLAKE2s 408 against 321). On ARM64 they go one
+// after another, which llvm-mca puts level or up to 4% ahead on Neoverse N1, V1 and V2.
 #[inline(always)]
 fn round<W: Word>(v: &mut [W; 16], m: &[W; 16], s: &[usize; 16]) {
+    if cfg!(target_arch = "x86_64") {
+        step(
+            v,
+            [[0, 4, 8, 12], [1, 5, 9, 13], [2, 6, 10, 14], [3, 7, 11, 15]],
+            [m[s[0]], m[s[2]], m[s[4]], m[s[6]]],
+            [m[s[1]], m[s[3]], m[s[5]], m[s[7]]],
+        );
+
+        step(
+            v,
+            [[0, 5, 10, 15], [1, 6, 11, 12], [2, 7, 8, 13], [3, 4, 9, 14]],
+            [m[s[8]], m[s[10]], m[s[12]], m[s[14]]],
+            [m[s[9]], m[s[11]], m[s[13]], m[s[15]]],
+        );
+
+        return;
+    }
+
     g(v, [0, 4, 8, 12], m[s[0]], m[s[1]]);
 
     g(v, [1, 5, 9, 13], m[s[2]], m[s[3]]);
@@ -317,8 +440,16 @@ fn round<W: Word>(v: &mut [W; 16], m: &[W; 16], s: &[usize; 16]) {
     g(v, [3, 4, 9, 14], m[s[14]], m[s[15]]);
 }
 
-// The compression function F of RFC 7693, 3.2, for one block of message words.
+// The compression function F of RFC 7693, 3.2, for one block of message words. Out of line, as
+// before the loop of whole blocks took its own copy of the rounds.
+#[inline(never)]
 pub(crate) fn compress<W: Word>(h: &mut [W; 8], m: &[W; 16], counter: u128, last: bool) {
+    rounds(h, m, counter, last);
+}
+
+// compress, inlined into the loop over whole blocks too.
+#[inline(always)]
+fn rounds<W: Word>(h: &mut [W; 8], m: &[W; 16], counter: u128, last: bool) {
     let iv = W::IV;
 
     let [t0, t1] = W::counter(counter);
@@ -385,7 +516,21 @@ fn process<W: Word>(
     counter: u128,
     last: Last<'_, W>,
 ) {
-    if W::kernel(h, first, blocks, counter, last) {
+    run(true, h, first, blocks, counter, last);
+}
+
+// process with the portable code only.
+#[inline(always)]
+fn portable<W: Word>(
+    h: &mut [W; 8],
+    first: Option<&[W; 16]>,
+    blocks: &[u8],
+    counter: u128,
+    last: Last<'_, W>,
+) {
+    if W::BYTES == 8 && !blocks.is_empty() {
+        all_blocks(h, first, blocks, counter, last);
+
         return;
     }
 
@@ -399,8 +544,28 @@ fn process<W: Word>(
         compress(h, first, counter, false);
     }
 
-    // compress takes the message words through memory, where they are wiped: a MAC's key block
-    // comes here as the first buffered block.
+    if !blocks.is_empty() {
+        whole_blocks(h, blocks, counter);
+    }
+
+    if let Some((m, total)) = last {
+        compress(h, m, total, true);
+    }
+}
+
+// The whole blocks of bytes into h, counter the number of bytes before them. One loop with the
+// compression inlined, so that the chaining value stays in registers from block to block and the
+// message words come from the input, where a call per block took h and m through memory. A MAC's
+// key block comes here as the first buffered block. Out of line, so that a call of process without
+// whole blocks keeps a small frame.
+#[inline(never)]
+fn whole_blocks<W: Word>(h: &mut [W; 8], blocks: &[u8], counter: u128) {
+    let size = 16 * W::BYTES as u128;
+
+    let mut counter = counter;
+
+    let mut state = *h;
+
     let mut m = [W::default(); 16];
 
     for block in blocks.chunks_exact(16 * W::BYTES) {
@@ -410,22 +575,101 @@ fn process<W: Word>(
 
         counter = counter.wrapping_add(size);
 
-        compress(h, &m, counter, false);
+        rounds(&mut state, &m, counter, false);
     }
 
-    if !blocks.is_empty() {
-        wipe(&mut m);
+    *h = state;
+
+    wipe_unless_optimized!(&mut state);
+
+    wipe_unless_optimized!(&mut m);
+}
+
+// The first block, the whole blocks of bytes and the last block into h, counter the number of
+// bytes before them. One loop with the compression inlined once, so that the chaining value stays
+// in registers from block to block and the message words come from the input, where a call per
+// block took h and m through memory. The first and last blocks take the same code: a second copy
+// of the compression for them doubled the code that a message of a few blocks runs (on an AMD Zen
+// 5 core, BLAKE2b of 1 KiB took 70 ns more than the time of its blocks). BLAKE2b only: BLAKE2s,
+// whose compression is smaller, took 3 to 4% more time this way for a MAC of 1 KiB on Zen 5 (EPYC
+// 9V45, 24 of 24 seeds), and keeps whole_blocks. Out of line, so that a call of process without
+// whole blocks keeps a small frame.
+#[inline(never)]
+fn all_blocks<W: Word>(
+    h: &mut [W; 8],
+    first: Option<&[W; 16]>,
+    blocks: &[u8],
+    counter: u128,
+    last: Last<'_, W>,
+) {
+    let size = 16 * W::BYTES as u128;
+
+    let mut counter = counter;
+
+    let mut state = *h;
+
+    let mut m = [W::default(); 16];
+
+    let mut first = first;
+
+    let mut last = last;
+
+    let mut chunks = blocks.chunks_exact(16 * W::BYTES);
+
+    loop {
+        let (total, end) = if let Some(words) = first.take() {
+            m = *words;
+
+            counter = counter.wrapping_add(size);
+
+            (counter, false)
+        } else if let Some(block) = chunks.next() {
+            for (word, bytes) in m.iter_mut().zip(block.chunks_exact(W::BYTES)) {
+                *word = W::from_le(bytes);
+            }
+
+            counter = counter.wrapping_add(size);
+
+            (counter, false)
+        } else if let Some((words, total)) = last.take() {
+            m = *words;
+
+            (total, true)
+        } else {
+            break;
+        };
+
+        rounds(&mut state, &m, total, end);
     }
 
-    if let Some((m, total)) = last {
-        compress(h, m, total, true);
-    }
+    *h = state;
+
+    wipe_unless_optimized!(&mut state);
+
+    wipe_unless_optimized!(&mut m);
 }
 
 // The words of at most a block of bytes, zero-padded: the bytes of data from `start` on. A partial
-// last word is read without a store, from the bytes that end data.
+// last word is read without a store, from the bytes that end data. Always inlined, as before its
+// copies of a constant size, which made the compiler move it and process out of mac.
+#[inline(always)]
 fn words<W: Word>(data: &[u8], start: usize, out: &mut [W; 16]) {
     let tail = &data[start..];
+
+    // A whole block, and a key of half a block (the digest length of BLAKE2s-256 and BLAKE2b-512),
+    // at a size the compiler knows, as loads and stores: at the size of the input, each took a
+    // call of memcpy.
+    if tail.len() == 16 * W::BYTES {
+        fixed::<W, 16>(tail, out);
+
+        return;
+    }
+
+    if tail.len() == 8 * W::BYTES {
+        fixed::<W, 8>(tail, out);
+
+        return;
+    }
 
     let whole = tail.len() / W::BYTES;
 
@@ -440,6 +684,14 @@ fn words<W: Word>(data: &[u8], start: usize, out: &mut [W; 16]) {
     }
 }
 
+// The first N words of out from tail, which holds N words.
+#[inline(always)]
+fn fixed<W: Word, const N: usize>(tail: &[u8], out: &mut [W; 16]) {
+    for (i, word) in out.iter_mut().enumerate().take(N) {
+        *word = W::from_le(&tail[i * W::BYTES..]);
+    }
+}
+
 // The bytes of data that precede its final block: whole blocks, leaving at least one byte for the
 // final block when there is data.
 fn leading<W: Word>(length: usize) -> usize {
@@ -448,11 +700,31 @@ fn leading<W: Word>(length: usize) -> usize {
     length.saturating_sub(1) / block * block
 }
 
-// The digest of data, out.len() bytes, from the chaining value h, in one pass over data.
-pub(crate) fn digest<W: Word>(h: &[W; 8], data: &[u8], out: &mut [u8]) {
-    if W::digest_kernel(h, data, out) {
+// process, or the portable code alone where the CPU kernel of a digest or MAC chose it (kernel
+// false).
+#[inline(always)]
+fn run<W: Word>(
+    kernel: bool,
+    h: &mut [W; 8],
+    first: Option<&[W; 16]>,
+    blocks: &[u8],
+    counter: u128,
+    last: Last<'_, W>,
+) {
+    if kernel && W::kernel(h, first, blocks, counter, last) {
         return;
     }
+
+    portable(h, first, blocks, counter, last);
+}
+
+// The digest of data, out.len() bytes, from the chaining value h, in one pass over data.
+pub(crate) fn digest<W: Word>(h: &[W; 8], data: &[u8], out: &mut [u8]) {
+    let kernel = match W::digest_kernel(h, data, out) {
+        Kernel::Done => return,
+        Kernel::Blocks => true,
+        Kernel::Portable => false,
+    };
 
     let mut h = *h;
 
@@ -462,7 +734,8 @@ pub(crate) fn digest<W: Word>(h: &[W; 8], data: &[u8], out: &mut [u8]) {
 
     words(data, whole, &mut last);
 
-    process(
+    run(
+        kernel,
         &mut h,
         None,
         &data[..whole],
@@ -480,13 +753,15 @@ pub(crate) fn digest<W: Word>(h: &[W; 8], data: &[u8], out: &mut [u8]) {
 // The keyed hash of data under a key of 1 to 16 * W::BYTES bytes, from the unkeyed chaining value
 // h of the configured digest length.
 pub(crate) fn mac<W: Word>(h: &[W; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
+    let kernel = match W::mac_kernel(h, key, data, out) {
+        Kernel::Done => return,
+        Kernel::Blocks => true,
+        Kernel::Portable => false,
+    };
+
     let mut h = *h;
 
     h[0] = h[0] ^ W::key_length(key.len());
-
-    if W::mac_kernel(&h, key, data, out) {
-        return;
-    }
 
     let mut key_block = [W::default(); 16];
 
@@ -497,13 +772,14 @@ pub(crate) fn mac<W: Word>(h: &[W; 8], key: &[u8], data: &[u8], out: &mut [u8]) 
     let mut last = [W::default(); 16];
 
     if data.is_empty() {
-        process(&mut h, None, &[], 0, Some((&key_block, block)));
+        run(kernel, &mut h, None, &[], 0, Some((&key_block, block)));
     } else {
         let whole = leading::<W>(data.len());
 
         words(data, whole, &mut last);
 
-        process(
+        run(
+            kernel,
             &mut h,
             Some(&key_block),
             &data[..whole],
@@ -773,7 +1049,10 @@ mod tests {
 
             W::store(&state, &mut expected[..size]);
 
-            if W::digest_kernel(&h, data, &mut actual[..size]) {
+            if matches!(
+                W::digest_kernel(&h, data, &mut actual[..size]),
+                Kernel::Done
+            ) {
                 assert_eq!(actual, expected, "case {n}");
 
                 accelerated += 1;
@@ -821,6 +1100,8 @@ mod tests {
 
             let mut state = h;
 
+            state[0] = state[0] ^ W::key_length(key.len());
+
             if data.is_empty() {
                 compress(&mut state, &key_block, block as u128, true);
             } else {
@@ -847,7 +1128,10 @@ mod tests {
 
             W::store(&state, &mut expected[..size]);
 
-            if W::mac_kernel(&h, key, data, &mut actual[..size]) {
+            if matches!(
+                W::mac_kernel(&h, key, data, &mut actual[..size]),
+                Kernel::Done
+            ) {
                 assert_eq!(actual, expected, "case {n}");
 
                 accelerated += 1;

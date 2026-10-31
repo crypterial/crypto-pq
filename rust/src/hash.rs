@@ -288,8 +288,43 @@ impl HashAlgorithm {
         Ok(())
     }
 
-    // digest_into for an out of digest_size bytes.
+    // digest_into for an out of digest_size bytes. On aarch64 SHA-2 leaves before the dispatcher
+    // that inlines BLAKE, as that dispatcher's stack frame cost SHA-256 of an empty input 1.4% on
+    // Apple M3.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(never)]
     pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
+        match &self.kind {
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
+            Kind::Sha256(iv) => finish256(iv, 0, data, out),
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
+            Kind::Sha512(iv) => finish512(iv, 0, data, out),
+            #[allow(unreachable_patterns)]
+            _ => self.digest_other(data, out),
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
+        self.digest_other(data, out);
+    }
+
+    // Every kind; on aarch64 the kinds other than SHA-2.
+    #[cfg_attr(target_arch = "aarch64", inline(never))]
+    #[cfg_attr(not(target_arch = "aarch64"), inline(always))]
+    fn digest_other(&self, data: &[u8], out: &mut [u8]) {
         match &self.kind {
             #[cfg(any(
                 feature = "sha2",

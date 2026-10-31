@@ -22,6 +22,40 @@ Implements specification 1.1 (draft).
 
 ### Changed
 
+- BLAKE2b, BLAKE2s and BLAKE3 on x86-64 CPUs with AVX-512F and AVX-512VL: the kernels for one
+  message take their rotations by 63 (BLAKE2b), 12 and 7 (BLAKE2s) and all four (BLAKE3) as one
+  VPRORD or VPRORQ, and BLAKE3 moves its message words between rounds with VPERMT2D, on 128-bit and
+  256-bit registers, in inline assembly within the AVX2 code. On AMD family 1Ah (Zen 5) the
+  kernels for one message give way to the portable code, which takes less time there; on other AMD
+  processors with AVX-512 (Zen 4) BLAKE2 keeps its AVX2 code. Outputs are unchanged.
+- BLAKE3 on x86-64 with AVX2 or SSE4.1: the kernels for one message keep the message in four
+  registers and build each round's words from the previous round's with shuffles, unpacks and
+  blends, as the reference SSE4.1 code does, instead of loading each word again from the block.
+  A digest of less than a block loads its words from the input, with no zeroed copy. Outputs are
+  unchanged.
+- BLAKE2b's MAC on x86-64 with AVX2 runs in one call of the digest kernel, which pads the key
+  block in registers and puts the key length into the chaining value. Outputs are unchanged.
+- BLAKE3 digests of at most one block with at most 32 bytes of output reach their kernel from the
+  call with one load of the feature word and no frame, and the kernel for one compression is reached
+  the same way. A digest of at most one chunk with 33 to 64 bytes of output reads a full last block
+  where it lies, without a copy, and BLAKE3 output words go straight into the output. `derive_key`
+  no longer wipes the context key, which is a hash of the public context (D-76). Outputs are
+  unchanged.
+- BLAKE3 on Intel x86-64 processors with Golden Cove or later cores that run without AVX-512, by a
+  table of models ([decision D-78](spec/decisions.md#decision-d-78)): a one-shot hash, keyed hash
+  or key derivation of at most 1 KiB with at most 64 bytes of output keeps the AVX2 kernels that
+  load each message word from the block and the one-shot path that calls them, which take less
+  time there than the four-register kernels and the short path. Outputs are unchanged.
+- One-shot SHA-224, SHA-256, SHA-384 and SHA-512 hashes on ARM64 branch from the algorithm
+  dispatch to their code before the stack frame that the paths of the other algorithms need.
+  Outputs are unchanged.
+- BLAKE2b, BLAKE2s and BLAKE3 on Arm Neoverse N2: one message runs in general registers with each
+  rotation taken off the chain as an EOR with a rotated operand, and BLAKE3's vector code runs one
+  group of four inputs, reading each round's message words where they are. Other cores keep their
+  code. Outputs are unchanged.
+- BLAKE2b and BLAKE2s in the portable code compress whole blocks in one loop with the chaining value
+  in registers. BLAKE3 sizes the buffers of a subtree of at most 16 chunks to it, and wipes only the
+  values written. Outputs are unchanged.
 - Keccak-f[1600] on x86-64 CPUs with AVX-512F and AVX-512VL: a kernel for four states side by side
   and, on the CPUs that run it in less time than the scalar code (AMD Zen 4 and Zen 5, Intel Ice
   Lake Xeon), one for a single state, selected at run time, use the EVEX instructions on 256-bit
@@ -128,6 +162,10 @@ Implements specification 1.1 (draft).
 
 ### Fixed
 
+- BLAKE2s and BLAKE3 on x86-64 and BLAKE3 on ARM64: the broadcasts of message and key words are
+  written out, so that no broadcast word stays in a frame of `array::map` that nothing wipes
+  (D-76): BLAKE3's extended output on ARM64 copied the root block by value, BLAKE2s's AVX2 kernel
+  left its last message word, and BLAKE3's AVX2 and SSE4.1 hash_many their last key word.
 - Secret buffers on the stack are wiped before each function returns, on every path, as
   specification 14.5 requires ([decision D-76](spec/decisions.md#decision-d-76)): the SHA-2 message
   schedules, the paired SHA-256 streams of the SHA-NI kernels, the buffers of the Keccak, BLAKE2,

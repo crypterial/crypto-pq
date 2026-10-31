@@ -11,9 +11,10 @@
 // in that order. Row b is the last one each half step writes and the first one the next reads, so
 // a rotation of b sits on the chain from one step to the next; a is written first, and its
 // rotation overlaps the rest of the step. The SSE4.1 kernels gather the words one at a time. The
-// one-shot digests, and BLAKE2s's MAC, keep the state in registers from the first block to the
-// output. (Message words moved by scalar stores into a ring that the rounds read with vector loads
-// measured 35 to 60% slower than these gathers: the loads waited on the stores.)
+// one-shot digests and MACs keep the state in registers from the first block to the output.
+// (Message words moved by scalar stores into a ring that the rounds read with vector loads took
+// 35 to 60% more time than these gathers: the loads waited on the stores.) With AVX-512VL the
+// AVX2 row forms take some of its rotations (module vl).
 
 use core::arch::x86_64::*;
 
@@ -21,7 +22,7 @@ use core::arch::x86_64::*;
 use super::memory::words_of;
 use super::memory::{clear, load128, load256, store128, store256};
 use crate::blake2::SIGMA;
-use crate::sha2::{IV_256, IV_512};
+use crate::sha2::{IV_256, IV_512, last_bytes};
 use crate::wipe::{wipe, wipe_unless_optimized};
 
 instruction!(swap32, __m256i, ymm_reg, "vpshufd {out}, {x}, 0xB1", x);
@@ -147,6 +148,31 @@ fn block64(block: &[u8; 128]) -> [__m256i; 8] {
     core::array::from_fn(|k| _mm256_broadcastsi128_si256(load128(&block.as_chunks::<16>().0[k])))
 }
 
+// The message of a final block made of the last `length` bytes of data, fewer than a block, and
+// zeros, into m: each 16-byte chunk loaded from data, or made from the bytes that end it, in a
+// register, so that no copy of the bytes is stored and read back.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn padded64(data: &[u8], length: usize, m: &mut [__m256i; 8]) {
+    let (whole, rest) = data[data.len() - length..].as_chunks::<16>();
+
+    *m = [_mm256_setzero_si256(); 8];
+
+    for (words, chunk) in m.iter_mut().zip(whole) {
+        *words = _mm256_broadcastsi128_si256(load128(chunk));
+    }
+
+    if let Some(words) = m.get_mut(whole.len())
+        && !rest.is_empty()
+    {
+        let value = last_bytes(data, rest.len());
+
+        let (low, high) = (value as i64, (value >> 64) as i64);
+
+        *words = _mm256_set_epi64x(high, low, high, low);
+    }
+}
+
 // Words w0 and w1 of the message in each half of a vector, from the pairs that hold them: one
 // instruction, whatever the words. The word indices are constants once a round is inlined.
 #[target_feature(enable = "avx2")]
@@ -170,217 +196,389 @@ fn gather64(m: &[__m256i; 8], w: [usize; 4]) -> __m256i {
     halves(pair64(m, w[0], w[1]), pair64(m, w[2], w[3]))
 }
 
-// Half of the four G functions of a step: a += m, a += b, d = ror(d ^ a), c += d, b = ror(b ^ c).
-#[target_feature(enable = "avx2")]
-#[inline]
-fn half64<const R1: u32, const R2: u32>(row: &mut [__m256i; 4], m: __m256i) {
-    let [a, b, c, d] = row;
+// The AVX2 row form of BLAKE2b, generated for AVX2 and for AVX-512VL with the module's rotation.
+// The twelve rounds of BLAKE2b on the rows, in the code of the caller: the out-of-line
+// compression of a single block and the loop over several.
+macro_rules! rounds64 {
+    ($row:ident, $m:expr) => {
+        round64::<0>(&mut $row, $m);
 
-    *a = _mm256_add_epi64(_mm256_add_epi64(*a, m), *b);
+        round64::<1>(&mut $row, $m);
 
-    *d = rotate64::<R1>(_mm256_xor_si256(*d, *a));
+        round64::<2>(&mut $row, $m);
 
-    *c = _mm256_add_epi64(*c, *d);
+        round64::<3>(&mut $row, $m);
 
-    *b = rotate64::<R2>(_mm256_xor_si256(*b, *c));
-}
+        round64::<4>(&mut $row, $m);
 
-// Round R, with the row of SIGMA a constant: an instance per round, each called once and inlined,
-// so that every index into the message is a constant. For the diagonal step, a moves down a lane
-// and c and d up one and two.
-#[target_feature(enable = "avx2")]
-#[inline]
-fn round64<const R: usize>(row: &mut [__m256i; 4], m: &[__m256i; 8]) {
-    let s = &SIGMA[R % 10];
+        round64::<5>(&mut $row, $m);
 
-    half64::<32, 24>(row, gather64(m, [s[0], s[2], s[4], s[6]]));
+        round64::<6>(&mut $row, $m);
 
-    half64::<16, 63>(row, gather64(m, [s[1], s[3], s[5], s[7]]));
+        round64::<7>(&mut $row, $m);
 
-    row[0] = lane_down(row[0]);
+        round64::<8>(&mut $row, $m);
 
-    row[2] = lane_up(row[2]);
+        round64::<9>(&mut $row, $m);
 
-    row[3] = lanes_across(row[3]);
+        round64::<10>(&mut $row, $m);
 
-    half64::<32, 24>(row, gather64(m, [s[14], s[8], s[10], s[12]]));
-
-    half64::<16, 63>(row, gather64(m, [s[15], s[9], s[11], s[13]]));
-
-    row[0] = lane_up(row[0]);
-
-    row[2] = lane_down(row[2]);
-
-    row[3] = lanes_across(row[3]);
-}
-
-#[target_feature(enable = "avx2")]
-#[inline]
-fn set64(words: &[u64]) -> __m256i {
-    _mm256_set_epi64x(
-        words[3] as i64,
-        words[2] as i64,
-        words[1] as i64,
-        words[0] as i64,
-    )
-}
-
-#[target_feature(enable = "avx2")]
-#[inline]
-fn compress64(h: &mut [__m256i; 2], m: &[__m256i; 8], counter: u128, last: bool) {
-    let flag = if last { -1 } else { 0 };
-
-    let mut row = [
-        h[0],
-        h[1],
-        set64(&IV_512[..4]),
-        _mm256_xor_si256(
-            set64(&IV_512[4..]),
-            _mm256_set_epi64x(0, flag, (counter >> 64) as i64, counter as i64),
-        ),
-    ];
-
-    round64::<0>(&mut row, m);
-
-    round64::<1>(&mut row, m);
-
-    round64::<2>(&mut row, m);
-
-    round64::<3>(&mut row, m);
-
-    round64::<4>(&mut row, m);
-
-    round64::<5>(&mut row, m);
-
-    round64::<6>(&mut row, m);
-
-    round64::<7>(&mut row, m);
-
-    round64::<8>(&mut row, m);
-
-    round64::<9>(&mut row, m);
-
-    round64::<10>(&mut row, m);
-
-    round64::<11>(&mut row, m);
-
-    h[0] = _mm256_xor_si256(h[0], _mm256_xor_si256(row[0], row[2]));
-
-    h[1] = _mm256_xor_si256(h[1], _mm256_xor_si256(row[1], row[3]));
-
-    wipe_unless_optimized!(words_of(&mut row));
-}
-
-#[target_feature(enable = "avx2")]
-pub(super) fn blake2b_avx2(
-    h: &mut [u64; 8],
-    first: Option<&[u64; 16]>,
-    blocks: &[[u8; 128]],
-    counter: u128,
-    last: Option<(&[u64; 16], u128)>,
-) {
-    let [low, high] = h.as_chunks::<4>().0 else {
-        unreachable!("eight words are two groups of four")
+        round64::<11>(&mut $row, $m);
     };
-
-    // compress64 stays out of line, so the state and the message words, the MAC's key block
-    // among them, go to it through memory, where they are cleared at the end.
-    let mut state = [load256(low), load256(high)];
-
-    let mut m = [_mm256_setzero_si256(); 8];
-
-    let mut counter = counter;
-
-    if let Some(first) = first {
-        counter = counter.wrapping_add(128);
-
-        m = pairs64(first.as_chunks().0.try_into().expect("eight"));
-
-        compress64(&mut state, &m, counter, false);
-    }
-
-    for block in blocks {
-        counter = counter.wrapping_add(128);
-
-        m = block64(block);
-
-        compress64(&mut state, &m, counter, false);
-    }
-
-    if let Some((last, total)) = last {
-        m = pairs64(last.as_chunks().0.try_into().expect("eight"));
-
-        compress64(&mut state, &m, total, true);
-    }
-
-    let [low, high] = h.as_chunks_mut::<4>().0 else {
-        unreachable!("eight words are two groups of four")
-    };
-
-    store256(state[0], low);
-
-    store256(state[1], high);
-
-    clear(&mut state, _mm256_setzero_si256());
-
-    clear(&mut m, _mm256_setzero_si256());
 }
 
-// The digest of data from the chaining value h, out.len() bytes: the whole blocks straight from
-// data, then the last block, which holds at least one byte unless data is empty, from a zeroed
-// copy. The copy and the digest's bytes are wiped.
-#[target_feature(enable = "avx2")]
-pub(super) fn blake2b_digest_avx2(h: &[u64; 8], data: &[u8], out: &mut [u8]) {
-    let [low, high] = h.as_chunks::<4>().0 else {
-        unreachable!("eight words are two groups of four")
+// With `unsafe` and a safety section, the entry points are unsafe functions documented with it.
+macro_rules! rows64 {
+    ($feature:literal, $rotate:ident $(, $unsafe:tt $safety:literal)?) => {
+        // Half of the four G functions of a step: a += m, a += b, d = ror(d ^ a), c += d, b = ror(b
+        // ^ c).
+        #[target_feature(enable = $feature)]
+        #[inline]
+        fn half64<const R1: u32, const R2: u32>(row: &mut [__m256i; 4], m: __m256i) {
+            let [a, b, c, d] = row;
+
+            *a = _mm256_add_epi64(_mm256_add_epi64(*a, m), *b);
+
+            *d = $rotate::<R1>(_mm256_xor_si256(*d, *a));
+
+            *c = _mm256_add_epi64(*c, *d);
+
+            *b = $rotate::<R2>(_mm256_xor_si256(*b, *c));
+        }
+
+        // Round R, with the row of SIGMA a constant: an instance per round, each called once and
+        // inlined, so that every index into the message is a constant. For the diagonal step, a
+        // moves down a lane and c and d up one and two.
+        #[target_feature(enable = $feature)]
+        #[inline]
+        fn round64<const R: usize>(row: &mut [__m256i; 4], m: &[__m256i; 8]) {
+            let s = &SIGMA[R % 10];
+
+            half64::<32, 24>(row, gather64(m, [s[0], s[2], s[4], s[6]]));
+
+            half64::<16, 63>(row, gather64(m, [s[1], s[3], s[5], s[7]]));
+
+            row[0] = lane_down(row[0]);
+
+            row[2] = lane_up(row[2]);
+
+            row[3] = lanes_across(row[3]);
+
+            half64::<32, 24>(row, gather64(m, [s[14], s[8], s[10], s[12]]));
+
+            half64::<16, 63>(row, gather64(m, [s[15], s[9], s[11], s[13]]));
+
+            row[0] = lane_up(row[0]);
+
+            row[2] = lane_down(row[2]);
+
+            row[3] = lanes_across(row[3]);
+        }
+
+        #[target_feature(enable = $feature)]
+        #[inline]
+        fn set64(words: &[u64]) -> __m256i {
+            _mm256_set_epi64x(
+                words[3] as i64,
+                words[2] as i64,
+                words[1] as i64,
+                words[0] as i64,
+            )
+        }
+
+        // The compression of one block into h, the code of a message of a single block apart from
+        // chain64, whose loop stores the gathered message words of its rounds on the stack (80
+        // stores), which a single block paid for (BLAKE2b-512 of 0 bytes, AMD Zen 4: 118 against
+        // 104 ns). Its one call site inlines it, so that its spills share the frame of
+        // blake2b_digest_avx2, aligned to 32 bytes: out of line, half of its 32-byte spills
+        // crossed a cache line.
+        #[target_feature(enable = $feature)]
+        #[inline]
+        fn compress64(h: &mut [__m256i; 2], m: &[__m256i; 8], counter: u128, last: bool) {
+            let flag = if last { -1 } else { 0 };
+
+            let mut row = [
+                h[0],
+                h[1],
+                set64(&IV_512[..4]),
+                _mm256_xor_si256(
+                    set64(&IV_512[4..]),
+                    _mm256_set_epi64x(0, flag, (counter >> 64) as i64, counter as i64),
+                ),
+            ];
+
+            rounds64!(row, m);
+
+            h[0] = _mm256_xor_si256(h[0], _mm256_xor_si256(row[0], row[2]));
+
+            h[1] = _mm256_xor_si256(h[1], _mm256_xor_si256(row[1], row[3]));
+
+            wipe_unless_optimized!(words_of(&mut row));
+        }
+
+        // The blocks that next gives, into h: next writes the message words of a block into m and
+        // returns its counter and whether it is the final block, or None after the last. One copy
+        // of the compression in the loop, so that the chaining value stays in registers from
+        // block to block, where a call per block took it through memory.
+        #[target_feature(enable = $feature)]
+        #[inline]
+        #[allow(unsafe_code)]
+        fn chain64(
+            h: &mut [__m256i; 2],
+            m: &mut [__m256i; 8],
+            mut next: impl FnMut(&mut [__m256i; 8]) -> Option<(u128, bool)>,
+        ) {
+            let mut state = *h;
+
+            while let Some((counter, last)) = next(m) {
+                // The rounds read the message words from memory. Held in registers from the
+                // stores of next, they left the gathered words of the rounds too few registers.
+                //
+                // SAFETY: an empty template, which only takes the address of m: the compiler
+                // assumes that it may read and write m, and it touches no stack or flags.
+                unsafe {
+                    core::arch::asm!(
+                        "/* {0} */",
+                        in(reg) m.as_mut_ptr(),
+                        options(nostack, preserves_flags),
+                    );
+                }
+
+                let flag = if last { -1 } else { 0 };
+
+                let mut row = [
+                    state[0],
+                    state[1],
+                    set64(&IV_512[..4]),
+                    _mm256_xor_si256(
+                        set64(&IV_512[4..]),
+                        _mm256_set_epi64x(0, flag, (counter >> 64) as i64, counter as i64),
+                    ),
+                ];
+
+                rounds64!(row, m);
+
+                state[0] = _mm256_xor_si256(state[0], _mm256_xor_si256(row[0], row[2]));
+
+                state[1] = _mm256_xor_si256(state[1], _mm256_xor_si256(row[1], row[3]));
+
+                wipe_unless_optimized!(words_of(&mut row));
+            }
+
+            *h = state;
+
+            wipe_unless_optimized!(words_of(&mut state));
+        }
+
+        $(#[doc = $safety] #[allow(unsafe_code)])?
+        #[target_feature(enable = $feature)]
+        pub(in crate::cpu::x86_64) $($unsafe)? fn blake2b_avx2(
+            h: &mut [u64; 8],
+            first: Option<&[u64; 16]>,
+            blocks: &[[u8; 128]],
+            counter: u128,
+            last: Option<(&[u64; 16], u128)>,
+        ) {
+            let [low, high] = h.as_chunks::<4>().0 else {
+                unreachable!("eight words are two groups of four")
+            };
+
+            let mut state = [load256(low), load256(high)];
+
+            // The message words, the MAC's key block among them, in memory, where the rounds read
+            // them; cleared at the end.
+            let mut m = [_mm256_setzero_si256(); 8];
+
+            let mut counter = counter;
+
+            let mut first = first;
+
+            let mut blocks = blocks.iter();
+
+            let mut last = last;
+
+            chain64(&mut state, &mut m, |m| {
+                if let Some(first) = first.take() {
+                    counter = counter.wrapping_add(128);
+
+                    *m = pairs64(first.as_chunks().0.try_into().expect("eight"));
+
+                    return Some((counter, false));
+                }
+
+                if let Some(block) = blocks.next() {
+                    counter = counter.wrapping_add(128);
+
+                    *m = block64(block);
+
+                    return Some((counter, false));
+                }
+
+                let (words, total) = last.take()?;
+
+                *m = pairs64(words.as_chunks().0.try_into().expect("eight"));
+
+                Some((total, true))
+            });
+
+            let [low, high] = h.as_chunks_mut::<4>().0 else {
+                unreachable!("eight words are two groups of four")
+            };
+
+            store256(state[0], low);
+
+            store256(state[1], high);
+
+            clear(&mut state, _mm256_setzero_si256());
+
+            clear(&mut m, _mm256_setzero_si256());
+        }
+
+        // The digest of data from the unkeyed chaining value h, out.len() bytes, keyed unless key
+        // is empty: the key's length goes into the first word here, and the key, zero-padded to a
+        // block, is the first block, or the final one when data is empty. The whole blocks come
+        // straight from data, a whole final block too, and a partial one and the key are padded in
+        // registers. The digest goes straight into out when it is a whole or half chaining value.
+        $(#[doc = $safety] #[allow(unsafe_code)])?
+        #[target_feature(enable = $feature)]
+        pub(in crate::cpu::x86_64) $($unsafe)? fn blake2b_digest_avx2(
+            h: &[u64; 8],
+            key: &[u8],
+            data: &[u8],
+            out: &mut [u8],
+        ) {
+            let [low, high] = h.as_chunks::<4>().0 else {
+                unreachable!("eight words are two groups of four")
+            };
+
+            let mut state = [load256(low), load256(high)];
+
+            // In registers: the caller's copy of h with the length written in made these loads
+            // wait for its stores, which the processor could not forward to them.
+            if !key.is_empty() {
+                let length = _mm256_set_epi64x(0, 0, 0, (key.len() as i64) << 8);
+
+                state[0] = _mm256_xor_si256(state[0], length);
+            }
+
+            let (blocks, tail) = data.split_at(data.len().saturating_sub(1) / 128 * 128);
+
+            // The message words in memory, where the rounds read them; cleared at the end.
+            let mut m = [_mm256_setzero_si256(); 8];
+
+            let mut counter = 0;
+
+            // One block: the key alone, or data of at most a block.
+            if blocks.is_empty() && (key.is_empty() || data.is_empty()) {
+                let counter = if key.is_empty() {
+                    match <&[u8; 128]>::try_from(tail) {
+                        Ok(block) => m = block64(block),
+                        Err(_) => padded64(data, tail.len(), &mut m),
+                    }
+
+                    tail.len() as u128
+                } else {
+                    padded64(key, key.len(), &mut m);
+
+                    128
+                };
+
+                compress64(&mut state, &m, counter, true);
+
+                output64(&state, out);
+
+                // compress64 takes the state through memory.
+                clear(&mut state, _mm256_setzero_si256());
+
+                clear(&mut m, _mm256_setzero_si256());
+
+                return;
+            }
+
+            let mut keyed = !key.is_empty();
+
+            let mut blocks = blocks.as_chunks::<128>().0.iter();
+
+            let mut tail_left = key.is_empty() || !data.is_empty();
+
+            chain64(&mut state, &mut m, |m| {
+                if keyed {
+                    keyed = false;
+
+                    padded64(key, key.len(), m);
+
+                    counter = 128;
+
+                    return Some((counter, data.is_empty()));
+                }
+
+                if let Some(block) = blocks.next() {
+                    counter += 128;
+
+                    *m = block64(block);
+
+                    return Some((counter, false));
+                }
+
+                if !tail_left {
+                    return None;
+                }
+
+                tail_left = false;
+
+                match <&[u8; 128]>::try_from(tail) {
+                    Ok(block) => *m = block64(block),
+                    Err(_) => padded64(data, tail.len(), m),
+                }
+
+                Some((counter + tail.len() as u128, true))
+            });
+
+            output64(&state, out);
+
+            clear(&mut state, _mm256_setzero_si256());
+
+            clear(&mut m, _mm256_setzero_si256());
+        }
+
+        // The first out.len() bytes of the chaining value in state: straight into out for a whole
+        // or half one, else through a copy, which is wiped.
+        #[target_feature(enable = $feature)]
+        #[inline]
+        fn output64(state: &[__m256i; 2], out: &mut [u8]) {
+            if let Ok(whole) = <&mut [u8; 64]>::try_from(&mut *out) {
+                let [low, high] = whole.as_chunks_mut::<32>().0 else {
+                    unreachable!("64 bytes are two groups of 32")
+                };
+
+                store256(state[0], low);
+
+                store256(state[1], high);
+
+                return;
+            }
+
+            if let Ok(half) = <&mut [u8; 32]>::try_from(&mut *out) {
+                store256(state[0], half);
+
+                return;
+            }
+
+            let mut bytes = [0; 64];
+
+            let [low, high] = bytes.as_chunks_mut::<32>().0 else {
+                unreachable!("64 bytes are two groups of 32")
+            };
+
+            store256(state[0], low);
+
+            store256(state[1], high);
+
+            out.copy_from_slice(&bytes[..out.len()]);
+
+            wipe(&mut bytes);
+        }
     };
-
-    let mut state = [load256(low), load256(high)];
-
-    let (blocks, tail) = data.split_at(data.len().saturating_sub(1) / 128 * 128);
-
-    let mut counter = 0;
-
-    // compress64 stays out of line, so the message words go to it through memory, where they are
-    // cleared at the end.
-    let mut m: [__m256i; 8];
-
-    for block in blocks.as_chunks::<128>().0 {
-        counter += 128;
-
-        m = block64(block);
-
-        compress64(&mut state, &m, counter, false);
-    }
-
-    let mut last = [0; 128];
-
-    last[..tail.len()].copy_from_slice(tail);
-
-    m = block64(&last);
-
-    compress64(&mut state, &m, data.len() as u128, true);
-
-    let mut bytes = [0; 64];
-
-    let [low, high] = bytes.as_chunks_mut::<32>().0 else {
-        unreachable!("64 bytes are two groups of 32")
-    };
-
-    store256(state[0], low);
-
-    store256(state[1], high);
-
-    out.copy_from_slice(&bytes[..out.len()]);
-
-    wipe(&mut last);
-
-    wipe(&mut bytes);
-
-    // compress64 takes the state through memory.
-    clear(&mut state, _mm256_setzero_si256());
-
-    clear(&mut m, _mm256_setzero_si256());
 }
 
 // BLAKE2b with SSE4.1, for x86-64 CPUs without AVX2: each row in two vectors of two words, the
@@ -807,7 +1005,17 @@ const GATHERS: [[[usize; 4]; 4]; 10] = gathers();
 fn gather32_avx2<const R: usize, const K: usize>(block: &[u8; 64]) -> __m128i {
     let words = block.as_chunks::<4>().0;
 
-    let [w0, w1, w2, w3] = GATHERS[R][K].map(|w| _mm_set1_epi32(i32::from_le_bytes(words[w])));
+    let [a, b, c, d] = GATHERS[R][K];
+
+    // Written out, not array::map: map was not inlined at codegen-units 16, and a broadcast message
+    // word stayed in its frame.
+    let w0 = _mm_set1_epi32(i32::from_le_bytes(words[a]));
+
+    let w1 = _mm_set1_epi32(i32::from_le_bytes(words[b]));
+
+    let w2 = _mm_set1_epi32(i32::from_le_bytes(words[c]));
+
+    let w3 = _mm_set1_epi32(i32::from_le_bytes(words[d]));
 
     blend32::<0b1100>(blend32::<0b0010>(w0, w1), blend32::<0b1000>(w2, w3))
 }
@@ -856,180 +1064,259 @@ fn rotate32_avx2<const R: u32>(x: __m128i) -> __m128i {
     }
 }
 
-#[target_feature(enable = "avx2")]
-#[inline]
-fn half32_avx2<const R1: u32, const R2: u32>(row: &mut [__m128i; 4], m: __m128i) {
-    let [a, b, c, d] = row;
+// The AVX2 row form of BLAKE2s, generated for AVX2 and for AVX-512VL with the module's rotation.
+// The entry point's `unsafe` and safety section as in rows64.
+macro_rules! rows32 {
+    ($feature:literal, $rotate:ident $(, $unsafe:tt $safety:literal)?) => {
+        #[target_feature(enable = $feature)]
+        #[inline]
+        fn half32_avx2<const R1: u32, const R2: u32>(row: &mut [__m128i; 4], m: __m128i) {
+            let [a, b, c, d] = row;
 
-    *a = _mm_add_epi32(_mm_add_epi32(*a, m), *b);
+            *a = _mm_add_epi32(_mm_add_epi32(*a, m), *b);
 
-    *d = rotate32_avx2::<R1>(_mm_xor_si128(*d, *a));
+            *d = $rotate::<R1>(_mm_xor_si128(*d, *a));
 
-    *c = _mm_add_epi32(*c, *d);
+            *c = _mm_add_epi32(*c, *d);
 
-    *b = rotate32_avx2::<R2>(_mm_xor_si128(*b, *c));
-}
+            *b = $rotate::<R2>(_mm_xor_si128(*b, *c));
+        }
 
-// Round R. For the diagonal step, a moves down a lane and c and d up one and two.
-#[target_feature(enable = "avx2")]
-#[inline]
-fn round32_avx2<const R: usize>(row: &mut [__m128i; 4], block: &[u8; 64]) {
-    half32_avx2::<16, 12>(row, gather32_avx2::<R, 0>(block));
+        // Round R. For the diagonal step, a moves down a lane and c and d up one and two.
+        #[target_feature(enable = $feature)]
+        #[inline]
+        fn round32_avx2<const R: usize>(row: &mut [__m128i; 4], block: &[u8; 64]) {
+            half32_avx2::<16, 12>(row, gather32_avx2::<R, 0>(block));
 
-    half32_avx2::<8, 7>(row, gather32_avx2::<R, 1>(block));
+            half32_avx2::<8, 7>(row, gather32_avx2::<R, 1>(block));
 
-    row[0] = word_down(row[0]);
+            row[0] = word_down(row[0]);
 
-    row[2] = word_up(row[2]);
+            row[2] = word_up(row[2]);
 
-    row[3] = words_across(row[3]);
+            row[3] = words_across(row[3]);
 
-    half32_avx2::<16, 12>(row, gather32_avx2::<R, 2>(block));
+            half32_avx2::<16, 12>(row, gather32_avx2::<R, 2>(block));
 
-    half32_avx2::<8, 7>(row, gather32_avx2::<R, 3>(block));
+            half32_avx2::<8, 7>(row, gather32_avx2::<R, 3>(block));
 
-    row[0] = word_up(row[0]);
+            row[0] = word_up(row[0]);
 
-    row[2] = word_down(row[2]);
+            row[2] = word_down(row[2]);
 
-    row[3] = words_across(row[3]);
-}
+            row[3] = words_across(row[3]);
+        }
 
-#[target_feature(enable = "avx2")]
-#[inline]
-fn compress32_avx2(h: &mut [__m128i; 2], block: &[u8; 64], counter: u64, last: bool) {
-    let flag = if last { -1 } else { 0 };
+        #[target_feature(enable = $feature)]
+        #[inline]
+        fn compress32_avx2(h: &mut [__m128i; 2], block: &[u8; 64], counter: u64, last: bool) {
+            let flag = if last { -1 } else { 0 };
 
-    let [low, high] = IV_256.as_chunks::<4>().0 else {
-        unreachable!("eight words are two groups of four")
-    };
-
-    let mut row = [
-        h[0],
-        h[1],
-        load128(low),
-        _mm_xor_si128(
-            load128(high),
-            _mm_set_epi32(0, flag, (counter >> 32) as i32, counter as i32),
-        ),
-    ];
-
-    round32_avx2::<0>(&mut row, block);
-
-    round32_avx2::<1>(&mut row, block);
-
-    round32_avx2::<2>(&mut row, block);
-
-    round32_avx2::<3>(&mut row, block);
-
-    round32_avx2::<4>(&mut row, block);
-
-    round32_avx2::<5>(&mut row, block);
-
-    round32_avx2::<6>(&mut row, block);
-
-    round32_avx2::<7>(&mut row, block);
-
-    round32_avx2::<8>(&mut row, block);
-
-    round32_avx2::<9>(&mut row, block);
-
-    h[0] = _mm_xor_si128(h[0], _mm_xor_si128(row[0], row[2]));
-
-    h[1] = _mm_xor_si128(h[1], _mm_xor_si128(row[1], row[3]));
-
-    wipe_unless_optimized!(words_of(&mut row));
-}
-
-// The first out.len() bytes of the chaining value in state, a whole digest straight from the
-// registers.
-#[target_feature(enable = "avx2")]
-#[inline]
-fn output32(state: &[__m128i; 2], out: &mut [u8]) {
-    let mut bytes = [0; 32];
-
-    let target = match <&mut [u8; 32]>::try_from(&mut *out) {
-        Ok(whole) => whole,
-        Err(_) => &mut bytes,
-    };
-
-    let [low, high] = target.as_chunks_mut::<16>().0 else {
-        unreachable!("32 bytes are two groups of 16")
-    };
-
-    store128(state[0], low);
-
-    store128(state[1], high);
-
-    if out.len() < 32 {
-        out.copy_from_slice(&bytes[..out.len()]);
-
-        wipe(&mut bytes);
-    }
-}
-
-// BLAKE2s from h, in order: first (a MAC's key block), the whole blocks, and last with its
-// counter, the only block with the final flag; counter counts the bytes before the first of them.
-// The result goes into out, h left as it is, or into h without out. This is the compression's one
-// call site, so it is inlined and the state stays in registers from the first block to the
-// output: called for each block, it went through memory each time.
-#[target_feature(enable = "avx2")]
-pub(super) fn blake2s_avx2(
-    h: &mut [u32; 8],
-    first: Option<&[u8; 64]>,
-    blocks: &[[u8; 64]],
-    last: Option<(&[u8; 64], u64)>,
-    counter: u64,
-    out: Option<&mut [u8]>,
-) {
-    let [low, high] = h.as_chunks::<4>().0 else {
-        unreachable!("eight words are two groups of four")
-    };
-
-    let mut state = [load128(low), load128(high)];
-
-    let mut counter = counter;
-
-    let total = last.map_or(0, |(_, total)| total);
-
-    let parts = [
-        first.map_or(&[][..], core::slice::from_ref),
-        blocks,
-        last.map_or(&[][..], |(block, _)| core::slice::from_ref(block)),
-    ];
-
-    for (part, blocks) in parts.into_iter().enumerate() {
-        for block in blocks {
-            let last = part == 2;
-
-            counter = if last {
-                total
-            } else {
-                counter.wrapping_add(64)
+            let [low, high] = IV_256.as_chunks::<4>().0 else {
+                unreachable!("eight words are two groups of four")
             };
 
-            compress32_avx2(&mut state, block, counter, last);
+            let mut row = [
+                h[0],
+                h[1],
+                load128(low),
+                _mm_xor_si128(
+                    load128(high),
+                    _mm_set_epi32(0, flag, (counter >> 32) as i32, counter as i32),
+                ),
+            ];
+
+            round32_avx2::<0>(&mut row, block);
+
+            round32_avx2::<1>(&mut row, block);
+
+            round32_avx2::<2>(&mut row, block);
+
+            round32_avx2::<3>(&mut row, block);
+
+            round32_avx2::<4>(&mut row, block);
+
+            round32_avx2::<5>(&mut row, block);
+
+            round32_avx2::<6>(&mut row, block);
+
+            round32_avx2::<7>(&mut row, block);
+
+            round32_avx2::<8>(&mut row, block);
+
+            round32_avx2::<9>(&mut row, block);
+
+            h[0] = _mm_xor_si128(h[0], _mm_xor_si128(row[0], row[2]));
+
+            h[1] = _mm_xor_si128(h[1], _mm_xor_si128(row[1], row[3]));
+
+            wipe_unless_optimized!(words_of(&mut row));
+        }
+
+        // The first out.len() bytes of the chaining value in state: a whole digest straight from
+        // the registers, else through a copy, wiped by halves. The copy only for a short digest,
+        // and no 32-byte store into it, as the frame has only 16-byte alignment: zeroed for every
+        // call with one, the copy crossed a cache line on half of the stack positions.
+        #[target_feature(enable = $feature)]
+        #[inline]
+        fn output32(state: &[__m128i; 2], out: &mut [u8]) {
+            if let Ok(whole) = <&mut [u8; 32]>::try_from(&mut *out) {
+                halves32(state, whole);
+
+                return;
+            }
+
+            let mut bytes = [0; 32];
+
+            halves32(state, &mut bytes);
+
+            out.copy_from_slice(&bytes[..out.len()]);
+
+            for half in bytes.as_chunks_mut::<16>().0 {
+                wipe(half);
+            }
+        }
+
+        #[target_feature(enable = $feature)]
+        #[inline]
+        fn halves32(state: &[__m128i; 2], out: &mut [u8; 32]) {
+            let [low, high] = out.as_chunks_mut::<16>().0 else {
+                unreachable!("32 bytes are two groups of 16")
+            };
+
+            store128(state[0], low);
+
+            store128(state[1], high);
+        }
+
+        // BLAKE2s from h, in order: first (a MAC's key block), the whole blocks, and last with its
+        // counter, the only block with the final flag; counter counts the bytes before the first of
+        // them.
+        // The result goes into out, h left as it is, or into h without out. This is the
+        // compression's one call site, so it is inlined and the state stays in registers from the
+        // first block to the output: called for each block, it went through memory each time.
+        $(#[doc = $safety] #[allow(unsafe_code)])?
+        #[target_feature(enable = $feature)]
+        pub(in crate::cpu::x86_64) $($unsafe)? fn blake2s_avx2(
+            h: &mut [u32; 8],
+            first: Option<&[u8; 64]>,
+            blocks: &[[u8; 64]],
+            last: Option<(&[u8; 64], u64)>,
+            counter: u64,
+            out: Option<&mut [u8]>,
+        ) {
+            let [low, high] = h.as_chunks::<4>().0 else {
+                unreachable!("eight words are two groups of four")
+            };
+
+            let mut state = [load128(low), load128(high)];
+
+            let mut counter = counter;
+
+            let total = last.map_or(0, |(_, total)| total);
+
+            let parts = [
+                first.map_or(&[][..], core::slice::from_ref),
+                blocks,
+                last.map_or(&[][..], |(block, _)| core::slice::from_ref(block)),
+            ];
+
+            for (part, blocks) in parts.into_iter().enumerate() {
+                for block in blocks {
+                    let last = part == 2;
+
+                    counter = if last {
+                        total
+                    } else {
+                        counter.wrapping_add(64)
+                    };
+
+                    compress32_avx2(&mut state, block, counter, last);
+                }
+            }
+
+            if let Some(out) = out {
+                output32(&state, out);
+
+                wipe_unless_optimized!(words_of(&mut state));
+
+                return;
+            }
+
+            let [low, high] = h.as_chunks_mut::<4>().0 else {
+                unreachable!("eight words are two groups of four")
+            };
+
+            store128(state[0], low);
+
+            store128(state[1], high);
+
+            wipe_unless_optimized!(words_of(&mut state));
+        }
+    };
+}
+
+// The row forms with AVX2's rotations.
+mod avx2 {
+    use super::*;
+
+    rows64!("avx2", rotate64);
+
+    rows32!("avx2", rotate32_avx2);
+}
+
+// The AVX2 row forms with the rotations by 63 (BLAKE2b), 12 and 7 (BLAKE2s) each one EVEX
+// instruction in place of two shifts and an OR, on the chain of every half step. The rotation by
+// 32 of BLAKE2b stays a VPSHUFD, which runs on another port.
+mod vl {
+    use super::super::evex::{ror32, ror64};
+    use super::*;
+
+    // Private to this module, whose entry points are unsafe and require AVX-512F and AVX-512VL:
+    // every call of the rotations below comes from one of them.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    #[allow(unsafe_code)]
+    fn rotate64_vl<const R: u32>(x: __m256i) -> __m256i {
+        match R {
+            // SAFETY: the CPU has AVX-512F and AVX-512VL, as the entry points require.
+            63 => unsafe { ror64::<63>(x) },
+            _ => rotate64::<R>(x),
         }
     }
 
-    if let Some(out) = out {
-        output32(&state, out);
-
-        wipe_unless_optimized!(words_of(&mut state));
-
-        return;
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    #[allow(unsafe_code)]
+    fn rotate32_vl<const R: u32>(x: __m128i) -> __m128i {
+        match R {
+            // SAFETY: as in rotate64_vl, here and in the next.
+            12 => unsafe { ror32::<12>(x) },
+            7 => unsafe { ror32::<7>(x) },
+            _ => rotate32_avx2::<R>(x),
+        }
     }
 
-    let [low, high] = h.as_chunks_mut::<4>().0 else {
-        unreachable!("eight words are two groups of four")
-    };
+    rows64!(
+        "avx2",
+        rotate64_vl,
+        unsafe "# Safety\n\nThe CPU has AVX-512F and AVX-512VL, and the operating system saves \
+            their registers."
+    );
 
-    store128(state[0], low);
-
-    store128(state[1], high);
-
-    wipe_unless_optimized!(words_of(&mut state));
+    rows32!(
+        "avx2",
+        rotate32_vl,
+        unsafe "# Safety\n\nThe CPU has AVX-512F and AVX-512VL, and the operating system saves \
+            their registers."
+    );
 }
+
+pub(super) use avx2::{blake2b_avx2, blake2b_digest_avx2, blake2s_avx2};
+pub(super) use vl::{
+    blake2b_avx2 as blake2b_vl, blake2b_digest_avx2 as blake2b_digest_vl,
+    blake2s_avx2 as blake2s_vl,
+};
 
 // The bytes of sixteen words, for the blocks that come as words.
 pub(super) fn bytes32(words: &[u32; 16]) -> [u8; 64] {

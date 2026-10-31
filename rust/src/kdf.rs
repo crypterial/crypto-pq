@@ -172,18 +172,15 @@ impl KdfAlgorithm {
         }
     }
 
+    // On aarch64 BLAKE3-KDF leaves to its own function, out of HKDF's frame: inlined, it gave HKDF
+    // one more saved register pair and a frame of 0x140 bytes against 0xe0.
+    #[cfg_attr(target_arch = "aarch64", inline(never))]
     fn derive_unchecked(&self, ikm: &[u8], out: &mut [u8], options: &KdfOptions) {
         let hash = match self.kind {
             #[cfg(feature = "hkdf")]
             KdfKind::Hkdf(hash) => hash,
             #[cfg(feature = "blake3")]
-            KdfKind::Blake3 => {
-                let _dit = Dit::keyed();
-
-                blake3::derive_key(options.info, ikm, out);
-
-                return;
-            }
+            KdfKind::Blake3 => return derive_blake3(options.info, ikm, out),
         };
 
         let _dit = Dit::keyed();
@@ -290,6 +287,16 @@ impl KdfAlgorithm {
 
         Ok(hash)
     }
+}
+
+// BLAKE3-KDF under its keyed DIT guard.
+#[cfg(feature = "blake3")]
+#[cfg_attr(target_arch = "aarch64", inline(never))]
+#[cfg_attr(not(target_arch = "aarch64"), inline(always))]
+fn derive_blake3(context: &[u8], ikm: &[u8], out: &mut [u8]) {
+    let _dit = Dit::keyed();
+
+    blake3::derive_key(context, ikm, out);
 }
 
 // T(i) = HMAC(PRK, T(i - 1) || info || i), from T(0) empty, until out is full. T(1) alone is a
