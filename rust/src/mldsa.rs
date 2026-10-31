@@ -182,8 +182,13 @@ const fn montgomery_mul(a: i32, b: i32) -> i32 {
     montgomery(a, b, b.wrapping_mul(QINV))
 }
 
-// (-q, q) to [0, q) with a mask instead of a branch.
-const fn freeze(a: i32) -> i32 {
+// (-q, q) to [0, q) with a mask instead of a branch, from ct::sign_mask (D-79).
+fn freeze(a: i32) -> i32 {
+    a + (Q & ct::sign_mask(a))
+}
+
+// freeze for constant items, where the barrier cannot run.
+const fn freeze_const(a: i32) -> i32 {
     a + (Q & (a >> 31))
 }
 
@@ -192,29 +197,35 @@ const fn reduce(a: i32) -> i32 {
     a - ((a + (1 << 22)) >> 23) * Q
 }
 
-const fn add(a: i32, b: i32) -> i32 {
+fn add(a: i32, b: i32) -> i32 {
     freeze(a + b - Q)
 }
 
-const fn sub(a: i32, b: i32) -> i32 {
+fn sub(a: i32, b: i32) -> i32 {
     freeze(a - b)
 }
 
-const fn mul(a: i32, b: i32) -> i32 {
+#[cfg(test)]
+fn mul(a: i32, b: i32) -> i32 {
     freeze(montgomery_mul(montgomery_mul(a, b), R2))
 }
 
 // 2^64 / 256 mod q: one Montgomery reduction against it removes the 2^-32 that the pointwise
 // products carry and divides by the 256 of the transform.
-const INVERSE_SCALE: i32 = mul(R2, 8347681);
+const INVERSE_SCALE: i32 = freeze_const(montgomery_mul(montgomery_mul(R2, 8347681), R2));
 
 // A coefficient in (-q, q) to [0, q).
-const fn canonical(a: i32) -> i32 {
+fn canonical(a: i32) -> i32 {
     freeze(a)
 }
 
-// [0, q) to the representative in (-(q - 1) / 2, (q - 1) / 2].
-const fn centered(a: i32) -> i32 {
+// [0, q) to the representative in (-(q - 1) / 2, (q - 1) / 2], the mask from ct::sign_mask.
+fn centered(a: i32) -> i32 {
+    a - (Q & ct::sign_mask((Q - 1) / 2 - a))
+}
+
+// centered without the barrier, for the twiddle factors, which are public, and constant items.
+const fn centered_const(a: i32) -> i32 {
     a - (Q & (((Q - 1) / 2 - a) >> 31))
 }
 
@@ -229,7 +240,7 @@ pub(crate) static FIELD: Field = Field::new(
         let mut m = 0;
 
         while m < 256 {
-            zetas[m] = centered(ZETAS[m]);
+            zetas[m] = centered_const(ZETAS[m]);
 
             m += 1;
         }
@@ -258,7 +269,7 @@ fn ntt_portable(w: &mut Poly) {
         for start in (0..256).step_by(2 * length) {
             m += 1;
 
-            let zeta = centered(ZETAS[m]);
+            let zeta = centered_const(ZETAS[m]);
 
             let zeta_qinv = zeta.wrapping_mul(QINV);
 
@@ -299,7 +310,7 @@ fn inverse_ntt_portable(w: &mut Poly) {
         for start in (0..256).step_by(2 * length) {
             m -= 1;
 
-            let zeta = -centered(ZETAS[m]);
+            let zeta = -centered_const(ZETAS[m]);
 
             let zeta_qinv = zeta.wrapping_mul(QINV);
 
@@ -369,6 +380,7 @@ fn pointwise_portable(f: &Poly, g: &Poly, product: &mut Poly) {
 // Branch-free FIPS 204 Algorithm 36 for r in [0, q): (r1, r0) with r0 centered. The sign masks
 // pass through black_box: an optimizer that sees x ^ (mask & x) or x - (mask & q) makes it a
 // select, which some compilers lower to a conditional move on the secret coefficient.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const fn decompose(r: i32, gamma2: i32) -> (i32, i32) {
     let mut r1 = (r + 127) >> 7;
 
@@ -385,11 +397,31 @@ const fn decompose(r: i32, gamma2: i32) -> (i32, i32) {
     (r1, r0 - (black_box(((Q - 1) / 2 - r0) >> 31) & Q))
 }
 
-const fn high_bits(r: i32, gamma2: i32) -> i32 {
+// As above, with the masks from ct::sign_mask (D-79): the compiler reads the sign of 43 - r1,
+// whose range it knows, as a comparison, and an and with a sign mask as a choice between two
+// values, a select on WebAssembly and a branch where no conditional move exists.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn decompose(r: i32, gamma2: i32) -> (i32, i32) {
+    let mut r1 = (r + 127) >> 7;
+
+    if gamma2 == (Q - 1) / 32 {
+        r1 = ((r1 * 1025 + (1 << 21)) >> 22) & 15;
+    } else {
+        r1 = (r1 * 11275 + (1 << 23)) >> 24;
+
+        r1 ^= ct::sign_mask(43 - r1) & r1;
+    }
+
+    let r0 = r - r1 * 2 * gamma2;
+
+    (r1, r0 - (ct::sign_mask((Q - 1) / 2 - r0) & Q))
+}
+
+fn high_bits(r: i32, gamma2: i32) -> i32 {
     decompose(r, gamma2).0
 }
 
-const fn low_bits(r: i32, gamma2: i32) -> i32 {
+fn low_bits(r: i32, gamma2: i32) -> i32 {
     decompose(r, gamma2).1
 }
 
@@ -1028,14 +1060,27 @@ fn sample_in_ball_public_from(
     }
 }
 
-// 0xFF when a equals b, 0 otherwise, XORed with zero. Given a zero from black_box, the compiler
-// cannot see the mask as a boolean, so it cannot make the selection that uses it a branch, which
-// it does on targets without a conditional move (RISC-V).
+// 0xFF when a equals b, 0 otherwise, XORed with zero, a zero from black_box, so that the compiler
+// cannot see the mask as a boolean.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 const fn equal_byte(a: u8, b: u8, zero: u8) -> u8 {
     let difference = a ^ b;
 
     ((difference | difference.wrapping_neg()) >> 7).wrapping_sub(1) ^ zero
+}
+
+// As ct's zero mask (D-79): the top bit of !(d | -d), set when the bytes are equal, spread by
+// ct::sign_mask, since the compiler reads a shift by 7 as a comparison and the mask as a choice
+// between two constants, a select on WebAssembly and a branch where no conditional move exists.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+fn equal_byte(a: u8, b: u8, zero: u8) -> u8 {
+    let difference = a ^ b;
+
+    let top = u32::from(!(difference | difference.wrapping_neg())) << 24;
+
+    (ct::sign_mask(top as i32) as u8) ^ zero
 }
 
 // The NTT of a polynomial with signed coefficients of absolute value below q, in place. The

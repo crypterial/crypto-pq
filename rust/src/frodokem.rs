@@ -153,7 +153,7 @@ impl Drop for Entries {
 }
 
 // Sample (draft 6.5): the magnitude counts the entries of T_chi below r >> 1, all of them compared
-// arithmetically, and bit 0 of r gives the sign.
+// arithmetically, and bit 0 of r gives the sign, spread between two barriers (D-79).
 #[inline(always)]
 fn sample(r: u16, cdf: &[u16]) -> u16 {
     let t = r >> 1;
@@ -164,7 +164,7 @@ fn sample(r: u16, cdf: &[u16]) -> u16 {
         e += c.wrapping_sub(t) >> 15;
     }
 
-    let sign = (r & 1).wrapping_neg();
+    let sign = ct::barrier((ct::barrier(u32::from(r)) & 1).wrapping_neg()) as u16;
 
     (e ^ sign).wrapping_sub(sign)
 }
@@ -749,9 +749,9 @@ pub(crate) fn decapsulate(p: &Parameters, sk: &[u8], ciphertext: &[u8], shared_s
         difference |= v ^ u16::from_be_bytes(*x);
     }
 
-    let same = (u32::from(black_box(difference)).wrapping_sub(1) >> 31) as u8;
+    let difference = u32::from(black_box(difference));
 
-    let mask = same.wrapping_neg() & ct::equal_mask(&c2_prime, c2);
+    let mask = ct::equal_mask(&c2_prime, c2) & ct::small_zero_mask(difference);
 
     let mut k_hat = [0u8; 32];
 

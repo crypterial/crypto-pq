@@ -162,6 +162,16 @@ Implements specification 1.1 (draft).
 
 ### Fixed
 
+- Constant time on RISC-V and s390x: the compiler turned the masked reductions of ML-DSA and
+  ML-KEM into a choice between two values, which these targets computed with a branch on secret
+  coefficients. On RISC-V without the Zicond extension, ML-DSA signing, ML-DSA key generation from
+  a seed, the import of expanded ML-DSA keys and the check of expanded ML-KEM decapsulation keys
+  branched at every opt-level; on s390x, the norm checks of ML-DSA signing and the ML-KEM noise
+  sampler at opt-levels 1, 2 and 3. Every mask computed from secret data now passes an
+  optimization barrier ([decision D-79](spec/decisions.md#decision-d-79)), an empty inline
+  assembly block, or `core::hint::black_box` on WebAssembly and the other targets without stable
+  inline assembly. The machine code for x86-64 and ARM64 is unchanged. rust-v1.0.0 and
+  rust-v1.0.1 have the same flaw.
 - BLAKE2s and BLAKE3 on x86-64 and BLAKE3 on ARM64: the broadcasts of message and key words are
   written out, so that no broadcast word stays in a frame of `array::map` that nothing wipes
   (D-76): BLAKE3's extended output on ARM64 copied the root block by value, BLAKE2s's AVX2 kernel
