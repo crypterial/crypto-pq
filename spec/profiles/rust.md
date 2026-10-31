@@ -45,10 +45,18 @@
    module; the CPU modules (feature detection, `core::arch` intrinsics, inline assembly); and the
    valgrind client requests of the `crypto_pq_ct` build. Each unsafe block carries a comment that states
    why it is sound.
-2. Constant time: masks and selections go through an optimization barrier defined in the constant-time
-   module, so that the compiler cannot turn them into branches; `==` on secret slices is forbidden;
-   slice bounds checks depend only on public lengths; `match` and `if` never take a secret
-   operand.
+2. Constant time: a mask computed from the sign or top bit of a secret value comes from
+   `ct::sign_mask`, which puts an optimization barrier on the value, spreads the bit with an
+   arithmetic shift and puts a barrier on the mask, so that the compiler can neither read the
+   shift as a comparison nor turn the selection that uses the mask into a branch
+   [[D-79](../decisions.md#decision-d-79)]; a bit spread by negation passes a barrier before and
+   after it. The barrier `ct::barrier` is an empty inline assembly block on a register where Rust
+   has stable inline assembly, `core::hint::black_box` on the other targets and under Miri, and
+   the identity on x86-64 and ARM64, whose builds CI checks under valgrind
+   ([14.1](../14-security.md#141-constant-time) item 7). It is defined in the CPU module, which
+   may hold inline assembly (item 1), and the constant-time module re-exports it. `==` on secret
+   slices is forbidden; slice bounds checks depend only on public lengths; `match` and `if` never
+   take a secret operand.
 3. Wiping: zero stores that the compiler cannot remove, then a compiler fence. A buffer is filled with
    zeros and its address goes into an empty assembly block; up to eight values of at most a word, and
    targets without stable inline assembly, get volatile writes. `SecretBytes` and the private key

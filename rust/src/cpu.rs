@@ -1174,6 +1174,62 @@ impl Field16 {
     }
 }
 
+// The optimization barrier of ct::barrier (D-79): the value unchanged, with nothing the compiler
+// may assume about it, so that a mask of secret data cannot become a select, which targets
+// without a conditional move lower to a branch (RISC-V, s390x z10). On x86-64 and ARM64, which
+// valgrind checks in CI (14.1 item 7), it is the identity.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
+pub(crate) fn barrier(value: u32) -> u32 {
+    value
+}
+
+#[cfg(all(
+    any(
+        target_arch = "arm",
+        target_arch = "x86",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x",
+    ),
+    not(miri)
+))]
+#[allow(unsafe_code)]
+#[inline(always)]
+pub(crate) fn barrier(mut value: u32) -> u32 {
+    // SAFETY: the assembly is empty: it leaves the register that holds the value as it is, and
+    // touches no memory, no stack and no flags.
+    unsafe {
+        core::arch::asm!(
+            "/* {0} */",
+            inout(reg) value,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+
+    value
+}
+
+// Targets without stable inline assembly in Rust, WebAssembly among them, and Miri.
+#[cfg(any(
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "x86",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x",
+    )),
+    all(miri, not(any(target_arch = "x86_64", target_arch = "aarch64")))
+))]
+#[inline(always)]
+pub(crate) fn barrier(value: u32) -> u32 {
+    core::hint::black_box(value)
+}
+
 // Inputs for the differential tests, which run each kernel and the portable code on the same
 // random and edge inputs: SplitMix64, the same sequence on every run.
 #[cfg(test)]

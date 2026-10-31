@@ -633,3 +633,50 @@ AVX-512 hidden, as on the client processors of these cores, the earlier form too
 percent less time for 64 bytes on Emerald Rapids and Granite Rapids and 0.6 percent less for 1 KiB
 on both, while on Haswell its kernels took 5 percent more for 1 KiB and on AMD Zen 3 1.1 percent
 more, so other processors keep the newer form; the models not measured are of the same core line.
+
+## Decision D-79
+
+A mask that the implementation computes from the sign or top bit of a secret value, to select or
+to subtract with it, comes from one helper, `ct::sign_mask`: an optimization barrier on the value
+([23.2](profiles/rust.md#232-security-mechanics) item 2), the arithmetic shift that spreads the
+bit, and a barrier on the mask. The first barrier keeps the compiler, which may know the range of
+the value from the code around it, from reading the shift as a comparison; the second keeps it
+from knowing that the mask is 0 or all ones. The FrodoKEM noise sign, bit 0 of the sample, is
+spread by a negation between two barriers in the same way. Without the barriers, LLVM rewrote the
+masked reductions of ML-DSA and ML-KEM, such as `a + (q & (a >> 31))`, as a choice between two
+values, which targets without a conditional move compute with a conditional branch on the secret
+value ([14.1](14-security.md#141-constant-time) item 1): RISC-V without the Zicond extension, and
+s390x at its baseline z10, which has no load-on-condition. The barrier is an empty inline
+assembly block that takes the value in a register and returns it, which emits no instruction, on
+the targets where Rust has stable inline assembly (32-bit ARM, 32-bit x86, RISC-V, LoongArch and
+s390x), and `core::hint::black_box` on the others, WebAssembly among them, and under Miri. On
+x86-64 and ARM64 it is the identity: there the compiler chooses with a conditional move or select
+instruction, and CI checks these builds mechanically under valgrind
+([14.1](14-security.md#141-constant-time) item 7); ML-DSA Decompose and the byte equality of
+SampleInBall keep their `black_box` forms there. The masks covered are those of the ML-DSA and
+ML-KEM reductions to [0, q), the ML-DSA reduction to the centered representative, the ML-KEM
+subtraction of q (in additions, subtractions, decoding, noise sampling and the compression of the
+message), the sign masks of ML-DSA Decompose, the constant-time equality of byte strings (with
+the FrodoKEM decapsulation choice), the byte equality of ML-DSA SampleInBall and the FrodoKEM
+noise sign. Constant items and the public twiddle factors use twins of the reductions without the
+barrier, since inline assembly cannot run in constant evaluation.
+
+Rationale: on riscv64gc, at opt-levels 1, 2, 3, s and z, ML-DSA signing (MakeHint and the
+addition of polynomials), ML-DSA key generation from a seed, the import of expanded ML-DSA keys
+and the ML-KEM check of expanded decapsulation keys branched on secret coefficients; on s390x
+(z10) the norm checks of ML-DSA signing and the ML-KEM noise sampler branched at opt-levels 1, 2
+and 3. rust-v1.0.0 and rust-v1.0.1 have the same flaw. On WebAssembly, Decompose, whose masks
+already passed `black_box`, compiled to selects, which a runtime may compile to a branch where
+the host has no conditional move. A barrier on the mask alone does not suffice: given the range
+of the value, the compiler forms the mask before the barrier as a choice between two constants,
+which on s390x and on 32-bit x86 at opt-level s became a branch in the equality of byte strings;
+and without the barrier on the mask, it turns the and with the shifted mask in Decompose into a
+select. The rule therefore applies to every such mask, whether or not a scan of the current
+compiler shows a branch. With the barriers, a scan of the machine code at opt-levels 1, 2, 3, s
+and z on riscv64gc, riscv32imac, i686, armv7, wasm32 and s390x (z10) finds no branch or select on
+secret data, and the x86-64 and ARM64 objects at opt-levels 3 and z, in the default, portable and
+constant-time builds, are equal to those before, function by function. Code size: at opt-level 3
+the riscv64gc, s390x and i686 builds have 0.3, 0.9 and 1.2 percent fewer instructions; at
+opt-level z riscv64gc and i686 have 0.07 and 0.05 percent more, and s390x 0.03 percent fewer. The
+barrier itself emits no instruction except on WebAssembly and under Miri, where `black_box`
+stores the value. No timing was taken on these targets.

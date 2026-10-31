@@ -38,13 +38,55 @@ pub(crate) fn equal(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && difference(a, b) == 0
 }
 
+// The optimization barrier for masks of secret data (D-79), from the CPU module, which may hold
+// the inline assembly: the compiler cannot know that a mask that passed it is 0 or all ones, so
+// it cannot make the selection that uses the mask a select, which RISC-V and s390x lower to a
+// branch.
+pub(crate) use crate::cpu::barrier;
+
+// All ones when x is negative, 0 otherwise. The shift that spreads the sign runs between two
+// barriers: on the input, so that the compiler, which may know the range of x, cannot read the
+// shift as a comparison, and on the mask, so that it cannot know the mask is 0 or all ones.
+#[inline(always)]
+pub(crate) fn sign_mask(x: i32) -> i32 {
+    barrier((barrier(x as u32) as i32 >> 31) as u32) as i32
+}
+
 // 0xFF when the equally long inputs match, 0 otherwise, without a branch on their contents.
 pub(crate) fn equal_mask(a: &[u8], b: &[u8]) -> u8 {
-    let difference = difference(a, b);
+    zero_mask(difference(a, b))
+}
 
-    let nonzero = (difference | difference.wrapping_neg()) >> 63;
+// 0xFF when x is 0, 0 otherwise.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
+fn zero_mask(x: u64) -> u8 {
+    let nonzero = (x | x.wrapping_neg()) >> 63;
 
     (nonzero as u8).wrapping_sub(1)
+}
+
+// The sign bit of !(x | -x), set when x is 0, spread by sign_mask: the compiler would read a shift
+// by 63 as a comparison with 0, and a NOT after the shift as a choice between two constants,
+// which s390x without load-on-condition, and 32-bit x86 at opt-level s, compute with a branch.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+fn zero_mask(x: u64) -> u8 {
+    sign_mask((!((x | x.wrapping_neg()) >> 32) as u32) as i32) as u8
+}
+
+// 0xFF when x is 0, 0 otherwise, for x below 2^31.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
+pub(crate) fn small_zero_mask(x: u32) -> u8 {
+    ((x.wrapping_sub(1) >> 31) as u8).wrapping_neg()
+}
+
+// As zero_mask: the sign of x - 1, spread by sign_mask.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+pub(crate) fn small_zero_mask(x: u32) -> u8 {
+    sign_mask(x.wrapping_sub(1) as i32) as u8
 }
 
 // out = a where mask is 0xFF, b where it is 0.

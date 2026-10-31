@@ -149,18 +149,19 @@ const fn reduce(t: u32) -> u16 {
     (t - divide(t) * Q) as u16
 }
 
-// x < 2q to x mod q, by a masked rather than a branching subtraction.
-const fn subtract_q(x: u32) -> u16 {
+// x < 2q to x mod q, by a masked rather than a branching subtraction, the mask from
+// ct::sign_mask (D-79).
+fn subtract_q(x: u32) -> u16 {
     let y = x.wrapping_sub(Q);
 
-    y.wrapping_add(Q & 0u32.wrapping_sub(y >> 31)) as u16
+    y.wrapping_add(Q & ct::sign_mask(y as i32) as u32) as u16
 }
 
-const fn add(a: u16, b: u16) -> u16 {
+fn add(a: u16, b: u16) -> u16 {
     subtract_q(a as u32 + b as u32)
 }
 
-const fn sub(a: u16, b: u16) -> u16 {
+fn sub(a: u16, b: u16) -> u16 {
     subtract_q(a as u32 + Q - b as u32)
 }
 
@@ -179,9 +180,9 @@ const fn montgomery(a: i32, b: i32, b_qinv: i32) -> i32 {
     high(a, b) - high(a.wrapping_mul(b_qinv), Q as i32)
 }
 
-// (-q, q) to [0, q) with a mask instead of a branch.
-const fn freeze(y: i32) -> u16 {
-    (y + (Q as i32 & (y >> 31))) as u16
+// (-q, q) to [0, q) with a mask instead of a branch, from ct::sign_mask.
+fn freeze(y: i32) -> u16 {
+    (y + (Q as i32 & ct::sign_mask(y))) as u16
 }
 
 // |w| < 2^31 to the canonical coefficients w mod q, into f.
