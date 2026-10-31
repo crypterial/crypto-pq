@@ -4,11 +4,12 @@
 // lanes and of the odd lanes moved down: their high halves are subtracted lane by lane, which is
 // exact whatever the low halves hold, and the odd lanes' results are blended back.
 //
-// The layers run in two passes over registers: first the three layers that pair coefficients 128,
-// 64 and 32 apart, on eight vectors 32 coefficients apart, then the others on blocks of 32
-// consecutive coefficients. For the layers that pair coefficients 4, 2 and 1 apart, two vectors
-// are transposed by halves, 64-bit and 32-bit groups so that partners share a lane; the factors
-// of those layers are spread over the lanes by a permutation of four or eight table entries.
+// The layers run in two passes over eight registers: first the three layers that pair coefficients
+// 128, 64 and 32 apart, on vectors 32 coefficients apart, then the others on 64 consecutive
+// coefficients, so that each layer has four independent butterflies. For the layers that pair
+// coefficients 4, 2 and 1 apart, pairs of vectors are transposed by halves, 64-bit and 32-bit
+// groups so that partners share a lane; the factors of those layers come from broadcasts, a
+// widening load or a load of eight table entries.
 //
 // All of these are data-processing instructions on Intel's data-operand-independent timing list,
 // with no branch or address that depends on a coefficient.
@@ -17,7 +18,7 @@ use core::arch::x86_64::*;
 
 #[cfg(not(crypto_pq_optimized))]
 use super::memory::words_of;
-use super::memory::{clear, load128, load256, store256};
+use super::memory::{load128, load256, store256};
 use crate::cpu::{Field, Prepare};
 use crate::wipe::wipe_unless_optimized;
 
@@ -66,44 +67,59 @@ fn broadcast(zetas: &[i32; 256], products: &[i32; 256], m: usize) -> Twiddle {
     constant(zetas[m], products[m])
 }
 
-// Entries m to m + COUNT - 1 of a table, each repeated over 8 / COUNT lanes.
+// The factors of the layer that pairs coefficients 4 apart: entries m and m + 1 of a table, each
+// over four lanes, from two broadcasts; adjacent lanes share their factor, so the odd lanes' form
+// is the same vector.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn entries<const COUNT: usize>(zetas: &[i32; 256], products: &[i32; 256], m: usize) -> Twiddle {
-    let load = |table: &[i32; 256]| match COUNT {
-        2 => {
-            let pair = i64::from(table[m] as u32) | i64::from(table[m + 1] as u32) << 32;
-
-            _mm256_castsi128_si256(_mm_cvtsi64_si128(pair))
-        }
-        4 => {
-            let four: &[i32; 4] = table[m..m + 4].try_into().expect("four entries");
-
-            _mm256_castsi128_si256(load128(four))
-        }
-        _ => {
-            let eight: &[i32; 8] = table[m..m + 8].try_into().expect("eight entries");
-
-            load256(eight)
-        }
+fn fours(zetas: &[i32; 256], products: &[i32; 256], m: usize) -> Twiddle {
+    let two = |table: &[i32; 256]| {
+        _mm256_blend_epi32::<0xF0>(_mm256_set1_epi32(table[m]), _mm256_set1_epi32(table[m + 1]))
     };
 
-    let (zeta, qinv) = (load(zetas), load(products));
+    let (zeta, qinv) = (two(zetas), two(products));
 
-    if COUNT == 8 {
-        return spread(zeta, qinv);
+    Twiddle {
+        zeta,
+        qinv,
+        zeta_odd: zeta,
+        qinv_odd: qinv,
     }
+}
 
-    let order = if COUNT == 2 {
-        _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1)
-    } else {
-        _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3)
+// The factors of the layer that pairs coefficients 2 apart: entries m to m + 3, each over two
+// adjacent lanes. The products read only the low half of each 64-bit lane, so entry i widened to
+// 64 bits serves both of its lanes, even and odd.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn twos(zetas: &[i32; 256], products: &[i32; 256], m: usize) -> Twiddle {
+    let four = |table: &[i32; 256]| {
+        let four: &[i32; 4] = table[m..m + 4].try_into().expect("four entries");
+
+        _mm256_cvtepu32_epi64(load128(four))
     };
 
-    spread(
-        _mm256_permutevar8x32_epi32(zeta, order),
-        _mm256_permutevar8x32_epi32(qinv, order),
-    )
+    let (zeta, qinv) = (four(zetas), four(products));
+
+    Twiddle {
+        zeta,
+        qinv,
+        zeta_odd: zeta,
+        qinv_odd: qinv,
+    }
+}
+
+// The factors of the layer that pairs neighbours: entries m to m + 7, one per lane.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn ones(zetas: &[i32; 256], products: &[i32; 256], m: usize) -> Twiddle {
+    let eight = |table: &[i32; 256]| {
+        let eight: &[i32; 8] = table[m..m + 8].try_into().expect("eight entries");
+
+        load256(eight)
+    };
+
+    spread(eight(zetas), eight(products))
 }
 
 #[target_feature(enable = "avx2")]
@@ -196,42 +212,60 @@ fn words(x: __m256i, y: __m256i) -> (__m256i, __m256i) {
     )
 }
 
-// The layers that pair coefficients 4, 2 and 1 apart on two vectors, the p-th pair of block b.
-// With the table's group m counted from 1, the layer that pairs coefficients d apart uses groups
-// 128 / d to 256 / d - 1.
-#[target_feature(enable = "avx2")]
-#[inline]
-fn forward_tail(
-    x: __m256i,
-    y: __m256i,
-    field: &Field,
-    group: usize,
-    q: __m256i,
-) -> (__m256i, __m256i) {
-    let (z, zq) = (&field.forward, &field.forward_qinv);
+// The body once for each value of the index, as a constant: LLVM kept loops over these few
+// vectors rolled, with the vectors on the stack and one butterfly at a time, which left the
+// multiplier waiting on each product's latency.
+macro_rules! unroll {
+    ($index:ident in [$($value:literal),+] $body:block) => {
+        $({
+            const $index: usize = $value;
 
-    let (x, y) = halves(x, y);
-
-    let (x, y) = forward_butterfly(x, y, entries::<2>(z, zq, 32 + 2 * group), q);
-
-    let (x, y) = quarters(x, y);
-
-    let (mut x, mut y) = forward_butterfly(x, y, entries::<4>(z, zq, 64 + 4 * group), q);
-
-    if field.layers == 8 {
-        let (even, odd) = words(x, y);
-
-        let (even, odd) = forward_butterfly(even, odd, entries::<8>(z, zq, 128 + 8 * group), q);
-
-        (x, y) = words(even, odd);
-    }
-
-    let (x, y) = quarters(x, y);
-
-    halves(x, y)
+            $body
+        })+
+    };
 }
 
-// The forward layers. ML-KEM's seven layers end with freeze(montgomery(x, forward_scale)).
+// The layers that pair coefficients 4, 2 and 1 apart on four pairs of vectors, pair p in x[2p]
+// and x[2p + 1], sixteen consecutive coefficients that are group first + p. With the table's group
+// m counted from 1, the layer that pairs coefficients d apart uses groups 128 / d to 256 / d - 1.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn forward_tail(x: &mut [__m256i; 8], field: &Field, first: usize, q: __m256i) {
+    let (z, zq) = (&field.forward, &field.forward_qinv);
+
+    unroll!(P in [0, 1, 2, 3] {
+        let (x0, x1) = halves(x[2 * P], x[2 * P + 1]);
+
+        (x[2 * P], x[2 * P + 1]) = forward_butterfly(x0, x1, fours(z, zq, 32 + 2 * (first + P)), q);
+    });
+
+    unroll!(P in [0, 1, 2, 3] {
+        let (x0, x1) = quarters(x[2 * P], x[2 * P + 1]);
+
+        (x[2 * P], x[2 * P + 1]) = forward_butterfly(x0, x1, twos(z, zq, 64 + 4 * (first + P)), q);
+    });
+
+    if field.layers == 8 {
+        unroll!(P in [0, 1, 2, 3] {
+            let (even, odd) = words(x[2 * P], x[2 * P + 1]);
+
+            let (even, odd) = forward_butterfly(even, odd, ones(z, zq, 128 + 8 * (first + P)), q);
+
+            (x[2 * P], x[2 * P + 1]) = words(even, odd);
+        });
+    }
+
+    unroll!(P in [0, 1, 2, 3] {
+        let (x0, x1) = quarters(x[2 * P], x[2 * P + 1]);
+
+        (x[2 * P], x[2 * P + 1]) = halves(x0, x1);
+    });
+}
+
+// The forward layers in two passes over registers: the layers that pair coefficients 128, 64 and
+// 32 apart on eight vectors 32 coefficients apart, then the others on 64 consecutive coefficients,
+// two blocks of 32, so that every layer has four independent butterflies. ML-KEM's seven layers
+// end with freeze(montgomery(x, forward_scale)).
 #[target_feature(enable = "avx2")]
 pub(super) fn forward(w: &mut [i32; 256], field: &Field) {
     let q = _mm256_set1_epi32(field.q);
@@ -246,114 +280,121 @@ pub(super) fn forward(w: &mut [i32; 256], field: &Field) {
 
     let t32 = [4, 5, 6, 7].map(|m| broadcast(z, zq, m));
 
-    // The working vectors, which the loops index through memory, are cleared at the end.
+    // The working vectors of both passes, indexed with constants only: registers (D-76).
     let zero = _mm256_setzero_si256();
 
-    let (mut x8, mut x4) = ([zero; 8], [zero; 4]);
+    let mut x = [zero; 8];
 
     for j in 0..4 {
-        let x = &mut x8;
+        unroll!(M in [0, 1, 2, 3, 4, 5, 6, 7] {
+            x[M] = load256(&vectors[j + 4 * M]);
+        });
 
-        for (m, x) in x.iter_mut().enumerate() {
-            *x = load256(&vectors[j + 4 * m]);
-        }
+        unroll!(I in [0, 1, 2, 3] {
+            (x[I], x[I + 4]) = forward_butterfly(x[I], x[I + 4], t128, q);
+        });
 
-        for i in 0..4 {
-            (x[i], x[i + 4]) = forward_butterfly(x[i], x[i + 4], t128, q);
-        }
+        unroll!(I in [0, 1, 4, 5] {
+            (x[I], x[I + 2]) = forward_butterfly(x[I], x[I + 2], t64[I / 4], q);
+        });
 
-        for (i, k, t) in [(0, 2, 0), (1, 3, 0), (4, 6, 1), (5, 7, 1)] {
-            (x[i], x[k]) = forward_butterfly(x[i], x[k], t64[t], q);
-        }
+        unroll!(G in [0, 1, 2, 3] {
+            (x[2 * G], x[2 * G + 1]) = forward_butterfly(x[2 * G], x[2 * G + 1], t32[G], q);
+        });
 
-        for (g, i) in [0, 2, 4, 6].into_iter().enumerate() {
-            (x[i], x[i + 1]) = forward_butterfly(x[i], x[i + 1], t32[g], q);
-        }
-
-        for (m, x) in x.iter().enumerate() {
-            store256(*x, &mut vectors[j + 4 * m]);
-        }
+        unroll!(M in [0, 1, 2, 3, 4, 5, 6, 7] {
+            store256(x[M], &mut vectors[j + 4 * M]);
+        });
     }
 
     let scale = field
         .forward_scale
         .map(|scale| constant(scale, scale.wrapping_mul(field.qinv)));
 
-    for (b, block) in vectors.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let x = &mut x4;
+    // Blocks 2c and 2c + 1 of 32 coefficients in x[0..4] and x[4..8].
+    for (c, blocks) in vectors.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        unroll!(M in [0, 1, 2, 3, 4, 5, 6, 7] {
+            x[M] = load256(&blocks[M]);
+        });
 
-        for (x, chunk) in x.iter_mut().zip(block.iter()) {
-            *x = load256(chunk);
-        }
+        unroll!(H in [0, 1] {
+            let t16 = broadcast(z, zq, 8 + 2 * c + H);
 
-        let t16 = broadcast(z, zq, 8 + b);
+            unroll!(I in [0, 1] {
+                (x[4 * H + I], x[4 * H + I + 2]) =
+                    forward_butterfly(x[4 * H + I], x[4 * H + I + 2], t16, q);
+            });
+        });
 
-        for (i, k) in [(0, 2), (1, 3)] {
-            (x[i], x[k]) = forward_butterfly(x[i], x[k], t16, q);
-        }
+        unroll!(H in [0, 1] {
+            unroll!(G in [0, 1] {
+                let t8 = broadcast(z, zq, 16 + 2 * (2 * c + H) + G);
 
-        for (g, i) in [0, 2].into_iter().enumerate() {
-            let t8 = broadcast(z, zq, 16 + 2 * b + g);
+                (x[4 * H + 2 * G], x[4 * H + 2 * G + 1]) =
+                    forward_butterfly(x[4 * H + 2 * G], x[4 * H + 2 * G + 1], t8, q);
+            });
+        });
 
-            (x[i], x[i + 1]) = forward_butterfly(x[i], x[i + 1], t8, q);
-        }
-
-        for (p, i) in [0, 2].into_iter().enumerate() {
-            (x[i], x[i + 1]) = forward_tail(x[i], x[i + 1], field, 2 * b + p, q);
-        }
+        forward_tail(&mut x, field, 4 * c, q);
 
         if let Some(scale) = scale {
-            for x in x.iter_mut() {
-                *x = freeze(montgomery(*x, scale, q), q);
-            }
+            unroll!(M in [0, 1, 2, 3, 4, 5, 6, 7] {
+                x[M] = freeze(montgomery(x[M], scale, q), q);
+            });
         }
 
-        for (x, chunk) in x.iter().zip(block.iter_mut()) {
-            store256(*x, chunk);
-        }
+        unroll!(M in [0, 1, 2, 3, 4, 5, 6, 7] {
+            store256(x[M], &mut blocks[M]);
+        });
     }
 
-    clear(&mut x8, zero);
-
-    clear(&mut x4, zero);
+    wipe_unless_optimized!(words_of(&mut x));
 }
 
 // The inverse layers that pair coefficients 1, 2 and 4 apart, mirroring forward_tail with the
 // reversed table, whose layer d uses its groups from 256 - 256 / d on.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn inverse_head(
-    x: __m256i,
-    y: __m256i,
-    field: &Field,
-    group: usize,
-    q: __m256i,
-) -> (__m256i, __m256i) {
+fn inverse_head(x: &mut [__m256i; 8], field: &Field, first: usize, q: __m256i) {
     let (z, zq) = (&field.inverse, &field.inverse_qinv);
 
-    let (x, y) = halves(x, y);
+    unroll!(P in [0, 1, 2, 3] {
+        let (x0, x1) = halves(x[2 * P], x[2 * P + 1]);
 
-    let (mut x, mut y) = quarters(x, y);
+        (x[2 * P], x[2 * P + 1]) = quarters(x0, x1);
+    });
 
     if field.layers == 8 {
-        let (even, odd) = words(x, y);
+        unroll!(P in [0, 1, 2, 3] {
+            let (even, odd) = words(x[2 * P], x[2 * P + 1]);
 
-        let (even, odd) = inverse_butterfly(even, odd, entries::<8>(z, zq, 8 * group), q);
+            let (even, odd) = inverse_butterfly(even, odd, ones(z, zq, 8 * (first + P)), q);
 
-        (x, y) = words(even, odd);
+            (x[2 * P], x[2 * P + 1]) = words(even, odd);
+        });
     }
 
-    let (x, y) = inverse_butterfly(x, y, entries::<4>(z, zq, 128 + 4 * group), q);
+    unroll!(P in [0, 1, 2, 3] {
+        let t = twos(z, zq, 128 + 4 * (first + P));
 
-    let (x, y) = quarters(x, y);
+        let (x0, x1) = inverse_butterfly(x[2 * P], x[2 * P + 1], t, q);
 
-    let (x, y) = inverse_butterfly(x, y, entries::<2>(z, zq, 192 + 2 * group), q);
+        (x[2 * P], x[2 * P + 1]) = quarters(x0, x1);
+    });
 
-    halves(x, y)
+    unroll!(P in [0, 1, 2, 3] {
+        let t = fours(z, zq, 192 + 2 * (first + P));
+
+        let (x0, x1) = inverse_butterfly(x[2 * P], x[2 * P + 1], t, q);
+
+        (x[2 * P], x[2 * P + 1]) = halves(x0, x1);
+    });
 }
 
-// The inverse layers on the reversed table, after the first step of Prepare, and the final
-// freeze(montgomery(x, inverse_scale)).
+// The inverse layers on the reversed table, after the first step of Prepare, in the two passes of
+// forward in the reverse order. The last layer takes the final freeze(montgomery(x, inverse_scale))
+// with it: its sums are multiplied by the scale and its differences by the factor premultiplied by
+// it, which gives the same canonical coefficients with one product fewer per pair.
 #[target_feature(enable = "avx2")]
 pub(super) fn inverse(w: &mut [i32; 256], field: &Field) {
     let q = _mm256_set1_epi32(field.q);
@@ -373,77 +414,86 @@ pub(super) fn inverse(w: &mut [i32; 256], field: &Field) {
         }
     };
 
-    // The working vectors, which the loops index through memory, are cleared at the end.
+    // The working vectors of both passes, indexed with constants only: registers (D-76).
     let zero = _mm256_setzero_si256();
 
-    let (mut x4, mut x8) = ([zero; 4], [zero; 8]);
+    let mut x = [zero; 8];
 
-    for (b, block) in vectors.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let x = &mut x4;
+    for (c, blocks) in vectors.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        unroll!(M in [0, 1, 2, 3, 4, 5, 6, 7] {
+            x[M] = prepare(load256(&blocks[M]));
+        });
 
-        for (x, chunk) in x.iter_mut().zip(block.iter()) {
-            *x = prepare(load256(chunk));
-        }
+        inverse_head(&mut x, field, 4 * c, q);
 
-        for (p, i) in [0, 2].into_iter().enumerate() {
-            (x[i], x[i + 1]) = inverse_head(x[i], x[i + 1], field, 2 * b + p, q);
-        }
+        unroll!(H in [0, 1] {
+            unroll!(G in [0, 1] {
+                let t8 = broadcast(z, zq, 224 + 2 * (2 * c + H) + G);
 
-        for (g, i) in [0, 2].into_iter().enumerate() {
-            let t8 = broadcast(z, zq, 224 + 2 * b + g);
+                (x[4 * H + 2 * G], x[4 * H + 2 * G + 1]) =
+                    inverse_butterfly(x[4 * H + 2 * G], x[4 * H + 2 * G + 1], t8, q);
+            });
+        });
 
-            (x[i], x[i + 1]) = inverse_butterfly(x[i], x[i + 1], t8, q);
-        }
+        unroll!(H in [0, 1] {
+            let t16 = broadcast(z, zq, 240 + 2 * c + H);
 
-        let t16 = broadcast(z, zq, 240 + b);
+            unroll!(I in [0, 1] {
+                (x[4 * H + I], x[4 * H + I + 2]) =
+                    inverse_butterfly(x[4 * H + I], x[4 * H + I + 2], t16, q);
+            });
+        });
 
-        for (i, k) in [(0, 2), (1, 3)] {
-            (x[i], x[k]) = inverse_butterfly(x[i], x[k], t16, q);
-        }
-
-        for (x, chunk) in x.iter().zip(block.iter_mut()) {
-            store256(*x, chunk);
-        }
+        unroll!(M in [0, 1, 2, 3, 4, 5, 6, 7] {
+            store256(x[M], &mut blocks[M]);
+        });
     }
 
     let t32 = [248, 249, 250, 251].map(|m| broadcast(z, zq, m));
 
     let t64 = [broadcast(z, zq, 252), broadcast(z, zq, 253)];
 
-    let t128 = broadcast(z, zq, 254);
+    let (s, zeta) = (field.inverse_scale, z[254]);
 
-    let scale = constant(
-        field.inverse_scale,
-        field.inverse_scale.wrapping_mul(field.qinv),
-    );
+    let product = i64::from(zeta) * i64::from(s);
+
+    let m = (product as i32).wrapping_mul(field.qinv);
+
+    let scaled = ((product - i64::from(m) * i64::from(field.q)) >> 32) as i32;
+
+    let scale = constant(s, s.wrapping_mul(field.qinv));
+
+    let t128 = constant(scaled, scaled.wrapping_mul(field.qinv));
 
     for j in 0..4 {
-        let x = &mut x8;
+        unroll!(M in [0, 1, 2, 3, 4, 5, 6, 7] {
+            x[M] = load256(&vectors[j + 4 * M]);
+        });
 
-        for (m, x) in x.iter_mut().enumerate() {
-            *x = load256(&vectors[j + 4 * m]);
-        }
+        unroll!(G in [0, 1, 2, 3] {
+            (x[2 * G], x[2 * G + 1]) = inverse_butterfly(x[2 * G], x[2 * G + 1], t32[G], q);
+        });
 
-        for (g, i) in [0, 2, 4, 6].into_iter().enumerate() {
-            (x[i], x[i + 1]) = inverse_butterfly(x[i], x[i + 1], t32[g], q);
-        }
+        unroll!(I in [0, 1, 4, 5] {
+            (x[I], x[I + 2]) = inverse_butterfly(x[I], x[I + 2], t64[I / 4], q);
+        });
 
-        for (i, k, t) in [(0, 2, 0), (1, 3, 0), (4, 6, 1), (5, 7, 1)] {
-            (x[i], x[k]) = inverse_butterfly(x[i], x[k], t64[t], q);
-        }
+        unroll!(I in [0, 1, 2, 3] {
+            let sum = _mm256_add_epi32(x[I], x[I + 4]);
 
-        for i in 0..4 {
-            (x[i], x[i + 4]) = inverse_butterfly(x[i], x[i + 4], t128, q);
-        }
+            let difference = _mm256_sub_epi32(x[I + 4], x[I]);
 
-        for (m, x) in x.iter().enumerate() {
-            store256(freeze(montgomery(*x, scale, q), q), &mut vectors[j + 4 * m]);
-        }
+            x[I] = freeze(montgomery(sum, scale, q), q);
+
+            x[I + 4] = freeze(montgomery(difference, t128, q), q);
+        });
+
+        unroll!(M in [0, 1, 2, 3, 4, 5, 6, 7] {
+            store256(x[M], &mut vectors[j + 4 * M]);
+        });
     }
 
-    clear(&mut x4, zero);
-
-    clear(&mut x8, zero);
+    wipe_unless_optimized!(words_of(&mut x));
 }
 
 // out = f * g coefficient by coefficient.
@@ -458,8 +508,25 @@ pub(super) fn products(out: &mut [i32; 256], f: &[i32; 256], g: &[i32; 256], fie
     }
 }
 
-// acc += f[j] * g[j] summed over j, coefficient by coefficient: sixteen coefficients of acc stay
-// in registers while every product is added. The sums are exact, so their order does not matter.
+// The Montgomery reduction of 64-bit sums, the even lanes' in even and the odd lanes' in odd:
+// sum - m q with m = sum q^-1 mod 2^32 has its result in the high half, and the even lanes' are
+// moved down and blended with the odd lanes'.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn reduce_wide(even: __m256i, odd_lanes: __m256i, qinv: __m256i, q: __m256i) -> __m256i {
+    let even = _mm256_sub_epi64(even, _mm256_mul_epi32(_mm256_mul_epi32(even, qinv), q));
+
+    let odd_lanes = _mm256_sub_epi64(
+        odd_lanes,
+        _mm256_mul_epi32(_mm256_mul_epi32(odd_lanes, qinv), q),
+    );
+
+    _mm256_blend_epi32::<0xAA>(odd(even), odd_lanes)
+}
+
+// acc += (f[0] g[0] + f[1] g[1] + ...) * 2^-32 coefficient by coefficient: the products of
+// sixteen coefficients are summed exactly in 64-bit lanes, even and odd lanes apart, and reduced
+// once, as the portable code does.
 #[target_feature(enable = "avx2")]
 pub(super) fn products_add(
     acc: &mut [i32; 256],
@@ -474,22 +541,37 @@ pub(super) fn products_add(
             unreachable!("sixteen values are two groups of eight")
         };
 
-        let mut sums = [load256(low), load256(high)];
+        let mut even = [_mm256_setzero_si256(); 2];
+
+        let mut odd_lanes = [_mm256_setzero_si256(); 2];
 
         for (f, g) in f.iter().zip(g) {
             let factors = f.as_chunks::<16>().0[chunk].as_chunks::<8>().0;
 
             let others = g.as_chunks::<16>().0[chunk].as_chunks::<8>().0;
 
-            for ((sum, f), g) in sums.iter_mut().zip(factors).zip(others) {
-                *sum = _mm256_add_epi32(*sum, product(load256(f), load256(g), qinv, q));
+            for v in 0..2 {
+                let (a, b) = (load256(&factors[v]), load256(&others[v]));
+
+                even[v] = _mm256_add_epi64(even[v], _mm256_mul_epi32(a, b));
+
+                odd_lanes[v] = _mm256_add_epi64(odd_lanes[v], _mm256_mul_epi32(odd(a), odd(b)));
             }
         }
 
-        store256(sums[0], low);
+        store256(
+            _mm256_add_epi32(load256(low), reduce_wide(even[0], odd_lanes[0], qinv, q)),
+            low,
+        );
 
-        store256(sums[1], high);
+        store256(
+            _mm256_add_epi32(load256(high), reduce_wide(even[1], odd_lanes[1], qinv, q)),
+            high,
+        );
 
-        wipe_unless_optimized!(words_of(&mut sums));
+        // Sums of products with the secret s1 (D-76).
+        wipe_unless_optimized!(words_of(&mut even));
+
+        wipe_unless_optimized!(words_of(&mut odd_lanes));
     }
 }

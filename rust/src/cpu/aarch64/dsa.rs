@@ -49,9 +49,16 @@ pub(crate) fn hints(
     Some(unsafe { hints_neon(h, r, ct0, gamma2, q) })
 }
 
-// HighBits of every coefficient packed in four bits, for gamma2 = (q - 1) / 32.
+// HighBits of every coefficient packed in four bits, for gamma2 = (q - 1) / 32; with hints, the
+// values UseHint gives.
 #[allow(unsafe_code)]
-pub(crate) fn encode_w1(out: &mut [u8], w: &[i32; 256], gamma2: i32, q: i32) -> bool {
+pub(crate) fn encode_w1(
+    out: &mut [u8],
+    w: &[i32; 256],
+    hints: Option<&[bool; 256]>,
+    gamma2: i32,
+    q: i32,
+) -> bool {
     let Ok(out) = <&mut [u8; 128]>::try_from(out) else {
         return false;
     };
@@ -61,7 +68,12 @@ pub(crate) fn encode_w1(out: &mut [u8], w: &[i32; 256], gamma2: i32, q: i32) -> 
     }
 
     // SAFETY: as in add.
-    unsafe { encode_w1_neon(out, w, gamma2, q) };
+    unsafe {
+        match hints {
+            Some(hints) => encode_w1_neon::<true>(out, w, hints, gamma2, q),
+            None => encode_w1_neon::<false>(out, w, &[false; 256], gamma2, q),
+        }
+    }
 
     true
 }
@@ -193,25 +205,72 @@ fn hints_neon(h: &mut [i32; 256], r: &[i32; 256], ct0: &[i32; 256], gamma2: i32,
     vaddvq_s32(count)
 }
 
-// Thirty-two values of four bits into sixteen bytes, the first of each pair in the low half.
+// UseHint (FIPS 204 Algorithm 40) for gamma2 = (q - 1) / 32, from HighBits r1, LowBits r0 and
+// hints h of 0 or 1: r1 + 1 where h is set and r0 > 0, r1 - 1 where it is set and r0 <= 0, modulo
+// 16. Only verification gives hints, and its values are public.
 #[target_feature(enable = "neon")]
-fn encode_w1_neon(out: &mut [u8; 128], w: &[i32; 256], gamma2: i32, q: i32) {
-    for (out, w) in out
-        .as_chunks_mut::<16>()
-        .0
-        .iter_mut()
-        .zip(w.as_chunks::<32>().0)
-    {
+#[inline]
+fn hinted(r1: int32x4_t, r0: int32x4_t, h: int32x4_t) -> int32x4_t {
+    // -1 where r0 <= 0: h ^ -1 minus -1 is -h.
+    let down = vreinterpretq_s32_u32(vclezq_s32(r0));
+
+    let delta = vsubq_s32(veorq_s32(h, down), down);
+
+    vandq_s32(vaddq_s32(r1, delta), vdupq_n_s32(15))
+}
+
+// Thirty-two values of four bits into sixteen bytes, the first of each pair in the low half; with
+// HINT, the values UseHint gives.
+#[target_feature(enable = "neon")]
+fn encode_w1_neon<const HINT: bool>(
+    out: &mut [u8; 128],
+    w: &[i32; 256],
+    hints: &[bool; 256],
+    gamma2: i32,
+    q: i32,
+) {
+    let groups = w.as_chunks::<32>().0.iter().zip(hints.as_chunks::<32>().0);
+
+    for (out, (w, h)) in out.as_chunks_mut::<16>().0.iter_mut().zip(groups) {
         let mut narrow = [vdupq_n_u8(0); 2];
 
-        for (narrow, w) in narrow.iter_mut().zip(w.as_chunks::<16>().0) {
+        let halves = w.as_chunks::<16>().0.iter().zip(h.as_chunks::<16>().0);
+
+        for (narrow, (w, h)) in narrow.iter_mut().zip(halves) {
             let [a, b, c, d] = w.as_chunks::<4>().0 else {
                 unreachable!("sixteen values are four groups of four")
             };
 
+            // The sixteen hints in 32-bit lanes, four per vector.
+            let h = load_u8(&h.map(u8::from));
+
+            let h = [vmovl_u8(vget_low_u8(h)), vmovl_u8(vget_high_u8(h))];
+
             #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-            let mut high = [a, b, c, d]
-                .map(|values| vreinterpretq_u32_s32(decompose(load_i32(values), gamma2, q).0));
+            let mut h = [
+                vmovl_u16(vget_low_u16(h[0])),
+                vmovl_u16(vget_high_u16(h[0])),
+                vmovl_u16(vget_low_u16(h[1])),
+                vmovl_u16(vget_high_u16(h[1])),
+            ];
+
+            let values = [a, b, c, d];
+
+            let r1 = |i: usize| {
+                let (r1, r0) = decompose(load_i32(values[i]), gamma2, q);
+
+                let r1 = if HINT {
+                    hinted(r1, r0, vreinterpretq_s32_u32(h[i]))
+                } else {
+                    r1
+                };
+
+                vreinterpretq_u32_s32(r1)
+            };
+
+            // Built and indexed with constants only, so that no array helper holds them (D-76).
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut high = [r1(0), r1(1), r1(2), r1(3)];
 
             #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
             let mut halves = [
@@ -224,16 +283,20 @@ fn encode_w1_neon(out: &mut [u8; 128], w: &[i32; 256], gamma2: i32, q: i32) {
             wipe_unless_optimized!(vector_lanes(&mut halves));
 
             wipe_unless_optimized!(vector_lanes(&mut high));
+
+            wipe_unless_optimized!(vector_lanes(&mut h));
         }
 
         // Each 16-bit lane holds a value x in its low byte and y in its high byte, both below 16:
         // x | y << 4 is the lane ORed with itself shifted right by four, in its low byte.
-        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-        let mut pairs = narrow.map(|bytes| {
+        let pair = |bytes: uint8x16_t| {
             let lanes = vreinterpretq_u16_u8(bytes);
 
             vmovn_u16(vorrq_u16(lanes, vshrq_n_u16::<4>(lanes)))
-        });
+        };
+
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut pairs = [pair(narrow[0]), pair(narrow[1])];
 
         store_u8(vcombine_u8(pairs[0], pairs[1]), out);
 

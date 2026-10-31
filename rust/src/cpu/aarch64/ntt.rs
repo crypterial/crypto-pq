@@ -478,38 +478,45 @@ fn products(out: &mut [i32; 256], f: &[i32; 256], g: &[i32; 256], field: &Field)
     }
 }
 
-// acc += f[j] * g[j] summed over j, coefficient by coefficient (ML-DSA): sixteen coefficients of
-// acc stay in registers while every product is added, in the order of the portable code.
+// acc += (f[0] g[0] + f[1] g[1] + ...) * 2^-32 coefficient by coefficient (ML-DSA): the products
+// of sixteen coefficients are summed exactly in 64-bit lanes by SMLAL and reduced once, as the
+// portable code does: sum - m q, with m = sum q^-1 mod 2^32, has its result in the high half.
 #[target_feature(enable = "neon")]
 fn products_add(acc: &mut [i32; 256], f: &[[i32; 256]], g: &[[i32; 256]], field: &Field) {
     let (q, qinv) = (vdupq_n_s32(field.q), vdupq_n_s32(field.qinv));
 
     for (chunk, acc) in acc.as_chunks_mut::<16>().0.iter_mut().enumerate() {
-        let mut sums = [vdupq_n_s32(0); 4];
-
-        for (sum, acc) in sums.iter_mut().zip(acc.as_chunks::<4>().0) {
-            *sum = load(acc);
-        }
+        let mut sums = [vdupq_n_s64(0); 8];
 
         for (f, g) in f.iter().zip(g) {
             let factors = f.as_chunks::<16>().0[chunk].as_chunks::<4>().0;
 
             let others = g.as_chunks::<16>().0[chunk].as_chunks::<4>().0;
 
-            for ((sum, f), g) in sums.iter_mut().zip(factors).zip(others) {
-                let b = load(g);
+            for v in 0..4 {
+                let (a, b) = (load(&factors[v]), load(&others[v]));
 
-                let t = Twiddle {
-                    zeta: b,
-                    qinv: vmulq_s32(b, qinv),
-                };
+                sums[2 * v] = vmlal_s32(sums[2 * v], vget_low_s32(a), vget_low_s32(b));
 
-                *sum = vaddq_s32(*sum, montgomery(load(f), t, q));
+                sums[2 * v + 1] = vmlal_high_s32(sums[2 * v + 1], a, b);
             }
         }
 
-        for (sum, acc) in sums.iter().zip(acc.as_chunks_mut::<4>().0) {
-            store(*sum, acc);
+        for (v, acc) in acc.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (low, high) = (sums[2 * v], sums[2 * v + 1]);
+
+            let m = vmulq_s32(
+                vuzp1q_s32(vreinterpretq_s32_s64(low), vreinterpretq_s32_s64(high)),
+                qinv,
+            );
+
+            let low = vmlsl_s32(low, vget_low_s32(m), vget_low_s32(q));
+
+            let high = vmlsl_high_s32(high, m, q);
+
+            let reduced = vuzp2q_s32(vreinterpretq_s32_s64(low), vreinterpretq_s32_s64(high));
+
+            store(vaddq_s32(load(acc), reduced), acc);
         }
 
         wipe_unless_optimized!(vector_lanes(&mut sums));

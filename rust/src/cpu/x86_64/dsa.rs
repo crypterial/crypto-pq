@@ -10,9 +10,12 @@
 use core::arch::x86_64::*;
 
 use super::ACCEPTED;
+#[cfg(not(crypto_pq_optimized))]
+use super::memory::words_of;
 use super::memory::{load128, load256, store128, store256};
 use crate::cpu::Pack;
 use crate::ct::declassify_value;
+use crate::wipe::wipe_unless_optimized;
 
 // (-q, q) to [0, q).
 #[target_feature(enable = "avx2")]
@@ -211,21 +214,87 @@ fn hints_with<const WIDE: bool>(
     across::<true>(count)
 }
 
-// HighBits of every coefficient packed in four bits (gamma2 = (q - 1) / 32) or six.
+// UseHint (FIPS 204 Algorithm 40) of eight coefficients, from their HighBits r1 and LowBits r0
+// and their hints: r1 + 1 where the hint is set and r0 > 0, r1 - 1 where it is set and r0 <= 0,
+// modulo m = 16 (WIDE) or 44. Only verification gives hints, and its values are public.
 #[target_feature(enable = "avx2")]
-pub(super) fn encode_w1(out: &mut [u8], w: &[i32; 256], gamma2: i32, q: i32) {
+#[inline]
+fn hinted<const WIDE: bool>(r1: __m256i, r0: __m256i, hints: &[bool; 8]) -> __m256i {
+    let h = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(
+        u64::from_le_bytes(hints.map(u8::from)) as i64
+    ));
+
+    // -1 where r0 <= 0: h ^ -1 minus -1 is -h.
+    let down = _mm256_cmpgt_epi32(_mm256_set1_epi32(1), r0);
+
+    let r1 = _mm256_add_epi32(r1, _mm256_sub_epi32(_mm256_xor_si256(h, down), down));
+
+    if WIDE {
+        _mm256_and_si256(r1, _mm256_set1_epi32(15))
+    } else {
+        let m = _mm256_set1_epi32(44);
+
+        let r1 = _mm256_add_epi32(r1, _mm256_and_si256(_mm256_srai_epi32::<31>(r1), m));
+
+        _mm256_andnot_si256(_mm256_cmpeq_epi32(r1, m), r1)
+    }
+}
+
+// HighBits of eight coefficients, through UseHint with their hints where HINT.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn high<const WIDE: bool, const HINT: bool>(
+    w: &[i32; 8],
+    hints: &[bool; 8],
+    gamma2: i32,
+    q: i32,
+) -> __m256i {
+    let (r1, r0) = decompose::<WIDE>(load256(w), gamma2, q);
+
+    if HINT {
+        hinted::<WIDE>(r1, r0, hints)
+    } else {
+        r1
+    }
+}
+
+// HighBits of every coefficient packed in four bits (gamma2 = (q - 1) / 32) or six, or with
+// hints, the values UseHint gives.
+#[target_feature(enable = "avx2")]
+pub(super) fn encode_w1(
+    out: &mut [u8],
+    w: &[i32; 256],
+    hints: Option<&[bool; 256]>,
+    gamma2: i32,
+    q: i32,
+) {
+    match hints {
+        Some(hints) => encode_w1_with::<true>(out, w, hints, gamma2, q),
+        None => encode_w1_with::<false>(out, w, &[false; 256], gamma2, q),
+    }
+}
+
+#[target_feature(enable = "avx2")]
+#[inline]
+fn encode_w1_with<const HINT: bool>(
+    out: &mut [u8],
+    w: &[i32; 256],
+    hints: &[bool; 256],
+    gamma2: i32,
+    q: i32,
+) {
     if gamma2 == (q - 1) / 32 {
         let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
 
-        for (out, w) in out
-            .as_chunks_mut::<16>()
-            .0
-            .iter_mut()
-            .zip(w.as_chunks::<32>().0)
-        {
-            let v: [__m256i; 4] = core::array::from_fn(|i| {
-                decompose::<true>(load256(&w.as_chunks::<8>().0[i]), gamma2, q).0
-            });
+        let groups = w.as_chunks::<32>().0.iter().zip(hints.as_chunks::<32>().0);
+
+        for (out, (w, h)) in out.as_chunks_mut::<16>().0.iter_mut().zip(groups) {
+            let (w, h) = (w.as_chunks::<8>().0, h.as_chunks::<8>().0);
+
+            let r1 = |i: usize| high::<true, HINT>(&w[i], &h[i], gamma2, q);
+
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut v = [r1(0), r1(1), r1(2), r1(3)];
 
             let bytes = _mm256_packus_epi16(
                 _mm256_packs_epi32(v[0], v[1]),
@@ -239,6 +308,9 @@ pub(super) fn encode_w1(out: &mut [u8], w: &[i32; 256], gamma2: i32, q: i32) {
             let packed = _mm256_permute4x64_epi64::<0x08>(_mm256_packus_epi16(pairs, pairs));
 
             store128(_mm256_castsi256_si128(packed), out);
+
+            // w1 of a signing attempt is secret until the attempt is accepted (D-76).
+            wipe_unless_optimized!(words_of(&mut v));
         }
 
         return;
@@ -251,19 +323,16 @@ pub(super) fn encode_w1(out: &mut [u8], w: &[i32; 256], gamma2: i32, q: i32) {
 
     let low = _mm256_set1_epi64x(0xFFF);
 
-    for (out, w) in out
-        .as_chunks_mut::<12>()
-        .0
-        .iter_mut()
-        .zip(w.as_chunks::<16>().0)
-    {
-        let [first, second] = w.as_chunks::<8>().0 else {
+    let groups = w.as_chunks::<16>().0.iter().zip(hints.as_chunks::<16>().0);
+
+    for (out, (w, h)) in out.as_chunks_mut::<12>().0.iter_mut().zip(groups) {
+        let ([first, second], [h0, h1]) = (w.as_chunks::<8>().0, h.as_chunks::<8>().0) else {
             unreachable!("sixteen values are two groups of eight")
         };
 
         let words = _mm256_packs_epi32(
-            decompose::<false>(load256(first), gamma2, q).0,
-            decompose::<false>(load256(second), gamma2, q).0,
+            high::<false, HINT>(first, h0, gamma2, q),
+            high::<false, HINT>(second, h1, gamma2, q),
         );
 
         let words = _mm256_permute4x64_epi64::<0xD8>(words);
@@ -287,6 +356,41 @@ pub(super) fn encode_w1(out: &mut [u8], w: &[i32; 256], gamma2: i32, q: i32) {
         head.copy_from_slice(&first.to_le_bytes()[..6]);
 
         tail.copy_from_slice(&second.to_le_bytes()[..6]);
+    }
+}
+
+// t1 * 2^13 from the ten-bit values of a public key, as unpack_mask takes its values: each 128-bit
+// half takes four values from five bytes, each value's two bytes gathered into a 32-bit lane and
+// shifted. The key is public, so its padded copy is not wiped.
+#[target_feature(enable = "avx2")]
+pub(super) fn unpack_t1(out: &mut [i32; 256], bytes: &[u8; 320]) {
+    let gather = _mm_setr_epi8(0, 1, -1, -1, 1, 2, -1, -1, 2, 3, -1, -1, 3, 4, -1, -1);
+
+    let shifts = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+
+    let mut padded = [0u8; 320 + 16];
+
+    padded[..320].copy_from_slice(bytes);
+
+    let mask = _mm256_set1_epi32(0x3FF);
+
+    for (i, out) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        let start = 10 * i;
+
+        let low: &[u8; 16] = padded[start..start + 16].try_into().expect("sixteen bytes");
+
+        let high: &[u8; 16] = padded[start + 5..start + 21]
+            .try_into()
+            .expect("sixteen bytes");
+
+        let both =
+            _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(load128(low)), load128(high));
+
+        let words = _mm256_shuffle_epi8(both, _mm256_broadcastsi128_si256(gather));
+
+        let values = _mm256_and_si256(_mm256_srlv_epi32(words, shifts), mask);
+
+        store256(_mm256_slli_epi32::<13>(values), out);
     }
 }
 
@@ -384,16 +488,12 @@ fn compact_indices(pattern: u32) -> __m128i {
 }
 
 // ML-DSA (FIPS 204, Algorithm 30): a candidate of 23 bits from every three bytes, eight from each
-// 24 bytes, the accepted ones moved together by a permutation and stored at the count of values so
-// far, which may write slots past it that later values or the end replace.
+// three lanes, the accepted ones moved together by a permutation and stored at the count of values
+// so far, which may write slots past it that later values or the end replace. The lanes are read
+// one by one, as broadcasts: a wider load that spans two of the Keccak kernel's stores waits until
+// they reach the cache.
 #[target_feature(enable = "avx2")]
 pub(super) fn uniform23(lanes: &[u64; 21], q: i32, a: &mut [i32; 256], count: &mut usize) {
-    let mut bytes = [0u8; 168 + 8];
-
-    for (bytes, lane) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(lanes) {
-        *bytes = lane.to_le_bytes();
-    }
-
     let spread = _mm256_setr_epi8(
         0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1, 4, 5, 6, -1, 7, 8, 9, -1, 10, 11, 12,
         -1, 13, 14, 15, -1,
@@ -401,19 +501,15 @@ pub(super) fn uniform23(lanes: &[u64; 21], q: i32, a: &mut [i32; 256], count: &m
 
     let (mask, bound) = (_mm256_set1_epi32(0x7F_FFFF), _mm256_set1_epi32(q));
 
+    let groups = lanes.as_chunks::<3>().0;
+
     let (mut step, mut filled) = (0, *count);
 
-    while step < 7 && filled <= 256 - 8 {
-        let group: &[u8; 24] = bytes[24 * step..24 * step + 24]
-            .try_into()
-            .expect("24 bytes");
+    while step < groups.len() && filled <= 256 - 8 {
+        let [first, middle, last] = groups[step].map(|lane| _mm256_set1_epi64x(lane as i64));
 
-        let low: &[u8; 16] = group[..16].try_into().expect("sixteen bytes");
-
-        let high: &[u8; 16] = group[8..].try_into().expect("sixteen bytes");
-
-        let both =
-            _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(load128(low)), load128(high));
+        // Lanes first, middle | middle, last: the bytes 24 step to 24 step + 16 and 8 later.
+        let both = _mm256_blend_epi32::<0xC3>(middle, _mm256_blend_epi32::<0xF0>(first, last));
 
         let candidates = _mm256_and_si256(_mm256_shuffle_epi8(both, spread), mask);
 
@@ -421,27 +517,44 @@ pub(super) fn uniform23(lanes: &[u64; 21], q: i32, a: &mut [i32; 256], count: &m
 
         let pattern = _mm256_movemask_ps(_mm256_castsi256_ps(accepted)) as u32;
 
-        let order = _mm256_cvtepu8_epi32(compact_indices(pattern));
-
         let out: &mut [i32; 8] = (&mut a[filled..filled + 8]).try_into().expect("eight");
 
-        store256(_mm256_permutevar8x32_epi32(candidates, order), out);
+        // All but one candidate in a thousand are accepted, so most steps store all eight; the
+        // matrix is public, so this branch may depend on it.
+        if pattern == 0xFF {
+            store256(candidates, out);
 
-        filled += usize::from(ACCEPTED[pattern as usize]);
+            filled += 8;
+        } else {
+            let order = _mm256_cvtepu8_epi32(compact_indices(pattern));
+
+            store256(_mm256_permutevar8x32_epi32(candidates, order), out);
+
+            filled += usize::from(ACCEPTED[pattern as usize]);
+        }
 
         step += 1;
     }
 
     *count = filled;
 
-    for chunk in bytes[24 * step..168].as_chunks::<3>().0 {
-        let z =
-            i32::from(chunk[0]) | (i32::from(chunk[1]) << 8) | (i32::from(chunk[2] & 0x7F) << 16);
+    for group in &groups[step..] {
+        let mut bytes = [0u8; 24];
 
-        if z < q && *count < 256 {
-            a[*count] = z;
+        for (out, lane) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(group) {
+            *out = lane.to_le_bytes();
+        }
 
-            *count += 1;
+        for chunk in bytes.as_chunks::<3>().0 {
+            let z = i32::from(chunk[0])
+                | (i32::from(chunk[1]) << 8)
+                | (i32::from(chunk[2] & 0x7F) << 16);
+
+            if z < q && *count < 256 {
+                a[*count] = z;
+
+                *count += 1;
+            }
         }
     }
 }
@@ -529,27 +642,28 @@ pub(super) fn bounded(lanes: &[u64; 17], eta: i32, a: &mut [i32; 256], count: &m
     }
 }
 
-// The coefficients as `map` says: power2round's r1 = (r + 2^12 - 1) >> 13 and r0 = r - (r1 << 13),
-// eta - x, or gamma1 - centered(x).
+// The coefficients as the encoding of BITS bits maps them, each encoding having one map: for 10,
+// power2round's r1 = (r + 2^12 - 1) >> 13; for 13, 2^12 - r0 with r0 = r - (r1 << 13); for 3 and
+// 4, eta - x; for 18 and 20, gamma1 - centered(x), eta or gamma1 being `bound`.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn mapped(x: __m256i, map: Pack, q: i32) -> __m256i {
-    match map {
-        Pack::High => _mm256_srai_epi32::<13>(_mm256_add_epi32(x, _mm256_set1_epi32(4095))),
-        Pack::Low => {
+fn mapped<const BITS: usize>(x: __m256i, bound: i32, q: i32) -> __m256i {
+    match BITS {
+        10 => _mm256_srai_epi32::<13>(_mm256_add_epi32(x, _mm256_set1_epi32(4095))),
+        13 => {
             let high = _mm256_srai_epi32::<13>(_mm256_add_epi32(x, _mm256_set1_epi32(4095)));
 
             let low = _mm256_sub_epi32(x, _mm256_slli_epi32::<13>(high));
 
             _mm256_sub_epi32(_mm256_set1_epi32(1 << 12), low)
         }
-        Pack::Eta(eta) => _mm256_sub_epi32(_mm256_set1_epi32(eta), x),
-        Pack::Gamma1(gamma1) => {
+        3 | 4 => _mm256_sub_epi32(_mm256_set1_epi32(bound), x),
+        _ => {
             let wrap = _mm256_srai_epi32::<31>(_mm256_sub_epi32(_mm256_set1_epi32((q - 1) / 2), x));
 
             let centered = _mm256_sub_epi32(x, _mm256_and_si256(_mm256_set1_epi32(q), wrap));
 
-            _mm256_sub_epi32(_mm256_set1_epi32(gamma1), centered)
+            _mm256_sub_epi32(_mm256_set1_epi32(bound), centered)
         }
     }
 }
@@ -571,9 +685,85 @@ pub(super) fn pack(out: &mut [u8], poly: &[i32; 256], bits: u32, map: Pack, q: i
     }
 }
 
+// Up to eight bits, 32 values at a time straight into out: in each vector, pairs of values become
+// 2 BITS bits of a 64-bit lane, shifted by 2 BITS times the lane's index so that the four lanes
+// ORed together hold the vector's eight values; the unpacks and the swap of halves OR four vectors'
+// lanes into one 64-bit lane each, whose 8 BITS low bits are the bytes of the output.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn pack_narrow<const BITS: usize>(out: &mut [u8], poly: &[i32; 256], bound: i32, q: i32) {
+    let low = _mm256_set1_epi64x((1 << BITS) - 1);
+
+    let gap = _mm_cvtsi32_si128(32 - BITS as i32);
+
+    let shifts = _mm256_setr_epi64x(0, 2 * BITS as i64, 4 * BITS as i64, 6 * BITS as i64);
+
+    let groups = out.chunks_exact_mut(4 * BITS).zip(poly.as_chunks::<32>().0);
+
+    // Below four bits, the lanes pass through memory; s is secret, so they are wiped.
+    let mut lanes = [0u64; 4];
+
+    for (out, values) in groups {
+        let shift = |k: usize| {
+            let v = mapped::<BITS>(load256(&values.as_chunks::<8>().0[k]), bound, q);
+
+            let pairs = _mm256_or_si256(
+                _mm256_and_si256(v, low),
+                _mm256_andnot_si256(low, _mm256_srl_epi64(v, gap)),
+            );
+
+            _mm256_sllv_epi64(pairs, shifts)
+        };
+
+        // Indexed with constants only: registers (D-76).
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut shifted = [shift(0), shift(1), shift(2), shift(3)];
+
+        let join = |a: __m256i, b: __m256i| {
+            _mm256_or_si256(_mm256_unpacklo_epi64(a, b), _mm256_unpackhi_epi64(a, b))
+        };
+
+        let (x, y) = (join(shifted[0], shifted[1]), join(shifted[2], shifted[3]));
+
+        let z = _mm256_or_si256(
+            _mm256_permute2x128_si256::<0x20>(x, y),
+            _mm256_permute2x128_si256::<0x31>(x, y),
+        );
+
+        if BITS == 4 {
+            let words = _mm256_permutevar8x32_epi32(z, _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6));
+
+            let out: &mut [u8; 16] = out.try_into().expect("sixteen bytes");
+
+            store128(_mm256_castsi256_si128(words), out);
+        } else {
+            store256(z, &mut lanes);
+
+            for (out, lane) in out.as_chunks_mut::<BITS>().0.iter_mut().zip(&lanes) {
+                out.copy_from_slice(&lane.to_le_bytes()[..BITS]);
+            }
+        }
+
+        wipe_unless_optimized!(words_of(&mut shifted));
+    }
+
+    crate::wipe::wipe(&mut lanes);
+}
+
 #[target_feature(enable = "avx2")]
 #[inline]
 fn pack_bits<const BITS: usize>(out: &mut [u8], poly: &[i32; 256], map: Pack, q: i32) {
+    let bound = match map {
+        Pack::Eta(bound) | Pack::Gamma1(bound) => bound,
+        Pack::High | Pack::Low => 0,
+    };
+
+    if BITS <= 8 {
+        pack_narrow::<BITS>(out, poly, bound, q);
+
+        return;
+    }
+
     let mut buffer = [0u8; 32 * 20 + 16];
 
     let low = _mm256_set1_epi64x((1 << BITS) - 1);
@@ -581,7 +771,7 @@ fn pack_bits<const BITS: usize>(out: &mut [u8], poly: &[i32; 256], map: Pack, q:
     let shift = |count: usize| _mm_cvtsi32_si128(count as i32);
 
     for (i, values) in poly.as_chunks::<8>().0.iter().enumerate() {
-        let v = mapped(load256(values), map, q);
+        let v = mapped::<BITS>(load256(values), bound, q);
 
         let pairs = _mm256_or_si256(
             _mm256_and_si256(v, low),

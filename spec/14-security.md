@@ -20,6 +20,8 @@
    declassification MUST be marked in the code so that the checker of [14.1](#141-constant-time) item 7 sees it.
 6. Rejection sampling on secret data is permitted only in the form that FIPS 204 specifies for the
    signing loop, and in SampleInBall without a branch on the candidates [[D-72](decisions.md#decision-d-72)].
+   SampleInBall on the c̃ of a signature that is an input of a verification call is not on secret
+   data [[D-72](decisions.md#decision-d-72)].
 7. The implementation MUST verify item 1 mechanically in CI for every secret-handling path, including
    every CPU-specific kernel that the checker can execute. The Rust implementation runs valgrind
    memcheck with every secret marked undefined through client requests (`--cfg crypto_pq_ct`), on

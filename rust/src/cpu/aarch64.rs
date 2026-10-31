@@ -875,6 +875,13 @@ pub(crate) fn mldsa_pack(
     false
 }
 
+// So does the decoding of t1.
+#[inline(always)]
+#[cfg(feature = "ml-dsa")]
+pub(crate) fn mldsa_t1(_: &mut [i32; 256], _: &[u8; 320]) -> bool {
+    false
+}
+
 #[inline(always)]
 #[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_multiply_cache(
@@ -1077,7 +1084,7 @@ fn vector64(low: u64, high: u64) -> uint64x2_t {
 #[allow(unsafe_code)]
 unsafe trait Vectors: Copy {}
 
-// SAFETY: one vector of eight or sixteen bytes of any bits, here and in the next six.
+// SAFETY: one vector of eight or sixteen bytes of any bits, here and in the next seven.
 #[cfg(not(crypto_pq_optimized))]
 #[allow(unsafe_code)]
 unsafe impl Vectors for uint8x8_t {}
@@ -1105,6 +1112,10 @@ unsafe impl Vectors for int32x4_t {}
 #[cfg(not(crypto_pq_optimized))]
 #[allow(unsafe_code)]
 unsafe impl Vectors for uint64x2_t {}
+
+#[cfg(not(crypto_pq_optimized))]
+#[allow(unsafe_code)]
+unsafe impl Vectors for int64x2_t {}
 
 // SAFETY: an array has no padding between its elements.
 #[cfg(not(crypto_pq_optimized))]

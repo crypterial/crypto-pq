@@ -459,13 +459,25 @@ mod arch {
 
     #[inline(always)]
     #[cfg(feature = "ml-dsa")]
-    pub(crate) fn mldsa_w1(_: &mut [u8], _: &[i32; 256], _: i32, _: i32) -> bool {
+    pub(crate) fn mldsa_w1(
+        _: &mut [u8],
+        _: &[i32; 256],
+        _: Option<&[bool; 256]>,
+        _: i32,
+        _: i32,
+    ) -> bool {
         false
     }
 
     #[inline(always)]
     #[cfg(feature = "ml-dsa")]
     pub(crate) fn mldsa_mask(_: &mut [i32; 256], _: &[u8], _: u32, _: i32, _: i32) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "ml-dsa")]
+    pub(crate) fn mldsa_t1(_: &mut [i32; 256], _: &[u8; 320]) -> bool {
         false
     }
 
@@ -753,8 +765,8 @@ pub(crate) use arch::{
 
 #[cfg(feature = "ml-dsa")]
 pub(crate) use arch::{
-    bounded, mldsa_add, mldsa_hints, mldsa_mask, mldsa_norm, mldsa_pack, mldsa_sub, mldsa_w1,
-    multiply, multiply_add, uniform23,
+    bounded, mldsa_add, mldsa_hints, mldsa_mask, mldsa_norm, mldsa_pack, mldsa_sub, mldsa_t1,
+    mldsa_w1, multiply, multiply_add, uniform23,
 };
 
 // What the transform kernels need of the field of ML-KEM or ML-DSA, so that they compute exactly
@@ -1157,6 +1169,54 @@ pub(crate) mod testing {
     // Every bit clear, every bit set and the two alternating patterns, which drive the carries
     // and rotations of the kernels to their extremes.
     pub(crate) const EDGES: [u64; 4] = [0, u64::MAX, 0xAAAA_AAAA_AAAA_AAAA, 0x5555_5555_5555_5555];
+}
+
+// Runs f in code compiled for AVX2 where the processor has it, so that loops over byte lanes that
+// the compiler vectorizes use 256-bit registers; None where there is no such tier.
+#[cfg(feature = "ml-dsa")]
+pub(crate) fn vector_scope<R>(f: impl FnOnce() -> R) -> Option<R> {
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))]
+    {
+        x86_64::vector_scope(f)
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    )))]
+    {
+        let _ = f;
+
+        None
+    }
+}
+
+// Whether one Keccak state is permuted in about the time of the group of four (the one-state
+// AVX-512VL kernel), which ML-DSA's key generation weighs when it orders its groups of sponges.
+#[cfg(feature = "ml-dsa")]
+pub(crate) fn one_state_keccak() -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))]
+    {
+        x86_64::one_state_keccak()
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    )))]
+    {
+        false
+    }
 }
 
 // Without the arm64 kernels there is no DIT for MAC and KDF calls to take.
@@ -1681,6 +1741,10 @@ mod kernel_count {
             super::mldsa_mask(&mut out, &bytes, 18, 1 << 17, Q),
         );
 
+        let t1: [u8; 320] = core::array::from_fn(|_| inputs.next() as u8);
+
+        tally.note("mldsa_t1", super::mldsa_t1(&mut out, &t1));
+
         tally.note(
             "mldsa_norm",
             super::mldsa_norm(&a, 1 << 17, None, Q).is_some(),
@@ -1697,7 +1761,7 @@ mod kernel_count {
 
         tally.note(
             "mldsa_w1",
-            super::mldsa_w1(&mut packed[..128], &a, gamma2, Q),
+            super::mldsa_w1(&mut packed[..128], &a, None, gamma2, Q),
         );
 
         tally.note("multiply", super::multiply(&mut out, &a, &b, &FIELD));

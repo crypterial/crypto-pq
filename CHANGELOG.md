@@ -54,6 +54,25 @@ Implements specification 1.1 (draft).
   layers within each block of 32 coefficients four blocks at a time, so that four independent
   butterflies are in flight. The inverse stores each block, transposed, in its output first, so
   that the compiler keeps no block of secret coefficients on the stack. Outputs are unchanged.
+- ML-DSA verification samples the challenge of the signature it is given by plain rejection, as
+  FIPS 204 Algorithm 29 is written, since that signature, c̃ with it, is public
+  ([decision D-72](spec/decisions.md#decision-d-72), revised for specification 1.1). Signing, and
+  the verification in the pairwise test of key generation, whose signature is never output, keep
+  the constant-time form. Outputs are unchanged.
+- ML-DSA: the products of the matrix and a vector are summed exactly in 64 bits for each
+  coefficient and reduced once, in the portable code and in the x86-64 and ARM64 kernels. Key
+  generation computes each row of t, and packs it into the public key, as soon as the entries of Â
+  that it needs are sampled, and hashes the blocks of the key filled so far beside the sampling of
+  the later entries, in an order chosen for the CPU's Keccak kernels. UseHint takes the modulus of
+  HighBits as a constant. Outputs are unchanged.
+- ML-DSA on x86-64 with AVX2: the NTT and the inverse NTT take their layers in two passes over
+  eight registers, with four independent butterflies in each layer and the factors loaded in lane
+  order, and the inverse NTT folds its final scaling into its last layer. The sampling of the
+  matrix reads the Keccak lanes one at a time. Kernels decode t1 from a public key and encode w1
+  with the hints in verification, s1 and s2 are packed 32 values at a time, and the z of a
+  signature is decoded as the mask is and its norm is checked on the centered values.
+  SampleInBall in signing is compiled for AVX2 where the CPU has it. On ARM64 the NEON kernel
+  encodes w1 with the hints too. Outputs are unchanged.
 - Keccak-f[1600] on Arm Neoverse N2: one state takes scalar rounds whose rotations fold into the
   operands of EOR and BIC, and three states take two in vector registers with the SHA3 instructions
   beside one in general registers, in place of the portable code. Other Arm cores keep the kernels

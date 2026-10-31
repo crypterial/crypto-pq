@@ -937,10 +937,16 @@ pub(crate) fn mldsa_hints(
 }
 
 // HighBits of every coefficient packed in four bits, for gamma2 = (q - 1) / 32, or six, for
-// gamma2 = (q - 1) / 88.
+// gamma2 = (q - 1) / 88; with hints, the values UseHint gives.
 #[allow(unsafe_code)]
 #[cfg(feature = "ml-dsa")]
-pub(crate) fn mldsa_w1(out: &mut [u8], w: &[i32; 256], gamma2: i32, q: i32) -> bool {
+pub(crate) fn mldsa_w1(
+    out: &mut [u8],
+    w: &[i32; 256],
+    hints: Option<&[bool; 256]>,
+    gamma2: i32,
+    q: i32,
+) -> bool {
     let bits = if gamma2 == (q - 1) / 32 { 4 } else { 6 };
 
     if (gamma2 != (q - 1) / 32 && gamma2 != (q - 1) / 88) || out.len() != 32 * bits || !has(AVX2) {
@@ -948,7 +954,7 @@ pub(crate) fn mldsa_w1(out: &mut [u8], w: &[i32; 256], gamma2: i32, q: i32) -> b
     }
 
     // SAFETY: as in ntt.
-    unsafe { dsa::encode_w1(out, w, gamma2, q) };
+    unsafe { dsa::encode_w1(out, w, hints, gamma2, q) };
 
     true
 }
@@ -957,12 +963,31 @@ pub(crate) fn mldsa_w1(out: &mut [u8], w: &[i32; 256], gamma2: i32, q: i32) -> b
 #[allow(unsafe_code)]
 #[cfg(feature = "ml-dsa")]
 pub(crate) fn mldsa_pack(out: &mut [u8], poly: &[i32; 256], bits: u32, map: Pack, q: i32) -> bool {
-    if !matches!(bits, 3 | 4 | 10 | 13 | 18 | 20) || out.len() != 32 * bits as usize || !has(AVX2) {
+    let one = matches!(
+        (bits, map),
+        (3 | 4, Pack::Eta(_)) | (10, Pack::High) | (13, Pack::Low) | (18 | 20, Pack::Gamma1(_))
+    );
+
+    if !one || out.len() != 32 * bits as usize || !has(AVX2) {
         return false;
     }
 
     // SAFETY: as in ntt.
     unsafe { dsa::pack(out, poly, bits, map, q) };
+
+    true
+}
+
+// t1 * 2^13 from the 320 bytes of a row of t1.
+#[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
+pub(crate) fn mldsa_t1(out: &mut [i32; 256], bytes: &[u8; 320]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ntt.
+    unsafe { dsa::unpack_t1(out, bytes) };
 
     true
 }
@@ -2237,6 +2262,27 @@ fn compress256_lanes_moved<const LANES: usize>(
     compress256_lanes_avx2(states, &mut aligned.0);
 
     wipe(aligned.0.as_flattened_mut());
+}
+
+#[allow(unsafe_code)]
+#[cfg(feature = "ml-dsa")]
+pub(crate) fn vector_scope<R>(f: impl FnOnce() -> R) -> Option<R> {
+    #[target_feature(enable = "avx2")]
+    fn scope<R>(f: impl FnOnce() -> R) -> R {
+        f()
+    }
+
+    if !has(AVX2) {
+        return None;
+    }
+
+    // SAFETY: as in ntt.
+    Some(unsafe { scope(f) })
+}
+
+#[cfg(feature = "ml-dsa")]
+pub(crate) fn one_state_keccak() -> bool {
+    has(AVX512_ONE)
 }
 
 #[cfg(test)]

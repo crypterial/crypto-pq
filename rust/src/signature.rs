@@ -800,7 +800,14 @@ fn self_test(
 ) -> Result<Vec<u8>, Error> {
     let signature = private_key.sign(SELF_TEST_MESSAGE, &SignOptions::default())?;
 
-    if public_key.verify(&signature, SELF_TEST_MESSAGE, &VerifyOptions::default()) {
+    // The signature is never output, so its challenge is verified as a secret.
+    if public_key.verify_signature(
+        &signature,
+        SELF_TEST_MESSAGE,
+        &VerifyOptions::default(),
+        true,
+        false,
+    ) {
         Ok(signature)
     } else {
         Err(Error::SelfTestFailed)
@@ -935,6 +942,19 @@ impl SignaturePublicKey {
         options: &VerifyOptions,
         policy: bool,
     ) -> bool {
+        self.verify_signature(signature, message, options, policy, true)
+    }
+
+    // public: whether the signature is public; false for one that is never output, whose ML-DSA
+    // challenge stays secret (D-72).
+    fn verify_signature(
+        &self,
+        signature: &[u8],
+        message: &[u8],
+        options: &VerifyOptions,
+        policy: bool,
+        public: bool,
+    ) -> bool {
         let algorithm = self.algorithm;
 
         let Ok(pre_hash) = algorithm.pre_hash(options.pre_hash, policy) else {
@@ -948,11 +968,17 @@ impl SignaturePublicKey {
 
         let representative = Representative::new(message, options.context, pre_hash);
 
-        self.verify_representative(&representative.parts(), signature)
+        self.verify_parts(&representative.parts(), signature, public)
     }
 
     // FIPS 204 Algorithm 8 or FIPS 205 Algorithm 20 on M', given in parts.
+    #[cfg(any(feature = "hazmat", test))]
     pub(crate) fn verify_representative(&self, parts: &[&[u8]], signature: &[u8]) -> bool {
+        self.verify_parts(parts, signature, true)
+    }
+
+    #[cfg_attr(not(feature = "ml-dsa"), allow(unused_variables))]
+    fn verify_parts(&self, parts: &[&[u8]], signature: &[u8], public: bool) -> bool {
         let key = &self.public.key;
 
         match (self.algorithm.scheme, &self.public.derived) {
@@ -960,7 +986,7 @@ impl SignaturePublicKey {
             (Scheme::MlDsa(p), Some(derived)) => {
                 let (matrix, verifying) = derived.for_verify(key, &p);
 
-                mldsa::verify_internal(matrix, verifying, parts, signature, &p)
+                mldsa::verify_internal(matrix, verifying, parts, signature, &p, public)
             }
             #[cfg(feature = "slh-dsa")]
             (Scheme::SlhDsa(p), _) => slhdsa::verify_internal(parts, signature, key, &p),

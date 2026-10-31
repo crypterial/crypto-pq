@@ -474,17 +474,25 @@ and the package that implements it change together in one history.
 
 ## Decision D-72
 
-SampleInBall (FIPS 204 Algorithm 29) runs in constant time in every
-attempt of ML-DSA signing: neither the positions nor the signs of the challenge decide a branch, a
-memory address or the number of steps ([14.1](14-security.md#141-constant-time) item 5). The only
-value derived from the challenge stream that is declassified is whether fewer than τ of the 128
-candidate bytes of the first SHAKE256 block fit, so that a further block is read; for a uniform stream
-its probability is 2^−87.7 for τ = 60, 2^−140.3 for τ = 49 and 2^−202.9 for τ = 39. Verification
-runs the same code. Rationale: the challenge c̃ of a rejected attempt is never output, so it is a
-secret, and only the decision to reject is public. Side channels on the challenges of rejected
-attempts are a demonstrated threat: [KARABULUT21] recovers their signs, and [ZHOU25] recovers the
-private key from rejected challenges together with the rejected responses. The declassified bit is
-expected fewer than 2^−23 times in 2^64 attempts, and no fixed amount of stream avoids it entirely.
+Revised for specification 1.1 on 2026-10-28; specification 1.0, which 1.0.0 and 1.0.1 implement,
+said that verification runs the same code. SampleInBall (FIPS 204 Algorithm 29) runs in constant
+time in every attempt of ML-DSA signing: neither the positions nor the signs of the challenge decide
+a branch, a memory address or the number of steps ([14.1](14-security.md#141-constant-time) item 5).
+The only value derived from the challenge stream that is declassified is whether fewer than τ of the
+128 candidate bytes of the first SHAKE256 block fit, so that a further block is read; for a uniform
+stream its probability is 2^−87.7 for τ = 60, 2^−140.3 for τ = 49 and 2^−202.9 for τ = 39.
+Verification of a signature that is an input of the call, whose c̃ is public
+([2.2](02-terminology.md#22-terms), [14.1](14-security.md#141-constant-time) item 4), may sample the
+challenge by plain rejection, as FIPS 204 Algorithm 29 is written; a verification of a signature
+that the implementation has not output, such as the pairwise test of key generation
+([14.4](14-security.md#144-self-tests)), runs the constant-time form. Rationale: the challenge c̃ of
+a rejected attempt is never output, so it is a secret, and only the decision to reject is public. A
+signature under verification is public as a whole, c̃ with it, so its challenge carries nothing that
+the signature does not; the pairwise test's signature is never output, so its challenge stays a
+secret. Side channels on the challenges of rejected attempts are a demonstrated threat:
+[KARABULUT21] recovers their signs, and [ZHOU25] recovers the private key from rejected challenges
+together with the rejected responses. The declassified bit is expected fewer than 2^−23 times in
+2^64 attempts, and no fixed amount of stream avoids it entirely.
 
 ## Decision D-73
 
