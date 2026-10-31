@@ -16,10 +16,7 @@
 use core::arch::aarch64::*;
 
 use super::memory::{load_u8, load_u64, store_i32, store_u16};
-#[cfg(not(crypto_pq_optimized))]
-use super::vector_lanes;
 use crate::ct::declassify_value;
-use crate::wipe::wipe_unless_optimized;
 
 // Shuffle indices that bring the accepted lanes of a vector of LANES lanes, WIDTH bytes each, to
 // its start in order, for every pattern of accepted lanes; 0xFF selects zero for the rest.
@@ -304,7 +301,15 @@ fn bounded_neon(lanes: &[u64; 17], eta: i32, a: &mut [i32; 256], count: &mut usi
 
         let (low, high) = (vand_u8(bytes, vdup_n_u8(0x0F)), vshr_n_u8::<4>(bytes));
 
-        for half in [vzip1_u8(low, high), vzip2_u8(low, high)] {
+        // Eight half-bytes at a time, in 8-bit lanes: the halves are selected by the public index,
+        // with no array or iterator of the secret values (D-76).
+        for k in 0..2 {
+            let half = if k == 0 {
+                vzip1_u8(low, high)
+            } else {
+                vzip2_u8(low, high)
+            };
+
             let values = if eta == 2 {
                 let fifth = vshr_n_u8::<6>(vmul_u8(half, vdup_n_u8(13)));
 
@@ -321,18 +326,19 @@ fn bounded_neon(lanes: &[u64; 17], eta: i32, a: &mut [i32; 256], count: &mut usi
 
             let packed = vmovl_s8(vreinterpret_s8_u8(vtbl1_u8(values, indices)));
 
-            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-            let mut wide = [vmovl_s16(vget_low_s16(packed)), vmovl_high_s16(packed)];
+            let start = filled;
 
-            for (i, vector) in wide.into_iter().enumerate() {
-                let start = filled + 4 * i;
+            store_i32(
+                vmovl_s16(vget_low_s16(packed)),
+                (&mut a[start..start + 4]).try_into().expect("four"),
+            );
 
-                store_i32(vector, (&mut a[start..start + 4]).try_into().expect("four"));
-            }
+            store_i32(
+                vmovl_high_s16(packed),
+                (&mut a[start + 4..start + 8]).try_into().expect("four"),
+            );
 
             filled += usize::from(ACCEPTED[pattern]);
-
-            wipe_unless_optimized!(vector_lanes(&mut wide));
         }
 
         step += 1;
@@ -340,25 +346,25 @@ fn bounded_neon(lanes: &[u64; 17], eta: i32, a: &mut [i32; 256], count: &mut usi
 
     *count = filled;
 
-    for half in lanes[step..]
-        .iter()
-        .flat_map(|lane| lane.to_le_bytes())
-        .flat_map(|byte| [byte & 0x0F, byte >> 4])
-    {
-        if *count == 256 {
-            return;
+    // The nibbles of the remaining lanes, low before high in each byte: plain loops over the lanes,
+    // so that no iterator holds a copy of the secret stream in memory (D-76).
+    for &lane in &lanes[step..] {
+        for position in 0..16 {
+            if *count == 256 {
+                return;
+            }
+
+            let half = ((lane >> (4 * position)) & 0x0F) as i32;
+
+            let (value, accepted) = if eta == 2 {
+                (2 - (half - 5 * ((205 * half) >> 10)), half < 15)
+            } else {
+                (4 - half, half < 9)
+            };
+
+            a[*count] = value;
+
+            *count += usize::from(declassify_value(accepted));
         }
-
-        let half = i32::from(half);
-
-        let (value, accepted) = if eta == 2 {
-            (2 - (half - 5 * ((205 * half) >> 10)), half < 15)
-        } else {
-            (4 - half, half < 9)
-        };
-
-        a[*count] = value;
-
-        *count += usize::from(declassify_value(accepted));
     }
 }

@@ -87,6 +87,10 @@ Implements specification 1.1 (draft).
   instructions, which the compiler kept on the stack, are wiped before each round returns, and the
   temporaries in which it built some of them are no longer made. At opt-level 3 the machine code is
   unchanged. Outputs are unchanged.
+- ML-DSA key generation sampled s1 and s2 from the SHAKE256 output through iterators that left a
+  lane of that output and its half-bytes on the stack, unwiped, in the portable code and in the
+  x86-64 and ARM64 kernels. The half-bytes are now taken in plain loops over the lanes, and no
+  iterator or array holds the secret values. Outputs are unchanged.
 - The hash engines of LMS, HSS and XMSS that have absorbed input are finished in the storage
   that wipes them on drop. The last call on a truncated SHA-256 or SHAKE256 hash took the engine
   by value and wiped only its copy, so that the input it had absorbed stayed on the stack: SEED

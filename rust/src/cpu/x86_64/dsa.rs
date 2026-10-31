@@ -481,10 +481,17 @@ pub(super) fn bounded(lanes: &[u64; 17], eta: i32, a: &mut [i32; 256], count: &m
 
         let values = _mm_shuffle_epi8(table, halves);
 
-        for (half, pattern) in [
-            (values, accepted & 0xFF),
-            (_mm_bsrli_si128::<8>(values), accepted >> 8),
-        ] {
+        // Eight candidates at a time, compacted and widened; the halves are selected by the public
+        // index, with no array or iterator of the secret values (D-76).
+        for k in 0..2 {
+            let half = if k == 0 {
+                values
+            } else {
+                _mm_bsrli_si128::<8>(values)
+            };
+
+            let pattern = (accepted >> (8 * k)) & 0xFF;
+
             let packed = _mm_shuffle_epi8(half, compact_indices(pattern));
 
             let out: &mut [i32; 8] = (&mut a[filled..filled + 8]).try_into().expect("eight");
@@ -499,26 +506,26 @@ pub(super) fn bounded(lanes: &[u64; 17], eta: i32, a: &mut [i32; 256], count: &m
 
     *count = filled;
 
-    for half in lanes[step..]
-        .iter()
-        .flat_map(|lane| lane.to_le_bytes())
-        .flat_map(|byte| [byte & 0x0F, byte >> 4])
-    {
-        if *count == 256 {
-            return;
+    // The nibbles of the remaining lanes, low before high in each byte: plain loops over the lanes,
+    // so that no iterator holds a copy of the secret stream in memory (D-76).
+    for &lane in &lanes[step..] {
+        for position in 0..16 {
+            if *count == 256 {
+                return;
+            }
+
+            let half = ((lane >> (4 * position)) & 0x0F) as i32;
+
+            let (value, accepted) = if eta == 2 {
+                (2 - (half - 5 * ((205 * half) >> 10)), half < 15)
+            } else {
+                (4 - half, half < 9)
+            };
+
+            a[*count] = value;
+
+            *count += usize::from(declassify_value(accepted));
         }
-
-        let half = i32::from(half);
-
-        let (value, accepted) = if eta == 2 {
-            (2 - (half - 5 * ((205 * half) >> 10)), half < 15)
-        } else {
-            (4 - half, half < 9)
-        };
-
-        a[*count] = value;
-
-        *count += usize::from(declassify_value(accepted));
     }
 }
 

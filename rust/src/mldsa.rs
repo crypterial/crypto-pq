@@ -640,28 +640,27 @@ fn sample_bounded(block: &[u64; 17], eta: i32, a: &mut Poly, count: &mut usize) 
 // advances the count. Which candidates are rejected is public, as BoringSSL also has it: the bytes
 // of the SHAKE256 stream are independent of each other, so the rejected ones say nothing about the
 // accepted coefficients. Those are computed without a division (205 * x >> 10 = x / 5 for x < 15).
+// The nibbles go low before high in each byte of each little-endian lane, in plain loops over the
+// lanes, so that no iterator holds a copy of the secret stream in memory (D-76).
 fn sample_bounded_portable(block: &[u64; 17], eta: i32, a: &mut Poly, count: &mut usize) {
-    let halves = block
-        .iter()
-        .flat_map(|lane| lane.to_le_bytes())
-        .flat_map(|byte| [byte & 0x0F, byte >> 4]);
+    for &lane in block {
+        for position in 0..16 {
+            if *count == 256 {
+                return;
+            }
 
-    for half in halves {
-        if *count == 256 {
-            return;
+            let half = ((lane >> (4 * position)) & 0x0F) as i32;
+
+            let (value, accepted) = if eta == 2 {
+                (2 - (half - 5 * ((205 * half) >> 10)), half < 15)
+            } else {
+                (4 - half, half < 9)
+            };
+
+            a[*count] = value;
+
+            *count += usize::from(declassify_value(accepted));
         }
-
-        let half = i32::from(half);
-
-        let (value, accepted) = if eta == 2 {
-            (2 - (half - 5 * ((205 * half) >> 10)), half < 15)
-        } else {
-            (4 - half, half < 9)
-        };
-
-        a[*count] = value;
-
-        *count += usize::from(declassify_value(accepted));
     }
 }
 
