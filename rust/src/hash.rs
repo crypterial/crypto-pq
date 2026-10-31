@@ -1001,7 +1001,7 @@ pub const ASCON_XOF128: XofAlgorithm = XofAlgorithm {
 pub const ASCON_CXOF128: XofAlgorithm = XofAlgorithm {
     name: "Ascon-CXOF128",
     rate: 8,
-    kind: XofKind::AsconCxof(ascon::customize(&[])),
+    kind: XofKind::AsconCxof(ascon::CXOF128_EMPTY),
     oid_arc: 0,
 };
 

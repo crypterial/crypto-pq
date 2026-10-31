@@ -84,6 +84,13 @@ Implements specification 1.1 (draft).
 - BLAKE3-MAC on x86-64 with AVX2 or SSE4.1: a message of at most 64 bytes is hashed by the one-block
   kernel from the key's bytes, so that no converted copy of the key is stored. Outputs are
   unchanged.
+- Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128: the portable rounds and the x86-64 kernel for
+  BMI1 and BMI2 take the S-box circuit of Zhang and Huang (ePrint 2023/1721), and the portable
+  linear layer is written so that ARM64 folds its rotations into the XORs. The portable digest
+  keeps the state in registers, and the x86-64 digest keeps one state word complemented from the
+  start state to the wipe. The customization of Ascon-CXOF128 runs through the CPU kernels at run
+  time, and the state for the empty string is a constant. The ARM64 kernel for Apple cores is
+  unchanged. Outputs are unchanged.
 - The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
   intrinsics are stable.
 
