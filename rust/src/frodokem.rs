@@ -199,19 +199,23 @@ struct Stream {
 }
 
 impl Stream {
-    fn new(domain: u8, seed_se: &[u8], cdf: &'static [u16]) -> Self {
-        let mut sponge = Keccak::new(SHAKE256_RATE, SHAKE_SUFFIX);
-
-        sponge.update(&[domain]);
-
-        sponge.update(seed_se);
-
+    // Unkeyed: absorb takes seedSE where the stream lives, so that no sponge that holds it is
+    // moved.
+    fn new(cdf: &'static [u16]) -> Self {
         Self {
-            sponge,
+            sponge: Keccak::new(SHAKE256_RATE, SHAKE_SUFFIX),
             blocks: [0; 2 * SHAKE256_RATE],
             position: 2 * SHAKE256_RATE,
             cdf,
         }
+    }
+
+    fn absorb(&mut self, domain: u8, seed_se: &[u8]) -> &mut Self {
+        self.sponge.update(&[domain]);
+
+        self.sponge.update(seed_se);
+
+        self
     }
 
     fn fill(&mut self, mut out: &mut [u16]) {
@@ -563,7 +567,9 @@ pub(crate) fn keygen(p: &Parameters, seed: &[u8]) -> SecretBytes {
     let (e, rows) = rest.split_at_mut(BAR * n);
 
     {
-        let mut stream = Stream::new(0x5f, &seed[secret..secret + p.seed_se_size], p.cdf);
+        let mut stream = Stream::new(p.cdf);
+
+        stream.absorb(0x5f, &seed[secret..secret + p.seed_se_size]);
 
         // S^T first, through e.
         stream.fill(e);
@@ -671,7 +677,7 @@ pub(crate) fn encapsulate(
         &mut work,
         pk,
         u,
-        &mut Stream::new(0x96, seed_se, p.cdf),
+        Stream::new(p.cdf).absorb(0x96, seed_se),
         c2,
     );
 
@@ -733,7 +739,7 @@ pub(crate) fn decapsulate(p: &Parameters, sk: &[u8], ciphertext: &[u8], shared_s
         &mut work,
         pk,
         &input[secret..2 * secret],
-        &mut Stream::new(0x96, &g[..p.seed_se_size], p.cdf),
+        Stream::new(p.cdf).absorb(0x96, &g[..p.seed_se_size]),
         &mut c2_prime,
     );
 

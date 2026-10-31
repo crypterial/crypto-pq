@@ -681,7 +681,8 @@ pub(crate) fn compress256_lanes_portable<const LANES: usize>(
     for (round, k) in K256.as_chunks::<16>().0.iter().enumerate() {
         if round > 0 {
             for t in 0..16 {
-                let (x, y, z) = (w[(t + 1) % 16], w[(t + 14) % 16], w[(t + 9) % 16]);
+                #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+                let (mut x, mut y, mut z) = (w[(t + 1) % 16], w[(t + 14) % 16], w[(t + 9) % 16]);
 
                 for (lane, word) in w[t].iter_mut().enumerate() {
                     let s0 = x[lane].rotate_right(7) ^ x[lane].rotate_right(18) ^ (x[lane] >> 3);
@@ -690,6 +691,12 @@ pub(crate) fn compress256_lanes_portable<const LANES: usize>(
 
                     *word = word.wrapping_add(s0).wrapping_add(z[lane]).wrapping_add(s1);
                 }
+
+                wipe_unless_optimized!(&mut x);
+
+                wipe_unless_optimized!(&mut y);
+
+                wipe_unless_optimized!(&mut z);
             }
         }
 

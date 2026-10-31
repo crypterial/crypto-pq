@@ -2083,33 +2083,79 @@ fn quarter<const N: usize, const J: usize>(streams: &mut [Stream; N], k: __m128i
     }
 }
 
+// Two streams kept in step: an empty assembly block that takes and gives back the state and the
+// message words of both, so that LLVM cannot run the schedule of one stream far ahead of its
+// rounds. At codegen-units 16 it did, and spilled ten message words of the last 16 rounds.
 #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
 #[inline]
-fn rounds256<const N: usize>(streams: &mut [Stream; N]) {
-    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-    let mut start = *streams;
+#[allow(unsafe_code)]
+fn in_step(streams: &mut [Stream]) {
+    if let [x, y] = streams {
+        let [x0, x1, x2, x3] = &mut x.m;
 
-    for (sixteen, k) in K256.as_chunks::<16>().0.iter().enumerate() {
-        let k = k.as_chunks::<4>().0;
+        let [y0, y1, y2, y3] = &mut y.m;
 
-        let schedule = sixteen < 3;
-
-        quarter::<N, 0>(streams, low_first(k[0]), schedule);
-
-        quarter::<N, 1>(streams, low_first(k[1]), schedule);
-
-        quarter::<N, 2>(streams, low_first(k[2]), schedule);
-
-        quarter::<N, 3>(streams, low_first(k[3]), schedule);
+        // SAFETY: the assembly is empty: it reads and writes the twelve registers it names and
+        // nothing else, no memory, stack or flags.
+        unsafe {
+            core::arch::asm!(
+                "/* {} {} {} {} {} {} {} {} {} {} {} {} */",
+                inout(xmm_reg) x.abef,
+                inout(xmm_reg) x.cdgh,
+                inout(xmm_reg) *x0,
+                inout(xmm_reg) *x1,
+                inout(xmm_reg) *x2,
+                inout(xmm_reg) *x3,
+                inout(xmm_reg) y.abef,
+                inout(xmm_reg) y.cdgh,
+                inout(xmm_reg) *y0,
+                inout(xmm_reg) *y1,
+                inout(xmm_reg) *y2,
+                inout(xmm_reg) *y3,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
     }
+}
 
-    for (stream, start) in streams.iter_mut().zip(&start) {
-        stream.abef = _mm_add_epi32(stream.abef, start.abef);
+// The sixteen quarters of the rounds, written out so that whether a quarter extends the schedule
+// is a constant; with in_step after each, the loop over them was left rolled.
+macro_rules! quarters {
+    ($streams:ident, $n:literal, $k:ident; $($q:literal $j:literal $schedule:literal),+) => {
+        $(
+            quarter::<$n, $j>(&mut $streams, low_first($k[$q]), $schedule);
 
-        stream.cdgh = _mm_add_epi32(stream.cdgh, start.cdgh);
-    }
+            in_step(&mut $streams);
+        )+
+    };
+}
 
-    wipe_unless_optimized!(memory::words_of(&mut start));
+// The 64 rounds of N streams and the feed-forward, written out at each call site: target_feature
+// functions cannot be inline(always), and rounds256::<2> was not inlined at codegen-units 16, which
+// left both streams in memory.
+macro_rules! rounds256 {
+    ($streams:ident, $n:literal) => {{
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut start = $streams;
+
+        let k = K256.as_chunks::<4>().0;
+
+        quarters!(
+            $streams, $n, k;
+            0 0 true, 1 1 true, 2 2 true, 3 3 true,
+            4 0 true, 5 1 true, 6 2 true, 7 3 true,
+            8 0 true, 9 1 true, 10 2 true, 11 3 true,
+            12 0 false, 13 1 false, 14 2 false, 15 3 false
+        );
+
+        for (stream, start) in $streams.iter_mut().zip(&start) {
+            stream.abef = _mm_add_epi32(stream.abef, start.abef);
+
+            stream.cdgh = _mm_add_epi32(stream.cdgh, start.cdgh);
+        }
+
+        wipe_unless_optimized!(memory::words_of(&mut start));
+    }};
 }
 
 // The streaming hash: the state stays in registers from one block to the next.
@@ -2137,7 +2183,7 @@ fn compress256_sha(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]])
             *m = _mm_shuffle_epi8(words, swap);
         }
 
-        rounds256(&mut streams);
+        rounds256!(streams, 1);
     }
 
     let [a, b, e, f] = from_high_first(streams[0].abef);
@@ -2203,7 +2249,7 @@ fn compress256_lanes_sha<const LANES: usize>(
     while lane + 2 <= LANES {
         let mut streams = [gather(states, w, lane), gather(states, w, lane + 1)];
 
-        rounds256(&mut streams);
+        rounds256!(streams, 2);
 
         scatter(states, &streams[0], lane);
 
@@ -2217,7 +2263,7 @@ fn compress256_lanes_sha<const LANES: usize>(
     if lane < LANES {
         let mut streams = [gather(states, w, lane)];
 
-        rounds256(&mut streams);
+        rounds256!(streams, 1);
 
         scatter(states, &streams[0], lane);
 
