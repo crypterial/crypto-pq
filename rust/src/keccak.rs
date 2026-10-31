@@ -281,6 +281,36 @@ impl Sponges {
         }
     }
 
+    // start for messages that the caller writes as whole lanes: fill(i, state) receives the zero
+    // state of sponge i and writes its message with the suffix and the padding, which must leave
+    // room for the rate's last byte. Callers whose messages are lanes already, such as SLH-DSA's
+    // chains, skip the bytes of start.
+    pub(crate) fn start_lanes(
+        &mut self,
+        rate: usize,
+        count: usize,
+        mut fill: impl FnMut(usize, &mut [u64; 25]),
+    ) {
+        assert!(
+            count <= MAX_SPONGES,
+            "at most MAX_SPONGES sponges run together"
+        );
+
+        wipe(self.states[..self.count].as_flattened_mut());
+
+        self.wide.restart(count);
+
+        self.count = count;
+
+        self.rate = rate;
+
+        self.done = 0;
+
+        for (i, state) in self.states[..count].iter_mut().enumerate() {
+            fill(i, state);
+        }
+    }
+
     // Squeezes the sponges marked active, which skips the permutations of those that already
     // have all the output they need. A sponge left out keeps the block it squeezed last and is
     // done: the vector form may permute it beside the others, so it is not squeezed again until

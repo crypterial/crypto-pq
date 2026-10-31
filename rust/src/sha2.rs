@@ -1102,6 +1102,43 @@ impl Sha512 {
 
         wipe(&mut state);
     }
+
+    // finish_message for two messages of one block each, side by side (compress512_pair).
+    pub(crate) fn finish_pair(
+        &self,
+        messages: &mut [[u8; 128]; 2],
+        length: usize,
+        out: &mut [[u8; 64]; 2],
+    ) {
+        assert_eq!(
+            self.blocks.len, 0,
+            "the shared input must fill whole blocks"
+        );
+
+        assert!(length + 17 <= 128, "one block for each message");
+
+        let bits = self.length.wrapping_add(length as u128).wrapping_mul(8);
+
+        for message in messages.iter_mut() {
+            message[length..].fill(0);
+
+            message[length] = 0x80;
+
+            message[112..].copy_from_slice(&bits.to_be_bytes());
+        }
+
+        let mut states = [self.state; 2];
+
+        compress512_pair(&mut states, messages);
+
+        for (state, out) in states.iter().zip(out) {
+            store512(state, out);
+        }
+
+        wipe(messages.as_flattened_mut());
+
+        wipe(states.as_flattened_mut());
+    }
 }
 
 impl Drop for Sha256 {

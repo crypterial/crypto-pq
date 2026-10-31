@@ -6,7 +6,7 @@ use crate::keccak::{self, MAX_SPONGES, Sponges};
 use crate::mac::{HMAC_SHA_256, HMAC_SHA_512};
 use crate::primitives::{sha256, sha512, shake256, shake256_into};
 use crate::sha2::{IV_256, IV_512, Sha256, Sha512};
-use crate::wipe::{SecretBytes, wipe};
+use crate::wipe::{SecretBytes, wipe, wipe_unless_optimized};
 
 const WOTS_HASH: u32 = 0;
 
@@ -34,6 +34,9 @@ const MAX_HEIGHT: usize = 14;
 
 // Hashes computed side by side (see Sha256::finish_lanes).
 const LANES: usize = 16;
+
+// The FORS tree leaves that fors_sign builds at a time, a power of two and a multiple of LANES.
+const FORS_BLOCK: usize = 128;
 
 type Adrs = [u8; 32];
 
@@ -226,19 +229,19 @@ impl<'a> Hashes<'a> {
     }
 
     fn shake(&self, adrs: &Adrs, parts: &[&[u8]]) -> Node {
-        let mut engine = shake256();
+        let mut engine = Line(shake256());
 
-        engine.update(self.pk_seed);
+        engine.0.update(self.pk_seed);
 
-        engine.update(adrs);
+        engine.0.update(adrs);
 
         for part in parts {
-            engine.update(part);
+            engine.0.update(part);
         }
 
         let mut out = [0; 32];
 
-        engine.read(&mut out[..self.n]);
+        engine.0.read(&mut out[..self.n]);
 
         out
     }
@@ -307,7 +310,7 @@ impl<'a> Hashes<'a> {
 
     // F with SHAKE256 for the lanes that have an input, a group of sponges side by side: PK.seed,
     // ADRS and the input fill less than one block. Kept out of f_lanes: inlined there, its sponges
-    // made the SHA-2 path of f_lanes about 1% slower. The lanes without input keep their nodes.
+    // cost the SHA-2 path of f_lanes about 1% more time. The lanes without input keep their nodes.
     // Builds with a one-block kernel take one_block_lanes.
     #[inline(never)]
     fn shake_lanes(
@@ -400,6 +403,91 @@ impl<'a> Hashes<'a> {
         }
     }
 
+    // H with SHAKE256 for the lanes that have a pair of nodes, a group of sponges side by side:
+    // PK.seed, ADRS and 2n bytes fill less than one block. Not through keccak::one_block: a second
+    // caller kept it out of line in shake_lanes, which cost about 2.5% of SLH-DSA-SHAKE key
+    // generation on Haswell. The lanes without input keep their nodes.
+    #[inline(never)]
+    fn shake_pairs(
+        &self,
+        adrs: &[Adrs; LANES],
+        inputs: [Option<[&[u8]; 2]>; LANES],
+        nodes: &mut [Node; LANES],
+    ) {
+        let n = self.n;
+
+        let mut sponges = Line(Sponges::empty());
+
+        let mut active = [0; LANES];
+
+        let mut count = 0;
+
+        for (lane, input) in inputs.iter().enumerate() {
+            if input.is_some() {
+                active[count] = lane;
+
+                count += 1;
+            }
+        }
+
+        for group in active[..count].chunks(keccak::group()) {
+            let parts: [[&[u8]; 4]; MAX_SPONGES] = core::array::from_fn(|i| {
+                let lane = group.get(i).copied().unwrap_or_default();
+
+                let [left, right] = inputs[lane].unwrap_or_default();
+
+                [self.pk_seed, &adrs[lane], left, right]
+            });
+
+            let messages = parts.each_ref().map(|parts| &parts[..]);
+
+            sponges.0.start(136, 0x1F, &messages[..group.len()]);
+
+            sponges.0.squeeze([true; MAX_SPONGES]);
+
+            for (i, &lane) in group.iter().enumerate() {
+                sponges.0.read(i, &mut nodes[lane][..n]);
+            }
+        }
+    }
+
+    // One SHA-256 block after the PK.seed block, word-major for lane `lane`, into blocks whose
+    // words after the input are zero: ADRSc, then the parts (n or 2n bytes in all, whole words and
+    // at most 32 bytes, so that the padding fits), the padding and the length.
+    fn pack<const L: usize>(
+        blocks: &mut [[u32; L]; 16],
+        lane: usize,
+        adrs: &Adrs,
+        parts: [&[u8]; 2],
+    ) {
+        let adrs_c = Self::compressed(adrs);
+
+        for (t, bytes) in adrs_c.as_chunks::<4>().0.iter().enumerate() {
+            blocks[t][lane] = u32::from_be_bytes(*bytes);
+        }
+
+        // ADRSc ends two bytes into word 5, so every input word straddles two block words.
+        let mut carry = (u32::from(adrs_c[20]) << 24) | (u32::from(adrs_c[21]) << 16);
+
+        let mut t = 5;
+
+        for part in parts {
+            for bytes in part.as_chunks::<4>().0 {
+                let word = u32::from_be_bytes(*bytes);
+
+                blocks[t][lane] = carry | (word >> 16);
+
+                carry = word << 16;
+
+                t += 1;
+            }
+        }
+
+        blocks[t][lane] = carry | 0x8000;
+
+        blocks[15][lane] = ((64 + 22 + parts[0].len() + parts[1].len()) * 8) as u32;
+    }
+
     // F of up to LANES independent inputs, side by side, into nodes, which the caller owns and
     // wipes where they are secret. A lane without input gives nothing useful; with SHAKE it costs
     // nothing.
@@ -418,32 +506,12 @@ impl<'a> Hashes<'a> {
         let mut blocks = [[0; LANES]; 16];
 
         for (lane, (adrs, input)) in adrs.iter().zip(inputs).enumerate() {
-            let adrs_c = Self::compressed(adrs);
-
-            for (t, bytes) in adrs_c.as_chunks::<4>().0.iter().enumerate() {
-                blocks[t][lane] = u32::from_be_bytes(*bytes);
-            }
-
-            // ADRSc ends two bytes into word 5, so every input word straddles two block words.
-            let mut carry = (u32::from(adrs_c[20]) << 24) | (u32::from(adrs_c[21]) << 16);
-
-            for (t, bytes) in input
-                .unwrap_or(&[0; 32][..n])
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .enumerate()
-            {
-                let word = u32::from_be_bytes(*bytes);
-
-                blocks[5 + t][lane] = carry | (word >> 16);
-
-                carry = word << 16;
-            }
-
-            blocks[5 + n / 4][lane] = carry | 0x8000;
-
-            blocks[15][lane] = ((64 + 22 + n) * 8) as u32;
+            Self::pack(
+                &mut blocks,
+                lane,
+                adrs,
+                [input.unwrap_or(&[0; 32][..n]), &[]],
+            );
         }
 
         let mut digests = [[0; LANES]; 8];
@@ -461,8 +529,74 @@ impl<'a> Hashes<'a> {
         wipe(digests.as_flattened_mut());
     }
 
-    fn prf_lanes(&self, adrs: &[Adrs; LANES], nodes: &mut [Node; LANES]) {
-        self.f_lanes(adrs, [Some(self.sk_seed); LANES], nodes);
+    // H of up to LANES pairs of nodes into nodes: side by side with SHAKE and with SHA-256 (n = 16,
+    // one block), two at a time with SHA-512. The lanes without input keep their nodes.
+    fn h_lanes(
+        &self,
+        adrs: &[Adrs; LANES],
+        inputs: [Option<[&[u8]; 2]>; LANES],
+        nodes: &mut [Node; LANES],
+    ) {
+        let Some(states) = &self.sha2 else {
+            return self.shake_pairs(adrs, inputs, nodes);
+        };
+
+        if let Some(large) = &states.large {
+            // Two at a time: one SHA-512 block each.
+            let mut live = (0..LANES).filter(|&lane| inputs[lane].is_some());
+
+            while let Some(first) = live.next() {
+                let [left, right] = inputs[first].unwrap_or_default();
+
+                let Some(second) = live.next() else {
+                    nodes[first] = self.h(&adrs[first], left, right);
+
+                    break;
+                };
+
+                let mut messages = [[0; 128]; 2];
+
+                let length = Self::message(&mut messages[0], &adrs[first], &[left, right]);
+
+                let [left, right] = inputs[second].unwrap_or_default();
+
+                Self::message(&mut messages[1], &adrs[second], &[left, right]);
+
+                let mut digests = [[0; 64]; 2];
+
+                large.finish_pair(&mut messages, length, &mut digests);
+
+                nodes[first] = self.truncate(&digests[0]);
+
+                nodes[second] = self.truncate(&digests[1]);
+            }
+
+            return;
+        }
+
+        // ADRSc and 32 bytes of nodes: one block, as for F with an input of 2n bytes.
+        let mut blocks = [[0; LANES]; 16];
+
+        for (lane, (adrs, input)) in adrs.iter().zip(inputs).enumerate() {
+            Self::pack(
+                &mut blocks,
+                lane,
+                adrs,
+                input.unwrap_or([&[0; 16], &[0; 16]]),
+            );
+        }
+
+        let mut digests = [[0; LANES]; 8];
+
+        states.small.finish_words(&mut blocks, &mut digests);
+
+        for (lane, node) in nodes.iter_mut().enumerate() {
+            if inputs[lane].is_some() {
+                for (bytes, state) in node[..16].as_chunks_mut::<4>().0.iter_mut().zip(&digests) {
+                    *bytes = state[lane].to_be_bytes();
+                }
+            }
+        }
     }
 
     // H of two n-byte nodes: one block of SHA-256 or SHA-512 after the seed.
@@ -483,17 +617,22 @@ impl<'a> Hashes<'a> {
                 self.truncate(&digest)
             }
             Some(Sha2States { small, large: None }) => {
-                let mut message = [[0; 64]];
+                // One block, packed in words for the kernel as in f_lanes.
+                let mut blocks = [[0; 1]; 16];
 
-                let length = Self::message(&mut message[0], adrs, &[left, right]);
+                Self::pack(&mut blocks, 0, adrs, [left, right]);
 
-                let mut digests = [[0; 32]; 1];
+                let mut digest = [[0; 1]; 8];
 
-                small.finish_lanes(&mut message, length, &mut digests);
+                small.finish_words(&mut blocks, &mut digest);
 
-                let [digest] = digests;
+                let mut out = [0; 32];
 
-                self.truncate(&digest)
+                for (bytes, word) in out[..16].as_chunks_mut::<4>().0.iter_mut().zip(&digest) {
+                    *bytes = word[0].to_be_bytes();
+                }
+
+                out
             }
         }
     }
@@ -507,6 +646,272 @@ impl<'a> Hashes<'a> {
             }) => self.with_sha512(large, adrs, &[data]),
             Some(Sha2States { small, large: None }) => self.with_sha256(small, adrs, &[data]),
         }
+    }
+}
+
+// A value on a 64-byte boundary, for the Keccak states of SLH-DSA-SHAKE on the stack: the sponges
+// of shake_pairs and the one of Hashes::shake (FLanes is aligned the same way). Unaligned, their
+// place on the stack, which the operating system shifts in every process, made verification take
+// up to 1.4x longer in some processes on AVX-512VL CPUs.
+#[repr(C, align(64))]
+struct Line<T>(T);
+
+// LANES F chains side by side, each lane with its own address and node, stepped together. The
+// nodes stay in the word form of the hash from one step to the next and become bytes only where a
+// value leaves a chain. With SHA-2 a step's input is the digest of the step before, shifted into
+// place in the block, and only the hash address changes in the address words. With SHAKE only the
+// lanes marked live are hashed: through keccak::one_block where the build has its kernel, else
+// with each sponge written as whole lanes, PK.seed, ADRS and the node of the step before.
+// The nodes are secret in key generation and signing: the owner keeps this in its own frame and
+// the buffers that hold them are wiped when it is dropped. Aligned as Line is.
+#[repr(align(64))]
+struct FLanes<'c> {
+    hashes: &'c Hashes<'c>,
+    // SHA-2: ADRSc words 0 to 4 of each lane, the two ADRSc bytes in the high half of word 5, the
+    // node words (the digests) and the block of the next step.
+    words: [[u32; LANES]; 5],
+    high: [u32; LANES],
+    digests: [[u32; LANES]; 8],
+    blocks: [[u32; LANES]; 16],
+    // SHAKE: PK.seed as Keccak lanes, the address of each lane, the nodes in one of two buffers
+    // (side: which one), and the sponges, made on first use and kept for every step: a new Sponges
+    // for each call cost the zeroing and the wipe of all its states. With a one-block kernel a
+    // step reads the nodes from one buffer and writes the next into the other, and there is no
+    // room for sponges: unused, they made the frame of xmss_tree 16 KB instead of 9 KB and cost
+    // about 1% of SLH-DSA-SHAKE key generation on Haswell when its chains ran in FLanes.
+    seed: [u64; 4],
+    adrs: [Adrs; LANES],
+    nodes: [[Node; LANES]; 2],
+    side: usize,
+    sponges: [Option<Sponges>; !keccak::ONE_BLOCK as usize],
+}
+
+impl<'c> FLanes<'c> {
+    fn new(hashes: &'c Hashes<'c>) -> Self {
+        Self {
+            hashes,
+            words: [[0; LANES]; 5],
+            high: [0; LANES],
+            digests: [[0; LANES]; 8],
+            blocks: [[0; LANES]; 16],
+            seed: core::array::from_fn(|i| {
+                hashes
+                    .pk_seed
+                    .as_chunks::<8>()
+                    .0
+                    .get(i)
+                    .map_or(0, |b| u64::from_le_bytes(*b))
+            }),
+            adrs: [[0; 32]; LANES],
+            nodes: [[[0; 32]; LANES]; 2],
+            side: 0,
+            sponges: [const { None }; !keccak::ONE_BLOCK as usize],
+        }
+    }
+
+    fn set_adrs(&mut self, lane: usize, adrs: &Adrs) {
+        if self.hashes.sha2.is_none() {
+            self.adrs[lane] = *adrs;
+
+            return;
+        }
+
+        let adrs_c = Hashes::compressed(adrs);
+
+        for (words, bytes) in self.words.iter_mut().zip(adrs_c.as_chunks::<4>().0) {
+            words[lane] = u32::from_be_bytes(*bytes);
+        }
+
+        self.high[lane] = (u32::from(adrs_c[20]) << 24) | (u32::from(adrs_c[21]) << 16);
+    }
+
+    // The hash address of every lane: its high half ends ADRSc word 4, its low half starts word 5.
+    fn set_hash(&mut self, value: u32) {
+        if self.hashes.sha2.is_none() {
+            for lane in 0..LANES {
+                self.set_lane_hash(lane, value);
+            }
+
+            return;
+        }
+
+        for word in &mut self.words[4] {
+            *word = (*word & 0xFFFF_0000) | (value >> 16);
+        }
+
+        self.high = [value << 16; LANES];
+    }
+
+    fn set_lane_hash(&mut self, lane: usize, value: u32) {
+        if self.hashes.sha2.is_none() {
+            self.adrs[lane][28..].copy_from_slice(&value.to_be_bytes());
+
+            return;
+        }
+
+        self.words[4][lane] = (self.words[4][lane] & 0xFFFF_0000) | (value >> 16);
+
+        self.high[lane] = value << 16;
+    }
+
+    fn load(&mut self, lane: usize, input: &[u8]) {
+        if self.hashes.sha2.is_none() {
+            self.nodes[self.side][lane][..input.len()].copy_from_slice(input);
+
+            return;
+        }
+
+        for (words, bytes) in self.digests.iter_mut().zip(input.as_chunks::<4>().0) {
+            words[lane] = u32::from_be_bytes(*bytes);
+        }
+    }
+
+    fn read(&self, lane: usize, out: &mut [u8]) {
+        if self.hashes.sha2.is_none() {
+            out.copy_from_slice(&self.nodes[self.side][lane][..out.len()]);
+
+            return;
+        }
+
+        for (bytes, words) in out.as_chunks_mut::<4>().0.iter_mut().zip(&self.digests) {
+            *bytes = words[lane].to_be_bytes();
+        }
+    }
+
+    // F of every lane's node under its address, in place; with SHAKE, of the live lanes only. A
+    // lane that is not live has no defined node after the step: the callers load it before use.
+    fn step(&mut self, live: &[bool; LANES]) {
+        let n = self.hashes.n;
+
+        let Some(states) = &self.hashes.sha2 else {
+            return self.step_shake(live);
+        };
+
+        let words = n / 4;
+
+        self.blocks[..5].copy_from_slice(&self.words);
+
+        // ADRSc ends two bytes into word 5, so every node word straddles two block words.
+        let mut carry = self.high;
+
+        for t in 0..words {
+            for (lane, carry) in carry.iter_mut().enumerate() {
+                let word = self.digests[t][lane];
+
+                self.blocks[5 + t][lane] = *carry | (word >> 16);
+
+                *carry = word << 16;
+            }
+        }
+
+        for (block, carry) in self.blocks[5 + words].iter_mut().zip(&carry) {
+            *block = carry | 0x8000;
+        }
+
+        // The low halves of the last node words: secret in key generation and signing.
+        wipe_unless_optimized!(&mut carry);
+
+        for block in &mut self.blocks[6 + words..15] {
+            *block = [0; LANES];
+        }
+
+        self.blocks[15] = [((64 + 22 + n) * 8) as u32; LANES];
+
+        states
+            .small
+            .finish_words(&mut self.blocks, &mut self.digests);
+    }
+
+    // PK.seed, ADRS and the node fill 2n + 32 bytes, whole lanes, which the suffix follows.
+    #[inline(never)]
+    fn step_shake(&mut self, live: &[bool; LANES]) {
+        let Some(slot) = self.sponges.first_mut() else {
+            return self.step_one_block(live);
+        };
+
+        let sponges = slot.get_or_insert_with(Sponges::empty);
+
+        let n = self.hashes.n;
+
+        let words = n / 8;
+
+        let mut active = [0; LANES];
+
+        let mut count = 0;
+
+        for (lane, &live) in live.iter().enumerate() {
+            if live {
+                active[count] = lane;
+
+                count += 1;
+            }
+        }
+
+        for group in active[..count].chunks(keccak::group()) {
+            sponges.start_lanes(136, group.len(), |i, state| {
+                let lane = group[i];
+
+                state[..words].copy_from_slice(&self.seed[..words]);
+
+                let adrs = self.adrs[lane].as_chunks::<8>().0;
+
+                for (word, bytes) in state[words..words + 4].iter_mut().zip(adrs) {
+                    *word = u64::from_le_bytes(*bytes);
+                }
+
+                let node = self.nodes[self.side][lane][..n].as_chunks::<8>().0;
+
+                for (word, bytes) in state[words + 4..].iter_mut().zip(node) {
+                    *word = u64::from_le_bytes(*bytes);
+                }
+
+                state[2 * words + 4] = 0x1F;
+
+                state[16] = 0x80 << 56;
+            });
+
+            sponges.squeeze([true; MAX_SPONGES]);
+
+            for (i, &lane) in group.iter().enumerate() {
+                let node = self.nodes[self.side][lane][..n].as_chunks_mut::<8>().0;
+
+                for (bytes, word) in node.iter_mut().zip(sponges.lanes::<4>(i)) {
+                    *bytes = word.to_le_bytes();
+                }
+            }
+        }
+    }
+
+    // step_shake through Hashes::shake_lanes, which takes keccak::one_block: the nodes of the live
+    // lanes go from one buffer into the other. Carrying the other lanes over and the call through
+    // f_lanes cost about 1% of SLH-DSA-SHAKE key generation on Haswell when its chains ran here.
+    #[inline(always)]
+    fn step_one_block(&mut self, live: &[bool; LANES]) {
+        let n = self.hashes.n;
+
+        let [even, odd] = &mut self.nodes;
+
+        let (from, to) = if self.side == 0 {
+            (&*even, odd)
+        } else {
+            (&*odd, even)
+        };
+
+        let inputs = core::array::from_fn(|lane| live[lane].then(|| &from[lane][..n]));
+
+        self.hashes.shake_lanes(&self.adrs, inputs, to);
+
+        self.side ^= 1;
+    }
+}
+
+impl Drop for FLanes<'_> {
+    fn drop(&mut self) {
+        wipe(self.digests.as_flattened_mut());
+
+        wipe(self.blocks.as_flattened_mut());
+
+        wipe(self.nodes.as_flattened_mut().as_flattened_mut());
     }
 }
 
@@ -531,14 +936,19 @@ impl<'s> TreeHash<'s> {
     }
 
     // combine(height, index, left, right) is the node at that height and index over its children.
-    fn push(
+    fn push(&mut self, index: u32, node: Node, combine: impl Fn(u32, u32, &Node, &Node) -> Node) {
+        self.push_at(0, index, node, combine);
+    }
+
+    // push for a node at a height above the leaves, the root of a subtree built by the caller,
+    // which has recorded the siblings below that height.
+    fn push_at(
         &mut self,
+        mut height: u32,
         mut index: u32,
         mut node: Node,
         combine: impl Fn(u32, u32, &Node, &Node) -> Node,
     ) {
-        let mut height = 0;
-
         loop {
             if let Some((leaf, auth)) = &mut self.target
                 && index == (*leaf >> height) ^ 1
@@ -563,6 +973,13 @@ impl<'s> TreeHash<'s> {
         self.stack[self.size] = (height, node);
 
         self.size += 1;
+    }
+
+    // The sibling at a height below the subtrees given to push_at, on the target leaf's path.
+    fn record(&mut self, height: u32, node: &Node) {
+        if let Some((_, auth)) = &mut self.target {
+            auth[height as usize * self.n..][..self.n].copy_from_slice(&node[..self.n]);
+        }
     }
 
     fn root(&self) -> Node {
@@ -613,6 +1030,10 @@ impl Context<'_> {
         keys: &mut [u8],
         mut signer: Option<(usize, &[u32; MAX_LEN], &mut [u8])>,
     ) {
+        if !(keccak::ONE_BLOCK && self.hashes.sha2.is_none()) {
+            return self.wots_leaves_lanes(adrs, first, leaves, keys, signer);
+        }
+
         let (n, len, count) = (self.p.n, self.p.len(), leaves.len());
 
         // The chain values, secret below the ends: each step reads one buffer and writes the
@@ -701,6 +1122,101 @@ impl Context<'_> {
         }
     }
 
+    // wots_leaves with the chains in FLanes, for SHA-2 and for builds without a one-block kernel.
+    // With SHAKE and the kernel, the loop above around f_lanes keeps the frame of xmss_tree small:
+    // with FLanes in it, key generation took about 2% longer on every x86 class.
+    #[inline(never)]
+    fn wots_leaves_lanes(
+        &self,
+        adrs: &Adrs,
+        first: u32,
+        leaves: &mut [Node],
+        keys: &mut [u8],
+        mut signer: Option<(usize, &[u32; MAX_LEN], &mut [u8])>,
+    ) {
+        let (n, len, count) = (self.p.n, self.p.len(), leaves.len());
+
+        // The chain values, secret below the ends, stay in the lanes from one step to the next.
+        let mut lanes = FLanes::new(&self.hashes);
+
+        for start in (0..count * len).step_by(LANES) {
+            let jobs: [Option<(usize, usize)>; LANES] = core::array::from_fn(|lane| {
+                let job = start + lane;
+
+                (job < count * len).then_some((job % count, job / count))
+            });
+
+            let live = jobs.map(|job| job.is_some());
+
+            let address = |lanes: &mut FLanes, kind: u32| {
+                for (lane, job) in jobs.iter().enumerate() {
+                    let mut lane_adrs = *adrs;
+
+                    set_type(&mut lane_adrs, kind);
+
+                    if let Some((leaf, chain)) = *job {
+                        set_key_pair(&mut lane_adrs, first + leaf as u32);
+
+                        set_chain(&mut lane_adrs, chain as u32);
+                    }
+
+                    lanes.set_adrs(lane, &lane_adrs);
+                }
+            };
+
+            address(&mut lanes, WOTS_PRF);
+
+            for lane in 0..LANES {
+                lanes.load(lane, self.hashes.sk_seed);
+            }
+
+            lanes.step(&live);
+
+            address(&mut lanes, WOTS_HASH);
+
+            for j in 0..W {
+                if let Some((signer_leaf, digits, signature)) = &mut signer {
+                    for (lane, job) in jobs.iter().enumerate() {
+                        if let Some((leaf, chain)) = *job
+                            && leaf == *signer_leaf
+                            && digits[chain] == j
+                        {
+                            lanes.read(lane, &mut signature[chain * n..(chain + 1) * n]);
+                        }
+                    }
+                }
+
+                if j == W - 1 {
+                    break;
+                }
+
+                lanes.set_hash(j);
+
+                lanes.step(&live);
+            }
+
+            for (lane, job) in jobs.iter().enumerate() {
+                if let Some((leaf, chain)) = *job {
+                    lanes.read(lane, &mut keys[(leaf * len + chain) * n..][..n]);
+                }
+            }
+        }
+
+        drop(lanes);
+
+        for (leaf, node) in leaves.iter_mut().enumerate() {
+            let mut pk_adrs = *adrs;
+
+            set_type(&mut pk_adrs, WOTS_PK);
+
+            set_key_pair(&mut pk_adrs, first + leaf as u32);
+
+            *node = self
+                .hashes
+                .t(&pk_adrs, &keys[leaf * len * n..(leaf + 1) * len * n]);
+        }
+    }
+
     // The root of the XMSS tree at adrs (layer and tree set). A signer, (leaf, message,
     // signature), receives the WOTS+ signature of the message by that leaf and its
     // authentication path.
@@ -775,41 +1291,43 @@ impl Context<'_> {
         let mut lanes: [Option<(usize, u32)>; LANES] = [None; LANES];
 
         // The values are public: they start from a signature.
-        let mut outputs = [[0; 32]; LANES];
+        let mut chains = FLanes::new(&self.hashes);
 
         loop {
-            for lane in lanes.iter_mut().filter(|lane| lane.is_none()) {
-                *lane = pending.next().map(|i| (i, starts[i]));
+            for (lane, slot) in lanes.iter_mut().enumerate() {
+                if slot.is_none()
+                    && let Some(i) = pending.next()
+                {
+                    let mut chain_adrs = *adrs;
+
+                    set_chain(&mut chain_adrs, i as u32);
+
+                    set_hash(&mut chain_adrs, starts[i]);
+
+                    chains.set_adrs(lane, &chain_adrs);
+
+                    chains.load(lane, &values[i][..n]);
+
+                    *slot = Some((i, starts[i]));
+                }
             }
 
             if lanes.iter().all(Option::is_none) {
                 return;
             }
 
-            let lane_adrs = lanes.map(|lane| {
-                let mut chain_adrs = *adrs;
+            chains.step(&lanes.map(|lane| lane.is_some()));
 
-                if let Some((i, j)) = lane {
-                    set_chain(&mut chain_adrs, i as u32);
-
-                    set_hash(&mut chain_adrs, j);
-                }
-
-                chain_adrs
-            });
-
-            let inputs = lanes.map(|lane| lane.map(|(i, _)| &values[i][..n]));
-
-            self.hashes.f_lanes(&lane_adrs, inputs, &mut outputs);
-
-            for (lane, output) in lanes.iter_mut().zip(&outputs) {
-                if let Some((i, j)) = lane {
-                    values[*i] = *output;
-
+            for (lane, slot) in lanes.iter_mut().enumerate() {
+                if let Some((i, j)) = slot {
                     *j += 1;
 
                     if *j == W - 1 {
-                        *lane = None;
+                        chains.read(lane, &mut values[*i][..n]);
+
+                        *slot = None;
+                    } else {
+                        chains.set_lane_hash(lane, *j);
                     }
                 }
             }
@@ -985,8 +1503,11 @@ impl Context<'_> {
     }
 
     // Signs the digest with the FORS key at adrs (FORS_TREE type, key pair set) and returns the
-    // FORS public key: each tree is built from its leaves, LANES at a time, revealing the secret
-    // value of the selected leaf and its authentication path.
+    // FORS public key, revealing the secret value of each selected leaf and its authentication
+    // path. Each tree is built in blocks of FORS_BLOCK leaves: the PRF and F of LANES leaves side
+    // by side, then the levels of the block with H side by side (with SHA-256 while a level has
+    // LANES nodes or more, as its lanes cost the same however many are live); the roots of the
+    // blocks go on a treehash.
     fn fors_sign(&self, digest: &[u8], adrs: &Adrs, out: &mut [u8]) -> Node {
         let (n, a) = (self.p.n, self.p.a);
 
@@ -994,8 +1515,15 @@ impl Context<'_> {
 
         let mut roots = [0u8; MAX_K * 32];
 
-        // The FORS secret values, which are wiped at the end, and the leaves over them.
-        let (mut secrets, mut leaves) = ([[0; 32]; LANES], [[0; 32]; LANES]);
+        // The secret values stay in the lanes, which wipe them when dropped; the nodes above them
+        // are public.
+        let mut lanes = FLanes::new(&self.hashes);
+
+        let mut level = [[0; 32]; FORS_BLOCK];
+
+        let block = (1usize << a).min(FORS_BLOCK);
+
+        let block_height = block.trailing_zeros();
 
         let trees = out
             .chunks_exact_mut((a + 1) * n)
@@ -1004,67 +1532,121 @@ impl Context<'_> {
         for (i, (chunk, root)) in trees.enumerate() {
             let (secret, auth) = chunk.split_at_mut(n);
 
-            let selected = indices[i];
+            let selected = indices[i] as usize;
 
             let base = (i << a) as u32;
 
-            let mut tree = TreeHash::new(n, Some((selected, auth)));
+            let node_adrs = |height: u32, index: usize| {
+                let mut node_adrs = *adrs;
 
-            for first in (0..1 << a).step_by(LANES) {
-                let secret_adrs = core::array::from_fn(|lane| {
-                    let mut secret_adrs = *adrs;
+                set_chain(&mut node_adrs, height);
 
-                    set_type(&mut secret_adrs, FORS_PRF);
-
-                    set_key_pair(&mut secret_adrs, key_pair(adrs));
-
-                    set_hash(&mut secret_adrs, base + first + lane as u32);
-
-                    secret_adrs
-                });
-
-                self.hashes.prf_lanes(&secret_adrs, &mut secrets);
-
-                if (first..first + LANES as u32).contains(&selected) {
-                    secret.copy_from_slice(&secrets[(selected - first) as usize][..n]);
-                }
-
-                let leaf_adrs = core::array::from_fn(|lane| {
-                    let mut leaf_adrs = *adrs;
-
-                    set_chain(&mut leaf_adrs, 0);
-
-                    set_hash(&mut leaf_adrs, base + first + lane as u32);
-
-                    leaf_adrs
-                });
-
-                self.hashes.f_lanes(
-                    &leaf_adrs,
-                    core::array::from_fn(|lane| Some(&secrets[lane][..n])),
-                    &mut leaves,
+                set_hash(
+                    &mut node_adrs,
+                    ((i << (a - height as usize)) + index) as u32,
                 );
 
-                for (lane, &leaf) in leaves.iter().enumerate() {
-                    tree.push(first + lane as u32, leaf, |height, index, left, right| {
-                        let mut node_adrs = *adrs;
+                node_adrs
+            };
 
-                        set_chain(&mut node_adrs, height);
+            let mut tree = TreeHash::new(n, Some((selected as u32, auth)));
 
-                        set_hash(
-                            &mut node_adrs,
-                            ((i << (a - height as usize)) as u32) + index,
-                        );
+            for start in (0..1 << a).step_by(block) {
+                for first in (start..start + block).step_by(LANES) {
+                    for lane in 0..LANES {
+                        let mut secret_adrs = *adrs;
 
-                        self.hashes.h(&node_adrs, &left[..n], &right[..n])
-                    });
+                        set_type(&mut secret_adrs, FORS_PRF);
+
+                        set_key_pair(&mut secret_adrs, key_pair(adrs));
+
+                        set_hash(&mut secret_adrs, base + (first + lane) as u32);
+
+                        lanes.set_adrs(lane, &secret_adrs);
+
+                        lanes.load(lane, self.hashes.sk_seed);
+                    }
+
+                    lanes.step(&[true; LANES]);
+
+                    if (first..first + LANES).contains(&selected) {
+                        lanes.read(selected - first, secret);
+                    }
+
+                    for lane in 0..LANES {
+                        lanes.set_adrs(lane, &node_adrs(0, first + lane));
+                    }
+
+                    lanes.step(&[true; LANES]);
+
+                    for lane in 0..LANES {
+                        lanes.read(lane, &mut level[first - start + lane][..n]);
+                    }
                 }
+
+                let mut count = block;
+
+                for height in 0..block_height {
+                    if (start..start + block).contains(&selected) {
+                        tree.record(height, &level[((selected - start) >> height) ^ 1]);
+                    }
+
+                    count /= 2;
+
+                    let offset = start >> (height + 1);
+
+                    // SHA-256 in lanes costs LANES hashes however many are live.
+                    let small = matches!(self.hashes.sha2, Some(Sha2States { large: None, .. }));
+
+                    if count < LANES && small {
+                        for j in 0..count {
+                            level[j] = self.hashes.h(
+                                &node_adrs(height + 1, offset + j),
+                                &level[2 * j][..n],
+                                &level[2 * j + 1][..n],
+                            );
+                        }
+
+                        continue;
+                    }
+
+                    for first in (0..count).step_by(LANES) {
+                        let live = first..count.min(first + LANES);
+
+                        let lane_adrs = core::array::from_fn(|lane| {
+                            node_adrs(height + 1, offset + first + lane)
+                        });
+
+                        let inputs = core::array::from_fn(|lane| {
+                            let j = first + lane;
+
+                            live.contains(&j)
+                                .then(|| [&level[2 * j][..n], &level[2 * j + 1][..n]])
+                        });
+
+                        let mut outputs = [[0; 32]; LANES];
+
+                        self.hashes.h_lanes(&lane_adrs, inputs, &mut outputs);
+
+                        level[live.clone()].copy_from_slice(&outputs[..live.len()]);
+                    }
+                }
+
+                tree.push_at(
+                    block_height,
+                    (start >> block_height) as u32,
+                    level[0],
+                    |height, index, left, right| {
+                        self.hashes
+                            .h(&node_adrs(height, index as usize), &left[..n], &right[..n])
+                    },
+                );
             }
 
             root.copy_from_slice(&tree.root()[..n]);
         }
 
-        wipe(secrets.as_flattened_mut());
+        drop(lanes);
 
         self.fors_public_key(adrs, &roots[..self.p.k * n])
     }
@@ -1103,16 +1685,57 @@ impl Context<'_> {
             }
         }
 
+        // The k climbs run side by side, one H per tree at each height (FIPS 205, Algorithm 17):
+        // the parent of the node at tree index t is at t / 2 one height up.
+        for first in (0..k).step_by(LANES) {
+            let trees = first..k.min(first + LANES);
+
+            for height in 0..a {
+                let lane_adrs = core::array::from_fn(|lane| {
+                    let mut node_adrs = *adrs;
+
+                    if trees.contains(&(first + lane)) {
+                        let i = first + lane;
+
+                        set_chain(&mut node_adrs, height as u32 + 1);
+
+                        set_hash(
+                            &mut node_adrs,
+                            (((i << a) as u32) + indices[i]) >> (height + 1),
+                        );
+                    }
+
+                    node_adrs
+                });
+
+                let inputs = core::array::from_fn(|lane| {
+                    let i = first + lane;
+
+                    trees.contains(&i).then(|| {
+                        let sibling = &chunks[i][n * (height + 1)..][..n];
+
+                        if (indices[i] >> height) & 1 == 0 {
+                            [&leaves[i][..n], sibling]
+                        } else {
+                            [sibling, &leaves[i][..n]]
+                        }
+                    })
+                });
+
+                let mut outputs = [[0; 32]; LANES];
+
+                self.hashes.h_lanes(&lane_adrs, inputs, &mut outputs);
+
+                for (leaf, output) in leaves[trees.clone()].iter_mut().zip(&outputs) {
+                    *leaf = *output;
+                }
+            }
+        }
+
         let mut roots = [0u8; MAX_K * 32];
 
-        let trees = chunks.iter().zip(&indices).zip(roots.chunks_exact_mut(n));
-
-        for (i, ((chunk, &index), root)) in trees.enumerate() {
-            set_chain(adrs, 0);
-
-            set_hash(adrs, ((i << a) as u32) + index);
-
-            root.copy_from_slice(&self.climb(leaves[i], index, &chunk[n..], adrs)[..n]);
+        for (root, leaf) in roots.chunks_exact_mut(n).zip(&leaves[..k]) {
+            root.copy_from_slice(&leaf[..n]);
         }
 
         self.fors_public_key(adrs, &roots[..k * n])
