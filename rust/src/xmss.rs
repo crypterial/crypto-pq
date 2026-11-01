@@ -294,9 +294,12 @@ impl<'a> Hashes<'a> {
 
         let mut digests = [[0; 32]; L];
 
-        state
-            .unwrap_or(&Sha256::new(&IV_256))
-            .finish_lanes(messages, length, &mut digests);
+        state.unwrap_or(&Sha256::new(&IV_256)).finish_lanes(
+            messages,
+            length,
+            &mut digests,
+            &active,
+        );
 
         for (node, digest) in nodes.iter_mut().zip(&digests) {
             node[..n].copy_from_slice(&digest[..n]);

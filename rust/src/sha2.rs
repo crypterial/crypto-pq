@@ -375,7 +375,7 @@ pub(crate) fn compress256_pair(states: &mut [[u32; 8]; 2], blocks: &[[u8; 64]; 2
         ]
     });
 
-    compress256_lanes(&mut lanes, &mut w);
+    compress256_lanes(&mut lanes, &mut w, &[true; 2]);
 
     for (i, lane) in lanes.iter().enumerate() {
         states[0][i] = lane[0];
@@ -702,6 +702,12 @@ fn compress256_block(state: &mut [u32; 8], block: &[u8; 64], w: &mut [u32; 16], 
         *word = u32::from_be_bytes(*bytes);
     }
 
+    compress256_words(state, w, v);
+}
+
+// compress256_block for a block already in w, which the schedule overwrites.
+#[inline(always)]
+fn compress256_words(state: &mut [u32; 8], w: &mut [u32; 16], v: &mut [u32; 8]) {
     *v = *state;
 
     rounds256::<0>(v, w);
@@ -765,15 +771,70 @@ fn round256_lanes<const LANES: usize>(
     }
 }
 
+// Whether the target has vector registers by default, which take the lanes of
+// compress256_lanes_portable. Without them each of its words is a load or a store, and the lanes
+// run one after the other in registers instead.
+const LANE_VECTORS: bool = cfg!(any(
+    target_feature = "sse2",
+    target_feature = "neon",
+    target_feature = "simd128",
+    target_feature = "v"
+));
+
 // The states and the blocks are word-major: states[i][lane] is word i of the state of that lane.
-// The schedule may overwrite the blocks.
+// The schedule may overwrite the blocks. The lanes that are not live may be left as they are,
+// which the lanes run one after the other do; whether a lane is live must be public.
 fn compress256_lanes<const LANES: usize>(
     states: &mut [Lanes<LANES>; 8],
     w: &mut [Lanes<LANES>; 16],
+    live: &[bool; LANES],
 ) {
-    if !cpu::compress256_lanes(states, w) {
-        compress256_lanes_portable(states, w);
+    if cpu::compress256_lanes(states, w) {
+        return;
     }
+
+    if LANE_VECTORS {
+        compress256_lanes_portable(states, w);
+    } else {
+        compress256_lanes_each(states, w, live);
+    }
+}
+
+// Each live lane on its own: its state and block are taken out of the word-major arrays into
+// arrays that the rounds index only with constants, so that they stay in registers at opt-level
+// 3, and are wiped once at the end below it (D-76).
+fn compress256_lanes_each<const LANES: usize>(
+    states: &mut [Lanes<LANES>; 8],
+    w: &[Lanes<LANES>; 16],
+    live: &[bool; LANES],
+) {
+    let mut state = [0; 8];
+
+    let mut block = [0; 16];
+
+    let mut v = [0; 8];
+
+    for lane in (0..LANES).filter(|&lane| live[lane]) {
+        for (word, words) in state.iter_mut().zip(&*states) {
+            *word = words[lane];
+        }
+
+        for (word, words) in block.iter_mut().zip(w) {
+            *word = words[lane];
+        }
+
+        compress256_words(&mut state, &mut block, &mut v);
+
+        for (words, word) in states.iter_mut().zip(&state) {
+            words[lane] = *word;
+        }
+    }
+
+    wipe_unless_optimized!(&mut state);
+
+    wipe_unless_optimized!(&mut block);
+
+    wipe_unless_optimized!(&mut v);
 }
 
 // Always inlined, so that a caller built for wider vectors (x86-64 AVX2) vectorizes it for them.
@@ -1124,6 +1185,7 @@ impl Sha256 {
         &self,
         blocks: &mut [[u32; LANES]; 16],
         states: &mut [[u32; LANES]; 8],
+        live: &[bool; LANES],
     ) {
         assert_eq!(
             self.blocks.len, 0,
@@ -1134,17 +1196,19 @@ impl Sha256 {
             *lanes = [word; LANES];
         }
 
-        compress256_lanes(states, blocks);
+        compress256_lanes(states, blocks, live);
     }
 
     // The digests of LANES messages of `length` bytes, each appended to the input so far, which
     // must fill whole blocks. Hashes that share a prefix, such as a public seed, pay for it once
-    // and run side by side. The message buffers receive the padding and are wiped.
+    // and run side by side. The message buffers receive the padding and are wiped. The digests
+    // of the lanes that are not live (public) are undefined.
     pub(crate) fn finish_lanes<const LANES: usize, const SIZE: usize>(
         &self,
         messages: &mut [[u8; SIZE]; LANES],
         length: usize,
         digests: &mut [[u8; 32]; LANES],
+        live: &[bool; LANES],
     ) {
         assert_eq!(
             self.blocks.len, 0,
@@ -1176,7 +1240,7 @@ impl Sha256 {
                 }
             }
 
-            compress256_lanes(&mut states, &mut words);
+            compress256_lanes(&mut states, &mut words, live);
         }
 
         for (lane, digest) in digests.iter_mut().enumerate() {
@@ -1450,6 +1514,31 @@ mod tests {
             let mut expected = states;
 
             compress256_lanes_portable(&mut expected, &mut w.clone());
+
+            let mut each = states;
+
+            compress256_lanes_each(&mut each, &w, &[true; LANES]);
+
+            assert_eq!(each, expected, "{LANES} lanes one by one, case {n}");
+
+            // Every other lane live, from the first or the second: the others keep their states.
+            let live: [bool; LANES] = core::array::from_fn(|lane| (lane + n) % 2 == 0);
+
+            let mut some = states;
+
+            compress256_lanes_each(&mut some, &w, &live);
+
+            for (i, words) in some.iter().enumerate() {
+                for (lane, &word) in words.iter().enumerate() {
+                    let want = if live[lane] {
+                        expected[i][lane]
+                    } else {
+                        states[i][lane]
+                    };
+
+                    assert_eq!(word, want, "{LANES} lanes, lane {lane} live {}", live[lane]);
+                }
+            }
 
             let mut actual = states;
 
