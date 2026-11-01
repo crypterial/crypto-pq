@@ -662,7 +662,7 @@ fn sample_ntt(
 
         for (i, (a, count)) in out.iter_mut().zip(&mut counts).enumerate() {
             if *count < 256 {
-                sample_uniform(sponges.lanes(i), a, count);
+                sample_uniform(&sponges.lanes(i), a, count);
             }
         }
     }
@@ -688,7 +688,7 @@ fn sample_noise(sponges: &mut Sponges, eta: usize, seed: &[u8], first: usize, ou
         if eta == 2 {
             // 128 bytes, inside the first block.
             for (i, f) in group.iter_mut().enumerate() {
-                binomial(eta, sponges.lanes::<16>(i), f);
+                binomial(eta, &*sponges.lanes::<16>(i), f);
             }
 
             continue;
@@ -698,13 +698,13 @@ fn sample_noise(sponges: &mut Sponges, eta: usize, seed: &[u8], first: usize, ou
         let mut lanes = [[0u64; 24]; MAX_SPONGES];
 
         for (i, lanes) in lanes[..group.len()].iter_mut().enumerate() {
-            lanes[..17].copy_from_slice(sponges.lanes::<17>(i));
+            lanes[..17].copy_from_slice(&*sponges.lanes::<17>(i));
         }
 
         sponges.squeeze([true; MAX_SPONGES]);
 
         for (i, (f, lanes)) in group.iter_mut().zip(&mut lanes).enumerate() {
-            lanes[17..].copy_from_slice(sponges.lanes::<7>(i));
+            lanes[17..].copy_from_slice(&*sponges.lanes::<7>(i));
 
             binomial(eta, lanes, f);
         }
@@ -749,10 +749,10 @@ fn encryption_noise(
     let mut lanes = [[0u64; 24]; 2];
 
     for (i, lanes) in lanes[..k].iter_mut().enumerate() {
-        lanes[..17].copy_from_slice(sponges.lanes::<17>(i));
+        lanes[..17].copy_from_slice(&*sponges.lanes::<17>(i));
     }
 
-    binomial(p.eta2, sponges.lanes::<16>(k), &mut e[0]);
+    binomial(p.eta2, &*sponges.lanes::<16>(k), &mut e[0]);
 
     let mut words = [0u64; 16];
 
@@ -771,7 +771,7 @@ fn encryption_noise(
     last.finish_with(|state| sponges.squeeze_beside(active, state));
 
     for (i, (f, lanes)) in y.iter_mut().zip(&mut lanes).enumerate() {
-        lanes[17..].copy_from_slice(sponges.lanes::<7>(i));
+        lanes[17..].copy_from_slice(&*sponges.lanes::<7>(i));
 
         binomial(p.eta1, lanes, f);
     }

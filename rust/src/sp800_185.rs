@@ -89,7 +89,7 @@ pub(crate) fn prefix(rate: usize, name: &[u8], customization: &[u8]) -> Option<[
         let mut state = [0; 25];
 
         for (lane, bytes) in state.iter_mut().zip(block.as_chunks::<8>().0) {
-            *lane = u64::from_le_bytes(*bytes);
+            *lane = keccak::to_lane(u64::from_le_bytes(*bytes));
         }
 
         keccak::permute_one(&mut state);
@@ -113,7 +113,8 @@ pub(crate) fn prefix(rate: usize, name: &[u8], customization: &[u8]) -> Option<[
 }
 
 // prefix(rate, "KMAC", "") at compile time: left_encode(rate), encode_string("KMAC") and
-// encode_string(""), one block.
+// encode_string(""), one block, permuted with lanes as the specification has them and then
+// stored as the state holds them.
 pub(crate) const fn kmac_prefix(rate: usize) -> [u64; 25] {
     let bytes = [1, rate as u8, 1, 32, b'K', b'M', b'A', b'C', 1, 0];
 
@@ -128,6 +129,14 @@ pub(crate) const fn kmac_prefix(rate: usize) -> [u64; 25] {
     }
 
     permute_const(&mut state);
+
+    i = 0;
+
+    while i < 25 {
+        state[i] = keccak::to_lane(state[i]);
+
+        i += 1;
+    }
 
     state
 }
