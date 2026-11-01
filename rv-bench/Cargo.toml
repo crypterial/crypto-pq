@@ -1,0 +1,26 @@
+[package]
+name = "rv-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+crypto-pq = { path = "../rust", features = ["hazmat"] }
+aws-lc-rs = "=1.19.0"
+ring = "=0.17.14"
+sha2 = "=0.11.1"
+hmac = "=0.13.0"
+hkdf = "=0.13.0"
+libcrux-sha2 = "=0.0.9"
+libcrux-hmac = "=0.0.9"
+libcrux-hkdf = "=0.0.9"
+hbs-lms = "=0.2.0-alpha.1"
+lms-signature = "=0.1.0-rc.2"
+xmss = "=0.1.0-pre.0"
+getrandom = { version = "=0.4.3", features = ["sys_rng"] }
+signature = "=3.0.0"
+
+[profile.release]
+codegen-units = 1
+
+[workspace]

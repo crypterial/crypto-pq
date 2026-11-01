@@ -1,0 +1,670 @@
+use std::hint::black_box;
+use std::time::{Duration, Instant};
+
+use crypto_pq::{
+    ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_512, BLAKE2B_MAC, BLAKE2S_256, BLAKE2S_MAC,
+    BLAKE3, BLAKE3_256, BLAKE3_KDF, BLAKE3_MAC, CSHAKE128, CSHAKE256, Error, HKDF_SHA_256,
+    HKDF_SHA_384, HKDF_SHA_512, HMAC_SHA_256, HSS_LMS, HashAlgorithm, KMAC128, KMAC256,
+    KdfAlgorithm, KdfOptions, KemAlgorithm, ML_DSA_44, ML_DSA_65, ML_DSA_87, ML_KEM_512,
+    ML_KEM_768, ML_KEM_1024, MacAlgorithm, MacOptions, SHA_256, SHA_512, SHA3_256, SHAKE128,
+    SHAKE256, SLH_DSA_SHA2_128F, SLH_DSA_SHA2_128S, SLH_DSA_SHA2_192F, SLH_DSA_SHA2_192S,
+    SLH_DSA_SHA2_256F, SLH_DSA_SHA2_256S, SLH_DSA_SHAKE_128F, SLH_DSA_SHAKE_128S,
+    SLH_DSA_SHAKE_192F, SLH_DSA_SHAKE_192S, SLH_DSA_SHAKE_256F, SLH_DSA_SHAKE_256S, SignOptions,
+    SignatureAlgorithm, StateStore, StatefulKeyGenOptions, StatefulLoadOptions, StatefulParameters,
+    StatefulPrivateKey, StatefulSignatureAlgorithm, VerifyOptions, XMSS, XMSS_MT, XofAlgorithm,
+    XofOptions, hazmat,
+};
+
+const MIN_TIME: Duration = Duration::from_secs(1);
+
+// ML-DSA signing loops a message-dependent number of times, so its cases rotate through these.
+const MESSAGES: usize = 16;
+
+const SLH_DSA: [SignatureAlgorithm; 12] = [
+    SLH_DSA_SHA2_128S,
+    SLH_DSA_SHA2_128F,
+    SLH_DSA_SHA2_192S,
+    SLH_DSA_SHA2_192F,
+    SLH_DSA_SHA2_256S,
+    SLH_DSA_SHA2_256F,
+    SLH_DSA_SHAKE_128S,
+    SLH_DSA_SHAKE_128F,
+    SLH_DSA_SHAKE_192S,
+    SLH_DSA_SHAKE_192F,
+    SLH_DSA_SHAKE_256S,
+    SLH_DSA_SHAKE_256F,
+];
+
+#[derive(Default)]
+struct MemoryStore(Option<Vec<u8>>);
+
+impl StateStore for MemoryStore {
+    fn read(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.0.clone())
+    }
+
+    fn update(&mut self, previous: Option<&[u8]>, next: &[u8]) -> Result<bool, Error> {
+        if self.0.as_deref() != previous {
+            return Ok(false);
+        }
+
+        self.0 = Some(next.to_vec());
+
+        Ok(true)
+    }
+}
+
+struct Runner {
+    filter: Option<String>,
+}
+
+impl Runner {
+    fn selects(&self, name: &str) -> bool {
+        self.filter
+            .as_ref()
+            .is_none_or(|filter| name.contains(filter.as_str()))
+    }
+
+    // batch(count) runs the operation count times and returns the time to count. The batches
+    // grow until MIN_TIME is reached, so a slow case still runs once.
+    fn case(&self, name: &str, mut batch: impl FnMut(u64) -> Duration) {
+        if !self.selects(name) {
+            return;
+        }
+
+        let mut iterations = 0;
+
+        let mut elapsed = Duration::ZERO;
+
+        let mut count = 1;
+
+        while elapsed < MIN_TIME {
+            elapsed += batch(count);
+
+            iterations += count;
+
+            let per_operation = elapsed.as_secs_f64() / iterations as f64;
+
+            let remaining = MIN_TIME.saturating_sub(elapsed).as_secs_f64();
+
+            count = ((remaining / per_operation).ceil() as u64).clamp(1, 10 * iterations);
+        }
+
+        let micros = elapsed.as_secs_f64() * 1e6 / iterations as f64;
+
+        println!("{name:<32}  {iterations:>9}  {micros:>14.3}");
+    }
+}
+
+fn timed(count: u64, mut operation: impl FnMut()) -> Duration {
+    let start = Instant::now();
+
+    for _ in 0..count {
+        operation();
+    }
+
+    start.elapsed()
+}
+
+fn bytes(length: usize) -> Vec<u8> {
+    (0..length).map(|i| i as u8).collect()
+}
+
+fn messages() -> Vec<Vec<u8>> {
+    (0..MESSAGES)
+        .map(|i| format!("crypto-pq benchmark message {i}").into_bytes())
+        .collect()
+}
+
+fn names(algorithm: &str, operations: [&str; 3]) -> [String; 3] {
+    operations.map(|operation| format!("{algorithm}/{operation}"))
+}
+
+fn hashes(runner: &Runner) {
+    let data = bytes(1024);
+
+    runner.case("sha-256/64B", |count| {
+        let mut out = [0; 32];
+
+        timed(count, || {
+            SHA_256
+                .digest_into(black_box(&data[..64]), &mut out)
+                .unwrap();
+
+            black_box(&out);
+        })
+    });
+
+    runner.case("sha-256/1KiB", |count| {
+        let mut out = [0; 32];
+
+        timed(count, || {
+            SHA_256.digest_into(black_box(&data), &mut out).unwrap();
+
+            black_box(&out);
+        })
+    });
+
+    runner.case("sha-512/1KiB", |count| {
+        let mut out = [0; 64];
+
+        timed(count, || {
+            SHA_512.digest_into(black_box(&data), &mut out).unwrap();
+
+            black_box(&out);
+        })
+    });
+
+    runner.case("sha3-256/1KiB", |count| {
+        let mut out = [0; 32];
+
+        timed(count, || {
+            SHA3_256.digest_into(black_box(&data), &mut out).unwrap();
+
+            black_box(&out);
+        })
+    });
+
+    runner.case("shake128/1KiB", |count| {
+        let mut out = [0; 32];
+
+        timed(count, || {
+            SHAKE128.digest_into(black_box(&data), &mut out).unwrap();
+
+            black_box(&out);
+        })
+    });
+
+    runner.case("shake256/1KiB", |count| {
+        let mut out = [0; 64];
+
+        timed(count, || {
+            SHAKE256.digest_into(black_box(&data), &mut out).unwrap();
+
+            black_box(&out);
+        })
+    });
+
+    for (name, algorithm) in [
+        ("blake2b-512", BLAKE2B_512),
+        ("blake2s-256", BLAKE2S_256),
+        ("ascon-hash256", ASCON_HASH256),
+    ] {
+        for (size, suffix) in [(64, "64B"), (1024, "1KiB")] {
+            hash(
+                runner,
+                &format!("{name}/{suffix}"),
+                algorithm,
+                &data[..size],
+            );
+        }
+    }
+
+    // BLAKE3 over one block, one chunk, sixteen chunks and as an XOF of sixteen output blocks.
+    let wide = bytes(16384);
+
+    for (name, input) in [
+        ("blake3-256/64B", &data[..64]),
+        ("blake3-256/1KiB", &data[..]),
+        ("blake3-256/16KiB", &wide[..]),
+    ] {
+        hash(runner, name, BLAKE3_256, input);
+    }
+
+    xof(runner, "blake3/1KiB", BLAKE3, &data, 1024);
+
+    let options = XofOptions::default().with_customization(b"crypto-pq benchmark");
+
+    for (name, algorithm, size) in [
+        ("cshake128/1KiB", CSHAKE128.configure(&options).unwrap(), 32),
+        ("cshake256/1KiB", CSHAKE256.configure(&options).unwrap(), 64),
+        ("ascon-xof128/1KiB", ASCON_XOF128, 32),
+        (
+            "ascon-cxof128/1KiB",
+            ASCON_CXOF128.configure(&options).unwrap(),
+            32,
+        ),
+    ] {
+        xof(runner, name, algorithm, &data, size);
+    }
+}
+
+fn hash(runner: &Runner, name: &str, algorithm: HashAlgorithm, data: &[u8]) {
+    runner.case(name, |count| {
+        let mut out = vec![0; algorithm.digest_size()];
+
+        timed(count, || {
+            algorithm.digest_into(black_box(data), &mut out).unwrap();
+
+            black_box(&out);
+        })
+    });
+}
+
+fn xof(runner: &Runner, name: &str, algorithm: XofAlgorithm, data: &[u8], size: usize) {
+    runner.case(name, |count| {
+        let mut out = vec![0; size];
+
+        timed(count, || {
+            algorithm.digest_into(black_box(data), &mut out).unwrap();
+
+            black_box(&out);
+        })
+    });
+}
+
+// MACs under a 32-byte key; KMAC with a customization string.
+fn macs(runner: &Runner) {
+    let data = bytes(1024);
+
+    let key = bytes(32);
+
+    let options = MacOptions::default().with_customization(b"crypto-pq benchmark");
+
+    for (name, algorithm) in [
+        ("hmac-sha-256", HMAC_SHA_256),
+        ("kmac128", KMAC128.configure(&options).unwrap()),
+        ("kmac256", KMAC256.configure(&options).unwrap()),
+        ("blake2b-mac", BLAKE2B_MAC),
+        ("blake2s-mac", BLAKE2S_MAC),
+        ("blake3-mac", BLAKE3_MAC),
+    ] {
+        for (size, suffix) in [(64, "64B"), (1024, "1KiB")] {
+            mac(
+                runner,
+                &format!("{name}/{suffix}"),
+                algorithm,
+                &key,
+                &data[..size],
+            );
+        }
+    }
+}
+
+fn mac(runner: &Runner, name: &str, algorithm: MacAlgorithm, key: &[u8], data: &[u8]) {
+    runner.case(name, |count| {
+        let mut out = vec![0; algorithm.digest_size()];
+
+        timed(count, || {
+            algorithm
+                .digest_into(black_box(key), black_box(data), &mut out)
+                .unwrap();
+
+            black_box(&out);
+        })
+    });
+}
+
+// HKDF derive with a 32-byte IKM, a 32-byte salt and a 16-byte info.
+fn kdfs(runner: &Runner) {
+    let ikm = bytes(32);
+
+    let salt = bytes(32);
+
+    let options = KdfOptions::default()
+        .with_salt(&salt)
+        .with_info(b"crypto-pq hkdf 1");
+
+    for (name, algorithm) in [
+        ("hkdf-sha-256", HKDF_SHA_256),
+        ("hkdf-sha-384", HKDF_SHA_384),
+        ("hkdf-sha-512", HKDF_SHA_512),
+    ] {
+        for size in [32, 64, 128] {
+            kdf(
+                runner,
+                &format!("{name}/{size}B"),
+                algorithm,
+                &ikm,
+                size,
+                &options,
+            );
+        }
+    }
+
+    // BLAKE3-KDF takes the context string as its info and no salt.
+    let context = KdfOptions::default().with_info(b"crypto-pq benchmark 2026-10-25 key derivation");
+
+    for size in [32, 64] {
+        kdf(
+            runner,
+            &format!("blake3-kdf/{size}B"),
+            BLAKE3_KDF,
+            &ikm,
+            size,
+            &context,
+        );
+    }
+}
+
+fn kdf(
+    runner: &Runner,
+    name: &str,
+    algorithm: KdfAlgorithm,
+    ikm: &[u8],
+    size: usize,
+    options: &KdfOptions,
+) {
+    runner.case(name, |count| {
+        let mut out = vec![0; size];
+
+        timed(count, || {
+            algorithm
+                .derive_into(black_box(ikm), &mut out, options)
+                .unwrap();
+
+            black_box(&out);
+        })
+    });
+}
+
+fn kem(runner: &Runner, algorithm: KemAlgorithm, seed_size: usize, randomness_size: usize) {
+    let [keygen, encaps, decaps] = names(algorithm.name(), ["keygen", "encaps", "decaps"]);
+
+    let seed = bytes(seed_size);
+
+    runner.case(&keygen, |count| {
+        timed(count, || {
+            black_box(hazmat::generate_kem_key_pair(algorithm, black_box(&seed)).unwrap());
+        })
+    });
+
+    if !runner.selects(&encaps) && !runner.selects(&decaps) {
+        return;
+    }
+
+    let pair = hazmat::generate_kem_key_pair(algorithm, &seed).unwrap();
+
+    let randomness = bytes(randomness_size);
+
+    runner.case(&encaps, |count| {
+        timed(count, || {
+            black_box(hazmat::encapsulate(&pair.public_key, black_box(&randomness)).unwrap());
+        })
+    });
+
+    let ciphertext = hazmat::encapsulate(&pair.public_key, &randomness)
+        .unwrap()
+        .ciphertext;
+
+    runner.case(&decaps, |count| {
+        timed(count, || {
+            black_box(
+                pair.private_key
+                    .decapsulate(black_box(&ciphertext))
+                    .unwrap(),
+            );
+        })
+    });
+}
+
+// SLH-DSA signing costs the same for every message, so its cases use one message; ML-DSA rotates.
+fn signature(runner: &Runner, algorithm: SignatureAlgorithm, seed_size: usize, rotate: bool) {
+    let [keygen, sign, verify] = names(algorithm.name(), ["keygen", "sign", "verify"]);
+
+    let seed = bytes(seed_size);
+
+    runner.case(&keygen, |count| {
+        timed(count, || {
+            black_box(hazmat::generate_signature_key_pair(algorithm, black_box(&seed)).unwrap());
+        })
+    });
+
+    if !runner.selects(&sign) && !runner.selects(&verify) {
+        return;
+    }
+
+    let pair = hazmat::generate_signature_key_pair(algorithm, &seed).unwrap();
+
+    let mut messages = messages();
+
+    if !rotate {
+        messages.truncate(1);
+    }
+
+    let options = SignOptions::default().with_deterministic(true);
+
+    let mut next = 0;
+
+    runner.case(&sign, |count| {
+        timed(count, || {
+            let message = &messages[next % messages.len()];
+
+            next += 1;
+
+            black_box(pair.private_key.sign(black_box(message), &options).unwrap());
+        })
+    });
+
+    if !runner.selects(&verify) {
+        return;
+    }
+
+    let signed: Vec<(&Vec<u8>, Vec<u8>)> = messages
+        .iter()
+        .map(|message| (message, pair.private_key.sign(message, &options).unwrap()))
+        .collect();
+
+    let options = VerifyOptions::default();
+
+    let mut next = 0;
+
+    runner.case(&verify, |count| {
+        timed(count, || {
+            let (message, signature) = &signed[next % signed.len()];
+
+            next += 1;
+
+            assert!(
+                pair.public_key
+                    .verify(black_box(signature), message, &options)
+            );
+        })
+    });
+}
+
+fn stateful(
+    runner: &Runner,
+    name: &str,
+    algorithm: StatefulSignatureAlgorithm,
+    parameters: StatefulParameters,
+    seed_size: usize,
+) {
+    let [keygen, sign, verify] = names(name, ["keygen", "sign", "verify"]);
+
+    let seed = bytes(seed_size);
+
+    let generate = || {
+        hazmat::generate_stateful_key_pair(
+            algorithm,
+            &seed,
+            0,
+            parameters,
+            MemoryStore::default(),
+            &StatefulKeyGenOptions::default(),
+        )
+        .unwrap()
+    };
+
+    runner.case(&keygen, |count| {
+        timed(count, || {
+            black_box(generate());
+        })
+    });
+
+    let messages = messages();
+
+    let mut key: Option<StatefulPrivateKey<MemoryStore>> = None;
+
+    let mut next = 0;
+
+    // An exhausted key is replaced outside the measured time.
+    runner.case(&sign, |count| {
+        let mut elapsed = Duration::ZERO;
+
+        for _ in 0..count {
+            if key
+                .as_ref()
+                .is_none_or(|key| key.remaining_signatures() == 0)
+            {
+                key = Some(generate().private_key);
+            }
+
+            let key = key.as_mut().unwrap();
+
+            let message = &messages[next % MESSAGES];
+
+            next += 1;
+
+            let start = Instant::now();
+
+            black_box(key.sign(black_box(message)).unwrap());
+
+            elapsed += start.elapsed();
+        }
+
+        elapsed
+    });
+
+    if !runner.selects(&verify) {
+        return;
+    }
+
+    let mut pair = generate();
+
+    let signed: Vec<(&Vec<u8>, Vec<u8>)> = messages
+        .iter()
+        .map(|message| (message, pair.private_key.sign(message).unwrap()))
+        .collect();
+
+    let mut next = 0;
+
+    runner.case(&verify, |count| {
+        timed(count, || {
+            let (message, signature) = &signed[next % MESSAGES];
+
+            next += 1;
+
+            assert!(pair.public_key.verify(black_box(signature), message));
+        })
+    });
+}
+
+// Loading a key builds its trees from the leaves; with a tree cache it recomputes the parents of
+// the cached nodes instead.
+fn load(
+    runner: &Runner,
+    name: &str,
+    algorithm: StatefulSignatureAlgorithm,
+    parameters: StatefulParameters,
+    seed_size: usize,
+) {
+    let (plain, cached) = (format!("{name}/load"), format!("{name}/load+cache"));
+
+    if !runner.selects(&plain) && !runner.selects(&cached) {
+        return;
+    }
+
+    let mut store = MemoryStore::default();
+
+    let cache = hazmat::generate_stateful_key_pair(
+        algorithm,
+        &bytes(seed_size),
+        0,
+        parameters,
+        &mut store,
+        &StatefulKeyGenOptions::default(),
+    )
+    .and_then(|pair| pair.private_key.export_tree_cache())
+    .unwrap();
+
+    for (name, tree_cache) in [(plain, &[][..]), (cached, &cache[..])] {
+        let options = StatefulLoadOptions::default().with_tree_cache(tree_cache);
+
+        runner.case(&name, |count| {
+            timed(count, || {
+                black_box(algorithm.load_private_key(&mut store, &options).unwrap());
+            })
+        });
+    }
+}
+
+fn main() {
+    let runner = Runner {
+        filter: std::env::args().skip(1).find(|arg| !arg.starts_with("--")),
+    };
+
+    hashes(&runner);
+
+    macs(&runner);
+
+    kdfs(&runner);
+
+    for algorithm in [ML_KEM_512, ML_KEM_768, ML_KEM_1024] {
+        kem(&runner, algorithm, 64, 32);
+    }
+
+    for algorithm in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
+        signature(&runner, algorithm, 32, true);
+    }
+
+    for algorithm in SLH_DSA {
+        let n = algorithm.public_key_size() / 2;
+
+        signature(&runner, algorithm, 3 * n, false);
+    }
+
+    stateful(
+        &runner,
+        "HSS-H10-W4",
+        HSS_LMS,
+        StatefulParameters::Levels(&[("LMS_SHA256_M32_H10", "LMOTS_SHA256_N32_W4")]),
+        48,
+    );
+
+    stateful(
+        &runner,
+        "HSS-H5H5-W8",
+        HSS_LMS,
+        StatefulParameters::Levels(&[
+            ("LMS_SHA256_M32_H5", "LMOTS_SHA256_N32_W8"),
+            ("LMS_SHA256_M32_H5", "LMOTS_SHA256_N32_W8"),
+        ]),
+        48,
+    );
+
+    stateful(
+        &runner,
+        "XMSS-SHA2_10_256",
+        XMSS,
+        StatefulParameters::Name("XMSS-SHA2_10_256"),
+        96,
+    );
+
+    stateful(
+        &runner,
+        "XMSSMT-SHA2_20/4_256",
+        XMSS_MT,
+        StatefulParameters::Name("XMSSMT-SHA2_20/4_256"),
+        96,
+    );
+
+    load(
+        &runner,
+        "HSS-H15-W4",
+        HSS_LMS,
+        StatefulParameters::Levels(&[("LMS_SHA256_M32_H15", "LMOTS_SHA256_N32_W4")]),
+        48,
+    );
+
+    // A tree of height 20 takes tens of seconds to build, so it runs only when a filter selects it.
+    if runner.filter.is_some() {
+        load(
+            &runner,
+            "HSS-H20-W4",
+            HSS_LMS,
+            StatefulParameters::Levels(&[("LMS_SHA256_M32_H20", "LMOTS_SHA256_N32_W4")]),
+            48,
+        );
+    }
+}

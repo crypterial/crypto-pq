@@ -1,0 +1,22 @@
+[package]
+name = "ab4-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# base: main's crate; new: the tree under test; aa: a renamed copy of new (the A/A control).
+# The workflow renames base's and aa's packages so that the three link into one binary.
+[dependencies]
+base = { package = "crypto-pq-base", path = "../rust-base", features = ["hazmat"] }
+new = { package = "crypto-pq", path = "../rust", features = ["hazmat"] }
+aa = { package = "crypto-pq-aa", path = "../rust-aa", features = ["hazmat"] }
+
+# aa-create: the aa slot holds a tree without MacAlgorithm::key (the T0 baseline), which the
+# two-message rows time with two creates, as base.
+[features]
+aa-create = []
+
+[profile.release]
+codegen-units = 1
+
+[workspace]

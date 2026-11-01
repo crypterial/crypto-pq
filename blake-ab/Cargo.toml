@@ -1,0 +1,42 @@
+[package]
+name = "blake-ab"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+cpq = { package = "crypto-pq", path = "../rust", features = ["hazmat"] }
+cpq_aa = { package = "crypto-pq-aa", path = "../rust-aa", features = ["hazmat"] }
+cpq_main = { package = "crypto-pq-main", path = "../rust-main", features = ["hazmat"] }
+blake2 = "=0.11.0"
+blake2b_simd = "=1.0.5"
+blake2s_simd = "=1.0.5"
+blake3 = "=1.8.7"
+blake2-rfc = "=0.2.18"
+blake2b-ref = "=0.3.1"
+rfc7693 = "=0.1.0"
+libcrux-blake2 = "=0.0.9"
+libsodium-sys-stable = { version = "=1.24.3", optional = true }
+blake2b-rs = { version = "=0.2.0", optional = true }
+tc_blake = "=0.1.0"
+cryptoxide = "=0.6.7"
+orion = "=0.18.1"
+dryoc = "=2.0.0"
+kevy-crypto = "=7.0.0"
+krypteia-tessera = "=0.2.0"
+purecrypto = "=0.10.3"
+rscrypto = { version = "=0.12.0", features = ["blake2b", "blake2s", "blake3", "ascon-hash"] }
+p3-blake2s = "=0.9.0-rc.2"
+ab-blake3 = "=0.2.0"
+openssl = "=0.10.81"
+tc_digest = "=0.1.1"
+
+[features]
+default = ["main"]
+main = ["dep:libsodium-sys-stable"]
+# blake2b-rs (BLAKE2 C) clashes with the global blake2b_* symbols of libsodium: a second build,
+# --no-default-features --features alt.
+alt = ["dep:blake2b-rs"]
+
+[profile.release]
+codegen-units = 1
