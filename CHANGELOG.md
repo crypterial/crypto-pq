@@ -28,6 +28,12 @@ Implements specification 1.1 (draft).
   256-bit registers, in inline assembly within the AVX2 code. On AMD family 1Ah (Zen 5) the
   kernels for one message give way to the portable code, which takes less time there; on other AMD
   processors with AVX-512 (Zen 4) BLAKE2 keeps its AVX2 code. Outputs are unchanged.
+- BLAKE3 on x86-64 processors of AMD families 19h and 1Ah (Zen 4, Zen 5) and on Intel's Sapphire
+  Rapids, Emerald Rapids and Granite Rapids: inputs of sixteen chunks or more hash sixteen chunks or
+  parents at a time, and extended outputs compute sixteen blocks at a time, in 512-bit registers
+  ([decision D-44](spec/decisions.md#decision-d-44)). Other processors keep 256-bit registers. The
+  AVX-512VL kernel for one message swaps the halves of its d row with the integer VPSHUFD. On ARM64
+  the NEON kernels rotate by 12 and 7 with USHR and SLI. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2 or SSE4.1: the kernels for one message keep the message in four
   registers and build each round's words from the previous round's with shuffles, unpacks and
   blends, as the reference SSE4.1 code does, instead of loading each word again from the block.

@@ -273,45 +273,58 @@ Withdrawn on 2026-10-23: it concerned implementations in other languages, which 
 
 ## Decision D-44
 
-Revised for specification 1.1 on 2026-10-26 and 2026-10-28; specification 1.0, which 1.0.0 and 1.0.1
-implement, said that crypto-pq contains no AVX-512 code. On x86-64 processors with AVX-512F and
-AVX-512VL, whose opmask and ZMM state the operating system saves (XCR0 bits 1, 2 and 5 to 7, or the
-`hw.optional.avx512f` and `hw.optional.avx512vl` sysctl values on macOS), the Keccak-f[1600] kernel
-on four states uses the EVEX instructions on 256-bit registers only, and so does the kernel on one
-state on the processors that run it in less time than the scalar kernel, by a table of families and
-models: AMD families 19h and 1Ah and Intel's Ice Lake Xeon; other processors run one state with the
-scalar kernel. On the same processors, the kernel that hashes eight lanes of SHA-256 side by side,
-for the chains and trees of LMS and XMSS and the SHA-2 hashes of SLH-DSA, keeps one lane in each
-element of a 256-bit register and uses rotations and three-input logic for Ch, Maj and the sigma
-functions. In a build for the baseline target, no code uses a 512-bit register. The Keccak round
-takes theta in the form that each vendor's cores run in less time. Sponges squeezed side by side
-keep their states in the vector layout of the kernel from one block to the next. The tier is
-detected at run time, and the AVX2 kernels and the portable code stay its twins
-([15.3](15-platforms.md#153-cpu-specific-code)). valgrind cannot execute AVX-512, so the
-constant-time check's build leaves the tier out ([14.1](14-security.md#141-constant-time) item 7),
-and its kernels are constant time by construction: logic, rotations, shifts, additions, shuffles,
-blends, broadcasts and loads and stores at addresses that depend on public lengths only, each on
-Intel's list of data-operand-independent timing instructions or a floating-point-domain logic, move,
-unpack, shuffle, insert or blend instruction of [D-75](#decision-d-75), with no branch, address or
-variable-latency instruction that depends on the data; which kernel runs depends only on the
-processor. CI runs them on native runners ([18.2](18-testing.md#182-cpu-tiers)). On the same
-processors, BLAKE2b, BLAKE2s and BLAKE3 take the tier for one message: the rotations of their AVX2
-row forms that take two shifts and an OR become one VPRORD or VPRORQ (BLAKE2b by 63, BLAKE2s by 12
-and 7, BLAKE3 every rotation), and BLAKE3 moves its message words to the next round's order with
-VPERMT2D, on 128-bit and 256-bit registers, written as inline assembly in the AVX2 code, so that the
-compiler places no value in a 512-bit register. On the processors of a table of families, AMD family
-1Ah, these kernels for one message give way to the portable code in general registers, which takes
-less time there; their kernels for several messages stay. BLAKE2b and BLAKE2s keep their AVX2 forms
-on the other AMD processors with AVX-512, where VPRORD and VPRORQ take two cycles. The minimum Rust
-version is 1.89, the first in which these target features and intrinsics are stable
+Revised for specification 1.1 on 2026-10-26, 2026-10-28 and 2026-11-01; specification 1.0, which
+1.0.0 and 1.0.1 implement, said that crypto-pq contains no AVX-512 code. On x86-64 processors with
+AVX-512F and AVX-512VL, whose opmask and ZMM state the operating system saves (XCR0 bits 1, 2 and 5
+to 7, or the `hw.optional.avx512f` and `hw.optional.avx512vl` sysctl values on macOS), the
+Keccak-f[1600] kernel on four states uses the EVEX instructions on 256-bit registers only, and so
+does the kernel on one state on the processors that run it in less time than the scalar kernel, by a
+table of families and models: AMD families 19h and 1Ah and Intel's Ice Lake Xeon; other processors
+run one state with the scalar kernel. On the same processors, the kernel that hashes eight lanes of
+SHA-256 side by side, for the chains and trees of LMS and XMSS and the SHA-2 hashes of SLH-DSA,
+keeps one lane in each element of a 256-bit register and uses rotations and three-input logic for
+Ch, Maj and the sigma functions. In a build for the baseline target, no code uses a 512-bit register
+but BLAKE3's two sixteen-lane kernels below. The Keccak round takes theta in the form that each
+vendor's cores run in less time. Sponges squeezed side by side keep their states in the vector
+layout of the kernel from one block to the next. The tier is detected at run time, and the AVX2
+kernels and the portable code stay its twins ([15.3](15-platforms.md#153-cpu-specific-code)).
+valgrind cannot execute AVX-512, so the constant-time check's build leaves the tier out
+([14.1](14-security.md#141-constant-time) item 7), and its kernels are constant time by
+construction: logic, rotations, shifts, additions, shuffles, blends, broadcasts and loads and stores
+at addresses that depend on public lengths only, each on Intel's list of data-operand-independent
+timing instructions or a floating-point-domain logic, move, unpack, shuffle, insert or blend
+instruction of [D-75](#decision-d-75), with no branch, address or variable-latency instruction that
+depends on the data; which kernel runs depends only on the processor. CI runs them on native runners
+([18.2](18-testing.md#182-cpu-tiers)). On the same processors, BLAKE2b, BLAKE2s and BLAKE3 take the
+tier for one message: the rotations of their AVX2 row forms that take two shifts and an OR become
+one VPRORD or VPRORQ (BLAKE2b by 63, BLAKE2s by 12 and 7, BLAKE3 every rotation), and BLAKE3 moves
+its message words to the next round's order with VPERMT2D, on 128-bit and 256-bit registers, written
+as inline assembly in the AVX2 code, so that the compiler places no value in a 512-bit register. On
+the processors of a table of families, AMD family 1Ah, these kernels for one message give way to the
+portable code in general registers, which takes less time there; their kernels for several messages
+stay. BLAKE2b and BLAKE2s keep their AVX2 forms on the other AMD processors with AVX-512, where
+VPRORD and VPRORQ take two cycles. On the processors of a third table, AMD families 19h and 1Ah and
+Intel's Sapphire Rapids, Emerald Rapids and Granite Rapids (family 6, models 8Fh, CFh and ADh),
+BLAKE3 hashes sixteen chunks or parents, and computes sixteen blocks of its extended output, side by
+side in 512-bit registers: each of zmm0 to zmm15 holds one state word of the sixteen inputs, zmm16
+to zmm31 hold the message words, and every rotation is one VPRORD. These two kernels are the only
+functions built with AVX-512F. Each is one block of inline assembly, of the instructions of this
+tier's kernels, that ends by zeroing zmm16 to zmm31 and with VZEROUPPER. The other processors with
+AVX-512, Ice Lake Xeon among them, run the eight-lane AVX2 kernel there. The minimum Rust version is
+1.89, the first in which these target features and intrinsics are stable
 ([15.2](15-platforms.md#152-supported-platforms)). Rationale: sixteen more registers, three-input
 logic and 64-bit rotations take fewer instructions per Keccak round than AVX2 does, and 256-bit
-registers keep the clock at which the core runs AVX2 code. For SHA-256 on eight lanes, the block of
-one lane takes 18 to 22 ns on the Zen 4, Zen 5, Ice Lake, Emerald Rapids and Granite Rapids
-processors measured, against 20 to 59 ns with the SHA extensions on two lanes and 31 to 44 ns with
-AVX2. AMD processors with the SHA extensions run SHA-256 lanes with them instead: with the SHA-NI
-rounds of specification 1.1, LMS, XMSS and SLH-DSA-SHA2 took 0.5 to 6 percent less time on Zen 4 and
-Zen 5 than with the eight-lane kernel, and 7 to 14 percent more on Emerald Rapids.
+registers keep the clock at which the core runs AVX2 code. On the processors of the third table, the
+512-bit BLAKE3 kernels of the blake3 crate and rscrypto hashed 16 KiB in 0.43 (Zen 5), 0.68 (Zen 4),
+0.56 (Emerald Rapids) and 0.55 (Granite Rapids) of the time of the eight-lane AVX2 kernel, close to
+what their instruction counts predict for each core, so no clock cost showed; Sapphire Rapids, whose
+core Emerald Rapids revises, was not measured. On Ice Lake Xeon they took 0.70, a fifth more than
+the count predicts. For SHA-256 on eight lanes, the block of one lane takes 18 to 22 ns on the Zen
+4, Zen 5, Ice Lake, Emerald Rapids and Granite Rapids processors measured, against 20 to 59 ns with
+the SHA extensions on two lanes and 31 to 44 ns with AVX2. AMD processors with the SHA extensions
+run SHA-256 lanes with them instead: with the SHA-NI rounds of specification 1.1, LMS, XMSS and
+SLH-DSA-SHA2 took 0.5 to 6 percent less time on Zen 4 and Zen 5 than with the eight-lane kernel, and
+7 to 14 percent more on Emerald Rapids.
 
 ## Decision D-45
 

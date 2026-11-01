@@ -23,8 +23,9 @@ its result is kept in an atomic.
    XGETBV); AVX-512F and AVX-512VL on top of the AVX2 tier, with operating-system support for the
    opmask and ZMM state, for Keccak-f[1600], SHA-256 on eight lanes, BLAKE2 and BLAKE3
    [[D-44](decisions.md#decision-d-44)]; SSE4.1; SHA-NI; AES-NI. Processors without
-   them run the portable code. The AVX-512 kernels use 256-bit registers only, and in a build for the
-   baseline target no code uses a 512-bit register. Within a tier, tables of CPUID vendors, families
+   them run the portable code. The AVX-512 kernels use 256-bit registers, but for BLAKE3's two
+   sixteen-lane kernels on the processors of a table, and in a build for the baseline target no
+   other code uses a 512-bit register. Within a tier, tables of CPUID vendors, families
    and models choose among the kernels of that tier, or the portable code, for some functions
    [[D-44](decisions.md#decision-d-44), [D-78](decisions.md#decision-d-78)]; the tables depend on
    the processor only, never on the data. CPU-specific code is not used inside an SGX enclave

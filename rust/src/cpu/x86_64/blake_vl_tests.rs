@@ -5,12 +5,14 @@
 // 0 to 65, 128 and 1025 bytes where a kernel takes them, keyed and unkeyed, and several output
 // lengths. CI's AVX-512 runners look for the line that the test prints. The references are the
 // portable compressions with RFC 7693's and the BLAKE3 specification's framing, checked against
-// the library's own functions first.
+// the library's own functions first. BLAKE3's 512-bit kernels for sixteen inputs are called the
+// same way, on every CPU with AVX512.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use super::super::testing::Inputs;
+use super::blake3_zmm::{Table16, hash16_zmm, xof16_zmm};
 use super::{AVX2, AVX512, Blake2sKernel, blake2, blake3, has};
 use crate::blake2::{Word, compress, start32, start64};
 use crate::blake3::{CHUNK_END, CHUNK_START, Last, PERMUTATION, ROOT};
@@ -636,4 +638,134 @@ fn blake_vl_kernels_match_portable() {
     }
 
     std::eprintln!("BLAKE VL kernels: {run} of {COUNT} run (AVX2 kernels: {avx2_run})");
+}
+
+// The cases of blake3_zmm_kernels_match_portable, hash16_zmm's and then xof16_zmm's.
+const ZMM_COUNT: usize = 9;
+
+// The counters of the sixteen lanes of table from counter on, one more each if increment.
+fn lane_counters(table: &mut Table16, counter: u64, increment: bool) {
+    for (l, (low, high)) in table.low.iter_mut().zip(table.high.iter_mut()).enumerate() {
+        let lane = if increment {
+            counter.wrapping_add(l as u64)
+        } else {
+            counter
+        };
+
+        *low = lane as u32;
+
+        *high = (lane >> 32) as u32;
+    }
+}
+
+// BLAKE3's 512-bit kernels on sixteen inputs and sixteen output blocks, called directly against
+// compress3 on every CPU with AVX512, whatever zmm_lanes() chooses for the dispatch. The counters
+// cross 2^32 and 2^64 within the sixteen lanes. CI's AVX-512 runners look for the line that the
+// test prints.
+#[test]
+#[allow(unsafe_code)]
+fn blake3_zmm_kernels_match_portable() {
+    let mut inputs = Inputs::new(77);
+
+    let mut run = 0;
+
+    if has(AVX512) {
+        for (blocks, counter, increment, flags) in [
+            (1, 0, false, 0),
+            (2, 0xFFFF_FFF8, true, KEYED_HASH),
+            (3, 5, true, 0),
+            (15, u64::MAX - 7, true, KEYED_HASH),
+            (16, 0, false, 0),
+        ] {
+            let words: [u32; 16] = block_words(&random(&mut inputs, 32));
+
+            let key: [u32; 8] = core::array::from_fn(|i| words[i]);
+
+            let data = random(&mut inputs, 16 * 64 * blocks);
+
+            let mut table = Table16::new();
+
+            lane_counters(&mut table, counter, increment);
+
+            table.flags[..blocks].fill(flags);
+
+            table.flags[0] |= CHUNK_START;
+
+            table.flags[blocks - 1] |= CHUNK_END;
+
+            let mut out = [[0; 32]; 16];
+
+            // SAFETY: the CPU has AVX-512F and AVX-512VL, and the operating system saves their
+            // registers; 1 <= blocks <= 16, and data holds sixteen inputs of `blocks` blocks.
+            unsafe { hash16_zmm(data.as_ptr(), blocks, &key, &table, &mut out) };
+
+            for (l, got) in out.iter().enumerate() {
+                let lane = if increment {
+                    counter.wrapping_add(l as u64)
+                } else {
+                    counter
+                };
+
+                let mut cv = key;
+
+                let input = &data[64 * blocks * l..][..64 * blocks];
+
+                for (b, block) in input.as_chunks::<64>().0.iter().enumerate() {
+                    let v = compress3(&cv, block, lane, 64, table.flags[b]);
+
+                    cv = core::array::from_fn(|i| v[i]);
+                }
+
+                assert_eq!(
+                    *got,
+                    key_bytes(&cv),
+                    "hash16_zmm, {blocks} blocks, lane {l}"
+                );
+            }
+
+            run += 1;
+        }
+
+        for (length, counter) in [(0, 0), (1, 0xFFFF_FFF0), (63, u64::MAX - 7), (64, 3)] {
+            let words: [u32; 16] = block_words(&random(&mut inputs, 32));
+
+            let cv: [u32; 8] = core::array::from_fn(|i| words[i]);
+
+            let bytes = padded64(&random(&mut inputs, length as usize));
+
+            let block: [u32; 16] = block_words(&bytes);
+
+            let flags = ROOT | CHUNK_START | CHUNK_END | KEYED_HASH;
+
+            let mut table = Table16::new();
+
+            lane_counters(&mut table, counter, true);
+
+            table.length = length;
+
+            table.flags[0] = flags;
+
+            let mut out = [[0; 64]; 16];
+
+            // SAFETY: the CPU has AVX-512F and AVX-512VL, and the operating system saves their
+            // registers.
+            unsafe { xof16_zmm(&cv, &block, &table, &mut out) };
+
+            for (l, got) in out.iter().enumerate() {
+                let v = compress3(&cv, &bytes, counter.wrapping_add(l as u64), length, flags);
+
+                let expected: Vec<u8> = v.iter().flat_map(|word| word.to_le_bytes()).collect();
+
+                assert_eq!(
+                    got[..],
+                    expected[..],
+                    "xof16_zmm, length {length}, block {l}"
+                );
+            }
+
+            run += 1;
+        }
+    }
+
+    std::eprintln!("BLAKE3 zmm kernels: {run} of {ZMM_COUNT} run");
 }

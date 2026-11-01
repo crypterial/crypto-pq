@@ -1,8 +1,8 @@
 // BLAKE3 with NEON on several inputs at once, as the reference implementation's hash_many: each
 // vector holds one state word of four inputs, so a G function of the specification runs on four
 // inputs with each instruction. The message words are transposed into the same form as each
-// block is loaded. Rotations by 16 and 8 are a REV32 and a TBL, by 12 and 7 a shift and a
-// shift-right-insert. GROUPS sets of four inputs run interleaved: a set alone leaves the vector
+// block is loaded. Rotations by 16 and 8 are a REV32 and a TBL, by 12 and 7 a USHR and an SLI.
+// GROUPS sets of four inputs run interleaved: a set alone leaves the vector
 // pipes idle while each step's chain of dependent instructions completes.
 //
 // The extended output of the root runs the same way on four consecutive output blocks, which
@@ -35,7 +35,7 @@ fn rotate16(x: uint32x4_t) -> uint32x4_t {
 #[target_feature(enable = "neon")]
 #[inline]
 fn rotate12(x: uint32x4_t) -> uint32x4_t {
-    vsriq_n_u32::<12>(vshlq_n_u32::<20>(x), x)
+    vsliq_n_u32::<20>(vshrq_n_u32::<12>(x), x)
 }
 
 #[target_feature(enable = "neon")]
@@ -47,7 +47,7 @@ fn rotate8(x: uint32x4_t, table: Rotate8) -> uint32x4_t {
 #[target_feature(enable = "neon")]
 #[inline]
 fn rotate7(x: uint32x4_t) -> uint32x4_t {
-    vsriq_n_u32::<7>(vshlq_n_u32::<25>(x), x)
+    vsliq_n_u32::<25>(vshrq_n_u32::<7>(x), x)
 }
 
 // One step of four G functions, (a, b, c, d) = (i, 4 + (i + shift) % 4, ...), of every group,

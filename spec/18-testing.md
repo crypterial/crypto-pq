@@ -20,9 +20,10 @@ CPU-specific tier of [15.3](15-platforms.md#153-cpu-specific-code) and the porta
 counts the kernels each model selects and fails if the count differs from the expected one. The
 AVX-512 tier, which the emulators do not execute, runs on native runners: CI runs the tests on
 several x86-64 runners, each records which of the tier's kernels it selected, and the run fails
-unless one selected the four-state kernel and one the one-state kernels. CI also checks that the
-library, built for the baseline target at each optimization level, contains no instruction on a
-512-bit register [[D-44](decisions.md#decision-d-44)].
+unless one selected the four-state kernel, one the one-state kernels and one ran BLAKE3's 512-bit
+kernels. CI also checks that the library, built for the baseline target at each optimization level,
+contains no instruction on a 512-bit register outside those two kernels
+[[D-44](decisions.md#decision-d-44)].
 
 ## 18.3 Platforms
 

@@ -763,27 +763,35 @@ fn single_block(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u32; 16]) {
     let mut last = [0; BLOCK];
 
     // A full last block is read where it lies: its copy took a call to memcpy, and the kernel's
-    // first loads waited on the copy's stores.
-    let block = match <&[u8; BLOCK]>::try_from(rest) {
-        Ok(block) => block,
-        Err(_) => {
+    // first loads waited on the copy's stores. last then holds only zeros, and is not wiped.
+    let in_place = <&[u8; BLOCK]>::try_from(rest).ok();
+
+    let block = match in_place {
+        Some(block) => block,
+        None => {
             last[..rest.len()].copy_from_slice(rest);
 
             &last
         }
     };
 
-    let mut cv = *key;
+    // A single block is compressed with the key where it lies, which leaves no copy of it to
+    // wipe.
+    if blocks.is_empty() {
+        compress(key, block, 0, rest.len() as u32, last_flags | ROOT, out);
+    } else {
+        let mut cv = [0; 8];
 
-    if !blocks.is_empty() {
         chain_blocks(key, blocks, 0, flags, [CHUNK_START, 0], None, &mut cv);
+
+        compress(&cv, block, 0, rest.len() as u32, last_flags | ROOT, out);
+
+        wipe(&mut cv);
     }
 
-    compress(&cv, block, 0, rest.len() as u32, last_flags | ROOT, out);
-
-    wipe(&mut cv);
-
-    wipe(&mut last);
+    if in_place.is_none() {
+        wipe(&mut last);
+    }
 }
 
 // The first out.len() bytes of output words, at most all of them.

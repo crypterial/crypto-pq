@@ -4,7 +4,8 @@
 // Keccak-f[1600] on four states and on one, BLAKE2b, BLAKE2s and BLAKE3, Ascon, the ML-KEM and
 // ML-DSA arithmetic, sampling and encodings, and FrodoKEM's SHAKE128 rows of A and its products of
 // A with the secret matrices; with AVX-512F and AVX-512VL besides, Keccak-f[1600] on four states
-// and on one in 256-bit registers; BLAKE2b, BLAKE2s and BLAKE3 without AVX2 with SSE4.1. Every
+// and on one in 256-bit registers, and on the cores of zmm_lanes() BLAKE3 on sixteen inputs in
+// 512-bit registers; BLAKE2b, BLAKE2s and BLAKE3 without AVX2 with SSE4.1. Every
 // instruction that takes secret data is on Intel's list of data-operand-independent timing
 // instructions or is a floating-point-domain logic, move, unpack, shuffle, insert or blend one that
 // SPEC D-75 counts with it, as LLVM emits some for integer intrinsics; branches, divisions and the
@@ -60,6 +61,9 @@ mod blake2;
 
 #[cfg(feature = "blake3")]
 mod blake3;
+
+#[cfg(feature = "blake3")]
+mod blake3_zmm;
 
 #[cfg(any(feature = "blake2", feature = "blake3"))]
 mod evex;
@@ -136,8 +140,9 @@ const AES: u32 = 1 << 3;
 
 // AVX-512F and AVX-512VL with the AVX2 tier, and an operating system that saves the opmask
 // registers and all 32 vector registers in full. Its kernels use the EVEX forms on 256-bit
-// registers only, never 512-bit ones, so that the core keeps the clock it runs AVX2 code at; they
-// gain sixteen more registers, three-input logic and 64-bit rotations.
+// registers only, so that the core keeps the clock it runs AVX2 code at; they gain sixteen more
+// registers, three-input logic and 64-bit rotations. The BLAKE3 kernels of ZMM_LANES alone use
+// 512-bit registers.
 const AVX512: u32 = 1 << 4;
 
 // AVX512 on a core that runs the one-state Keccak kernel in vector registers in less time than the
@@ -158,6 +163,10 @@ const ONE_MESSAGE: u32 = 1 << 7;
 // the table in gather_rows(), on a core without AVX512 (whose cores of the table take the
 // AVX-512VL tier). No tier test reads it.
 const GATHER: u32 = 1 << 8;
+
+// AVX512 on a core that hashes sixteen BLAKE3 inputs, and computes sixteen blocks of its extended
+// output, side by side in 512-bit registers (blake3_zmm.rs), by the table in zmm_lanes().
+const ZMM_LANES: u32 = 1 << 9;
 
 const READY: u32 = 1 << 31;
 
@@ -180,7 +189,8 @@ const fn guaranteed(feature: u32) -> bool {
         )),
         SSE41 => cfg!(all(target_feature = "ssse3", target_feature = "sse4.1")),
         AES => cfg!(all(target_feature = "aes", target_feature = "sse4.1")),
-        // AVX512_ONE and AVX512_AMD also depend on the core, which no target feature states.
+        // AVX512_ONE, AVX512_AMD and ZMM_LANES also depend on the core, which no target feature
+        // states.
         AVX512 => cfg!(all(
             target_feature = "avx512f",
             target_feature = "avx512vl",
@@ -197,7 +207,8 @@ const fn guaranteed(feature: u32) -> bool {
 // kernels are constant-time by construction instead (keccak.rs). --cfg crypto_pq_sse41 leaves out
 // AVX2, AVX-512 and the SHA extensions too, so that a CPU with them runs the SSE4.1 kernels.
 const fn usable(feature: u32) -> bool {
-    let avx512 = feature == AVX512 || feature == AVX512_ONE || feature == AVX512_AMD;
+    let avx512 =
+        feature == AVX512 || feature == AVX512_ONE || feature == AVX512_AMD || feature == ZMM_LANES;
 
     if cfg!(crypto_pq_sse41) && (feature == AVX2 || avx512 || feature == SHA) {
         return false;
@@ -448,6 +459,10 @@ fn probe() -> u32 {
             if one_state(vendor, leaf1.eax) {
                 found |= AVX512_ONE;
             }
+
+            if zmm_lanes(vendor, leaf1.eax) {
+                found |= ZMM_LANES;
+            }
         }
     }
 
@@ -473,6 +488,24 @@ fn one_state(vendor: Vendor, eax: u32) -> bool {
     match vendor {
         Vendor::Amd => family == 0x19 || family == 0x1A,
         Vendor::Intel => family == 0x6 && (model == 0x6A || model == 0x6C),
+        Vendor::Other => false,
+    }
+}
+
+// Whether a core with AVX512 runs BLAKE3 on sixteen inputs, or sixteen blocks of its extended
+// output, in 512-bit registers (D-44), from the family and model in CPUID leaf 1 EAX: AMD Zen 4
+// (family 19h) and Zen 5 (1Ah), Intel Sapphire Rapids (family 6, model 8Fh), Emerald Rapids (CFh)
+// and Granite Rapids (ADh). There the blake3 crate's and rscrypto's 512-bit kernels hashed 16 KiB
+// in 0.43 (Zen 5), 0.68 (Zen 4), 0.56 (Emerald Rapids) and 0.55 (Granite Rapids) of the time of
+// the eight-lane AVX2 kernel (Sapphire Rapids, the core of Emerald Rapids, not measured). Ice Lake
+// Xeon (6Ah, 6Ch), where those kernels took 0.70, keeps 256-bit registers, as do cores not in the
+// table and cores of other vendors.
+fn zmm_lanes(vendor: Vendor, eax: u32) -> bool {
+    let (family, model) = family_model(eax);
+
+    match vendor {
+        Vendor::Amd => family == 0x19 || family == 0x1A,
+        Vendor::Intel => family == 0x6 && matches!(model, 0x8F | 0xAD | 0xCF),
         Vendor::Other => false,
     }
 }
@@ -707,8 +740,11 @@ pub(crate) fn blake3_many(input: &[u8], many: &crate::blake3::Many, out: &mut [[
     if among(found, AVX2) {
         let pair = !among(found, ONE_MESSAGE);
 
-        // SAFETY: the CPU has AVX2 and the operating system saves its registers.
-        return unsafe { blake3::hash_many_avx2(input, many, out, pair) };
+        let wide = among(found, ZMM_LANES);
+
+        // SAFETY: the CPU has AVX2 and the operating system saves its registers, and with wide
+        // AVX-512F and AVX-512VL too (ZMM_LANES is found with AVX512 only).
+        return unsafe { blake3::hash_many_avx2(input, many, out, pair, wide) };
     }
 
     if among(found, SSE41) {
@@ -729,12 +765,16 @@ pub(crate) fn blake3_xof(
     info: [u32; 2],
     out: &mut [[u8; 64]],
 ) -> usize {
-    if has(AVX2) {
+    let found = features();
+
+    if among(found, AVX2) {
+        let wide = among(found, ZMM_LANES);
+
         // SAFETY: as in blake3_many.
-        return unsafe { blake3::xof_avx2(cv, block, counter, info, out) };
+        return unsafe { blake3::xof_avx2(cv, block, counter, info, out, wide) };
     }
 
-    if has(SSE41) {
+    if among(found, SSE41) {
         // SAFETY: as in blake3_many.
         return unsafe { blake3::xof_sse41(cv, block, counter, info, out) };
     }
