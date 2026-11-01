@@ -1,5 +1,5 @@
 use crate::cpu;
-use crate::wipe::{wipe, wipe_unless_optimized};
+use crate::wipe::{registers, wipe, wipe_unless_optimized};
 
 pub(crate) const K256: [u32; 64] = [
     0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
@@ -548,6 +548,10 @@ fn finish256_state(state: &[u32; 8], data: &[u8], bits: u64, out: &mut [u8]) {
 // block.
 #[cfg_attr(not(target_arch = "aarch64"), inline(never))]
 fn finish256_portable(state: &mut [u32; 8], data: &[u8], bits: u64) {
+    if !LANE_VECTORS {
+        return finish256_words(state, data, bits);
+    }
+
     let mut last = [[0; 64]; 2];
 
     let used = pad(data, u128::from(bits), 8, &mut last);
@@ -555,6 +559,62 @@ fn finish256_portable(state: &mut [u32; 8], data: &[u8], bits: u64) {
     compress256(state, data.as_chunks::<64>().0, &last[..used]);
 
     wipe(last.as_flattened_mut());
+}
+
+// finish256_portable without vector registers: the padding blocks after data's whole blocks go
+// into the schedule word by word, with no block of bytes to zero, fill, read and wipe. w and v as
+// in compress256_blocks (D-76).
+fn finish256_words(state: &mut [u32; 8], data: &[u8], bits: u64) {
+    let (blocks, tail) = data.as_chunks::<64>();
+
+    if !blocks.is_empty() {
+        compress256(state, blocks, &[]);
+    }
+
+    // The length takes the last 8 bytes, after the tail and the marker byte.
+    let padding = if tail.len() + 9 > 64 { 2 } else { 1 };
+
+    let mut v = [0; 8];
+
+    for block in 0..padding {
+        let mut w: [u32; 16] = registers!(
+            |i| padding_word256(tail, bits, padding, 16 * block + i);
+            0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+        );
+
+        compress256_words(state, &mut w, &mut v);
+
+        wipe_unless_optimized!(&mut w);
+    }
+
+    wipe_unless_optimized!(&mut v);
+}
+
+// Big-endian word j of the `padding` blocks (FIPS 180-4, 5.1.1) that end a message with tail, the
+// bytes after its whole blocks: the tail, the marker byte 0x80, zeros, and the length in bits in
+// the last two words.
+#[inline(always)]
+fn padding_word256(tail: &[u8], bits: u64, padding: usize, j: usize) -> u32 {
+    let (words, rest) = tail.as_chunks::<4>();
+
+    if let Some(bytes) = words.get(j) {
+        return u32::from_be_bytes(*bytes);
+    }
+
+    if j == words.len() {
+        return rest
+            .iter()
+            .zip([24, 16, 8])
+            .fold(0x80 << (24 - 8 * rest.len()), |word, (byte, shift)| {
+                word | u32::from(*byte) << shift
+            });
+    }
+
+    match 16 * padding - j {
+        2 => (bits >> 32) as u32,
+        1 => bits as u32,
+        _ => 0,
+    }
 }
 
 // finish256 for SHA-512, whose length field takes 16 bytes.
@@ -575,6 +635,10 @@ pub(crate) fn finish512(state: &[u64; 8], absorbed: u128, data: &[u8], out: &mut
 // finish256_portable for SHA-512.
 #[inline(never)]
 fn finish512_portable(state: &mut [u64; 8], data: &[u8], bits: u128) {
+    if PADDING_WORDS512 {
+        return finish512_words(state, data, bits);
+    }
+
     let mut last = [[0; 128]; 2];
 
     let used = pad(data, bits, 16, &mut last);
@@ -582,6 +646,62 @@ fn finish512_portable(state: &mut [u64; 8], data: &[u8], bits: u128) {
     compress512(state, data.as_chunks::<128>().0, &last[..used]);
 
     wipe(last.as_flattened_mut());
+}
+
+// Whether finish512_portable builds its padding blocks as finish256_portable does without vector
+// registers. Not on 32-bit Arm, where the words take two registers each: there it ran more
+// instructions than the blocks in memory (9182 against 8921 for an empty message).
+const PADDING_WORDS512: bool = !LANE_VECTORS && !cfg!(target_arch = "arm");
+
+// finish256_words for SHA-512.
+fn finish512_words(state: &mut [u64; 8], data: &[u8], bits: u128) {
+    let (blocks, tail) = data.as_chunks::<128>();
+
+    if !blocks.is_empty() {
+        compress512(state, blocks, &[]);
+    }
+
+    let padding = if tail.len() + 17 > 128 { 2 } else { 1 };
+
+    let mut v = [0; 8];
+
+    for block in 0..padding {
+        let mut w: [u64; 16] = registers!(
+            |i| padding_word512(tail, bits, padding, 16 * block + i);
+            0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+        );
+
+        compress512_words(state, &mut w, &mut v);
+
+        wipe_unless_optimized!(&mut w);
+    }
+
+    wipe_unless_optimized!(&mut v);
+}
+
+// padding_word256 for SHA-512.
+#[inline(always)]
+fn padding_word512(tail: &[u8], bits: u128, padding: usize, j: usize) -> u64 {
+    let (words, rest) = tail.as_chunks::<8>();
+
+    if let Some(bytes) = words.get(j) {
+        return u64::from_be_bytes(*bytes);
+    }
+
+    if j == words.len() {
+        return rest
+            .iter()
+            .zip([56, 48, 40, 32, 24, 16, 8])
+            .fold(0x80 << (56 - 8 * rest.len()), |word, (byte, shift)| {
+                word | u64::from(*byte) << shift
+            });
+    }
+
+    match 16 * padding - j {
+        2 => (bits >> 64) as u64,
+        1 => bits as u64,
+        _ => 0,
+    }
 }
 
 // HMAC (RFC 2104) keys, built in place: the key, at most a block, padded with zeros to a block
@@ -596,8 +716,15 @@ fn pads<const BLOCK: usize>(key: &[u8], pads: &mut [[u8; BLOCK]; 2]) {
     }
 }
 
-// The states after HMAC's inner and outer key blocks, compressed side by side into states.
+// The states after HMAC's inner and outer key blocks, compressed side by side into states, or,
+// without vector registers, one after the other from the key's words.
 pub(crate) fn keyed256(iv: &[u32; 8], key: &[u8], states: &mut [[u32; 8]; 2]) {
+    if !LANE_VECTORS {
+        keyed256_words(iv, key, states);
+
+        return;
+    }
+
     let mut block = [[0; 64]; 2];
 
     pads(key, &mut block);
@@ -609,7 +736,50 @@ pub(crate) fn keyed256(iv: &[u32; 8], key: &[u8], states: &mut [[u32; 8]; 2]) {
     wipe(block.as_flattened_mut());
 }
 
+// keyed256 with no block of bytes to fill, XOR and wipe: each key block goes into the schedule
+// straight from the key's big-endian words, XORed with the pad's byte in each position. w and v
+// as in compress256_blocks (D-76).
+fn keyed256_words(iv: &[u32; 8], key: &[u8], states: &mut [[u32; 8]; 2]) {
+    let mut v = [0; 8];
+
+    for (state, pad) in states.iter_mut().zip([0x3636_3636, 0x5C5C_5C5C]) {
+        let mut w: [u32; 16] = registers!(
+            |i| pad ^ key_word256(key, i);
+            0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+        );
+
+        *state = *iv;
+
+        compress256_words(state, &mut w, &mut v);
+
+        wipe_unless_optimized!(&mut w);
+    }
+
+    wipe_unless_optimized!(&mut v);
+}
+
+// Big-endian word i of a key of at most a block, padded with zeros to a block.
+#[inline(always)]
+fn key_word256(key: &[u8], i: usize) -> u32 {
+    let (words, tail) = key.as_chunks::<4>();
+
+    match words.get(i) {
+        Some(bytes) => u32::from_be_bytes(*bytes),
+        None if i == words.len() => tail
+            .iter()
+            .zip([24, 16, 8])
+            .fold(0, |word, (byte, shift)| word | u32::from(*byte) << shift),
+        None => 0,
+    }
+}
+
 pub(crate) fn keyed512(iv: &[u64; 8], key: &[u8], states: &mut [[u64; 8]; 2]) {
+    if !LANE_VECTORS {
+        keyed512_words(iv, key, states);
+
+        return;
+    }
+
     let mut block = [[0; 128]; 2];
 
     pads(key, &mut block);
@@ -619,6 +789,44 @@ pub(crate) fn keyed512(iv: &[u64; 8], key: &[u8], states: &mut [[u64; 8]; 2]) {
     compress512_pair(states, &block);
 
     wipe(block.as_flattened_mut());
+}
+
+// keyed256_words for SHA-512.
+fn keyed512_words(iv: &[u64; 8], key: &[u8], states: &mut [[u64; 8]; 2]) {
+    let mut v = [0; 8];
+
+    for (state, pad) in states
+        .iter_mut()
+        .zip([0x3636_3636_3636_3636, 0x5C5C_5C5C_5C5C_5C5C])
+    {
+        let mut w: [u64; 16] = registers!(
+            |i| pad ^ key_word512(key, i);
+            0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+        );
+
+        *state = *iv;
+
+        compress512_words(state, &mut w, &mut v);
+
+        wipe_unless_optimized!(&mut w);
+    }
+
+    wipe_unless_optimized!(&mut v);
+}
+
+// key_word256 for SHA-512.
+#[inline(always)]
+fn key_word512(key: &[u8], i: usize) -> u64 {
+    let (words, tail) = key.as_chunks::<8>();
+
+    match words.get(i) {
+        Some(bytes) => u64::from_be_bytes(*bytes),
+        None if i == words.len() => tail
+            .iter()
+            .zip([56, 48, 40, 32, 24, 16, 8])
+            .fold(0, |word, (byte, shift)| word | u64::from(*byte) << shift),
+        None => 0,
+    }
 }
 
 // HMAC-SHA-256, or HMAC-SHA-224 for a 28-byte tag, under a key of at most a block.
@@ -958,18 +1166,69 @@ pub(crate) fn compress256_lanes_portable<const LANES: usize>(
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn round512(a: u64, b: u64, c: u64, d: &mut u64, e: u64, f: u64, g: u64, h: &mut u64, kw: u64) {
-    let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+    let s1 = big_sigma512(e, [14, 18, 41]);
 
     let t1 = h
         .wrapping_add(kw)
         .wrapping_add(((f ^ g) & e) ^ g)
         .wrapping_add(s1);
 
-    let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+    let s0 = big_sigma512(a, [28, 34, 39]);
 
     *d = d.wrapping_add(t1);
 
     *h = s0.wrapping_add(((a ^ b) & (b ^ c)) ^ b).wrapping_add(t1);
+}
+
+// SHA-512's Σ: the XOR of x rotated right by a, b and c.
+#[inline(always)]
+fn big_sigma512(x: u64, [a, b, c]: [u32; 3]) -> u64 {
+    if !cfg!(target_arch = "arm") {
+        return x.rotate_right(a) ^ x.rotate_right(b) ^ x.rotate_right(c);
+    }
+
+    xor_rotated_halves(x, [a, b, c], 0, 0)
+}
+
+// SHA-512's σ: the XOR of x rotated right by a and b and shifted right by s, from 1 to 31.
+#[inline(always)]
+fn small_sigma512(x: u64, [a, b]: [u32; 2], s: u32) -> u64 {
+    if !cfg!(target_arch = "arm") {
+        return x.rotate_right(a) ^ x.rotate_right(b) ^ (x >> s);
+    }
+
+    let (hi, lo) = ((x >> 32) as u32, x as u32);
+
+    xor_rotated_halves(x, [a, b], hi >> s, lo >> s ^ hi << (32 - s))
+}
+
+// The halves of x rotated right by each of the rotations, from 1 to 63 but 32, XORed into high and
+// low, as one word, for 32-bit Arm. The two shifts of a rotated half have no bits in common, so
+// that all of them join one chain of XORs, each folded into its XOR as a shifted operand. In a
+// loop: written out, the rotated halves were each built with an OR first, as for a 64-bit rotation
+// (an empty message took 9933 instructions against 8921).
+#[inline(always)]
+fn xor_rotated_halves<const N: usize>(
+    x: u64,
+    rotations: [u32; N],
+    mut high: u32,
+    mut low: u32,
+) -> u64 {
+    let (hi, lo) = ((x >> 32) as u32, x as u32);
+
+    for n in rotations {
+        let (hi, lo, n) = if n < 32 {
+            (hi, lo, n)
+        } else {
+            (lo, hi, n - 32)
+        };
+
+        high ^= hi >> n ^ lo << (32 - n);
+
+        low ^= lo >> n ^ hi << (32 - n);
+    }
+
+    u64::from(high) << 32 | u64::from(low)
 }
 
 // rounds256 for SHA-512.
@@ -1019,9 +1278,9 @@ fn rounds512<const R: usize>(v: &mut [u64; 8], w: &[u64; 16]) {
 fn word512(w: &mut [u64; 16], t: usize) {
     let (x, y) = (w[(t + 1) % 16], w[(t + 14) % 16]);
 
-    let s0 = x.rotate_right(1) ^ x.rotate_right(8) ^ (x >> 7);
+    let s0 = small_sigma512(x, [1, 8], 7);
 
-    let s1 = y.rotate_right(19) ^ y.rotate_right(61) ^ (y >> 6);
+    let s1 = small_sigma512(y, [19, 61], 6);
 
     w[t] = w[t]
         .wrapping_add(s0)
@@ -1131,6 +1390,12 @@ fn compress512_block(state: &mut [u64; 8], block: &[u8; 128], w: &mut [u64; 16],
         *word = u64::from_be_bytes(*bytes);
     }
 
+    compress512_words(state, w, v);
+}
+
+// compress512_block for a block already in w, which the schedule overwrites.
+#[inline(always)]
+fn compress512_words(state: &mut [u64; 8], w: &mut [u64; 16], v: &mut [u64; 8]) {
     *v = *state;
 
     rounds512::<0>(v, w);

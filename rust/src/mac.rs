@@ -171,15 +171,30 @@ pub(crate) fn block_key<'a>(
     feature = "xmss"
 ))]
 pub(crate) fn hmac(hash: &HashAlgorithm, key: &[u8], data: &[u8], out: &mut [u8]) {
-    let mut hashed = [0; 64];
-
-    let key = block_key(hash, key, &mut hashed);
+    if key.len() > hash.block_size() {
+        return hmac_hashed_key(hash, key, data, out);
+    }
 
     match hash.kind {
         Kind::Sha256(iv) => sha2::hmac256(iv, key, data, out),
         Kind::Sha512(iv) => sha2::hmac512(iv, key, data, out),
         _ => unreachable!("HMAC is defined here over SHA-2 only"),
     }
+}
+
+// hmac under a key longer than a block, which it hashes first. Out of line, so that a key of at
+// most a block needs no buffer.
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[inline(never)]
+fn hmac_hashed_key(hash: &HashAlgorithm, key: &[u8], data: &[u8], out: &mut [u8]) {
+    let mut hashed = [0; 64];
+
+    hmac(hash, block_key(hash, key, &mut hashed), data, out);
 
     wipe(&mut hashed);
 }
