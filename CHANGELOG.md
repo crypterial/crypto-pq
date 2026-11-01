@@ -34,6 +34,11 @@ Implements specification 1.1 (draft).
   ([decision D-44](spec/decisions.md#decision-d-44)). Other processors keep 256-bit registers. The
   AVX-512VL kernel for one message swaps the halves of its d row with the integer VPSHUFD. On ARM64
   the NEON kernels rotate by 12 and 7 with USHR and SLI. Outputs are unchanged.
+- BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
+  inputs with one bounds check and its counters with no loop state on the stack, and a whole group
+  of eight writes its chaining values straight into the caller's buffer. On every architecture a
+  group of inputs that the kernels finish skips the scalar loop for the inputs left. Outputs are
+  unchanged.
 - BLAKE3 on x86-64 with AVX2 or SSE4.1: the kernels for one message keep the message in four
   registers and build each round's words from the previous round's with shuffles, unpacks and
   blends, as the reference SSE4.1 code does, instead of loading each word again from the block.

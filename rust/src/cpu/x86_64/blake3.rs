@@ -2205,25 +2205,30 @@ fn flags(table: &mut Table, many: &Many) {
     rows[many.blocks - 1][0] = MaybeUninit::new([end; 8]);
 }
 
-// The inputs of the lanes, `first` on: an index past the last input repeats the last one.
-fn lanes<'a, const L: usize>(
-    input: &'a [[u8; 64]],
+// The first block of the input of each lane, `first` on: an index past the last input repeats
+// the last one. One check that input holds the `count` inputs of `blocks` blocks each puts
+// `blocks` blocks behind every pointer, so the lanes need no check of their own.
+fn lanes<const L: usize>(
+    input: &[[u8; 64]],
     many: &Many,
     first: usize,
     count: usize,
-) -> [&'a [[u8; 64]]; L] {
+) -> [*const [u8; 64]; L] {
+    let input = &input[..count * many.blocks];
+
     core::array::from_fn(|l| {
         let lane = (first + l).min(count - 1);
 
-        &input[lane * many.blocks..(lane + 1) * many.blocks]
+        input.as_ptr().wrapping_add(lane * many.blocks)
     })
 }
 
-// The counters of the lanes into the table, low and high words.
+// The counters of the lanes into the table, low and high words. Indexed: with low and high
+// zipped, LLVM kept the iterator in the frame and reloaded it for each lane (x86-64 asm).
 fn counters<const L: usize>(table: &mut Table, many: &Many, first: usize, count: usize) {
     let [_, _, _, _, _, _, low, high, _, _] = &mut table.head;
 
-    for (l, (low, high)) in low.iter_mut().zip(high.iter_mut()).take(L).enumerate() {
+    for l in 0..L {
         let lane = (first + l).min(count - 1);
 
         let counter = if many.increment {
@@ -2232,9 +2237,9 @@ fn counters<const L: usize>(table: &mut Table, many: &Many, first: usize, count:
             many.counter
         };
 
-        *low = counter as u32;
+        low[l] = counter as u32;
 
-        *high = (counter >> 32) as u32;
+        high[l] = (counter >> 32) as u32;
     }
 }
 
@@ -2266,15 +2271,15 @@ fn hash8(input: &[[u8; 64]], many: &Many, table: &mut Table, first: usize, out: 
     // Written by the assembly before it reads it.
     let mut m = [MaybeUninit::<__m256i>::uninit(); 17];
 
-    let [l0, l1, l2, l3, l4, l5, l6, l7] = lanes.map(|lane| lane.as_ptr());
+    let [l0, l1, l2, l3, l4, l5, l6, l7] = lanes;
 
     // SAFETY: AVX2 instructions, which this function's target feature provides, on the vector
     // registers, all declared clobbered, and on the registers named below. The loop runs at least
     // once and reads the flags of each block from table's 16 rows, so it needs 1 <= blocks <= 16,
     // which hash_many_avx2, the only caller, checks. For every block offset below rcx = 64
-    // blocks, they read the 64 bytes there of each lane's input, which has `blocks` blocks; they
-    // read and write the 256 bytes of h and the 544 of m, and read table, at the offsets that the
-    // template names; no stack.
+    // blocks, they read the 64 bytes there of each lane's input, which has `blocks` blocks of
+    // input behind its pointer (lanes); they read and write the 256 bytes of h and the 544 of m,
+    // and read table, at the offsets that the template names; no stack.
     unsafe {
         vector_asm!(
             asm_hash!("ymm", "ymmword", 32, asm_quarter8, "{m} + 32 * 16"),
@@ -2288,15 +2293,23 @@ fn hash8(input: &[[u8; 64]], many: &Many, table: &mut Table, first: usize, out: 
         )
     };
 
-    let mut words = cvs8(&h);
+    // A whole group's chaining values go straight into out; the lanes past the last input repeat
+    // it, and their values are dropped.
+    let rest = &mut out[first..];
 
-    for (l, words) in words.iter().enumerate() {
-        if first + l < count {
-            out[first + l] = *words;
-        }
+    if let Some(group) = rest.first_chunk_mut::<8>() {
+        cvs8(&h, group);
+    } else {
+        let mut words = [[0; 32]; 8];
+
+        cvs8(&h, &mut words);
+
+        let len = rest.len();
+
+        rest.copy_from_slice(&words[..len]);
+
+        wipe(words.as_flattened_mut());
     }
-
-    wipe(words.as_flattened_mut());
 
     clear(&mut h, _mm256_setzero_si256());
 
@@ -2394,7 +2407,7 @@ fn hash4(input: &[[u8; 64]], many: &Many, table: &mut Table, first: usize, out: 
     // As in hash8.
     let mut m = [MaybeUninit::<__m128i>::uninit(); 17];
 
-    let [l0, l1, l2, l3] = lanes.map(|lane| lane.as_ptr());
+    let [l0, l1, l2, l3] = lanes;
 
     // SAFETY: as in hash8, for four lanes, 16-byte vectors, 128 bytes of h and 272 of m.
     unsafe {
@@ -2758,15 +2771,13 @@ fn transpose4x2(x: [__m256i; 4]) -> [__m256i; 4] {
     ]
 }
 
-// The eight words of each lane: word j of the lanes in h[j].
+// The eight words of lane l into out[l]: word j of the lanes in h[j].
 #[target_feature(enable = "avx2")]
 #[inline]
-fn cvs8(h: &[__m256i; 8]) -> [[u8; 32]; 8] {
+fn cvs8(h: &[__m256i; 8], out: &mut [[u8; 32]; 8]) {
     let low = transpose4x2([h[0], h[1], h[2], h[3]]);
 
     let high = transpose4x2([h[4], h[5], h[6], h[7]]);
-
-    let mut out = [[0; 32]; 8];
 
     for l in 0..4 {
         let first = _mm256_permute2x128_si256::<0x20>(low[l], high[l]);
@@ -2777,8 +2788,6 @@ fn cvs8(h: &[__m256i; 8]) -> [[u8; 32]; 8] {
 
         store256(second, &mut out[l + 4]);
     }
-
-    out
 }
 
 #[target_feature(enable = "avx2")]
