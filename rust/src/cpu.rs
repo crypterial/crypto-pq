@@ -135,6 +135,11 @@ mod arch {
     }
 
     #[inline(always)]
+    pub(crate) fn digest256(_: &[u32; 8], _: &[u8], _: u64, _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
     pub(crate) fn finish512(_: &mut [u64; 8], _: &[u8], _: u128) -> bool {
         false
     }
@@ -590,8 +595,8 @@ mod arch {
 }
 
 pub(crate) use arch::{
-    compress256, compress256_lanes, compress256_pair, compress512, compress512_pair, finish256,
-    finish512, hmac256, hmac256_keyed, hmac512, hmac512_keyed,
+    compress256, compress256_lanes, compress256_pair, compress512, compress512_pair, digest256,
+    finish256, finish512, hmac256, hmac256_keyed, hmac512, hmac512_keyed,
 };
 
 #[cfg(feature = "frodokem")]
@@ -1421,6 +1426,13 @@ mod kernel_count {
         let bits = 8 * data.len() as u64;
 
         tally.note("finish256", super::finish256(&mut state, &data, bits));
+
+        let mut digest = [0; 32];
+
+        tally.note(
+            "digest256",
+            super::digest256(&IV_256, &data, bits, &mut digest),
+        );
 
         let mut state = IV_512;
 

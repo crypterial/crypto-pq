@@ -391,6 +391,17 @@ pub(crate) fn pad<const BLOCK: usize>(
 pub(crate) fn finish256(state: &[u32; 8], absorbed: u64, data: &[u8], out: &mut [u8]) {
     let bits = absorbed.wrapping_add(data.len() as u64).wrapping_mul(8);
 
+    if !cpu::digest256(state, data, bits, out) {
+        finish256_state(state, data, bits, out);
+    }
+}
+
+// finish256 through a copy of the state, which store256 turns into the digest. Out of line on
+// x86-64, so that finish256 keeps no stack frame when digest256 stores the digest; inlined
+// elsewhere, where digest256 never does.
+#[cfg_attr(target_arch = "x86_64", inline(never))]
+#[cfg_attr(not(target_arch = "x86_64"), inline(always))]
+fn finish256_state(state: &[u32; 8], data: &[u8], bits: u64, out: &mut [u8]) {
     let mut state = *state;
 
     if !cpu::finish256(&mut state, data, bits) {
@@ -1171,13 +1182,17 @@ impl Sha512 {
     }
 }
 
+// Inline on x86-64, so that the drop of a hasher in another crate wipes the state without a call;
+// elsewhere as the methods of Hasher (hash.rs).
 impl Drop for Sha256 {
+    #[cfg_attr(target_arch = "x86_64", inline)]
     fn drop(&mut self) {
         wipe(&mut self.state);
     }
 }
 
 impl Drop for Sha512 {
+    #[cfg_attr(target_arch = "x86_64", inline)]
     fn drop(&mut self) {
         wipe(&mut self.state);
     }
@@ -1455,6 +1470,63 @@ mod tests {
                 "SHA-512/224, length {length}"
             );
         }
+    }
+
+    // The kernels that store the digest against the portable finish, for every length up to three
+    // blocks after a block already absorbed and both digest sizes, and finish256 for every size of
+    // out, which takes the other path where the kernel stores no such digest. finish256 runs
+    // first, as digest256 leaves the detection to it. Where there is no kernel, digest256 returns
+    // false.
+    #[test]
+    fn digest_kernel_matches_portable() {
+        let data: [u8; 3 * 64 + 1] = Inputs::new(7).bytes();
+
+        let mut accelerated = 0;
+
+        for length in 0..data.len() {
+            let message = &data[..length];
+
+            let bits = 8 * (64 + length as u64);
+
+            for (iv, size) in [(&IV_256, 32), (&IV_224, 28)] {
+                let mut state = *iv;
+
+                finish256_portable(&mut state, message, bits);
+
+                let mut expected = [0; 32];
+
+                store256(&state, &mut expected);
+
+                for taken in 0..=32 {
+                    let mut out = [0; 32];
+
+                    finish256(iv, 64, message, &mut out[..taken]);
+
+                    assert_eq!(
+                        out[..taken],
+                        expected[..taken],
+                        "out {taken}, length {length}"
+                    );
+                }
+
+                let mut out = [0; 32];
+
+                if cpu::digest256(iv, message, bits, &mut out[..size]) {
+                    let (digest, after) = out.split_at(size);
+
+                    assert_eq!(digest, &expected[..size], "size {size}, length {length}");
+
+                    assert!(after.iter().all(|&byte| byte == 0), "size {size}");
+
+                    accelerated += 1;
+                }
+            }
+        }
+
+        std::eprintln!(
+            "SHA-256 digests: {accelerated} of {} cases through a CPU kernel",
+            2 * data.len()
+        );
     }
 
     // The one-call HMAC kernels against the key states and the finish of the generic path, for

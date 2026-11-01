@@ -143,19 +143,58 @@ impl Engine {
                 feature = "lms",
                 feature = "xmss"
             ))]
-            Self::Sha512(engine) => engine.digest_into(out),
+            Self::Sha512(engine) => digest_sha512(engine, out),
             #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
-            Self::Keccak(engine) => engine.clone().read(out),
+            Self::Keccak(engine) => read_keccak(engine, out),
             #[cfg(feature = "blake2")]
             Self::Blake2b(engine) => engine.finish(out),
             #[cfg(feature = "blake2")]
             Self::Blake2s(engine) => engine.finish(out),
             #[cfg(feature = "ascon")]
-            Self::Ascon(sponge) => sponge.clone().read(out),
+            Self::Ascon(sponge) => read_ascon(sponge, out),
             #[cfg(feature = "blake3")]
-            Self::Blake3(hasher) => hasher.finish(out),
+            Self::Blake3(hasher) => finish_blake3(hasher, out),
         }
     }
+}
+
+// On x86-64 the arms that need the stack run in functions of their own: the sponges squeeze a
+// copy, SHA-512 passes an argument there and BLAKE3 builds its output block there. Inlined, they
+// gave digest_into a stack frame that every other engine paid for. Other targets keep them inline,
+// keep the arms of create and call the methods of Hasher: with all three as on x86-64, a SHA-256
+// hasher took about 13 cycles more per hash on Neoverse N2, in fewer instructions.
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[cfg_attr(target_arch = "x86_64", inline(never))]
+#[cfg_attr(not(target_arch = "x86_64"), inline(always))]
+fn digest_sha512(engine: &Sha512, out: &mut [u8]) {
+    engine.digest_into(out);
+}
+
+#[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
+#[cfg_attr(target_arch = "x86_64", inline(never))]
+#[cfg_attr(not(target_arch = "x86_64"), inline(always))]
+fn read_keccak(engine: &Keccak, out: &mut [u8]) {
+    engine.clone().read(out);
+}
+
+#[cfg(feature = "ascon")]
+#[cfg_attr(target_arch = "x86_64", inline(never))]
+#[cfg_attr(not(target_arch = "x86_64"), inline(always))]
+fn read_ascon(sponge: &ascon::Sponge, out: &mut [u8]) {
+    sponge.clone().read(out);
+}
+
+#[cfg(feature = "blake3")]
+#[cfg_attr(target_arch = "x86_64", inline(never))]
+#[cfg_attr(not(target_arch = "x86_64"), inline(always))]
+fn finish_blake3(hasher: &blake3::Hasher, out: &mut [u8]) {
+    hasher.finish(out);
 }
 
 // A caller buffer of another length fails, and is left as it was.
@@ -356,6 +395,7 @@ impl HashAlgorithm {
     }
 
     /// An incremental hasher.
+    #[cfg(not(target_arch = "x86_64"))]
     pub fn create(&self) -> Hasher {
         let engine = match &self.kind {
             #[cfg(any(
@@ -392,6 +432,41 @@ impl HashAlgorithm {
         }
     }
 
+    /// An incremental hasher.
+    #[cfg(target_arch = "x86_64")]
+    pub fn create(&self) -> Hasher {
+        let size = self.digest_size;
+
+        match &self.kind {
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
+            Kind::Sha256(iv) => create_sha256(iv, size),
+            #[cfg(any(
+                feature = "sha2",
+                feature = "ml-dsa",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
+            Kind::Sha512(iv) => create_sha512(iv, size),
+            #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
+            Kind::Sha3 => create_sha3(self.block_size(), size),
+            #[cfg(feature = "blake2")]
+            Kind::Blake2b(h) => create_blake2b(h, size),
+            #[cfg(feature = "blake2")]
+            Kind::Blake2s(h) => create_blake2s(h, size),
+            #[cfg(feature = "ascon")]
+            Kind::Ascon => create_ascon(size),
+            #[cfg(feature = "blake3")]
+            Kind::Blake3 => create_blake3(size),
+        }
+    }
+
     // The block size of HMAC's key blocks, and the rate of SHA-3.
     pub(crate) const fn block_size(&self) -> usize {
         match self.kind {
@@ -425,14 +500,103 @@ impl HashAlgorithm {
     }
 }
 
+// On x86-64 each kind of hasher is built by a function of its own, in the caller's slot. With the
+// arms in create, LLVM built every kind in one buffer on the stack, in the frame of BLAKE3's
+// hasher, and copied all of the largest kind from there, with loads that waited on stores of other
+// widths. Other targets keep the arms in create (digest_into's arms say why).
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn create_sha256(iv: &[u32; 8], size: usize) -> Hasher {
+    Hasher {
+        engine: Engine::Sha256(Sha256::new(iv)),
+        size,
+    }
+}
+
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn create_sha512(iv: &[u64; 8], size: usize) -> Hasher {
+    Hasher {
+        engine: Engine::Sha512(Sha512::new(iv)),
+        size,
+    }
+}
+
+#[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn create_sha3(rate: usize, size: usize) -> Hasher {
+    Hasher {
+        engine: Engine::Keccak(Keccak::new(rate, SHA3_SUFFIX)),
+        size,
+    }
+}
+
+#[cfg(feature = "blake2")]
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn create_blake2b(h: &[u64; 8], size: usize) -> Hasher {
+    Hasher {
+        engine: Engine::Blake2b(blake2::Engine::new(h)),
+        size,
+    }
+}
+
+#[cfg(feature = "blake2")]
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn create_blake2s(h: &[u32; 8], size: usize) -> Hasher {
+    Hasher {
+        engine: Engine::Blake2s(blake2::Engine::new(h)),
+        size,
+    }
+}
+
+#[cfg(feature = "ascon")]
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn create_ascon(size: usize) -> Hasher {
+    Hasher {
+        engine: Engine::Ascon(ascon::Sponge::new(&ascon::HASH256)),
+        size,
+    }
+}
+
+#[cfg(feature = "blake3")]
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn create_blake3(size: usize) -> Hasher {
+    Hasher {
+        engine: Engine::Blake3(Box::new(blake3::Hasher::hash())),
+        size,
+    }
+}
+
 /// An incremental hash computation, made by [`HashAlgorithm::create`].
 pub struct Hasher {
     engine: Engine,
     size: usize,
 }
 
+// update and digest_into inline on x86-64, as HashAlgorithm::digest_into, so that a caller calls
+// the engine's dispatcher directly (digest_into's arms say why not elsewhere).
 impl Hasher {
     /// Absorbs `data`.
+    #[cfg_attr(target_arch = "x86_64", inline)]
     pub fn update(&mut self, data: &[u8]) {
         self.engine.update(data);
     }
@@ -448,6 +612,7 @@ impl Hasher {
 
     /// The digest written into `out`, which must be the digest size of the algorithm. Fails with
     /// [`Error::InvalidLength`] if `out` has another length.
+    #[cfg_attr(target_arch = "x86_64", inline)]
     pub fn digest_into(&self, out: &mut [u8]) -> Result<(), Error> {
         check_length(out.len(), self.size)?;
 

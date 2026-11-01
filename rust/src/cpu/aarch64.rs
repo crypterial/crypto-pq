@@ -635,6 +635,12 @@ pub(crate) fn finish256(state: &mut [u32; 8], data: &[u8], bits: u64) -> bool {
     true
 }
 
+// The digest is stored from the state that finish256 leaves.
+#[inline(always)]
+pub(crate) fn digest256(_: &[u32; 8], _: &[u8], _: u64, _: &mut [u8]) -> bool {
+    false
+}
+
 #[allow(unsafe_code)]
 pub(crate) fn finish512(state: &mut [u64; 8], data: &[u8], bits: u128) -> bool {
     if !has(SHA3) {

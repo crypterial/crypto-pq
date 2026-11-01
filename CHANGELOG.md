@@ -60,6 +60,13 @@ Implements specification 1.1 (draft).
 - One-shot SHA-224, SHA-256, SHA-384 and SHA-512 hashes on ARM64 branch from the algorithm
   dispatch to their code before the stack frame that the paths of the other algorithms need.
   Outputs are unchanged.
+- SHA-224 and SHA-256 on x86-64 CPUs with the SHA extensions: one-shot digests, the digests of a
+  `Hasher` and the tags of HMAC-SHA-224 and HMAC-SHA-256 are stored from the kernel's registers,
+  with no copy of the state to swap and wipe, and a digest reaches the kernel with no stack frame.
+  On x86-64, `HashAlgorithm::create` builds each kind of `Hasher` in a function of its own, in the
+  caller's slot, the digest of a `Hasher` reaches its engine with no stack frame, and
+  `Hasher::update`, `Hasher::digest_into` and the wipe of a SHA-2 state on drop are inline.
+  Outputs are unchanged.
 - BLAKE2b, BLAKE2s and BLAKE3 on Arm Neoverse N2: one message runs in general registers with each
   rotation taken off the chain as an EOR with a rotated operand, and BLAKE3's vector code runs one
   group of four inputs, reading each round's message words where they are. Other cores keep their
