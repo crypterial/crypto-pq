@@ -671,8 +671,15 @@ ML-KEM reductions to [0, q), the ML-DSA reduction to the centered representative
 subtraction of q (in additions, subtractions, decoding, noise sampling and the compression of the
 message), the sign masks of ML-DSA Decompose, the constant-time equality of byte strings (with
 the FrodoKEM decapsulation choice), the byte equality of ML-DSA SampleInBall and the FrodoKEM
-noise sign. Constant items and the public twiddle factors use twins of the reductions without the
-barrier, since inline assembly cannot run in constant evaluation.
+noise sign. On the targets other than x86-64 and ARM64, SampleInBall runs its passes on the bytes
+of 64-bit words, eight lanes an operation, instead of a byte equality for each lane: the mask of a
+lane is the top bit of its byte in !(((x & 0x7F..) + 0x7F..) | x | 0x7F..), set only where that
+byte of x is zero, spread over the byte by a subtraction that borrows from no other byte. No single
+bit of the word decides it, so the compiler sees no choice between two values that it could make a
+select or a branch, and the rule does not apply; the secret byte that a step seeks passes the
+barrier once, before it is spread over the word. Constant items and the public twiddle factors use
+twins of the reductions without the barrier, since inline assembly cannot run in constant
+evaluation.
 
 Rationale: on riscv64gc, at opt-levels 1, 2, 3, s and z, ML-DSA signing (MakeHint and the
 addition of polynomials), ML-DSA key generation from a seed, the import of expanded ML-DSA keys
@@ -688,7 +695,12 @@ select. The rule therefore applies to every such mask, whether or not a scan of 
 compiler shows a branch. With the barriers, a scan of the machine code at opt-levels 1, 2, 3, s
 and z on riscv64gc, riscv32imac, i686, armv7, wasm32 and s390x (z10) finds no branch or select on
 secret data, and the x86-64 and ARM64 objects at opt-levels 3 and z, in the default, portable and
-constant-time builds, are equal to those before, function by function. Code size: at opt-level 3
+constant-time builds, are equal to those before, function by function. The word passes of
+SampleInBall, scanned in the same way, have none either: their branches and selects test step and
+loop counters, lengths, tau, the shift amounts of 64-bit words on 32-bit targets, and the
+declassified test for another block of the stream; with them ML-DSA signing executes 16 to 30
+percent fewer instructions on armv7 and i686 (counted under QEMU) and 33 to 40 percent fewer on
+wasm32 (wasmtime fuel). Code size: at opt-level 3
 the riscv64gc, s390x and i686 builds have 0.3, 0.9 and 1.2 percent fewer instructions; at
 opt-level z riscv64gc and i686 have 0.07 and 0.05 percent more, and s390x 0.03 percent fewer. The
 barrier itself emits no instruction except on WebAssembly and under Miri, where `black_box`
