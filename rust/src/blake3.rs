@@ -506,6 +506,12 @@ fn hash_many(input: &[u8], many: &Many, out: &mut [[u8; 32]]) {
         done += 2;
     }
 
+    // Nothing left, as after the kernels in most calls: the loop below would still cost a
+    // division, and its state a wipe of eight words.
+    if done == out.len() {
+        return;
+    }
+
     let mut state = [0; 8];
 
     for (i, (cv, bytes)) in out
