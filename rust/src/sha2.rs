@@ -332,12 +332,38 @@ fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
     compress256_portable(state, blocks, more);
 }
 
+// Whether compress256_portable takes each slice through a call of its own to one out-of-line loop
+// over its blocks. Over the chain of both slices, LLVM computed the whole schedule of a block
+// ahead of its rounds on wasm32, which Cranelift then spilled, and the rounds ran on their latency
+// alone (llvm-mca on the x86-64 code of Cranelift, Zen 3: SHA-256 676 cycles a block against 622,
+// SHA-512 855 against 772). Natively the loop over one slice spilled more on aarch64 (Cortex-A53,
+// SHA-256: 1164 cycles a block against 1145) and ran 0.7% more instructions on i686.
+const SLICE_CALLS: bool = cfg!(target_family = "wasm");
+
 // Out of line, so that the dispatch above, which a streaming update calls for every block or two,
 // keeps no frame of its own: inlined there, the portable rounds made every call to a CPU kernel
 // save six or seven registers and reserve about 200 bytes of stack first.
 #[inline(never)]
 fn compress256_portable(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
-    compress256_blocks(state, blocks.iter().chain(more));
+    if !SLICE_CALLS {
+        compress256_blocks(state, blocks.iter().chain(more));
+
+        return;
+    }
+
+    if !blocks.is_empty() {
+        compress256_slice(state, blocks);
+    }
+
+    if !more.is_empty() {
+        compress256_slice(state, more);
+    }
+}
+
+// compress256_blocks over one slice, for SLICE_CALLS.
+#[inline(never)]
+fn compress256_slice(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+    compress256_blocks(state, blocks);
 }
 
 // The portable compression of each block in turn. The schedule and the working variables are
@@ -1050,7 +1076,25 @@ fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
 // compress256_portable for SHA-512.
 #[inline(never)]
 fn compress512_portable(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
-    compress512_blocks(state, blocks.iter().chain(more));
+    if !SLICE_CALLS {
+        compress512_blocks(state, blocks.iter().chain(more));
+
+        return;
+    }
+
+    if !blocks.is_empty() {
+        compress512_slice(state, blocks);
+    }
+
+    if !more.is_empty() {
+        compress512_slice(state, more);
+    }
+}
+
+// compress256_slice for SHA-512.
+#[inline(never)]
+fn compress512_slice(state: &mut [u64; 8], blocks: &[[u8; 128]]) {
+    compress512_blocks(state, blocks);
 }
 
 // compress256_blocks for SHA-512.
@@ -1461,10 +1505,25 @@ mod tests {
 
             compress256_blocks(&mut expected, blocks);
 
-            let mut actual = state;
-
             // The blocks as one stream from two slices, split at every point in turn.
             let (first, more) = blocks.split_at(n / 3 % (blocks.len() + 1));
+
+            let mut portable = state;
+
+            compress256_portable(&mut portable, first, more);
+
+            assert_eq!(portable, expected, "portable, case {n}");
+
+            // The other form of the portable loop, whichever the target runs.
+            let mut slices = state;
+
+            compress256_slice(&mut slices, first);
+
+            compress256_slice(&mut slices, more);
+
+            assert_eq!(slices, expected, "slices, case {n}");
+
+            let mut actual = state;
 
             if cpu::compress256(&mut actual, first, more) {
                 assert_eq!(actual, expected, "case {n}");
@@ -1592,9 +1651,24 @@ mod tests {
 
             compress512_blocks(&mut expected, blocks);
 
-            let mut actual = state;
-
             let (first, more) = blocks.split_at(n / 3 % (blocks.len() + 1));
+
+            let mut portable = state;
+
+            compress512_portable(&mut portable, first, more);
+
+            assert_eq!(portable, expected, "portable, case {n}");
+
+            // The other form of the portable loop, whichever the target runs.
+            let mut slices = state;
+
+            compress512_slice(&mut slices, first);
+
+            compress512_slice(&mut slices, more);
+
+            assert_eq!(slices, expected, "slices, case {n}");
+
+            let mut actual = state;
 
             if cpu::compress512(&mut actual, first, more) {
                 assert_eq!(actual, expected, "case {n}");
