@@ -1,18 +1,133 @@
 // AES-128 and AES-256 encryption (FIPS 197). With the AES instructions (AES-NI on x86-64, the
 // ARMv8 AES instructions on arm64) the round keys are expanded and the blocks encrypted by them.
-// Everywhere else the portable code is constant time all the same: four blocks at once in
-// bitsliced form, eight 64-bit words of which word b holds bit b of all 64 bytes, with the S-box
-// circuit of Boyar and Peralta (eprint 2009/191), the design of BearSSL's aes_ct64. No table is
-// indexed by data and no branch depends on it.
+// Everywhere else the portable code is constant time all the same: a group of blocks in bitsliced
+// form, as BearSSL's aes_ct64 and aes_ct pack them, eight planes of which plane b holds bit b of
+// every byte. A u64 plane holds four blocks; a u32 plane holds two, on the 32-bit targets other
+// than WebAssembly, where a 64-bit operation takes two instructions. The S-box is the circuit of
+// Boyar and Peralta (eprint 2009/191). The rounds are fixsliced (Adomnicai and Peyrin, eprint
+// 2020/1123): they leave out ShiftRows, so that after round r the state is ShiftRows applied r
+// times fewer than FIPS 197 has it, and MixColumns and the round key of round r are moved to
+// match. No table is indexed by data and no branch depends on it.
 
 use alloc::boxed::Box;
+use core::ops::{BitAnd, BitOr, BitXor, BitXorAssign, Not, Shl, Shr};
 
 use crate::cpu;
 use crate::wipe::wipe;
 
+#[cfg(any(target_pointer_width = "64", target_family = "wasm"))]
+type Native = u64;
+
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+type Native = u32;
+
+// A bit plane of a group of BLOCKS blocks: bit ROW r + BLOCKS c + i of plane b is bit b of the
+// byte in row r, column c of block i. A row of the state is a run of ROW bits, a column of it a
+// run of BLOCKS bits.
+trait Plane:
+    Copy
+    + Default
+    + BitAnd<Output = Self>
+    + BitOr<Output = Self>
+    + BitXor<Output = Self>
+    + BitXorAssign
+    + Not<Output = Self>
+    + Shl<u32, Output = Self>
+    + Shr<u32, Output = Self>
+{
+    const BLOCKS: usize;
+
+    const ROW: u32 = 4 * Self::BLOCKS as u32;
+
+    // A rotation right by n bits.
+    fn rotate(self, n: u32) -> Self;
+
+    // The low ROW bits of pattern in each of the four rows.
+    fn rows(pattern: u32) -> Self;
+
+    // pattern in each byte.
+    fn bytes(pattern: u8) -> Self;
+
+    // The first BLOCKS blocks into the planes, in the order that ortho turns into bit planes.
+    fn spread(blocks: &[[u8; 16]], q: &mut [Self; 8]);
+
+    // The inverse of spread, into the first BLOCKS blocks.
+    fn gather(q: &[Self; 8], blocks: &mut [[u8; 16]]);
+}
+
+// As BearSSL's aes_ct64: words 0 and 1 of block i through q[i], words 2 and 3 through q[i + 4].
+impl Plane for u64 {
+    const BLOCKS: usize = 4;
+
+    fn rotate(self, n: u32) -> Self {
+        self.rotate_right(n)
+    }
+
+    fn rows(pattern: u32) -> Self {
+        u64::from(pattern as u16) * 0x0001_0001_0001_0001
+    }
+
+    fn bytes(pattern: u8) -> Self {
+        u64::from(pattern) * 0x0101_0101_0101_0101
+    }
+
+    #[inline(always)]
+    fn spread(blocks: &[[u8; 16]], q: &mut [u64; 8]) {
+        for (i, block) in blocks[..4].iter().enumerate() {
+            (q[i], q[i + 4]) = interleave_in(&words_of(block));
+        }
+    }
+
+    #[inline(always)]
+    fn gather(q: &[u64; 8], blocks: &mut [[u8; 16]]) {
+        for (i, block) in blocks[..4].iter_mut().enumerate() {
+            let words = interleave_out(q[i], q[i + 4]);
+
+            for (bytes, word) in block.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+                *bytes = word.to_le_bytes();
+            }
+        }
+    }
+}
+
+// As BearSSL's aes_ct: word w of block i in q[2w + i].
+impl Plane for u32 {
+    const BLOCKS: usize = 2;
+
+    fn rotate(self, n: u32) -> Self {
+        self.rotate_right(n)
+    }
+
+    fn rows(pattern: u32) -> Self {
+        (pattern & 0xFF) * 0x0101_0101
+    }
+
+    fn bytes(pattern: u8) -> Self {
+        u32::from(pattern) * 0x0101_0101
+    }
+
+    #[inline(always)]
+    fn spread(blocks: &[[u8; 16]], q: &mut [u32; 8]) {
+        for (i, block) in blocks[..2].iter().enumerate() {
+            for (w, word) in words_of(block).into_iter().enumerate() {
+                q[2 * w + i] = word;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn gather(q: &[u32; 8], blocks: &mut [[u8; 16]]) {
+        for (i, block) in blocks[..2].iter_mut().enumerate() {
+            for (w, bytes) in block.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                *bytes = q[2 * w + i].to_le_bytes();
+            }
+        }
+    }
+}
+
 // The round keys of one key: in FIPS 197 byte order for the AES instructions, or bitsliced, each
-// spread over four blocks, for the portable code; only the form in use is filled. They are on the
-// heap, so that moving an Aes moves a pointer and leaves no copy of them behind, and are wiped
+// in every block of a group, for the portable code; only the form in use is filled. They are on
+// the heap, so that moving an Aes moves a pointer and leaves no copy of them behind, and are wiped
 // when it is dropped.
 pub(crate) struct Aes {
     rounds: usize,
@@ -22,14 +137,14 @@ pub(crate) struct Aes {
 
 struct RoundKeys {
     fips: [[u8; 16]; 15],
-    bitsliced: [u64; 120],
+    bitsliced: [[Native; 8]; 15],
 }
 
 impl Drop for RoundKeys {
     fn drop(&mut self) {
         wipe(&mut self.fips);
 
-        wipe(&mut self.bitsliced);
+        wipe(self.bitsliced.as_flattened_mut());
     }
 }
 
@@ -57,7 +172,7 @@ impl Aes {
             rounds,
             keys: Box::new(RoundKeys {
                 fips: [[0; 16]; 15],
-                bitsliced: [0; 120],
+                bitsliced: [[0; 8]; 15],
             }),
             hardware: false,
         };
@@ -72,31 +187,10 @@ impl Aes {
 
         expand(key, &mut words[..4 * (rounds + 1)]);
 
-        for (r, keys) in aes.keys.bitsliced[..8 * (rounds + 1)]
-            .as_chunks_mut::<8>()
-            .0
-            .iter_mut()
-            .enumerate()
-        {
-            let mut q = [0; 8];
-
-            (q[0], q[4]) = interleave_in(&[
-                words[4 * r],
-                words[4 * r + 1],
-                words[4 * r + 2],
-                words[4 * r + 3],
-            ]);
-
-            (q[1], q[2], q[3]) = (q[0], q[0], q[0]);
-
-            (q[5], q[6], q[7]) = (q[4], q[4], q[4]);
-
-            ortho(&mut q);
-
-            keys.copy_from_slice(&q);
-
-            wipe(&mut q);
-        }
+        bitslice_keys(
+            &words[..4 * (rounds + 1)],
+            &mut aes.keys.bitsliced[..rounds + 1],
+        );
 
         wipe(&mut words);
 
@@ -121,61 +215,111 @@ impl Aes {
             return;
         }
 
-        for group in blocks.chunks_mut(4) {
-            let mut four = [[0; 16]; 4];
+        let keys = &self.keys.bitsliced[..self.rounds + 1];
 
-            four[..group.len()].copy_from_slice(group);
+        let (groups, rest) = blocks.as_chunks_mut::<{ Native::BLOCKS }>();
 
-            self.encrypt4(&mut four);
+        for group in groups {
+            encrypt_group(keys, group);
+        }
 
-            group.copy_from_slice(&four[..group.len()]);
+        if !rest.is_empty() {
+            let mut group = [[0; 16]; 4];
 
-            wipe(&mut four);
+            group[..rest.len()].copy_from_slice(rest);
+
+            encrypt_group(keys, &mut group);
+
+            rest.copy_from_slice(&group[..rest.len()]);
+
+            wipe(&mut group);
         }
     }
+}
 
-    fn encrypt4(&self, blocks: &mut [[u8; 16]; 4]) {
-        let mut q = [0; 8];
+// Encrypts the first P::BLOCKS blocks in place under the bitsliced round keys. Rounds 1 to 4 run
+// in the representations 1, 2, 3 and 0, and so on. The round before the last, 9 or 13, is in
+// representation 1, so ShiftRows twice, the one left out and that of the last round, brings the
+// state to the order of FIPS 197. The S-box and the other pieces are inlined here: a call would
+// pass the planes through memory.
+fn encrypt_group<P: Plane>(keys: &[[P; 8]], blocks: &mut [[u8; 16]]) {
+    let rounds = keys.len() - 1;
 
-        for (i, block) in blocks.iter().enumerate() {
-            (q[i], q[i + 4]) = interleave_in(&words_of(block));
+    let mut q = [P::default(); 8];
+
+    P::spread(blocks, &mut q);
+
+    ortho(&mut q);
+
+    add_round_key(&mut q, &keys[0]);
+
+    for r in (1..rounds - 1).step_by(4) {
+        round::<P, 1>(&mut q, &keys[r]);
+
+        round::<P, 2>(&mut q, &keys[r + 1]);
+
+        round::<P, 3>(&mut q, &keys[r + 2]);
+
+        round::<P, 0>(&mut q, &keys[r + 3]);
+    }
+
+    round::<P, 1>(&mut q, &keys[rounds - 1]);
+
+    sbox(&mut q);
+
+    shift_rows_2(&mut q);
+
+    add_round_key(&mut q, &keys[rounds]);
+
+    ortho(&mut q);
+
+    P::gather(&q, blocks);
+
+    wipe(&mut q);
+}
+
+// The expanded key as bitsliced round keys, each in every block of a group. Round key r but the
+// last is in the representation of round r, ShiftRows undone r times, and those after the first
+// carry the S-box constant 0x63, which the circuit leaves out and MixColumns passes unchanged.
+fn bitslice_keys<P: Plane>(words: &[u32], keys: &mut [[P; 8]]) {
+    let last = keys.len() - 1;
+
+    for (r, (key, words)) in keys.iter_mut().zip(words.as_chunks::<4>().0).enumerate() {
+        let mut block = [0; 16];
+
+        for (bytes, word) in block.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+            *bytes = word.to_le_bytes();
         }
+
+        let turns = if r < last { (4 - r % 4) % 4 } else { 0 };
+
+        let mut blocks = [shift_rows_bytes(&block, turns); 4];
+
+        let mut q = [P::default(); 8];
+
+        P::spread(&blocks, &mut q);
 
         ortho(&mut q);
 
-        add_round_key(&mut q, &self.keys.bitsliced[..8]);
-
-        for r in 1..self.rounds {
-            sbox(&mut q);
-
-            shift_rows(&mut q);
-
-            mix_columns(&mut q);
-
-            add_round_key(&mut q, &self.keys.bitsliced[8 * r..8 * r + 8]);
-        }
-
-        sbox(&mut q);
-
-        shift_rows(&mut q);
-
-        add_round_key(
-            &mut q,
-            &self.keys.bitsliced[8 * self.rounds..8 * self.rounds + 8],
-        );
-
-        ortho(&mut q);
-
-        for (i, block) in blocks.iter_mut().enumerate() {
-            let words = interleave_out(q[i], q[i + 4]);
-
-            for (bytes, word) in block.as_chunks_mut::<4>().0.iter_mut().zip(words) {
-                bytes.copy_from_slice(&word.to_le_bytes());
+        if r > 0 {
+            for b in [0, 1, 5, 6] {
+                q[b] = !q[b];
             }
         }
 
+        *key = q;
+
         wipe(&mut q);
+
+        wipe(&mut blocks);
+
+        wipe(&mut block);
     }
+}
+
+// ShiftRows applied n times to a block in FIPS 197 order, byte 4c + r in row r, column c.
+fn shift_rows_bytes(block: &[u8; 16], n: usize) -> [u8; 16] {
+    core::array::from_fn(|i| block[4 * ((i / 4 + n * (i % 4)) % 4) + i % 4])
 }
 
 fn words_of(block: &[u8; 16]) -> [u32; 4] {
@@ -208,11 +352,15 @@ fn expand(key: &[u8], w: &mut [u32]) {
     }
 }
 
-// SubWord: the S-box on the word placed as the first column of a block.
+// SubWord: the S-box on each byte of the word.
 fn sub_word(x: u32) -> u32 {
-    let mut q = [0; 8];
+    let mut blocks = [[0; 16]; 4];
 
-    q[0] = u64::from(x);
+    blocks[0][..4].copy_from_slice(&x.to_le_bytes());
+
+    let mut q: [Native; 8] = [0; 8];
+
+    Native::spread(&blocks, &mut q);
 
     ortho(&mut q);
 
@@ -220,9 +368,13 @@ fn sub_word(x: u32) -> u32 {
 
     ortho(&mut q);
 
-    let out = q[0] as u32;
+    Native::gather(&q, &mut blocks);
+
+    let out = u32::from_le_bytes(blocks[0][..4].try_into().unwrap()) ^ 0x6363_6363;
 
     wipe(&mut q);
+
+    wipe(&mut blocks);
 
     out
 }
@@ -256,57 +408,77 @@ fn interleave_out(q0: u64, q1: u64) -> [u32; 4] {
     })
 }
 
-// Swaps the bits of x selected by low with those of y selected by low << shift.
+// Swaps the bits of q[x] selected by low << shift with those of q[y] selected by low.
 #[inline(always)]
-fn swap(q: &mut [u64; 8], x: usize, y: usize, low: u64, shift: u32) {
-    let (a, b) = (q[x], q[y]);
+fn swap<P: Plane>(q: &mut [P; 8], x: usize, y: usize, low: P, shift: u32) {
+    let t = ((q[x] >> shift) ^ q[y]) & low;
 
-    q[x] = (a & low) | ((b & low) << shift);
+    q[y] ^= t;
 
-    q[y] = ((a >> shift) & low) | (b & !low);
+    q[x] ^= t << shift;
 }
 
-// Converts between four interleaved blocks and the bit planes; the transform is its own inverse.
-fn ortho(q: &mut [u64; 8]) {
+// Converts between the spread blocks and the bit planes; the transform is its own inverse.
+#[inline(always)]
+fn ortho<P: Plane>(q: &mut [P; 8]) {
     for i in [0, 2, 4, 6] {
-        swap(q, i, i + 1, 0x5555_5555_5555_5555, 1);
+        swap(q, i, i + 1, P::bytes(0x55), 1);
     }
 
     for i in [0, 1, 4, 5] {
-        swap(q, i, i + 2, 0x3333_3333_3333_3333, 2);
+        swap(q, i, i + 2, P::bytes(0x33), 2);
     }
 
     for i in 0..4 {
-        swap(q, i, i + 4, 0x0F0F_0F0F_0F0F_0F0F, 4);
+        swap(q, i, i + 4, P::bytes(0x0F), 4);
     }
 }
 
-fn add_round_key(q: &mut [u64; 8], key: &[u64]) {
+fn add_round_key<P: Plane>(q: &mut [P; 8], key: &[P; 8]) {
     for (x, k) in q.iter_mut().zip(key) {
-        *x ^= k;
+        *x ^= *k;
     }
 }
 
-fn shift_rows(q: &mut [u64; 8]) {
+// A round but the last, its ShiftRows left out: K of them so far, mod 4.
+#[inline(always)]
+fn round<P: Plane, const K: u32>(q: &mut [P; 8], key: &[P; 8]) {
+    sbox(q);
+
+    mix_columns::<P, K>(q);
+
+    add_round_key(q, key);
+}
+
+// Row r of a plane.
+fn row<P: Plane>(r: u32) -> P {
+    (!P::default() >> (3 * P::ROW)) << (P::ROW * r)
+}
+
+// ShiftRows twice: rows 1 and 3 turn by two columns, half a row, and rows 0 and 2 stay.
+fn shift_rows_2<P: Plane>(q: &mut [P; 8]) {
+    let half = P::ROW / 2;
+
+    let (stay, turn) = (row::<P>(0) | row(2), row::<P>(1) | row(3));
+
+    let low = P::rows((1 << half) - 1);
+
     for x in q.iter_mut() {
         let v = *x;
 
-        *x = (v & 0x0000_0000_0000_FFFF)
-            | ((v & 0x0000_0000_FFF0_0000) >> 4)
-            | ((v & 0x0000_0000_000F_0000) << 12)
-            | ((v & 0x0000_FF00_0000_0000) >> 8)
-            | ((v & 0x0000_00FF_0000_0000) << 8)
-            | ((v & 0xF000_0000_0000_0000) >> 12)
-            | ((v & 0x0FFF_0000_0000_0000) << 4);
+        *x = (v & stay) | ((v >> half) & turn & low) | ((v << half) & turn & !low);
     }
 }
 
-fn mix_columns(q: &mut [u64; 8]) {
-    let r: [u64; 8] = core::array::from_fn(|i| q[i].rotate_right(16));
+// MixColumns in representation K, where byte (r, c) of the state of FIPS 197 sits in column
+// c + K r (mod 4) of row r: output row r, column c takes row r + i from column c + K i.
+#[inline(always)]
+fn mix_columns<P: Plane, const K: u32>(q: &mut [P; 8]) {
+    let r: [P; 8] = core::array::from_fn(|i| turn::<P, K, 1>(q[i]));
 
     let [q0, q1, q2, q3, q4, q5, q6, q7] = *q;
 
-    let rot = |x: u64| x.rotate_right(32);
+    let rot = turn::<P, K, 2>;
 
     q[0] = q7 ^ r[7] ^ r[0] ^ rot(q0 ^ r[0]);
 
@@ -325,9 +497,27 @@ fn mix_columns(q: &mut [u64; 8]) {
     q[7] = q6 ^ r[6] ^ r[7] ^ rot(q7 ^ r[7]);
 }
 
-// The S-box on the eight bit planes, q[0] the least significant bit: the circuit of Boyar and
-// Peralta, 113 gates, which numbers the bits from the most significant one, x0 = q[7].
-fn sbox(q: &mut [u64; 8]) {
+// Row r of the result takes row r + I of x from column c + K I (mod 4): the rows turn and, unless
+// K I is a multiple of 4, the columns within each row.
+#[inline(always)]
+fn turn<P: Plane, const K: u32, const I: u32>(x: P) -> P {
+    let m = P::BLOCKS as u32 * (K * I % 4);
+
+    if m == 0 {
+        return x.rotate(P::ROW * I);
+    }
+
+    let low = P::rows((1 << (P::ROW - m)) - 1);
+
+    (x.rotate(P::ROW * I + m) & low) | (x.rotate(P::ROW * I + m - P::ROW) & !low)
+}
+
+// The S-box on the eight bit planes, q[0] the least significant bit, but for its constant 0x63:
+// the circuit of Boyar and Peralta, 32 AND and 83 XOR gates, which numbers the bits from the most
+// significant one, x0 = q[7], with XORs in place of its four XNORs. The round keys after the
+// first carry the constant instead, and SubWord adds it itself.
+#[inline(always)]
+fn sbox<P: Plane>(q: &mut [P; 8]) {
     let (x0, x1, x2, x3, x4, x5, x6, x7) = (q[7], q[6], q[5], q[4], q[3], q[2], q[1], q[0]);
 
     let y14 = x3 ^ x5;
@@ -548,9 +738,9 @@ fn sbox(q: &mut [u64; 8]) {
 
     q[7] = t59 ^ t63;
 
-    q[6] = !(t64 ^ s3);
+    q[6] = t64 ^ s3;
 
-    q[5] = !(t55 ^ t67);
+    q[5] = t55 ^ t67;
 
     q[4] = s3;
 
@@ -558,9 +748,9 @@ fn sbox(q: &mut [u64; 8]) {
 
     q[2] = t47 ^ t65;
 
-    q[1] = !(t56 ^ t62);
+    q[1] = t56 ^ t62;
 
-    q[0] = !(t48 ^ t60);
+    q[0] = t48 ^ t60;
 }
 
 #[cfg(test)]
@@ -614,7 +804,8 @@ mod tests {
 
     // The AESAVS known answers for ECB (KAT_AES.zip): GFSbox, KeySbox, VarKey and VarTxt for both
     // key sizes. Every record of the ENCRYPT and the DECRYPT sections is a key, a plaintext and
-    // its ciphertext, checked through the AES instructions and through the portable code.
+    // its ciphertext, checked through the AES instructions and through the portable code, with
+    // planes of both types.
     #[test]
     fn aesavs() {
         let mut checked = 0;
@@ -649,6 +840,17 @@ mod tests {
                             let mut block: [u8; 16] = plaintext[..].try_into().unwrap();
 
                             aes.encrypt_block(&mut block);
+
+                            assert_eq!(block[..], ciphertext[..], "{path}");
+                        }
+
+                        for encrypt in [
+                            encrypt_with::<u32> as fn(&[u8], &mut [u8; 16]),
+                            encrypt_with::<u64>,
+                        ] {
+                            let mut block: [u8; 16] = plaintext[..].try_into().unwrap();
+
+                            encrypt(&key, &mut block);
 
                             assert_eq!(block[..], ciphertext[..], "{path}");
                         }
@@ -703,6 +905,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    // The two plane types on random keys and four different blocks.
+    #[test]
+    fn planes_agree() {
+        let mut inputs = crate::cpu::testing::Inputs::new(0xAE6);
+
+        for n in 0..500 {
+            let key: [u8; 32] = inputs.bytes();
+
+            let key = &key[..if n % 2 == 0 { 16 } else { 32 }];
+
+            let blocks: [[u8; 16]; 4] = core::array::from_fn(|_| inputs.bytes());
+
+            let (mut wide, mut narrow) = (blocks, blocks);
+
+            encrypt_group(&keys_for::<u64>(key), &mut wide);
+
+            let keys = keys_for::<u32>(key);
+
+            for pair in narrow.as_chunks_mut::<2>().0 {
+                encrypt_group(&keys, pair);
+            }
+
+            assert_eq!(wide, narrow, "case {n}");
+        }
+    }
+
+    // The bitsliced round keys of key in planes of type P, whichever type the target uses.
+    fn keys_for<P: Plane>(key: &[u8]) -> alloc::vec::Vec<[P; 8]> {
+        let rounds = if key.len() == 16 { 10 } else { 14 };
+
+        let mut words = [0u32; 60];
+
+        expand(key, &mut words[..4 * (rounds + 1)]);
+
+        let mut keys = alloc::vec![[P::default(); 8]; rounds + 1];
+
+        bitslice_keys(&words[..4 * (rounds + 1)], &mut keys);
+
+        keys
+    }
+
+    // The block through the portable rounds in planes of type P, in every block of a group.
+    fn encrypt_with<P: Plane>(key: &[u8], block: &mut [u8; 16]) {
+        let mut group = [*block; 4];
+
+        encrypt_group(&keys_for::<P>(key), &mut group);
+
+        assert!(group[..P::BLOCKS].iter().all(|b| b == &group[0]));
+
+        *block = group[0];
     }
 
     fn words_of_bytes(words: &[u32]) -> [u8; 16] {
