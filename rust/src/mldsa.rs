@@ -1115,7 +1115,8 @@ fn unpack_mask_portable(bytes: &[u8], bits: u32, gamma1: i32, poly: &mut Poly) {
 // (14.1 item 5, D-72): no branch and no memory index depends on the stream, only on public step
 // numbers. The candidates are taken in order with a secret count, the inside-out shuffle runs on
 // the list of drawn positions, and the list is spread over the 256 coefficients last; each of
-// these steps is a pass of byte masks over a fixed range, which the compiler vectorizes. The
+// these steps is a pass of byte masks over a fixed range, which the compiler vectorizes on x86-64
+// and ARM64, and which runs on the bytes of 64-bit words elsewhere (sample_in_ball_words). The
 // challenge goes to poly.
 fn sample_in_ball(seed: &[u8], tau: usize, poly: &mut Poly) {
     let mut stream = shake256();
@@ -1143,6 +1144,10 @@ const LANES: [u8; 256] = {
 // The passes in code compiled for AVX2 where the processor has it (cpu::vector_scope), and in the
 // build's baseline elsewhere: the same source, so the same masks and no branch on the stream.
 fn sample_in_ball_from(mut squeeze: impl FnMut(&mut [u8; 136]), tau: usize, poly: &mut Poly) {
+    if WORD_PASSES {
+        return sample_in_ball_words(squeeze, tau, poly);
+    }
+
     if cpu::vector_scope(|| sample_in_ball_passes(&mut squeeze, tau, poly)).is_none() {
         sample_in_ball_passes(squeeze, tau, poly);
     }
@@ -1226,6 +1231,145 @@ fn sample_in_ball_passes(mut squeeze: impl FnMut(&mut [u8; 136]), tau: usize, po
     wipe(&mut block);
 
     wipe(&mut signs);
+
+    wipe(&mut drawn);
+
+    wipe(&mut positions);
+
+    wipe(&mut c);
+}
+
+// Whether SampleInBall runs its passes on words: where equal_byte takes its masks from
+// ct::sign_mask (D-79), whose barriers keep a pass of byte masks out of vector registers, so that
+// it runs a byte at a time.
+const WORD_PASSES: bool = !cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
+
+// Byte i of word k is 8k + i: the lane numbers 0 to 255 in 32 words.
+const LANE_WORDS: [u64; 32] = {
+    let mut words = [0; 32];
+
+    let mut k = 0;
+
+    while k < 32 {
+        let mut i = 0;
+
+        while i < 8 {
+            words[k] |= ((8 * k + i) as u64) << (8 * i);
+
+            i += 1;
+        }
+
+        k += 1;
+    }
+
+    words
+};
+
+// byte in each byte of a word.
+#[inline(always)]
+const fn spread(byte: u8) -> u64 {
+    byte as u64 * 0x0101_0101_0101_0101
+}
+
+// A secret byte in each byte of a word, through ct::barrier.
+#[inline(always)]
+fn sought(byte: u32) -> u64 {
+    spread(ct::barrier(byte) as u8)
+}
+
+// 0xFF in each byte of x that is zero, 0 in the others. The top bit of a byte of
+// ((x & 0x7F..) + 0x7F..) | x is clear only where the byte is zero, and the sum carries into no
+// other byte; the bit is then spread over its byte, which borrows from no other byte either.
+#[inline(always)]
+const fn zero_bytes(x: u64) -> u64 {
+    let low = 0x7F7F_7F7F_7F7F_7F7F;
+
+    let top = !(((x & low) + low) | x | low);
+
+    top | (top - (top >> 7))
+}
+
+// sample_in_ball_passes on the bytes of 64-bit words, eight lanes an operation, for WORD_PASSES:
+// the same passes in the same order, with the same results. A step takes the mask of each lane
+// from the zero byte of a word's xor with the byte sought, which is secret and passes ct::barrier
+// first. So the compiler sees no comparison of a value and no mask that is 0 or all ones, from
+// which it could form a select or a branch, and one barrier serves all the words of a step
+// instead of two for each lane. Only the slots below tau are read, so the steps over slots stop
+// at the word of the last.
+fn sample_in_ball_words(mut squeeze: impl FnMut(&mut [u8; 136]), tau: usize, poly: &mut Poly) {
+    let mut block = [0u8; 136];
+
+    squeeze(&mut block);
+
+    // Bit t: the sign of step t.
+    let signs = u64::from_le_bytes(*block.first_chunk().expect("eight bytes"));
+
+    let words = tau.div_ceil(8);
+
+    let mut drawn = [0u64; 8];
+
+    let mut count = 0u32;
+
+    let mut start = 8;
+
+    loop {
+        for &candidate in &block[start..] {
+            let (slot, value) = (sought(count), spread(candidate));
+
+            for (word, &lanes) in drawn[..words].iter_mut().zip(&LANE_WORDS) {
+                *word ^= (*word ^ value) & zero_bytes(lanes ^ slot);
+            }
+
+            count += (u32::from(candidate) + tau as u32)
+                .wrapping_sub(257)
+                .wrapping_sub(count)
+                >> 31;
+        }
+
+        if declassify_value(count.wrapping_sub(tau as u32) >> 31) == 0 {
+            break;
+        }
+
+        squeeze(&mut block);
+
+        start = 0;
+    }
+
+    let mut positions = [0u64; 8];
+
+    for t in 0..tau {
+        let (k, shift) = (t / 8, 8 * (t % 8));
+
+        let j = (drawn[k] >> shift) as u8;
+
+        let (from, to) = (sought(u32::from(j)), spread((256 - tau + t) as u8));
+
+        for word in &mut positions[..words] {
+            *word ^= (*word ^ to) & zero_bytes(*word ^ from);
+        }
+
+        positions[k] = (positions[k] & !(0xFF << shift)) | (u64::from(j) << shift);
+    }
+
+    let mut c = [0u64; 32];
+
+    for t in 0..tau {
+        let position = sought(u32::from((positions[t / 8] >> (8 * (t % 8))) as u8));
+
+        let sign = spread(1u8.wrapping_sub(((signs >> t) as u8 & 1) << 1));
+
+        for (word, &lanes) in c.iter_mut().zip(&LANE_WORDS) {
+            *word |= sign & zero_bytes(lanes ^ position);
+        }
+    }
+
+    for (xs, &word) in poly.as_chunks_mut::<8>().0.iter_mut().zip(&c) {
+        for (i, x) in xs.iter_mut().enumerate() {
+            *x = canonical(i32::from((word >> (8 * i)) as i8));
+        }
+    }
+
+    wipe(&mut block);
 
     wipe(&mut drawn);
 
@@ -2829,6 +2973,18 @@ mod tests {
         c.map(canonical)
     }
 
+    // The byte passes and the word passes of the constant-time SampleInBall on the streams that
+    // next gives, one each.
+    fn sample_in_ball_both_passes<S: FnMut(&mut [u8; 136])>(
+        mut next: impl FnMut() -> S,
+        tau: usize,
+    ) -> [Poly; 2] {
+        [
+            poly(|f| sample_in_ball_passes(next(), tau, f)),
+            poly(|f| sample_in_ball_words(next(), tau, f)),
+        ]
+    }
+
     // The two forms of SampleInBall on the 64 c~ values, of 200000 random ones, whose streams
     // reject more candidates before the last draw than the others do, and on those that need a
     // second SHAKE256 block if any.
@@ -2923,6 +3079,21 @@ mod tests {
                     poly(|f| sample_in_ball_public(seed, p.tau, f)) == expected,
                     "{p:?}, seed {n}, public"
                 );
+
+                // Both forms of the passes, whichever sample_in_ball runs on this target.
+                if n < seeds / 10 {
+                    let streams = || {
+                        let mut stream = shake256();
+
+                        stream.update(seed);
+
+                        move |block: &mut [u8; 136]| stream.read(block)
+                    };
+
+                    let forms = sample_in_ball_both_passes(streams, p.tau);
+
+                    assert!(forms == [expected; 2], "{p:?}, seed {n}, both passes");
+                }
             }
 
             // The first step takes only bytes up to 256 - tau, the lowest floor here.
@@ -2954,6 +3125,19 @@ mod tests {
                 });
 
                 assert!(actual == expected, "{p:?}, floor {floor}, stream {n}");
+
+                let streams = || {
+                    let mut inputs = Inputs::new(n as u64);
+
+                    move |block: &mut [u8; 136]| stream(&mut inputs, block)
+                };
+
+                let forms = sample_in_ball_both_passes(streams, p.tau);
+
+                assert!(
+                    forms == [expected; 2],
+                    "{p:?}, floor {floor}, stream {n}, both passes"
+                );
 
                 let mut third = Inputs::new(n as u64);
 
