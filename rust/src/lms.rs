@@ -238,7 +238,7 @@ fn digest_lanes<const L: usize>(
 
     let mut digests = [[0; 32]; L];
 
-    Sha256::new(&IV_256).finish_lanes(messages, length, &mut digests);
+    Sha256::new(&IV_256).finish_lanes(messages, length, &mut digests, &active);
 
     for (node, digest) in nodes.iter_mut().zip(&digests) {
         node[..n].copy_from_slice(&digest[..n]);
@@ -315,7 +315,7 @@ fn chain_lanes<const L: usize>(
 
     let mut states = [[0; L]; 8];
 
-    Sha256::new(&IV_256).finish_words(&mut blocks, &mut states);
+    Sha256::new(&IV_256).finish_words(&mut blocks, &mut states, &active);
 
     for (lane, node) in nodes.iter_mut().enumerate() {
         for (bytes, state) in node[..n].as_chunks_mut::<4>().0.iter_mut().zip(&states) {
@@ -565,7 +565,7 @@ fn chains_sha256(
 
             blocks[15] = [((23 + n) * 8) as u32; LANES];
 
-            engine.finish_words(&mut blocks, &mut x);
+            engine.finish_words(&mut blocks, &mut x, &lanes.map(|chain| chain.is_some()));
 
             for k in &mut k {
                 *k += 1;

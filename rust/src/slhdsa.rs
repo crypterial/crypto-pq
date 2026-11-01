@@ -516,7 +516,11 @@ impl<'a> Hashes<'a> {
 
         let mut digests = [[0; LANES]; 8];
 
-        states.small.finish_words(&mut blocks, &mut digests);
+        states.small.finish_words(
+            &mut blocks,
+            &mut digests,
+            &inputs.map(|input| input.is_some()),
+        );
 
         for (lane, node) in nodes.iter_mut().enumerate() {
             for (bytes, state) in node[..n].as_chunks_mut::<4>().0.iter_mut().zip(&digests) {
@@ -588,7 +592,11 @@ impl<'a> Hashes<'a> {
 
         let mut digests = [[0; LANES]; 8];
 
-        states.small.finish_words(&mut blocks, &mut digests);
+        states.small.finish_words(
+            &mut blocks,
+            &mut digests,
+            &inputs.map(|input| input.is_some()),
+        );
 
         for (lane, node) in nodes.iter_mut().enumerate() {
             if inputs[lane].is_some() {
@@ -624,7 +632,7 @@ impl<'a> Hashes<'a> {
 
                 let mut digest = [[0; 1]; 8];
 
-                small.finish_words(&mut blocks, &mut digest);
+                small.finish_words(&mut blocks, &mut digest, &[true]);
 
                 let mut out = [0; 32];
 
@@ -819,7 +827,7 @@ impl<'c> FLanes<'c> {
 
         states
             .small
-            .finish_words(&mut self.blocks, &mut self.digests);
+            .finish_words(&mut self.blocks, &mut self.digests, live);
     }
 
     // PK.seed, ADRS and the node fill 2n + 32 bytes, whole lanes, which the suffix follows.
