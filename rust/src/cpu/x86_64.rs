@@ -761,10 +761,13 @@ pub(crate) fn blake3_xof(
     let found = features();
 
     if among(found, AVX2) {
-        let wide = among(found, ZMM_LANES);
+        if among(found, ZMM_LANES) && out.len() >= 16 {
+            // SAFETY: as in blake3_many, with wide.
+            return unsafe { blake3::xof_zmm(cv, block, counter, info, out) };
+        }
 
         // SAFETY: as in blake3_many.
-        return unsafe { blake3::xof_avx2(cv, block, counter, info, out, wide) };
+        return unsafe { blake3::xof_avx2(cv, block, counter, info, out) };
     }
 
     if among(found, SSE41) {

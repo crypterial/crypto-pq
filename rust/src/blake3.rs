@@ -2322,7 +2322,9 @@ mod tests {
         for (n, &length) in lengths.iter().enumerate() {
             let data = &data[..length];
 
-            let size = [32, 1, 64, 65, 300, 1031][n % 6];
+            // 1863 bytes are output blocks for a group of sixteen, then one of eight and one of
+            // four, one more block and part of one.
+            let size = [32, 1, 64, 65, 300, 1031, 1863][n % 7];
 
             let context = &context[..[0, 47, 1024, 1025, 1100][n % 5]];
 
