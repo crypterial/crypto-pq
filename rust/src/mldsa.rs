@@ -674,7 +674,7 @@ fn rej_ntt_poly(
 
         for (i, (a, count)) in out.iter_mut().zip(&mut counts).enumerate() {
             if *count < 256 {
-                sample_uniform(sponges.lanes(i), a, count);
+                sample_uniform(&sponges.lanes(i), a, count);
             }
         }
     }
@@ -732,7 +732,7 @@ fn rej_bounded_poly(sponges: &mut Sponges, seed: &[u8], first: usize, eta: i32, 
 
         for (i, (a, count)) in out.iter_mut().zip(&mut counts).enumerate() {
             if *count < 256 {
-                sample_bounded(sponges.lanes(i), eta, a, count);
+                sample_bounded(&sponges.lanes(i), eta, a, count);
             }
         }
     }

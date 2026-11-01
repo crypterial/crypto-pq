@@ -700,7 +700,7 @@ impl<'c> FLanes<'c> {
                     .as_chunks::<8>()
                     .0
                     .get(i)
-                    .map_or(0, |b| u64::from_le_bytes(*b))
+                    .map_or(0, |b| keccak::to_lane(u64::from_le_bytes(*b)))
             }),
             adrs: [[0; 32]; LANES],
             nodes: [[[0; 32]; LANES]; 2],
@@ -856,18 +856,18 @@ impl<'c> FLanes<'c> {
                 let adrs = self.adrs[lane].as_chunks::<8>().0;
 
                 for (word, bytes) in state[words..words + 4].iter_mut().zip(adrs) {
-                    *word = u64::from_le_bytes(*bytes);
+                    *word = keccak::to_lane(u64::from_le_bytes(*bytes));
                 }
 
                 let node = self.nodes[self.side][lane][..n].as_chunks::<8>().0;
 
                 for (word, bytes) in state[words + 4..].iter_mut().zip(node) {
-                    *word = u64::from_le_bytes(*bytes);
+                    *word = keccak::to_lane(u64::from_le_bytes(*bytes));
                 }
 
-                state[2 * words + 4] = 0x1F;
+                state[2 * words + 4] = keccak::to_lane(0x1F);
 
-                state[16] = 0x80 << 56;
+                state[16] = keccak::to_lane(0x80 << 56);
             });
 
             sponges.squeeze([true; MAX_SPONGES]);
@@ -875,7 +875,7 @@ impl<'c> FLanes<'c> {
             for (i, &lane) in group.iter().enumerate() {
                 let node = self.nodes[self.side][lane][..n].as_chunks_mut::<8>().0;
 
-                for (bytes, word) in node.iter_mut().zip(sponges.lanes::<4>(i)) {
+                for (bytes, word) in node.iter_mut().zip(sponges.lanes::<4>(i).iter()) {
                     *bytes = word.to_le_bytes();
                 }
             }

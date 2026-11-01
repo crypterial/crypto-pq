@@ -318,7 +318,7 @@ fn shake_rows_portable(
         sponges.squeeze(active);
 
         for (l, row) in rows.chunks_exact_mut(n).enumerate() {
-            let lanes = sponges.lanes::<21>(l);
+            let lanes = &*sponges.lanes::<21>(l);
 
             for (entries, &lane) in row[offset..].as_chunks_mut::<4>().0.iter_mut().zip(lanes) {
                 *entries = array::from_fn(|k| (lane >> (16 * k)) as u16);

@@ -1,3 +1,5 @@
+use core::ops::Deref;
+
 use crate::cpu;
 use crate::sha2::low_bytes;
 use crate::wipe::{registers, wipe, wipe_unless_optimized};
@@ -37,6 +39,7 @@ pub(crate) const ROTATIONS: [u32; 25] = [
 // comes from lane (x + 3y) % 5 + 5x of a. The column parities that theta needs in the next round
 // are summed as the lanes of e are written, so few values stay live and little spills to memory.
 // A CPU kernel runs these rounds beside its vector rounds.
+#[cfg(any(target_pointer_width = "64", target_family = "wasm"))]
 #[inline(always)]
 pub(crate) fn round(a: &[u64; 25], e: &mut [u64; 25], parities: &mut [u64; 5], constant: u64) {
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
@@ -84,6 +87,7 @@ pub(crate) fn round(a: &[u64; 25], e: &mut [u64; 25], parities: &mut [u64; 5], c
 }
 
 // The column parities that the first round's theta needs.
+#[cfg(any(target_pointer_width = "64", target_family = "wasm"))]
 pub(crate) fn parities(state: &[u64; 25]) -> [u64; 5] {
     registers!(
         |x| state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
@@ -143,6 +147,7 @@ pub(crate) const fn permute_const(a: &mut [u64; 25]) {
     }
 }
 
+#[cfg(any(target_pointer_width = "64", target_family = "wasm"))]
 pub(crate) fn permute(state: &mut [u64; 25]) {
     let mut parities = parities(state);
 
@@ -157,6 +162,236 @@ pub(crate) fn permute(state: &mut [u64; 25]) {
     wipe_unless_optimized!(&mut e);
 
     wipe_unless_optimized!(&mut parities);
+}
+
+// Where a lane takes two registers, the state holds each lane bit-interleaved: the even bits of
+// the lane in its low word and the odd bits in its high word, bit j of a word being bit 2j or
+// 2j + 1 of the lane. A rotation of the lane is then one 32-bit rotation of each word, the words
+// swapped for an odd amount, where the 64-bit rotation took two shifts and an OR a word. Lanes
+// enter the state through to_lane and leave it through from_lane, so that a permutation converts
+// none; both are the identity where a lane takes one register.
+#[cfg(any(target_pointer_width = "64", target_family = "wasm"))]
+#[inline(always)]
+pub(crate) const fn to_lane(lane: u64) -> u64 {
+    lane
+}
+
+#[cfg(any(target_pointer_width = "64", target_family = "wasm"))]
+#[inline(always)]
+pub(crate) const fn from_lane(lane: u64) -> u64 {
+    lane
+}
+
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+#[inline(always)]
+pub(crate) const fn to_lane(lane: u64) -> u64 {
+    let low = unzip(lane as u32);
+
+    let high = unzip((lane >> 32) as u32);
+
+    ((low & 0xffff) | (high << 16)) as u64 | (((low >> 16) | (high & 0xffff_0000)) as u64) << 32
+}
+
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+#[inline(always)]
+pub(crate) const fn from_lane(lane: u64) -> u64 {
+    let (even, odd) = (lane as u32, (lane >> 32) as u32);
+
+    let low = zip((even & 0xffff) | (odd << 16));
+
+    let high = zip((even >> 16) | (odd & 0xffff_0000));
+
+    low as u64 | (high as u64) << 32
+}
+
+// The even bits of x in its low half, in order, and its odd bits in its high half: four exchanges
+// of bit groups, each of the bits of x at the masked positions with the bits a distance above.
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+#[inline(always)]
+const fn unzip(mut x: u32) -> u32 {
+    let mut t = (x ^ (x >> 1)) & 0x2222_2222;
+
+    x ^= t ^ (t << 1);
+
+    t = (x ^ (x >> 2)) & 0x0c0c_0c0c;
+
+    x ^= t ^ (t << 2);
+
+    t = (x ^ (x >> 4)) & 0x00f0_00f0;
+
+    x ^= t ^ (t << 4);
+
+    t = (x ^ (x >> 8)) & 0x0000_ff00;
+
+    x ^ t ^ (t << 8)
+}
+
+// The inverse of unzip: the same exchanges in the opposite order, as each is its own inverse.
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+#[inline(always)]
+const fn zip(mut x: u32) -> u32 {
+    let mut t = (x ^ (x >> 8)) & 0x0000_ff00;
+
+    x ^= t ^ (t << 8);
+
+    t = (x ^ (x >> 4)) & 0x00f0_00f0;
+
+    x ^= t ^ (t << 4);
+
+    t = (x ^ (x >> 2)) & 0x0c0c_0c0c;
+
+    x ^= t ^ (t << 2);
+
+    t = (x ^ (x >> 1)) & 0x2222_2222;
+
+    x ^ t ^ (t << 1)
+}
+
+// The parities of each round come from its input, and each output plane from its source lanes
+// alone, half a plane at a time, so that only those stay live. The words are in memory, where
+// the wipe reaches them.
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+pub(crate) fn permute(state: &mut [u64; 25]) {
+    let mut a = state.map(|lane| [lane as u32, (lane >> 32) as u32]);
+
+    let mut e = [[0; 2]; 25];
+
+    let mut theta = [[0; 2]; 5];
+
+    core::hint::black_box((&mut a, &mut e, &mut theta));
+
+    for constants in INTERLEAVED_CONSTANTS.as_chunks::<2>().0 {
+        round_interleaved(&a, &mut e, &mut theta, constants[0]);
+
+        round_interleaved(&e, &mut a, &mut theta, constants[1]);
+    }
+
+    *state = a.map(|[even, odd]| u64::from(even) | u64::from(odd) << 32);
+
+    wipe(&mut a);
+
+    wipe(&mut e);
+
+    wipe(&mut theta);
+}
+
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+const INTERLEAVED_CONSTANTS: [[u32; 2]; 24] = {
+    let mut constants = [[0; 2]; 24];
+
+    let mut i = 0;
+
+    while i < 24 {
+        let lane = to_lane(ROUND_CONSTANTS[i]);
+
+        constants[i] = [lane as u32, (lane >> 32) as u32];
+
+        i += 1;
+    }
+
+    constants
+};
+
+// The parities go to theta one column half at a time, and theta's D values replace them, so that
+// each value is stored before the next column is loaded.
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+#[inline(always)]
+fn round_interleaved(
+    a: &[[u32; 2]; 25],
+    e: &mut [[u32; 2]; 25],
+    theta: &mut [[u32; 2]; 5],
+    constant: [u32; 2],
+) {
+    for x in 0..5 {
+        for h in 0..2 {
+            order();
+
+            theta[x][h] = a[x][h] ^ a[x + 5][h] ^ a[x + 10][h] ^ a[x + 15][h] ^ a[x + 20][h];
+        }
+    }
+
+    order();
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut c = *theta;
+
+    for x in 0..5 {
+        let (before, after) = (c[(x + 4) % 5], c[(x + 1) % 5]);
+
+        theta[x] = [before[0] ^ after[1].rotate_left(1), before[1] ^ after[0]];
+    }
+
+    wipe_unless_optimized!(&mut c);
+
+    half_plane::<0, 0>(a, theta, e, constant[0]);
+
+    half_plane::<0, 1>(a, theta, e, constant[1]);
+
+    half_plane::<1, 0>(a, theta, e, 0);
+
+    half_plane::<1, 1>(a, theta, e, 0);
+
+    half_plane::<2, 0>(a, theta, e, 0);
+
+    half_plane::<2, 1>(a, theta, e, 0);
+
+    half_plane::<3, 0>(a, theta, e, 0);
+
+    half_plane::<3, 1>(a, theta, e, 0);
+
+    half_plane::<4, 0>(a, theta, e, 0);
+
+    half_plane::<4, 1>(a, theta, e, 0);
+}
+
+// Word H of plane Y of a round's output, Y and H constants so that every index and rotation
+// amount is one. Bit 2j of a lane rotated by 2k + 1 is bit 2(j - k - 1) + 1 of the lane, and bit
+// 2j + 1 is bit 2(j - k): the even word of the result is the odd word rotated by k + 1, and the odd
+// word the even one rotated by k.
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+#[inline(always)]
+fn half_plane<const Y: usize, const H: usize>(
+    a: &[[u32; 2]; 25],
+    d: &[[u32; 2]; 5],
+    e: &mut [[u32; 2]; 25],
+    constant: u32,
+) {
+    order();
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut b: [u32; 5] = registers!(
+        |x| {
+            let source = (x + 3 * Y) % 5 + 5 * x;
+
+            let rotation = ROTATIONS[source];
+
+            let (word, amount) = match (rotation % 2, H) {
+                (0, _) => (H, rotation / 2),
+                (_, 0) => (1, rotation / 2 + 1),
+                _ => (0, rotation / 2),
+            };
+
+            (a[source][word] ^ d[source % 5][word]).rotate_left(amount)
+        };
+        0 1 2 3 4
+    );
+
+    for x in 0..5 {
+        let word = b[x] ^ (!b[(x + 1) % 5] & b[(x + 2) % 5]);
+
+        e[x + 5 * Y][H] = if x == 0 { word ^ constant } else { word };
+    }
+
+    wipe_unless_optimized!(&mut b);
+}
+
+// A point that LLVM moves no load or store across, so that it loads the words of a column or a
+// plane where they are used: it otherwise loaded them all at the start of a round and spilled
+// them, with fourteen registers on 32-bit Arm.
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+#[inline(always)]
+fn order() {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 // One state through a CPU kernel where there is one.
@@ -174,7 +409,7 @@ fn xor_bytes(state: &mut [u64; 25], position: &mut usize, mut bytes: &[u8]) {
             return;
         };
 
-        state[*position / 8] ^= u64::from(byte) << (8 * (*position % 8));
+        state[*position / 8] ^= to_lane(u64::from(byte) << (8 * (*position % 8)));
 
         *position += 1;
 
@@ -184,13 +419,13 @@ fn xor_bytes(state: &mut [u64; 25], position: &mut usize, mut bytes: &[u8]) {
     let (lanes, tail) = bytes.as_chunks::<8>();
 
     for (lane, chunk) in state[*position / 8..].iter_mut().zip(lanes) {
-        *lane ^= u64::from_le_bytes(*chunk);
+        *lane ^= to_lane(u64::from_le_bytes(*chunk));
     }
 
     *position += 8 * lanes.len();
 
     for &byte in tail {
-        state[*position / 8] ^= u64::from(byte) << (8 * (*position % 8));
+        state[*position / 8] ^= to_lane(u64::from(byte) << (8 * (*position % 8)));
 
         *position += 1;
     }
@@ -274,17 +509,17 @@ impl Sponges {
 
             assert!(position < rate, "the message must fit in one block");
 
-            state[position / 8] ^= u64::from(suffix) << (8 * (position % 8));
+            state[position / 8] ^= to_lane(u64::from(suffix) << (8 * (position % 8)));
 
             // The rate is a multiple of 8, so its last byte is the top byte of a lane.
-            state[rate / 8 - 1] ^= 0x80 << 56;
+            state[rate / 8 - 1] ^= to_lane(0x80 << 56);
         }
     }
 
     // start for messages that the caller writes as whole lanes: fill(i, state) receives the zero
     // state of sponge i and writes its message with the suffix and the padding, which must leave
-    // room for the rate's last byte. Callers whose messages are lanes already, such as SLH-DSA's
-    // chains, skip the bytes of start.
+    // room for the rate's last byte, each lane through to_lane. Callers whose messages are lanes
+    // already, such as SLH-DSA's chains, skip the bytes of start.
     pub(crate) fn start_lanes(
         &mut self,
         rate: usize,
@@ -413,13 +648,23 @@ impl Sponges {
     }
 
     // The lanes of the block that sponge i squeezed last, in output order on every target.
+    #[cfg(any(target_pointer_width = "64", target_family = "wasm"))]
     #[inline(always)]
-    pub(crate) fn lanes<const LANES: usize>(&self, i: usize) -> &[u64; LANES] {
+    pub(crate) fn lanes<const LANES: usize>(&self, i: usize) -> impl Deref<Target = [u64; LANES]> {
         assert!(8 * LANES <= self.rate, "lanes beyond the rate");
 
         self.states[i]
-            .first_chunk()
+            .first_chunk::<LANES>()
             .expect("the rate is at most 21 lanes")
+    }
+
+    // A copy of the lanes through from_lane, which the state holds bit-interleaved.
+    #[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+    #[inline(always)]
+    pub(crate) fn lanes<const LANES: usize>(&self, i: usize) -> impl Deref<Target = [u64; LANES]> {
+        assert!(8 * LANES <= self.rate, "lanes beyond the rate");
+
+        Lanes(core::array::from_fn(|j| from_lane(self.states[i][j])))
     }
 
     // The first out.len() bytes of the block that sponge i squeezed last.
@@ -429,12 +674,33 @@ impl Sponges {
         let (chunks, tail) = out.as_chunks_mut::<8>();
 
         for (chunk, lane) in chunks.iter_mut().zip(&self.states[i]) {
-            *chunk = lane.to_le_bytes();
+            *chunk = from_lane(*lane).to_le_bytes();
         }
 
         if !tail.is_empty() {
-            low_bytes(self.states[i][chunks.len()], tail);
+            low_bytes(from_lane(self.states[i][chunks.len()]), tail);
         }
+    }
+}
+
+// Lanes of a squeezed block as Sponges::lanes returns them where the state holds lanes
+// bit-interleaved: secret output, wiped when dropped.
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+struct Lanes<const LANES: usize>([u64; LANES]);
+
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+impl<const LANES: usize> Deref for Lanes<LANES> {
+    type Target = [u64; LANES];
+
+    fn deref(&self) -> &[u64; LANES] {
+        &self.0
+    }
+}
+
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
+impl<const LANES: usize> Drop for Lanes<LANES> {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
     }
 }
 
@@ -492,8 +758,9 @@ impl Keccak {
         Self::resume([0; 25], rate, suffix)
     }
 
-    // A sponge whose input so far has left `state` at a block boundary. resume and state move
-    // states by value, so they are only for public ones: the cSHAKE and KMAC prefixes.
+    // A sponge whose input so far has left `state`, in the form of to_lane, at a block boundary.
+    // resume and state move states by value, so they are only for public ones: the cSHAKE and
+    // KMAC prefixes.
     pub(crate) const fn resume(state: [u64; 25], rate: usize, suffix: u8) -> Self {
         Self {
             state,
@@ -575,9 +842,10 @@ impl Keccak {
 
         let last = self.rate - 1;
 
-        self.state[self.position / 8] ^= u64::from(self.suffix) << (8 * (self.position % 8));
+        self.state[self.position / 8] ^=
+            to_lane(u64::from(self.suffix) << (8 * (self.position % 8)));
 
-        self.state[last / 8] ^= 0x80 << (8 * (last % 8));
+        self.state[last / 8] ^= to_lane(0x80 << (8 * (last % 8)));
 
         permute(&mut self.state);
 
@@ -647,7 +915,7 @@ impl Keccak {
                 return;
             };
 
-            *byte = (self.state[self.position / 8] >> (8 * (self.position % 8))) as u8;
+            *byte = (from_lane(self.state[self.position / 8]) >> (8 * (self.position % 8))) as u8;
 
             self.position += 1;
 
@@ -657,13 +925,13 @@ impl Keccak {
         let (lanes, tail) = out.as_chunks_mut::<8>();
 
         for (chunk, lane) in lanes.iter_mut().zip(&self.state[self.position / 8..]) {
-            *chunk = lane.to_le_bytes();
+            *chunk = from_lane(*lane).to_le_bytes();
         }
 
         self.position += 8 * lanes.len();
 
         for byte in tail {
-            *byte = (self.state[self.position / 8] >> (8 * (self.position % 8))) as u8;
+            *byte = (from_lane(self.state[self.position / 8]) >> (8 * (self.position % 8))) as u8;
 
             self.position += 1;
         }
@@ -1181,13 +1449,13 @@ mod tests {
                 None => inputs.words(),
             };
 
-            let mut expected = state;
+            let mut expected = state.map(to_lane);
 
             permute(&mut expected);
 
             permute_const(&mut state);
 
-            assert_eq!(state, expected, "case {n}");
+            assert_eq!(state, expected.map(from_lane), "case {n}");
         }
     }
 
