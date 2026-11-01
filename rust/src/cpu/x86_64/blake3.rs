@@ -1403,10 +1403,11 @@ mod rows_pair {
 
 // The row form with AVX-512VL on xmm registers: each rotation is one VPRORD, which takes the
 // chain of a half step from eight cycles to six where the AVX2 form rotates by 12 and 7 with two
-// shifts and an OR. The message words of a round stay in two ymm registers, the vectors of its
-// four half steps in lane order, and two VPERMT2D take them to the next round's order, in place
-// of the AVX2 form's sixteen broadcasts and 84 blends per block, which LLVM spilled. The EVEX
-// instructions are inline assembly in AVX2 code (evex.rs).
+// shifts and an OR. In digest1 and compress, the message words of a round stay in two ymm
+// registers, the vectors of its four half steps in lane order, and two VPERMT2D take them to the
+// next round's order, in place of the AVX2 form's sixteen broadcasts and 84 blends per block,
+// which LLVM spilled; their EVEX instructions are inline assembly in AVX2 code (evex.rs). A chain
+// of blocks is one block of assembly (chain_rows).
 mod rows_vl {
     use super::super::evex::{permute2, ror32};
     use super::*;
@@ -1566,6 +1567,137 @@ mod rows_vl {
         ]
     }
 
+    /// Blocks of a chain on cv, in the row form of the blake3 crate's AVX-512 assembly for one
+    /// input (its hash_many), instruction for instruction: the state's rows in xmm0 to xmm3 and
+    /// the message's in xmm4 to xmm7, permuted with thirteen shuffles and blends between the
+    /// rounds of a loop of seven, the chaining value in xmm0 and xmm1 from block to block. The
+    /// intrinsics form, its message in two ymm registers and two VPERMT2D a round, took 50.7 ns a
+    /// block of a 1 KiB hash on Granite Rapids and 61.2 on Emerald Rapids, against 46.2 and 55.7
+    /// for rscrypto, which runs this assembly there, and 63.4 against 62.2 on AMD Zen 4. The first
+    /// block takes the flags first, the others rest, and the last end besides; each is length
+    /// bytes long.
+    ///
+    /// # Safety
+    ///
+    /// As for chain, and blocks is not empty.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    #[allow(unsafe_code)]
+    unsafe fn chain_rows(
+        cv: &mut [u32; 8],
+        blocks: &[[u8; 64]],
+        counter: u64,
+        length: u32,
+        [first, rest, end]: [u32; 3],
+    ) {
+        let [iv, _] = IV_256.as_chunks::<4>().0 else {
+            unreachable!("eight words are two groups of four")
+        };
+
+        // SAFETY: AVX-512VL instructions, which the CPU has, on xmm0 to xmm9, declared clobbered,
+        // and on xmm14 and xmm15, read only. They read the 32 bytes of cv and the 64 bytes of each
+        // of the blocks, at least one, and write cv; no stack.
+        unsafe {
+            core::arch::asm!(
+                "vmovdqu xmm0, xmmword ptr [{cv}]",
+                "vmovdqu xmm1, xmmword ptr [{cv} + 16]",
+                ".p2align 5",
+                "2:",
+                "mov {t:e}, {flags:e}",
+                "or {t:e}, {end:e}",
+                "add {offset}, 64",
+                "cmp {offset}, {total}",
+                "cmovne {t:e}, {flags:e}",
+                "vpinsrd xmm3, xmm14, {t:e}, 3",
+                "vmovdqa xmm2, xmm15",
+                "vmovups xmm8, xmmword ptr [{blocks} + {offset} - 64]",
+                "vmovups xmm9, xmmword ptr [{blocks} + {offset} - 48]",
+                "vshufps xmm4, xmm8, xmm9, 136",
+                "vshufps xmm5, xmm8, xmm9, 221",
+                "vmovups xmm8, xmmword ptr [{blocks} + {offset} - 32]",
+                "vmovups xmm9, xmmword ptr [{blocks} + {offset} - 16]",
+                "vshufps xmm6, xmm8, xmm9, 136",
+                "vshufps xmm7, xmm8, xmm9, 221",
+                "vpshufd xmm6, xmm6, 0x93",
+                "vpshufd xmm7, xmm7, 0x93",
+                "mov {rounds:e}, 7",
+                "3:",
+                "vpaddd xmm0, xmm0, xmm4",
+                "vpaddd xmm0, xmm0, xmm1",
+                "vpxord xmm3, xmm3, xmm0",
+                "vprord xmm3, xmm3, 16",
+                "vpaddd xmm2, xmm2, xmm3",
+                "vpxord xmm1, xmm1, xmm2",
+                "vprord xmm1, xmm1, 12",
+                "vpaddd xmm0, xmm0, xmm5",
+                "vpaddd xmm0, xmm0, xmm1",
+                "vpxord xmm3, xmm3, xmm0",
+                "vprord xmm3, xmm3, 8",
+                "vpaddd xmm2, xmm2, xmm3",
+                "vpxord xmm1, xmm1, xmm2",
+                "vprord xmm1, xmm1, 7",
+                "vpshufd xmm0, xmm0, 0x93",
+                "vpshufd xmm3, xmm3, 0x4E",
+                "vpshufd xmm2, xmm2, 0x39",
+                "vpaddd xmm0, xmm0, xmm6",
+                "vpaddd xmm0, xmm0, xmm1",
+                "vpxord xmm3, xmm3, xmm0",
+                "vprord xmm3, xmm3, 16",
+                "vpaddd xmm2, xmm2, xmm3",
+                "vpxord xmm1, xmm1, xmm2",
+                "vprord xmm1, xmm1, 12",
+                "vpaddd xmm0, xmm0, xmm7",
+                "vpaddd xmm0, xmm0, xmm1",
+                "vpxord xmm3, xmm3, xmm0",
+                "vprord xmm3, xmm3, 8",
+                "vpaddd xmm2, xmm2, xmm3",
+                "vpxord xmm1, xmm1, xmm2",
+                "vprord xmm1, xmm1, 7",
+                "vpshufd xmm0, xmm0, 0x39",
+                "vpshufd xmm3, xmm3, 0x4E",
+                "vpshufd xmm2, xmm2, 0x93",
+                "dec {rounds:e}",
+                "jz 4f",
+                "vshufps xmm8, xmm4, xmm5, 214",
+                "vpshufd xmm9, xmm4, 0x0F",
+                "vpshufd xmm4, xmm8, 0x39",
+                "vshufps xmm8, xmm6, xmm7, 250",
+                "vpblendd xmm9, xmm9, xmm8, 0xAA",
+                "vpunpcklqdq xmm8, xmm7, xmm5",
+                "vpblendd xmm8, xmm8, xmm6, 0x88",
+                "vpshufd xmm8, xmm8, 0x78",
+                "vpunpckhdq xmm5, xmm5, xmm7",
+                "vpunpckldq xmm6, xmm6, xmm5",
+                "vpshufd xmm7, xmm6, 0x1E",
+                "vmovdqa xmm5, xmm9",
+                "vmovdqa xmm6, xmm8",
+                "jmp 3b",
+                "4:",
+                "vpxor xmm0, xmm0, xmm2",
+                "vpxor xmm1, xmm1, xmm3",
+                "mov {flags:e}, {rest:e}",
+                "cmp {offset}, {total}",
+                "jne 2b",
+                "vmovdqu xmmword ptr [{cv}], xmm0",
+                "vmovdqu xmmword ptr [{cv} + 16], xmm1",
+                cv = in(reg) cv.as_mut_ptr(),
+                blocks = in(reg) blocks.as_ptr(),
+                total = in(reg) 64 * blocks.len(),
+                offset = inout(reg) 0usize => _,
+                flags = inout(reg) first => _,
+                rest = in(reg) rest,
+                end = in(reg) end,
+                t = out(reg) _,
+                rounds = out(reg) _,
+                in("xmm14") _mm_set_epi64x(i64::from(length), counter as i64),
+                in("xmm15") load128(iv),
+                out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _, out("xmm4") _,
+                out("xmm5") _, out("xmm6") _, out("xmm7") _, out("xmm8") _, out("xmm9") _,
+                options(nostack),
+            )
+        };
+    }
+
     /// As rows!'s chain.
     ///
     /// # Safety
@@ -1581,48 +1713,14 @@ mod rows_vl {
         [first, end]: [u32; 2],
         last: crate::blake3::Last,
     ) {
-        let [low, high] = cv.as_chunks_mut::<4>().0 else {
-            unreachable!("eight words are two groups of four")
-        };
-
-        let mut h = [load128(low), load128(high)];
-
-        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-        let mut m = [_mm256_setzero_si256(); 2];
-
-        let whole = blocks.len();
-
-        let body = blocks.iter().enumerate().map(|(i, block)| {
-            let mut f = flags;
-
-            if i == 0 {
-                f |= first;
-            }
-
-            if i + 1 == whole {
-                f |= end;
-            }
-
-            (block, 64, f)
-        });
-
-        for (block, length, f) in body.chain(last) {
-            let mut row = start(h, counter, length, f);
-
-            rounds(&mut row, block, &mut m);
-
-            h = [_mm_xor_si128(row[0], row[2]), _mm_xor_si128(row[1], row[3])];
-
-            wipe_unless_optimized!(words_of(&mut row));
+        // SAFETY (both calls): as for this function, with at least one block.
+        if !blocks.is_empty() {
+            unsafe { chain_rows(cv, blocks, counter, 64, [flags | first, flags, end]) };
         }
 
-        store128(h[0], low);
-
-        store128(h[1], high);
-
-        wipe_unless_optimized!(words_of(&mut h));
-
-        wipe_unless_optimized!(words_of(&mut m));
+        if let Some((block, length, f)) = last {
+            unsafe { chain_rows(cv, core::slice::from_ref(block), counter, length, [f, f, 0]) };
+        }
     }
 
     /// As rows!'s digest1.
@@ -2143,7 +2241,7 @@ fn rounds4(v: &mut [__m128i; 16], m: &[__m128i; 16]) {
 // blocks are written, and the assembly reads no others: zeroing all of them cost a kilobyte of
 // stores per call.
 #[repr(C, align(32))]
-struct Table {
+pub(super) struct Table {
     head: [[u32; 8]; 10],
     flags: [[MaybeUninit<[u32; 8]>; 2]; 16],
 }
@@ -2314,6 +2412,44 @@ fn hash8(input: &[[u8; 64]], many: &Many, table: &mut Table, first: usize, out: 
     clear(&mut h, _mm256_setzero_si256());
 
     clear(&mut m, MaybeUninit::new(_mm256_setzero_si256()));
+}
+
+// hash_many's inputs `first` to `first + 7` as hash8 hashes them, with the eight-lane AVX-512VL
+// kernel of blake3_zmm.rs.
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+fn hash8_vl(
+    input: &[[u8; 64]],
+    many: &Many,
+    table: &mut Table,
+    first: usize,
+    out: &mut [[u8; 32]],
+) {
+    let count = out.len();
+
+    let lanes = lanes::<8>(input, many, first, count);
+
+    counters::<8>(table, many, first, count);
+
+    let rest = &mut out[first..];
+
+    // SAFETY (both calls): hash_many_avx2 calls hash8_vl only when wide is set, which is on a CPU
+    // with AVX-512F and AVX-512VL whose registers the operating system saves (zmm_lanes() is
+    // tested with AVX512 only); 1 <= blocks <= 16, as hash_many_avx2 checks; lanes() puts `blocks`
+    // blocks of input behind each pointer.
+    if let Some(group) = rest.first_chunk_mut::<8>() {
+        unsafe { super::blake3_zmm::hash8_ymm(&lanes, many.blocks, many.key, table, group) };
+    } else {
+        let mut words = [[0; 32]; 8];
+
+        unsafe { super::blake3_zmm::hash8_ymm(&lanes, many.blocks, many.key, table, &mut words) };
+
+        let len = rest.len();
+
+        rest.copy_from_slice(&words[..len]);
+
+        wipe(words.as_flattened_mut());
+    }
 }
 
 // The flags of the blocks into the table of the 512-bit kernel, as flags() does for Table.
@@ -3020,7 +3156,8 @@ mod lanes_avx2_4 {
 // or four as four, two side by side in the row form if `pair`; returns how many it hashed, from
 // the first on. One input left, and two without `pair`, go back to the caller: one through the
 // dispatch of the row form's chain, two through the scalar code.
-// wide: sixteen inputs at a time with the 512-bit kernel first, on a core of zmm_lanes()'s table.
+// wide: sixteen inputs at a time with the 512-bit kernel first, on a core of zmm_lanes()'s table,
+// and eight with the eight-lane AVX-512VL kernel.
 #[target_feature(enable = "avx2")]
 pub(super) fn hash_many_avx2(
     input: &[u8],
@@ -3052,6 +3189,15 @@ pub(super) fn hash_many_avx2(
         };
 
         flags(&mut table, many);
+
+        // On a wide core the eight AVX-512VL lanes take three or four inputs too: llvm-mca 19
+        // models them at 297 cycles a block on Sapphire Rapids, hash4's four AVX2 lanes at 369
+        // (312 and 315 on Zen 4).
+        while wide && count - done >= 3 {
+            hash8_vl(input, many, &mut table, done, out);
+
+            done = count.min(done + 8);
+        }
 
         while count - done >= 5 {
             hash8(input, many, &mut table, done, out);
@@ -3151,25 +3297,22 @@ pub(super) fn xof_zmm(
 ) -> usize {
     let (groups, _) = out.as_chunks_mut::<16>();
 
-    let mut table = Table16::new();
+    let sixteen = 16 * groups.len();
 
-    table.length = length;
+    if !groups.is_empty() {
+        let mut table = Table16::new();
 
-    table.flags[0] = flags;
+        table.length = length;
 
-    let mut next = counter;
-
-    for group in groups.iter_mut() {
-        counters16(&mut table, next, true);
+        table.flags[0] = flags;
 
         // SAFETY: blake3_xof calls this only on a CPU with AVX-512F and AVX-512VL whose registers
-        // the operating system saves (zmm_lanes() is tested with AVX512 only).
-        unsafe { super::blake3_zmm::xof16_zmm(cv, block, &table, group) };
-
-        next = next.wrapping_add(16);
+        // the operating system saves (zmm_lanes() is tested with AVX512 only), and groups holds
+        // one group or more.
+        unsafe { super::blake3_zmm::xof16_zmm(cv, block, counter, &mut table, groups) };
     }
 
-    let sixteen = 16 * groups.len();
+    let next = counter.wrapping_add(sixteen as u64);
 
     sixteen + xof_avx2(cv, block, next, [length, flags], &mut out[sixteen..])
 }
