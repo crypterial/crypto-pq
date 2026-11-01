@@ -7,7 +7,7 @@ use crate::cpu::{self, Field, Pack, Prepare};
 use crate::ct::{self, declassify, declassify_value};
 use crate::keccak::{self, Keccak, MAX_SPONGES, Sponges};
 use crate::primitives::{shake256, shake256_into};
-use crate::wipe::{SecretBytes, wipe, wipe_unless_optimized};
+use crate::wipe::{SecretBytes, registers, wipe, wipe_unless_optimized};
 
 pub(crate) const Q: i32 = 8380417;
 
@@ -260,31 +260,209 @@ fn ntt(w: &mut Poly) {
     }
 }
 
+// A twiddle factor and its product by q^-1 mod 2^32, as montgomery takes them.
+type Twiddle = (i32, i32);
+
+const fn twiddle(zeta: i32) -> Twiddle {
+    (zeta, zeta.wrapping_mul(QINV))
+}
+
+// The twiddle factors of the portable transforms in the order in which their passes take them.
+// A pass loads a group of coefficients, runs the butterflies of several layers on it and stores
+// it: the layers of distances 128, 64 and 32 on eight coefficients 32 apart, those of 16, 8 and 4
+// on eight coefficients 4 apart in each run of 32, and those of 2 and 1 on each run of four. So a
+// coefficient is loaded and stored three times instead of eight, and no factor is computed.
+struct Twiddles {
+    outer: [Twiddle; 7],
+    middle: [[Twiddle; 7]; 8],
+    inner: [[Twiddle; 3]; 64],
+}
+
+const fn forward_twiddle(m: usize) -> Twiddle {
+    twiddle(centered_const(ZETAS[m]))
+}
+
+const fn inverse_twiddle(m: usize) -> Twiddle {
+    twiddle(-centered_const(ZETAS[m]))
+}
+
+// The zetas of ntt_portable: layer by layer, the block at offset s of the layer of distance d
+// takes zeta 256 / (2d) + s / (2d).
+static FORWARD: Twiddles = {
+    let mut outer = [(0, 0); 7];
+
+    let mut i = 0;
+
+    while i < 7 {
+        outer[i] = forward_twiddle(1 + i);
+
+        i += 1;
+    }
+
+    let mut middle = [[(0, 0); 7]; 8];
+
+    let mut b = 0;
+
+    while b < 8 {
+        middle[b] = [
+            forward_twiddle(8 + b),
+            forward_twiddle(16 + 2 * b),
+            forward_twiddle(17 + 2 * b),
+            forward_twiddle(32 + 4 * b),
+            forward_twiddle(33 + 4 * b),
+            forward_twiddle(34 + 4 * b),
+            forward_twiddle(35 + 4 * b),
+        ];
+
+        b += 1;
+    }
+
+    let mut inner = [[(0, 0); 3]; 64];
+
+    let mut c = 0;
+
+    while c < 64 {
+        inner[c] = [
+            forward_twiddle(64 + c),
+            forward_twiddle(128 + 2 * c),
+            forward_twiddle(129 + 2 * c),
+        ];
+
+        c += 1;
+    }
+
+    Twiddles {
+        outer,
+        middle,
+        inner,
+    }
+};
+
+// The negated zetas of inverse_ntt_portable: the block at offset s of the layer of distance d
+// takes zeta 512 / (2d) - 1 - s / (2d). The last, of the layer of distance 128, is multiplied by
+// INVERSE_SCALE, so that the differences of that layer take one Montgomery product instead of one
+// with the factor and one with the scale.
+static INVERSE: Twiddles = {
+    let mut inner = [[(0, 0); 3]; 64];
+
+    let mut c = 0;
+
+    while c < 64 {
+        inner[c] = [
+            inverse_twiddle(255 - 2 * c),
+            inverse_twiddle(254 - 2 * c),
+            inverse_twiddle(127 - c),
+        ];
+
+        c += 1;
+    }
+
+    let mut middle = [[(0, 0); 7]; 8];
+
+    let mut b = 0;
+
+    while b < 8 {
+        middle[b] = [
+            inverse_twiddle(63 - 4 * b),
+            inverse_twiddle(62 - 4 * b),
+            inverse_twiddle(61 - 4 * b),
+            inverse_twiddle(60 - 4 * b),
+            inverse_twiddle(31 - 2 * b),
+            inverse_twiddle(30 - 2 * b),
+            inverse_twiddle(15 - b),
+        ];
+
+        b += 1;
+    }
+
+    let scaled = montgomery_mul(-centered_const(ZETAS[1]), INVERSE_SCALE);
+
+    Twiddles {
+        outer: [
+            inverse_twiddle(7),
+            inverse_twiddle(6),
+            inverse_twiddle(5),
+            inverse_twiddle(4),
+            inverse_twiddle(3),
+            inverse_twiddle(2),
+            twiddle(centered_const(freeze_const(scaled))),
+        ],
+        middle,
+        inner,
+    }
+};
+
+// The butterfly of ntt_portable on v[i] and v[j], for i < j.
+#[inline(always)]
+fn forward_butterfly<const N: usize>(v: &mut [i32; N], i: usize, j: usize, z: Twiddle) {
+    let t = montgomery(v[j], z.0, z.1);
+
+    v[j] = v[i] - t;
+
+    v[i] += t;
+}
+
+// Three layers of ntt_portable on eight coefficients: v[i] with v[i + 4] by z[0], v[i] with
+// v[i + 2] by z[1] and z[2], neighbours by z[3] to z[6].
+#[inline(always)]
+fn forward_eight(v: &mut [i32; 8], z: &[Twiddle; 7]) {
+    for i in 0..4 {
+        forward_butterfly(v, i, i + 4, z[0]);
+    }
+
+    for i in [0, 1, 4, 5] {
+        forward_butterfly(v, i, i + 2, z[1 + i / 4]);
+    }
+
+    for i in [0, 2, 4, 6] {
+        forward_butterfly(v, i, i + 1, z[3 + i / 2]);
+    }
+}
+
+// The last two layers of ntt_portable on a run of four coefficients.
+#[inline(always)]
+fn forward_four(v: &mut [i32; 4], z: &[Twiddle; 3]) {
+    for i in 0..2 {
+        forward_butterfly(v, i, i + 2, z[0]);
+    }
+
+    for i in [0, 2] {
+        forward_butterfly(v, i, i + 1, z[1 + i / 2]);
+    }
+}
+
+// The layers of FIPS 204 Algorithm 41, three at a time (see Twiddles).
 fn ntt_portable(w: &mut Poly) {
-    let mut m = 0;
+    let (rows, _) = w.as_chunks_mut::<32>();
 
-    let mut length = 128;
+    for j in 0..32 {
+        let mut v = registers!(|t| rows[t][j]; 0 1 2 3 4 5 6 7);
 
-    while length >= 1 {
-        for start in (0..256).step_by(2 * length) {
-            m += 1;
+        forward_eight(&mut v, &FORWARD.outer);
 
-            let zeta = centered_const(ZETAS[m]);
-
-            let zeta_qinv = zeta.wrapping_mul(QINV);
-
-            let (low, high) = w[start..start + 2 * length].split_at_mut(length);
-
-            for (a, b) in low.iter_mut().zip(high) {
-                let t = montgomery(*b, zeta, zeta_qinv);
-
-                *b = *a - t;
-
-                *a += t;
-            }
+        for (row, &x) in rows.iter_mut().zip(&v) {
+            row[j] = x;
         }
 
-        length /= 2;
+        wipe_unless_optimized!(&mut v);
+    }
+
+    for (row, z) in rows.iter_mut().zip(&FORWARD.middle) {
+        for j in 0..4 {
+            let mut v = registers!(|t| row[j + 4 * t]; 0 1 2 3 4 5 6 7);
+
+            forward_eight(&mut v, z);
+
+            for (t, &x) in v.iter().enumerate() {
+                row[j + 4 * t] = x;
+            }
+
+            wipe_unless_optimized!(&mut v);
+        }
+    }
+
+    for (run, z) in w.as_chunks_mut::<4>().0.iter_mut().zip(&FORWARD.inner) {
+        forward_four(run, z);
     }
 }
 
@@ -297,41 +475,91 @@ fn inverse_ntt(w: &mut Poly) {
     }
 }
 
-fn inverse_ntt_portable(w: &mut Poly) {
-    for x in w.iter_mut() {
-        *x = reduce(*x);
+// The butterfly of inverse_ntt_portable on v[i] and v[j], for i < j.
+#[inline(always)]
+fn inverse_butterfly<const N: usize>(v: &mut [i32; N], i: usize, j: usize, z: Twiddle) {
+    let t = v[i];
+
+    v[i] = t + v[j];
+
+    v[j] = montgomery(t - v[j], z.0, z.1);
+}
+
+// The first two layers of inverse_ntt_portable on a run of four coefficients.
+#[inline(always)]
+fn inverse_four(v: &mut [i32; 4], z: &[Twiddle; 3]) {
+    for i in [0, 2] {
+        inverse_butterfly(v, i, i + 1, z[i / 2]);
     }
 
-    let mut m = 256;
+    for i in 0..2 {
+        inverse_butterfly(v, i, i + 2, z[2]);
+    }
+}
 
-    let mut length = 1;
+// Two layers of inverse_ntt_portable on eight coefficients, neighbours by z[0] to z[3] and v[i]
+// with v[i + 2] by z[4] and z[5]; the caller runs the third, v[i] with v[i + 4] by z[6].
+#[inline(always)]
+fn inverse_two_layers(v: &mut [i32; 8], z: &[Twiddle; 7]) {
+    for i in [0, 2, 4, 6] {
+        inverse_butterfly(v, i, i + 1, z[i / 2]);
+    }
 
-    while length < 256 {
-        for start in (0..256).step_by(2 * length) {
-            m -= 1;
+    for i in [0, 1, 4, 5] {
+        inverse_butterfly(v, i, i + 2, z[4 + i / 4]);
+    }
+}
 
-            let zeta = -centered_const(ZETAS[m]);
-
-            let zeta_qinv = zeta.wrapping_mul(QINV);
-
-            let (low, high) = w[start..start + 2 * length].split_at_mut(length);
-
-            for (a, b) in low.iter_mut().zip(high) {
-                let t = *a;
-
-                *a = t + *b;
-
-                *b = montgomery(t - *b, zeta, zeta_qinv);
-            }
+// The layers of FIPS 204 Algorithm 42 in the passes of ntt_portable, in reverse.
+fn inverse_ntt_portable(w: &mut Poly) {
+    for (run, z) in w.as_chunks_mut::<4>().0.iter_mut().zip(&INVERSE.inner) {
+        for x in run.iter_mut() {
+            *x = reduce(*x);
         }
 
-        length *= 2;
+        inverse_four(run, z);
     }
 
-    let scale_qinv = INVERSE_SCALE.wrapping_mul(QINV);
+    let (rows, _) = w.as_chunks_mut::<32>();
 
-    for x in w.iter_mut() {
-        *x = freeze(montgomery(*x, INVERSE_SCALE, scale_qinv));
+    for (row, z) in rows.iter_mut().zip(&INVERSE.middle) {
+        for j in 0..4 {
+            let mut v = registers!(|t| row[j + 4 * t]; 0 1 2 3 4 5 6 7);
+
+            inverse_two_layers(&mut v, z);
+
+            for i in 0..4 {
+                inverse_butterfly(&mut v, i, i + 4, z[6]);
+            }
+
+            for (t, &x) in v.iter().enumerate() {
+                row[j + 4 * t] = x;
+            }
+
+            wipe_unless_optimized!(&mut v);
+        }
+    }
+
+    let (scale, last) = (twiddle(INVERSE_SCALE), INVERSE.outer[6]);
+
+    for j in 0..32 {
+        let mut v = registers!(|t| rows[t][j]; 0 1 2 3 4 5 6 7);
+
+        inverse_two_layers(&mut v, &INVERSE.outer);
+
+        for i in 0..4 {
+            let (a, b) = (v[i], v[i + 4]);
+
+            v[i] = freeze(montgomery(a + b, scale.0, scale.1));
+
+            v[i + 4] = freeze(montgomery(a - b, last.0, last.1));
+        }
+
+        for (row, &x) in rows.iter_mut().zip(&v) {
+            row[j] = x;
+        }
+
+        wipe_unless_optimized!(&mut v);
     }
 }
 
