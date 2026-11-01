@@ -39,6 +39,10 @@ Implements specification 1.1 (draft).
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
   group of inputs that the kernels finish skips the scalar loop for the inputs left. Outputs are
   unchanged.
+- BLAKE2b and BLAKE2s on Arm Neoverse N2: each round loads its message words from the block where
+  it lies, and each block loads the IV, so that the state keeps its registers with no moves between
+  them; the loop takes the key block, the whole blocks and the final block in turn, with no index
+  over the three. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2 or SSE4.1: the kernels for one message keep the message in four
   registers and build each round's words from the previous round's with shuffles, unpacks and
   blends, as the reference SSE4.1 code does, instead of loading each word again from the block.
