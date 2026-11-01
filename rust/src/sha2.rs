@@ -939,6 +939,26 @@ fn compress256_block(state: &mut [u32; 8], block: &[u8; 64], w: &mut [u32; 16], 
     compress256_words(state, w, v);
 }
 
+// The compression of one block whose big-endian word t is word(t), into state, for a caller that
+// builds the block from words of its own where there are no vector registers (LANE_VECTORS), and
+// so no CPU kernel: the steps of LMS chains, with no block of bytes to fill, read and wipe. w and
+// v as in compress256_blocks (D-76).
+#[inline(always)]
+pub(crate) fn compress256_built(state: &mut [u32; 8], word: impl Fn(usize) -> u32) {
+    let mut w: [u32; 16] = registers!(
+        |t| word(t);
+        0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+    );
+
+    let mut v = [0; 8];
+
+    compress256_words(state, &mut w, &mut v);
+
+    wipe_unless_optimized!(&mut w);
+
+    wipe_unless_optimized!(&mut v);
+}
+
 // compress256_block for a block already in w, which the schedule overwrites.
 #[inline(always)]
 fn compress256_words(state: &mut [u32; 8], w: &mut [u32; 16], v: &mut [u32; 8]) {
@@ -1007,8 +1027,8 @@ fn round256_lanes<const LANES: usize>(
 
 // Whether the target has vector registers by default, which take the lanes of
 // compress256_lanes_portable. Without them each of its words is a load or a store, and the lanes
-// run one after the other in registers instead.
-const LANE_VECTORS: bool = cfg!(any(
+// run one after the other in registers instead. Nor is there a CPU kernel without them (cpu.rs).
+pub(crate) const LANE_VECTORS: bool = cfg!(any(
     target_feature = "sse2",
     target_feature = "neon",
     target_feature = "simd128",

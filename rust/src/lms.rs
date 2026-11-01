@@ -4,8 +4,8 @@ use crate::ct::declassify;
 use crate::error::Error;
 use crate::merkle::{MerkleTree, Node, TreeHasher};
 use crate::primitives::TruncatedHash;
-use crate::sha2::{IV_256, Sha256};
-use crate::wipe::{SecretBytes, wipe};
+use crate::sha2::{IV_256, LANE_VECTORS, Sha256, compress256_built};
+use crate::wipe::{SecretBytes, wipe, wipe_unless_optimized};
 
 const D_PBLC: [u8; 2] = [0x80, 0x80];
 
@@ -183,12 +183,14 @@ fn derive(lms: &LmsType, i: &[u8], q: u32, index: u16, seed: &[u8], out: &mut No
     );
 }
 
+// Digit i of data, of 8 / w a byte: w is a power of two, so that the byte and the place in it come
+// from shifts, where a division by the width took a call on 32-bit Arm.
 fn coefficient(t: &OtsType, data: &[u8], i: usize) -> u32 {
-    let per_byte = 8 / t.w as usize;
+    let log = 3 - t.w.trailing_zeros();
 
-    let shift = 8 - t.w as usize * (i % per_byte + 1);
+    let shift = 8 - t.w * ((i & ((1 << log) - 1)) as u32 + 1);
 
-    (u32::from(data[i / per_byte]) >> shift) & ((1 << t.w) - 1)
+    (u32::from(data[i >> log]) >> shift) & ((1 << t.w) - 1)
 }
 
 // The p base-2^w digits of the message hash followed by its checksum.
@@ -352,6 +354,10 @@ fn ots_public_keys<const L: usize>(
     first: u32,
     seed: &[u8],
 ) -> [Node; L] {
+    if CHAIN_WORDS && !t.shake {
+        return core::array::from_fn(|lane| ots_public_key_words(t, i, first + lane as u32, seed));
+    }
+
     let n = t.n;
 
     let q: [u32; L] = core::array::from_fn(|lane| first + lane as u32);
@@ -593,6 +599,203 @@ fn chains_sha256(
     wipe(&mut carry);
 }
 
+// Where there are no vector registers, the SHA-256 chains run one after the other with their
+// values as words, which the lanes would keep in memory: each step builds its block from them in
+// registers, the chains need no order, and the message of an LM-OTS public key is hashed in one
+// call from one buffer.
+const CHAIN_WORDS: bool = !LANE_VECTORS;
+
+// The words of I || u32(q), the first five of the block of every chain step.
+fn prefix_words(i: &[u8], q: u32) -> [u32; 5] {
+    let mut prefix = [q; 5];
+
+    for (word, bytes) in prefix.iter_mut().zip(i.as_chunks::<4>().0) {
+        *word = u32::from_be_bytes(*bytes);
+    }
+
+    prefix
+}
+
+// The big-endian words of a chain value, as many as it has.
+fn load_words(value: &[u8], x: &mut [u32; 8]) {
+    for (word, bytes) in x.iter_mut().zip(value.as_chunks::<4>().0) {
+        *word = u32::from_be_bytes(*bytes);
+    }
+}
+
+fn store_words(x: &[u32; 8], value: &mut [u8]) {
+    for (bytes, word) in value.as_chunks_mut::<4>().0.iter_mut().zip(x) {
+        *bytes = word.to_be_bytes();
+    }
+}
+
+// x = H(I || u32(q) || u16(j) || u8(k) || x) for x of WORDS big-endian words (CHAIN_WORDS): a
+// chain step, or with k = 0xFF and x = SEED the first value of chain j. x starts three bytes into
+// block word 5, so each of its words straddles two block words, and the padding follows it.
+#[inline(always)]
+fn step_words<const WORDS: usize>(prefix: &[u32; 5], j: u32, k: u32, x: &mut [u32; 8]) {
+    let mut state = IV_256;
+
+    compress256_built(&mut state, |t| match t {
+        0..5 => prefix[t],
+        5 => j << 16 | k << 8 | x[0] >> 24,
+        _ if t < 5 + WORDS => x[t - 6] << 8 | x[t - 5] >> 24,
+        _ if t == 5 + WORDS => x[WORDS - 1] << 8 | 0x80,
+        15 => (8 * (23 + 4 * WORDS)) as u32,
+        _ => 0,
+    });
+
+    *x = state;
+
+    wipe_unless_optimized!(&mut state);
+}
+
+// Chain j of the LM-OTS key q from step starts[j] to end, for every chain, with SHA-256 and the
+// values as words (CHAIN_WORDS), one chain after the other, in place in values. The steps come
+// from public digests.
+fn chains_words<'a>(
+    n: usize,
+    i: &[u8],
+    q: u32,
+    starts: &[u8],
+    end: u32,
+    values: impl Iterator<Item = &'a mut [u8]>,
+) {
+    if n == 24 {
+        chains_words_of::<6>(i, q, starts, end, values);
+    } else {
+        chains_words_of::<8>(i, q, starts, end, values);
+    }
+}
+
+fn chains_words_of<'a, const WORDS: usize>(
+    i: &[u8],
+    q: u32,
+    starts: &[u8],
+    end: u32,
+    values: impl Iterator<Item = &'a mut [u8]>,
+) {
+    let prefix = prefix_words(i, q);
+
+    for ((j, value), &start) in values.enumerate().zip(starts) {
+        let start = u32::from(start);
+
+        if start == end {
+            continue;
+        }
+
+        let mut x = [0; 8];
+
+        load_words(value, &mut x);
+
+        for k in start..end {
+            step_words::<WORDS>(&prefix, j as u32, k, &mut x);
+        }
+
+        store_words(&x, value);
+
+        wipe_unless_optimized!(&mut x);
+    }
+}
+
+// Chains j = 0, 1, ... of the LM-OTS key q with SHA-256 as words (CHAIN_WORDS), from their secret
+// first values H(I || u32(q) || u16(j) || u8(0xFF) || SEED) to their ends, into values, n bytes a
+// chain: the chain ends of the public key, or the values of a signature.
+fn derived_chains_words(
+    n: usize,
+    i: &[u8],
+    q: u32,
+    seed: &[u8],
+    ends: impl Iterator<Item = u32>,
+    values: &mut [u8],
+) {
+    if n == 24 {
+        derived_chains_words_of::<6>(i, q, seed, ends, values);
+    } else {
+        derived_chains_words_of::<8>(i, q, seed, ends, values);
+    }
+}
+
+fn derived_chains_words_of<const WORDS: usize>(
+    i: &[u8],
+    q: u32,
+    seed: &[u8],
+    ends: impl Iterator<Item = u32>,
+    values: &mut [u8],
+) {
+    let prefix = prefix_words(i, q);
+
+    // SEED and the chain values below the ends, secret: in registers at opt-level 3, and wiped
+    // below it (D-76).
+    let mut s = [0; 8];
+
+    load_words(seed, &mut s);
+
+    for (j, (value, end)) in values.chunks_exact_mut(4 * WORDS).zip(ends).enumerate() {
+        let mut x = s;
+
+        step_words::<WORDS>(&prefix, j as u32, 0xFF, &mut x);
+
+        for k in 0..end {
+            step_words::<WORDS>(&prefix, j as u32, k, &mut x);
+        }
+
+        store_words(&x, value);
+
+        wipe_unless_optimized!(&mut x);
+    }
+
+    wipe_unless_optimized!(&mut s);
+}
+
+// The message of the LM-OTS public key K of key q, I || u32(q) || u16(D_PBLC) || z[0] || ... ||
+// z[p - 1], in the first 22 + p n bytes of message, z left for the caller.
+fn public_key_message<'a>(
+    t: &OtsType,
+    i: &[u8],
+    q: u32,
+    message: &'a mut [u8; 22 + MAX_P * 32],
+) -> &'a mut [u8] {
+    let message = &mut message[..22 + t.p() * t.n];
+
+    message[..16].copy_from_slice(i);
+
+    message[16..20].copy_from_slice(&q.to_be_bytes());
+
+    message[20..22].copy_from_slice(&D_PBLC);
+
+    message
+}
+
+// ots_public_keys for one key with the chain values as words (CHAIN_WORDS).
+fn ots_public_key_words(t: &OtsType, i: &[u8], q: u32, seed: &[u8]) -> Node {
+    let mut message = [0; 22 + MAX_P * 32];
+
+    let message = public_key_message(t, i, q, &mut message);
+
+    let top = (1 << t.w) - 1;
+
+    derived_chains_words(t.n, i, q, seed, core::iter::repeat(top), &mut message[22..]);
+
+    digest(false, t.n, &[message])
+}
+
+// ots_candidate after the digits with the chain values as words (CHAIN_WORDS): the y of the
+// signature advance to the ends in place in the message of the candidate key.
+fn ots_candidate_words(t: &OtsType, i: &[u8], q: u32, signature: &[u8], digits: &[u8]) -> Node {
+    let mut message = [0; 22 + MAX_P * 32];
+
+    let message = public_key_message(t, i, q, &mut message);
+
+    message[22..].copy_from_slice(&signature[4 + t.n..]);
+
+    let values = message[22..].chunks_exact_mut(t.n);
+
+    chains_words(t.n, i, q, digits, (1 << t.w) - 1, values);
+
+    digest(false, t.n, &[message])
+}
+
 // The secret chain starts x_j of the key q, LANES at a time, into values.
 fn secret_values(
     t: &OtsType,
@@ -643,6 +846,22 @@ fn ots_sign(
 
     out.extend_from_slice(c);
 
+    if CHAIN_WORDS && !t.shake {
+        let mut y = [0; MAX_P * 32];
+
+        let ends = digits(t, &q_hash).into_iter().map(u32::from);
+
+        derived_chains_words(n, i, q, seed, ends, &mut y[..p * n]);
+
+        out.extend_from_slice(&y[..p * n]);
+
+        // The copy of the signature, which the caller verifies before it is released and wipes if
+        // it is faulty.
+        wipe(&mut y[..p * n]);
+
+        return out;
+    }
+
     let digits = digits(t, &q_hash).map(u32::from);
 
     let mut values = [[0; 32]; MAX_P];
@@ -668,6 +887,10 @@ fn ots_candidate(t: &OtsType, i: &[u8], q: u32, signature: &[u8], message: &[u8]
     let c = &signature[4..4 + n];
 
     let q_hash = digest(t.shake, n, &[i, &q.to_be_bytes(), &D_MESG, c, message]);
+
+    if CHAIN_WORDS && !t.shake {
+        return ots_candidate_words(t, i, q, signature, &digits(t, &q_hash));
+    }
 
     let mut values = [[0; 32]; MAX_P];
 
@@ -1096,6 +1319,97 @@ mod tests {
             chains(&t, &i, q, &starts[..p], &ends[..p], &mut values[..p]);
 
             assert!(values[..p] == expected[..p], "{}", t.name);
+        }
+    }
+
+    // The public key, signature and candidate key of one LM-OTS key against one hash per step,
+    // for every SHA-256 type, through the words functions (CHAIN_WORDS), which every target tests
+    // this way, and through the functions that pick them or the lanes.
+    #[test]
+    fn chain_words_match_steps() {
+        let i = [0x5A; 16];
+
+        let q: u32 = 0x0A0B_0C0D;
+
+        let secrets: [u8; 32] = core::array::from_fn(|b| (b as u8).wrapping_mul(7) ^ 0x3C);
+
+        let message = b"chain words";
+
+        for t in OTS_TYPES.iter().filter(|t| !t.shake) {
+            let (n, p, top) = (t.n, t.p(), (1u32 << t.w) - 1);
+
+            let lms = LMS_TYPES
+                .into_iter()
+                .find(|lms| t.same_family(lms))
+                .unwrap();
+
+            let seed = &secrets[..n];
+
+            let advance = |j: usize, from: u32, to: u32, mut x: Node| {
+                for k in from..to {
+                    let parts = [
+                        &i[..],
+                        &q.to_be_bytes(),
+                        &(j as u16).to_be_bytes(),
+                        &[k as u8],
+                        &x[..n],
+                    ];
+
+                    x = digest(false, n, &parts);
+                }
+
+                x
+            };
+
+            let first = |j: usize| {
+                let mut x = [0; 32];
+
+                derive(&lms, &i, q, j as u16, seed, &mut x);
+
+                x
+            };
+
+            let mut engine = TruncatedHash::new(false);
+
+            for part in [&i[..], &q.to_be_bytes(), &D_PBLC] {
+                engine.update(part);
+            }
+
+            for j in 0..p {
+                engine.update(&advance(j, 0, top, first(j))[..n]);
+            }
+
+            let mut key = [0; 32];
+
+            engine.finish(n, &mut key);
+
+            assert_eq!(ots_public_key_words(t, &i, q, seed), key, "{}", t.name);
+
+            let picked = ots_public_keys::<1>(t, &lms, &i, q, seed);
+
+            assert_eq!(picked[0], key, "{}", t.name);
+
+            let c = &secrets[32 - n..];
+
+            let signature = ots_sign(t, &lms, &i, q, seed, c, message);
+
+            let q_hash = digest(false, n, &[&i, &q.to_be_bytes(), &D_MESG, c, message]);
+
+            let digits = digits(t, &q_hash);
+
+            for (j, y) in signature[4 + n..].chunks_exact(n).enumerate() {
+                let expected = advance(j, 0, u32::from(digits[j]), first(j));
+
+                assert_eq!(y, &expected[..n], "{} chain {j}", t.name);
+            }
+
+            let candidate = ots_candidate_words(t, &i, q, &signature, &digits);
+
+            assert_eq!(candidate, key, "{}", t.name);
+
+            let picked = ots_candidate(t, &i, q, &signature, message);
+
+            assert_eq!(picked, key, "{}", t.name);
         }
     }
 }
