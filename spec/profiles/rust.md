@@ -164,5 +164,5 @@ A conforming Rust implementation meets each item:
 - valgrind constant-time check on x86-64 and ARM64, default and portable, and on x86-64 with
   `crypto_pq_sse41`.
 - x86-64 CPU models of [18.2](../18-testing.md#182-cpu-tiers) under emulation, and the AVX-512 tier on native runners, with no
-  instruction on a 512-bit register in the library built for the baseline target at any
-  optimization level.
+  instruction on a 512-bit register outside BLAKE3's two 512-bit kernels in the library built for
+  the baseline target at any optimization level.

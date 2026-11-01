@@ -23,6 +23,7 @@
 use core::arch::x86_64::*;
 use core::mem::MaybeUninit;
 
+use super::blake3_zmm::Table16;
 #[cfg(not(crypto_pq_optimized))]
 use super::memory::words_of;
 use super::memory::{Plain, clear, load128, load128_bytes, load256, store128, store256};
@@ -1450,6 +1451,16 @@ mod rows_vl {
 
     const ORDERS: [[[u32; 8]; 2]; 2] = orders();
 
+    // As an intrinsic, LLVM wrote the swap of d's halves as VSHUFPD, a shuffle of the floating
+    // point domain, on the d row's dependency chain.
+    instruction!(
+        words_across,
+        __m128i,
+        xmm_reg,
+        "vpshufd {out}, {x}, 0x4E",
+        x
+    );
+
     // Private to this module, whose entry points are unsafe and require AVX-512F and AVX-512VL:
     // every call of half and rounds_words comes from one of them.
     #[target_feature(enable = "avx2")]
@@ -1482,7 +1493,7 @@ mod rows_vl {
 
         row[2] = _mm_shuffle_epi32::<0x39>(row[2]);
 
-        row[3] = _mm_shuffle_epi32::<0x4E>(row[3]);
+        row[3] = words_across(row[3]);
 
         half::<16, 12>(row, _mm256_castsi256_si128(m[1]));
 
@@ -1492,7 +1503,7 @@ mod rows_vl {
 
         row[2] = _mm_shuffle_epi32::<0x93>(row[2]);
 
-        row[3] = _mm_shuffle_epi32::<0x4E>(row[3]);
+        row[3] = words_across(row[3]);
     }
 
     // The seven rounds of a block on row, the message vectors built and permuted in m.
@@ -2292,6 +2303,70 @@ fn hash8(input: &[[u8; 64]], many: &Many, table: &mut Table, first: usize, out: 
     clear(&mut m, MaybeUninit::new(_mm256_setzero_si256()));
 }
 
+// The flags of the blocks into the table of the 512-bit kernel, as flags() does for Table.
+fn flags16(table: &mut Table16, many: &Many) {
+    let rows = &mut table.flags[..many.blocks];
+
+    rows.fill(many.flags);
+
+    let start = many.flags | many.start;
+
+    let end = if many.blocks == 1 { start } else { many.flags } | many.end;
+
+    rows[0] = start;
+
+    rows[many.blocks - 1] = end;
+}
+
+// The counters of sixteen lanes into the table of the 512-bit kernel, from `first` on, each one
+// more than the last if `increment`.
+fn counters16(table: &mut Table16, first: u64, increment: bool) {
+    for (l, (low, high)) in table.low.iter_mut().zip(table.high.iter_mut()).enumerate() {
+        let counter = if increment {
+            first.wrapping_add(l as u64)
+        } else {
+            first
+        };
+
+        *low = counter as u32;
+
+        *high = (counter >> 32) as u32;
+    }
+}
+
+// hash_many's inputs `first` to `first + 15` with the 512-bit kernel, their chaining values
+// written straight into out.
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+fn hash16(
+    input: &[[u8; 64]],
+    many: &Many,
+    table: &mut Table16,
+    first: usize,
+    out: &mut [[u8; 32]],
+) {
+    let start = if many.increment {
+        many.counter.wrapping_add(first as u64)
+    } else {
+        many.counter
+    };
+
+    counters16(table, start, many.increment);
+
+    let inputs = &input[first * many.blocks..(first + 16) * many.blocks];
+
+    let out =
+        <&mut [[u8; 32]; 16]>::try_from(&mut out[first..first + 16]).expect("sixteen outputs");
+
+    // SAFETY: hash_many_avx2 calls this only when wide is set, which is on a CPU with AVX-512F and
+    // AVX-512VL whose registers the operating system saves (zmm_lanes() is tested with AVX512
+    // only); 1 <= blocks <= 16, as hash_many_avx2 checks; inputs holds sixteen inputs of `blocks`
+    // blocks each, input i at 64 * blocks * i bytes.
+    unsafe {
+        super::blake3_zmm::hash16_zmm(inputs.as_ptr().cast(), many.blocks, many.key, table, out)
+    };
+}
+
 // hash_many's inputs `first` to `first + 3` with AVX2 on xmm registers.
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
@@ -2915,8 +2990,15 @@ mod lanes_avx2_4 {
 // or four as four, two side by side in the row form if `pair`; returns how many it hashed, from
 // the first on. One input left, and two without `pair`, go back to the caller: one through the
 // dispatch of the row form's chain, two through the scalar code.
+// wide: sixteen inputs at a time with the 512-bit kernel first, on a core of zmm_lanes()'s table.
 #[target_feature(enable = "avx2")]
-pub(super) fn hash_many_avx2(input: &[u8], many: &Many, out: &mut [[u8; 32]], pair: bool) -> usize {
+pub(super) fn hash_many_avx2(
+    input: &[u8],
+    many: &Many,
+    out: &mut [[u8; 32]],
+    pair: bool,
+    wide: bool,
+) -> usize {
     // The assembly takes one to sixteen blocks per input; anything else is left to the portable
     // code.
     if !(1..=16).contains(&many.blocks) {
@@ -2929,7 +3011,19 @@ pub(super) fn hash_many_avx2(input: &[u8], many: &Many, out: &mut [[u8; 32]], pa
 
     let mut done = 0;
 
-    if count >= 3 {
+    if wide {
+        let mut table = Table16::new();
+
+        flags16(&mut table, many);
+
+        while count - done >= 16 {
+            hash16(input, many, &mut table, done, out);
+
+            done += 16;
+        }
+    }
+
+    if count - done >= 3 {
         let mut table = Table {
             head: HEAD,
             flags: [[MaybeUninit::uninit(); 2]; 16],
@@ -2992,17 +3086,48 @@ pub(super) fn hash_many_sse41(input: &[u8], many: &Many, out: &mut [[u8; 32]]) -
 }
 
 // Output blocks of the root into out, eight and then four at a time; returns how many.
+// wide: sixteen output blocks at a time with the 512-bit kernel first, as in hash_many_avx2.
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
 pub(super) fn xof_avx2(
     cv: &[u32; 8],
     block: &[u32; 16],
     counter: u64,
-    info: [u32; 2],
+    [length, flags]: [u32; 2],
     out: &mut [[u8; 64]],
+    wide: bool,
 ) -> usize {
-    let (eights, rest) = out.as_chunks_mut::<8>();
+    let info = [length, flags];
 
     let mut next = counter;
+
+    let mut sixteen = 0;
+
+    if wide {
+        let (groups, _) = out.as_chunks_mut::<16>();
+
+        let mut table = Table16::new();
+
+        table.length = length;
+
+        table.flags[0] = flags;
+
+        for group in groups.iter_mut() {
+            counters16(&mut table, next, true);
+
+            // SAFETY: wide is set only on a CPU with AVX-512F and AVX-512VL whose registers the
+            // operating system saves (zmm_lanes() is tested with AVX512 only).
+            unsafe { super::blake3_zmm::xof16_zmm(cv, block, &table, group) };
+
+            next = next.wrapping_add(16);
+        }
+
+        sixteen = 16 * groups.len();
+    }
+
+    let out = &mut out[sixteen..];
+
+    let (eights, rest) = out.as_chunks_mut::<8>();
 
     for group in eights.iter_mut() {
         lanes_avx2::xof_group(cv, block, next, info, group);
@@ -3018,7 +3143,7 @@ pub(super) fn xof_avx2(
         next = next.wrapping_add(4);
     }
 
-    8 * eights.len() + 4 * fours.len()
+    sixteen + 8 * eights.len() + 4 * fours.len()
 }
 
 #[target_feature(enable = "sse2,ssse3,sse4.1")]
