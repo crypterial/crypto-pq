@@ -233,6 +233,13 @@ fn has(feature: u32) -> bool {
     features() & feature != 0
 }
 
+// has without the detection: false for a feature that the build does not guarantee until a call
+// of has, or of features, has detected the features.
+#[inline]
+fn detected(feature: u32) -> bool {
+    usable(feature) && (guaranteed(feature) || FEATURES.load(Ordering::Relaxed) & feature != 0)
+}
+
 // The features found, detected on the first call. Every thread that finds the cache empty computes
 // the same value, so a relaxed store suffices.
 #[inline]
@@ -1057,6 +1064,22 @@ pub(crate) fn finish256(state: &mut [u32; 8], data: &[u8], bits: u64) -> bool {
 
     // SAFETY: as in compress256.
     unsafe { sha2::finish256(state, data, bits) };
+
+    true
+}
+
+// finish256 and the digest of SHA-256 or SHA-224 stored from the registers, with the SHA
+// extensions; other sizes, and the other paths, store the state that finish256 leaves. Before
+// the first detection this returns false, and finish256, which the caller runs then, detects:
+// with no call to the detection here, a caller that takes this kernel needs no stack frame.
+#[allow(unsafe_code)]
+pub(crate) fn digest256(state: &[u32; 8], data: &[u8], bits: u64, out: &mut [u8]) -> bool {
+    if !detected(SHA) || !matches!(out.len(), 28 | 32) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { digest256_sha(state, data, bits, out) };
 
     true
 }
@@ -2738,6 +2761,45 @@ fn state_of(stream: &Stream, state: &mut [u32; 8]) {
     memory::store128(_mm_alignr_epi8::<8>(ghcd, abef), efgh);
 }
 
+// The words of state_of as big-endian bytes, the 32 of a digest or the 28 of SHA-224's, stored
+// from the registers, so that no copy of the state waits on the stack to be swapped and wiped.
+#[target_feature(enable = "ssse3,sse4.1")]
+#[inline]
+fn digest_of(stream: &Stream, out: &mut [u8]) {
+    let abef = _mm_shuffle_epi32::<0x1B>(stream.abef);
+
+    let ghcd = _mm_shuffle_epi32::<0xB1>(stream.cdgh);
+
+    let swap = _mm_set_epi64x(0x0C0D_0E0F_0809_0A0B, 0x0405_0607_0001_0203);
+
+    let abcd = _mm_shuffle_epi8(_mm_blend_epi16::<0xF0>(abef, ghcd), swap);
+
+    let efgh = _mm_shuffle_epi8(_mm_alignr_epi8::<8>(ghcd, abef), swap);
+
+    match out.as_chunks_mut::<16>() {
+        ([first, second], []) => {
+            memory::store128(abcd, first);
+
+            memory::store128(efgh, second);
+        }
+        ([first], rest) => {
+            memory::store128(abcd, first);
+
+            // SHA-224's digest ends with words e, f and g.
+            let ([e, f, g], []) = rest.as_chunks_mut::<4>() else {
+                unreachable!("a digest of 32 or 28 bytes")
+            };
+
+            *e = _mm_cvtsi128_si32(efgh).to_le_bytes();
+
+            *f = _mm_extract_epi32::<1>(efgh).to_le_bytes();
+
+            *g = _mm_extract_epi32::<2>(efgh).to_le_bytes();
+        }
+        _ => unreachable!("a digest of 32 or 28 bytes"),
+    }
+}
+
 // Sixteen bytes whose little-endian value is `value` as four big-endian schedule words, the first
 // in the lowest lane.
 #[target_feature(enable = "ssse3")]
@@ -2794,62 +2856,85 @@ fn compress256_sha(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]])
     wipe_unless_optimized!(memory::words_of(&mut streams));
 }
 
-// The whole blocks of data and then its padded last block or two, for a message of `bits` bits
-// that ends with data, the padding built in registers as in the aarch64 tail256. The stream's
-// schedule words keep message words, which are wiped with the stream.
+// The whole blocks of data and then its padded last block or two, on one stream, for a message of
+// `bits` bits that ends with data, the padding built in registers as in the aarch64 tail256. The
+// stream's schedule words keep message words, which are wiped with the stream. A macro, as
+// rounds256 is, for the two functions that differ in how they store the state.
+macro_rules! finish_stream256 {
+    ($streams:ident, $data:expr, $bits:expr) => {{
+        let data: &[u8] = $data;
+
+        let bits: u64 = $bits;
+
+        let (blocks, tail) = data.as_chunks::<64>();
+
+        let (whole, rest) = tail.as_chunks::<16>();
+
+        let marker = last_bytes(data, rest.len()) | 0x80 << (8 * rest.len());
+
+        // The length field: words 14 and 15 of the last block.
+        let length = _mm_set_epi32(bits as i32, (bits >> 32) as i32, 0, 0);
+
+        for block in blocks {
+            block_words(block, &mut $streams[0].m);
+
+            rounds256!($streams, 1);
+        }
+
+        $streams[0].m = [
+            last_chunk(whole, 0, marker),
+            last_chunk(whole, 1, marker),
+            last_chunk(whole, 2, marker),
+            last_chunk(whole, 3, marker),
+        ];
+
+        // The padded blocks in a loop of their own, so that the rounds are written out twice, not
+        // three times: the one with the tail and the marker, then, when the length does not fit
+        // there, one of zeros and the length. The tail's words are built after the whole blocks,
+        // so that no copy of them waits on the stack.
+        let mut padded = if tail.len() + 9 > 64 {
+            2
+        } else {
+            $streams[0].m[3] = _mm_or_si128($streams[0].m[3], length);
+
+            1
+        };
+
+        loop {
+            rounds256!($streams, 1);
+
+            padded -= 1;
+
+            if padded == 0 {
+                break;
+            }
+
+            let zero = _mm_setzero_si128();
+
+            $streams[0].m = [zero, zero, zero, length];
+        }
+    }};
+}
+
 #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
 fn finish256_sha(state: &mut [u32; 8], data: &[u8], bits: u64) {
     let mut streams = [stream_of(state)];
 
-    let (blocks, tail) = data.as_chunks::<64>();
-
-    let (whole, rest) = tail.as_chunks::<16>();
-
-    let marker = last_bytes(data, rest.len()) | 0x80 << (8 * rest.len());
-
-    // The length field: words 14 and 15 of the last block.
-    let length = _mm_set_epi32(bits as i32, (bits >> 32) as i32, 0, 0);
-
-    for block in blocks {
-        block_words(block, &mut streams[0].m);
-
-        rounds256!(streams, 1);
-    }
-
-    streams[0].m = [
-        last_chunk(whole, 0, marker),
-        last_chunk(whole, 1, marker),
-        last_chunk(whole, 2, marker),
-        last_chunk(whole, 3, marker),
-    ];
-
-    // The padded blocks in a loop of their own, so that the rounds are written out twice, not
-    // three times: the one with the tail and the marker, then, when the length does not fit
-    // there, one of zeros and the length. The tail's words are built after the whole blocks, so
-    // that no copy of them waits on the stack.
-    let mut padded = if tail.len() + 9 > 64 {
-        2
-    } else {
-        streams[0].m[3] = _mm_or_si128(streams[0].m[3], length);
-
-        1
-    };
-
-    loop {
-        rounds256!(streams, 1);
-
-        padded -= 1;
-
-        if padded == 0 {
-            break;
-        }
-
-        let zero = _mm_setzero_si128();
-
-        streams[0].m = [zero, zero, zero, length];
-    }
+    finish_stream256!(streams, data, bits);
 
     state_of(&streams[0], state);
+
+    wipe_unless_optimized!(memory::words_of(&mut streams));
+}
+
+// finish256_sha for a digest of 32 bytes or its truncation to 28, stored from the registers.
+#[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+fn digest256_sha(state: &[u32; 8], data: &[u8], bits: u64, out: &mut [u8]) {
+    let mut streams = [stream_of(state)];
+
+    finish_stream256!(streams, data, bits);
+
+    digest_of(&streams[0], out);
 
     wipe_unless_optimized!(memory::words_of(&mut streams));
 }
@@ -2946,15 +3031,7 @@ fn after_keys256_sha(states: &mut [[u32; 8]; 2], data: &[u8], tag: &mut [u8]) {
 
     rounds256!(outer, 1);
 
-    let mut words = [0; 8];
-
-    state_of(&outer[0], &mut words);
-
-    for (bytes, word) in tag.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
-        *bytes = word.to_be_bytes();
-    }
-
-    wipe(&mut words);
+    digest_of(&outer[0], tag);
 
     wipe_unless_optimized!(memory::words_of(&mut outer));
 }

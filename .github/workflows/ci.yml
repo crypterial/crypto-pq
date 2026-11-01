@@ -314,7 +314,7 @@ jobs:
       matrix:
         include:
           - { cpu: Haswell-v4, kernels: 62 }
-          - { cpu: Denverton, kernels: 15 }
+          - { cpu: Denverton, kernels: 16 }
           - { cpu: qemu64, kernels: 0 }
     defaults:
       run:
