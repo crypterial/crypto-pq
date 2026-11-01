@@ -209,7 +209,9 @@ impl<const N: usize> Drop for Blocks<N> {
 }
 
 // One round, with the working variables passed in their rotated roles so that unrolled rounds
-// never move values between them: only d and h receive new values.
+// never move values between them: only d and h receive new values. Ch and Maj take three
+// operations each without an and-not instruction, and the a ^ b of Maj is the b ^ c of the next
+// round.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn round256(a: u32, b: u32, c: u32, d: &mut u32, e: u32, f: u32, g: u32, h: &mut u32, kw: u32) {
@@ -217,14 +219,109 @@ fn round256(a: u32, b: u32, c: u32, d: &mut u32, e: u32, f: u32, g: u32, h: &mut
 
     let t1 = h
         .wrapping_add(kw)
-        .wrapping_add((e & f) | (!e & g))
+        .wrapping_add(((f ^ g) & e) ^ g)
         .wrapping_add(s1);
 
     let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
 
     *d = d.wrapping_add(t1);
 
-    *h = s0.wrapping_add((a & b) | (c & (a | b))).wrapping_add(t1);
+    *h = s0.wrapping_add(((a ^ b) & (b ^ c)) ^ b).wrapping_add(t1);
+}
+
+// Rounds R to R + 15 on the working variables v, with the schedule words of those rounds. Always
+// inlined, so that the round constants become immediates and v stays in registers.
+#[inline(always)]
+fn rounds256<const R: usize>(v: &mut [u32; 8], w: &[u32; 16]) {
+    let kw = |i: usize| K256[R + i].wrapping_add(w[i]);
+
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *v;
+
+    round256(a, b, c, &mut d, e, f, g, &mut h, kw(0));
+
+    round256(h, a, b, &mut c, d, e, f, &mut g, kw(1));
+
+    round256(g, h, a, &mut b, c, d, e, &mut f, kw(2));
+
+    round256(f, g, h, &mut a, b, c, d, &mut e, kw(3));
+
+    round256(e, f, g, &mut h, a, b, c, &mut d, kw(4));
+
+    round256(d, e, f, &mut g, h, a, b, &mut c, kw(5));
+
+    round256(c, d, e, &mut f, g, h, a, &mut b, kw(6));
+
+    round256(b, c, d, &mut e, f, g, h, &mut a, kw(7));
+
+    round256(a, b, c, &mut d, e, f, g, &mut h, kw(8));
+
+    round256(h, a, b, &mut c, d, e, f, &mut g, kw(9));
+
+    round256(g, h, a, &mut b, c, d, e, &mut f, kw(10));
+
+    round256(f, g, h, &mut a, b, c, d, &mut e, kw(11));
+
+    round256(e, f, g, &mut h, a, b, c, &mut d, kw(12));
+
+    round256(d, e, f, &mut g, h, a, b, &mut c, kw(13));
+
+    round256(c, d, e, &mut f, g, h, a, &mut b, kw(14));
+
+    round256(b, c, d, &mut e, f, g, h, &mut a, kw(15));
+
+    *v = [a, b, c, d, e, f, g, h];
+}
+
+// Word t of the next 16 of the schedule, in the slot of the word 16 before it: t - 15, t - 7 and
+// t - 2 are at (t + 1) % 16, (t + 9) % 16 and (t + 14) % 16.
+#[inline(always)]
+fn word256(w: &mut [u32; 16], t: usize) {
+    let (x, y) = (w[(t + 1) % 16], w[(t + 14) % 16]);
+
+    let s0 = x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3);
+
+    let s1 = y.rotate_right(17) ^ y.rotate_right(19) ^ (y >> 10);
+
+    w[t] = w[t]
+        .wrapping_add(s0)
+        .wrapping_add(w[(t + 9) % 16])
+        .wrapping_add(s1);
+}
+
+// The next 16 words of the schedule, written out so that every index is a constant.
+#[inline(always)]
+fn schedule256(w: &mut [u32; 16]) {
+    word256(w, 0);
+
+    word256(w, 1);
+
+    word256(w, 2);
+
+    word256(w, 3);
+
+    word256(w, 4);
+
+    word256(w, 5);
+
+    word256(w, 6);
+
+    word256(w, 7);
+
+    word256(w, 8);
+
+    word256(w, 9);
+
+    word256(w, 10);
+
+    word256(w, 11);
+
+    word256(w, 12);
+
+    word256(w, 13);
+
+    word256(w, 14);
+
+    word256(w, 15);
 }
 
 fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
@@ -243,16 +340,21 @@ fn compress256_portable(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 
     compress256_blocks(state, blocks.iter().chain(more));
 }
 
-// The portable compression of each block in turn. The schedule holds words of the message, so one
-// serves every block and is wiped once at the end.
+// The portable compression of each block in turn. The schedule and the working variables are
+// scratch of the operation, which every block writes in full: in registers at opt-level 3, and
+// wiped once at the end below it (D-76).
 fn compress256_blocks<'a>(state: &mut [u32; 8], blocks: impl IntoIterator<Item = &'a [u8; 64]>) {
     let mut w = [0; 16];
 
+    let mut v = [0; 8];
+
     for block in blocks {
-        compress256_block(state, block, &mut w);
+        compress256_block(state, block, &mut w, &mut v);
     }
 
-    wipe(&mut w);
+    wipe_unless_optimized!(&mut w);
+
+    wipe_unless_optimized!(&mut v);
 }
 
 // One block into each of two states, side by side: a lone stream waits on the latency of its
@@ -589,57 +691,35 @@ pub(crate) fn hmac512(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
     wipe(keyed.as_flattened_mut());
 }
 
-// w is the caller's schedule buffer, which every block writes in full.
-fn compress256_block(state: &mut [u32; 8], block: &[u8; 64], w: &mut [u32; 16]) {
+// All 64 rounds written out, so that the code indexes the schedule w, which keeps its last 16
+// words, and the working variables v only with constants, and at opt-level 3 both stay in
+// registers (on wasm32, locals): with a loop over the slots, every use of a word is a load or a
+// store on wasm32, and a loop over the rounds loads their constants. Always inlined into
+// compress256_blocks, which owns w and v, so that they stay arrays of registers there.
+#[inline(always)]
+fn compress256_block(state: &mut [u32; 8], block: &[u8; 64], w: &mut [u32; 16], v: &mut [u32; 8]) {
     for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
         *word = u32::from_be_bytes(*bytes);
     }
 
-    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+    *v = *state;
 
-    // The schedule keeps its last 16 words: word t lives at t % 16, so t - 15, t - 7 and t - 2
-    // are at (t + 1) % 16, (t + 9) % 16 and (t + 14) % 16, and t - 16 is the slot it replaces.
-    for start in (0..64).step_by(8) {
-        let mut kw = [0; 8];
+    rounds256::<0>(v, w);
 
-        for (j, kw) in kw.iter_mut().enumerate() {
-            let t = start + j;
+    schedule256(w);
 
-            if t >= 16 {
-                let (x, y) = (w[(t + 1) % 16], w[(t + 14) % 16]);
+    rounds256::<16>(v, w);
 
-                let s0 = x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3);
+    schedule256(w);
 
-                let s1 = y.rotate_right(17) ^ y.rotate_right(19) ^ (y >> 10);
+    rounds256::<32>(v, w);
 
-                w[t % 16] = w[t % 16]
-                    .wrapping_add(s0)
-                    .wrapping_add(w[(t + 9) % 16])
-                    .wrapping_add(s1);
-            }
+    schedule256(w);
 
-            *kw = w[t % 16].wrapping_add(K256[t]);
-        }
+    rounds256::<48>(v, w);
 
-        round256(a, b, c, &mut d, e, f, g, &mut h, kw[0]);
-
-        round256(h, a, b, &mut c, d, e, f, &mut g, kw[1]);
-
-        round256(g, h, a, &mut b, c, d, e, &mut f, kw[2]);
-
-        round256(f, g, h, &mut a, b, c, d, &mut e, kw[3]);
-
-        round256(e, f, g, &mut h, a, b, c, &mut d, kw[4]);
-
-        round256(d, e, f, &mut g, h, a, b, &mut c, kw[5]);
-
-        round256(c, d, e, &mut f, g, h, a, &mut b, kw[6]);
-
-        round256(b, c, d, &mut e, f, g, h, &mut a, kw[7]);
-    }
-
-    for (word, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-        *word = word.wrapping_add(value);
+    for (word, value) in state.iter_mut().zip(v.iter()) {
+        *word = word.wrapping_add(*value);
     }
 }
 
@@ -787,6 +867,7 @@ pub(crate) fn compress256_lanes_portable<const LANES: usize>(
     wipe_unless_optimized!(words.as_flattened_mut());
 }
 
+// round256 for SHA-512.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn round512(a: u64, b: u64, c: u64, d: &mut u64, e: u64, f: u64, g: u64, h: &mut u64, kw: u64) {
@@ -794,14 +875,107 @@ fn round512(a: u64, b: u64, c: u64, d: &mut u64, e: u64, f: u64, g: u64, h: &mut
 
     let t1 = h
         .wrapping_add(kw)
-        .wrapping_add((e & f) | (!e & g))
+        .wrapping_add(((f ^ g) & e) ^ g)
         .wrapping_add(s1);
 
     let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
 
     *d = d.wrapping_add(t1);
 
-    *h = s0.wrapping_add((a & b) | (c & (a | b))).wrapping_add(t1);
+    *h = s0.wrapping_add(((a ^ b) & (b ^ c)) ^ b).wrapping_add(t1);
+}
+
+// rounds256 for SHA-512.
+#[inline(always)]
+fn rounds512<const R: usize>(v: &mut [u64; 8], w: &[u64; 16]) {
+    let kw = |i: usize| K512[R + i].wrapping_add(w[i]);
+
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *v;
+
+    round512(a, b, c, &mut d, e, f, g, &mut h, kw(0));
+
+    round512(h, a, b, &mut c, d, e, f, &mut g, kw(1));
+
+    round512(g, h, a, &mut b, c, d, e, &mut f, kw(2));
+
+    round512(f, g, h, &mut a, b, c, d, &mut e, kw(3));
+
+    round512(e, f, g, &mut h, a, b, c, &mut d, kw(4));
+
+    round512(d, e, f, &mut g, h, a, b, &mut c, kw(5));
+
+    round512(c, d, e, &mut f, g, h, a, &mut b, kw(6));
+
+    round512(b, c, d, &mut e, f, g, h, &mut a, kw(7));
+
+    round512(a, b, c, &mut d, e, f, g, &mut h, kw(8));
+
+    round512(h, a, b, &mut c, d, e, f, &mut g, kw(9));
+
+    round512(g, h, a, &mut b, c, d, e, &mut f, kw(10));
+
+    round512(f, g, h, &mut a, b, c, d, &mut e, kw(11));
+
+    round512(e, f, g, &mut h, a, b, c, &mut d, kw(12));
+
+    round512(d, e, f, &mut g, h, a, b, &mut c, kw(13));
+
+    round512(c, d, e, &mut f, g, h, a, &mut b, kw(14));
+
+    round512(b, c, d, &mut e, f, g, h, &mut a, kw(15));
+
+    *v = [a, b, c, d, e, f, g, h];
+}
+
+// word256 for SHA-512.
+#[inline(always)]
+fn word512(w: &mut [u64; 16], t: usize) {
+    let (x, y) = (w[(t + 1) % 16], w[(t + 14) % 16]);
+
+    let s0 = x.rotate_right(1) ^ x.rotate_right(8) ^ (x >> 7);
+
+    let s1 = y.rotate_right(19) ^ y.rotate_right(61) ^ (y >> 6);
+
+    w[t] = w[t]
+        .wrapping_add(s0)
+        .wrapping_add(w[(t + 9) % 16])
+        .wrapping_add(s1);
+}
+
+// schedule256 for SHA-512.
+#[inline(always)]
+fn schedule512(w: &mut [u64; 16]) {
+    word512(w, 0);
+
+    word512(w, 1);
+
+    word512(w, 2);
+
+    word512(w, 3);
+
+    word512(w, 4);
+
+    word512(w, 5);
+
+    word512(w, 6);
+
+    word512(w, 7);
+
+    word512(w, 8);
+
+    word512(w, 9);
+
+    word512(w, 10);
+
+    word512(w, 11);
+
+    word512(w, 12);
+
+    word512(w, 13);
+
+    word512(w, 14);
+
+    word512(w, 15);
 }
 
 fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
@@ -822,11 +996,15 @@ fn compress512_portable(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8;
 fn compress512_blocks<'a>(state: &mut [u64; 8], blocks: impl IntoIterator<Item = &'a [u8; 128]>) {
     let mut w = [0; 16];
 
+    let mut v = [0; 8];
+
     for block in blocks {
-        compress512_block(state, block, &mut w);
+        compress512_block(state, block, &mut w, &mut v);
     }
 
-    wipe(&mut w);
+    wipe_unless_optimized!(&mut w);
+
+    wipe_unless_optimized!(&mut v);
 }
 
 // compress256_pair for SHA-512.
@@ -840,58 +1018,36 @@ pub(crate) fn compress512_pair(states: &mut [[u64; 8]; 2], blocks: &[[u8; 128]; 
     }
 }
 
-// Never inlined: inlined into compress512, its frame and register saves came with every call, the
-// kernel's included, and cost a one-block SHA-512 about 30 ns on an Apple M3.
-#[inline(never)]
-fn compress512_block(state: &mut [u64; 8], block: &[u8; 128], w: &mut [u64; 16]) {
+// compress256_block for SHA-512, with its 80 rounds. Inlined into compress512_portable, which is
+// out of line, so that the frame of the rounds stays out of the dispatch to the kernels.
+#[inline(always)]
+fn compress512_block(state: &mut [u64; 8], block: &[u8; 128], w: &mut [u64; 16], v: &mut [u64; 8]) {
     for (word, bytes) in w.iter_mut().zip(block.as_chunks::<8>().0) {
         *word = u64::from_be_bytes(*bytes);
     }
 
-    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+    *v = *state;
 
-    // The same rolling schedule as SHA-256.
-    for start in (0..80).step_by(8) {
-        let mut kw = [0; 8];
+    rounds512::<0>(v, w);
 
-        for (j, kw) in kw.iter_mut().enumerate() {
-            let t = start + j;
+    schedule512(w);
 
-            if t >= 16 {
-                let (x, y) = (w[(t + 1) % 16], w[(t + 14) % 16]);
+    rounds512::<16>(v, w);
 
-                let s0 = x.rotate_right(1) ^ x.rotate_right(8) ^ (x >> 7);
+    schedule512(w);
 
-                let s1 = y.rotate_right(19) ^ y.rotate_right(61) ^ (y >> 6);
+    rounds512::<32>(v, w);
 
-                w[t % 16] = w[t % 16]
-                    .wrapping_add(s0)
-                    .wrapping_add(w[(t + 9) % 16])
-                    .wrapping_add(s1);
-            }
+    schedule512(w);
 
-            *kw = w[t % 16].wrapping_add(K512[t]);
-        }
+    rounds512::<48>(v, w);
 
-        round512(a, b, c, &mut d, e, f, g, &mut h, kw[0]);
+    schedule512(w);
 
-        round512(h, a, b, &mut c, d, e, f, &mut g, kw[1]);
+    rounds512::<64>(v, w);
 
-        round512(g, h, a, &mut b, c, d, e, &mut f, kw[2]);
-
-        round512(f, g, h, &mut a, b, c, d, &mut e, kw[3]);
-
-        round512(e, f, g, &mut h, a, b, c, &mut d, kw[4]);
-
-        round512(d, e, f, &mut g, h, a, b, &mut c, kw[5]);
-
-        round512(c, d, e, &mut f, g, h, a, &mut b, kw[6]);
-
-        round512(b, c, d, &mut e, f, g, h, &mut a, kw[7]);
-    }
-
-    for (word, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-        *word = word.wrapping_add(value);
+    for (word, value) in state.iter_mut().zip(v.iter()) {
+        *word = word.wrapping_add(*value);
     }
 }
 
