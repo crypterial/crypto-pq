@@ -1,0 +1,201 @@
+# Temporary (port-eng run 2, category 9): crypto-pq new (rust/: main 23aa5eb with PR #38 and
+# PR #39), base (rust-main/: daea168, before D-79, whose hash code equals main's), an A/A copy of
+# new (rust-aa/) and new with the wasm32 barrier variant (rust-wb/: ML-DSA in dsa, ML-KEM in
+# kc-wb) against the counted rivals of categories 1 to 8 on i686, armv7 and wasm32-wasip1. One
+# build job cross-compiles every binary in rust:1.99.0-trixie with the Debian cross gcc (static
+# i686 and armv7 binaries, default wasm32 build, no +simd128), on an Arm64 runner: the same image
+# and steps were checked on an Arm64 host before the push. Each run job checks every output
+# against crypto-pq's (CHECK OK) before any timing. x86 jobs: i686 natively, then wasm32 under
+# wasmtime and under Node.js. arm jobs: armv7 only if AArch32 runs at EL0, then wasm32 under both.
+# Budget (run.sh defaults, every row kept): pair rounds 5 with 2 s per case after 3 rounds, meas
+# 8 rounds, dsa 9, slh 3 (sign of the s sets is the slow row), kem 31. One wasm32 suite took
+# 18 min under wasmtime on a loaded M3 (2 CPUs); a run job holds three suites, about 80 min
+# expected, under the 150-minute timeout.
+# The branch is deleted after the run.
+name: port-eng-bench
+
+on:
+  push:
+    branches: ["bench/port-eng-*"]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  WASMTIME_VERSION: v50.0.1
+  WASMTIME_SHA256_X86_64: 685466455dd42a14774a86c36c8f2e45cbb9bd6d92a850139315df60a75498a5
+  WASMTIME_SHA256_AARCH64: d737e077416d78fbfb0a008229ec27d6a0fd5a4924874b8c38b293c850cf4094
+
+jobs:
+  build:
+    name: build i686, armv7, wasm32 (rust:1.99.0-trixie)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    container:
+      # rust:1.99.0-trixie, linux/arm64 image manifest.
+      image: rust@sha256:585dced3da590f4f7dc2719172ead5b39ea781bd8b698c092112da8ef3be0659
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Debian cross gcc, i386 and armhf OpenSSL, zlib and zstd, cmake and libclang
+        run: |
+          set -euo pipefail
+          dpkg --add-architecture i386
+          dpkg --add-architecture armhf
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends cmake libclang-19-dev \
+            gcc-i686-linux-gnu gcc-arm-linux-gnueabihf libc6-dev-i386-cross libc6-dev-armhf-cross \
+            libssl-dev:i386 libssl-dev:armhf
+          # zlib and zstd static libraries (Debian's libcrypto.a needs them) unpacked apart, not
+          # installed: zlib1g-dev:i386 and :armhf pull libc6-dev:i386 and :armhf into
+          # /usr/lib/<multiarch>, which openssl-sys puts on the link path ahead of the cross
+          # sysroot, and that glibc does not link static (i686: undefined ___tls_get_addr from
+          # ld-linux.so.2, bench 1).
+          mkdir -p "$RUNNER_TEMP/debs" "$RUNNER_TEMP/xlib"
+          (cd "$RUNNER_TEMP/debs" && apt-get download zlib1g-dev:i386 libzstd-dev:i386 zlib1g-dev:armhf libzstd-dev:armhf)
+          for d in "$RUNNER_TEMP"/debs/*.deb; do dpkg -x "$d" "$RUNNER_TEMP/xlib"; done
+          sha256sum "$RUNNER_TEMP"/debs/*.deb
+          ls "$RUNNER_TEMP"/xlib/usr/lib/*/
+          if ls /usr/lib/i386-linux-gnu/libc.a /usr/lib/arm-linux-gnueabihf/libc.a 2> /dev/null; then
+            echo "a target libc6-dev is installed next to the cross sysroot"
+            exit 1
+          fi
+          rustup target add --toolchain 1.99.0 i686-unknown-linux-gnu armv7-unknown-linux-gnueabihf wasm32-wasip1
+          rustc +1.99.0 --version
+          i686-linux-gnu-gcc --version | head -1
+      - name: build
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/logs"
+          export LIBCLANG_PATH=/usr/lib/llvm-19/lib CARGO_FLAGS=--locked
+          export SRC="$GITHUB_WORKSPACE/pbench" SCRIPTS="$GITHUB_WORKSPACE/pbench/scripts"
+          export OUT="$RUNNER_TEMP/bin" TD="$RUNNER_TEMP/t" LOGS="$RUNNER_TEMP/logs" XLIB="$RUNNER_TEMP/xlib/usr/lib"
+          # The shell runs with -e: a failed build must not end the step before its logs.
+          rc=0
+          sh pbench/scripts/pbuild.sh || rc=$?
+          # pbuild prints every error block of a failed build; the logs of failed builds follow in
+          # full (without the progress lines), lines cut at 4000 characters.
+          for f in "$RUNNER_TEMP"/logs/*.log; do
+            if grep -q '^error' "$f"; then
+              echo "::group::$f"
+              grep -vE '^ *(Compiling|Downloaded|Downloading|Locking|Adding|Updating|Fresh) ' "$f" | cut -c1-4000
+              echo "::endgroup::"
+            fi
+          done
+          file "$OUT"/*/* | sed 's/, BuildID[^,]*//'
+          sha256sum "$OUT"/*/*
+          exit $rc
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin
+          path: ${{ runner.temp }}/bin
+
+  x86:
+    needs: build
+    name: run x86 ${{ matrix.id }} (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [x01, x02, x03, x04, x05, x06, x07, x08, x09, x10, x11, x12]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bin
+          path: bin
+      - name: wasmtime (archive checked against its SHA-256)
+        run: |
+          set -euo pipefail
+          f=wasmtime-$WASMTIME_VERSION-x86_64-linux.tar.xz
+          curl -sSLf -o "$RUNNER_TEMP/$f" "https://github.com/bytecodealliance/wasmtime/releases/download/$WASMTIME_VERSION/$f"
+          echo "$WASMTIME_SHA256_X86_64  $RUNNER_TEMP/$f" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP"
+      - run: |
+          {
+            uname -srm
+            lscpu | grep -E '^(Model name|Vendor ID|CPU family|Model:|Stepping|CPU\(s\)|L1d|L2|L3)' || true
+            for f in sse2 ssse3 sse4_1 avx2 bmi2 sha_ni avx512f avx512vl; do
+              if grep -qw "$f" /proc/cpuinfo; then echo "flag $f yes"; else echo "flag $f no"; fi
+            done
+            echo "node $(node --version)"
+            export WASMTIME="$RUNNER_TEMP/wasmtime-$WASMTIME_VERSION-x86_64-linux/wasmtime" WASI_RUN="$PWD/pbench/wasi-run.mjs"
+            "$WASMTIME" --version
+            chmod +x bin/*/*
+            echo "CLASS i686 load $(cut -d' ' -f1-3 /proc/loadavg)"
+            taskset -c 1 sh pbench/run.sh native bin/i686-unknown-linux-gnu || echo "SUITE native rc=$?"
+            echo "CLASS wasmtime load $(cut -d' ' -f1-3 /proc/loadavg)"
+            taskset -c 1 sh pbench/run.sh wasmtime bin/wasm32-wasip1 || echo "SUITE wasmtime rc=$?"
+            echo "CLASS node load $(cut -d' ' -f1-3 /proc/loadavg)"
+            taskset -c 1 sh pbench/run.sh node bin/wasm32-wasip1 || echo "SUITE node rc=$?"
+            echo "load $(cat /proc/loadavg)"
+          } 2>&1 | tee "$RUNNER_TEMP/raw.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: raw-${{ matrix.id }}
+          path: ${{ runner.temp }}/raw.txt
+
+  arm:
+    needs: build
+    name: run arm ${{ matrix.id }} (ubuntu-24.04-arm)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [a01, a02, a03]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bin
+          path: bin
+      - name: AArch32 at EL0 (a static armv7 binary)
+        id: aarch32
+        run: |
+          chmod +x bin/*/*
+          if out=$(bin/armv7-unknown-linux-gnueabihf/kem-new 2>&1); then
+            echo "AARCH32 yes: $out" | tee "$RUNNER_TEMP/aarch32.txt"
+            echo "ok=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "AARCH32 no (rc=$?): $out; the armv7 class is unavailable on this runner" | tee "$RUNNER_TEMP/aarch32.txt"
+            echo "ok=no" >> "$GITHUB_OUTPUT"
+          fi
+      - name: wasmtime (archive checked against its SHA-256)
+        run: |
+          set -euo pipefail
+          f=wasmtime-$WASMTIME_VERSION-aarch64-linux.tar.xz
+          curl -sSLf -o "$RUNNER_TEMP/$f" "https://github.com/bytecodealliance/wasmtime/releases/download/$WASMTIME_VERSION/$f"
+          echo "$WASMTIME_SHA256_AARCH64  $RUNNER_TEMP/$f" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP"
+      - run: |
+          {
+            uname -srm
+            lscpu | grep -E '^(Model name|Vendor ID|CPU part|CPU\(s\)|L1d|L2|L3)' || true
+            grep -m1 -o 'Features.*' /proc/cpuinfo || true
+            cat "$RUNNER_TEMP/aarch32.txt"
+            echo "node $(node --version)"
+            export WASMTIME="$RUNNER_TEMP/wasmtime-$WASMTIME_VERSION-aarch64-linux/wasmtime" WASI_RUN="$PWD/pbench/wasi-run.mjs"
+            "$WASMTIME" --version
+            if [ "${{ steps.aarch32.outputs.ok }}" = yes ]; then
+              echo "CLASS armv7 load $(cut -d' ' -f1-3 /proc/loadavg)"
+              taskset -c 1 sh pbench/run.sh native bin/armv7-unknown-linux-gnueabihf || echo "SUITE native rc=$?"
+            else
+              echo "CLASS armv7 unavailable"
+            fi
+            echo "CLASS wasmtime load $(cut -d' ' -f1-3 /proc/loadavg)"
+            taskset -c 1 sh pbench/run.sh wasmtime bin/wasm32-wasip1 || echo "SUITE wasmtime rc=$?"
+            echo "CLASS node load $(cut -d' ' -f1-3 /proc/loadavg)"
+            taskset -c 1 sh pbench/run.sh node bin/wasm32-wasip1 || echo "SUITE node rc=$?"
+            echo "load $(cat /proc/loadavg)"
+          } 2>&1 | tee "$RUNNER_TEMP/raw.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: raw-${{ matrix.id }}
+          path: ${{ runner.temp }}/raw.txt

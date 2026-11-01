@@ -1,0 +1,185 @@
+[package]
+name = "crypto-pq-aa"
+version = "1.0.1"
+edition = "2024"
+rust-version = "1.89"
+description = "Secure, optimized post-quantum cryptography in pure Rust with no dependencies: ML-KEM, FrodoKEM, ML-DSA, SLH-DSA, HSS/LMS and XMSS, plus SHA-2, SHA-3, BLAKE2, BLAKE3, Ascon, HMAC and HKDF."
+license = "Apache-2.0 OR MIT"
+homepage = "https://crypterial.com/research/crypto-pq/"
+repository = "https://github.com/crypterial/crypto-pq"
+readme = "README.md"
+keywords = ["post-quantum", "cryptography", "ml-kem", "ml-dsa", "slh-dsa"]
+categories = ["cryptography", "no-std"]
+include = ["/src", "/build.rs", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
+
+# Every algorithm family is a feature, and the default set enables them all. hazmat, the
+# deterministic operations for test vectors that take the caller's seeds and randomness, is opt-in.
+[features]
+default = [
+    "ml-kem",
+    "frodokem",
+    "ml-dsa",
+    "slh-dsa",
+    "lms",
+    "xmss",
+    "sha2",
+    "sha3",
+    "blake2",
+    "blake3",
+    "ascon",
+    "hmac",
+    "hkdf",
+]
+ml-kem = []
+frodokem = []
+ml-dsa = []
+slh-dsa = []
+lms = []
+xmss = []
+sha2 = []
+sha3 = []
+blake2 = []
+blake3 = []
+ascon = []
+hmac = ["sha2"]
+hkdf = ["hmac"]
+hazmat = []
+
+# docs.rs documents every feature, hazmat included, and shows the features that each item needs.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+name = "bench"
+harness = false
+required-features = [
+    "ml-kem",
+    "frodokem",
+    "ml-dsa",
+    "slh-dsa",
+    "lms",
+    "xmss",
+    "sha2",
+    "sha3",
+    "blake2",
+    "blake3",
+    "ascon",
+    "hmac",
+    "hkdf",
+    "hazmat",
+]
+
+[[test]]
+name = "ascon"
+required-features = ["ascon"]
+
+[[test]]
+name = "blake2"
+required-features = ["blake2", "sha2"]
+
+[[test]]
+name = "blake3"
+required-features = ["blake3"]
+
+[[test]]
+name = "cross"
+required-features = [
+    "ml-kem",
+    "frodokem",
+    "ml-dsa",
+    "slh-dsa",
+    "lms",
+    "xmss",
+    "hmac",
+    "sha3",
+    "hazmat",
+]
+
+[[test]]
+name = "ct"
+required-features = [
+    "ml-kem",
+    "frodokem",
+    "ml-dsa",
+    "slh-dsa",
+    "lms",
+    "xmss",
+    "sha2",
+    "sha3",
+    "blake2",
+    "blake3",
+    "ascon",
+    "hmac",
+    "hkdf",
+    "hazmat",
+]
+
+[[test]]
+name = "frodokem"
+required-features = ["frodokem", "sha2", "sha3", "hazmat"]
+
+[[test]]
+name = "hash"
+required-features = ["sha2", "sha3", "blake2", "ascon", "hmac", "ml-dsa", "slh-dsa", "hazmat"]
+
+[[test]]
+name = "kdf"
+required-features = ["hkdf"]
+
+[[test]]
+name = "kem"
+required-features = ["ml-kem", "hazmat"]
+
+[[test]]
+name = "mldsa"
+required-features = ["ml-dsa", "hazmat"]
+
+[[test]]
+name = "robustness"
+required-features = [
+    "ml-kem",
+    "frodokem",
+    "ml-dsa",
+    "slh-dsa",
+    "lms",
+    "xmss",
+    "hmac",
+    "hazmat",
+]
+
+[[test]]
+name = "slhdsa"
+required-features = ["slh-dsa", "hazmat"]
+
+[[test]]
+name = "sp800_185"
+required-features = ["sha3", "hazmat"]
+
+[[test]]
+name = "stateful"
+required-features = ["lms", "xmss", "hmac", "hazmat"]
+
+[[test]]
+name = "symmetric"
+required-features = [
+    "sha2",
+    "sha3",
+    "blake2",
+    "blake3",
+    "ascon",
+    "hmac",
+    "hkdf",
+    "hazmat",
+]
+
+# The SLH-DSA, XMSS and LMS vector suites take minutes unoptimized; test builds keep their debug
+# assertions and overflow checks but are optimized.
+[profile.test]
+opt-level = 3
+
+# RUSTFLAGS="--cfg crypto_pq_ct" builds the constant-time check of tests/ct.rs,
+# RUSTFLAGS="--cfg crypto_pq_portable" leaves out every CPU-specific instruction, and
+# RUSTFLAGS="--cfg crypto_pq_sse41" caps x86-64 at SSE4.1 and AES-NI.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(crypto_pq_ct)', 'cfg(crypto_pq_portable)', 'cfg(crypto_pq_sse41)', 'cfg(crypto_pq_optimized)'] }

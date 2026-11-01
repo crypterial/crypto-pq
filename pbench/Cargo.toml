@@ -1,0 +1,113 @@
+[package]
+name = "pbench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# port-eng phase 1 (never shipped): the counted harnesses of categories 1 to 8, unchanged in what
+# they time, as one crate for i686, armv7 and wasm32-wasip1. crypto-pq new (rust/), base
+# (rust-main/) and an A/A copy of new (rust-aa/). Rivals at their latest crates.io release on
+# 2026-11-01 with default features; a rival that does not build for a target with its default
+# features (rule D2) is left out there by the target tables below.
+#   kc    cat 1 Keccak (and the ML-KEM rows of RustCrypto, libcrux, aws-lc-rs)  bench/kc-eng
+#   kem   cat 3 against oqs                                                    kem-eng overlay-12
+#   kem2  cat 3 against aws-lc-rs and pqcrypto-mlkem                           kem-eng overlay-13
+#   dsa   cat 2                                                                dsa-eng overlay-7
+#   rv    cat 4 SHA-2, HMAC, HKDF, LMS, XMSS                                   sha-eng overlay-19
+#   slh   cat 5                                                                slh-eng overlay-9
+#   meas  cat 6 BLAKE2/BLAKE3, cat 7 Ascon, cat 8 FrodoKEM                     meas-eng overlay-1
+# kc, rv and meas link one crypto-pq copy as crypto_pq (cpq in meas): new by default, base with
+# feature flavor-base, the A/A copy with flavor-aa. Feature alt swaps libsodium for blake2b-rs,
+# whose C symbols clash with libsodium's (meas only).
+[features]
+default = ["main"]
+main = ["dep:libsodium-sys-stable"]
+alt = ["dep:blake2b-rs"]
+flavor-base = []
+flavor-aa = []
+flavor-wb = []
+
+[dependencies]
+cpq_new = { package = "crypto-pq", path = "../rust", features = ["hazmat"] }
+cpq_base = { package = "crypto-pq-main", path = "../rust-main", features = ["hazmat"] }
+cpq_aa = { package = "crypto-pq-aa", path = "../rust-aa", features = ["hazmat"] }
+# new with the WebAssembly barrier variant (port-eng bench 2): a volatile read in place of black_box.
+cpq_wb = { package = "crypto-pq-wb", path = "../rust-wb", features = ["hazmat"] }
+sha3 = "=0.12.0"
+shake = "=0.1.0"
+cshake = "=0.2.1"
+tiny-keccak = { version = "=2.0.2", features = ["sha3", "shake", "cshake", "kmac"] }
+sha3-kmac = "=0.3.0"
+libcrux-sha3 = "=0.0.11"
+ml-kem = { version = "=0.3.4", features = ["hazmat"] }
+libcrux-ml-kem = "=0.0.11"
+ml-dsa = "=0.1.1"
+libcrux-ml-dsa = "=0.0.11"
+rustcrypto_slh = { package = "slh-dsa", version = "=0.2.0-rc.5" }
+fips205 = "=0.5.0"
+lattice_slh = { package = "lattice-slh-dsa", version = "=0.4.0" }
+sha2 = "=0.11.1"
+hmac = "=0.13.0"
+hkdf = "=0.13.0"
+libcrux-sha2 = "=0.0.9"
+libcrux-hmac = "=0.0.9"
+libcrux-hkdf = "=0.0.9"
+hbs-lms = "=0.2.0-alpha.1"
+lms-signature = "=0.1.0-rc.2"
+xmss = "=0.1.0-pre.0"
+getrandom = { version = "=0.4.3", features = ["sys_rng"] }
+signature = "=3.0.0"
+blake2 = "=0.11.0"
+blake2b_simd = "=1.0.5"
+blake2s_simd = "=1.0.5"
+blake3 = "=1.8.7"
+blake2-rfc = "=0.2.18"
+blake2b-ref = "=0.3.1"
+rfc7693 = "=0.1.0"
+libcrux-blake2 = "=0.0.9"
+tc_blake = "=0.1.0"
+cryptoxide = "=0.6.7"
+orion = "=0.18.1"
+dryoc = "=2.0.0"
+kevy-crypto = "=7.0.0"
+krypteia-tessera = "=0.2.0"
+p3-blake2s = "=0.9.0-rc.2"
+ab-blake3 = "=0.2.0"
+ascon-hash256 = "=0.1.0"
+ascon-xof128 = "=0.2.1"
+ascon-hash = "=0.4.0"
+tc_ascon_hash = "=0.1.0"
+ascon-rs = "=0.1.0"
+ascon-full = "=0.1.0"
+frodo-kem = "=0.1.0"
+frodo-kem-rs = "=0.9.1"
+rand_core = "=0.10.1"
+tc_digest = "=0.1.1"
+
+# C-backed rivals: built with the Debian cross gcc on i686 and armv7; none builds for
+# wasm32-wasip1 with the Rust toolchain alone. purecrypto (pure Rust) has no OsRng there.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+aws-lc-rs = "=1.19.0"
+ring = "=0.17.14"
+openssl = "=0.10.81"
+libsodium-sys-stable = { version = "=1.24.3", optional = true }
+blake2b-rs = { version = "=0.2.0", optional = true }
+slhdsa-c-rs = "=0.0.5"
+pqcrypto-mlkem = "=0.1.1"
+pqcrypto-frodo = "=0.4.11"
+pqcrypto-traits = "=0.3.5"
+purecrypto = "=0.10.4"
+
+# liboqs 0.13.0 stops at CMake on 32-bit ARM ("Unknown or unsupported processor: arm").
+[target.'cfg(not(any(target_family = "wasm", target_arch = "arm")))'.dependencies]
+oqs = "=0.11.0"
+
+# rscrypto 0.12.0 has compile_error! on 32-bit x86.
+[target.'cfg(not(target_arch = "x86"))'.dependencies]
+rscrypto = { version = "=0.12.0", features = ["blake2b", "blake2s", "blake3", "ascon-hash"] }
+
+[profile.release]
+debug = false
+codegen-units = 1
+
+[workspace]

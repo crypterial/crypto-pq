@@ -1,0 +1,2704 @@
+use alloc::vec;
+use alloc::vec::Vec;
+use core::hint::black_box;
+use core::ops::{Deref, DerefMut};
+
+use crate::cpu::{self, Field, Pack, Prepare};
+use crate::ct::{self, declassify, declassify_value};
+use crate::keccak::{self, Keccak, MAX_SPONGES, Sponges};
+use crate::primitives::{shake256, shake256_into};
+use crate::wipe::{SecretBytes, wipe, wipe_unless_optimized};
+
+pub(crate) const Q: i32 = 8380417;
+
+const SHAKE: u8 = 0x1F;
+
+const D: u32 = 13;
+
+// q^-1 mod 2^32, for Montgomery reduction.
+const QINV: i32 = 58728449;
+
+// 2^64 mod q: a second Montgomery reduction against it turns a*b*2^-32 back into a*b.
+const R2: i32 = ((1u128 << 64) % Q as u128) as i32;
+
+type Poly = [i32; 256];
+
+const fn power(base: u64, exponent: u32) -> u64 {
+    let mut result = 1;
+
+    let mut i = 0;
+
+    while i < exponent {
+        result = result * base % Q as u64;
+
+        i += 1;
+    }
+
+    result
+}
+
+// 1753^BitRev8(m) mod q, premultiplied by 2^32 so that one Montgomery reduction of a product with
+// it gives the plain product modulo q.
+const ZETAS: [i32; 256] = {
+    let mut table = [0; 256];
+
+    let mut m = 0;
+
+    while m < 256 {
+        let zeta = power(1753, (m as u32).reverse_bits() >> 24);
+
+        table[m] = ((zeta << 32) % Q as u64) as i32;
+
+        m += 1;
+    }
+
+    table
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Parameters {
+    k: usize,
+    l: usize,
+    eta: i32,
+    tau: usize,
+    pub(crate) lambda: usize,
+    gamma1: i32,
+    gamma2: i32,
+    omega: usize,
+}
+
+pub(crate) const ML_DSA_44: Parameters = Parameters {
+    k: 4,
+    l: 4,
+    eta: 2,
+    tau: 39,
+    lambda: 128,
+    gamma1: 1 << 17,
+    gamma2: (Q - 1) / 88,
+    omega: 80,
+};
+
+pub(crate) const ML_DSA_65: Parameters = Parameters {
+    k: 6,
+    l: 5,
+    eta: 4,
+    tau: 49,
+    lambda: 192,
+    gamma1: 1 << 19,
+    gamma2: (Q - 1) / 32,
+    omega: 55,
+};
+
+pub(crate) const ML_DSA_87: Parameters = Parameters {
+    k: 8,
+    l: 7,
+    eta: 2,
+    tau: 60,
+    lambda: 256,
+    gamma1: 1 << 19,
+    gamma2: (Q - 1) / 32,
+    omega: 75,
+};
+
+const fn bit_length(value: i32) -> u32 {
+    u32::BITS - (value as u32).leading_zeros()
+}
+
+impl Parameters {
+    const fn beta(&self) -> i32 {
+        self.tau as i32 * self.eta
+    }
+
+    const fn eta_bits(&self) -> u32 {
+        bit_length(2 * self.eta)
+    }
+
+    const fn gamma1_bits(&self) -> u32 {
+        1 + bit_length(self.gamma1 - 1)
+    }
+
+    const fn w1_bits(&self) -> u32 {
+        bit_length((Q - 1) / (2 * self.gamma2) - 1)
+    }
+
+    const fn challenge_size(&self) -> usize {
+        self.lambda / 4
+    }
+
+    pub(crate) const fn public_key_size(&self) -> usize {
+        32 + 320 * self.k
+    }
+
+    pub(crate) const fn private_key_size(&self) -> usize {
+        128 + 32 * ((self.k + self.l) * self.eta_bits() as usize + D as usize * self.k)
+    }
+
+    pub(crate) const fn signature_size(&self) -> usize {
+        self.challenge_size() + 32 * self.l * self.gamma1_bits() as usize + self.omega + self.k
+    }
+}
+
+// A vector of polynomials, wiped when dropped because most of them hold secret values.
+struct Polys(Vec<Poly>);
+
+impl Polys {
+    fn new(count: usize) -> Self {
+        Self(vec![[0; 256]; count])
+    }
+}
+
+impl Deref for Polys {
+    type Target = [Poly];
+
+    fn deref(&self) -> &[Poly] {
+        &self.0
+    }
+}
+
+impl DerefMut for Polys {
+    fn deref_mut(&mut self) -> &mut [Poly] {
+        &mut self.0
+    }
+}
+
+impl Drop for Polys {
+    fn drop(&mut self) {
+        wipe(self.0.as_flattened_mut());
+    }
+}
+
+const fn high(a: i32, b: i32) -> i32 {
+    ((a as i64 * b as i64) >> 32) as i32
+}
+
+// a * b * 2^-32 mod q in (-q, q), for |a * b| < 2^31 q, given b_qinv = b * q^-1 mod 2^32. The
+// low halves of a * b and of its multiple of q cancel, so only high halves are computed, which
+// the compiler can vectorize.
+const fn montgomery(a: i32, b: i32, b_qinv: i32) -> i32 {
+    high(a, b) - high(a.wrapping_mul(b_qinv), Q)
+}
+
+const fn montgomery_mul(a: i32, b: i32) -> i32 {
+    montgomery(a, b, b.wrapping_mul(QINV))
+}
+
+// (-q, q) to [0, q) with a mask instead of a branch.
+const fn freeze(a: i32) -> i32 {
+    a + (Q & (a >> 31))
+}
+
+// |a| < 2^31 - 2^22 to a representative of absolute value below q, without a division.
+const fn reduce(a: i32) -> i32 {
+    a - ((a + (1 << 22)) >> 23) * Q
+}
+
+const fn add(a: i32, b: i32) -> i32 {
+    freeze(a + b - Q)
+}
+
+const fn sub(a: i32, b: i32) -> i32 {
+    freeze(a - b)
+}
+
+const fn mul(a: i32, b: i32) -> i32 {
+    freeze(montgomery_mul(montgomery_mul(a, b), R2))
+}
+
+// 2^64 / 256 mod q: one Montgomery reduction against it removes the 2^-32 that the pointwise
+// products carry and divides by the 256 of the transform.
+const INVERSE_SCALE: i32 = mul(R2, 8347681);
+
+// A coefficient in (-q, q) to [0, q).
+const fn canonical(a: i32) -> i32 {
+    freeze(a)
+}
+
+// [0, q) to the representative in (-(q - 1) / 2, (q - 1) / 2].
+const fn centered(a: i32) -> i32 {
+    a - (Q & (((Q - 1) / 2 - a) >> 31))
+}
+
+// The twiddle factors as the CPU kernels take them.
+pub(crate) static FIELD: Field = Field::new(
+    Q,
+    QINV,
+    8,
+    {
+        let mut zetas = [0; 256];
+
+        let mut m = 0;
+
+        while m < 256 {
+            zetas[m] = centered(ZETAS[m]);
+
+            m += 1;
+        }
+
+        zetas
+    },
+    Prepare::Reduce,
+    None,
+    INVERSE_SCALE,
+);
+
+// Inputs of absolute value below q; the butterflies reduce only their products, so the outputs
+// stay below 9q in absolute value.
+fn ntt(w: &mut Poly) {
+    if !cpu::ntt(w, &FIELD) {
+        ntt_portable(w);
+    }
+}
+
+fn ntt_portable(w: &mut Poly) {
+    let mut m = 0;
+
+    let mut length = 128;
+
+    while length >= 1 {
+        for start in (0..256).step_by(2 * length) {
+            m += 1;
+
+            let zeta = centered(ZETAS[m]);
+
+            let zeta_qinv = zeta.wrapping_mul(QINV);
+
+            let (low, high) = w[start..start + 2 * length].split_at_mut(length);
+
+            for (a, b) in low.iter_mut().zip(high) {
+                let t = montgomery(*b, zeta, zeta_qinv);
+
+                *b = *a - t;
+
+                *a += t;
+            }
+        }
+
+        length /= 2;
+    }
+}
+
+// Inverts ntt on sums of pointwise products (see INVERSE_SCALE) and returns coefficients in
+// [0, q). The input is first brought below q in absolute value, so the sums of the butterflies
+// stay below 256q.
+fn inverse_ntt(w: &mut Poly) {
+    if !cpu::inverse_ntt(w, &FIELD) {
+        inverse_ntt_portable(w);
+    }
+}
+
+fn inverse_ntt_portable(w: &mut Poly) {
+    for x in w.iter_mut() {
+        *x = reduce(*x);
+    }
+
+    let mut m = 256;
+
+    let mut length = 1;
+
+    while length < 256 {
+        for start in (0..256).step_by(2 * length) {
+            m -= 1;
+
+            let zeta = -centered(ZETAS[m]);
+
+            let zeta_qinv = zeta.wrapping_mul(QINV);
+
+            let (low, high) = w[start..start + 2 * length].split_at_mut(length);
+
+            for (a, b) in low.iter_mut().zip(high) {
+                let t = *a;
+
+                *a = t + *b;
+
+                *b = montgomery(t - *b, zeta, zeta_qinv);
+            }
+        }
+
+        length *= 2;
+    }
+
+    let scale_qinv = INVERSE_SCALE.wrapping_mul(QINV);
+
+    for x in w.iter_mut() {
+        *x = freeze(montgomery(*x, INVERSE_SCALE, scale_qinv));
+    }
+}
+
+// a * 2^-32 mod q by the Montgomery reduction of a 64-bit value: a - m q, with m = a q^-1 mod
+// 2^32, is a multiple of 2^32. For |a| < 2^63 - 2^31 q the result is below |a| / 2^32 + q / 2 in
+// absolute value, so in (-q, q) for |a| < 2^31 q.
+const fn montgomery_wide(a: i64) -> i32 {
+    let m = (a as i32).wrapping_mul(QINV);
+
+    ((a - m as i64 * Q as i64) >> 32) as i32
+}
+
+// acc += (f[0] g[0] + f[1] g[1] + ...) * 2^-32 coefficient-wise, for outputs of ntt and the
+// matrix: each coefficient's products are summed exactly in 64 bits and reduced once. Inputs of
+// absolute value below 9q, at most seven terms: the sums stay below 567 q^2 < 2^56, and each
+// result below 2q; inverse_ntt reduces the sums.
+fn multiply_add(acc: &mut Poly, f: &[Poly], g: &[Poly]) {
+    if !cpu::multiply_add(acc, f, g, &FIELD) {
+        multiply_add_portable(acc, f, g);
+    }
+}
+
+fn multiply_add_portable(acc: &mut Poly, f: &[Poly], g: &[Poly]) {
+    for (i, x) in acc.iter_mut().enumerate() {
+        let sum = f
+            .iter()
+            .zip(g)
+            .fold(0, |sum, (f, g)| sum + i64::from(f[i]) * i64::from(g[i]));
+
+        *x += montgomery_wide(sum);
+    }
+}
+
+fn pointwise(f: &Poly, g: &Poly, product: &mut Poly) {
+    if !cpu::multiply(product, f, g, &FIELD) {
+        pointwise_portable(f, g, product);
+    }
+}
+
+fn pointwise_portable(f: &Poly, g: &Poly, product: &mut Poly) {
+    for ((x, &a), &b) in product.iter_mut().zip(f).zip(g) {
+        *x = montgomery_mul(a, b);
+    }
+}
+
+// Branch-free FIPS 204 Algorithm 36 for r in [0, q): (r1, r0) with r0 centered. The sign masks
+// pass through black_box: an optimizer that sees x ^ (mask & x) or x - (mask & q) makes it a
+// select, which some compilers lower to a conditional move on the secret coefficient.
+const fn decompose(r: i32, gamma2: i32) -> (i32, i32) {
+    let mut r1 = (r + 127) >> 7;
+
+    if gamma2 == (Q - 1) / 32 {
+        r1 = ((r1 * 1025 + (1 << 21)) >> 22) & 15;
+    } else {
+        r1 = (r1 * 11275 + (1 << 23)) >> 24;
+
+        r1 ^= black_box((43 - r1) >> 31) & r1;
+    }
+
+    let r0 = r - r1 * 2 * gamma2;
+
+    (r1, r0 - (black_box(((Q - 1) / 2 - r0) >> 31) & Q))
+}
+
+const fn high_bits(r: i32, gamma2: i32) -> i32 {
+    decompose(r, gamma2).0
+}
+
+const fn low_bits(r: i32, gamma2: i32) -> i32 {
+    decompose(r, gamma2).1
+}
+
+// FIPS 204 Algorithm 35 for r in [0, q): (r + 2^12 - 1) >> 13 rounds r / 2^13 the same way.
+const fn power2round(r: i32) -> (i32, i32) {
+    let r1 = (r + (1 << (D - 1)) - 1) >> D;
+
+    (r1, r - (r1 << D))
+}
+
+// FIPS 204 Algorithm 40, with m = (q - 1) / (2 gamma2) as a constant of each gamma2 and the
+// remainders as compares, which a division per coefficient took several times as long as.
+fn use_hint(hint: bool, r: i32, gamma2: i32) -> i32 {
+    let m = if gamma2 == (Q - 1) / 32 { 16 } else { 44 };
+
+    let (r1, r0) = decompose(r, gamma2);
+
+    match (hint, r0 > 0) {
+        (false, _) => r1,
+        (true, true) if r1 == m - 1 => 0,
+        (true, true) => r1 + 1,
+        (true, false) if r1 == 0 => m - 1,
+        (true, false) => r1 - 1,
+    }
+}
+
+// -1 when some centered value reaches the bound in absolute value, 0 otherwise, computed over
+// every value without branching on any of them.
+fn reaches(values: impl IntoIterator<Item = i32>, bound: i32) -> i32 {
+    values.into_iter().fold(0, |flag, value| {
+        let sign = value >> 31;
+
+        flag | ((bound - 1 - ((value ^ sign) - sign)) >> 31)
+    })
+}
+
+// out = a + b or a - b modulo q, coefficient by coefficient, for canonical a and b.
+fn add_polys(out: &mut Poly, a: &Poly, b: &Poly) {
+    if !cpu::mldsa_add(out, a, b, Q) {
+        add_polys_portable(out, a, b);
+    }
+}
+
+fn add_polys_portable(out: &mut Poly, a: &Poly, b: &Poly) {
+    for ((x, a), b) in out.iter_mut().zip(a).zip(b) {
+        *x = add(*a, *b);
+    }
+}
+
+fn sub_polys(out: &mut Poly, a: &Poly, b: &Poly) {
+    if !cpu::mldsa_sub(out, a, b, Q) {
+        sub_polys_portable(out, a, b);
+    }
+}
+
+fn sub_polys_portable(out: &mut Poly, a: &Poly, b: &Poly) {
+    for ((x, a), b) in out.iter_mut().zip(a).zip(b) {
+        *x = sub(*a, *b);
+    }
+}
+
+// reaches over the centered coefficients of a polynomial in [0, q), or with gamma2 over the low
+// bits that Decompose gives them.
+fn poly_reaches(values: &Poly, bound: i32, gamma2: Option<i32>) -> i32 {
+    match cpu::mldsa_norm(values, bound, gamma2, Q) {
+        Some(flag) => flag,
+        None => poly_reaches_portable(values, bound, gamma2),
+    }
+}
+
+fn poly_reaches_portable(values: &Poly, bound: i32, gamma2: Option<i32>) -> i32 {
+    match gamma2 {
+        Some(gamma2) => reaches(values.iter().map(|&x| low_bits(x, gamma2)), bound),
+        None => reaches(values.iter().map(|&x| centered(x)), bound),
+    }
+}
+
+// The hint bits of r and ct0, h = [HighBits(r + ct0) != HighBits(r)], and how many are set.
+fn make_hints(h: &mut Poly, r: &Poly, ct0: &Poly, gamma2: i32) -> i32 {
+    match cpu::mldsa_hints(h, r, ct0, gamma2, Q) {
+        Some(count) => count,
+        None => make_hints_portable(h, r, ct0, gamma2),
+    }
+}
+
+fn make_hints_portable(h: &mut Poly, r: &Poly, ct0: &Poly, gamma2: i32) -> i32 {
+    let mut count = 0;
+
+    for ((bit, &x), &c) in h.iter_mut().zip(r).zip(ct0) {
+        let difference = high_bits(add(x, c), gamma2) ^ high_bits(x, gamma2);
+
+        *bit = ((difference | -difference) >> 31) & 1;
+
+        count += *bit;
+    }
+
+    count
+}
+
+fn pack(out: &mut [u8], bits: u32, values: impl IntoIterator<Item = i32>) {
+    let mut poly = [0; 256];
+
+    for (x, value) in poly.iter_mut().zip(values) {
+        *x = value;
+    }
+
+    pack_with(out, bits, &poly, |x| x);
+
+    wipe(&mut poly);
+}
+
+// pack of f applied to every coefficient, which maps them as they are packed instead of into a
+// buffer that would then need wiping.
+fn pack_with(out: &mut [u8], bits: u32, poly: &Poly, f: impl Fn(i32) -> i32) {
+    match bits {
+        3 => pack_bits::<3>(out, poly, f),
+        4 => pack_bits::<4>(out, poly, f),
+        6 => pack_bits::<6>(out, poly, f),
+        10 => pack_bits::<10>(out, poly, f),
+        13 => pack_bits::<13>(out, poly, f),
+        18 => pack_bits::<18>(out, poly, f),
+        20 => pack_bits::<20>(out, poly, f),
+        _ => unreachable!("no ML-DSA encoding uses {bits} bits"),
+    }
+}
+
+// pack_with of one of the maps of the encodings, through a CPU kernel where there is one.
+fn pack_mapped(out: &mut [u8], bits: u32, poly: &Poly, map: Pack) {
+    if cpu::mldsa_pack(out, poly, bits, map, Q) {
+        return;
+    }
+
+    match map {
+        Pack::High => pack_with(out, bits, poly, |x| power2round(x).0),
+        Pack::Low => pack_with(out, bits, poly, |x| (1 << (D - 1)) - power2round(x).1),
+        Pack::Eta(eta) => pack_with(out, bits, poly, |x| eta - x),
+        Pack::Gamma1(gamma1) => pack_with(out, bits, poly, |x| gamma1 - centered(x)),
+    }
+}
+
+fn unpack(data: &[u8], bits: u32, values: &mut Poly) {
+    match bits {
+        3 => unpack_bits::<3>(data, values),
+        4 => unpack_bits::<4>(data, values),
+        6 => unpack_bits::<6>(data, values),
+        10 => unpack_bits::<10>(data, values),
+        13 => unpack_bits::<13>(data, values),
+        18 => unpack_bits::<18>(data, values),
+        20 => unpack_bits::<20>(data, values),
+        _ => unreachable!("no ML-DSA encoding uses {bits} bits"),
+    }
+}
+
+// Values move in groups that fill whole bytes and fit 128 bits, eight of them or four above 16
+// bits, so that every shift is a constant.
+const fn group_size(bits: usize) -> usize {
+    if bits <= 16 { 8 } else { 4 }
+}
+
+fn pack_bits<const BITS: usize>(out: &mut [u8], values: &Poly, f: impl Fn(i32) -> i32) {
+    let size = group_size(BITS);
+
+    for (bytes, group) in out
+        .chunks_exact_mut(BITS * size / 8)
+        .zip(values.chunks_exact(size))
+    {
+        let word = group.iter().enumerate().fold(0u128, |word, (i, &value)| {
+            word | (u128::from(f(value) as u32) << (BITS * i))
+        });
+
+        for (j, byte) in bytes.iter_mut().enumerate() {
+            *byte = (word >> (8 * j)) as u8;
+        }
+    }
+}
+
+fn unpack_bits<const BITS: usize>(data: &[u8], values: &mut Poly) {
+    let size = group_size(BITS);
+
+    let length = BITS * size / 8;
+
+    for (group, bytes) in values.chunks_exact_mut(size).zip(data.chunks_exact(length)) {
+        // A copy of constant size, which stays in registers: folded in byte by byte, the word
+        // took half as long again for 18 and 20 bits.
+        let mut window = [0; 16];
+
+        window[..length].copy_from_slice(bytes);
+
+        let word = u128::from_le_bytes(window);
+
+        for (i, value) in group.iter_mut().enumerate() {
+            *value = (word >> (BITS * i)) as i32 & ((1 << BITS) - 1);
+        }
+
+        wipe_unless_optimized!(&mut window);
+    }
+}
+
+// One block of an XOF stream, as the lanes of the sponge, into the coefficients accepted so far
+// (FIPS 204 Algorithm 30).
+fn sample_uniform(block: &[u64; 21], a: &mut Poly, count: &mut usize) {
+    if !cpu::uniform23(block, Q, a, count) {
+        sample_uniform_portable(block, a, count);
+    }
+}
+
+// The matrix is public, so its rejections may branch.
+fn sample_uniform_portable(block: &[u64; 21], a: &mut Poly, count: &mut usize) {
+    let mut bytes = [0; 168];
+
+    for (out, lane) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(block) {
+        *out = lane.to_le_bytes();
+    }
+
+    for chunk in bytes.as_chunks::<3>().0 {
+        let z =
+            i32::from(chunk[0]) | (i32::from(chunk[1]) << 8) | (i32::from(chunk[2] & 0x7F) << 16);
+
+        if z < Q && *count < 256 {
+            a[*count] = z;
+
+            *count += 1;
+        }
+    }
+}
+
+// Entries first, first + 1, ... of Â, whose XOF streams are squeezed in lockstep by `squeeze`,
+// which may permute another state beside them.
+fn rej_ntt_poly(
+    sponges: &mut Sponges,
+    rho: &[u8],
+    l: usize,
+    first: usize,
+    out: &mut [Poly],
+    mut squeeze: impl FnMut(&mut Sponges, [bool; MAX_SPONGES]),
+) {
+    let indices: [[u8; 2]; MAX_SPONGES] =
+        core::array::from_fn(|e| [((first + e) % l) as u8, ((first + e) / l) as u8]);
+
+    let parts = indices.each_ref().map(|index| [rho, &index[..]]);
+
+    let messages = parts.each_ref().map(|parts| &parts[..]);
+
+    sponges.start(168, SHAKE, &messages[..out.len()]);
+
+    let mut counts = [0; MAX_SPONGES];
+
+    while counts[..out.len()].iter().any(|&count| count < 256) {
+        squeeze(sponges, counts.map(|count| count < 256));
+
+        for (i, (a, count)) in out.iter_mut().zip(&mut counts).enumerate() {
+            if *count < 256 {
+                sample_uniform(sponges.lanes(i), a, count);
+            }
+        }
+    }
+}
+
+fn sample_bounded(block: &[u64; 17], eta: i32, a: &mut Poly, count: &mut usize) {
+    if !cpu::bounded(block, eta, a, count) {
+        sample_bounded_portable(block, eta, a, count);
+    }
+}
+
+// The accepted values never steer a branch: each candidate is written and only an accepted one
+// advances the count. Which candidates are rejected is public, as BoringSSL also has it: the bytes
+// of the SHAKE256 stream are independent of each other, so the rejected ones say nothing about the
+// accepted coefficients. Those are computed without a division (205 * x >> 10 = x / 5 for x < 15).
+// The nibbles go low before high in each byte of each little-endian lane, in plain loops over the
+// lanes, so that no iterator holds a copy of the secret stream in memory (D-76).
+fn sample_bounded_portable(block: &[u64; 17], eta: i32, a: &mut Poly, count: &mut usize) {
+    for &lane in block {
+        for position in 0..16 {
+            if *count == 256 {
+                return;
+            }
+
+            let half = ((lane >> (4 * position)) & 0x0F) as i32;
+
+            let (value, accepted) = if eta == 2 {
+                (2 - (half - 5 * ((205 * half) >> 10)), half < 15)
+            } else {
+                (4 - half, half < 9)
+            };
+
+            a[*count] = value;
+
+            *count += usize::from(declassify_value(accepted));
+        }
+    }
+}
+
+// FIPS 204 Algorithm 34 for the nonces first, first + 1, ..., squeezed in lockstep.
+fn rej_bounded_poly(sponges: &mut Sponges, seed: &[u8], first: usize, eta: i32, out: &mut [Poly]) {
+    let nonces: [[u8; 2]; MAX_SPONGES] =
+        core::array::from_fn(|i| ((first + i) as u16).to_le_bytes());
+
+    let parts = nonces.each_ref().map(|nonce| [seed, &nonce[..]]);
+
+    let messages = parts.each_ref().map(|parts| &parts[..]);
+
+    sponges.start(136, SHAKE, &messages[..out.len()]);
+
+    let mut counts = [0; MAX_SPONGES];
+
+    while counts[..out.len()].iter().any(|&count| count < 256) {
+        sponges.squeeze(counts.map(|count| count < 256));
+
+        for (i, (a, count)) in out.iter_mut().zip(&mut counts).enumerate() {
+            if *count < 256 {
+                sample_bounded(sponges.lanes(i), eta, a, count);
+            }
+        }
+    }
+}
+
+// Row i and column j at i * l + j, a group of entries at a time. The matrix is public, so it is
+// not wiped.
+fn expand_a(rho: &[u8], p: &Parameters) -> Vec<Poly> {
+    let mut a = vec![[0; 256]; p.k * p.l];
+
+    let mut sponges = Sponges::empty();
+
+    let size = keccak::group();
+
+    for (first, group) in (0..).step_by(size).zip(a.chunks_mut(size)) {
+        rej_ntt_poly(&mut sponges, rho, p.l, first, group, Sponges::squeeze);
+    }
+
+    a
+}
+
+// expand_a for a public key, and tr = H(pk, 64) beside it: while blocks of pk remain, each group
+// of sponges leaves a slot free, and every squeeze also permutes the sponge that absorbs pk, in
+// that slot, where a permutation costs little next to the group's. A key verified once, the most
+// common use, otherwise paid for the ten to twenty permutations of tr alone.
+fn expand_a_and_tr(pk: &[u8], p: &Parameters) -> (Vec<Poly>, [u8; 64]) {
+    let mut a = vec![[0; 256]; p.k * p.l];
+
+    let mut sponges = Sponges::empty();
+
+    let mut hash = Keccak::new(136, SHAKE);
+
+    let (mut blocks, mut finished) = (pk.as_chunks::<136>().0.iter(), false);
+
+    let mut first = 0;
+
+    while first < a.len() {
+        let size = keccak::group() - usize::from(!finished);
+
+        let group = &mut a[first..(first + size).min(p.k * p.l)];
+
+        rej_ntt_poly(
+            &mut sponges,
+            &pk[..32],
+            p.l,
+            first,
+            group,
+            |sponges, active| match blocks.next() {
+                Some(block) => {
+                    hash.update_block_with(block, |state| sponges.squeeze_beside(active, state));
+                }
+                None if !finished => {
+                    hash.update(&pk[pk.len() - pk.len() % 136..]);
+
+                    hash.finish_with(|state| sponges.squeeze_beside(active, state));
+
+                    finished = true;
+                }
+                None => sponges.squeeze(active),
+            },
+        );
+
+        first += group.len();
+    }
+
+    if !finished {
+        for block in blocks {
+            hash.update(block);
+        }
+
+        hash.update(&pk[pk.len() - pk.len() % 136..]);
+    }
+
+    let mut tr = [0; 64];
+
+    hash.read(&mut tr);
+
+    (a, tr)
+}
+
+// Signed coefficients of s1 and s2 (FIPS 204 Algorithm 33).
+fn expand_s(rho_prime: &[u8], p: &Parameters) -> Polys {
+    let mut s = Polys::new(p.l + p.k);
+
+    let mut sponges = Sponges::empty();
+
+    let size = keccak::group();
+
+    for (first, group) in (0..).step_by(size).zip(s.chunks_mut(size)) {
+        rej_bounded_poly(&mut sponges, rho_prime, first, p.eta, group);
+    }
+
+    s
+}
+
+// FIPS 204 Algorithm 34 with the l nonces from kappa on, all sponges side by side. Inlined into
+// the signing loop, its one caller: measured 4% faster signing than a call.
+#[inline(always)]
+fn expand_mask(rho: &[u8], kappa: u16, p: &Parameters, y: &mut Polys) {
+    let bits = p.gamma1_bits();
+
+    let size = 32 * bits as usize;
+
+    let mut buffers = [[0u8; 640]; MAX_SPONGES];
+
+    let mut sponges = Sponges::empty();
+
+    for (first, group) in (0..).step_by(MAX_SPONGES).zip(y.chunks_mut(MAX_SPONGES)) {
+        let nonces: [[u8; 2]; MAX_SPONGES] =
+            core::array::from_fn(|i| kappa.wrapping_add((first + i) as u16).to_le_bytes());
+
+        let parts = nonces.each_ref().map(|nonce| [rho, &nonce[..]]);
+
+        let messages = parts.each_ref().map(|parts| &parts[..]);
+
+        sponges.start(136, SHAKE, &messages[..group.len()]);
+
+        for offset in (0..size).step_by(136) {
+            sponges.squeeze([true; MAX_SPONGES]);
+
+            let end = (offset + 136).min(size);
+
+            for (i, buffer) in buffers[..group.len()].iter_mut().enumerate() {
+                sponges.read(i, &mut buffer[offset..end]);
+            }
+        }
+
+        for (poly, buffer) in group.iter_mut().zip(&buffers) {
+            unpack_mask(poly, &buffer[..size], bits, p.gamma1);
+        }
+    }
+
+    wipe(buffers.as_flattened_mut());
+}
+
+// The mask's coefficients gamma1 - x modulo q for its packed values x.
+fn unpack_mask(poly: &mut Poly, bytes: &[u8], bits: u32, gamma1: i32) {
+    if !cpu::mldsa_mask(poly, bytes, bits, gamma1, Q) {
+        unpack_mask_portable(bytes, bits, gamma1, poly);
+    }
+}
+
+fn unpack_mask_portable(bytes: &[u8], bits: u32, gamma1: i32, poly: &mut Poly) {
+    unpack(bytes, bits, poly);
+
+    for x in poly.iter_mut() {
+        *x = canonical(gamma1 - *x);
+    }
+}
+
+// FIPS 204 Algorithm 29. The challenge of a rejected attempt is never output, so it is a secret
+// (14.1 item 5, D-72): no branch and no memory index depends on the stream, only on public step
+// numbers. The candidates are taken in order with a secret count, the inside-out shuffle runs on
+// the list of drawn positions, and the list is spread over the 256 coefficients last; each of
+// these steps is a pass of byte masks over a fixed range, which the compiler vectorizes. The
+// challenge goes to poly.
+fn sample_in_ball(seed: &[u8], tau: usize, poly: &mut Poly) {
+    let mut stream = shake256();
+
+    stream.update(seed);
+
+    sample_in_ball_from(|block| stream.read(block), tau, poly);
+}
+
+// 0, 1, ..., 255: the lane numbers that the passes compare with a secret slot or position.
+const LANES: [u8; 256] = {
+    let mut lanes = [0; 256];
+
+    let mut i = 0;
+
+    while i < 256 {
+        lanes[i] = i as u8;
+
+        i += 1;
+    }
+
+    lanes
+};
+
+// The passes in code compiled for AVX2 where the processor has it (cpu::vector_scope), and in the
+// build's baseline elsewhere: the same source, so the same masks and no branch on the stream.
+fn sample_in_ball_from(mut squeeze: impl FnMut(&mut [u8; 136]), tau: usize, poly: &mut Poly) {
+    if cpu::vector_scope(|| sample_in_ball_passes(&mut squeeze, tau, poly)).is_none() {
+        sample_in_ball_passes(squeeze, tau, poly);
+    }
+}
+
+#[inline(always)]
+fn sample_in_ball_passes(mut squeeze: impl FnMut(&mut [u8; 136]), tau: usize, poly: &mut Poly) {
+    let mut block = [0u8; 136];
+
+    squeeze(&mut block);
+
+    let zero = black_box(0);
+
+    // The sign of step t as a coefficient byte: 1, or 0xFF for -1.
+    let mut signs = [0u8; 64];
+
+    for (t, sign) in signs.iter_mut().enumerate() {
+        *sign = 1u8.wrapping_sub(((block[t / 8] >> (t % 8)) & 1) << 1);
+    }
+
+    // The j of each step of the shuffle: the candidates that fit, in order. Step count takes a
+    // candidate of at most 256 - tau + count. Every candidate is written to drawn[count], and
+    // the one that fits stays there, as count moves on; after the last step every candidate fits,
+    // and count passes the slots that the shuffle reads.
+    let mut drawn = [0u8; 64];
+
+    let mut count = 0u32;
+
+    let mut start = 8;
+
+    loop {
+        for &candidate in &block[start..] {
+            for (j, &slot) in drawn.iter_mut().zip(&LANES) {
+                *j ^= (*j ^ candidate) & equal_byte(slot, count as u8, zero);
+            }
+
+            count += (u32::from(candidate) + tau as u32)
+                .wrapping_sub(257)
+                .wrapping_sub(count)
+                >> 31;
+        }
+
+        // Fewer than tau of the first block's 128 candidates fit with probability 2^-87.7 for
+        // tau = 60 (2^-140.3 for 49, 2^-202.9 for 39); that single bit is public.
+        if declassify_value(count.wrapping_sub(tau as u32) >> 31) == 0 {
+            break;
+        }
+
+        squeeze(&mut block);
+
+        start = 0;
+    }
+
+    // Entry t of the list is the position of the sign drawn at step t: the entry at j moves to
+    // i, and slot t takes j. Slots past the step hold scratch that a later step overwrites.
+    let mut positions = [0u8; 64];
+
+    for (t, &j) in drawn[..tau].iter().enumerate() {
+        let i = (256 - tau + t) as u8;
+
+        for (position, &slot) in positions.iter_mut().zip(&LANES) {
+            let moved = *position ^ ((*position ^ i) & equal_byte(*position, j, zero));
+
+            *position = moved ^ ((moved ^ j) & equal_byte(slot, t as u8, 0));
+        }
+    }
+
+    // The coefficients as bytes; the positions are distinct, so each takes at most one sign.
+    let mut c = [0u8; 256];
+
+    for (&position, &sign) in positions[..tau].iter().zip(&signs) {
+        for (coefficient, &lane) in c.iter_mut().zip(&LANES) {
+            *coefficient ^= (*coefficient ^ sign) & equal_byte(lane, position, zero);
+        }
+    }
+
+    for (x, &byte) in poly.iter_mut().zip(&c) {
+        *x = canonical(i32::from(byte as i8));
+    }
+
+    wipe(&mut block);
+
+    wipe(&mut signs);
+
+    wipe(&mut drawn);
+
+    wipe(&mut positions);
+
+    wipe(&mut c);
+}
+
+// FIPS 204 Algorithm 29 on a c~ that is public, that of a signature under verification (14.1
+// item 4, D-72): plain rejection, a branch per candidate and the swap at the drawn position.
+fn sample_in_ball_public(seed: &[u8], tau: usize, poly: &mut Poly) {
+    let mut stream = shake256();
+
+    stream.update(seed);
+
+    sample_in_ball_public_from(|block| stream.read(block), tau, poly);
+}
+
+fn sample_in_ball_public_from(
+    mut squeeze: impl FnMut(&mut [u8; 136]),
+    tau: usize,
+    poly: &mut Poly,
+) {
+    let mut block = [0u8; 136];
+
+    squeeze(&mut block);
+
+    let mut signs = u64::from_le_bytes(*block.first_chunk().expect("eight bytes"));
+
+    let mut next = 8;
+
+    let mut c = [0i8; 256];
+
+    for i in 256 - tau..256 {
+        let j = loop {
+            if next == block.len() {
+                squeeze(&mut block);
+
+                next = 0;
+            }
+
+            let j = usize::from(block[next]);
+
+            next += 1;
+
+            if j <= i {
+                break j;
+            }
+        };
+
+        c[i] = c[j];
+
+        c[j] = 1 - 2 * (signs & 1) as i8;
+
+        signs >>= 1;
+    }
+
+    for (x, &value) in poly.iter_mut().zip(&c) {
+        *x = canonical(i32::from(value));
+    }
+}
+
+// 0xFF when a equals b, 0 otherwise, XORed with zero. Given a zero from black_box, the compiler
+// cannot see the mask as a boolean, so it cannot make the selection that uses it a branch, which
+// it does on targets without a conditional move (RISC-V).
+#[inline(always)]
+const fn equal_byte(a: u8, b: u8, zero: u8) -> u8 {
+    let difference = a ^ b;
+
+    ((difference | difference.wrapping_neg()) >> 7).wrapping_sub(1) ^ zero
+}
+
+// The NTT of a polynomial with signed coefficients of absolute value below q, in place. The
+// transform takes them as they are: every product is a Montgomery product, valid for any input of
+// that size, so the outputs differ from those of the canonical inputs by multiples of q only, and
+// the sums stay below 9q as for canonical inputs.
+fn ntt_signed(f: &mut Poly) {
+    ntt(f);
+}
+
+fn ntt_all(signed: &[Poly]) -> Polys {
+    let mut hat = Polys::new(signed.len());
+
+    for (f, s) in hat.iter_mut().zip(signed) {
+        f.copy_from_slice(s);
+
+        ntt_signed(f);
+    }
+
+    hat
+}
+
+// t = A * s1 + s2 from the matrix and the signed s1 and s2.
+fn public_t(a: &[Poly], s1: &[Poly], s2: &[Poly], p: &Parameters) -> Polys {
+    let s1_hat = ntt_all(s1);
+
+    let mut t = Polys::new(p.k);
+
+    for ((t_i, row), s2_i) in t.iter_mut().zip(a.chunks_exact(p.l)).zip(s2) {
+        multiply_add(t_i, row, &s1_hat);
+
+        inverse_ntt(t_i);
+
+        for (x, e) in t_i.iter_mut().zip(s2_i) {
+            *x = add(*x, canonical(*e));
+        }
+    }
+
+    t
+}
+
+// Key generation's pk, t and tr = H(pk, 64) together. The entries of Â are sampled a group of
+// sponges at a time, and each row of t is computed, and packed into pk, as soon as its entries
+// are; a group that leaves a slot free hashes the blocks of pk filled so far beside its squeezes,
+// where a permutation costs little next to the group's, instead of alone afterwards. The groups
+// that come after the first `full` whole ones leave one slot free (full_groups).
+fn public_key_and_tr(
+    rho: &[u8],
+    s1: &[Poly],
+    s2: &[Poly],
+    p: &Parameters,
+    full: usize,
+) -> (Vec<u8>, Polys, [u8; 64]) {
+    public_key_and_tr_in_groups(rho, s1, s2, p, full, keccak::group())
+}
+
+// The same with groups of `size` sponges, at most keccak::group(). A group of one sponge has no
+// slot to leave free, so every group is whole and the key is hashed afterwards.
+fn public_key_and_tr_in_groups(
+    rho: &[u8],
+    s1: &[Poly],
+    s2: &[Poly],
+    p: &Parameters,
+    full: usize,
+    size: usize,
+) -> (Vec<u8>, Polys, [u8; 64]) {
+    let s1_hat = ntt_all(s1);
+
+    let mut a = vec![[0; 256]; p.k * p.l];
+
+    let mut t = Polys::new(p.k);
+
+    let mut pk = vec![0; p.public_key_size()];
+
+    pk[..32].copy_from_slice(rho);
+
+    let mut sponges = Sponges::empty();
+
+    let (size, narrow) = group_sizes(size);
+
+    let total = p.k * p.l;
+
+    let mut hash = Keccak::new(136, SHAKE);
+
+    let (mut first, mut groups, mut rows, mut hashed) = (0, 0, 0, 0);
+
+    while first < total {
+        let n = if groups < full { size } else { narrow }.min(total - first);
+
+        // Only a group that leaves a slot free hashes.
+        let ready = if n < size { 32 + 320 * rows } else { hashed };
+
+        let mut blocks = pk[hashed..ready].as_chunks::<136>().0.iter();
+
+        let group = &mut a[first..first + n];
+
+        rej_ntt_poly(
+            &mut sponges,
+            rho,
+            p.l,
+            first,
+            group,
+            |sponges, active| match blocks.next() {
+                Some(block) => {
+                    hash.update_block_with(block, |state| sponges.squeeze_beside(active, state));
+
+                    hashed += 136;
+                }
+                None => sponges.squeeze(active),
+            },
+        );
+
+        first += n;
+
+        groups += 1;
+
+        for i in rows..first / p.l {
+            multiply_add(&mut t[i], &a[i * p.l..(i + 1) * p.l], &s1_hat);
+
+            inverse_ntt(&mut t[i]);
+
+            for (x, e) in t[i].iter_mut().zip(&s2[i]) {
+                *x = add(*x, canonical(*e));
+            }
+
+            let chunk = &mut pk[32 + 320 * i..32 + 320 * (i + 1)];
+
+            pack_mapped(chunk, 10, &t[i], Pack::High);
+
+            // t1 is part of the public key.
+            declassify(chunk);
+        }
+
+        rows = first / p.l;
+    }
+
+    hash.update(&pk[hashed..]);
+
+    let mut tr = [0; 64];
+
+    hash.read(&mut tr);
+
+    (pk, t, tr)
+}
+
+// How many whole groups of keccak::group() sponges public_key_and_tr starts with: the count that
+// minimizes the estimated permutation time. A group squeezes five blocks (an entry of Â rarely
+// takes more) and each block of it counts as 1.1 lone permutations where the one-state AVX-512VL
+// kernel runs a lone one in about the time of the group of four, and as size / 2 elsewhere
+// (x86-64's AVX2 group of four takes about twice one); each group after the whole ones hashes up
+// to five blocks of pk beside its squeezes, those its finished rows have filled. The counts are
+// public, and the choice changes the order of the work only, not its results.
+fn full_groups(p: &Parameters) -> usize {
+    full_groups_of(p, keccak::group())
+}
+
+fn full_groups_of(p: &Parameters, size: usize) -> usize {
+    let (size, narrow) = group_sizes(size);
+
+    let total = p.k * p.l;
+
+    let blocks = (32 + 320 * p.k) / 136 + 1;
+
+    // In tenths of a lone permutation.
+    let block = if cpu::one_state_keccak() {
+        11
+    } else {
+        5 * size
+    };
+
+    let estimate = |full: usize| {
+        let (mut first, mut groups, mut hashed) = (0, 0, 0);
+
+        while first < total {
+            let n = if groups < full { size } else { narrow }.min(total - first);
+
+            if n < size {
+                hashed = ((32 + 320 * (first / p.l)) / 136).min(hashed + 5);
+            }
+
+            first += n;
+
+            groups += 1;
+        }
+
+        groups * 5 * block + 10 * (blocks - hashed)
+    };
+
+    (0..=total / size)
+        .rev()
+        .min_by_key(|&full| estimate(full))
+        .unwrap_or(0)
+}
+
+// A whole group and one that leaves a slot free, each of at least one sponge, so that every group
+// takes an entry and the schedules end for any group size.
+const fn group_sizes(size: usize) -> (usize, usize) {
+    let size = if size == 0 { 1 } else { size };
+
+    (size, if size > 1 { size - 1 } else { 1 })
+}
+
+fn encode_public_key(rho: &[u8], t: &Polys, p: &Parameters) -> Vec<u8> {
+    let mut pk = vec![0; p.public_key_size()];
+
+    pk[..32].copy_from_slice(rho);
+
+    for (chunk, poly) in pk[32..].as_chunks_mut::<320>().0.iter_mut().zip(t.iter()) {
+        pack_mapped(chunk, 10, poly, Pack::High);
+    }
+
+    pk
+}
+
+fn encode_private_key(parts: [&[u8]; 3], s: &Polys, t: &Polys, p: &Parameters) -> SecretBytes {
+    let mut sk = SecretBytes::zeroed(p.private_key_size());
+
+    sk[..32].copy_from_slice(parts[0]);
+
+    sk[32..64].copy_from_slice(parts[1]);
+
+    sk[64..128].copy_from_slice(parts[2]);
+
+    let size = 32 * p.eta_bits() as usize;
+
+    let (s_bytes, t0_bytes) = sk[128..].split_at_mut((p.l + p.k) * size);
+
+    for (chunk, poly) in s_bytes.chunks_exact_mut(size).zip(s.iter()) {
+        pack_mapped(chunk, p.eta_bits(), poly, Pack::Eta(p.eta));
+    }
+
+    for (chunk, poly) in t0_bytes
+        .as_chunks_mut::<{ 32 * D as usize }>()
+        .0
+        .iter_mut()
+        .zip(t.iter())
+    {
+        pack_mapped(chunk, D, poly, Pack::Low);
+    }
+
+    sk
+}
+
+// The signed coefficients of s1 and s2 of an expanded private key.
+fn decode_s(sk: &[u8], p: &Parameters) -> Polys {
+    let size = 32 * p.eta_bits() as usize;
+
+    let mut s = Polys::new(p.l + p.k);
+
+    for (poly, chunk) in s.iter_mut().zip(sk[128..].chunks_exact(size)) {
+        unpack(chunk, p.eta_bits(), poly);
+
+        for x in poly.iter_mut() {
+            *x = p.eta - *x;
+        }
+    }
+
+    s
+}
+
+fn hash_public_key(pk: &[u8]) -> [u8; 64] {
+    let mut tr = [0; 64];
+
+    shake256_into(&[pk], &mut tr);
+
+    tr
+}
+
+// Â of a public key, which signing and verification both use. It is public, so it is not wiped.
+#[derive(Clone)]
+pub(crate) struct Matrix(Vec<Poly>);
+
+impl Matrix {
+    pub(crate) fn new(pk: &[u8], p: &Parameters) -> Self {
+        Self(expand_a(&pk[..32], p))
+    }
+}
+
+// What verification alone derives from a public key: t̂1 = NTT(t1 * 2^d) and tr = H(pk, 64).
+#[derive(Clone)]
+pub(crate) struct VerifyingKey {
+    t1: Vec<Poly>,
+    tr: [u8; 64],
+}
+
+impl VerifyingKey {
+    pub(crate) fn new(pk: &[u8]) -> Self {
+        Self {
+            t1: t1_hat(pk),
+            tr: hash_public_key(pk),
+        }
+    }
+}
+
+fn t1_hat(pk: &[u8]) -> Vec<Poly> {
+    let chunks = pk[32..].as_chunks::<320>().0;
+
+    let mut t1 = vec![[0; 256]; chunks.len()];
+
+    for (t1, chunk) in t1.iter_mut().zip(chunks) {
+        if !cpu::mldsa_t1(t1, chunk) {
+            unpack(chunk, 10, t1);
+
+            for x in t1.iter_mut() {
+                *x <<= D;
+            }
+        }
+
+        ntt(t1);
+    }
+
+    t1
+}
+
+// Â and what verification derives from a public key, computed together for the first
+// verification with a key, which is often its only one (see expand_a_and_tr).
+pub(crate) fn public_derived(pk: &[u8], p: &Parameters) -> (Matrix, VerifyingKey) {
+    let (a, tr) = expand_a_and_tr(pk, p);
+
+    (Matrix(a), VerifyingKey { t1: t1_hat(pk), tr })
+}
+
+// The NTT forms of s1, s2 and t0 that signing uses, wiped when dropped. K and tr are read from the
+// expanded private key itself.
+pub(crate) struct SigningKey {
+    s1: Polys,
+    s2: Polys,
+    t0: Polys,
+}
+
+impl SigningKey {
+    // For an expanded private key from key generation or one that passed check_private_key.
+    pub(crate) fn new(sk: &[u8], p: &Parameters) -> Self {
+        let size = 32 * p.eta_bits() as usize;
+
+        let s = decode_s(sk, p);
+
+        let (s1, s2) = s.split_at(p.l);
+
+        let mut t0 = Polys::new(p.k);
+
+        let t0_bytes = &sk[128 + (p.l + p.k) * size..];
+
+        for (hat, chunk) in t0
+            .iter_mut()
+            .zip(t0_bytes.as_chunks::<{ 32 * D as usize }>().0)
+        {
+            unpack(chunk, D, hat);
+
+            for x in hat.iter_mut() {
+                *x = (1 << (D - 1)) - *x;
+            }
+
+            ntt_signed(hat);
+        }
+
+        Self {
+            s1: ntt_all(s1),
+            s2: ntt_all(s2),
+            t0,
+        }
+    }
+}
+
+pub(crate) fn keygen_internal(xi: &[u8], p: &Parameters) -> (Vec<u8>, SecretBytes) {
+    let mut seeds = [0u8; 128];
+
+    shake256_into(&[xi, &[p.k as u8, p.l as u8]], &mut seeds);
+
+    let (rho, rest) = seeds.split_at(32);
+
+    let (rho_prime, key) = rest.split_at(64);
+
+    // rho is part of the public key.
+    declassify(rho);
+
+    let s = expand_s(rho_prime, p);
+
+    let (s1, s2) = s.split_at(p.l);
+
+    let (pk, t, tr) = public_key_and_tr(rho, s1, s2, p, full_groups(p));
+
+    let sk = encode_private_key([rho, key, &tr], &s, &t, p);
+
+    wipe(&mut seeds);
+
+    (pk, sk)
+}
+
+// An expanded private key carries everything needed to rebuild the public key, so a key whose
+// parts disagree is rejected instead of producing signatures that never verify. Re-encoding the
+// key from its own s1, s2, rho and K compares t0 and tr in one constant-time pass. Returns pk.
+pub(crate) fn check_private_key(sk: &[u8], p: &Parameters) -> Option<Vec<u8>> {
+    // rho is part of the public key.
+    declassify(&sk[..32]);
+
+    let (rho, key) = (&sk[..32], &sk[32..64]);
+
+    let s = decode_s(sk, p);
+
+    // Whether the key is valid is public: importing it fails otherwise.
+    if declassify_value(reaches(s.iter().flatten().copied(), p.eta + 1) != 0) {
+        return None;
+    }
+
+    let (s1, s2) = s.split_at(p.l);
+
+    let t = public_t(&expand_a(rho, p), s1, s2, p);
+
+    let pk = encode_public_key(rho, &t, p);
+
+    declassify(&pk);
+
+    let rebuilt = encode_private_key([rho, key, &hash_public_key(&pk)], &s, &t, p);
+
+    declassify_value(ct::equal(&rebuilt, sk)).then_some(pk)
+}
+
+fn hint_bit_pack(h: &Polys, p: &Parameters, out: &mut [u8]) {
+    let mut index = 0;
+
+    for (i, poly) in h.iter().enumerate() {
+        for (j, &bit) in poly.iter().enumerate() {
+            if bit != 0 {
+                out[index] = j as u8;
+
+                index += 1;
+            }
+        }
+
+        out[p.omega + i] = index as u8;
+    }
+}
+
+// FIPS 204, Algorithm 21: the encoding must be canonical (strictly increasing indices, zero
+// padding), otherwise the signature is rejected.
+fn hint_bit_unpack(data: &[u8], p: &Parameters, h: &mut [[bool; 256]]) -> bool {
+    let mut index = 0;
+
+    for (i, poly) in h.iter_mut().enumerate() {
+        let end = usize::from(data[p.omega + i]);
+
+        if end < index || end > p.omega {
+            return false;
+        }
+
+        let first = index;
+
+        while index < end {
+            if index > first && data[index - 1] >= data[index] {
+                return false;
+            }
+
+            poly[usize::from(data[index])] = true;
+
+            index += 1;
+        }
+    }
+
+    data[index..p.omega].iter().all(|&byte| byte == 0)
+}
+
+fn encode_w1(w: &Polys, p: &Parameters, out: &mut [u8]) {
+    let bits = p.w1_bits();
+
+    for (chunk, poly) in out.chunks_exact_mut(32 * bits as usize).zip(w.iter()) {
+        if !cpu::mldsa_w1(chunk, poly, None, p.gamma2, Q) {
+            encode_w1_portable(chunk, poly, p.gamma2);
+        }
+    }
+}
+
+fn encode_w1_portable(out: &mut [u8], w: &Poly, gamma2: i32) {
+    let bits = bit_length((Q - 1) / (2 * gamma2) - 1);
+
+    pack_with(out, bits, w, |x| high_bits(x, gamma2));
+}
+
+// w1' = UseHint(h, w) encoded as encode_w1 does.
+fn use_hints(out: &mut [u8], w: &Poly, hints: &[bool; 256], gamma2: i32) {
+    if cpu::mldsa_w1(out, w, Some(hints), gamma2, Q) {
+        return;
+    }
+
+    use_hints_portable(out, w, hints, gamma2);
+}
+
+fn use_hints_portable(out: &mut [u8], w: &Poly, hints: &[bool; 256], gamma2: i32) {
+    let bits = bit_length((Q - 1) / (2 * gamma2) - 1);
+
+    pack(
+        out,
+        bits,
+        w.iter()
+            .zip(hints)
+            .map(|(&x, &hint)| use_hint(hint, x, gamma2)),
+    );
+}
+
+fn challenge(mu: &[u8], w1: &[u8], p: &Parameters, c_tilde: &mut [u8; 64]) {
+    shake256_into(&[mu, w1], &mut c_tilde[..p.challenge_size()]);
+}
+
+fn message_hash(tr: &[u8], message: &[&[u8]]) -> [u8; 64] {
+    let mut stream = shake256();
+
+    stream.update(tr);
+
+    for part in message {
+        stream.update(part);
+    }
+
+    let mut mu = [0; 64];
+
+    stream.read(&mut mu);
+
+    mu
+}
+
+// FIPS 204 Algorithm 7. The norm checks run over every coefficient without branching; only their
+// combined outcome, the rejection decision, steers the loop. sk supplies K and tr.
+pub(crate) fn sign_internal(
+    matrix: &Matrix,
+    key: &SigningKey,
+    sk: &[u8],
+    message: &[&[u8]],
+    rnd: &[u8],
+    p: &Parameters,
+) -> Vec<u8> {
+    let (a, s1_hat, s2_hat, t0_hat) = (&matrix.0, &key.s1, &key.s2, &key.t0);
+
+    let mu = message_hash(&sk[64..128], message);
+
+    let mut rho_prime = [0u8; 64];
+
+    shake256_into(&[&sk[32..64], rnd, &mu], &mut rho_prime);
+
+    let mut y = Polys::new(p.l);
+
+    let mut y_hat = Polys::new(p.l);
+
+    let mut z = Polys::new(p.l);
+
+    let mut w = Polys::new(p.k);
+
+    let mut r = Polys::new(p.k);
+
+    let mut ct0 = Polys::new(p.k);
+
+    let mut h = Polys::new(p.k);
+
+    // w1, c_tilde and c of a rejected attempt are secret (D-72). Each attempt writes them over
+    // the last one's, and those of the accepted attempt are public; w1 is wiped when dropped,
+    // and cs, which holds the products with s1 and s2, at the end.
+    let mut w1 = SecretBytes::zeroed(32 * p.k * p.w1_bits() as usize);
+
+    let (mut c_tilde, mut c_hat, mut cs) = ([0u8; 64], [0; 256], [0; 256]);
+
+    let mut kappa = 0u16;
+
+    loop {
+        expand_mask(&rho_prime, kappa, p, &mut y);
+
+        kappa = kappa.wrapping_add(p.l as u16);
+
+        for (hat, poly) in y_hat.iter_mut().zip(y.iter()) {
+            *hat = *poly;
+
+            ntt(hat);
+        }
+
+        for (w_i, row) in w.iter_mut().zip(a.chunks_exact(p.l)) {
+            *w_i = [0; 256];
+
+            multiply_add(w_i, row, &y_hat);
+
+            inverse_ntt(w_i);
+        }
+
+        encode_w1(&w, p, &mut w1);
+
+        challenge(&mu, &w1, p, &mut c_tilde);
+
+        sample_in_ball(&c_tilde[..p.challenge_size()], p.tau, &mut c_hat);
+
+        ntt(&mut c_hat);
+
+        for ((z_i, y_i), s) in z.iter_mut().zip(y.iter()).zip(s1_hat.iter()) {
+            pointwise(&c_hat, s, &mut cs);
+
+            inverse_ntt(&mut cs);
+
+            add_polys(z_i, y_i, &cs);
+        }
+
+        // r holds w - c*s2, the argument of both the low-bits check and the hints.
+        for ((r_i, w_i), s) in r.iter_mut().zip(w.iter()).zip(s2_hat.iter()) {
+            pointwise(&c_hat, s, &mut cs);
+
+            inverse_ntt(&mut cs);
+
+            sub_polys(r_i, w_i, &cs);
+        }
+
+        let z_check = z.iter().fold(0, |flag, z_i| {
+            flag | poly_reaches(z_i, p.gamma1 - p.beta(), None)
+        });
+
+        let r0_check = r.iter().fold(0, |flag, r_i| {
+            flag | poly_reaches(r_i, p.gamma2 - p.beta(), Some(p.gamma2))
+        });
+
+        // Only the decision to restart is public, not which check failed or where: a restart
+        // reveals nothing, because the next attempt is independent of this one.
+        if declassify_value(z_check | r0_check != 0) {
+            continue;
+        }
+
+        for (ct0_i, t) in ct0.iter_mut().zip(t0_hat.iter()) {
+            pointwise(&c_hat, t, ct0_i);
+
+            inverse_ntt(ct0_i);
+        }
+
+        let mut count = 0;
+
+        for ((h_i, r_i), ct0_i) in h.iter_mut().zip(r.iter()).zip(ct0.iter()) {
+            count += make_hints(h_i, r_i, ct0_i, p.gamma2);
+        }
+
+        let ct0_check = ct0
+            .iter()
+            .fold(0, |flag, ct0_i| flag | poly_reaches(ct0_i, p.gamma2, None));
+
+        if declassify_value((ct0_check != 0) | (count > p.omega as i32)) {
+            continue;
+        }
+
+        break;
+    }
+
+    wipe(&mut cs);
+
+    // The accepted c_tilde, z and h form the signature.
+    declassify(&h);
+
+    let mut signature = vec![0; p.signature_size()];
+
+    let (head, hints) = signature.split_at_mut(p.signature_size() - p.omega - p.k);
+
+    let (c_part, z_part) = head.split_at_mut(p.challenge_size());
+
+    c_part.copy_from_slice(&c_tilde[..p.challenge_size()]);
+
+    let bits = p.gamma1_bits();
+
+    for (chunk, poly) in z_part.chunks_exact_mut(32 * bits as usize).zip(z.iter()) {
+        pack_mapped(chunk, bits, poly, Pack::Gamma1(p.gamma1));
+    }
+
+    hint_bit_pack(&h, p, hints);
+
+    wipe(&mut rho_prime);
+
+    declassify(&signature);
+
+    signature
+}
+
+// z = gamma1 - x from the signature, and whether its norm is below gamma1 - beta. On x86-64, z has
+// the encoding of the mask, so it is decoded as the mask is, modulo q, and its norm is checked
+// centered; on other CPUs the signed decoding takes less time (Neoverse N2 and M3 measured).
+#[cfg(target_arch = "x86_64")]
+fn decode_z(z: &mut [Poly], bytes: &[u8], p: &Parameters) -> bool {
+    let bits = p.gamma1_bits();
+
+    for (poly, chunk) in z.iter_mut().zip(bytes.chunks_exact(32 * bits as usize)) {
+        unpack_mask(poly, chunk, bits, p.gamma1);
+    }
+
+    z.iter()
+        .all(|poly| poly_reaches(poly, p.gamma1 - p.beta(), None) == 0)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn decode_z(z: &mut [Poly], bytes: &[u8], p: &Parameters) -> bool {
+    let bits = p.gamma1_bits();
+
+    for (poly, chunk) in z.iter_mut().zip(bytes.chunks_exact(32 * bits as usize)) {
+        unpack(chunk, bits, poly);
+
+        for x in poly.iter_mut() {
+            *x = p.gamma1 - *x;
+        }
+    }
+
+    reaches(z.iter().flatten().copied(), p.gamma1 - p.beta()) == 0
+}
+
+// public: whether the signature is public, so that its challenge may be sampled with branches;
+// false for a signature that is never output, as that of the key-generation self-test.
+pub(crate) fn verify_internal(
+    matrix: &Matrix,
+    key: &VerifyingKey,
+    message: &[&[u8]],
+    sig: &[u8],
+    p: &Parameters,
+    public: bool,
+) -> bool {
+    if sig.len() != p.signature_size() {
+        return false;
+    }
+
+    let (c_tilde, rest) = sig.split_at(p.challenge_size());
+
+    let bits = p.gamma1_bits();
+
+    let (z_bytes, hint_bytes) = rest.split_at(32 * p.l * bits as usize);
+
+    let mut hints = [[false; 256]; 8];
+
+    let h = &mut hints[..p.k];
+
+    if !hint_bit_unpack(hint_bytes, p, h) {
+        return false;
+    }
+
+    // z and w are public, as the signature and the key are, so they are neither zeroed first nor
+    // wiped.
+    let mut z = vec![[0; 256]; p.l];
+
+    if !decode_z(&mut z, z_bytes, p) {
+        return false;
+    }
+
+    let mu = message_hash(&key.tr, message);
+
+    let mut c_hat = [0; 256];
+
+    if public {
+        sample_in_ball_public(c_tilde, p.tau, &mut c_hat);
+    } else {
+        sample_in_ball(c_tilde, p.tau, &mut c_hat);
+    }
+
+    ntt(&mut c_hat);
+
+    for poly in z.iter_mut() {
+        ntt_signed(poly);
+    }
+
+    let w: Vec<Poly> = key
+        .t1
+        .iter()
+        .zip(matrix.0.chunks_exact(p.l))
+        .map(|(t1, row)| {
+            let mut w_i = [0; 256];
+
+            pointwise(&c_hat, t1, &mut w_i);
+
+            for x in &mut w_i {
+                *x = -*x;
+            }
+
+            multiply_add(&mut w_i, row, &z);
+
+            inverse_ntt(&mut w_i);
+
+            w_i
+        })
+        .collect();
+
+    let mut w1 = [0; 32 * 8 * 4];
+
+    let w1 = &mut w1[..32 * p.k * p.w1_bits() as usize];
+
+    for ((chunk, w_i), h_i) in w1
+        .chunks_exact_mut(32 * p.w1_bits() as usize)
+        .zip(w.iter())
+        .zip(h.iter())
+    {
+        use_hints(chunk, w_i, h_i, p.gamma2);
+    }
+
+    let mut expected = [0; 64];
+
+    challenge(&mu, w1, p, &mut expected);
+
+    expected[..p.challenge_size()] == *c_tilde
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpu::testing::Inputs;
+
+    // A polynomial that an out-parameter function writes, for the comparisons.
+    fn poly(write: impl FnOnce(&mut Poly)) -> Poly {
+        let mut f = [0; 256];
+
+        write(&mut f);
+
+        f
+    }
+
+    // A polynomial with coefficients in [low, high): the bounds themselves, alternated, for the
+    // first cases, random ones after that.
+    fn coefficients(inputs: &mut Inputs, case: usize, low: i32, high: i32) -> Poly {
+        let edge = [low, high - 1];
+
+        core::array::from_fn(|i| match case {
+            0 | 1 => edge[case],
+            2 => edge[i % 2],
+            _ => {
+                let width = (i64::from(high) - i64::from(low)) as u64;
+
+                (i64::from(low) + (inputs.next() % width) as i64) as i32
+            }
+        })
+    }
+
+    // The transform and product kernels against the portable code, each on the range its callers
+    // give it: canonical coefficients into the forward transform, sums of products below 2^31 -
+    // 2^22 into the inverse, and the lazy outputs of the forward transform, below 9q, into the
+    // products.
+    #[test]
+    fn transform_kernels_match_portable() {
+        let mut inputs = Inputs::new(8380417);
+
+        let mut accelerated = 0;
+
+        for n in 0..20_000 {
+            // Canonical inputs, and signed ones as ntt_signed passes them.
+            let f = coefficients(&mut inputs, n, if n % 4 < 2 { 0 } else { -Q + 1 }, Q);
+
+            let (mut expected, mut actual) = (f, f);
+
+            ntt_portable(&mut expected);
+
+            if cpu::ntt(&mut actual, &FIELD) {
+                assert_eq!(actual, expected, "ntt, case {n}");
+
+                accelerated += 1;
+            }
+
+            let bound = i32::MAX - (1 << 22) + 1;
+
+            let f = coefficients(&mut inputs, n, -bound + 1, bound);
+
+            let (mut expected, mut actual) = (f, f);
+
+            inverse_ntt_portable(&mut expected);
+
+            if cpu::inverse_ntt(&mut actual, &FIELD) {
+                assert_eq!(actual, expected, "inverse, case {n}");
+            }
+
+            let (f, g) = (
+                coefficients(&mut inputs, n, -9 * Q + 1, 9 * Q),
+                coefficients(&mut inputs, n + 1, -9 * Q + 1, 9 * Q),
+            );
+
+            let acc = coefficients(&mut inputs, n, -(1 << 28), 1 << 28);
+
+            let mut product = [0; 256];
+
+            if cpu::multiply(&mut product, &f, &g, &FIELD) {
+                assert_eq!(
+                    product,
+                    poly(|h| pointwise_portable(&f, &g, h)),
+                    "multiply, case {n}"
+                );
+            }
+
+            // Rows of one to seven products, as signing and key generation sum them.
+            let terms = 1 + n % 7;
+
+            let row: [Poly; 7] =
+                core::array::from_fn(|i| coefficients(&mut inputs, n + i, -9 * Q + 1, 9 * Q));
+
+            let vector: [Poly; 7] =
+                core::array::from_fn(|i| coefficients(&mut inputs, n + i + 1, -9 * Q + 1, 9 * Q));
+
+            let (mut expected, mut actual) = (acc, acc);
+
+            multiply_add_portable(&mut expected, &row[..terms], &vector[..terms]);
+
+            if cpu::multiply_add(&mut actual, &row[..terms], &vector[..terms], &FIELD) {
+                assert_eq!(actual, expected, "multiply_add, case {n}");
+            }
+        }
+
+        std::eprintln!("ML-DSA: {accelerated} of 20000 cases through the CPU kernels");
+    }
+
+    // The transform kernels against the portable code at the ends of each caller's range, in
+    // sign patterns of every period, the whole polynomial at one end included: coefficients of
+    // absolute value q - 1 into the forward transform, and into the inverse the inputs whose first
+    // step gives values at the ends of its range, so that the sums of the butterflies reach their
+    // bounds.
+    #[test]
+    fn transform_kernels_match_portable_at_extremes() {
+        let ends = [Q - 1, i32::MAX - (1 << 22)];
+
+        for period in 0..9 {
+            for (end, sign) in ends.into_iter().flat_map(|end| [(end, 1), (end, -1)]) {
+                let f: Poly = core::array::from_fn(|i| {
+                    let side = if (i >> period) % 2 == 0 { 1 } else { -1 };
+
+                    side * sign * end
+                });
+
+                let (mut expected, mut actual) = (f, f);
+
+                if end == Q - 1 {
+                    ntt_portable(&mut expected);
+
+                    if cpu::ntt(&mut actual, &FIELD) {
+                        assert_eq!(actual, expected, "ntt, period {period}, sign {sign}");
+                    }
+                } else {
+                    inverse_ntt_portable(&mut expected);
+
+                    if cpu::inverse_ntt(&mut actual, &FIELD) {
+                        assert_eq!(actual, expected, "inverse, period {period}, sign {sign}");
+                    }
+                }
+            }
+        }
+    }
+
+    // The rejection kernels against the portable code from every count near the end and from
+    // random ones: the same count and the same accepted values; slots past the count may differ.
+    // The uniform blocks include candidates at the bound and with the ignored top bit set.
+    #[test]
+    fn sampling_kernels_match_portable() {
+        let mut inputs = Inputs::new(23);
+
+        let mut accelerated = 0;
+
+        for n in 0..20_000 {
+            let start = match n % 3 {
+                0 => 256 - n / 3 % 64,
+                _ => (inputs.next() % 257) as usize,
+            };
+
+            let prefix: Poly = core::array::from_fn(|_| (inputs.next() % Q as u64) as i32);
+
+            let bytes: [u8; 168] = match n % 5 {
+                0 => {
+                    let mut block = [0; 168];
+
+                    for bytes in block.as_chunks_mut::<3>().0 {
+                        let next = inputs.next();
+
+                        let z = (Q as u64 - 2 + next % 4) | ((next >> 2) & 1) << 23;
+
+                        *bytes = [z as u8, (z >> 8) as u8, (z >> 16) as u8];
+                    }
+
+                    block
+                }
+                1 => [[0x00, 0xFF, 0x7F][n / 5 % 3]; 168],
+                _ => inputs.bytes(),
+            };
+
+            let block: [u64; 21] =
+                core::array::from_fn(|i| u64::from_le_bytes(bytes.as_chunks::<8>().0[i]));
+
+            let (mut expected, mut expected_count) = (prefix, start);
+
+            sample_uniform_portable(&block, &mut expected, &mut expected_count);
+
+            let (mut actual, mut actual_count) = (prefix, start);
+
+            if cpu::uniform23(&block, Q, &mut actual, &mut actual_count) {
+                assert_eq!(actual_count, expected_count, "uniform, case {n}");
+
+                assert_eq!(
+                    actual[..actual_count],
+                    expected[..actual_count],
+                    "uniform, case {n}"
+                );
+
+                accelerated += 1;
+            }
+
+            let block: [u64; 17] = match n % 5 {
+                1 => [u64::from_ne_bytes([[0x00, 0xFF, 0x99, 0xEE, 0xF8, 0x8F][n / 5 % 6]; 8]); 17],
+                _ => inputs.words(),
+            };
+
+            for eta in [2, 4] {
+                let (mut expected, mut expected_count) = (prefix, start);
+
+                sample_bounded_portable(&block, eta, &mut expected, &mut expected_count);
+
+                let (mut actual, mut actual_count) = (prefix, start);
+
+                if cpu::bounded(&block, eta, &mut actual, &mut actual_count) {
+                    assert_eq!(actual_count, expected_count, "eta {eta}, case {n}");
+
+                    assert_eq!(
+                        actual[..actual_count],
+                        expected[..actual_count],
+                        "eta {eta}, case {n}"
+                    );
+
+                    accelerated += 1;
+                }
+            }
+        }
+
+        std::eprintln!("ML-DSA sampling: {accelerated} of 60000 cases through the CPU kernels");
+    }
+
+    // The signing kernels against the portable code on random canonical polynomials and on the
+    // bounds of each step: sums and differences, both norm checks at bounds that the values
+    // reach and miss, the hints with their count, the encoding of w1 and the mask expansion.
+    #[test]
+    fn signing_kernels_match_portable() {
+        let mut inputs = Inputs::new(8380416);
+
+        let mut accelerated = 0;
+
+        for n in 0..20_000 {
+            let (a, b) = (
+                coefficients(&mut inputs, n, 0, Q),
+                coefficients(&mut inputs, n + 1, 0, Q),
+            );
+
+            let (mut expected, mut actual) = ([0; 256], [0; 256]);
+
+            add_polys_portable(&mut expected, &a, &b);
+
+            if cpu::mldsa_add(&mut actual, &a, &b, Q) {
+                assert_eq!(actual, expected, "add, case {n}");
+
+                accelerated += 1;
+            }
+
+            sub_polys_portable(&mut expected, &a, &b);
+
+            if cpu::mldsa_sub(&mut actual, &a, &b, Q) {
+                assert_eq!(actual, expected, "sub, case {n}");
+            }
+
+            for gamma2 in [(Q - 1) / 88, (Q - 1) / 32] {
+                // Values near the bound: a random centered value of absolute value up to 2^20,
+                // and bounds around it.
+                let bound = (inputs.next() % (1 << 20)) as i32 + 2;
+
+                // Centered values strictly inside the bound, with the extremes, and then one
+                // coefficient that reaches it, in a random position.
+                let mut small: Poly = core::array::from_fn(|i| {
+                    let value = match i % 4 {
+                        0 => bound - 1,
+                        1 => 1 - bound,
+                        _ => (inputs.next() % (2 * bound as u64 - 1)) as i32 - (bound - 1),
+                    };
+
+                    freeze(value)
+                });
+
+                for values in [&a, &small] {
+                    for low in [None, Some(gamma2)] {
+                        let expected = poly_reaches_portable(values, bound, low);
+
+                        if let Some(actual) = cpu::mldsa_norm(values, bound, low, Q) {
+                            assert_eq!(actual, expected, "norm {low:?}, case {n}");
+                        }
+                    }
+                }
+
+                small[(inputs.next() % 256) as usize] =
+                    freeze(if n % 2 == 0 { bound } else { -bound });
+
+                let expected = poly_reaches_portable(&small, bound, None);
+
+                assert_eq!(expected, -1, "the bound is reached, case {n}");
+
+                if let Some(actual) = cpu::mldsa_norm(&small, bound, None, Q) {
+                    assert_eq!(actual, expected, "norm at the bound, case {n}");
+                }
+
+                let mut expected_hints = [0; 256];
+
+                let expected = make_hints_portable(&mut expected_hints, &a, &b, gamma2);
+
+                let mut actual_hints = [0; 256];
+
+                if let Some(count) = cpu::mldsa_hints(&mut actual_hints, &a, &b, gamma2, Q) {
+                    assert_eq!(
+                        (count, actual_hints),
+                        (expected, expected_hints),
+                        "hints, case {n}"
+                    );
+                }
+
+                let size = 32 * bit_length((Q - 1) / (2 * gamma2) - 1) as usize;
+
+                let (mut expected, mut actual) = ([0; 192], [0; 192]);
+
+                encode_w1_portable(&mut expected[..size], &a, gamma2);
+
+                if cpu::mldsa_w1(&mut actual[..size], &a, None, gamma2, Q) {
+                    assert_eq!(actual[..size], expected[..size], "w1, case {n}");
+                }
+
+                let hints: [bool; 256] = core::array::from_fn(|_| match n {
+                    0 => false,
+                    1 => true,
+                    _ => inputs.next() % 2 == 1,
+                });
+
+                use_hints_portable(&mut expected[..size], &a, &hints, gamma2);
+
+                let oracle = a.iter().zip(&hints).map(|(&r, &hint)| {
+                    let m = (Q - 1) / (2 * gamma2);
+
+                    let (r1, r0) = decompose(r, gamma2);
+
+                    match (hint, r0 > 0) {
+                        (false, _) => r1,
+                        (true, true) => (r1 + 1) % m,
+                        (true, false) => (r1 - 1 + m) % m,
+                    }
+                });
+
+                let mut reference = [0; 192];
+
+                pack(&mut reference[..size], size as u32 / 32, oracle);
+
+                assert_eq!(expected[..size], reference[..size], "use_hint, case {n}");
+
+                if cpu::mldsa_w1(&mut actual[..size], &a, Some(&hints), gamma2, Q) {
+                    assert_eq!(actual[..size], expected[..size], "use_hint w1, case {n}");
+                }
+            }
+
+            for (bits, gamma1) in [(18, 1 << 17), (20, 1 << 19)] {
+                let bytes: [u8; 640] = match n {
+                    0 => [0; 640],
+                    1 => [0xFF; 640],
+                    _ => inputs.bytes(),
+                };
+
+                let size = 32 * bits as usize;
+
+                let expected = poly(|f| unpack_mask_portable(&bytes[..size], bits, gamma1, f));
+
+                let mut actual = [0; 256];
+
+                if cpu::mldsa_mask(&mut actual, &bytes[..size], bits, gamma1, Q) {
+                    assert_eq!(actual, expected, "mask {bits}, case {n}");
+                }
+            }
+
+            let row: [u8; 320] = match n {
+                0 => [0; 320],
+                1 => [0xFF; 320],
+                _ => inputs.bytes(),
+            };
+
+            let expected = poly(|f| {
+                unpack(&row, 10, f);
+
+                for x in f.iter_mut() {
+                    *x <<= D;
+                }
+            });
+
+            let mut actual = [0; 256];
+
+            if cpu::mldsa_t1(&mut actual, &row) {
+                assert_eq!(actual, expected, "t1, case {n}");
+            }
+        }
+
+        std::eprintln!("ML-DSA signing: {accelerated} of 20000 cases through the CPU kernels");
+    }
+
+    // The packing kernel against pack_with for every map and size of the encodings, on the
+    // domain of each map with its bounds first: t in [0, q), s in [-eta, eta], and z whose
+    // centered value lies in (-gamma1, gamma1].
+    #[test]
+    fn packing_kernel_matches_portable() {
+        let mut inputs = Inputs::new(13);
+
+        let mut accelerated = 0;
+
+        for n in 0..6_000 {
+            let (bits, map, poly) = match n % 6 {
+                0 => (10, Pack::High, coefficients(&mut inputs, n / 6, 0, Q)),
+                1 => (D, Pack::Low, coefficients(&mut inputs, n / 6, 0, Q)),
+                2 => (3, Pack::Eta(2), coefficients(&mut inputs, n / 6, -2, 3)),
+                3 => (4, Pack::Eta(4), coefficients(&mut inputs, n / 6, -4, 5)),
+                _ => {
+                    let (bits, gamma1) = if n % 6 == 4 {
+                        (18, 1 << 17)
+                    } else {
+                        (20, 1 << 19)
+                    };
+
+                    let centered = coefficients(&mut inputs, n / 6, 1 - gamma1, gamma1 + 1);
+
+                    (bits, Pack::Gamma1(gamma1), centered.map(freeze))
+                }
+            };
+
+            let size = 32 * bits as usize;
+
+            let mut expected = [0; 640];
+
+            match map {
+                Pack::High => pack_with(&mut expected[..size], bits, &poly, |x| power2round(x).0),
+                Pack::Low => pack_with(&mut expected[..size], bits, &poly, |x| {
+                    (1 << (D - 1)) - power2round(x).1
+                }),
+                Pack::Eta(eta) => pack_with(&mut expected[..size], bits, &poly, |x| eta - x),
+                Pack::Gamma1(gamma1) => {
+                    pack_with(&mut expected[..size], bits, &poly, |x| gamma1 - centered(x))
+                }
+            }
+
+            let mut actual = [0; 640];
+
+            if cpu::mldsa_pack(&mut actual[..size], &poly, bits, map, Q) {
+                assert_eq!(actual, expected, "{bits} bits, case {n}");
+
+                accelerated += 1;
+            }
+
+            pack_mapped(&mut actual[..size], bits, &poly, map);
+
+            assert_eq!(actual, expected, "pack_mapped, {bits} bits, case {n}");
+        }
+
+        std::eprintln!("ML-DSA packing: {accelerated} of 6000 cases through a CPU kernel");
+    }
+
+    fn reference_decompose(r: i32, gamma2: i32) -> (i32, i32) {
+        let mut r0 = r % (2 * gamma2);
+
+        if r0 > gamma2 {
+            r0 -= 2 * gamma2;
+        }
+
+        if r - r0 == Q - 1 {
+            (0, r0 - 1)
+        } else {
+            ((r - r0) / (2 * gamma2), r0)
+        }
+    }
+
+    #[test]
+    fn decompose_matches_the_definition() {
+        for gamma2 in [(Q - 1) / 88, (Q - 1) / 32] {
+            for r in 0..Q {
+                assert_eq!(decompose(r, gamma2), reference_decompose(r, gamma2), "{r}");
+            }
+        }
+    }
+
+    // decode_z against the signed decoding: the same verdict and the same z modulo q for the ends
+    // of the encoding, z next to the norm bound on each side of it and at gamma1, inside random
+    // accepted vectors, and random bytes.
+    #[test]
+    fn decode_z_matches_the_signed_form() {
+        let mut inputs = Inputs::new(1 << 19);
+
+        for p in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
+            let (bits, bound) = (p.gamma1_bits(), p.gamma1 - p.beta());
+
+            let size = 32 * bits as usize;
+
+            let edges = [
+                bound - 1,
+                bound,
+                1 - bound,
+                -bound,
+                p.gamma1,
+                1 - p.gamma1,
+                0,
+            ];
+
+            for n in 0..200 {
+                let mut bytes = [0u8; 7 * 640];
+
+                let bytes = &mut bytes[..p.l * size];
+
+                match n {
+                    0 => {}
+                    1 => bytes.fill(0xFF),
+                    _ if n % 9 == 8 => {
+                        for byte in bytes.iter_mut() {
+                            *byte = inputs.next() as u8;
+                        }
+                    }
+                    _ => {
+                        for chunk in bytes.chunks_exact_mut(size) {
+                            let mut z = coefficients(&mut inputs, n, 1 - bound, bound);
+
+                            z[inputs.next() as usize % 256] = edges[n % edges.len()];
+
+                            pack(chunk, bits, z.map(|z| p.gamma1 - z));
+                        }
+                    }
+                }
+
+                let mut z = vec![[0; 256]; p.l];
+
+                let accepted = decode_z(&mut z, bytes, &p);
+
+                let mut signed = vec![[0; 256]; p.l];
+
+                for (poly, chunk) in signed.iter_mut().zip(bytes.chunks_exact(size)) {
+                    unpack(chunk, bits, poly);
+
+                    for x in poly.iter_mut() {
+                        *x = p.gamma1 - *x;
+                    }
+                }
+
+                let expected = signed.iter().flatten().all(|&z| z.abs() < bound);
+
+                assert_eq!(accepted, expected, "{p:?}, case {n}");
+
+                let mut pairs = z.iter().flatten().zip(signed.iter().flatten());
+
+                assert!(pairs.all(|(&a, &b)| (a - b) % Q == 0), "{p:?}, case {n}");
+            }
+        }
+    }
+
+    // UseHint against FIPS 204 Algorithm 40 as written, on reference_decompose, for every r in
+    // [0, q), both values of gamma2 and both hints: use_hint, the portable encoding of its values
+    // and the encoding kernel.
+    #[test]
+    fn use_hint_matches_the_definition() {
+        let mut accelerated = 0;
+
+        for gamma2 in [(Q - 1) / 88, (Q - 1) / 32] {
+            let m = (Q - 1) / (2 * gamma2);
+
+            let size = 32 * bit_length(m - 1) as usize;
+
+            for hint in [false, true] {
+                let hints = [hint; 256];
+
+                for start in (0..Q).step_by(256) {
+                    let w: Poly = core::array::from_fn(|i| (start + i as i32) % Q);
+
+                    let oracle = w.map(|r| {
+                        let (r1, r0) = reference_decompose(r, gamma2);
+
+                        match (hint, r0 > 0) {
+                            (false, _) => r1,
+                            (true, true) => (r1 + 1) % m,
+                            (true, false) => (r1 - 1 + m) % m,
+                        }
+                    });
+
+                    for (&r, &expected) in w.iter().zip(&oracle) {
+                        assert_eq!(use_hint(hint, r, gamma2), expected, "{gamma2}, {hint}, {r}");
+                    }
+
+                    let (mut expected, mut actual) = ([0; 192], [0; 192]);
+
+                    pack(&mut expected[..size], size as u32 / 32, oracle);
+
+                    use_hints_portable(&mut actual[..size], &w, &hints, gamma2);
+
+                    assert_eq!(actual, expected, "{gamma2}, {hint}, from {start}");
+
+                    if cpu::mldsa_w1(&mut actual[..size], &w, Some(&hints), gamma2, Q) {
+                        assert_eq!(actual, expected, "kernel, {gamma2}, {hint}, from {start}");
+
+                        accelerated += 1;
+                    }
+                }
+            }
+        }
+
+        std::eprintln!("ML-DSA UseHint: {accelerated} of 130948 polynomials through a kernel");
+    }
+
+    #[test]
+    fn power2round_matches_the_definition() {
+        for r in 0..Q {
+            let mut r0 = r & ((1 << D) - 1);
+
+            if r0 > 1 << (D - 1) {
+                r0 -= 1 << D;
+            }
+
+            assert_eq!(power2round(r), ((r - r0) >> D, r0), "{r}");
+        }
+    }
+
+    #[test]
+    fn modular_arithmetic() {
+        for a in (0..Q).step_by(99_991) {
+            for b in (0..Q).step_by(77_773) {
+                let (x, y) = (i64::from(a), i64::from(b));
+
+                let q = i64::from(Q);
+
+                assert_eq!(i64::from(add(a, b)), (x + y) % q);
+
+                assert_eq!(i64::from(sub(a, b)), (x - y).rem_euclid(q));
+
+                assert_eq!(i64::from(mul(a, b)), x * y % q);
+            }
+        }
+
+        assert_eq!(R2, 2365951);
+
+        assert_eq!(ZETAS[1], mul(4808194, 4193792));
+    }
+
+    // The matrix and tr computed together equal the matrix and the hash computed apart, for every
+    // parameter set and keys of random bytes, including key lengths that are and are not a
+    // multiple of the hash's rate.
+    #[test]
+    fn matrix_and_tr_together_match_apart() {
+        let mut inputs = Inputs::new(204);
+
+        for p in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
+            for extra in [0, 1, 136 - p.public_key_size() % 136] {
+                let pk: [u8; 2592 + 136] = inputs.bytes();
+
+                let pk = &pk[..p.public_key_size() + extra];
+
+                let (a, tr) = expand_a_and_tr(pk, &p);
+
+                assert!(a == expand_a(&pk[..32], &p), "{p:?}, {extra}");
+
+                assert_eq!(tr, hash_public_key(pk), "{p:?}, {extra}");
+            }
+        }
+    }
+
+    // Key generation's pk, t and tr equal those computed apart, whatever the size and order of the
+    // groups of sponges, for every parameter set; the schedules end for groups of one sponge.
+    #[test]
+    fn public_key_and_tr_match_apart() {
+        let mut inputs = Inputs::new(205);
+
+        for p in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
+            let rho: [u8; 32] = inputs.bytes();
+
+            let s: [Poly; 15] =
+                core::array::from_fn(|_| coefficients(&mut inputs, 3, -p.eta, p.eta + 1));
+
+            let (s1, s2) = s[..p.l + p.k].split_at(p.l);
+
+            let t = public_t(&expand_a(&rho, &p), s1, s2, &p);
+
+            let pk = encode_public_key(&rho, &t, &p);
+
+            for size in 1..=keccak::group() {
+                assert!(
+                    full_groups_of(&p, size) <= p.k * p.l / size,
+                    "{p:?}, {size}"
+                );
+
+                for full in 0..=p.k * p.l / size {
+                    let together = public_key_and_tr_in_groups(&rho, s1, s2, &p, full, size);
+
+                    assert!(together.0 == pk, "{p:?}, {size}, {full}");
+
+                    assert!(together.1.iter().eq(t.iter()), "{p:?}, {size}, {full}");
+
+                    assert_eq!(together.2, hash_public_key(&pk), "{p:?}, {size}, {full}");
+                }
+            }
+        }
+    }
+
+    // FIPS 204 Algorithm 29 as written, a byte at a time with a branch on each: the oracle of the
+    // constant-time sample_in_ball.
+    fn sample_in_ball_reference(mut squeeze: impl FnMut(&mut [u8; 136]), tau: usize) -> Poly {
+        let mut block = [0; 136];
+
+        squeeze(&mut block);
+
+        let mut signs = u64::from_le_bytes(*block.first_chunk().unwrap());
+
+        let mut next = 8;
+
+        let mut c = [0; 256];
+
+        for i in 256 - tau..256 {
+            let j = loop {
+                if next == block.len() {
+                    squeeze(&mut block);
+
+                    next = 0;
+                }
+
+                let j = usize::from(block[next]);
+
+                next += 1;
+
+                if j <= i {
+                    break j;
+                }
+            };
+
+            c[i] = c[j];
+
+            c[j] = 1 - 2 * (signs & 1) as i32;
+
+            signs >>= 1;
+        }
+
+        c.map(canonical)
+    }
+
+    // The two forms of SampleInBall on the 64 c~ values, of 200000 random ones, whose streams
+    // reject more candidates before the last draw than the others do, and on those that need a
+    // second SHAKE256 block if any.
+    #[test]
+    fn sample_in_ball_forms_agree_on_many_rejections() {
+        let mut inputs = Inputs::new(31);
+
+        for p in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
+            let mut ranked = std::vec::Vec::new();
+
+            for _ in 0..200_000 {
+                let seed: [u8; 64] = inputs.bytes();
+
+                let seed = &seed[..p.challenge_size()];
+
+                let mut stream = shake256();
+
+                stream.update(seed);
+
+                let mut block = [0; 136];
+
+                stream.read(&mut block);
+
+                let (mut used, mut drawn) = (8, 0);
+
+                while drawn < p.tau && used < block.len() {
+                    drawn += usize::from(usize::from(block[used]) <= 256 - p.tau + drawn);
+
+                    used += 1;
+                }
+
+                let rejected = used - 8 - drawn + usize::from(drawn < p.tau) * 1000;
+
+                ranked.push((rejected, seed.to_vec()));
+            }
+
+            ranked.sort();
+
+            let top = &ranked[ranked.len() - 64..];
+
+            for (rejected, seed) in top {
+                let mut stream = shake256();
+
+                stream.update(seed);
+
+                let expected = sample_in_ball_reference(|block| stream.read(block), p.tau);
+
+                assert!(
+                    poly(|f| sample_in_ball(seed, p.tau, f)) == expected,
+                    "{p:?} {rejected}"
+                );
+
+                assert!(
+                    poly(|f| sample_in_ball_public(seed, p.tau, f)) == expected,
+                    "{p:?} {rejected}, public"
+                );
+            }
+
+            std::eprintln!("{p:?}: up to {} rejections", top[top.len() - 1].0);
+        }
+    }
+
+    // The constant-time SampleInBall against the oracle: on SHAKE256 streams from random seeds of
+    // each parameter set's length, and on streams of high bytes, most of which do not fit, so that
+    // the draw goes on into later blocks and ends at every point of a block.
+    #[test]
+    fn sample_in_ball_matches_the_definition() {
+        let seeds = 100_000;
+
+        let mut inputs = Inputs::new(29);
+
+        let mut later_blocks = 0;
+
+        for p in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
+            for n in 0..seeds {
+                let seed: [u8; 64] = inputs.bytes();
+
+                let seed = &seed[..p.challenge_size()];
+
+                let mut stream = shake256();
+
+                stream.update(seed);
+
+                let expected = sample_in_ball_reference(|block| stream.read(block), p.tau);
+
+                assert!(
+                    poly(|f| sample_in_ball(seed, p.tau, f)) == expected,
+                    "{p:?}, seed {n}"
+                );
+
+                assert!(
+                    poly(|f| sample_in_ball_public(seed, p.tau, f)) == expected,
+                    "{p:?}, seed {n}, public"
+                );
+            }
+
+            // The first step takes only bytes up to 256 - tau, the lowest floor here.
+            for n in 0..seeds / 10 {
+                let floor = 256 - p.tau as u64 - [64, 32, 8, 0][n % 4];
+
+                let stream = |inputs: &mut Inputs, block: &mut [u8; 136]| {
+                    for byte in block.iter_mut() {
+                        *byte = (floor + inputs.next() % (256 - floor)) as u8;
+                    }
+                };
+
+                let (mut first, mut second) = (Inputs::new(n as u64), Inputs::new(n as u64));
+
+                let mut blocks = 0;
+
+                let expected = sample_in_ball_reference(|block| stream(&mut first, block), p.tau);
+
+                let actual = poly(|f| {
+                    sample_in_ball_from(
+                        |block| {
+                            blocks += 1;
+
+                            stream(&mut second, block);
+                        },
+                        p.tau,
+                        f,
+                    );
+                });
+
+                assert!(actual == expected, "{p:?}, floor {floor}, stream {n}");
+
+                let mut third = Inputs::new(n as u64);
+
+                let public = poly(|f| {
+                    sample_in_ball_public_from(|block| stream(&mut third, block), p.tau, f);
+                });
+
+                assert!(
+                    public == expected,
+                    "{p:?}, floor {floor}, stream {n}, public"
+                );
+
+                later_blocks += usize::from(blocks > 1);
+            }
+        }
+
+        std::eprintln!(
+            "SampleInBall: {seeds} seeds per parameter set, {later_blocks} streams past one block"
+        );
+    }
+}
