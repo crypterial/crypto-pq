@@ -19,11 +19,18 @@ use crypto_pq::{Error, KeyFormat};
 
 pub type Fields = HashMap<String, String>;
 
-// Checks the items on every core; a failed assertion in any worker fails the test.
+// Checks the items on every core; a failed assertion in any worker fails the test. On one core,
+// or without threads (wasm32-wasip1), on the calling thread.
 pub fn parallel<T: Sync>(items: &[T], check: impl Fn(&T) + Sync) {
-    let next = AtomicUsize::new(0);
-
     let workers = std::thread::available_parallelism().map_or(1, usize::from);
+
+    if workers < 2 {
+        items.iter().for_each(check);
+
+        return;
+    }
+
+    let next = AtomicUsize::new(0);
 
     std::thread::scope(|scope| {
         for _ in 0..workers.min(items.len()) {
