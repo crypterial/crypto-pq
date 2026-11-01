@@ -662,7 +662,8 @@ fn lane_counters(table: &mut Table16, counter: u64, increment: bool) {
 // BLAKE3's 512-bit kernels on sixteen inputs and on groups of sixteen output blocks, and hash_many
 // with them and the eight-lane AVX-512VL kernel for three inputs or more (wide), called directly
 // against compress3 on every CPU with AVX512, whatever zmm_lanes() chooses for the dispatch. The
-// counters cross 2^32 and 2^64 within the lanes and from one group of output blocks to the next.
+// counters cross 2^32 within the lanes, and those of the output blocks 2^64 as well, also from one
+// group to the next; hash_many's stay below 2^64, as chunk counters do.
 // CI's AVX-512 runners look for the line that the test prints.
 #[test]
 #[allow(unsafe_code)]
@@ -775,10 +776,10 @@ fn blake3_zmm_kernels_match_portable() {
             (3, 1, 0, true, 0),
             (4, 16, 0xFFFF_FFFE, true, KEYED_HASH),
             (5, 2, 5, true, 0),
-            (8, 3, u64::MAX - 3, true, KEYED_HASH),
+            (8, 3, 0x1_FFFF_FFFD, true, KEYED_HASH),
             (11, 15, 0xFFFF_FFF9, true, 0),
             (16, 4, 7, false, KEYED_HASH),
-            (21, 16, u64::MAX - 9, true, 0),
+            (21, 16, 0xFFFF_FFFF_FFF0, true, 0),
         ] {
             let words: [u32; 16] = block_words(&random(&mut inputs, 32));
 
