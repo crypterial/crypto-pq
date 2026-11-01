@@ -519,6 +519,11 @@ fn process<W: Word>(
     run(true, h, first, blocks, counter, last);
 }
 
+// Whether the whole blocks go to compress one call at a time. Under Cranelift, which compiles
+// WebAssembly in wasmtime, the rounds inlined into the loops below took more cycles per block than
+// the call (llvm-mca, Zen 3: BLAKE2b 613 against 479, BLAKE2s 444 against 412).
+const BLOCK_CALLS: bool = cfg!(target_family = "wasm");
+
 // process with the portable code only.
 #[inline(always)]
 fn portable<W: Word>(
@@ -528,7 +533,7 @@ fn portable<W: Word>(
     counter: u128,
     last: Last<'_, W>,
 ) {
-    if W::BYTES == 8 && !blocks.is_empty() {
+    if W::BYTES == 8 && !blocks.is_empty() && !BLOCK_CALLS {
         all_blocks(h, first, blocks, counter, last);
 
         return;
@@ -563,6 +568,24 @@ fn whole_blocks<W: Word>(h: &mut [W; 8], blocks: &[u8], counter: u128) {
     let size = 16 * W::BYTES as u128;
 
     let mut counter = counter;
+
+    if BLOCK_CALLS {
+        let mut m = [W::default(); 16];
+
+        for block in blocks.chunks_exact(16 * W::BYTES) {
+            for (word, bytes) in m.iter_mut().zip(block.chunks_exact(W::BYTES)) {
+                *word = W::from_le(bytes);
+            }
+
+            counter = counter.wrapping_add(size);
+
+            compress(h, &m, counter, false);
+        }
+
+        wipe(&mut m);
+
+        return;
+    }
 
     let mut state = *h;
 
