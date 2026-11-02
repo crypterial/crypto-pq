@@ -175,6 +175,66 @@ Implements specification 1.1 (draft).
   register. AMD processors with the SHA extensions keep the SHA-NI kernel, which runs these hashes
   in less time there. The SHA-NI and AVX2 kernels and the portable code stay its twins, and outputs
   are unchanged.
+- SHA-224, SHA-256, SHA-384 and SHA-512 in the portable code, which runs on 32-bit Arm and x86,
+  WebAssembly, RISC-V, s390x and the CPUs without the SHA-2 kernels: the rounds are written out in
+  groups of 16, and the message schedule and the working variables are arrays indexed with
+  constants only, so that they stay in registers, with the round constants as immediates. On
+  targets without vector registers by default (32-bit Arm, RISC-V without the V extension, s390x
+  and WebAssembly without simd128), the messages that LMS, XMSS, SLH-DSA and HMAC hash side by side
+  run through the rounds one at a time, and HMAC's key blocks and the padding of a hash enter the
+  schedule word by word from the key and from the last bytes of the message, with no block built
+  in memory; SHA-512 on 32-bit Arm keeps its padding block. On WebAssembly each of the two slices
+  of an update reaches the loop over its blocks in a call of its own. On 32-bit Arm the sigma
+  functions of SHA-512 are computed on the 32-bit halves of each word. On every target HMAC hashes
+  a key longer than a block out of line, and a shorter key needs no buffer. Outputs are unchanged.
+- LMS and HSS over SHA-256 and SHA-256/192 on targets without vector registers by default: each
+  step of a Winternitz chain is one compression whose block is built from words, those of I and q
+  fixed for a key, the chain value entering the schedule as big-endian words and the padding as
+  constants, and the secret chain starts are derived from the words of SEED the same way. The
+  chains run one after the other, and their ends are hashed with one update. On every target the
+  digits of the message hash are taken by shifts, as the width is a power of two, in place of a
+  division. Outputs are unchanged.
+- Keccak-f[1600] on 32-bit targets: where a lane takes two words (32-bit Arm, RISC-V and the other
+  32-bit targets but x86 and WebAssembly), the state holds each lane bit-interleaved, as XKCP's
+  inplace32BI does, so that a lane rotation is one 32-bit rotation of each word, and lanes are
+  converted only where they are absorbed and read. On 32-bit x86 with SSE2 the states are permuted
+  two at a time, the same lane of both in one SSE2 register, and a state alone beside the zero
+  state ([decision D-80](spec/decisions.md#decision-d-80)). Outputs are unchanged.
+- Keccak-f[1600] on WebAssembly: each round reads its lanes from one array in memory and writes
+  them to another, and sums the column parities from memory, so that a wasm engine keeps a plane
+  and a few values in registers instead of spilling the 25 lanes
+  ([decision D-81](spec/decisions.md#decision-d-81)). The second array is wiped after the
+  permutation. Outputs are unchanged.
+- One-shot Keccak digests that no CPU kernel takes absorb whole blocks a lane at a time and the
+  last bytes of the input with the suffix as one lane, and read their output the same way, with no
+  byte position kept and no division by the rate. On targets without stable inline assembly, such
+  as WebAssembly, a wipe of values of eight bytes or more gives each value a volatile store of its
+  own. Outputs are unchanged.
+- Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128: on 32-bit Arm the state holds its words
+  bit-interleaved, so that each rotation is one 32-bit rotation of each half, and on 32-bit x86
+  with SSE2 the state runs in pairs beside the zero state, as the Keccak lanes do there
+  ([decision D-82](spec/decisions.md#decision-d-82)). The one-shot digest absorbs the blocks a word
+  at a time and the padded last block as one word, and computes each output word after a
+  permutation. On WebAssembly the Ascon digests leave the one-shot dispatchers first, and the
+  customization of Ascon-CXOF128 runs its rounds inline. Outputs are unchanged.
+- BLAKE2b and BLAKE2s on WebAssembly compress each block in a call of the compression function, in
+  place of rounds inlined into the loops over the blocks, which wasm engines compiled to more work
+  a block. Outputs are unchanged.
+- AES in the portable code, which the AES sets of FrodoKEM use for the matrix A on CPUs without AES
+  instructions: the rounds are fixsliced (Adomnicai and Peyrin, ePrint 2020/1123), with four blocks
+  in 64-bit planes on 64-bit targets and WebAssembly and two in 32-bit planes on the other 32-bit
+  targets, in the layouts of BearSSL's aes_ct64 and aes_ct. The round keys are converted to match
+  at key setup, and the S-box runs without its NOTs. The paths that use the AES instructions are
+  unchanged. Outputs are unchanged.
+- ML-KEM and ML-DSA where the NTT has no AVX2 or NEON kernel (32-bit Arm and x86, WebAssembly,
+  RISC-V, s390x and the portable builds): the NTT and its inverse take three passes on eight
+  coefficients held in registers, with the twiddle factors and their products by QINV from static
+  tables, in place of one pass through memory for each layer. The inverse reduces in its first
+  pass and folds its final scaling into its last layer. Outputs are unchanged.
+- ML-DSA signing on 32-bit Arm and x86, WebAssembly, RISC-V and s390x runs the constant-time
+  passes of SampleInBall on 64-bit words, eight lanes an operation, with the mask of each lane
+  taken from its byte of a word by arithmetic that no single bit decides
+  ([decision D-79](spec/decisions.md#decision-d-79)). Outputs are unchanged.
 - The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
   intrinsics are stable.
 
