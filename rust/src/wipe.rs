@@ -52,7 +52,10 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
 }
 
 // Targets without stable inline assembly in Rust, and Miri, which cannot run it: volatile writes,
-// which survive dead-store elimination, in groups of sixteen and then eight values.
+// which survive dead-store elimination, in groups of sixteen and then eight values, but for values
+// of eight bytes or more, which get a volatile write each. A volatile write of a group is built in
+// a temporary first and copied, and LLVM sets a temporary of more than 64 bytes with memset, which
+// on WebAssembly is memory.fill, a call out of the module in wasmtime.
 #[cfg(any(
     not(any(
         target_arch = "aarch64",
@@ -67,6 +70,17 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
 ))]
 #[allow(unsafe_code)]
 pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
+    if size_of::<T>() >= 8 {
+        for value in values {
+            // SAFETY: `value` comes from a mutable slice, so it is valid, aligned and exclusive.
+            unsafe { core::ptr::write_volatile(value, T::default()) };
+        }
+
+        compiler_fence(Ordering::SeqCst);
+
+        return;
+    }
+
     let (wide, rest) = values.as_chunks_mut::<16>();
 
     for group in wide {

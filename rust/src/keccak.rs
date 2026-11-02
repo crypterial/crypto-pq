@@ -173,7 +173,9 @@ pub(crate) fn permute(state: &mut [u64; 25]) {
 // it reads, stores the lanes it writes, and holds no more values than the registers of x86-64.
 #[cfg(target_family = "wasm")]
 pub(crate) fn permute(state: &mut [u64; 25]) {
-    let mut e = [0; 25];
+    // A zero that LLVM cannot see, so that 25 stores set the array: LLVM sets [0; 25] with memset,
+    // which is memory.fill, a call out of the module in wasmtime.
+    let mut e = [core::hint::black_box(0); 25];
 
     let mut pin = Cell::new(0);
 
@@ -743,6 +745,75 @@ fn xor_bytes(state: &mut [u64; 25], position: &mut usize, mut bytes: &[u8]) {
     }
 }
 
+// XORs whole lanes into the rate from its start.
+fn xor_lanes(state: &mut [u64; 25], lanes: &[[u8; 8]]) {
+    for (lane, chunk) in state.iter_mut().zip(lanes) {
+        *lane ^= to_lane(u64::from_le_bytes(*chunk));
+    }
+}
+
+// The one-shot sponge where no kernel takes it, from a state at a block boundary. The blocks and
+// the output go a lane at a time, and the last bytes of the input, with the suffix, and of the
+// output each as one lane, so that no position is kept from one step to the next, and no division
+// by the rate is needed.
+fn digest_lanes(
+    state: &mut [u64; 25],
+    rate: usize,
+    suffix: u8,
+    mut data: &[u8],
+    mut out: &mut [u8],
+) {
+    while data.len() >= rate {
+        let (block, rest) = data.split_at(rate);
+
+        xor_lanes(state, block.as_chunks::<8>().0);
+
+        permute_one(state);
+
+        data = rest;
+    }
+
+    let (lanes, tail) = data.as_chunks::<8>();
+
+    xor_lanes(state, lanes);
+
+    let mut lane = u64::from(suffix) << (8 * tail.len());
+
+    for (i, &byte) in tail.iter().enumerate() {
+        lane |= u64::from(byte) << (8 * i);
+    }
+
+    state[lanes.len()] ^= to_lane(lane);
+
+    state[rate / 8 - 1] ^= to_lane(0x80 << 56);
+
+    loop {
+        permute_one(state);
+
+        let take = rate.min(out.len());
+
+        let (chunk, rest) = core::mem::take(&mut out).split_at_mut(take);
+
+        let (lanes, tail) = chunk.as_chunks_mut::<8>();
+
+        for (bytes, lane) in lanes.iter_mut().zip(state.iter()) {
+            *bytes = from_lane(*lane).to_le_bytes();
+        }
+
+        let lane = from_lane(state[lanes.len()]);
+
+        for (i, byte) in tail.iter_mut().enumerate() {
+            *byte = (lane >> (8 * i)) as u8;
+        }
+
+        out = rest;
+
+        if out.is_empty() {
+            break;
+        }
+    }
+}
+
 // Every state, side by side where the CPU has a kernel for several at once, and two at a time
 // where pairs hold them.
 pub(crate) fn permute_all(states: &mut [&mut [u64; 25]]) {
@@ -1227,11 +1298,11 @@ impl Keccak {
             return;
         }
 
-        let mut engine = Self::new(rate, suffix);
+        let mut state = [0; 25];
 
-        engine.update(data);
+        digest_lanes(&mut state, rate, suffix, data, out);
 
-        engine.read(out);
+        wipe(&mut state);
     }
 
     // digest_into from a state at a block boundary, such as cSHAKE's after its prefix.
@@ -1246,11 +1317,11 @@ impl Keccak {
             return;
         }
 
-        let mut engine = Self::resume(*start, rate, suffix);
+        let mut state = *start;
 
-        engine.update(data);
+        digest_lanes(&mut state, rate, suffix, data, out);
 
-        engine.read(out);
+        wipe(&mut state);
     }
 
     fn extract(&mut self, mut out: &mut [u8]) {

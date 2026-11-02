@@ -765,7 +765,9 @@ correct on any target, which the target family chooses at compile time; like the
 [15.3](15-platforms.md#153-cpu-specific-code), needs no run-time detection or twin, and stays in the
 builds that force the portable code. Every index and rotation is a constant, so the form has no
 branch or memory access that depends on the data, and the second array and the cell are wiped after
-the permutation.
+the permutation. The second array starts from a zero hidden behind `core::hint::black_box`, so that
+25 stores set it: LLVM sets an array of zeros of more than 64 bytes with memset, which under bulk
+memory is memory.fill, and wasmtime runs memory.fill as a call into its runtime.
 
 Rationale: under wasmtime 50.0.1, Cranelift compiled the loop of two rounds on x86-64 (its Zen 3
 preset, with BMI1 and BMI2) to 643 instructions, with 49.5 stores a round, all of them spills; it
