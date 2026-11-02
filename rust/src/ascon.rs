@@ -6,29 +6,29 @@ use crate::cpu;
 use crate::sha2::last_bytes;
 use crate::wipe::wipe;
 
-pub(crate) const HASH256: [u64; 5] = [
+pub(crate) const HASH256: [u64; 5] = held([
     0x9B1E5494E934D681,
     0x4BC3A01E333751D2,
     0xAE65396C6B34B81A,
     0x3C7FD4A4D56A4DB3,
     0x1A5C464906C5976D,
-];
+]);
 
-pub(crate) const XOF128: [u64; 5] = [
+pub(crate) const XOF128: [u64; 5] = held([
     0xDA82CE768D9447EB,
     0xCC7CE6C75F1EF969,
     0xE7508FD780085631,
     0x0EE0EA53416B58CC,
     0xE0547524DB6F0BDE,
-];
+]);
 
-const CXOF128: [u64; 5] = [
+const CXOF128: [u64; 5] = held([
     0x675527C2A0E8DE03,
     0x43D12D7DC0377BBC,
     0xE9901DEC426E81B5,
     0x2AB14907720780B6,
     0x8F3F1D02D432BC46,
-];
+]);
 
 // SP 800-232, 5.3: the customization string is at most 2048 bits.
 pub(crate) const MAX_CUSTOMIZATION: usize = 256;
@@ -37,6 +37,107 @@ pub(crate) const MAX_CUSTOMIZATION: usize = 256;
 const CONSTANTS: [u64; 12] = [
     0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5, 0x96, 0x87, 0x78, 0x69, 0x5A, 0x4B,
 ];
+
+// On 32-bit Arm the state holds each word bit-interleaved: its even bits in the low half and its
+// odd bits in the high half, bit j of a half being bit 2j or 2j + 1 of the word. A rotation of the
+// word is then one 32-bit rotation of each half, the halves swapped for an odd amount, which Arm
+// takes as the rotated operand of an EOR, where the 64-bit rotation took two shifts and an ORR a
+// half. Elsewhere the state holds the words whole: on 32-bit x86 the interleaved words took more
+// instructions, and the other 32-bit targets, on which they were not counted, keep the form of the
+// 64-bit ones. Words enter the state through to_lane and leave it through from_lane, so that a
+// permutation converts none; both are the identity where the state holds the words whole.
+#[cfg(not(target_arch = "arm"))]
+#[inline(always)]
+const fn to_lane(word: u64) -> u64 {
+    word
+}
+
+#[cfg(not(target_arch = "arm"))]
+#[inline(always)]
+const fn from_lane(word: u64) -> u64 {
+    word
+}
+
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+const fn to_lane(word: u64) -> u64 {
+    let low = unzip(word as u32);
+
+    let high = unzip((word >> 32) as u32);
+
+    ((low & 0xffff) | (high << 16)) as u64 | (((low >> 16) | (high & 0xffff_0000)) as u64) << 32
+}
+
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+const fn from_lane(word: u64) -> u64 {
+    let (even, odd) = (word as u32, (word >> 32) as u32);
+
+    let low = zip((even & 0xffff) | (odd << 16));
+
+    let high = zip((even >> 16) | (odd & 0xffff_0000));
+
+    low as u64 | (high as u64) << 32
+}
+
+// The even bits of x in its low half, in order, and its odd bits in its high half: four exchanges
+// of bit groups, each of the bits of x at the masked positions with the bits a distance above, as
+// in Keccak's interleaved lanes.
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+const fn unzip(mut x: u32) -> u32 {
+    let mut t = (x ^ (x >> 1)) & 0x2222_2222;
+
+    x ^= t ^ (t << 1);
+
+    t = (x ^ (x >> 2)) & 0x0c0c_0c0c;
+
+    x ^= t ^ (t << 2);
+
+    t = (x ^ (x >> 4)) & 0x00f0_00f0;
+
+    x ^= t ^ (t << 4);
+
+    t = (x ^ (x >> 8)) & 0x0000_ff00;
+
+    x ^ t ^ (t << 8)
+}
+
+// The inverse of unzip: the same exchanges in the opposite order, as each is its own inverse.
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+const fn zip(mut x: u32) -> u32 {
+    let mut t = (x ^ (x >> 8)) & 0x0000_ff00;
+
+    x ^= t ^ (t << 8);
+
+    t = (x ^ (x >> 4)) & 0x00f0_00f0;
+
+    x ^= t ^ (t << 4);
+
+    t = (x ^ (x >> 2)) & 0x0c0c_0c0c;
+
+    x ^= t ^ (t << 2);
+
+    t = (x ^ (x >> 1)) & 0x2222_2222;
+
+    x ^ t ^ (t << 1)
+}
+
+// A state given word by word, as the state holds it.
+const fn held(words: [u64; 5]) -> [u64; 5] {
+    let mut s = [0; 5];
+
+    let mut i = 0;
+
+    while i < 5 {
+        s[i] = to_lane(words[i]);
+
+        i += 1;
+    }
+
+    s
+}
 
 // The S-box layer: the circuit of Zhang and Huang, ePrint 2023/1721, checked against the S-box
 // table on all 32 inputs in every bit position by sbox_matches_table.
@@ -65,6 +166,7 @@ const fn sbox(s: &mut [u64; 5]) {
 
 // The linear layer, each x ^ ror(x, a) ^ ror(x, b) as x ^ ror(x ^ ror(x, b - a), a): AArch64 then
 // folds both rotations into the EORs as rotated operands.
+#[cfg(not(target_arch = "arm"))]
 #[inline(always)]
 const fn linear(s: &mut [u64; 5]) {
     let [x0, x1, x2, x3, x4] = *s;
@@ -78,9 +180,46 @@ const fn linear(s: &mut [u64; 5]) {
     ];
 }
 
+// The linear layer on interleaved words: each x ^ ror(x, a) ^ ror(x, b) a half at a time, every
+// rotation of a half the rotated operand of an EOR on 32-bit Arm.
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+const fn linear(s: &mut [u64; 5]) {
+    *s = [
+        diffuse(s[0], 19, 28),
+        diffuse(s[1], 61, 39),
+        diffuse(s[2], 1, 6),
+        diffuse(s[3], 10, 17),
+        diffuse(s[4], 7, 41),
+    ];
+}
+
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+const fn diffuse(x: u64, a: u32, b: u32) -> u64 {
+    let (even, odd) = (x as u32, (x >> 32) as u32);
+
+    let (even_a, odd_a) = rotate(even, odd, a);
+
+    let (even_b, odd_b) = rotate(even, odd, b);
+
+    (even ^ even_a ^ even_b) as u64 | ((odd ^ odd_a ^ odd_b) as u64) << 32
+}
+
+// The halves of an interleaved word rotated right by r.
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+const fn rotate(even: u32, odd: u32, r: u32) -> (u32, u32) {
+    if r.is_multiple_of(2) {
+        (even.rotate_right(r / 2), odd.rotate_right(r / 2))
+    } else {
+        (odd.rotate_right(r / 2), even.rotate_right(r / 2 + 1))
+    }
+}
+
 #[inline(always)]
 const fn round(s: &mut [u64; 5], constant: u64) {
-    s[2] ^= constant;
+    s[2] ^= to_lane(constant);
 
     sbox(s);
 
@@ -152,7 +291,7 @@ pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
     let words = blocks.iter().map(|block| u64::from_le_bytes(*block));
 
     for word in words.chain([last]) {
-        s[0] ^= word;
+        s[0] ^= to_lane(word);
 
         rounds(&mut s);
     }
@@ -162,7 +301,7 @@ pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
             rounds(&mut s);
         }
 
-        let bytes = s[0].to_le_bytes();
+        let bytes = from_lane(s[0]).to_le_bytes();
 
         match <&mut [u8; 8]>::try_from(&mut *chunk) {
             Ok(word) => *word = bytes,
@@ -182,7 +321,7 @@ macro_rules! customize {
 
         let mut s = CXOF128;
 
-        s[0] ^= 8 * z.len() as u64;
+        s[0] ^= to_lane(8 * z.len() as u64);
 
         $permute(&mut s);
 
@@ -191,7 +330,7 @@ macro_rules! customize {
         let mut i = 0;
 
         while i < blocks.len() {
-            s[0] ^= u64::from_le_bytes(blocks[i]);
+            s[0] ^= to_lane(u64::from_le_bytes(blocks[i]));
 
             $permute(&mut s);
 
@@ -208,7 +347,7 @@ macro_rules! customize {
             i += 1;
         }
 
-        s[0] ^= last;
+        s[0] ^= to_lane(last);
 
         $permute(&mut s);
 
@@ -265,7 +404,7 @@ impl Sponge {
                 return;
             }
 
-            self.s[0] ^= u64::from_le_bytes(self.pending);
+            self.s[0] ^= to_lane(u64::from_le_bytes(self.pending));
 
             permute(&mut self.s);
 
@@ -275,7 +414,7 @@ impl Sponge {
         let (blocks, tail) = data.as_chunks::<8>();
 
         for block in blocks {
-            self.s[0] ^= u64::from_le_bytes(*block);
+            self.s[0] ^= to_lane(u64::from_le_bytes(*block));
 
             permute(&mut self.s);
         }
@@ -292,7 +431,7 @@ impl Sponge {
 
         last[self.filled] = 0x01;
 
-        self.s[0] ^= u64::from_le_bytes(last);
+        self.s[0] ^= to_lane(u64::from_le_bytes(last));
 
         permute(&mut self.s);
 
@@ -321,7 +460,7 @@ impl Sponge {
 
             let (chunk, rest) = core::mem::take(&mut out).split_at_mut(take);
 
-            chunk.copy_from_slice(&self.s[0].to_le_bytes()[start..start + take]);
+            chunk.copy_from_slice(&from_lane(self.s[0]).to_le_bytes()[start..start + take]);
 
             self.available -= take;
 
@@ -433,7 +572,7 @@ mod tests {
 
     // The customization of crate version 1.0.1, one byte of Z at a time.
     fn classic_customize(z: &[u8]) -> [u64; 5] {
-        let mut s = CXOF128;
+        let mut s = CXOF128.map(from_lane);
 
         s[0] ^= 8 * z.len() as u64;
 
@@ -451,7 +590,7 @@ mod tests {
 
         classic_permute(&mut s);
 
-        s
+        held(s)
     }
 
     #[test]
@@ -477,6 +616,8 @@ mod tests {
             let mut expected = state;
 
             classic_permute(&mut expected);
+
+            let (state, expected) = (held(state), held(expected));
 
             let mut actual = state;
 
@@ -525,13 +666,13 @@ mod tests {
             (0x0000_0800_00CC_0003, XOF128),
             (0x0000_0800_00CC_0004, CXOF128),
         ] {
-            let mut s = [iv, 0, 0, 0, 0];
+            let mut s = held([iv, 0, 0, 0, 0]);
 
             permute(&mut s);
 
             assert_eq!(s, start);
 
-            let mut s = [iv, 0, 0, 0, 0];
+            let mut s = held([iv, 0, 0, 0, 0]);
 
             permute_const(&mut s);
 
@@ -579,7 +720,7 @@ mod tests {
             let (blocks, tail) = data.as_chunks::<8>();
 
             for block in blocks {
-                s[0] ^= u64::from_le_bytes(*block);
+                s[0] ^= to_lane(u64::from_le_bytes(*block));
 
                 permute_const(&mut s);
             }
@@ -590,7 +731,7 @@ mod tests {
 
             last[tail.len()] = 1;
 
-            s[0] ^= u64::from_le_bytes(last);
+            s[0] ^= to_lane(u64::from_le_bytes(last));
 
             permute_const(&mut s);
 
@@ -599,7 +740,7 @@ mod tests {
                     permute_const(&mut s);
                 }
 
-                chunk.copy_from_slice(&s[0].to_le_bytes()[..chunk.len()]);
+                chunk.copy_from_slice(&from_lane(s[0]).to_le_bytes()[..chunk.len()]);
             }
 
             let mut actual = [0; 41];
