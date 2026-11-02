@@ -181,6 +181,31 @@ Implements specification 1.1 (draft).
   register. AMD processors with the SHA extensions keep the SHA-NI kernel, which runs these hashes
   in less time there. The SHA-NI and AVX2 kernels and the portable code stay its twins, and outputs
   are unchanged.
+- Keccak-f[1600] on 32-bit targets other than WebAssembly: the state holds each lane
+  bit-interleaved, as XKCP's inplace32BI does, so that a lane rotation is one 32-bit rotation of
+  each word, and lanes are converted only where they are absorbed and read. On 32-bit x86 with SSE2
+  the states are instead permuted two at a time, the same lane of both in one SSE2 register, and a
+  state alone beside the zero state ([decision D-80](spec/decisions.md#decision-d-80)). Outputs are
+  unchanged.
+- Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128 on 32-bit Arm: the state holds its words
+  bit-interleaved, so that each rotation is one 32-bit rotation of each half, and words are
+  converted only where they are absorbed and read
+  ([decision D-81](spec/decisions.md#decision-d-81)). Outputs are unchanged.
+- AES in the portable code, which the AES sets of FrodoKEM use for the matrix A on CPUs without AES
+  instructions: the rounds are fixsliced (Adomnicai and Peyrin, ePrint 2020/1123), with four blocks
+  in 64-bit planes on 64-bit targets and WebAssembly and two in 32-bit planes on the other 32-bit
+  targets, in the layouts of BearSSL's aes_ct64 and aes_ct. The round keys are converted to match
+  at key setup, and the S-box runs without its NOTs. The paths that use the AES instructions are
+  unchanged. Outputs are unchanged.
+- ML-KEM and ML-DSA where the NTT has no AVX2 or NEON kernel (32-bit Arm and x86, WebAssembly,
+  RISC-V, s390x and the portable builds): the NTT and its inverse take three passes on eight
+  coefficients held in registers, with the twiddle factors and their products by QINV from static
+  tables, in place of one pass through memory for each layer. The inverse reduces in its first
+  pass and folds its final scaling into its last layer. Outputs are unchanged.
+- ML-DSA signing on 32-bit Arm and x86, WebAssembly, RISC-V and s390x runs the constant-time
+  passes of SampleInBall on 64-bit words, eight lanes an operation, with the mask of each lane
+  taken from its byte of a word by arithmetic that no single bit decides
+  ([decision D-79](spec/decisions.md#decision-d-79)). Outputs are unchanged.
 - The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
   intrinsics are stable.
 
