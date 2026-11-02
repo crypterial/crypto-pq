@@ -738,3 +738,31 @@ of the next round as it is written, as the 64-bit form does, took 5 percent more
 per block of SHA3-256. A scan of the i686 machine code at opt-levels 1, 2, 3, s and z finds no
 branch or select on secret data, and the objects of x86-64, ARM64, armv7 and wasm32 are equal to
 those before, function by function. No timing was taken on this target.
+
+## Decision D-81
+
+On 32-bit Arm, Ascon-p[12] holds each 64-bit word of the state bit-interleaved, its even bits in the
+low 32-bit half and its odd bits in the high half, so that a rotation of a word is a rotation of
+each half, the halves swapped for an odd amount, which Arm takes as the rotated operand of an EOR;
+the 64-bit rotation took two shifts and an ORR a half. Each word of input enters the state, and each
+word of output leaves it, through a fixed exchange of bit groups, so that the permutation converts
+nothing, and the start states are held interleaved at compile time. Other targets hold the words
+whole: on 32-bit x86 the interleaved words took more instructions than the whole words, and the
+other 32-bit targets, on which they were not counted, keep the form of the 64-bit ones.
+
+The form is portable code, Rust without intrinsics or assembly that is correct on any target, which
+the target's architecture chooses at compile time. It is not CPU-specific code under
+[15.3](15-platforms.md#153-cpu-specific-code), needs no run-time detection or twin, and stays in the
+builds that force the portable code. Every index, shift and rotation amount is a constant, so the
+form has no branch or memory access that depends on the data.
+
+Rationale: counted under QEMU, Ascon-Hash256 of 0, 64 and 1024 bytes, Ascon-XOF128 of 0 bytes to 32
+and of 64 bytes to 1024, and Ascon-CXOF128 of 0 and 64 bytes to 32 execute 26.5 to 28.5 percent
+fewer instructions on armv7; on i686 the interleaved words took 2.5 to 4.3 percent more instructions
+than the whole words. In bench run 41403058064, on Neoverse N2 in 32-bit mode, Ascon-Hash256 of 64
+bytes and 1 KiB and Ascon-XOF128 and Ascon-CXOF128 of 1 KiB took 0.72 times the time before with a
+one-shot digest that also absorbed the blocks a word at a time; the digest here, which keeps its
+loop over both kinds of block, executes 0.6 to 2.1 percent more instructions than that one. A scan
+of the armv7 machine code at opt-levels 1, 2, 3, s and z finds no new branch, select, table or
+division in the Ascon functions, and on x86-64, ARM64, i686 and wasm32 they are equal to those
+before, function by function.
