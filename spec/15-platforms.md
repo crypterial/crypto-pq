@@ -19,8 +19,9 @@ its result is kept in an atomic.
 
 1. CPU-specific code exists only for x86-64, ARM64 and RISC-V (P9) and is always selected at run time
    by feature detection, with a portable twin. The forms of the portable code that a target's pointer
-   width or baseline features choose at compile time, such as the Keccak lanes of 32-bit x86
-   [[D-80](decisions.md#decision-d-80)], are not CPU-specific code.
+   width, baseline features or family choose at compile time, such as the Keccak lanes of 32-bit
+   x86 [[D-80](decisions.md#decision-d-80)] and of WebAssembly
+   [[D-81](decisions.md#decision-d-81)], are not CPU-specific code.
 2. x86-64 tiers: AVX2 with BMI1 and BMI2 and operating-system support for the YMM state (checked with
    XGETBV); AVX-512F and AVX-512VL on top of the AVX2 tier, with operating-system support for the
    opmask and ZMM state, for Keccak-f[1600], SHA-256 on eight lanes, BLAKE2 and BLAKE3

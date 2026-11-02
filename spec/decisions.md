@@ -738,3 +738,44 @@ of the next round as it is written, as the 64-bit form does, took 5 percent more
 per block of SHA3-256. A scan of the i686 machine code at opt-levels 1, 2, 3, s and z finds no
 branch or select on secret data, and the objects of x86-64, ARM64, armv7 and wasm32 are equal to
 those before, function by function. No timing was taken on this target.
+
+## Decision D-81
+
+On WebAssembly, the rounds of Keccak-f[1600] keep the lanes in memory. `keccak::permute` gives the
+addresses of the state, of a second array of 25 lanes and of a cell away through
+`core::hint::black_box`, and each round reads one array and writes the other in two steps. It first
+sums the five column parities, a column at a time, from the four lanes of the column in memory and
+the lane of the last plane, which the round before reads back from its own stores with no fence
+between, so that the compiler keeps those five lanes in registers; each parity is stored in the cell
+before a compiler fence. It then computes the five output planes, each behind a fence of its own,
+from its five source lanes in memory, and stores them. The fence is `core::hint::black_box(())`, an
+empty assembly block that may read and write all memory whose address has been given away: the loads
+after it cannot move above it, nor the stores before it below it. The store of each parity makes the
+compiler sum the parity before the loads of the next column; without it LLVM moves the exclusive-ors
+to their first use and keeps the loads of all five columns live together. Each column and each plane
+is a function of its own with a constant index, since a loop with a fence in it stays a loop and
+computes its lane indices at run time. A step then holds at most the five values of d, the five
+lanes of a plane and a few more, within the general registers that an engine allocates on x86-64. In
+locals, as the 64-bit form keeps them, the 25 lanes outnumber those registers, and an engine such as
+Cranelift spills and reloads lanes in every round; parities summed in registers as each plane is
+written, as the 64-bit form sums them, stay live through the round beside d and the plane, which on
+x86-64 spills as well. The form is portable code, Rust without intrinsics or assembly that is
+correct on any target, which the target family chooses at compile time; like the pair form of
+[D-80](#decision-d-80), it is not CPU-specific code under
+[15.3](15-platforms.md#153-cpu-specific-code), needs no run-time detection or twin, and stays in the
+builds that force the portable code. Every index and rotation is a constant, so the form has no
+branch or memory access that depends on the data, and the second array and the cell are wiped after
+the permutation.
+
+Rationale: under wasmtime 50.0.1, Cranelift compiled the loop of two rounds on x86-64 (its Zen 3
+preset, with BMI1 and BMI2) to 643 instructions, with 49.5 stores a round, all of them spills; it
+now compiles it to 437, with 31.5 stores a round, against 610 to 628 instructions for two rounds of
+libcrux-sha3. On ARM64 the loop takes 420 instructions against 422, and its 76 loads and stores a
+round, against 73.5, are those of the lanes instead of spills. SHA3-224 to SHA3-512 of 64, 1024 and
+16384 bytes, timed under wasmtime, took 0.64 to 0.68 times their time before on a Haswell x86-64
+host, where libcrux-sha3 took 1.19 to 1.40 times as long as the new form, and 0.96 to 0.98 times on
+an Apple M3, where libcrux-sha3 took 0.945 to 1.08 times as long. Summing the parities in registers
+as each plane is written, as the 64-bit form does, took 0.88 to 0.91 times the time before on the M3
+but 0.91 to 1.01 on Haswell, where libcrux-sha3 stayed ahead (it took 0.84 to 0.92 times as long),
+and loading the stored parities back for d took up to 5 percent longer than before on the M3. The
+objects of x86-64, ARM64, armv7 and i686 are equal to those before, function by function.

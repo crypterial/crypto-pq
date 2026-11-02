@@ -1,3 +1,5 @@
+#[cfg(target_family = "wasm")]
+use core::cell::Cell;
 use core::ops::Deref;
 
 use crate::cpu;
@@ -39,7 +41,7 @@ pub(crate) const ROTATIONS: [u32; 25] = [
 // comes from lane (x + 3y) % 5 + 5x of a. The column parities that theta needs in the next round
 // are summed as the lanes of e are written, so few values stay live and little spills to memory.
 // A CPU kernel runs these rounds beside its vector rounds.
-#[cfg(any(target_pointer_width = "64", target_family = "wasm"))]
+#[cfg(all(target_pointer_width = "64", not(target_family = "wasm")))]
 #[inline(always)]
 pub(crate) fn round(a: &[u64; 25], e: &mut [u64; 25], parities: &mut [u64; 5], constant: u64) {
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
@@ -87,7 +89,7 @@ pub(crate) fn round(a: &[u64; 25], e: &mut [u64; 25], parities: &mut [u64; 5], c
 }
 
 // The column parities that the first round's theta needs.
-#[cfg(any(target_pointer_width = "64", target_family = "wasm"))]
+#[cfg(all(target_pointer_width = "64", not(target_family = "wasm")))]
 pub(crate) fn parities(state: &[u64; 25]) -> [u64; 5] {
     registers!(
         |x| state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
@@ -147,7 +149,7 @@ pub(crate) const fn permute_const(a: &mut [u64; 25]) {
     }
 }
 
-#[cfg(any(target_pointer_width = "64", target_family = "wasm"))]
+#[cfg(all(target_pointer_width = "64", not(target_family = "wasm")))]
 pub(crate) fn permute(state: &mut [u64; 25]) {
     let mut parities = parities(state);
 
@@ -162,6 +164,133 @@ pub(crate) fn permute(state: &mut [u64; 25]) {
     wipe_unless_optimized!(&mut e);
 
     wipe_unless_optimized!(&mut parities);
+}
+
+// The rounds of wasm keep the lanes in memory (D-81). An engine such as Cranelift allocates the
+// locals of wasm to registers, and in locals the 25 lanes outnumber them: on x86-64 about 14 are
+// free, and lanes spill and reload in every round. Here black_box gives the addresses of both
+// arrays and of pin away and a fence opens each step of a round, so that the step loads the lanes
+// it reads, stores the lanes it writes, and holds no more values than the registers of x86-64.
+#[cfg(target_family = "wasm")]
+pub(crate) fn permute(state: &mut [u64; 25]) {
+    let mut e = [0; 25];
+
+    let mut pin = Cell::new(0);
+
+    core::hint::black_box((&mut *state, &mut e, &pin));
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut last: [u64; 5] = registers!(|x| state[x + 20]; 0 1 2 3 4);
+
+    for constants in ROUND_CONSTANTS.as_chunks::<2>().0 {
+        round_memory(state, &mut e, &mut last, &pin, constants[0]);
+
+        round_memory(&e, state, &mut last, &pin, constants[1]);
+    }
+
+    wipe(&mut e);
+
+    wipe(core::slice::from_mut(pin.get_mut()));
+
+    wipe_unless_optimized!(&mut last);
+}
+
+// One round from a into e. Its column parities come from the lanes of a in memory, but for the
+// last plane of the round before, which a round leaves in last: summed in registers as the planes
+// are written, as the 64-bit form sums them, the parities would stay live through the round beside
+// d and the plane, which on x86-64 spills.
+#[cfg(target_family = "wasm")]
+#[inline(always)]
+fn round_memory(
+    a: &[u64; 25],
+    e: &mut [u64; 25],
+    last: &mut [u64; 5],
+    pin: &Cell<u64>,
+    constant: u64,
+) {
+    core::hint::black_box(());
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut parities = [
+        parity_memory::<0>(a, last, pin),
+        parity_memory::<1>(a, last, pin),
+        parity_memory::<2>(a, last, pin),
+        parity_memory::<3>(a, last, pin),
+        parity_memory::<4>(a, last, pin),
+    ];
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut d: [u64; 5] = registers!(
+        |x| parities[(x + 4) % 5] ^ parities[(x + 1) % 5].rotate_left(1);
+        0 1 2 3 4
+    );
+
+    wipe_unless_optimized!(&mut parities);
+
+    plane_memory::<0>(a, &d, e, constant);
+
+    plane_memory::<1>(a, &d, e, constant);
+
+    plane_memory::<2>(a, &d, e, constant);
+
+    plane_memory::<3>(a, &d, e, constant);
+
+    plane_memory::<4>(a, &d, e, constant);
+
+    // No fence stands between the stores of the last plane and these loads, so LLVM takes the
+    // lanes from the registers that stored them.
+    *last = registers!(|x| e[x + 20]; 0 1 2 3 4);
+
+    wipe_unless_optimized!(&mut d);
+}
+
+// The parity goes to pin, whose address has been given away, before a fence that the loads of the
+// next column cannot pass, so the parity is summed before them: without the store LLVM moves the
+// exclusive-ors to their first use in d, and the loads of all five columns stay live together.
+#[cfg(target_family = "wasm")]
+#[inline(always)]
+fn parity_memory<const X: usize>(a: &[u64; 25], last: &[u64; 5], pin: &Cell<u64>) -> u64 {
+    let parity = a[X] ^ a[X + 5] ^ a[X + 10] ^ a[X + 15] ^ last[X];
+
+    pin.set(parity);
+
+    core::hint::black_box(());
+
+    parity
+}
+
+// The fence is black_box(()), an empty assembly block that may read and write all memory whose
+// address has been given away: the loads of the plane cannot move above it, nor its stores below
+// the next one. Each plane is a function of its own: a loop over the planes with the fence in it
+// stays a loop, which computes the lane indices at run time.
+#[cfg(target_family = "wasm")]
+#[inline(always)]
+fn plane_memory<const Y: usize>(a: &[u64; 25], d: &[u64; 5], e: &mut [u64; 25], constant: u64) {
+    core::hint::black_box(());
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut b: [u64; 5] = registers!(
+        |x| {
+            let source = (x + 3 * Y) % 5 + 5 * x;
+
+            (a[source] ^ d[source % 5]).rotate_left(ROTATIONS[source])
+        };
+        0 1 2 3 4
+    );
+
+    for x in 0..5 {
+        let lane = b[x] ^ (!b[(x + 1) % 5] & b[(x + 2) % 5]);
+
+        let lane = if x == 0 && Y == 0 {
+            lane ^ constant
+        } else {
+            lane
+        };
+
+        e[x + 5 * Y] = lane;
+    }
+
+    wipe_unless_optimized!(&mut b);
 }
 
 // Where a lane takes two registers, the state holds each lane bit-interleaved, but for the pairs
