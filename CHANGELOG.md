@@ -34,6 +34,12 @@ Implements specification 1.1 (draft).
   ([decision D-44](spec/decisions.md#decision-d-44)). Other processors keep 256-bit registers. The
   AVX-512VL kernel for one message swaps the halves of its d row with the integer VPSHUFD. On ARM64
   the NEON kernels rotate by 12 and 7 with USHR and SLI. Outputs are unchanged.
+- BLAKE3 on those processors: the three to eight inputs left after the groups of sixteen hash on
+  eight lanes in 256-bit registers with AVX-512VL, in place of the AVX2 kernels, the sixteen-lane
+  kernel loads each block in 256-bit halves, and an extended output computes all of its groups of
+  sixteen blocks in one loop. With the AVX-512VL kernels for one message, the blocks of one chunk,
+  such as those of a 1 KiB hash, run the row form of the blake3 crate's assembly for one input.
+  Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
