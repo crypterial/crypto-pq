@@ -229,11 +229,11 @@ fn round256(a: u32, b: u32, c: u32, d: &mut u32, e: u32, f: u32, g: u32, h: &mut
     *h = s0.wrapping_add(((a ^ b) & (b ^ c)) ^ b).wrapping_add(t1);
 }
 
-// Rounds R to R + 15 on the working variables v, with the schedule words of those rounds. Always
-// inlined, so that the round constants become immediates and v stays in registers.
+// One group of 16 rounds on the working variables v, with the schedule words w and the round
+// constants k of those rounds. Always inlined, so that v stays in registers.
 #[inline(always)]
-fn rounds256<const R: usize>(v: &mut [u32; 8], w: &[u32; 16]) {
-    let kw = |i: usize| K256[R + i].wrapping_add(w[i]);
+fn rounds256(v: &mut [u32; 8], w: &[u32; 16], k: &[u32; 16]) {
+    let kw = |i: usize| k[i].wrapping_add(w[i]);
 
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *v;
 
@@ -925,11 +925,11 @@ pub(crate) fn hmac512(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
     wipe(keyed.as_flattened_mut());
 }
 
-// All 64 rounds written out, so that the code indexes the schedule w, which keeps its last 16
-// words, and the working variables v only with constants, and at opt-level 3 both stay in
-// registers (on wasm32, locals): with a loop over the slots, every use of a word is a load or a
-// store on wasm32, and a loop over the rounds loads their constants. Always inlined into
-// compress256_blocks, which owns w and v, so that they stay arrays of registers there.
+// One group of 16 rounds written out and run in a loop, so that the code indexes the schedule w,
+// which keeps its last 16 words, and the working variables v only with constants, and at opt-level
+// 3 both stay in registers (on wasm32, locals): with a loop over the slots, every use of a word is
+// a load or a store on wasm32. Always inlined into compress256_blocks, which owns w and v, so that
+// they stay arrays of registers there.
 #[inline(always)]
 fn compress256_block(state: &mut [u32; 8], block: &[u8; 64], w: &mut [u32; 16], v: &mut [u32; 8]) {
     for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
@@ -959,24 +959,20 @@ pub(crate) fn compress256_built(state: &mut [u32; 8], word: impl Fn(usize) -> u3
     wipe_unless_optimized!(&mut v);
 }
 
-// compress256_block for a block already in w, which the schedule overwrites.
+// compress256_block for a block already in w, which the schedule overwrites. Written out in full,
+// the 64 rounds took 3616 instructions on i686 and V8 compiled them to 2116 on ARM64, against 1148
+// and 850 in the loop.
 #[inline(always)]
 fn compress256_words(state: &mut [u32; 8], w: &mut [u32; 16], v: &mut [u32; 8]) {
     *v = *state;
 
-    rounds256::<0>(v, w);
+    for (group, k) in K256.as_chunks::<16>().0.iter().enumerate() {
+        if group > 0 {
+            schedule256(w);
+        }
 
-    schedule256(w);
-
-    rounds256::<16>(v, w);
-
-    schedule256(w);
-
-    rounds256::<32>(v, w);
-
-    schedule256(w);
-
-    rounds256::<48>(v, w);
+        rounds256(v, w, k);
+    }
 
     for (word, value) in state.iter_mut().zip(v.iter()) {
         *word = word.wrapping_add(*value);
@@ -1253,8 +1249,8 @@ fn xor_rotated_halves<const N: usize>(
 
 // rounds256 for SHA-512.
 #[inline(always)]
-fn rounds512<const R: usize>(v: &mut [u64; 8], w: &[u64; 16]) {
-    let kw = |i: usize| K512[R + i].wrapping_add(w[i]);
+fn rounds512(v: &mut [u64; 8], w: &[u64; 16], k: &[u64; 16]) {
+    let kw = |i: usize| k[i].wrapping_add(w[i]);
 
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *v;
 
@@ -1413,28 +1409,18 @@ fn compress512_block(state: &mut [u64; 8], block: &[u8; 128], w: &mut [u64; 16],
     compress512_words(state, w, v);
 }
 
-// compress512_block for a block already in w, which the schedule overwrites.
+// compress256_words for SHA-512, with its five groups of rounds.
 #[inline(always)]
 fn compress512_words(state: &mut [u64; 8], w: &mut [u64; 16], v: &mut [u64; 8]) {
     *v = *state;
 
-    rounds512::<0>(v, w);
+    for (group, k) in K512.as_chunks::<16>().0.iter().enumerate() {
+        if group > 0 {
+            schedule512(w);
+        }
 
-    schedule512(w);
-
-    rounds512::<16>(v, w);
-
-    schedule512(w);
-
-    rounds512::<32>(v, w);
-
-    schedule512(w);
-
-    rounds512::<48>(v, w);
-
-    schedule512(w);
-
-    rounds512::<64>(v, w);
+        rounds512(v, w, k);
+    }
 
     for (word, value) in state.iter_mut().zip(v.iter()) {
         *word = word.wrapping_add(*value);
