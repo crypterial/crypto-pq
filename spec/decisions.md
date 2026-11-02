@@ -712,8 +712,8 @@ On 32-bit x86 with SSE2, Keccak-f[1600] holds the same lane of two states as a p
 words, and `keccak::permute_all` permutes the states of a group two at a time; a state alone runs
 beside the zero state, whose permutation is public. Each operation of a round on a pair is the
 same operation on both words, which LLVM's SLP vectorizer turns into one SSE2 instruction for
-both states. build.rs sets `crypto_pq_keccak_pairs` where the target architecture is x86 and the
-target features include sse2, as they do on every i686 target; the other 32-bit targets keep the
+both states. build.rs sets `crypto_pq_pairs` where the target architecture is x86 and the target
+features include sse2, as they do on every i686 target; the other 32-bit targets keep the
 bit-interleaved lanes, and 64-bit targets and WebAssembly the plain lanes. The pair form is
 portable code, Rust without intrinsics or assembly that is correct on any target: the target's
 features choose at compile time between two forms of the portable code, as its pointer width
@@ -781,3 +781,52 @@ as each plane is written, as the 64-bit form does, took 0.88 to 0.91 times the t
 but 0.91 to 1.01 on Haswell, where libcrux-sha3 stayed ahead (it took 0.84 to 0.92 times as long),
 and loading the stored parities back for d took up to 5 percent longer than before on the M3. The
 objects of x86-64, ARM64, armv7 and i686 are equal to those before, function by function.
+
+## Decision D-82
+
+On 32-bit Arm, Ascon-p[12] holds each 64-bit word of the state bit-interleaved, its even bits in the
+low 32-bit half and its odd bits in the high half, so that a rotation of a word is a rotation of
+each half, the halves swapped for an odd amount, which Arm takes as the rotated operand of an EOR;
+the 64-bit rotation took two shifts and an ORR a half. Each word of input enters the state, and each
+word of output leaves it, through a fixed exchange of bit groups, so that the permutation converts
+nothing, and the start states are held interleaved at compile time. On 32-bit x86 with SSE2 the
+state runs beside the zero state, whose permutation is public, as five pairs of a word of each, in
+the form of Keccak's pairs in [D-80](#decision-d-80): each operation of a round on a pair is the
+same operation on both words, which LLVM's SLP vectorizer turns into one SSE2 instruction; the two
+arrays of pairs stay in memory behind `core::hint::black_box`, with a compiler fence before each
+round; each rotation shifts the word and the word XOR an opaque zero; and the arrays are wiped after
+the permutation. build.rs sets D-80's cfg, `crypto_pq_pairs`, for both. Other targets hold the words
+whole: the interleaved words were counted on Arm and on 32-bit x86, where they took more
+instructions than the whole words, and the other 32-bit targets keep the form of the 64-bit ones.
+
+Where no CPU kernel takes the one-shot digest, it absorbs the whole blocks a word at a time, then
+the padded last block as one word read from the last eight bytes of the input, and computes each
+output word after a permutation, the first that of the last block, with no position or count of
+words kept from one step to the next. On WebAssembly the one-shot dispatchers of `HashAlgorithm` and
+`XofAlgorithm` take the Ascon functions first, inline in the caller, and call the dispatcher of the
+other kinds, which is not inlined; `XofAlgorithm::configure` and `XofAlgorithm::digest_into` are
+inline there, and Ascon-CXOF128's customization runs the rounds inline.
+
+These forms are portable code, Rust without intrinsics or assembly that is correct on any target,
+which the target's architecture, features and family choose at compile time. They are not
+CPU-specific code under [15.3](15-platforms.md#153-cpu-specific-code), need no run-time detection or
+twin, and stay in the builds that force the portable code. Every index, shift and rotation amount is
+a constant or follows from a public length, so no form has a branch or memory access that depends on
+the data.
+
+Rationale: counted under QEMU, Ascon-Hash256 of 0, 64 and 1024 bytes, Ascon-XOF128 of 0 bytes to 32
+and of 64 bytes to 1024, and Ascon-CXOF128 of 0 and 64 bytes to 32 with a 16-byte customization
+string execute 27 to 29 percent fewer instructions on armv7, where RustCrypto's ascon-hash256 and
+ascon-xof128 execute 1.25 to 1.32 times as many, and 16 to 17 percent fewer on i686, where they
+execute 1.16 to 1.19 times as many; the interleaved words took 2.5 to 4.3 percent more instructions
+on i686 than the whole words. llvm-mca, run over the instructions that each digest executes, puts
+the i686 rows at 0.94 to 0.97 times their cycles before on Haswell, 0.93 to 0.96 on Skylake at the
+four uops a cycle that it renames (LLVM 19's model dispatches six, and then puts them at 1.07 to
+1.16), 0.80 to 0.84 on Alder Lake to Granite Rapids and 0.60 to 0.64 on Zen 3 and Zen 4, where
+RustCrypto's crates take 1.01 to 1.09, 1.02 to 1.09, 1.12 to 1.37 and 1.52 to 1.69 times as many
+cycles. Under wasmtime 50.0.1 the rows execute 2 to 11 percent fewer instructions as Cranelift
+compiles the module for ARM64 and 5 to 11 percent fewer as it compiles it for the x86-64 features of
+a Haswell, where RustCrypto's execute 1.02 to 1.07 and 1.04 to 1.09 times as many. The objects of
+x86-64 and ARM64 are equal to those before but for the portable one-shot digest, which runs where no
+CPU kernel takes it, as on x86-64 without AVX2 and on ARM64 cores other than Apple's: there the rows
+execute 1.4 to 2.8 and 1.4 to 5.8 percent fewer instructions. No timing was taken on these targets.
