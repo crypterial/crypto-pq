@@ -206,6 +206,25 @@ Implements specification 1.1 (draft).
   passes of SampleInBall on 64-bit words, eight lanes an operation, with the mask of each lane
   taken from its byte of a word by arithmetic that no single bit decides
   ([decision D-79](spec/decisions.md#decision-d-79)). Outputs are unchanged.
+- SHA-224, SHA-256, SHA-384 and SHA-512 in the portable code, which runs on 32-bit Arm and x86,
+  WebAssembly, RISC-V, s390x and the CPUs without the SHA-2 kernels: one group of 16 rounds is
+  written out and run in a loop over the groups, and the message schedule and the working
+  variables are arrays indexed with constants only, so that they stay in registers. On targets
+  without vector registers by default (32-bit Arm, RISC-V without the V extension, s390x and
+  WebAssembly without simd128), the messages that LMS, XMSS, SLH-DSA and HMAC hash side by side
+  run through the rounds one at a time, and HMAC's key blocks and the padding of a hash enter the
+  schedule word by word from the key and from the last bytes of the message, with no block built
+  in memory; SHA-512 on 32-bit Arm keeps its padding block. On WebAssembly each of the two slices
+  of an update reaches the loop over its blocks in a call of its own. On 32-bit Arm the sigma
+  functions of SHA-512 are computed on the 32-bit halves of each word. On every target HMAC hashes
+  a key longer than a block out of line, and a shorter key needs no buffer. Outputs are unchanged.
+- LMS and HSS over SHA-256 and SHA-256/192 on targets without vector registers by default: each
+  step of a Winternitz chain is one compression whose block is built from words, those of I and q
+  fixed for a key, the chain value entering the schedule as big-endian words and the padding as
+  constants, and the secret chain starts are derived from the words of SEED the same way. The
+  chains run one after the other, and their ends are hashed with one update. On every target the
+  digits of the message hash are taken by shifts, as the width is a power of two, in place of a
+  division. Outputs are unchanged.
 - The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
   intrinsics are stable.
 
