@@ -705,3 +705,36 @@ the riscv64gc, s390x and i686 builds have 0.3, 0.9 and 1.2 percent fewer instruc
 opt-level z riscv64gc and i686 have 0.07 and 0.05 percent more, and s390x 0.03 percent fewer. The
 barrier itself emits no instruction except on WebAssembly and under Miri, where `black_box`
 stores the value. No timing was taken on these targets.
+
+## Decision D-80
+
+On 32-bit x86 with SSE2, Keccak-f[1600] holds the same lane of two states as a pair of 64-bit
+words, and `keccak::permute_all` permutes the states of a group two at a time; a state alone runs
+beside the zero state, whose permutation is public. Each operation of a round on a pair is the
+same operation on both words, which LLVM's SLP vectorizer turns into one SSE2 instruction for
+both states. build.rs sets `crypto_pq_keccak_pairs` where the target architecture is x86 and the
+target features include sse2, as they do on every i686 target; the other 32-bit targets keep the
+bit-interleaved lanes, and 64-bit targets and WebAssembly the plain lanes. The pair form is
+portable code, Rust without intrinsics or assembly that is correct on any target: the target's
+features choose at compile time between two forms of the portable code, as its pointer width
+chooses between the plain and the bit-interleaved lanes. It is not CPU-specific code under
+[15.3](15-platforms.md#153-cpu-specific-code), needs no run-time detection or twin, and stays in
+the builds that force the portable code. Three details of the form keep the vectorizer at work:
+the two arrays of pairs stay in memory, behind `core::hint::black_box`, with a compiler fence
+before each plane, so that the stores of each plane give the vectorizer its starting points; each
+rotation shifts the lane and the lane XOR an opaque zero, since from one value LLVM forms a funnel
+shift, which SSE2 lacks, and its cost kept the whole round scalar; and each round computes the
+column parities from its input lanes. Every index and shift amount is a constant, so the form has
+no branch or memory access that depends on the data, and the arrays of pairs are wiped after the
+permutation.
+
+Rationale: on i686, counted under QEMU, a block of SHA3-256 executes 8841 instructions, against
+12170 with the bit-interleaved lanes. ML-KEM key generation executes 34 to 39 percent fewer
+instructions, encapsulation with a reused key 17 to 20 percent and with an imported key 29 to 40
+percent fewer, and decapsulation 13 to 15 percent fewer; ML-DSA key generation executes 42 to 47
+percent fewer, verification with a reused key 13 to 17 percent and with an imported key 41 to 46
+percent fewer, and signing 16 to 18 percent fewer. Adding each plane of a round to the parities
+of the next round as it is written, as the 64-bit form does, took 5 percent more instructions
+per block of SHA3-256. A scan of the i686 machine code at opt-levels 1, 2, 3, s and z finds no
+branch or select on secret data, and the objects of x86-64, ARM64, armv7 and wasm32 are equal to
+those before, function by function. No timing was taken on this target.

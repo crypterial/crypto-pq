@@ -182,4 +182,4 @@ opt-level = 3
 # RUSTFLAGS="--cfg crypto_pq_portable" leaves out every CPU-specific instruction, and
 # RUSTFLAGS="--cfg crypto_pq_sse41" caps x86-64 at SSE4.1 and AES-NI.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(crypto_pq_ct)', 'cfg(crypto_pq_portable)', 'cfg(crypto_pq_sse41)', 'cfg(crypto_pq_optimized)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(crypto_pq_ct)', 'cfg(crypto_pq_portable)', 'cfg(crypto_pq_sse41)', 'cfg(crypto_pq_optimized)', 'cfg(crypto_pq_keccak_pairs)'] }

@@ -1,7 +1,9 @@
 // Sets crypto_pq_optimized when the crate is compiled at opt-level 3, where LLVM keeps the arrays
 // that wipe::wipe_unless_optimized takes in registers (D-76). At 2 some of them stay in memory
 // (keccak::permute e, for one), so 2 sets nothing, as does every other level and a level that
-// cannot be read: those arrays are then wiped. It never panics.
+// cannot be read: those arrays are then wiped. Sets crypto_pq_keccak_pairs for 32-bit x86 with
+// SSE2, where Keccak holds the lanes of two states in pairs that LLVM vectorizes (D-80). It never
+// panics.
 use std::env;
 use std::io::Write;
 
@@ -44,5 +46,13 @@ fn main() {
 
     if opt_level().as_deref() == Some("3") {
         let _ = writeln!(out, "cargo::rustc-cfg=crypto_pq_optimized");
+    }
+
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+
+    let features = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+
+    if arch == "x86" && features.split(',').any(|feature| feature == "sse2") {
+        let _ = writeln!(out, "cargo::rustc-cfg=crypto_pq_keccak_pairs");
     }
 }
