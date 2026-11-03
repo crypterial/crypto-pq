@@ -180,6 +180,8 @@ impl<const N: usize> Blocks<N> {
             process(core::slice::from_ref(&self.bytes));
 
             self.len = 0;
+
+            self.wipe_second();
         }
 
         let (blocks, rest) = data.as_chunks::<N>();
@@ -196,15 +198,47 @@ impl<const N: usize> Blocks<N> {
         self.len = rest.len();
     }
 
+    // The whole blocks of M bytes in the buffer go to process, and the bytes after them to its
+    // front.
+    fn flush<const M: usize>(&mut self, process: impl FnOnce(&[[u8; M]])) {
+        let whole = self.len / M * M;
+
+        if whole == 0 {
+            return;
+        }
+
+        process(self.bytes[..whole].as_chunks::<M>().0);
+
+        self.bytes.copy_within(whole..self.len, 0);
+
+        self.len -= whole;
+
+        self.wipe_second();
+    }
+
     // The buffered bytes: the message after its whole blocks.
     fn buffered(&self) -> &[u8] {
         &self.bytes[..self.len]
+    }
+
+    // The second block of a buffer of two, Sha512's on x86-64, wiped as its bytes leave it: it
+    // holds bytes only while len reaches into it, so that the drop of a state that never held more
+    // than a block, such as a MAC from a MacKey of a short message, wipes the first block alone.
+    fn wipe_second(&mut self) {
+        if N == 256 {
+            wipe(&mut self.bytes[N / 2..]);
+        }
     }
 }
 
 impl<const N: usize> Drop for Blocks<N> {
     fn drop(&mut self) {
-        wipe(&mut self.bytes);
+        // Blocks::wipe_second.
+        if N == 256 && self.len <= N / 2 {
+            wipe(&mut self.bytes[..N / 2]);
+        } else {
+            wipe(&mut self.bytes);
+        }
     }
 }
 
@@ -1572,10 +1606,20 @@ impl Sha256 {
     }
 }
 
+// The bytes that Sha512 buffers: two blocks on x86-64, whose AVX2 kernel compresses blocks in
+// pairs, with the schedule of both in the same vector instructions, so that small updates give it
+// pairs too (alone, a block took 2895 instructions, against 2448 for each block of a pair); one
+// block elsewhere.
+const BUFFER512: usize = if cfg!(target_arch = "x86_64") {
+    256
+} else {
+    128
+};
+
 #[derive(Clone)]
 pub(crate) struct Sha512 {
     state: [u64; 8],
-    blocks: Blocks<128>,
+    blocks: Blocks<BUFFER512>,
     length: u128,
 }
 
@@ -1593,12 +1637,18 @@ impl Sha512 {
         }
     }
 
-    // A copy of other, written field by field into self: a clone moved into place went through
-    // the stack (mac.rs, MacKey).
+    // A copy of other, a keyed state, written field by field into self, a new state: a clone moved
+    // into place went through the stack (mac.rs, MacKey). key_hmac leaves the buffer empty, so a
+    // buffer of two blocks keeps the zeros of new, as Blocks::wipe_second needs: copied, it took a
+    // call of memcpy, and a branch on its length built the MAC on the stack.
     pub(crate) fn copy_from(&mut self, other: &Self) {
+        debug_assert!(other.blocks.len == 0 && self.blocks.len == 0);
+
         self.state = other.state;
 
-        self.blocks.bytes = other.blocks.bytes;
+        if BUFFER512 == 128 {
+            self.blocks.bytes = other.blocks.bytes;
+        }
 
         self.blocks.len = other.blocks.len;
 
@@ -1623,8 +1673,23 @@ impl Sha512 {
 
         let state = &mut self.state;
 
+        self.blocks.update(data, |groups| {
+            compress512(state, groups.as_flattened().as_chunks::<128>().0, &[])
+        });
+    }
+
+    // The whole blocks that the buffer holds compressed now, for a state that finish_message and
+    // finish_pair share, as their input must fill whole blocks.
+    pub(crate) fn flush(&mut self) {
+        // A buffer of one block holds no whole block after an update.
+        if BUFFER512 == 128 {
+            return;
+        }
+
+        let state = &mut self.state;
+
         self.blocks
-            .update(data, |blocks| compress512(state, blocks, &[]));
+            .flush::<128>(|blocks| compress512(state, blocks, &[]));
     }
 
     pub(crate) fn digest(&self) -> [u8; 64] {
@@ -2032,6 +2097,8 @@ mod tests {
 
             engine.update(&data[..128]);
 
+            engine.flush();
+
             let state = engine.state;
 
             engine.update(message);
@@ -2059,6 +2126,52 @@ mod tests {
                 whole.digest()[..28],
                 "SHA-512/224, length {length}"
             );
+        }
+    }
+
+    // The second block of SHA-512's buffer of two holds no bytes while the length stays within the
+    // first (Blocks::wipe_second): after each update in pieces of the sizes around one and two
+    // blocks, of a new state and of a keyed state's copy, and after a flush where the buffer
+    // reaches into the second block.
+    #[test]
+    fn second_block_wiped() {
+        fn check(blocks: &Blocks<BUFFER512>, size: usize, piece: usize, step: &str) {
+            if BUFFER512 == 256 && blocks.len <= 128 {
+                assert!(
+                    blocks.bytes[128..].iter().all(|&b| b == 0),
+                    "pieces of {size}, piece {piece}, {step}"
+                );
+            }
+        }
+
+        let data: [u8; 1024] = core::array::from_fn(|i| (i % 251) as u8 | 1);
+
+        let mut keyed = Sha512::new(&IV_512);
+
+        keyed.key_hmac(b"key", &mut [0; 8]);
+
+        for size in [1, 63, 64, 65, 127, 128, 129, 255, 256, 257] {
+            for (copy, step) in [(false, "update"), (true, "update of a copy")] {
+                let mut engine = Sha512::new(&IV_512);
+
+                if copy {
+                    engine.copy_from(&keyed);
+                }
+
+                for (piece, bytes) in data.chunks(size).enumerate() {
+                    engine.update(bytes);
+
+                    check(&engine.blocks, size, piece, step);
+
+                    if engine.blocks.len > 128 {
+                        let mut flushed = engine.clone();
+
+                        flushed.flush();
+
+                        check(&flushed.blocks, size, piece, "flush");
+                    }
+                }
+            }
         }
     }
 

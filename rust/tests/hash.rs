@@ -122,6 +122,48 @@ fn hash_digest_is_repeatable() {
     }
 }
 
+// SHA-384 and SHA-512 streamed in pieces of each size around one and two blocks, which the hasher
+// buffers, against the one-shot digest, for messages around every multiple of a block up to five,
+// with a digest between the pieces too.
+#[test]
+fn sha512_buffering() {
+    let data: Vec<u8> = (0..768).map(|i| (i % 251) as u8).collect();
+
+    let lengths = (0..=5).flat_map(|blocks| [128 * blocks, 128 * blocks + 1, 128 * blocks + 111]);
+
+    for algorithm in [SHA_384, SHA_512] {
+        for length in lengths.clone().chain([127, 255, 383, 511, 639]) {
+            let message = &data[..length];
+
+            for size in [1, 63, 64, 65, 127, 128, 129, 255, 256, 257] {
+                let mut hasher = algorithm.create();
+
+                let mut absorbed = 0;
+
+                for piece in message.chunks(size) {
+                    hasher.update(piece);
+
+                    absorbed += piece.len();
+
+                    if absorbed == 3 * size {
+                        assert_eq!(
+                            hasher.digest(),
+                            algorithm.digest(&message[..absorbed]),
+                            "{length} {size} after three pieces"
+                        );
+                    }
+                }
+
+                assert_eq!(
+                    hasher.digest(),
+                    algorithm.digest(message),
+                    "{length} {size}"
+                );
+            }
+        }
+    }
+}
+
 // The _into forms write what the allocating forms return, for messages around every block size,
 // and refuse a buffer of any other size.
 #[test]
