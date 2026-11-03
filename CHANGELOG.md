@@ -174,6 +174,10 @@ Implements specification 1.1 (draft).
   it, in place of one loop that tested for the schedule at every double round. One-shot hashes and
   the data of a one-shot HMAC, which the final call takes whole, keep the loop. Outputs are
   unchanged.
+- SHA-512 and SHA-384, their truncated forms, and HMAC over them, on x86-64: a hash object holds up
+  to two blocks before it compresses them, so that the AVX2 kernel, which schedules both blocks of
+  a pair in the same vector instructions, takes the blocks of small updates in pairs too, and a
+  digest compresses a held block together with the padding. Outputs are unchanged.
 - SHA-256 on x86-64 CPUs with AVX-512F and AVX-512VL: the messages hashed side by side, eight at a
   time, in the chains and trees of LMS and XMSS and in the SHA-2 sets of SLH-DSA take a kernel,
   selected at run time, that keeps one message in each element of a 256-bit register and uses
