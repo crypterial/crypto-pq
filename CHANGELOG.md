@@ -191,6 +191,11 @@ Implements specification 1.1 (draft).
   bit-interleaved, so that each rotation is one 32-bit rotation of each half, and words are
   converted only where they are absorbed and read
   ([decision D-81](spec/decisions.md#decision-d-81)). Outputs are unchanged.
+- BLAKE2b and BLAKE3 on 32-bit x86 ([decision D-82](spec/decisions.md#decision-d-82)): with SSE2,
+  BLAKE2b's state holds the words of each row in pairs, so that each step of a round is one SSE2
+  operation on both words of a pair; BLAKE3 compresses each block of a chain in a call of its own,
+  and writes the whole blocks of an extended output from the registers of their compression
+  straight into the output. Outputs are unchanged.
 - AES in the portable code, which the AES sets of FrodoKEM use for the matrix A on CPUs without AES
   instructions: the rounds are fixsliced (Adomnicai and Peyrin, ePrint 2020/1123), with four blocks
   in 64-bit planes on 64-bit targets and WebAssembly and two in 32-bit planes on the other 32-bit
