@@ -677,6 +677,9 @@ impl Drop for Outer {
     }
 }
 
+// HMAC's variant is the largest, on x86-64 by more than clippy's limit, where SHA-512 holds two
+// blocks: boxing it would cost an allocation per MAC.
+#[allow(clippy::large_enum_variant)]
 enum MacEngine {
     // The inner engine has absorbed the inner key block and the data so far.
     #[cfg(any(

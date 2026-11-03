@@ -214,6 +214,8 @@ impl<'a> Hashes<'a> {
 
                 large.update(&[0; 128][p.n..]);
 
+                large.flush();
+
                 large
             });
 
