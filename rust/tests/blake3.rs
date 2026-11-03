@@ -137,6 +137,36 @@ fn reads_from_any_offset() {
     assert!(BLAKE3.digest(&data, 0).unwrap().is_empty());
 }
 
+// Every output length up to two blocks and a part of one, one-shot, against the prefix of a longer
+// output: the one-shot paths write a part of a block, a whole block and more blocks each their own
+// way, for inputs of one block, one chunk and more.
+#[test]
+fn one_shot_lengths() {
+    let context = KdfOptions::default().with_info(b"context");
+
+    for length in [0, 1, 64, 65, 1024, 1025] {
+        let data = input(length);
+
+        let whole = BLAKE3.digest(&data, 131).unwrap();
+
+        let derived = BLAKE3_KDF.derive(&data, 131, &context).unwrap();
+
+        for size in 1..=131 {
+            assert_eq!(
+                BLAKE3.digest(&data, size).unwrap(),
+                whole[..size],
+                "{length} {size}"
+            );
+
+            assert_eq!(
+                *BLAKE3_KDF.derive(&data, size, &context).unwrap(),
+                derived[..size],
+                "{length} {size} derive_key"
+            );
+        }
+    }
+}
+
 #[test]
 fn options() {
     assert_eq!(BLAKE3_256.name(), "BLAKE3-256");

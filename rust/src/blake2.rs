@@ -87,6 +87,13 @@ pub(crate) trait Word:
     // The CPU kernel of mac, from the unkeyed chaining value: the kernel puts the key's length in,
     // in registers.
     fn mac_kernel(h: &[Self; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel;
+
+    // The rounds of compress on pairs of words, where BLAKE2b runs them so, which returns whether
+    // it did them.
+    #[inline(always)]
+    fn pair_rounds(_: &mut [Self; 8], _: &[Self; 16], _: u128, _: bool) -> bool {
+        false
+    }
 }
 
 impl Word for u64 {
@@ -166,6 +173,14 @@ impl Word for u64 {
     #[inline(always)]
     fn mac_kernel(h: &[Self; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
         cpu::blake2b_mac(h, key, data, out)
+    }
+
+    #[cfg(crypto_pq_pairs)]
+    #[inline(always)]
+    fn pair_rounds(h: &mut [Self; 8], m: &[Self; 16], counter: u128, last: bool) -> bool {
+        rounds_pair(h, m, counter, last);
+
+        true
     }
 }
 
@@ -450,6 +465,10 @@ pub(crate) fn compress<W: Word>(h: &mut [W; 8], m: &[W; 16], counter: u128, last
 // compress, inlined into the loop over whole blocks too.
 #[inline(always)]
 fn rounds<W: Word>(h: &mut [W; 8], m: &[W; 16], counter: u128, last: bool) {
+    if W::pair_rounds(h, m, counter, last) {
+        return;
+    }
+
     let iv = W::IV;
 
     let [t0, t1] = W::counter(counter);
@@ -505,6 +524,181 @@ fn rounds<W: Word>(h: &mut [W; 8], m: &[W; 16], counter: u128, last: bool) {
     }
 
     wipe_unless_optimized!(&mut v);
+}
+
+// On 32-bit x86 with SSE2 (crypto_pq_pairs, which build.rs sets), BLAKE2b's state goes in pairs
+// of the words of a row, columns 0 and 2 and columns 1 and 3: each operation of a step is then
+// one operation on both words of a pair, which LLVM's SLP vectorizer turns into one SSE2
+// instruction, and the diagonal step takes the same pairs, some with their words swapped (D-82).
+#[cfg(crypto_pq_pairs)]
+type Pair = [u64; 2];
+
+// The pairs of rows a to d: a02, a13, b02, b13, c02, c13, d02, d13. Aligned for the SSE2
+// instructions that take an operand from memory.
+#[cfg(crypto_pq_pairs)]
+#[repr(C, align(16))]
+struct Rows([Pair; 8]);
+
+#[cfg(crypto_pq_pairs)]
+#[inline(always)]
+fn add_pair(a: Pair, b: Pair) -> Pair {
+    [a[0].wrapping_add(b[0]), a[1].wrapping_add(b[1])]
+}
+
+#[cfg(crypto_pq_pairs)]
+#[inline(always)]
+fn xor_pair(a: Pair, b: Pair) -> Pair {
+    [a[0] ^ b[0], a[1] ^ b[1]]
+}
+
+// A rotation as shifts of a and a ^ zero, as keccak::rotate_pair.
+#[cfg(crypto_pq_pairs)]
+#[inline(always)]
+fn rotate_pair(a: Pair, zero: Pair, amount: u32) -> Pair {
+    let b = xor_pair(a, zero);
+
+    [
+        a[0] >> amount | b[0] << (64 - amount),
+        a[1] >> amount | b[1] << (64 - amount),
+    ]
+}
+
+#[cfg(crypto_pq_pairs)]
+#[inline(always)]
+fn swap(a: Pair) -> Pair {
+    [a[1], a[0]]
+}
+
+// A point that LLVM moves no load or store across, so that each half of a round loads and stores
+// its own pairs: over a whole round it kept more values than the eight SSE2 registers hold, and
+// spilled them.
+#[cfg(crypto_pq_pairs)]
+#[inline(always)]
+fn order() {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+// g on both words of each pair.
+#[cfg(crypto_pq_pairs)]
+#[inline(always)]
+fn g_pair(a: &mut Pair, b: &mut Pair, c: &mut Pair, d: &mut Pair, x: Pair, y: Pair, zero: Pair) {
+    let [r1, r2, r3, r4] = u64::ROTATIONS;
+
+    *a = add_pair(add_pair(*a, x), *b);
+
+    *d = rotate_pair(xor_pair(*d, *a), zero, r1);
+
+    *c = add_pair(*c, *d);
+
+    *b = rotate_pair(xor_pair(*b, *c), zero, r2);
+
+    *a = add_pair(add_pair(*a, y), *b);
+
+    *d = rotate_pair(xor_pair(*d, *a), zero, r3);
+
+    *c = add_pair(*c, *d);
+
+    *b = rotate_pair(xor_pair(*b, *c), zero, r4);
+}
+
+// A round on the pairs: the columns, then the diagonals (0, 5, 10, 15) with (2, 7, 8, 13) and
+// (1, 6, 11, 12) with (3, 4, 9, 14).
+#[cfg(crypto_pq_pairs)]
+#[inline(always)]
+fn round_pair(rows: &mut Rows, m: &[u64; 16], s: &[usize; 16], zero: Pair) {
+    order();
+
+    let [a02, a13, b02, b13, c02, c13, d02, d13] = &mut rows.0;
+
+    // The message words that g takes on the two words of a pair, at positions i and j of s.
+    let message = |i: usize, j: usize| [m[s[i]], m[s[j]]];
+
+    g_pair(a02, b02, c02, d02, message(0, 4), message(1, 5), zero);
+
+    g_pair(a13, b13, c13, d13, message(2, 6), message(3, 7), zero);
+
+    order();
+
+    let c20 = &mut swap(*c02);
+
+    let d31 = &mut swap(*d13);
+
+    g_pair(a02, b13, c20, d31, message(8, 12), message(9, 13), zero);
+
+    let b20 = &mut swap(*b02);
+
+    let c31 = &mut swap(*c13);
+
+    g_pair(a13, b20, c31, d02, message(10, 14), message(11, 15), zero);
+
+    *b02 = swap(*b20);
+
+    *c02 = swap(*c20);
+
+    *c13 = swap(*c31);
+
+    *d13 = swap(*d31);
+}
+
+// rounds on the pairs. The rows stay in memory, behind black_box, where the wipe reaches them: as
+// values, they left the vectorizer no stores to start from.
+#[cfg(crypto_pq_pairs)]
+#[inline(always)]
+fn rounds_pair(h: &mut [u64; 8], m: &[u64; 16], counter: u128, last: bool) {
+    let iv = IV_512;
+
+    let [t0, t1] = u64::counter(counter);
+
+    let mut rows = Rows([
+        [h[0], h[2]],
+        [h[1], h[3]],
+        [h[4], h[6]],
+        [h[5], h[7]],
+        [iv[0], iv[2]],
+        [iv[1], iv[3]],
+        [iv[4] ^ t0, if last { !iv[6] } else { iv[6] }],
+        [iv[5] ^ t1, iv[7]],
+    ]);
+
+    core::hint::black_box(&mut rows);
+
+    let zero = core::hint::black_box([0; 2]);
+
+    // Written out, so that every index into the message is a constant.
+    round_pair(&mut rows, m, &SIGMA[0], zero);
+
+    round_pair(&mut rows, m, &SIGMA[1], zero);
+
+    round_pair(&mut rows, m, &SIGMA[2], zero);
+
+    round_pair(&mut rows, m, &SIGMA[3], zero);
+
+    round_pair(&mut rows, m, &SIGMA[4], zero);
+
+    round_pair(&mut rows, m, &SIGMA[5], zero);
+
+    round_pair(&mut rows, m, &SIGMA[6], zero);
+
+    round_pair(&mut rows, m, &SIGMA[7], zero);
+
+    round_pair(&mut rows, m, &SIGMA[8], zero);
+
+    round_pair(&mut rows, m, &SIGMA[9], zero);
+
+    round_pair(&mut rows, m, &SIGMA[0], zero);
+
+    round_pair(&mut rows, m, &SIGMA[1], zero);
+
+    // h[j] ^= v[j] ^ v[j + 8], where pair i holds words j and j + 2 of row i / 2.
+    for (i, (top, bottom)) in rows.0[..4].iter().zip(&rows.0[4..]).enumerate() {
+        let j = 4 * (i / 2) + i % 2;
+
+        h[j] ^= top[0] ^ bottom[0];
+
+        h[j + 2] ^= top[1] ^ bottom[1];
+    }
+
+    wipe(&mut rows.0);
 }
 
 // The first block (the key block of a MAC), then the whole blocks of bytes, then the final block,

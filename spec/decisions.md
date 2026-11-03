@@ -712,7 +712,7 @@ On 32-bit x86 with SSE2, Keccak-f[1600] holds the same lane of two states as a p
 words, and `keccak::permute_all` permutes the states of a group two at a time; a state alone runs
 beside the zero state, whose permutation is public. Each operation of a round on a pair is the
 same operation on both words, which LLVM's SLP vectorizer turns into one SSE2 instruction for
-both states. build.rs sets `crypto_pq_keccak_pairs` where the target architecture is x86 and the
+both states. build.rs sets `crypto_pq_pairs` where the target architecture is x86 and the
 target features include sse2, as they do on every i686 target; the other 32-bit targets keep the
 bit-interleaved lanes, and 64-bit targets and WebAssembly the plain lanes. The pair form is
 portable code, Rust without intrinsics or assembly that is correct on any target: the target's
@@ -766,3 +766,44 @@ loop over both kinds of block, executes 0.6 to 2.1 percent more instructions tha
 of the armv7 machine code at opt-levels 1, 2, 3, s and z finds no new branch, select, table or
 division in the Ascon functions, and on x86-64, ARM64, i686 and wasm32 they are equal to those
 before, function by function.
+
+## Decision D-82
+
+On 32-bit x86 with SSE2, BLAKE2b holds the words of each row of its state in pairs, those of
+columns 0 and 2 and those of columns 1 and 3, so that each operation of the G function on a pair is
+the same operation on both words, which LLVM's SLP vectorizer turns into one SSE2 instruction. The
+diagonal step takes the same pairs, four of them with their words swapped. build.rs sets
+`crypto_pq_pairs`, the configuration of [D-80](#decision-d-80), for both forms; BLAKE2s, whose words
+are 32 bits, keeps its form there, as the other targets keep theirs. The details of D-80 keep the
+vectorizer at work here too: the pairs stay in memory, behind `core::hint::black_box`, and each
+rotation shifts the word and the word XOR an opaque zero. A compiler fence before the columns and
+before the diagonals of each round makes each half load and store its own pairs: over a whole round
+LLVM kept more values than the eight SSE2 registers hold, and spilled them.
+
+On 32-bit x86, BLAKE3 compresses each block of a chain in a call of its own, in place in the
+chaining value. With the rounds inlined into the loop over the blocks, the seven general registers
+held little of the state: its words stayed in memory, changed by 60 read-modify-write instructions
+per block, each waiting for the store of the one before. Compressed alone, a block has 3 of them.
+The whole blocks of an extended output go from the registers of their compression straight into the
+output: stored as words and then copied as bytes, they were loaded back with wider loads than their
+stores, which a store cannot forward. Other targets keep the form before.
+
+Both forms are portable code, Rust without intrinsics or assembly that is correct on any target,
+which the target's architecture and features choose at compile time. They are not CPU-specific code
+under [15.3](15-platforms.md#153-cpu-specific-code), need no run-time detection or twin, and stay in
+the builds that force the portable code. Every index and shift amount is a constant, so neither form
+has a branch or memory access that depends on the data, and the pairs are wiped after each
+compression.
+
+Rationale: on i686, counted under QEMU one instruction at a time, BLAKE2b-512 of 0 bytes to 1 KiB
+and its MAC of 64 bytes execute 53 to 57 percent fewer instructions. BLAKE3 of 1 KiB executes 1.8
+percent more, its extended output of 1 KiB from 64 bytes 1.5 percent fewer, and BLAKE2s, BLAKE3 of 0
+and 64 bytes and its MAC of 64 bytes as many as before. In bench run 41610095005, on 13 runners (Zen
+3, Zen 4, Zen 5 and Granite Rapids), with every function aligned to 64 bytes and to 128, the time
+before over the time here was 1.14 to 2.06 for BLAKE2b and its MAC, 1.05 to 1.31 for BLAKE3 and its
+MAC of 1 KiB and 16 KiB, and 1.05 to 1.41 for its extended output of 1 KiB and 16 KiB. BLAKE2s, and
+BLAKE3 of up to 64 bytes, were at 0.986 to 1.03. The lowest, on Zen 3, were BLAKE2s-256 of 0 and 64
+bytes, whose machine code, the bench harness's included, is the same as before, and BLAKE3 key
+derivation of 64 bytes, at 64 bytes of alignment: at 128 it was 1.012. A scan of the i686 machine
+code at opt-levels 1, 2, 3, s and z finds no branch, select, table or division on secret data, and
+the code of x86-64, ARM64, armv7 and wasm32 is the same as before, function by function.
