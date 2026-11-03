@@ -171,31 +171,19 @@ pub(crate) fn permute(state: &mut [u64; 25]) {
 // took two shifts and an OR a word. Lanes enter the state through to_lane and leave it through
 // from_lane, so that a permutation converts none; both are the identity where a lane takes one
 // register or a pair holds it whole.
-#[cfg(any(
-    target_pointer_width = "64",
-    target_family = "wasm",
-    crypto_pq_keccak_pairs
-))]
+#[cfg(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs))]
 #[inline(always)]
 pub(crate) const fn to_lane(lane: u64) -> u64 {
     lane
 }
 
-#[cfg(any(
-    target_pointer_width = "64",
-    target_family = "wasm",
-    crypto_pq_keccak_pairs
-))]
+#[cfg(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs))]
 #[inline(always)]
 pub(crate) const fn from_lane(lane: u64) -> u64 {
     lane
 }
 
-#[cfg(not(any(
-    target_pointer_width = "64",
-    target_family = "wasm",
-    crypto_pq_keccak_pairs
-)))]
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs)))]
 #[inline(always)]
 pub(crate) const fn to_lane(lane: u64) -> u64 {
     let low = unzip(lane as u32);
@@ -205,11 +193,7 @@ pub(crate) const fn to_lane(lane: u64) -> u64 {
     ((low & 0xffff) | (high << 16)) as u64 | (((low >> 16) | (high & 0xffff_0000)) as u64) << 32
 }
 
-#[cfg(not(any(
-    target_pointer_width = "64",
-    target_family = "wasm",
-    crypto_pq_keccak_pairs
-)))]
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs)))]
 #[inline(always)]
 pub(crate) const fn from_lane(lane: u64) -> u64 {
     let (even, odd) = (lane as u32, (lane >> 32) as u32);
@@ -223,11 +207,7 @@ pub(crate) const fn from_lane(lane: u64) -> u64 {
 
 // The even bits of x in its low half, in order, and its odd bits in its high half: four exchanges
 // of bit groups, each of the bits of x at the masked positions with the bits a distance above.
-#[cfg(not(any(
-    target_pointer_width = "64",
-    target_family = "wasm",
-    crypto_pq_keccak_pairs
-)))]
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs)))]
 #[inline(always)]
 const fn unzip(mut x: u32) -> u32 {
     let mut t = (x ^ (x >> 1)) & 0x2222_2222;
@@ -248,11 +228,7 @@ const fn unzip(mut x: u32) -> u32 {
 }
 
 // The inverse of unzip: the same exchanges in the opposite order, as each is its own inverse.
-#[cfg(not(any(
-    target_pointer_width = "64",
-    target_family = "wasm",
-    crypto_pq_keccak_pairs
-)))]
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs)))]
 #[inline(always)]
 const fn zip(mut x: u32) -> u32 {
     let mut t = (x ^ (x >> 8)) & 0x0000_ff00;
@@ -275,11 +251,7 @@ const fn zip(mut x: u32) -> u32 {
 // The parities of each round come from its input, and each output plane from its source lanes
 // alone, half a plane at a time, so that only those stay live. The words are in memory, where
 // the wipe reaches them.
-#[cfg(not(any(
-    target_pointer_width = "64",
-    target_family = "wasm",
-    crypto_pq_keccak_pairs
-)))]
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs)))]
 pub(crate) fn permute(state: &mut [u64; 25]) {
     let mut a = state.map(|lane| [lane as u32, (lane >> 32) as u32]);
 
@@ -304,11 +276,7 @@ pub(crate) fn permute(state: &mut [u64; 25]) {
     wipe(&mut theta);
 }
 
-#[cfg(not(any(
-    target_pointer_width = "64",
-    target_family = "wasm",
-    crypto_pq_keccak_pairs
-)))]
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs)))]
 const INTERLEAVED_CONSTANTS: [[u32; 2]; 24] = {
     let mut constants = [[0; 2]; 24];
 
@@ -327,11 +295,7 @@ const INTERLEAVED_CONSTANTS: [[u32; 2]; 24] = {
 
 // The parities go to theta one column half at a time, and theta's D values replace them, so that
 // each value is stored before the next column is loaded.
-#[cfg(not(any(
-    target_pointer_width = "64",
-    target_family = "wasm",
-    crypto_pq_keccak_pairs
-)))]
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs)))]
 #[inline(always)]
 fn round_interleaved(
     a: &[[u32; 2]; 25],
@@ -385,11 +349,7 @@ fn round_interleaved(
 // amount is one. Bit 2j of a lane rotated by 2k + 1 is bit 2(j - k - 1) + 1 of the lane, and bit
 // 2j + 1 is bit 2(j - k): the even word of the result is the odd word rotated by k + 1, and the odd
 // word the even one rotated by k.
-#[cfg(not(any(
-    target_pointer_width = "64",
-    target_family = "wasm",
-    crypto_pq_keccak_pairs
-)))]
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs)))]
 #[inline(always)]
 fn half_plane<const Y: usize, const H: usize>(
     a: &[[u32; 2]; 25],
@@ -435,25 +395,25 @@ fn order() {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
-// On 32-bit x86 with SSE2 (crypto_pq_keccak_pairs, which build.rs sets), a pair holds the same
+// On 32-bit x86 with SSE2 (crypto_pq_pairs, which build.rs sets), a pair holds the same
 // lane of two states, whole: each operation of a round is then one SSE2 instruction on both
 // states, which LLVM's SLP vectorizer forms from the two operations of a pair. A state alone runs
 // beside the zero state, whose permutation is public.
-#[cfg(crypto_pq_keccak_pairs)]
+#[cfg(crypto_pq_pairs)]
 type Pair = [u64; 2];
 
 // Aligned for the SSE2 instructions that take an operand from memory.
-#[cfg(crypto_pq_keccak_pairs)]
+#[cfg(crypto_pq_pairs)]
 #[repr(C, align(16))]
 struct Pairs([Pair; 25]);
 
-#[cfg(crypto_pq_keccak_pairs)]
+#[cfg(crypto_pq_pairs)]
 #[inline(always)]
 fn xor_pair(a: Pair, b: Pair) -> Pair {
     [a[0] ^ b[0], a[1] ^ b[1]]
 }
 
-#[cfg(crypto_pq_keccak_pairs)]
+#[cfg(crypto_pq_pairs)]
 #[inline(always)]
 fn chi_pair(a: Pair, b: Pair, c: Pair) -> Pair {
     [a[0] ^ (!b[0] & c[0]), a[1] ^ (!b[1] & c[1])]
@@ -462,7 +422,7 @@ fn chi_pair(a: Pair, b: Pair, c: Pair) -> Pair {
 // A rotation as shifts of two values that LLVM cannot prove equal, a and a ^ zero for a zero that
 // it cannot see: of one value it forms a funnel shift, which SSE2 lacks, and the vectorizer's cost
 // of that kept the whole round scalar.
-#[cfg(crypto_pq_keccak_pairs)]
+#[cfg(crypto_pq_pairs)]
 #[inline(always)]
 fn rotate_pair(a: Pair, zero: Pair, amount: u32) -> Pair {
     if amount == 0 {
@@ -478,7 +438,7 @@ fn rotate_pair(a: Pair, zero: Pair, amount: u32) -> Pair {
 }
 
 // Plane Y of a round's output for both states.
-#[cfg(crypto_pq_keccak_pairs)]
+#[cfg(crypto_pq_pairs)]
 #[inline(always)]
 fn plane_pair<const Y: usize>(a: &Pairs, d: &[Pair; 5], e: &mut Pairs, constant: u64, zero: Pair) {
     order();
@@ -508,7 +468,7 @@ fn plane_pair<const Y: usize>(a: &Pairs, d: &[Pair; 5], e: &mut Pairs, constant:
     wipe_unless_optimized!(&mut b);
 }
 
-#[cfg(crypto_pq_keccak_pairs)]
+#[cfg(crypto_pq_pairs)]
 #[inline(always)]
 fn round_pair(a: &Pairs, e: &mut Pairs, constant: u64, zero: Pair) {
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
@@ -543,7 +503,7 @@ fn round_pair(a: &Pairs, e: &mut Pairs, constant: u64, zero: Pair) {
 }
 
 // Keccak-f[1600] on two states side by side.
-#[cfg(crypto_pq_keccak_pairs)]
+#[cfg(crypto_pq_pairs)]
 fn permute_pair(first: &mut [u64; 25], second: &mut [u64; 25]) {
     let mut a = Pairs(core::array::from_fn(|i| [first[i], second[i]]));
 
@@ -572,7 +532,7 @@ fn permute_pair(first: &mut [u64; 25], second: &mut [u64; 25]) {
     wipe(&mut e.0);
 }
 
-#[cfg(crypto_pq_keccak_pairs)]
+#[cfg(crypto_pq_pairs)]
 pub(crate) fn permute(state: &mut [u64; 25]) {
     permute_pair(state, &mut [0; 25]);
 }
@@ -619,7 +579,7 @@ fn xor_bytes(state: &mut [u64; 25], position: &mut usize, mut bytes: &[u8]) {
 pub(crate) fn permute_all(states: &mut [&mut [u64; 25]]) {
     let done = cpu::permute_many(states);
 
-    #[cfg(crypto_pq_keccak_pairs)]
+    #[cfg(crypto_pq_pairs)]
     let done = {
         let (pairs, _) = states[done..].as_chunks_mut::<2>();
 
@@ -843,11 +803,7 @@ impl Sponges {
     }
 
     // The lanes of the block that sponge i squeezed last, in output order on every target.
-    #[cfg(any(
-        target_pointer_width = "64",
-        target_family = "wasm",
-        crypto_pq_keccak_pairs
-    ))]
+    #[cfg(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs))]
     #[inline(always)]
     pub(crate) fn lanes<const LANES: usize>(&self, i: usize) -> impl Deref<Target = [u64; LANES]> {
         assert!(8 * LANES <= self.rate, "lanes beyond the rate");
@@ -858,11 +814,7 @@ impl Sponges {
     }
 
     // A copy of the lanes through from_lane, which the state holds bit-interleaved.
-    #[cfg(not(any(
-        target_pointer_width = "64",
-        target_family = "wasm",
-        crypto_pq_keccak_pairs
-    )))]
+    #[cfg(not(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs)))]
     #[inline(always)]
     pub(crate) fn lanes<const LANES: usize>(&self, i: usize) -> impl Deref<Target = [u64; LANES]> {
         assert!(8 * LANES <= self.rate, "lanes beyond the rate");
@@ -888,18 +840,10 @@ impl Sponges {
 
 // Lanes of a squeezed block as Sponges::lanes returns them where the state holds lanes
 // bit-interleaved: secret output, wiped when dropped.
-#[cfg(not(any(
-    target_pointer_width = "64",
-    target_family = "wasm",
-    crypto_pq_keccak_pairs
-)))]
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs)))]
 struct Lanes<const LANES: usize>([u64; LANES]);
 
-#[cfg(not(any(
-    target_pointer_width = "64",
-    target_family = "wasm",
-    crypto_pq_keccak_pairs
-)))]
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs)))]
 impl<const LANES: usize> Deref for Lanes<LANES> {
     type Target = [u64; LANES];
 
@@ -908,11 +852,7 @@ impl<const LANES: usize> Deref for Lanes<LANES> {
     }
 }
 
-#[cfg(not(any(
-    target_pointer_width = "64",
-    target_family = "wasm",
-    crypto_pq_keccak_pairs
-)))]
+#[cfg(not(any(target_pointer_width = "64", target_family = "wasm", crypto_pq_pairs)))]
 impl<const LANES: usize> Drop for Lanes<LANES> {
     fn drop(&mut self) {
         wipe(&mut self.0);

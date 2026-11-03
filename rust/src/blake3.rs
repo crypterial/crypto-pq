@@ -233,6 +233,33 @@ fn compress_portable(
     }
 }
 
+// The output of the compression of the block of words m, as bytes into out, for the whole blocks
+// of an extended output on 32-bit x86 (Output::root). Its words go into out from the registers
+// that hold them: stored as words and then copied as bytes, they were loaded back with wider loads
+// than their stores, which a store cannot forward (two 8-byte loads per 16 bytes of output, and
+// memcpy's 16-byte loads after them).
+#[inline(never)]
+fn compress_bytes(
+    cv: &[u32; 8],
+    m: &[u32; 16],
+    counter: u64,
+    length: u32,
+    flags: u32,
+    out: &mut [u8; BLOCK],
+) {
+    let v = rounds(cv, m, counter, length, flags);
+
+    for (i, bytes) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let word = if i < 8 {
+            v[i] ^ v[i + 8]
+        } else {
+            v[i] ^ cv[i - 8]
+        };
+
+        *bytes = word.to_le_bytes();
+    }
+}
+
 // The chaining value, the first eight output words alone, into out.
 #[inline]
 fn chain(
@@ -298,6 +325,13 @@ fn chain_blocks(
     chain_blocks_portable(out, cv, blocks, counter, flags, edges, last);
 }
 
+// Whether each block of a chain is compressed by a call of its own. On 32-bit x86, whose seven
+// registers hold little of the state, the rounds inlined into the loop over blocks kept words of
+// it in memory, which read-modify-write instructions changed, 60 of them in a block, each waiting
+// for the store of the last: on an AMD Zen 3 core a block took 128 ns, against 105 ns for
+// purecrypto's compression, a call per block. Compressed alone, a block has 3 of them.
+const BLOCK_CALLS: bool = cfg!(target_arch = "x86");
+
 // The chain stays in registers from block to block; a call per block stored it and loaded it
 // back, on the critical path. out comes first, where a returned array's address goes: last, it
 // changed the registers of the loop, and a 1 KiB hash took 1 percent longer on Apple M3. Out of
@@ -312,9 +346,32 @@ fn chain_blocks_portable(
     [start, end]: [u32; 2],
     last: Last,
 ) {
-    let mut h = *cv;
-
     let whole = blocks.len();
+
+    // out already holds cv (chain_blocks).
+    if BLOCK_CALLS {
+        for (i, block) in blocks.iter().enumerate() {
+            let mut f = flags;
+
+            if i == 0 {
+                f |= start;
+            }
+
+            if i + 1 == whole {
+                f |= end;
+            }
+
+            chain_in_place(out, block, counter, BLOCK as u32, f);
+        }
+
+        if let Some((block, length, f)) = last {
+            chain_in_place(out, block, counter, length, f);
+        }
+
+        return;
+    }
+
+    let mut h = *cv;
 
     for (i, block) in blocks.iter().enumerate() {
         let mut f = flags;
@@ -341,6 +398,16 @@ fn chain_blocks_portable(
     *out = h;
 
     wipe_unless_optimized!(&mut h);
+}
+
+// The chaining value after one block, in place in h.
+#[inline(never)]
+fn chain_in_place(h: &mut [u32; 8], block: &[u8; BLOCK], counter: u64, length: u32, flags: u32) {
+    let v = rounds(h, &words(block), counter, length, flags);
+
+    for (i, word) in h.iter_mut().enumerate() {
+        *word = v[i] ^ v[i + 8];
+    }
 }
 
 // chain_blocks for two inputs of as many blocks, into out.
@@ -610,7 +677,19 @@ impl Output {
             if skip == 0 {
                 let (blocks, _) = rest.as_chunks_mut::<BLOCK>();
 
-                let done = cpu::blake3_xof(&self.cv, &m, index, [self.length, flags], blocks);
+                let mut done = cpu::blake3_xof(&self.cv, &m, index, [self.length, flags], blocks);
+
+                // 32-bit x86, which has no kernel for them, compresses the whole blocks one at a
+                // time, straight into out.
+                if cfg!(target_arch = "x86") {
+                    for (i, block) in blocks.iter_mut().enumerate().skip(done) {
+                        let counter = index.wrapping_add(i as u64);
+
+                        compress_bytes(&self.cv, &m, counter, self.length, flags, block);
+                    }
+
+                    done = blocks.len();
+                }
 
                 rest = &mut core::mem::take(&mut rest)[done * BLOCK..];
 
