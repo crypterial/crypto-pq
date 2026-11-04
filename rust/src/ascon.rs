@@ -3,6 +3,7 @@
 // (Appendix A). The start states are the states after the first permutation of each IV (A.3).
 
 use crate::cpu;
+#[cfg(not(target_arch = "x86"))]
 use crate::sha2::last_bytes;
 use crate::wipe::wipe;
 
@@ -165,8 +166,10 @@ const fn sbox(s: &mut [u64; 5]) {
 }
 
 // The linear layer, each x ^ ror(x, a) ^ ror(x, b) as x ^ ror(x ^ ror(x, b - a), a): AArch64 then
-// folds both rotations into the EORs as rotated operands.
-#[cfg(not(target_arch = "arm"))]
+// folds both rotations into the EORs as rotated operands, and so does V8 on ARM64 for WebAssembly.
+// Written with both rotations of x, the compiler XORs the two rotations together first, and V8
+// computes one of them apart: one instruction more per word.
+#[cfg(not(any(target_arch = "arm", target_arch = "x86")))]
 #[inline(always)]
 const fn linear(s: &mut [u64; 5]) {
     let [x0, x1, x2, x3, x4] = *s;
@@ -177,6 +180,22 @@ const fn linear(s: &mut [u64; 5]) {
         x2 ^ (x2 ^ x2.rotate_right(5)).rotate_right(1),
         x3 ^ (x3 ^ x3.rotate_right(7)).rotate_right(10),
         x4 ^ (x4 ^ x4.rotate_right(34)).rotate_right(7),
+    ];
+}
+
+// The linear layer on 32-bit x86 as the specification writes it: both rotations of x side by side,
+// one step less in each round's chain of dependent instructions.
+#[cfg(target_arch = "x86")]
+#[inline(always)]
+const fn linear(s: &mut [u64; 5]) {
+    let [x0, x1, x2, x3, x4] = *s;
+
+    *s = [
+        x0 ^ x0.rotate_right(19) ^ x0.rotate_right(28),
+        x1 ^ x1.rotate_right(61) ^ x1.rotate_right(39),
+        x2 ^ x2.rotate_right(1) ^ x2.rotate_right(6),
+        x3 ^ x3.rotate_right(10) ^ x3.rotate_right(17),
+        x4 ^ x4.rotate_right(7) ^ x4.rotate_right(41),
     ];
 }
 
@@ -277,6 +296,7 @@ pub(crate) fn permute(s: &mut [u64; 5]) {
 // The output for data from a start state, read once. cpu::ascon_digest declines exactly where
 // cpu::ascon does, so the portable rounds run here with the state in registers: the blocks and
 // the padded last block through one permutation, then the output words through another.
+#[cfg(not(target_arch = "x86"))]
 pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
     if cpu::ascon_digest(start, data, out) {
         return;
@@ -312,9 +332,73 @@ pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
     wipe(&mut s);
 }
 
+// The same digest on 32-bit x86, where this form took fewer instructions: whole output words are
+// stored as they are and the bytes after the last whole word apart, in place of a test of the
+// length of each chunk. On WebAssembly it took fewer instructions too, but Cranelift then compiled
+// the loop over the blocks into code that took more time on AMD Zen cores.
+#[cfg(target_arch = "x86")]
+pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
+    if cpu::ascon_digest(start, data, out) {
+        return;
+    }
+
+    let mut s = *start;
+
+    let (blocks, tail) = data.as_chunks::<8>();
+
+    let last = last_word(data, tail.len()) ^ 1 << (8 * tail.len());
+
+    let words = blocks.iter().map(|block| u64::from_le_bytes(*block));
+
+    for word in words.chain([last]) {
+        s[0] ^= to_lane(word);
+
+        rounds(&mut s);
+    }
+
+    let (words, tail) = out.as_chunks_mut::<8>();
+
+    for (i, word) in words.iter_mut().enumerate() {
+        if i > 0 {
+            rounds(&mut s);
+        }
+
+        *word = from_lane(s[0]).to_le_bytes();
+    }
+
+    if !tail.is_empty() {
+        if !words.is_empty() {
+            rounds(&mut s);
+        }
+
+        tail.copy_from_slice(&from_lane(s[0]).to_le_bytes()[..tail.len()]);
+    }
+
+    wipe(&mut s);
+}
+
+// The last count bytes of data, count below 8, as a little-endian word, from the eight bytes at
+// the end where there are as many: sha2::last_bytes shifts a 128-bit value, four words here, and
+// reads a window only from 16 bytes of data.
+#[cfg(target_arch = "x86")]
+fn last_word(data: &[u8], count: usize) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+
+    if let Some(window) = data.last_chunk::<8>() {
+        return u64::from_le_bytes(*window) >> (8 * (8 - count));
+    }
+
+    data[data.len() - count..]
+        .iter()
+        .rev()
+        .fold(0, |word, &byte| word << 8 | u64::from(byte))
+}
+
 // Ascon-CXOF128's state after the customization string z, at most MAX_CUSTOMIZATION bytes: its
-// length in bits as the first block, then z padded. One body for the run-time state, through the
-// CPU kernels, and for the constant, through permute_const.
+// length in bits as the first block, then z padded. One body for the run-time state, through
+// permute or the rounds inline, and for the constant, through permute_const.
 macro_rules! customize {
     ($z:expr, $permute:ident) => {{
         let z: &[u8] = $z;
@@ -355,7 +439,13 @@ macro_rules! customize {
     }};
 }
 
+// On WebAssembly and 32-bit x86, where no CPU kernel takes the permutation, with the rounds
+// inline: a call of permute per block loaded and stored the state each time.
 pub(crate) fn customize(z: &[u8]) -> [u64; 5] {
+    #[cfg(any(target_family = "wasm", target_arch = "x86"))]
+    return customize!(z, rounds);
+
+    #[cfg(not(any(target_family = "wasm", target_arch = "x86")))]
     customize!(z, permute)
 }
 
@@ -754,30 +844,35 @@ mod tests {
     }
 
     // The one-shot output against the sponge fed and read in pieces, for lengths around the
-    // block boundaries.
+    // block boundaries, and outputs of part of a word, of whole words and of both.
     #[test]
     fn digest_matches_sponge() {
         let data: [u8; 40] = Inputs::new(6).bytes();
 
         for length in 0..data.len() {
-            let mut expected = [0; 45];
+            for size in [1, 7, 8, 16, 45] {
+                let mut expected = [0; 45];
 
-            digest(&XOF128, &data[..length], &mut expected);
+                digest(&XOF128, &data[..length], &mut expected[..size]);
 
-            for piece in [1, 3, 8, 9] {
-                let mut sponge = Sponge::new(&XOF128);
+                for piece in [1, 3, 8, 9] {
+                    let mut sponge = Sponge::new(&XOF128);
 
-                for chunk in data[..length].chunks(piece) {
-                    sponge.update(chunk);
+                    for chunk in data[..length].chunks(piece) {
+                        sponge.update(chunk);
+                    }
+
+                    let mut actual = [0; 45];
+
+                    for chunk in actual[..size].chunks_mut(piece + 2) {
+                        sponge.read(chunk);
+                    }
+
+                    assert_eq!(
+                        actual, expected,
+                        "length {length}, size {size}, piece {piece}"
+                    );
                 }
-
-                let mut actual = [0; 45];
-
-                for chunk in actual.chunks_mut(piece + 2) {
-                    sponge.read(chunk);
-                }
-
-                assert_eq!(actual, expected, "length {length}, piece {piece}");
             }
         }
     }
