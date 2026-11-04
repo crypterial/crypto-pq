@@ -1341,6 +1341,10 @@ fn word512(w: &mut [u64; 16], t: usize) {
 // schedule256 for SHA-512.
 #[inline(always)]
 fn schedule512(w: &mut [u64; 16]) {
+    if cfg!(crypto_pq_pairs) {
+        return schedule512_pairs(w);
+    }
+
     word512(w, 0);
 
     word512(w, 1);
@@ -1372,6 +1376,62 @@ fn schedule512(w: &mut [u64; 16]) {
     word512(w, 14);
 
     word512(w, 15);
+}
+
+// schedule512 on 32-bit x86 with SSE2 (crypto_pq_pairs), two words at a time: words t and t + 1,
+// for t even, from the pairs at t + 1, t + 9 and t + 14, which LLVM's SLP vectorizer computes in
+// SSE2 registers, where each word alone takes two general registers (D-83).
+#[inline(always)]
+fn schedule512_pairs(w: &mut [u64; 16]) {
+    let zero = core::hint::black_box([0; 2]);
+
+    // Written out, so that every index is a constant: as a loop over the steps it stayed scalar.
+    words512_pair(w, 0, zero);
+
+    words512_pair(w, 2, zero);
+
+    words512_pair(w, 4, zero);
+
+    words512_pair(w, 6, zero);
+
+    words512_pair(w, 8, zero);
+
+    words512_pair(w, 10, zero);
+
+    words512_pair(w, 12, zero);
+
+    words512_pair(w, 14, zero);
+}
+
+// word512 for words t and t + 1.
+#[inline(always)]
+fn words512_pair(w: &mut [u64; 16], t: usize, zero: [u64; 2]) {
+    let pair = |i: usize| [w[i % 16], w[(i + 1) % 16]];
+
+    let s0 = small_sigma512_pair(pair(t + 1), zero, [1, 8], 7);
+
+    let s1 = small_sigma512_pair(pair(t + 14), zero, [19, 61], 6);
+
+    let ([x, y], [c, d]) = (pair(t), pair(t + 9));
+
+    w[t] = x.wrapping_add(s0[0]).wrapping_add(c).wrapping_add(s1[0]);
+
+    w[t + 1] = y.wrapping_add(s0[1]).wrapping_add(d).wrapping_add(s1[1]);
+}
+
+// small_sigma512 on both words of a pair, each rotation as shifts of x and of x ^ zero, for a zero
+// that LLVM cannot see: from x alone it forms a funnel shift, which SSE2 lacks (D-80).
+#[inline(always)]
+fn small_sigma512_pair(x: [u64; 2], zero: [u64; 2], [a, b]: [u32; 2], s: u32) -> [u64; 2] {
+    let sigma = |i: usize| {
+        let y = x[i] ^ zero[i];
+
+        let rotate = |n: u32| x[i] >> n | y << (64 - n);
+
+        rotate(a) ^ rotate(b) ^ x[i] >> s
+    };
+
+    [sigma(0), sigma(1)]
 }
 
 fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
@@ -1410,12 +1470,21 @@ fn compress512_slice(state: &mut [u64; 8], blocks: &[[u8; 128]]) {
 fn compress512_blocks<'a>(state: &mut [u64; 8], blocks: impl IntoIterator<Item = &'a [u8; 128]>) {
     let mut w = [0; 16];
 
+    // In memory, where the wipe reaches them, the words give schedule512_pairs the loads and
+    // stores of pairs that the vectorizer starts from, as blake2::rounds_pair has its rows.
+    #[cfg(crypto_pq_pairs)]
+    core::hint::black_box(&mut w);
+
     let mut v = [0; 8];
 
     for block in blocks {
         compress512_block(state, block, &mut w, &mut v);
     }
 
+    #[cfg(crypto_pq_pairs)]
+    wipe(&mut w);
+
+    #[cfg(not(crypto_pq_pairs))]
     wipe_unless_optimized!(&mut w);
 
     wipe_unless_optimized!(&mut v);
