@@ -195,6 +195,13 @@ Implements specification 1.1 (draft).
   bit-interleaved, so that each rotation is one 32-bit rotation of each half, and words are
   converted only where they are absorbed and read
   ([decision D-81](spec/decisions.md#decision-d-81)). Outputs are unchanged.
+- One-shot Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128 on WebAssembly and 32-bit x86: the hash
+  and XOF dispatchers branch to the Ascon code before they set up the stack frame that the other
+  algorithms need, `XofAlgorithm::configure` and `XofAlgorithm::digest_into` are inline, and the
+  customization of Ascon-CXOF128 runs the rounds inline in place of a call of the permutation per
+  block. On 32-bit x86 the digest also stores whole output words as they are, and the linear layer
+  takes the two rotations of each word side by side, as the specification writes it, which leaves
+  one dependent step less in each round. Outputs are unchanged.
 - BLAKE2b and BLAKE3 on 32-bit x86 ([decision D-82](spec/decisions.md#decision-d-82)): with SSE2,
   BLAKE2b's state holds the words of each row in pairs, so that each step of a round is one SSE2
   operation on both words of a pair; BLAKE3 compresses each block of a chain in a call of its own,
