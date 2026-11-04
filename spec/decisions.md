@@ -807,3 +807,29 @@ bytes, whose machine code, the bench harness's included, is the same as before, 
 derivation of 64 bytes, at 64 bytes of alignment: at 128 it was 1.012. A scan of the i686 machine
 code at opt-levels 1, 2, 3, s and z finds no branch, select, table or division on secret data, and
 the code of x86-64, ARM64, armv7 and wasm32 is the same as before, function by function.
+
+## Decision D-83
+
+On 32-bit x86 with SSE2, the message schedule of SHA-512, which SHA-384, SHA-512/224 and SHA-512/256
+share, computes its words two at a time: words t and t + 1, for t even, from the pairs of words at
+t, t + 1, t + 9 and t + 14 (mod 16), so that each operation of a step is the same operation on both
+words of a pair, which LLVM's SLP vectorizer turns into one SSE2 instruction. A 64-bit word alone
+takes two general registers there, and each of its rotations two double shifts. build.rs sets
+`crypto_pq_pairs`, the configuration of [D-80](#decision-d-80), for the form; the rounds keep
+theirs, as SHA-256 and the other targets keep their schedules. The details of D-80 keep the
+vectorizer at work here too: the sixteen words stay in memory, behind `core::hint::black_box`, and
+each rotation shifts the word and the word XOR an opaque zero. The eight steps of a schedule are
+written out, so that every index is a constant: as a loop over the steps, the schedule stayed
+scalar.
+
+The form is portable code, Rust without intrinsics or assembly that is correct on any target, which
+the target's architecture and features choose at compile time. It is not CPU-specific code under
+[15.3](15-platforms.md#153-cpu-specific-code), needs no run-time detection or twin, and stays in the
+builds that force the portable code. Every index and shift amount is a constant, so the form has no
+branch or memory access that depends on the data, and the words are wiped after the last block.
+
+Rationale: on i686, counted under QEMU one instruction at a time, a block of SHA-512 executes 8272
+instructions, against 10007 before. SHA-512 of 0 bytes and 1 KiB, HMAC-SHA-512 of 64 bytes and
+HKDF-SHA-512 of 32 bytes execute 16.2 to 17.2 percent fewer instructions. A scan of the i686 machine
+code at opt-levels 1, 2, 3, s and z finds no branch, select, table or division on secret data, and
+the code of x86-64, ARM64, armv7 and wasm32 is the same as before, function by function.
