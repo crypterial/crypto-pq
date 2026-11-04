@@ -178,6 +178,11 @@ Implements specification 1.1 (draft).
   to two blocks before it compresses them, so that the AVX2 kernel, which schedules both blocks of
   a pair in the same vector instructions, takes the blocks of small updates in pairs too, and a
   digest compresses a held block together with the padding. Outputs are unchanged.
+- SHA-512, SHA-384 and their truncated forms on 32-bit x86 with SSE2, with HMAC and HKDF over them
+  and the SHA2 sets of SLH-DSA at security categories 3 and 5
+  ([decision D-83](spec/decisions.md#decision-d-83)): the message schedule computes its words two at
+  a time, so that each of its steps is one SSE2 operation on both words of a pair, where a word
+  alone takes two general registers. Outputs are unchanged.
 - SHA-256 on x86-64 CPUs with AVX-512F and AVX-512VL: the messages hashed side by side, eight at a
   time, in the chains and trees of LMS and XMSS and in the SHA-2 sets of SLH-DSA take a kernel,
   selected at run time, that keeps one message in each element of a 256-bit register and uses
