@@ -1,21 +1,29 @@
-// BLAKE3 on sixteen inputs side by side in 512-bit registers, for hash_many and the extended
-// output, on the cores of the table in zmm_lanes() of x86_64.rs (D-44), and on eight in 256-bit
-// registers with the AVX-512VL instructions for hash_many's groups of eight there. Each register
-// holds one state word of sixteen (or eight) inputs, as each of blake3.rs's eight-lane AVX2
-// kernels holds eight: the state is in registers 0 to 15 and the message words in 16 to 31, all
-// in registers through the seven rounds, and every rotation is one VPRORD. The blocks of the
-// sixteen inputs are loaded in 256-bit halves, inputs i and i + 4 in one register, the high half
-// an insert from memory, which leaves the shuffle port free, and transposed into words with
-// VPUNPCKLQDQ, VPUNPCKHQDQ, VSHUFPS and VSHUFI32X4: 48 shuffles a block, where whole-block loads
-// took 64. The outputs go back with VPUNPCKLDQ, VPUNPCKHDQ, VPUNPCKLQDQ, VPUNPCKHQDQ and
-// VSHUFI32X4. The eight-lane kernel loads and stores as the AVX2 kernel does. Every instruction is
-// on Intel's list of data-operand-independent timing instructions, or counts as on it by D-75
-// (VSHUFPS), and no branch or address depends on the data. The extended output's counters, public
-// values, are stepped with VPCMPUD and a VPADDD under its mask.
+// BLAKE3 with AVX-512F and AVX-512VL, on the cores of the table in zmm_lanes() of x86_64.rs (D-44,
+// D-84), in two forms.
 //
-// The three kernels are the only functions built with AVX-512F, and the two of sixteen lanes the
-// only code with 512-bit registers, which CI checks. Each is one block of assembly that ends by
-// zeroing registers 16 to 31, which no other code uses, and with VZEROUPPER.
+// On sixteen inputs side by side in 512-bit registers, for hash_many and the extended output, and
+// on eight in 256-bit registers for their groups of eight there, each register holds one state
+// word of sixteen (or eight) inputs, as each of blake3.rs's eight-lane AVX2 kernels holds eight:
+// the state is in registers 0 to 15 and the message words in 16 to 31, all in registers through
+// the seven rounds, and every rotation is one VPRORD. The blocks of the sixteen inputs are loaded
+// in 256-bit halves, inputs i and i + 4 in one register, the high half an insert from memory,
+// which leaves the shuffle port free, and transposed into words with VPUNPCKLQDQ, VPUNPCKHQDQ,
+// VSHUFPS and VSHUFI32X4: 48 shuffles a block, where whole-block loads took 64. The outputs go back
+// with VPUNPCKLDQ, VPUNPCKHDQ, VPUNPCKLQDQ, VPUNPCKHQDQ and VSHUFI32X4. The eight-lane kernel
+// loads and stores as the AVX2 kernel does. The extended output's counters, public values, are
+// stepped with VPCMPUD and a VPADDD under its mask.
+//
+// On two to four inputs or output blocks, in the row form, each 128-bit lane holds one row of one
+// input: the rows are in registers 0 to 3, the message in 16 to 23, and the words move to the next
+// round's order with VSHUFPS, VPSHUFD, VPUNPCKLDQ, VPUNPCKHDQ, VPUNPCKLQDQ and VPBLENDMD, which
+// takes those registers where VPBLENDD does not. KMOVW loads the blends' masks, which are constants,
+// and VPBROADCASTQ and VPADDQ the public counters.
+//
+// Every instruction is on Intel's list of data-operand-independent timing instructions, or counts
+// as on it by D-75 (VSHUFPS), and no branch or address depends on the data. These kernels are the
+// only functions built with AVX-512F, and those on sixteen and on four inputs or blocks the only
+// code with 512-bit registers, which CI checks. Each is one block of assembly that ends by zeroing
+// registers 16 to 31, which no other code uses, and with VZEROUPPER.
 
 use super::blake3::Table;
 use crate::sha2::IV_256;
@@ -374,6 +382,254 @@ macro_rules! ymm_cvs {
     };
 }
 
+// Instruction op on registers x and y of the width that r names, with immediate imm.
+macro_rules! vec_imm {
+    ($r:literal, $op:literal, $x:literal, $y:literal, $imm:literal) => {
+        concat!($op, " ", $r, $x, ", ", $r, $y, ", ", $imm, "\n")
+    };
+}
+
+// Half a step of the row form: a += m + b, d = (d ^ a) >>> dr, c += d, b = (b ^ c) >>> br, the
+// rows a, b, c and d in registers 0 to 3 and the message words in register m.
+#[rustfmt::skip]
+macro_rules! rows_half {
+    ($r:literal, $m:literal, $dr:literal, $br:literal) => {
+        concat!(
+            vec_op!($r, "vpaddd", 0, 0, $m), vec_op!($r, "vpaddd", 0, 0, 1),
+            vec_op!($r, "vpxord", 3, 3, 0), vec_ror!($r, 3, $dr),
+            vec_op!($r, "vpaddd", 2, 2, 3),
+            vec_op!($r, "vpxord", 1, 1, 2), vec_ror!($r, 1, $br),
+        )
+    };
+}
+
+// One round of the row form. Rows a, c and d turn to the diagonals and b stays: b is the last
+// value of each half step, so a shuffle of it would lengthen the chain of the next.
+#[rustfmt::skip]
+macro_rules! rows_round {
+    ($r:literal, $m0:literal, $m1:literal, $m2:literal, $m3:literal) => {
+        concat!(
+            rows_half!($r, $m0, 16, 12), rows_half!($r, $m1, 8, 7),
+            vec_imm!($r, "vpshufd", 0, 0, "0x93"), vec_imm!($r, "vpshufd", 3, 3, "0x4E"),
+            vec_imm!($r, "vpshufd", 2, 2, "0x39"),
+            rows_half!($r, $m2, 16, 12), rows_half!($r, $m3, 8, 7),
+            vec_imm!($r, "vpshufd", 0, 0, "0x39"), vec_imm!($r, "vpshufd", 3, 3, "0x4E"),
+            vec_imm!($r, "vpshufd", 2, 2, "0x93"),
+        )
+    };
+}
+
+// The message registers a to d of one round into e to h in the next round's order, with shuffles
+// inside each 128-bit lane, so that the same instructions serve both widths. Register 24 is
+// scratch, k1 selects the even words' neighbours (0xAAAA) and k2 each lane's last word (0x8888).
+#[rustfmt::skip]
+macro_rules! rows_next {
+    (
+        $r:literal,
+        $a:literal, $b:literal, $c:literal, $d:literal,
+        $e:literal, $f:literal, $g:literal, $h:literal
+    ) => {
+        concat!(
+            "vshufps ", $r, $e, ", ", $r, $a, ", ", $r, $b, ", 0xD6\n",
+            vec_imm!($r, "vpshufd", $f, $a, "0x0F"),
+            vec_imm!($r, "vpshufd", $e, $e, "0x39"),
+            "vshufps ", $r, "24, ", $r, $c, ", ", $r, $d, ", 0xFA\n",
+            "vpblendmd ", $r, $f, " {{k1}}, ", $r, $f, ", ", $r, "24\n",
+            vec_op!($r, "vpunpcklqdq", $g, $d, $b),
+            "vpblendmd ", $r, $g, " {{k2}}, ", $r, $g, ", ", $r, $c, "\n",
+            vec_imm!($r, "vpshufd", $g, $g, "0x78"),
+            vec_op!($r, "vpunpckhdq", 24, $b, $d),
+            vec_op!($r, "vpunpckldq", $h, $c, 24),
+            vec_imm!($r, "vpshufd", $h, $h, "0x1E"),
+        )
+    };
+}
+
+#[rustfmt::skip]
+macro_rules! rows_seven {
+    ($r:literal) => {
+        concat!(
+            rows_round!($r, 16, 17, 18, 19), rows_next!($r, 16, 17, 18, 19, 20, 21, 22, 23),
+            rows_round!($r, 20, 21, 22, 23), rows_next!($r, 20, 21, 22, 23, 16, 17, 18, 19),
+            rows_round!($r, 16, 17, 18, 19), rows_next!($r, 16, 17, 18, 19, 20, 21, 22, 23),
+            rows_round!($r, 20, 21, 22, 23), rows_next!($r, 20, 21, 22, 23, 16, 17, 18, 19),
+            rows_round!($r, 16, 17, 18, 19), rows_next!($r, 16, 17, 18, 19, 20, 21, 22, 23),
+            rows_round!($r, 20, 21, 22, 23), rows_next!($r, 20, 21, 22, 23, 16, 17, 18, 19),
+            rows_round!($r, 16, 17, 18, 19),
+        )
+    };
+}
+
+// The message words in registers 8 to 11, four to a lane in block order, into 16 to 19, the
+// vectors of the first round's four half steps.
+#[rustfmt::skip]
+macro_rules! rows_split {
+    ($r:literal) => {
+        concat!(
+            "vshufps ", $r, "16, ", $r, "8, ", $r, "9, 0x88\n",
+            "vshufps ", $r, "17, ", $r, "8, ", $r, "9, 0xDD\n",
+            "vshufps ", $r, "18, ", $r, "10, ", $r, "11, 0x88\n",
+            "vshufps ", $r, "19, ", $r, "10, ", $r, "11, 0xDD\n",
+            vec_imm!($r, "vpshufd", 18, 18, "0x93"), vec_imm!($r, "vpshufd", 19, 19, "0x93"),
+        )
+    };
+}
+
+// The two masks of rows_next.
+macro_rules! rows_masks {
+    () => {
+        concat!(
+            "mov eax, 0xAAAA\n",
+            "kmovw k1, eax\n",
+            "mov eax, 0x8888\n",
+            "kmovw k2, eax\n",
+        )
+    };
+}
+
+// Row d of each lane into register 5 ahead of a loop over blocks: the 64-bit counters from r14 on
+// by the steps at r15, and the block length of 64. The flags come per block.
+#[rustfmt::skip]
+macro_rules! rows_counters {
+    ($r:literal, $width:literal) => {
+        concat!(
+            "vpbroadcastq ", $r, "5, r14\n",
+            "vpaddq ", $r, "5, ", $r, "5, ", $width, " ptr [r15]\n",
+            "mov eax, 64\n",
+            "vpbroadcastq ", $r, "5 {{k1}}, rax\n",
+        )
+    };
+}
+
+// The rows of a block: the chaining value stays in registers 0 and 1, the IV in register 4; the
+// flags at rdi go into row d.
+#[rustfmt::skip]
+macro_rules! rows_start {
+    ($r:literal) => {
+        concat!(
+            "vmovdqa32 ", $r, "2, ", $r, "4\n",
+            "vpbroadcastd ", $r, "5 {{k2}}, dword ptr [rdi]\n",
+            "vmovdqa32 ", $r, "3, ", $r, "5\n",
+        )
+    };
+}
+
+// The next chaining value, and the loop over the blocks.
+#[rustfmt::skip]
+macro_rules! rows_end {
+    ($r:literal) => {
+        concat!(
+            vec_op!($r, "vpxord", 0, 0, 2), vec_op!($r, "vpxord", 1, 1, 3),
+            "add rdi, 4\n",
+            "add rax, 64\n",
+            "cmp rax, rcx\n",
+            "jne 2b\n",
+        )
+    };
+}
+
+// Bytes o to o + 15 of the current block of lanes 0 to 3 (r8 to r11) into zmm x.
+#[rustfmt::skip]
+macro_rules! rows_load4 {
+    ($o:literal, $x:literal) => {
+        concat!(
+            "vmovdqu xmm", $x, ", xmmword ptr [r8 + rax + ", $o, "]\n",
+            "vinserti128 ymm", $x, ", ymm", $x, ", xmmword ptr [r9 + rax + ", $o, "], 1\n",
+            "vinserti32x4 zmm", $x, ", zmm", $x, ", xmmword ptr [r10 + rax + ", $o, "], 2\n",
+            "vinserti32x4 zmm", $x, ", zmm", $x, ", xmmword ptr [r11 + rax + ", $o, "], 3\n",
+        )
+    };
+}
+
+// Bytes o to o + 15 of the current block of lanes 0 and 1 (r8 and r9) into ymm x.
+#[rustfmt::skip]
+macro_rules! rows_load2 {
+    ($o:literal, $x:literal) => {
+        concat!(
+            "vmovdqu xmm", $x, ", xmmword ptr [r8 + rax + ", $o, "]\n",
+            "vinserti128 ymm", $x, ", ymm", $x, ", xmmword ptr [r9 + rax + ", $o, "], 1\n",
+        )
+    };
+}
+
+// An output block's four rows from a lane: register 8's at o, 9's at o + 16 and so on, for the
+// extended output, whose rows are in registers 8 to 11.
+#[rustfmt::skip]
+macro_rules! rows_output {
+    ($r:literal, $lane:literal, $o0:literal, $o1:literal, $o2:literal, $o3:literal) => {
+        concat!(
+            "vextracti32x4 xmmword ptr [rdx + ", $o0, "], ", $r, "8, ", $lane, "\n",
+            "vextracti32x4 xmmword ptr [rdx + ", $o1, "], ", $r, "9, ", $lane, "\n",
+            "vextracti32x4 xmmword ptr [rdx + ", $o2, "], ", $r, "10, ", $lane, "\n",
+            "vextracti32x4 xmmword ptr [rdx + ", $o3, "], ", $r, "11, ", $lane, "\n",
+        )
+    };
+}
+
+// The start of the extended output's kernels: the chaining value at rax into registers 0 and 1 and
+// a copy in 6 and 7, the IV at r13 into row c, the counters from r8 by the steps at r15 with the
+// length and the flags of r9 into row d, and the block's words at rcx into 16 to 19.
+#[rustfmt::skip]
+macro_rules! rows_xof_start {
+    ($r:literal, $width:literal) => {
+        concat!(
+            "vbroadcasti32x4 ", $r, "0, xmmword ptr [rax]\n",
+            "vbroadcasti32x4 ", $r, "1, xmmword ptr [rax + 16]\n",
+            "vmovdqa32 ", $r, "6, ", $r, "0\n",
+            "vmovdqa32 ", $r, "7, ", $r, "1\n",
+            "vbroadcasti32x4 ", $r, "2, xmmword ptr [r13]\n",
+            rows_masks!(),
+            "vpbroadcastq ", $r, "3, r8\n",
+            "vpaddq ", $r, "3, ", $r, "3, ", $width, " ptr [r15]\n",
+            "vpbroadcastq ", $r, "3 {{k1}}, r9\n",
+            "vbroadcasti32x4 ", $r, "8, xmmword ptr [rcx]\n",
+            "vbroadcasti32x4 ", $r, "9, xmmword ptr [rcx + 16]\n",
+            "vbroadcasti32x4 ", $r, "10, xmmword ptr [rcx + 32]\n",
+            "vbroadcasti32x4 ", $r, "11, xmmword ptr [rcx + 48]\n",
+            rows_split!($r),
+            rows_seven!($r),
+            vec_op!($r, "vpxord", 8, 0, 2), vec_op!($r, "vpxord", 9, 1, 3),
+            vec_op!($r, "vpxord", 10, 2, 6), vec_op!($r, "vpxord", 11, 3, 7),
+            "vmovdqu xmmword ptr [rdx], xmm8\n",
+            "vmovdqu xmmword ptr [rdx + 16], xmm9\n",
+            "vmovdqu xmmword ptr [rdx + 32], xmm10\n",
+            "vmovdqu xmmword ptr [rdx + 48], xmm11\n",
+        )
+    };
+}
+
+// The output block of a lane from registers a to d, each with four of its words in its low half.
+#[rustfmt::skip]
+macro_rules! xof8_low {
+    (
+        $a:literal, $b:literal, $c:literal, $d:literal,
+        $o0:literal, $o1:literal, $o2:literal, $o3:literal
+    ) => {
+        concat!(
+            "vmovdqu32 xmmword ptr [rdx + ", $o0, "], xmm", $a, "\n",
+            "vmovdqu32 xmmword ptr [rdx + ", $o1, "], xmm", $b, "\n",
+            "vmovdqu32 xmmword ptr [rdx + ", $o2, "], xmm", $c, "\n",
+            "vmovdqu32 xmmword ptr [rdx + ", $o3, "], xmm", $d, "\n",
+        )
+    };
+}
+
+// As xof8_low, from the registers' high halves.
+#[rustfmt::skip]
+macro_rules! xof8_high {
+    (
+        $a:literal, $b:literal, $c:literal, $d:literal,
+        $o0:literal, $o1:literal, $o2:literal, $o3:literal
+    ) => {
+        concat!(
+            "vextracti32x4 xmmword ptr [rdx + ", $o0, "], ymm", $a, ", 1\n",
+            "vextracti32x4 xmmword ptr [rdx + ", $o1, "], ymm", $b, ", 1\n",
+            "vextracti32x4 xmmword ptr [rdx + ", $o2, "], ymm", $c, ", 1\n",
+            "vextracti32x4 xmmword ptr [rdx + ", $o3, "], ymm", $d, ", 1\n",
+        )
+    };
+}
+
 // The assembly with all 32 vector registers declared clobbered.
 macro_rules! zmm_asm {
     ($($operand:tt)*) => {
@@ -686,6 +942,339 @@ pub(super) unsafe fn xof16_zmm(
             in("rdi") &raw mut *table,
             inout("r8") counter => _,
             in("r9") &raw const STEPS,
+            out("k1") _,
+        )
+    };
+}
+
+// The steps of the row form's 64-bit counters, by lane, every other word: the words between them
+// hold the block length and the flags, which the kernels write over the sum.
+#[repr(C, align(64))]
+pub(super) struct RowSteps([u64; 8]);
+
+pub(super) static ROW_STEPS: RowSteps = RowSteps([0, 0, 1, 0, 2, 0, 3, 0]);
+
+pub(super) static NO_STEPS: RowSteps = RowSteps([0; 8]);
+
+/// The chaining values of the three or four inputs of out's length, `blocks` blocks each from
+/// lanes[i] on, in the row form on 512-bit registers: each 128-bit lane holds a row of one input.
+/// The counters run from `counter` by steps, and flags holds each block's flags.
+///
+/// # Safety
+///
+/// The CPU has AVX-512F and AVX-512VL and the operating system saves their registers; 1 <=
+/// blocks <= 16; each of the four pointers has `blocks` blocks of input behind it; out holds three
+/// or four values.
+#[target_feature(enable = "avx512f,avx512vl")]
+#[inline(never)]
+#[allow(unsafe_code)]
+pub(super) unsafe fn hash4_zmm(
+    lanes: &[*const [u8; 64]; 4],
+    blocks: usize,
+    key: &[u32; 8],
+    counter: u64,
+    steps: &RowSteps,
+    flags: &[u32; 16],
+    out: &mut [[u8; 32]],
+) {
+    let [l0, l1, l2, l3] = *lanes;
+
+    // SAFETY: AVX-512F and AVX-512VL instructions, which the caller's CPU has, on the vector
+    // registers, k1 and k2, all declared clobbered, and on the registers named below. The loop
+    // runs `blocks` times, at least once, as the caller ensures, and reads the flags of each block
+    // from flags, which holds sixteen, and the 64 bytes of that block of each lane. It reads the
+    // 32 bytes of key, the first 16 of the IV and the 64 of steps, writes the 32 bytes of each of
+    // out's values, three or four as the comparison picks, and uses no stack.
+    unsafe {
+        zmm_asm!(
+            "vbroadcasti32x4 zmm0, xmmword ptr [r12]",
+            "vbroadcasti32x4 zmm1, xmmword ptr [r12 + 16]",
+            "vbroadcasti32x4 zmm4, xmmword ptr [r13]",
+            rows_masks!(),
+            rows_counters!("zmm", "zmmword"),
+            "xor eax, eax",
+            ".p2align 5",
+            "2:",
+            rows_load4!("0", 8),
+            rows_load4!("16", 9),
+            rows_load4!("32", 10),
+            rows_load4!("48", 11),
+            rows_split!("zmm"),
+            rows_start!("zmm"),
+            rows_seven!("zmm"),
+            rows_end!("zmm"),
+            "vmovdqu xmmword ptr [rsi], xmm0",
+            "vmovdqu xmmword ptr [rsi + 16], xmm1",
+            "vextracti128 xmmword ptr [rsi + 32], ymm0, 1",
+            "vextracti128 xmmword ptr [rsi + 48], ymm1, 1",
+            "vextracti32x4 xmmword ptr [rsi + 64], zmm0, 2",
+            "vextracti32x4 xmmword ptr [rsi + 80], zmm1, 2",
+            "cmp rdx, 4",
+            "jne 3f",
+            "vextracti32x4 xmmword ptr [rsi + 96], zmm0, 3",
+            "vextracti32x4 xmmword ptr [rsi + 112], zmm1, 3",
+            "3:",
+            vec_clear!("zmm"),
+            out("rax") _,
+            in("rcx") 64 * blocks,
+            in("rdx") out.len(),
+            in("rsi") out.as_mut_ptr(),
+            inout("rdi") flags.as_ptr() => _,
+            in("r8") l0, in("r9") l1, in("r10") l2, in("r11") l3,
+            in("r12") key.as_ptr(),
+            in("r13") IV_256.as_ptr(),
+            in("r14") counter,
+            in("r15") &raw const *steps,
+            out("k1") _, out("k2") _,
+        )
+    };
+}
+
+/// hash4_zmm on two inputs and 256-bit registers.
+///
+/// # Safety
+///
+/// As for hash4_zmm, with two pointers.
+#[target_feature(enable = "avx512f,avx512vl")]
+#[inline(never)]
+#[allow(unsafe_code)]
+pub(super) unsafe fn hash2_ymm(
+    lanes: &[*const [u8; 64]; 2],
+    blocks: usize,
+    key: &[u32; 8],
+    counter: u64,
+    steps: &RowSteps,
+    flags: &[u32; 16],
+    out: &mut [[u8; 32]; 2],
+) {
+    let [l0, l1] = *lanes;
+
+    // SAFETY: as in hash4_zmm, on registers of at most 256 bits, with two inputs and two values of
+    // out, and the first 32 bytes of steps.
+    unsafe {
+        zmm_asm!(
+            "vbroadcasti32x4 ymm0, xmmword ptr [r12]",
+            "vbroadcasti32x4 ymm1, xmmword ptr [r12 + 16]",
+            "vbroadcasti32x4 ymm4, xmmword ptr [r13]",
+            rows_masks!(),
+            rows_counters!("ymm", "ymmword"),
+            "xor eax, eax",
+            ".p2align 5",
+            "2:",
+            rows_load2!("0", 8),
+            rows_load2!("16", 9),
+            rows_load2!("32", 10),
+            rows_load2!("48", 11),
+            rows_split!("ymm"),
+            rows_start!("ymm"),
+            rows_seven!("ymm"),
+            rows_end!("ymm"),
+            "vmovdqu xmmword ptr [rsi], xmm0",
+            "vmovdqu xmmword ptr [rsi + 16], xmm1",
+            "vextracti128 xmmword ptr [rsi + 32], ymm0, 1",
+            "vextracti128 xmmword ptr [rsi + 48], ymm1, 1",
+            vec_clear!("ymm"),
+            out("rax") _,
+            in("rcx") 64 * blocks,
+            in("rsi") out.as_mut_ptr(),
+            inout("rdi") flags.as_ptr() => _,
+            in("r8") l0, in("r9") l1,
+            in("r12") key.as_ptr(),
+            in("r13") IV_256.as_ptr(),
+            in("r14") counter,
+            in("r15") &raw const *steps,
+            out("k1") _, out("k2") _,
+        )
+    };
+}
+
+/// The three or four output blocks of out's length from the root's chaining value cv and message
+/// words block, at the counters from `counter` on, in the row form on 512-bit registers. tail
+/// holds the block length in its low half and the flags in its high half.
+///
+/// # Safety
+///
+/// The CPU has AVX-512F and AVX-512VL and the operating system saves their registers; out holds
+/// three or four blocks.
+#[target_feature(enable = "avx512f,avx512vl")]
+#[inline(never)]
+#[allow(unsafe_code)]
+pub(super) unsafe fn xof4_zmm(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    tail: u64,
+    out: &mut [[u8; 64]],
+) {
+    // SAFETY: AVX-512F and AVX-512VL instructions, which the caller's CPU has, on the vector
+    // registers, k1 and k2, all declared clobbered, and on the registers named below. It reads the
+    // 32 bytes of cv, the 64 of block, the first 16 of the IV and the 64 of ROW_STEPS, writes the
+    // 64 bytes of each of out's blocks, three or four as the comparison picks, and uses no stack.
+    unsafe {
+        zmm_asm!(
+            rows_xof_start!("zmm", "zmmword"),
+            rows_output!("ymm", 1, 64, 80, 96, 112),
+            rows_output!("zmm", 2, 128, 144, 160, 176),
+            "cmp rsi, 4",
+            "jne 3f",
+            rows_output!("zmm", 3, 192, 208, 224, 240),
+            "3:",
+            vec_clear!("zmm"),
+            inout("rax") cv.as_ptr() => _,
+            in("rcx") block.as_ptr(),
+            in("rdx") out.as_mut_ptr(),
+            in("rsi") out.len(),
+            in("r8") counter,
+            in("r9") tail,
+            in("r13") IV_256.as_ptr(),
+            in("r15") &raw const ROW_STEPS,
+            out("k1") _, out("k2") _,
+        )
+    };
+}
+
+/// xof4_zmm on two output blocks and 256-bit registers.
+///
+/// # Safety
+///
+/// The CPU has AVX-512F and AVX-512VL and the operating system saves their registers.
+#[target_feature(enable = "avx512f,avx512vl")]
+#[inline(never)]
+#[allow(unsafe_code)]
+pub(super) unsafe fn xof2_ymm(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    tail: u64,
+    out: &mut [[u8; 64]; 2],
+) {
+    // SAFETY: as in xof4_zmm, on registers of at most 256 bits, with the two blocks of out and the
+    // first 32 bytes of ROW_STEPS.
+    unsafe {
+        zmm_asm!(
+            rows_xof_start!("ymm", "ymmword"),
+            rows_output!("ymm", 1, 64, 80, 96, 112),
+            vec_clear!("ymm"),
+            inout("rax") cv.as_ptr() => _,
+            in("rcx") block.as_ptr(),
+            in("rdx") out.as_mut_ptr(),
+            in("r8") counter,
+            in("r9") tail,
+            in("r13") IV_256.as_ptr(),
+            in("r15") &raw const ROW_STEPS,
+            out("k1") _, out("k2") _,
+        )
+    };
+}
+
+/// The five to eight output blocks of out's length from the root's chaining value cv and message
+/// words block, at the counters from `counter` on, as xof16_zmm computes sixteen, on eight lanes
+/// in 256-bit registers. tail holds the block length in its low half and the flags in its high
+/// half.
+///
+/// # Safety
+///
+/// The CPU has AVX-512F and AVX-512VL and the operating system saves their registers; out holds
+/// five to eight blocks.
+#[target_feature(enable = "avx512f,avx512vl")]
+#[inline(never)]
+#[allow(unsafe_code)]
+pub(super) unsafe fn xof8_ymm(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    tail: u64,
+    out: &mut [[u8; 64]],
+) {
+    // SAFETY: AVX-512F and AVX-512VL instructions on registers of at most 256 bits, which the
+    // caller's CPU has, on the vector registers and k1, all declared clobbered, and on the
+    // registers named below. It reads the 32 bytes of cv, the 64 of block, the first 16 of the IV
+    // and the first 32 and the last 4 of STEPS, writes the 64 bytes of each of out's blocks, five
+    // to eight as the comparisons pick, and uses no stack.
+    unsafe {
+        zmm_asm!(
+            "vpbroadcastd ymm0, dword ptr [rax]",
+            "vpbroadcastd ymm1, dword ptr [rax + 4]",
+            "vpbroadcastd ymm2, dword ptr [rax + 8]",
+            "vpbroadcastd ymm3, dword ptr [rax + 12]",
+            "vpbroadcastd ymm4, dword ptr [rax + 16]",
+            "vpbroadcastd ymm5, dword ptr [rax + 20]",
+            "vpbroadcastd ymm6, dword ptr [rax + 24]",
+            "vpbroadcastd ymm7, dword ptr [rax + 28]",
+            "vpbroadcastd ymm8, dword ptr [r13]",
+            "vpbroadcastd ymm9, dword ptr [r13 + 4]",
+            "vpbroadcastd ymm10, dword ptr [r13 + 8]",
+            "vpbroadcastd ymm11, dword ptr [r13 + 12]",
+            "vpbroadcastd ymm16, r8d",
+            "shr r8, 32",
+            "vpbroadcastd ymm13, r8d",
+            "vpaddd ymm12, ymm16, ymmword ptr [r15]",
+            "vpcmpud k1, ymm12, ymm16, 1",
+            "vpaddd ymm13 {{k1}}, ymm13, dword ptr [r15 + 68]{{1to8}}",
+            "vpbroadcastd ymm14, r9d",
+            "shr r9, 32",
+            "vpbroadcastd ymm15, r9d",
+            "vpbroadcastd ymm16, dword ptr [rcx]",
+            "vpbroadcastd ymm17, dword ptr [rcx + 4]",
+            "vpbroadcastd ymm18, dword ptr [rcx + 8]",
+            "vpbroadcastd ymm19, dword ptr [rcx + 12]",
+            "vpbroadcastd ymm20, dword ptr [rcx + 16]",
+            "vpbroadcastd ymm21, dword ptr [rcx + 20]",
+            "vpbroadcastd ymm22, dword ptr [rcx + 24]",
+            "vpbroadcastd ymm23, dword ptr [rcx + 28]",
+            "vpbroadcastd ymm24, dword ptr [rcx + 32]",
+            "vpbroadcastd ymm25, dword ptr [rcx + 36]",
+            "vpbroadcastd ymm26, dword ptr [rcx + 40]",
+            "vpbroadcastd ymm27, dword ptr [rcx + 44]",
+            "vpbroadcastd ymm28, dword ptr [rcx + 48]",
+            "vpbroadcastd ymm29, dword ptr [rcx + 52]",
+            "vpbroadcastd ymm30, dword ptr [rcx + 56]",
+            "vpbroadcastd ymm31, dword ptr [rcx + 60]",
+            vec_seven!("ymm"),
+            "vpxord ymm16, ymm0, ymm8",
+            "vpxord ymm17, ymm1, ymm9",
+            "vpxord ymm18, ymm2, ymm10",
+            "vpxord ymm19, ymm3, ymm11",
+            "vpxord ymm20, ymm4, ymm12",
+            "vpxord ymm21, ymm5, ymm13",
+            "vpxord ymm22, ymm6, ymm14",
+            "vpxord ymm23, ymm7, ymm15",
+            "vpxord ymm24, ymm8, dword ptr [rax]{{1to8}}",
+            "vpxord ymm25, ymm9, dword ptr [rax + 4]{{1to8}}",
+            "vpxord ymm26, ymm10, dword ptr [rax + 8]{{1to8}}",
+            "vpxord ymm27, ymm11, dword ptr [rax + 12]{{1to8}}",
+            "vpxord ymm28, ymm12, dword ptr [rax + 16]{{1to8}}",
+            "vpxord ymm29, ymm13, dword ptr [rax + 20]{{1to8}}",
+            "vpxord ymm30, ymm14, dword ptr [rax + 24]{{1to8}}",
+            "vpxord ymm31, ymm15, dword ptr [rax + 28]{{1to8}}",
+            vec_four!("ymm", 16, 17, 18, 19, 0, 1, 2, 3),
+            vec_four!("ymm", 20, 21, 22, 23, 0, 1, 2, 3),
+            vec_four!("ymm", 24, 25, 26, 27, 0, 1, 2, 3),
+            vec_four!("ymm", 28, 29, 30, 31, 0, 1, 2, 3),
+            xof8_low!(16, 20, 24, 28, 0, 16, 32, 48),
+            xof8_low!(17, 21, 25, 29, 64, 80, 96, 112),
+            xof8_low!(18, 22, 26, 30, 128, 144, 160, 176),
+            xof8_low!(19, 23, 27, 31, 192, 208, 224, 240),
+            xof8_high!(16, 20, 24, 28, 256, 272, 288, 304),
+            "cmp rsi, 6",
+            "jb 3f",
+            xof8_high!(17, 21, 25, 29, 320, 336, 352, 368),
+            "cmp rsi, 7",
+            "jb 3f",
+            xof8_high!(18, 22, 26, 30, 384, 400, 416, 432),
+            "cmp rsi, 8",
+            "jb 3f",
+            xof8_high!(19, 23, 27, 31, 448, 464, 480, 496),
+            "3:",
+            vec_clear!("ymm"),
+            in("rax") cv.as_ptr(),
+            in("rcx") block.as_ptr(),
+            in("rdx") out.as_mut_ptr(),
+            in("rsi") out.len(),
+            inout("r8") counter => _,
+            inout("r9") tail => _,
+            in("r13") IV_256.as_ptr(),
+            in("r15") &raw const STEPS,
             out("k1") _,
         )
     };

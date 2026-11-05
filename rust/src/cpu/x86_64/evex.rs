@@ -53,29 +53,3 @@ pub(super) unsafe fn ror64<const R: u32>(x: __m256i) -> __m256i {
 
     out
 }
-
-/// The words of a and b that index selects, as _mm256_permutex2var_epi32(a, index, b).
-///
-/// # Safety
-///
-/// As for ror32.
-#[cfg(feature = "blake3")]
-#[target_feature(enable = "avx2")]
-#[inline]
-#[allow(unsafe_code)]
-pub(super) unsafe fn permute2(a: __m256i, index: __m256i, b: __m256i) -> __m256i {
-    let out;
-
-    // SAFETY: as in ror32, a VPERMT2D.
-    unsafe {
-        asm!(
-            "vpermt2d {a}, {index}, {b}",
-            a = inout(ymm_reg) a => out,
-            index = in(ymm_reg) index,
-            b = in(ymm_reg) b,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-    }
-
-    out
-}
