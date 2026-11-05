@@ -859,6 +859,12 @@ of data-operand-independent timing instructions, or counts as on it by [D-75](#d
 each form is tested against the portable code on the native runners of
 [18.2](18-testing.md#182-cpu-tiers).
 
+On WebAssembly, `hash_many` runs the last two inputs one after the other, not side by side as on the
+other targets, and the whole blocks of an extended output go from the registers of their compression
+straight into the output, as on 32-bit x86 ([D-82](#decision-d-82)). Both are forms of the portable
+code that the target chooses at compile time, not CPU-specific code under
+[15.3](15-platforms.md#153-cpu-specific-code), and neither depends on the data.
+
 Rationale: a block in the row form takes the latency of one compression, whose chain of dependent
 instructions is as long on any register width, so that four inputs in one 512-bit register take the
 time of one input, while the eight-lane form takes its full latency with lanes empty. llvm-mca 19
@@ -872,3 +878,9 @@ kernel, which reads the message from memory, though llvm-mca 19 models them at 2
 block: the measurement decided, and what the model misses was not established. On Zen 1 and Zen+,
 where no runner exists, llvm-mca 19 models that plan at 466 cycles a block against 377 for four lanes
 on 128-bit registers. The cores of the Atom line were neither modelled nor measured.
+
+On WebAssembly, in bench run 42094485113, the side-by-side form took 1.29 (Zen 3), 1.33 (Zen 4), 1.10
+(Zen 5) and 1.02 (Neoverse N2) times the time here for 2 KiB under wasmtime, and 1.34, 1.02, 1.04 and
+1.03 under Node.js; what the runtimes do to it was not established. For 16 KiB of extended output, the
+words stored and then copied took 1.06, 1.09, 1.10 and 1.05 times the time here under wasmtime, and
+1.08, 1.07, 1.11 and 1.13 under Node.js.
