@@ -3379,14 +3379,16 @@ macro_rules! lanes_xof {
         $feature:literal, $vector:ty, $lanes:literal, $xor:ident, $set1:ident, $zero:ident,
         $load:ident, $blocks:ident, $rounds:ident
     ) => {
-        // Output blocks counter to counter + LANES - 1 of the root.
+        // Output blocks of the root for the counters from `counter` on, LANES to each group of
+        // out. Only the counters differ from group to group, so the message and the chaining
+        // value are broadcast once, and the state's scratch is cleared once at the end.
         #[target_feature(enable = $feature)]
-        pub(super) fn xof_group(
+        pub(super) fn xof_groups(
             cv: &[u32; 8],
             block: &[u32; 16],
             counter: u64,
             [length, flags]: [u32; 2],
-            out: &mut [[u8; 64]; $lanes],
+            out: &mut [[[u8; 64]; $lanes]],
         ) {
             let mut m = [$zero(); 16];
 
@@ -3400,56 +3402,64 @@ macro_rules! lanes_xof {
                 *word = $set1(*value as i32);
             }
 
-            let mut low = [0u32; $lanes];
+            let mut v = [$zero(); 16];
 
-            let mut high = [0u32; $lanes];
+            let mut next = counter;
 
-            for l in 0..$lanes {
-                let c = counter.wrapping_add(l as u64);
+            for group in out {
+                let mut low = [0u32; $lanes];
 
-                low[l] = c as u32;
+                let mut high = [0u32; $lanes];
 
-                high[l] = (c >> 32) as u32;
+                for l in 0..$lanes {
+                    let c = next.wrapping_add(l as u64);
+
+                    low[l] = c as u32;
+
+                    high[l] = (c >> 32) as u32;
+                }
+
+                v = [
+                    h[0],
+                    h[1],
+                    h[2],
+                    h[3],
+                    h[4],
+                    h[5],
+                    h[6],
+                    h[7],
+                    $set1(IV_256[0] as i32),
+                    $set1(IV_256[1] as i32),
+                    $set1(IV_256[2] as i32),
+                    $set1(IV_256[3] as i32),
+                    $load(&low),
+                    $load(&high),
+                    $set1(length as i32),
+                    $set1(flags as i32),
+                ];
+
+                $rounds(&mut v, &m);
+
+                let mut words = [$zero(); 16];
+
+                for i in 0..8 {
+                    words[i] = $xor(v[i], v[i + 8]);
+
+                    words[i + 8] = $xor(v[i + 8], h[i]);
+                }
+
+                $blocks(&words, group);
+
+                wipe_unless_optimized!(words_of(&mut words));
+
+                next = next.wrapping_add($lanes);
             }
-
-            let mut v = [
-                h[0],
-                h[1],
-                h[2],
-                h[3],
-                h[4],
-                h[5],
-                h[6],
-                h[7],
-                $set1(IV_256[0] as i32),
-                $set1(IV_256[1] as i32),
-                $set1(IV_256[2] as i32),
-                $set1(IV_256[3] as i32),
-                $load(&low),
-                $load(&high),
-                $set1(length as i32),
-                $set1(flags as i32),
-            ];
-
-            $rounds(&mut v, &m);
-
-            let mut words = [$zero(); 16];
-
-            for i in 0..8 {
-                words[i] = $xor(v[i], v[i + 8]);
-
-                words[i + 8] = $xor(v[i + 8], h[i]);
-            }
-
-            $blocks(&words, out);
 
             clear(&mut v, $zero());
 
             clear(&mut m, $zero());
 
             clear(&mut h, $zero());
-
-            clear(&mut words, $zero());
         }
     };
 }
@@ -3831,13 +3841,15 @@ pub(super) fn xof_avx2(
 
     let mut done = 8 * eights.len();
 
-    for (i, group) in eights.iter_mut().enumerate() {
-        lanes_avx2::xof_group(cv, block, counter.wrapping_add(8 * i as u64), info, group);
+    if done > 0 {
+        lanes_avx2::xof_groups(cv, block, counter, info, eights);
     }
 
     if xmm_four {
         if let Some((group, _)) = out[done..].split_first_chunk_mut::<4>() {
-            lanes_avx2_4::xof_group(cv, block, counter.wrapping_add(done as u64), info, group);
+            let next = counter.wrapping_add(done as u64);
+
+            lanes_avx2_4::xof_groups(cv, block, next, info, core::slice::from_mut(group));
 
             done += 4;
         }
@@ -3951,13 +3963,11 @@ pub(super) fn xof_sse41(
 ) -> usize {
     let (fours, _) = out.as_chunks_mut::<4>();
 
-    let mut next = counter;
+    let done = 4 * fours.len();
 
-    for group in fours.iter_mut() {
-        lanes_sse41::xof_group(cv, block, next, info, group);
-
-        next = next.wrapping_add(4);
+    if done > 0 {
+        lanes_sse41::xof_groups(cv, block, counter, info, fours);
     }
 
-    4 * fours.len()
+    done
 }
