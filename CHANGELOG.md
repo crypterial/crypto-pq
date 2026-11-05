@@ -24,22 +24,31 @@ Implements specification 1.1 (draft).
 
 - BLAKE2b, BLAKE2s and BLAKE3 on x86-64 CPUs with AVX-512F and AVX-512VL: the kernels for one
   message take their rotations by 63 (BLAKE2b), 12 and 7 (BLAKE2s) and all four (BLAKE3) as one
-  VPRORD or VPRORQ, and BLAKE3 moves its message words between rounds with VPERMT2D, on 128-bit and
-  256-bit registers, in inline assembly within the AVX2 code. On AMD family 1Ah (Zen 5) the
-  kernels for one message give way to the portable code, which takes less time there; on other AMD
+  VPRORD or VPRORQ, on 128-bit and 256-bit registers, in inline assembly within the AVX2 code. On
+  AMD family 1Ah (Zen 5) the kernels for one message give way to the portable code, which takes less
+  time there; on other AMD
   processors with AVX-512 (Zen 4) BLAKE2 keeps its AVX2 code. Outputs are unchanged.
-- BLAKE3 on x86-64 processors of AMD families 19h and 1Ah (Zen 4, Zen 5) and on Intel's Sapphire
-  Rapids, Emerald Rapids and Granite Rapids: inputs of sixteen chunks or more hash sixteen chunks or
-  parents at a time, and extended outputs compute sixteen blocks at a time, in 512-bit registers
+- BLAKE3 on x86-64 processors of AMD families 19h and 1Ah (Zen 4, Zen 5) and on Intel's Ice Lake
+  Xeon, Sapphire Rapids, Emerald Rapids and Granite Rapids: inputs of sixteen chunks or more hash
+  sixteen chunks or parents at a time, and extended outputs compute sixteen blocks at a time, in
+  512-bit registers
   ([decision D-44](spec/decisions.md#decision-d-44)). Other processors keep 256-bit registers. The
   AVX-512VL kernel for one message swaps the halves of its d row with the integer VPSHUFD. On ARM64
   the NEON kernels rotate by 12 and 7 with USHR and SLI. Outputs are unchanged.
-- BLAKE3 on those processors: the three to eight inputs left after the groups of sixteen hash on
+- BLAKE3 on those processors: the five to eight inputs left after the groups of sixteen hash on
   eight lanes in 256-bit registers with AVX-512VL, in place of the AVX2 kernels, the sixteen-lane
   kernel loads each block in 256-bit halves, and an extended output computes all of its groups of
   sixteen blocks in one loop. With the AVX-512VL kernels for one message, the blocks of one chunk,
-  such as those of a 1 KiB hash, run the row form of the blake3 crate's assembly for one input.
-  Outputs are unchanged.
+  such as those of a 1 KiB hash, and single blocks run the row form of the blake3 crate's assembly
+  for one input. Outputs are unchanged.
+- BLAKE3 on x86-64: two to four inputs, parents or blocks of an extended output run in the row form,
+  each 128-bit lane holding one row of one input ([decision D-84](spec/decisions.md#decision-d-84)):
+  with AVX-512 on the processors above, on 512-bit registers for three or four and 256-bit registers
+  for two, and with AVX2 on 256-bit registers, `hash_many` in the register plan of the blake3 crate's
+  assembly, unless the core runs a 256-bit instruction as two operations. The chaining values of a
+  tree of up to the width of the kernels go straight into the block of the top parent, with no copy
+  between levels, and five to eight blocks of an extended output run on eight lanes. An extended
+  output from an input of at most one block skips the chunk buffer. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
