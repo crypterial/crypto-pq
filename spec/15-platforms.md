@@ -23,7 +23,8 @@ its result is kept in an atomic.
    of 32-bit x86 [[D-80](decisions.md#decision-d-80)], the Ascon state of 32-bit Arm
    [[D-81](decisions.md#decision-d-81)], the BLAKE2b state and BLAKE3 chains of 32-bit x86
    [[D-82](decisions.md#decision-d-82)] and its SHA-512 schedule
-   [[D-83](decisions.md#decision-d-83)], are not CPU-specific code.
+   [[D-83](decisions.md#decision-d-83)], and the BLAKE3 chains and output blocks of WebAssembly
+   [[D-84](decisions.md#decision-d-84)], are not CPU-specific code.
 2. x86-64 tiers: AVX2 with BMI1 and BMI2 and operating-system support for the YMM state (checked with
    XGETBV); AVX-512F and AVX-512VL on top of the AVX2 tier, with operating-system support for the
    opmask and ZMM state, for Keccak-f[1600], SHA-256 on eight lanes, BLAKE2 and BLAKE3

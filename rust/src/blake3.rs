@@ -234,10 +234,10 @@ fn compress_portable(
 }
 
 // The output of the compression of the block of words m, as bytes into out, for the whole blocks
-// of an extended output on 32-bit x86 (Output::root). Its words go into out from the registers
-// that hold them: stored as words and then copied as bytes, they were loaded back with wider loads
-// than their stores, which a store cannot forward (two 8-byte loads per 16 bytes of output, and
-// memcpy's 16-byte loads after them).
+// of an extended output on 32-bit x86 and WebAssembly (root_whole). Its words go into out from the
+// registers that hold them: stored as words and then copied as bytes, they were loaded back with
+// wider loads than their stores, which a store cannot forward (two 8-byte loads per 16 bytes of
+// output, and memcpy's 16-byte loads after them).
 #[inline(never)]
 fn compress_bytes(
     cv: &[u32; 8],
@@ -410,7 +410,10 @@ fn chain_in_place(h: &mut [u32; 8], block: &[u8; BLOCK], counter: u64, length: u
     }
 }
 
-// chain_blocks for two inputs of as many blocks, into out.
+// chain_blocks for two inputs of as many blocks, into out. Out of line, so that the registers of
+// its rounds do not depend on hash_many's body: inlined there, a BLAKE3 hash of 2 KiB ran 40615
+// instructions in it on 32-bit x86, against 39978 here.
+#[inline(never)]
 fn chain_blocks_pair(
     key: &[u32; 8],
     inputs: [&[[u8; BLOCK]]; 2],
@@ -531,6 +534,11 @@ pub(crate) struct Many<'a> {
     pub(crate) end: u32,
 }
 
+// Whether hash_many runs the last two inputs side by side. Under the WebAssembly runtimes that was
+// the longer way for 2 KiB, by 1.29 (Zen 3), 1.33 (Zen 4), 1.10 (Zen 5) and 1.02 (Neoverse N2) under
+// wasmtime and 1.34, 1.02, 1.04 and 1.03 under Node.js; why was not established.
+const PAIR_CHAINS: bool = !cfg!(target_family = "wasm");
+
 // The chaining values of the inputs into out, input i being input[i * blocks * 64..] for
 // out.len() inputs: as many as the kernels take, side by side, and the rest one by one.
 fn hash_many(input: &[u8], many: &Many, out: &mut [[u8; 32]]) {
@@ -542,7 +550,7 @@ fn hash_many(input: &[u8], many: &Many, out: &mut [[u8; 32]]) {
 
     // Two inputs left: their chains side by side, which keeps more of the scalar pipes busy than
     // one chain after the other.
-    if out.len() - done == 2 {
+    if PAIR_CHAINS && out.len() - done == 2 {
         let counter = |i: usize| {
             if many.increment {
                 many.counter + i as u64
@@ -618,9 +626,9 @@ fn root_whole(cv: &[u32; 8], m: &[u32; 16], index: u64, info: [u32; 2], out: &mu
 
     let done = cpu::blake3_xof(cv, m, index, info, blocks);
 
-    // 32-bit x86, which has no kernel for them, compresses the whole blocks one at a time,
-    // straight into out.
-    if cfg!(target_arch = "x86") {
+    // 32-bit x86 and WebAssembly, which have no kernel for them, compress the whole blocks one at
+    // a time, straight into out.
+    if cfg!(any(target_arch = "x86", target_family = "wasm")) {
         let [length, flags] = info;
 
         for (i, block) in blocks.iter_mut().enumerate().skip(done) {
@@ -1569,6 +1577,21 @@ fn digest1_words(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
     digest1(key, flags, data, out);
 }
 
+// An output of more than a block from an input of at most one. Out of line, so that this block on
+// the stack and its wipe cost the shorter outputs of one_shot_long nothing.
+#[inline(never)]
+fn one_block_long(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
+    let mut last = [0; BLOCK];
+
+    last[..data.len()].copy_from_slice(data);
+
+    let root = flags | CHUNK_START | CHUNK_END | ROOT;
+
+    root_output(key, &last, [data.len() as u32, root], 0, out);
+
+    wipe(&mut last);
+}
+
 // one_shot for more than a block of input or more than 32 bytes of output.
 #[inline(never)]
 fn one_shot_long(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
@@ -1589,15 +1612,7 @@ fn one_shot_long(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
 
         wipe(&mut v);
     } else if data.len() <= BLOCK {
-        let mut last = [0; BLOCK];
-
-        last[..data.len()].copy_from_slice(data);
-
-        let root = flags | CHUNK_START | CHUNK_END | ROOT;
-
-        root_output(key, &last, [data.len() as u32, root], 0, out);
-
-        wipe(&mut last);
+        one_block_long(key, flags, data, out);
     } else {
         let mut root = Output::EMPTY;
 
