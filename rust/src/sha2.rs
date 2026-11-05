@@ -400,6 +400,22 @@ fn compress256_slice(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
     compress256_blocks(state, blocks);
 }
 
+// The blocks of a one-shot input of under four, each through compress256_shared, as its padding.
+#[inline(never)]
+fn compress256_few(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+    for block in blocks {
+        let mut w = [0; 16];
+
+        for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
+        }
+
+        compress256_shared(state, &w);
+
+        wipe(&mut w);
+    }
+}
+
 // The portable compression of each block in turn. The schedule and the working variables are
 // scratch of the operation, which every block writes in full: in registers at opt-level 3, and
 // wiped once at the end below it (D-76).
@@ -602,7 +618,11 @@ fn finish256_words(state: &mut [u32; 8], data: &[u8], bits: u64) {
     let (blocks, tail) = data.as_chunks::<64>();
 
     if !blocks.is_empty() {
-        compress256(state, blocks, &[]);
+        if PEEL256 && blocks.len() < 4 {
+            compress256_few(state, blocks);
+        } else {
+            compress256(state, blocks, &[]);
+        }
     }
 
     // The length takes the last 8 bytes, after the tail and the marker byte.
@@ -610,15 +630,30 @@ fn finish256_words(state: &mut [u32; 8], data: &[u8], bits: u64) {
 
     let mut v = [0; 8];
 
+    // On WebAssembly a hash of a single block in all keeps its words in registers, here, and any
+    // other padding block runs the one copy of compress256_shared. See D-85.
+    let shared = PEEL256 && (padding > 1 || bits != tail.len() as u64 * 8);
+
     for block in 0..padding {
-        let mut w: [u32; 16] = registers!(
-            |i| padding_word256(tail, bits, padding, 16 * block + i);
-            0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
-        );
+        if shared {
+            let mut w: [u32; 16] = registers!(
+                |i| padding_word256(tail, bits, padding, 16 * block + i);
+                0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+            );
 
-        compress256_words(state, &mut w, &mut v);
+            compress256_shared(state, &w);
 
-        wipe_unless_optimized!(&mut w);
+            wipe(&mut w);
+        } else {
+            let mut w: [u32; 16] = registers!(
+                |i| padding_word256(tail, bits, padding, 16 * block + i);
+                0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+            );
+
+            compress256_words::<PEEL256>(state, &mut w, &mut v);
+
+            wipe_unless_optimized!(&mut w);
+        }
     }
 
     wipe_unless_optimized!(&mut v);
@@ -784,9 +819,15 @@ fn keyed256_words(iv: &[u32; 8], key: &[u8], states: &mut [[u32; 8]; 2]) {
 
         *state = *iv;
 
-        compress256_words(state, &mut w, &mut v);
+        if PEEL256 {
+            compress256_shared(state, &w);
 
-        wipe_unless_optimized!(&mut w);
+            wipe(&mut w);
+        } else {
+            compress256_words::<false>(state, &mut w, &mut v);
+
+            wipe_unless_optimized!(&mut w);
+        }
     }
 
     wipe_unless_optimized!(&mut v);
@@ -970,7 +1011,7 @@ fn compress256_block(state: &mut [u32; 8], block: &[u8; 64], w: &mut [u32; 16], 
         *word = u32::from_be_bytes(*bytes);
     }
 
-    compress256_words(state, w, v);
+    compress256_words::<PEEL256>(state, w, v);
 }
 
 // The compression of one block whose big-endian word t is word(t), into state, for a caller that
@@ -986,7 +1027,29 @@ pub(crate) fn compress256_built(state: &mut [u32; 8], word: impl Fn(usize) -> u3
 
     let mut v = [0; 8];
 
-    compress256_words(state, &mut w, &mut v);
+    compress256_words::<PEEL256>(state, &mut w, &mut v);
+
+    wipe_unless_optimized!(&mut w);
+
+    wipe_unless_optimized!(&mut v);
+}
+
+// Whether compress256_words runs the rounds of the first group ahead of a loop over the other
+// three, whose pass then holds the schedule of a group and its rounds in one block. Cranelift
+// places each pure value right before its first use, so each word of the schedule then lands next
+// to the round that reads it; under the if of a loop over all four groups, the schedule ran as a
+// block of its own ahead of the rounds.
+const PEEL256: bool = cfg!(target_family = "wasm");
+
+// compress256_words on a copy of the block, in one place for the padding blocks and HMAC key blocks
+// of WebAssembly and compress256_few. See D-85.
+#[inline(never)]
+fn compress256_shared(state: &mut [u32; 8], w: &[u32; 16]) {
+    let mut w = *w;
+
+    let mut v = [0; 8];
+
+    compress256_words::<true>(state, &mut w, &mut v);
 
     wipe_unless_optimized!(&mut w);
 
@@ -997,15 +1060,27 @@ pub(crate) fn compress256_built(state: &mut [u32; 8], word: impl Fn(usize) -> u3
 // the 64 rounds took 3616 instructions on i686 and V8 compiled them to 2116 on ARM64, against 1148
 // and 850 in the loop.
 #[inline(always)]
-fn compress256_words(state: &mut [u32; 8], w: &mut [u32; 16], v: &mut [u32; 8]) {
+fn compress256_words<const PEEL: bool>(state: &mut [u32; 8], w: &mut [u32; 16], v: &mut [u32; 8]) {
     *v = *state;
 
-    for (group, k) in K256.as_chunks::<16>().0.iter().enumerate() {
-        if group > 0 {
-            schedule256(w);
-        }
+    let groups = K256.as_chunks::<16>().0;
 
-        rounds256(v, w, k);
+    if PEEL {
+        rounds256(v, w, &groups[0]);
+
+        for k in &groups[1..] {
+            schedule256(w);
+
+            rounds256(v, w, k);
+        }
+    } else {
+        for (group, k) in groups.iter().enumerate() {
+            if group > 0 {
+                schedule256(w);
+            }
+
+            rounds256(v, w, k);
+        }
     }
 
     for (word, value) in state.iter_mut().zip(v.iter()) {
@@ -1107,7 +1182,7 @@ fn compress256_lanes_each<const LANES: usize>(
             *word = words[lane];
         }
 
-        compress256_words(&mut state, &mut block, &mut v);
+        compress256_words::<false>(&mut state, &mut block, &mut v);
 
         for (words, word) in states.iter_mut().zip(&state) {
             words[lane] = *word;
