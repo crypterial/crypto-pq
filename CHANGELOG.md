@@ -49,6 +49,12 @@ Implements specification 1.1 (draft).
   tree of up to the width of the kernels go straight into the block of the top parent, with no copy
   between levels, and five to eight blocks of an extended output run on eight lanes. An extended
   output from an input of at most one block skips the chunk buffer. Outputs are unchanged.
+- BLAKE3 on x86-64 with AVX2 or SSE4.1: the groups of an extended output on eight or four lanes
+  broadcast the message and the chaining value once for all groups, with one scratch state. Outputs
+  are unchanged.
+- BLAKE3 on WebAssembly: the last two inputs of `hash_many` run one after the other, and the whole
+  blocks of an extended output go straight into the output, as on 32-bit x86
+  ([decision D-84](spec/decisions.md#decision-d-84)). Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
