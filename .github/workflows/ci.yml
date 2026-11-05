@@ -194,10 +194,10 @@ jobs:
               cargo clippy --all-targets --locked --release $features --target "$target" -- -D warnings
             done
           done
-      # The AVX-512VL kernels use 256-bit registers, and only BLAKE3's two sixteen-lane kernels
-      # (cpu/x86_64/blake3_zmm.rs) use 512-bit ones: the build of every feature at each
+      # The AVX-512VL kernels use 256-bit registers, and only BLAKE3's sixteen-lane and four-lane
+      # kernels (cpu/x86_64/blake3_zmm.rs) use 512-bit ones: the build of every feature at each
       # optimization level has no instruction on a 512-bit register outside them. The kernels'
-      # three-input logic, and the 512-bit registers in those two, show that the disassembly read
+      # three-input logic, and the 512-bit registers in those four, show that the disassembly read
       # their code. The feature word (cpu/x86_64.rs, FEATURES) is read relative to the instruction
       # pointer, not through the GOT, which every read takes once a function that other crates
       # inline exports it.
@@ -210,10 +210,10 @@ jobs:
             (cd "$RUNNER_TEMP/objects" && ar x "$GITHUB_WORKSPACE/rust/target/release/libcrypto_pq.rlib")
             objdump -dr "$RUNNER_TEMP"/objects/*.o > "$RUNNER_TEMP/objects.txt"
             grep -q vpternlogq "$RUNNER_TEMP/objects.txt"
-            awk '/^[0-9a-f]+ <.*>:$/ { zmm = index($0, "hash16_zmm") || index($0, "xof16_zmm") }
+            awk '/^[0-9a-f]+ <.*>:$/ { zmm = index($0, "hash16_zmm") || index($0, "xof16_zmm") || index($0, "hash4_zmm") || index($0, "xof4_zmm") }
               /%zmm/ { if (zmm) { seen++ } else if (outside++ < 20) { print } }
               END { exit !(seen > 0 && outside == 0) }' "$RUNNER_TEMP/objects.txt" || {
-              echo "a 512-bit register outside BLAKE3's two kernels, or none in them, at opt-level $level"
+              echo "a 512-bit register outside BLAKE3's four kernels, or none in them, at opt-level $level"
               exit 1
             }
             grep -q 'R_X86_64_PC32.*FEATURES' "$RUNNER_TEMP/objects.txt"

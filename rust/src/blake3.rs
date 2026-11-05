@@ -611,6 +611,105 @@ fn hash_many(input: &[u8], many: &Many, out: &mut [[u8; 32]]) {
     wipe(&mut state);
 }
 
+// Whole blocks of the root's output into out, from block `index` on, as many as the kernels take
+// side by side; returns how many.
+fn root_whole(cv: &[u32; 8], m: &[u32; 16], index: u64, info: [u32; 2], out: &mut [u8]) -> usize {
+    let (blocks, _) = out.as_chunks_mut::<BLOCK>();
+
+    let done = cpu::blake3_xof(cv, m, index, info, blocks);
+
+    // 32-bit x86, which has no kernel for them, compresses the whole blocks one at a time,
+    // straight into out.
+    if cfg!(target_arch = "x86") {
+        let [length, flags] = info;
+
+        for (i, block) in blocks.iter_mut().enumerate().skip(done) {
+            let counter = index.wrapping_add(i as u64);
+
+            compress_bytes(cv, m, counter, length, flags, block);
+        }
+
+        return blocks.len();
+    }
+
+    done
+}
+
+// What root_output's kernels leave: the blocks one at a time, from byte `skip` of block `index`.
+// Out of line, so that a whole number of blocks costs these two buffers nothing.
+#[inline(never)]
+fn root_rest(
+    cv: &[u32; 8],
+    block: &[u8; BLOCK],
+    m: &[u32; 16],
+    info: [u32; 2],
+    mut index: u64,
+    mut skip: usize,
+    mut rest: &mut [u8],
+) {
+    let [length, flags] = info;
+
+    let mut v = [0; 16];
+
+    let mut bytes = [0; BLOCK];
+
+    while !rest.is_empty() {
+        compress(cv, block, index, length, flags, &mut v);
+
+        for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&v) {
+            *chunk = word.to_le_bytes();
+        }
+
+        let take = (BLOCK - skip).min(rest.len());
+
+        let (head, tail) = core::mem::take(&mut rest).split_at_mut(take);
+
+        head.copy_from_slice(&bytes[skip..skip + take]);
+
+        rest = tail;
+
+        skip = 0;
+
+        index = index.wrapping_add(1);
+
+        let done = root_whole(cv, m, index, info, rest);
+
+        rest = &mut core::mem::take(&mut rest)[done * BLOCK..];
+
+        index = index.wrapping_add(done as u64);
+    }
+
+    wipe(&mut v);
+
+    wipe(&mut bytes);
+}
+
+// The root's output from byte `offset` on, into out, from its chaining value, its last block and
+// that block's [length, flags].
+fn root_output(cv: &[u32; 8], block: &[u8; BLOCK], info: [u32; 2], offset: u64, out: &mut [u8]) {
+    let mut m = words(block);
+
+    let mut index = offset / BLOCK as u64;
+
+    let skip = (offset % BLOCK as u64) as usize;
+
+    let mut rest = out;
+
+    if skip == 0 {
+        let done = root_whole(cv, &m, index, info, rest);
+
+        rest = &mut rest[done * BLOCK..];
+
+        index = index.wrapping_add(done as u64);
+    }
+
+    if !rest.is_empty() {
+        root_rest(cv, block, &m, info, index, skip, rest);
+    }
+
+    wipe(&mut m);
+}
+
 // A node before its chaining value is taken. The root squeezes any number of 64-byte blocks from
 // it, block i with counter i. Nodes are written into the caller's Output, which Drop wipes, so
 // that no move leaves a copy of message bytes or chaining values on the stack.
@@ -660,70 +759,7 @@ impl Output {
             return;
         }
 
-        let mut index = offset / BLOCK as u64;
-
-        let mut skip = (offset % BLOCK as u64) as usize;
-
-        let mut v = [0; 16];
-
-        let mut bytes = [0; BLOCK];
-
-        let mut m = words(&self.block);
-
-        let mut rest = out;
-
-        while !rest.is_empty() {
-            // Whole blocks from a block boundary on, as many as the kernels take side by side.
-            if skip == 0 {
-                let (blocks, _) = rest.as_chunks_mut::<BLOCK>();
-
-                let mut done = cpu::blake3_xof(&self.cv, &m, index, [self.length, flags], blocks);
-
-                // 32-bit x86, which has no kernel for them, compresses the whole blocks one at a
-                // time, straight into out.
-                if cfg!(target_arch = "x86") {
-                    for (i, block) in blocks.iter_mut().enumerate().skip(done) {
-                        let counter = index.wrapping_add(i as u64);
-
-                        compress_bytes(&self.cv, &m, counter, self.length, flags, block);
-                    }
-
-                    done = blocks.len();
-                }
-
-                rest = &mut core::mem::take(&mut rest)[done * BLOCK..];
-
-                index = index.wrapping_add(done as u64);
-
-                if rest.is_empty() {
-                    break;
-                }
-            }
-
-            compress(&self.cv, &self.block, index, self.length, flags, &mut v);
-
-            for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&v) {
-                *chunk = word.to_le_bytes();
-            }
-
-            let take = (BLOCK - skip).min(rest.len());
-
-            let (head, tail) = core::mem::take(&mut rest).split_at_mut(take);
-
-            head.copy_from_slice(&bytes[skip..skip + take]);
-
-            rest = tail;
-
-            skip = 0;
-
-            index = index.wrapping_add(1);
-        }
-
-        wipe(&mut v);
-
-        wipe(&mut bytes);
-
-        wipe(&mut m);
+        root_output(&self.cv, &self.block, [self.length, flags], offset, out);
     }
 
     // A copy field by field, straight into this node's storage.
@@ -750,8 +786,6 @@ impl Drop for Output {
 
 // The parent of the chaining values left and right, into out.
 fn parent(key: &[u32; 8], flags: u32, left: &[u32; 8], right: &[u32; 8], out: &mut Output) {
-    out.cv = *key;
-
     for (bytes, word) in out
         .block
         .as_chunks_mut::<4>()
@@ -761,6 +795,13 @@ fn parent(key: &[u32; 8], flags: u32, left: &[u32; 8], right: &[u32; 8], out: &m
     {
         *bytes = word.to_le_bytes();
     }
+
+    parent_fields(key, flags, out);
+}
+
+// All of a parent node but its block.
+fn parent_fields(key: &[u32; 8], flags: u32, out: &mut Output) {
+    out.cv = *key;
 
     out.counter = 0;
 
@@ -905,23 +946,41 @@ fn write_words<const N: usize>(v: &[u32; N], out: &mut [u8]) {
     }
 }
 
-// The two children of the root of the subtree of the chunks of `data`, at least two and at most
-// WIDE of them, the first one numbered `counter`, into out: hash_many for the whole chunks, then
+// The chaining value of the chunk of `data`, whole or not, numbered `counter`, into out.
+fn chunk_value(key: &[u32; 8], flags: u32, counter: u64, data: &[u8], out: &mut [u8; 32]) {
+    let mut node = Output::EMPTY;
+
+    chunk(key, flags, counter, data, &mut node);
+
+    let mut cv = [0; 8];
+
+    node.chaining_value(&mut cv);
+
+    cv_bytes(&cv, out);
+
+    wipe(&mut cv);
+}
+
+// The two children of the root of the subtree of the chunks of `data`, at least two and at most N
+// of them, the first one numbered `counter`, into children: hash_many for the whole chunks, then
 // for each level of parents, with the last value of an odd level carried up to the next, which
-// builds the tree of the specification. The buffers hold N and H = N / 2 values, N at least the
-// chunks of data: zeroing and wiping those of a whole group cost a 16 KiB input 6 KiB of stores.
+// builds the tree of the specification. Each level goes straight where the next reads it, the
+// buffers taking turns, and the last into children, so that no value is copied between kernels.
+// The buffers hold N and H = N / 2 values, N at least the chunks of data: zeroing and wiping those
+// of a whole group cost a 16 KiB input 6 KiB of stores. H is 0 when N is 4: the last level, of
+// three or four values, takes no buffer. Two chunks take neither.
 fn leaves<const N: usize, const H: usize>(
     key: &[u32; 8],
     flags: u32,
     counter: u64,
     data: &[u8],
-    out: &mut [[u32; 8]; 2],
+    children: &mut [[u8; 32]],
 ) {
-    let mut cvs = [[0; 32]; N];
-
     let whole = data.len() / CHUNK;
 
     let (full, last) = data.split_at(whole * CHUNK);
+
+    let written = data.len().div_ceil(CHUNK);
 
     let chunks = Many {
         key,
@@ -933,26 +992,24 @@ fn leaves<const N: usize, const H: usize>(
         end: CHUNK_END,
     };
 
+    let last_counter = counter + whole as u64;
+
+    if written == 2 {
+        hash_many(full, &chunks, &mut children[..whole]);
+
+        if !last.is_empty() {
+            chunk_value(key, flags, last_counter, last, &mut children[1]);
+        }
+
+        return;
+    }
+
+    let mut cvs = [[0; 32]; N];
+
     hash_many(full, &chunks, &mut cvs[..whole]);
 
-    let mut count = whole;
-
-    let written = data.len().div_ceil(CHUNK);
-
     if !last.is_empty() {
-        let mut node = Output::EMPTY;
-
-        chunk(key, flags, counter + whole as u64, last, &mut node);
-
-        let mut cv = [0; 8];
-
-        node.chaining_value(&mut cv);
-
-        cv_bytes(&cv, &mut cvs[count]);
-
-        wipe(&mut cv);
-
-        count += 1;
+        chunk_value(key, flags, last_counter, last, &mut cvs[whole]);
     }
 
     let parents = Many {
@@ -967,32 +1024,44 @@ fn leaves<const N: usize, const H: usize>(
 
     let mut level = [[0; 32]; H];
 
-    while count > 2 {
+    let (mut from, mut to) = (&mut cvs[..], &mut level[..]);
+
+    let mut count = written;
+
+    while count > 4 {
         let pairs = count / 2;
 
-        hash_many(
-            cvs[..2 * pairs].as_flattened(),
-            &parents,
-            &mut level[..pairs],
-        );
-
-        cvs[..pairs].copy_from_slice(&level[..pairs]);
+        hash_many(from[..2 * pairs].as_flattened(), &parents, &mut to[..pairs]);
 
         if count % 2 == 1 {
-            cvs[pairs] = cvs[count - 1];
+            to[pairs] = from[count - 1];
         }
 
         count = pairs + count % 2;
+
+        core::mem::swap(&mut from, &mut to);
     }
 
-    key_words(&cvs[0], &mut out[0]);
+    let pairs = count / 2;
 
-    key_words(&cvs[1], &mut out[1]);
+    hash_many(
+        from[..2 * pairs].as_flattened(),
+        &parents,
+        &mut children[..pairs],
+    );
 
-    // Only the values written: the rest are still zero.
-    wipe(level[..written / 2].as_flattened_mut());
+    if count == 3 {
+        children[1] = from[2];
+    }
 
-    wipe(cvs[..written].as_flattened_mut());
+    // Only the values written: the rest are still zero. A constant length needs no call of memset.
+    if N == 4 {
+        wipe(cvs.as_flattened_mut());
+    } else {
+        wipe(level[..written.div_ceil(2)].as_flattened_mut());
+
+        wipe(cvs[..written].as_flattened_mut());
+    }
 }
 
 // The top node of at most WIDE chunks whose first one is numbered `counter`, into out: the
@@ -1004,17 +1073,17 @@ fn top(key: &[u32; 8], flags: u32, counter: u64, data: &[u8], out: &mut Output) 
         return;
     }
 
-    let mut halves = [[0; 8]; 2];
+    let (children, _) = out.block.as_chunks_mut::<32>();
 
-    if data.len() <= SMALL * CHUNK {
-        leaves::<SMALL, { SMALL / 2 }>(key, flags, counter, data, &mut halves);
+    if data.len() <= 4 * CHUNK {
+        leaves::<4, 0>(key, flags, counter, data, children);
+    } else if data.len() <= SMALL * CHUNK {
+        leaves::<SMALL, { SMALL / 2 }>(key, flags, counter, data, children);
     } else {
-        leaves::<WIDE, { WIDE / 2 }>(key, flags, counter, data, &mut halves);
+        leaves::<WIDE, { WIDE / 2 }>(key, flags, counter, data, children);
     }
 
-    parent(key, flags, &halves[0], &halves[1], out);
-
-    wipe(halves.as_flattened_mut());
+    parent_fields(key, flags, out);
 }
 
 // The top node of the subtree of `data`, whose first chunk is numbered `counter`, a multiple of
@@ -1519,6 +1588,16 @@ fn one_shot_long(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
         write_words(&v, out);
 
         wipe(&mut v);
+    } else if data.len() <= BLOCK {
+        let mut last = [0; BLOCK];
+
+        last[..data.len()].copy_from_slice(data);
+
+        let root = flags | CHUNK_START | CHUNK_END | ROOT;
+
+        root_output(key, &last, [data.len() as u32, root], 0, out);
+
+        wipe(&mut last);
     } else {
         let mut root = Output::EMPTY;
 
@@ -2348,6 +2427,55 @@ mod tests {
     // The three modes, one-shot, incremental in uneven pieces and read in pieces, against the
     // reference, for the edge lengths of blocks, chunks and subtrees and for random lengths up to
     // 1 MiB: whatever kernels the CPU has, the outputs are the specification's.
+    // One-shot outputs longer than a block from at most a block of input, whose root takes no node
+    // in memory, at the lengths where the output kernels change.
+    #[test]
+    fn short_input_long_output() {
+        let mut inputs = Inputs::new(0x0B1A_4E36);
+
+        let data = random(&mut inputs, BLOCK);
+
+        let key_bytes: [u8; KEY] = inputs.bytes();
+
+        let key = key_words(&key_bytes);
+
+        let context = random(&mut inputs, 47);
+
+        let derived = context_reference(&context);
+
+        for length in [0, 1, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64] {
+            let data = &data[..length];
+
+            for size in [
+                65, 127, 128, 129, 192, 193, 256, 257, 320, 321, 384, 448, 512, 513, 576, 960,
+                1024, 1025, 1216, 2048, 2049,
+            ] {
+                for (flags, k) in [
+                    (0, IV_256),
+                    (KEYED_HASH, key),
+                    (DERIVE_KEY_MATERIAL, derived),
+                ] {
+                    let mut expected = vec![0; size];
+
+                    reference(&k, flags, data, 0, &mut expected);
+
+                    let mut actual = vec![0; size];
+
+                    match flags {
+                        0 => digest(data, &mut actual),
+                        KEYED_HASH => keyed_hash(&key_bytes, data, &mut actual),
+                        _ => derive_key(&context, data, &mut actual),
+                    }
+
+                    assert_eq!(
+                        actual, expected,
+                        "length {length} size {size} flags {flags}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn blake3_kernel_tree_matches_reference() {
         let mut inputs = Inputs::new(5);

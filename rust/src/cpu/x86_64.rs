@@ -168,6 +168,10 @@ const GATHER: u32 = 1 << 8;
 // output, side by side in 512-bit registers (blake3_zmm.rs), by the table in zmm_lanes().
 const ZMM_LANES: u32 = 1 << 9;
 
+// A core that hashes BLAKE3's three or four inputs in 128-bit registers (blake3.rs, hash4), not in
+// the row form on 256-bit registers, by the table in xmm_four().
+const XMM_FOUR: u32 = 1 << 10;
+
 const READY: u32 = 1 << 31;
 
 // What the build guarantees needs no detection, and its check folds away.
@@ -216,7 +220,7 @@ const fn usable(feature: u32) -> bool {
 
     // The checks of the vector kernels run on whatever runner CI gets, so these builds keep them
     // on every core.
-    let class = feature == ONE_MESSAGE || feature == GATHER;
+    let class = feature == ONE_MESSAGE || feature == GATHER || feature == XMM_FOUR;
 
     if class && (cfg!(crypto_pq_sse41) || cfg!(crypto_pq_ct)) {
         return false;
@@ -447,6 +451,10 @@ fn probe() -> u32 {
         found |= ONE_MESSAGE;
     }
 
+    if xmm_four(vendor, leaf1.eax) {
+        found |= XMM_FOUR;
+    }
+
     if found & AVX2 != 0 && leaf7.ebx & (1 << 16) != 0 && leaf7.ebx & (1 << 31) != 0 {
         // SAFETY: XGETBV exists, as AVX2 was found with OSXSAVE.
         if avx512_state(unsafe { _xgetbv(0) }) {
@@ -493,19 +501,21 @@ fn one_state(vendor: Vendor, eax: u32) -> bool {
 }
 
 // Whether a core with AVX512 runs BLAKE3 on sixteen inputs, or sixteen blocks of its extended
-// output, in 512-bit registers (D-44), from the family and model in CPUID leaf 1 EAX: AMD Zen 4
-// (family 19h) and Zen 5 (1Ah), Intel Sapphire Rapids (family 6, model 8Fh), Emerald Rapids (CFh)
+// output, in 512-bit registers (D-44), and on two to four in the row form of the same kernels
+// (D-84), from the family and model in CPUID leaf 1 EAX: AMD Zen 4 (family 19h) and Zen 5 (1Ah),
+// Intel Ice Lake Xeon (family 6, models 6Ah and 6Ch), Sapphire Rapids (8Fh), Emerald Rapids (CFh)
 // and Granite Rapids (ADh). There the blake3 crate's and rscrypto's 512-bit kernels hashed 16 KiB
 // in 0.43 (Zen 5), 0.68 (Zen 4), 0.56 (Emerald Rapids) and 0.55 (Granite Rapids) of the time of
-// the eight-lane AVX2 kernel (Sapphire Rapids, the core of Emerald Rapids, not measured). Ice Lake
-// Xeon (6Ah, 6Ch), where those kernels took 0.70, keeps 256-bit registers, as do cores not in the
-// table and cores of other vendors.
+// the eight-lane AVX2 kernel (Sapphire Rapids, the core of Emerald Rapids, not measured). On Ice
+// Lake Xeon this crate's own took 0.56 to 0.58 of the time of its eight-lane kernel for 16 KiB and
+// 64 KiB, and a copy of it in the same process 0.63 to 0.73. Cores not in the table and cores of
+// other vendors keep 256-bit registers.
 fn zmm_lanes(vendor: Vendor, eax: u32) -> bool {
     let (family, model) = family_model(eax);
 
     match vendor {
         Vendor::Amd => family == 0x19 || family == 0x1A,
-        Vendor::Intel => family == 0x6 && matches!(model, 0x8F | 0xAD | 0xCF),
+        Vendor::Intel => family == 0x6 && matches!(model, 0x6A | 0x6C | 0x8F | 0xAD | 0xCF),
         Vendor::Other => false,
     }
 }
@@ -523,6 +533,22 @@ fn one_message(vendor: Vendor, eax: u32) -> bool {
     let (family, _) = family_model(eax);
 
     vendor == Vendor::Amd && family == 0x1A
+}
+
+// Whether a core keeps BLAKE3's three or four inputs in 128-bit registers, from the family and
+// model in CPUID leaf 1 EAX: where a 256-bit instruction runs as two operations of 128 bits, as on
+// AMD Zen 1 and Zen+ (family 17h, models below 30h), for which llvm-mca 19 models the row form at
+// 466 cycles a block against 377 for the 128-bit form, and on Intel's cores of the Atom line alone,
+// neither modelled nor measured: Sierra Forest (AFh), Grand Ridge (B6h), Alder Lake-N (BEh) and
+// Clearwater Forest (DDh). Cores of other vendors keep it too.
+fn xmm_four(vendor: Vendor, eax: u32) -> bool {
+    let (family, model) = family_model(eax);
+
+    match vendor {
+        Vendor::Amd => family == 0x17 && model < 0x30,
+        Vendor::Intel => family == 0x6 && matches!(model, 0xAF | 0xB6 | 0xBE | 0xDD),
+        Vendor::Other => true,
+    }
 }
 
 // Whether a core runs BLAKE3's one-shot hashes in less time in the code before rows_avx2 than in
@@ -740,11 +766,13 @@ pub(crate) fn blake3_many(input: &[u8], many: &crate::blake3::Many, out: &mut [[
     if among(found, AVX2) {
         let pair = !among(found, ONE_MESSAGE);
 
+        let xmm_four = among(found, XMM_FOUR);
+
         let wide = among(found, ZMM_LANES);
 
         // SAFETY: the CPU has AVX2 and the operating system saves its registers, and with wide
         // AVX-512F and AVX-512VL too (ZMM_LANES is found with AVX512 only).
-        return unsafe { blake3::hash_many_avx2(input, many, out, pair, wide) };
+        return unsafe { blake3::hash_many_avx2(input, many, out, pair, xmm_four, wide) };
     }
 
     if among(found, SSE41) {
@@ -768,13 +796,13 @@ pub(crate) fn blake3_xof(
     let found = features();
 
     if among(found, AVX2) {
-        if among(found, ZMM_LANES) && out.len() >= 16 {
+        if among(found, ZMM_LANES) {
             // SAFETY: as in blake3_many, with wide.
             return unsafe { blake3::xof_zmm(cv, block, counter, info, out) };
         }
 
         // SAFETY: as in blake3_many.
-        return unsafe { blake3::xof_avx2(cv, block, counter, info, out) };
+        return unsafe { blake3::xof_avx2(cv, block, counter, info, out, among(found, XMM_FOUR)) };
     }
 
     if among(found, SSE41) {
@@ -3324,6 +3352,35 @@ mod tests {
         for (vendor, eax, expected) in cases {
             assert_eq!(
                 super::one_message(vendor, eax),
+                expected,
+                "{vendor:?} {eax:#010x}"
+            );
+        }
+    }
+
+    #[test]
+    fn xmm_four_table() {
+        let cases = [
+            (Amd, 0x0080_0F12, true),    // Zen 1, Naples: family 17h, model 01h
+            (Amd, 0x0080_0F82, true),    // Zen+, Pinnacle Ridge: model 08h
+            (Amd, 0x0081_0F10, true),    // Zen 1, Raven Ridge: model 11h
+            (Amd, 0x0083_0F10, false),   // Zen 2, Rome: model 31h
+            (Amd, 0x0087_0F10, false),   // Zen 2, Matisse: model 71h
+            (Amd, 0x00A0_0F11, false),   // Zen 3, Milan: family 19h
+            (Amd, 0x00A1_0F11, false),   // Zen 4, Genoa: family 19h
+            (Amd, 0x00B0_0F21, false),   // Zen 5, Turin: family 1Ah
+            (Intel, 0x0003_06C3, false), // Haswell: model 3Ch
+            (Intel, 0x0005_0657, false), // Cascade Lake: model 55h
+            (Intel, 0x0009_0672, false), // Alder Lake-S: model 97h
+            (Intel, 0x000A_06F3, true),  // Sierra Forest: model AFh
+            (Intel, 0x000B_06E0, true),  // Alder Lake-N: model BEh
+            (Other, 0x0083_0F10, true),  // family 17h from another vendor
+            (Other, 0x0003_06C3, true),  // family 6 from another vendor
+        ];
+
+        for (vendor, eax, expected) in cases {
+            assert_eq!(
+                super::xmm_four(vendor, eax),
                 expected,
                 "{vendor:?} {eax:#010x}"
             );

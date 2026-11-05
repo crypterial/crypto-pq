@@ -13,7 +13,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::super::testing::Inputs;
-use super::blake3_zmm::{Table16, hash16_zmm, xof16_zmm};
+use super::blake3_zmm::{ROW_STEPS, Table16, hash4_zmm, hash16_zmm, xof4_zmm, xof8_ymm, xof16_zmm};
 use super::{AVX2, AVX512, Blake2sKernel, blake2, blake3, has};
 use crate::blake2::{Word, compress, start32, start64};
 use crate::blake3::{CHUNK_END, CHUNK_START, Last, Many, PERMUTATION, ROOT};
@@ -641,8 +641,157 @@ fn blake_vl_kernels_match_portable() {
     std::eprintln!("BLAKE VL kernels: {run} of {COUNT} run (AVX2 kernels: {avx2_run})");
 }
 
-// The cases of blake3_zmm_kernels_match_portable: hash16_zmm's, xof16_zmm's and hash_many's.
-const ZMM_COUNT: usize = 16;
+// hash_many on three to twelve inputs with AVX2, in both forms of three or four inputs, against
+// compress3 on every CPU with AVX2. The counters cross 2^32 within the lanes.
+#[test]
+#[allow(unsafe_code)]
+fn blake3_four_forms_match_portable() {
+    if !has(AVX2) {
+        std::eprintln!("BLAKE3 four inputs not run: no AVX2");
+
+        return;
+    }
+
+    let mut inputs = Inputs::new(0x0B1A_4E34);
+
+    for xmm_four in [false, true] {
+        for count in 3..=12 {
+            for (blocks, counter, increment, flags) in [
+                (1, 0, true, 0),
+                (2, 0xFFFF_FFFE, true, KEYED_HASH),
+                (3, 5, false, 0),
+                (16, 0xFFFF_FFFD, true, KEYED_HASH),
+            ] {
+                let data = random(&mut inputs, 64 * blocks * count);
+
+                let key: [u32; 8] = core::array::from_fn(|_| inputs.next() as u32);
+
+                let many = Many {
+                    blocks,
+                    key: &key,
+                    counter,
+                    increment,
+                    flags,
+                    start: CHUNK_START,
+                    end: CHUNK_END,
+                };
+
+                let mut out = vec![[0; 32]; count];
+
+                // SAFETY: the CPU has AVX2 and the operating system saves its registers.
+                let done = unsafe {
+                    blake3::hash_many_avx2(&data, &many, &mut out, true, xmm_four, false)
+                };
+
+                // Eight, and one left for the caller.
+                let whole = if count == 9 { 8 } else { count };
+
+                assert_eq!(done, whole, "{count} inputs, xmm_four {xmm_four}");
+
+                for (i, got) in out[..done].iter().enumerate() {
+                    let lane = if increment {
+                        counter.wrapping_add(i as u64)
+                    } else {
+                        counter
+                    };
+
+                    let mut cv = key;
+
+                    let input = &data[64 * blocks * i..][..64 * blocks];
+
+                    for (b, block) in input.as_chunks::<64>().0.iter().enumerate() {
+                        let mut f = flags;
+
+                        if b == 0 {
+                            f |= CHUNK_START;
+                        }
+
+                        if b + 1 == blocks {
+                            f |= CHUNK_END;
+                        }
+
+                        let v = compress3(&cv, block, lane, 64, f);
+
+                        cv = core::array::from_fn(|j| v[j]);
+                    }
+
+                    assert_eq!(
+                        *got,
+                        key_bytes(&cv),
+                        "{count} inputs of {blocks} blocks, xmm_four {xmm_four}, input {i}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// xof_avx2 on one to twenty-one blocks, in both forms of four, against compress3 on every CPU with
+// AVX2. The counters cross 2^32 and 2^64 within the blocks; the blocks past those it computes stay
+// as they were.
+#[test]
+#[allow(unsafe_code)]
+fn blake3_xof_forms_match_portable() {
+    if !has(AVX2) {
+        std::eprintln!("BLAKE3 extended output not run: no AVX2");
+
+        return;
+    }
+
+    let mut inputs = Inputs::new(0x0B1A_4E35);
+
+    for xmm_four in [false, true] {
+        for blocks in 1..=21 {
+            for (counter, keyed) in [(0, 0), (0xFFFF_FFFD, KEYED_HASH), (u64::MAX - 1, 0)] {
+                let cv: [u32; 8] = core::array::from_fn(|_| inputs.next() as u32);
+
+                let length = (blocks as u32 * 3) % 65;
+
+                let bytes = padded64(&random(&mut inputs, length as usize));
+
+                let block: [u32; 16] = block_words(&bytes);
+
+                let flags = ROOT | CHUNK_START | CHUNK_END | keyed;
+
+                let mut out = vec![[0xA5; 64]; blocks];
+
+                // SAFETY: the CPU has AVX2 and the operating system saves its registers.
+                let done = unsafe {
+                    blake3::xof_avx2(&cv, &block, counter, [length, flags], &mut out, xmm_four)
+                };
+
+                assert!(
+                    blocks - done <= 3,
+                    "{blocks} blocks, xmm_four {xmm_four}, {done} done"
+                );
+
+                if !xmm_four {
+                    assert!(blocks - done <= 1, "{blocks} blocks, {done} done");
+                }
+
+                for (i, got) in out[..done].iter().enumerate() {
+                    let v = compress3(&cv, &bytes, counter.wrapping_add(i as u64), length, flags);
+
+                    let expected: Vec<u8> = v.iter().flat_map(|word| word.to_le_bytes()).collect();
+
+                    assert_eq!(
+                        got[..],
+                        expected[..],
+                        "{blocks} blocks, xmm_four {xmm_four}, block {i}"
+                    );
+                }
+
+                for got in &out[done..] {
+                    assert_eq!(*got, [0xA5; 64], "{blocks} blocks, a block past done");
+                }
+            }
+        }
+    }
+}
+
+// The cases of blake3_zmm_kernels_match_portable: hash16_zmm's, xof16_zmm's, hash_many's and
+// xof_zmm's.
+const ZMM_COUNT: usize = 47;
 
 // The counters of the sixteen lanes of table from counter on, one more each if increment.
 fn lane_counters(table: &mut Table16, counter: u64, increment: bool) {
@@ -660,10 +809,10 @@ fn lane_counters(table: &mut Table16, counter: u64, increment: bool) {
 }
 
 // BLAKE3's 512-bit kernels on sixteen inputs and on groups of sixteen output blocks, and hash_many
-// with them and the eight-lane AVX-512VL kernel for three inputs or more (wide), called directly
-// against compress3 on every CPU with AVX512, whatever zmm_lanes() chooses for the dispatch. The
-// counters cross 2^32 within the lanes, and those of the output blocks 2^64 as well, also from one
-// group to the next; hash_many's stay below 2^64, as chunk counters do.
+// and xof_zmm with them, the eight-lane AVX-512VL kernel and the row form on two to four (wide),
+// called directly against compress3 on every CPU with AVX512, whatever zmm_lanes() chooses for the
+// dispatch. The counters cross 2^32 within the lanes, and those of the output blocks 2^64 as well,
+// also from one group to the next; hash_many's stay below 2^64, as chunk counters do.
 // CI's AVX-512 runners look for the line that the test prints.
 #[test]
 #[allow(unsafe_code)]
@@ -773,9 +922,20 @@ fn blake3_zmm_kernels_match_portable() {
         }
 
         for (count, blocks, counter, increment, flags) in [
+            (2, 1, 0, true, 0),
+            (2, 2, 0xFFFF_FFFF, true, KEYED_HASH),
+            (2, 16, 7, false, KEYED_HASH),
             (3, 1, 0, true, 0),
+            (3, 2, 0xFFFF_FFFE, true, KEYED_HASH),
+            (3, 16, 7, false, 0),
+            (4, 1, 0, false, KEYED_HASH),
             (4, 16, 0xFFFF_FFFE, true, KEYED_HASH),
             (5, 2, 5, true, 0),
+            (6, 1, 0xFFFF_FFFC, true, 0),
+            (7, 16, 3, true, KEYED_HASH),
+            (18, 2, 0xFFFF_FFF0, true, 0),
+            (19, 1, 0, false, KEYED_HASH),
+            (20, 3, 9, true, 0),
             (8, 3, 0x1_FFFF_FFFD, true, KEYED_HASH),
             (11, 15, 0xFFFF_FFF9, true, 0),
             (16, 4, 7, false, KEYED_HASH),
@@ -801,7 +961,8 @@ fn blake3_zmm_kernels_match_portable() {
 
             // SAFETY: the CPU has AVX2, AVX-512F and AVX-512VL, and the operating system saves
             // their registers, as wide needs.
-            let done = unsafe { blake3::hash_many_avx2(&data, &many, &mut out, false, true) };
+            let done =
+                unsafe { blake3::hash_many_avx2(&data, &many, &mut out, false, false, true) };
 
             assert_eq!(done, count, "hash_many, {count} inputs");
 
@@ -837,6 +998,131 @@ fn blake3_zmm_kernels_match_portable() {
                     key_bytes(&cv),
                     "hash_many, {count} inputs of {blocks} blocks, input {i}"
                 );
+            }
+
+            run += 1;
+        }
+    }
+
+    if has(AVX512) {
+        for blocks in 2..=15 {
+            let words: [u32; 16] = block_words(&random(&mut inputs, 32));
+
+            let cv: [u32; 8] = core::array::from_fn(|i| words[i]);
+
+            let length = blocks as u32 * 4;
+
+            let bytes = padded64(&random(&mut inputs, length as usize));
+
+            let block: [u32; 16] = block_words(&bytes);
+
+            let flags = ROOT | CHUNK_START | CHUNK_END | KEYED_HASH;
+
+            let counter = if blocks % 2 == 0 {
+                u64::MAX - 2
+            } else {
+                0xFFFF_FFFE
+            };
+
+            let mut out = vec![[0; 64]; blocks + 16 * (blocks & 1)];
+
+            // SAFETY: the CPU has AVX2, AVX-512F and AVX-512VL, and the operating system saves
+            // their registers, as xof_zmm needs.
+            let done = unsafe { blake3::xof_zmm(&cv, &block, counter, [length, flags], &mut out) };
+
+            let whole = out.len();
+
+            assert!(whole - done <= 1, "xof_zmm, {whole} blocks, {done} done");
+
+            for (i, got) in out[..done].iter().enumerate() {
+                let v = compress3(&cv, &bytes, counter.wrapping_add(i as u64), length, flags);
+
+                let expected: Vec<u8> = v.iter().flat_map(|word| word.to_le_bytes()).collect();
+
+                assert_eq!(got[..], expected[..], "xof_zmm, {whole} blocks, block {i}");
+            }
+
+            for got in &out[done..] {
+                assert_eq!(*got, [0; 64], "xof_zmm, {whole} blocks, a block past done");
+            }
+
+            run += 1;
+        }
+    }
+
+    // The row form's last lane on three inputs and three blocks: nothing past the third.
+    if has(AVX512) {
+        let key = [7; 8];
+
+        let data = random(&mut inputs, 4 * 64);
+
+        let (input, _) = data.as_chunks::<64>();
+
+        let lanes = [&input[0], &input[1], &input[2], &input[2]].map(core::ptr::from_ref);
+
+        let mut flags = [0; 16];
+
+        flags[0] = CHUNK_START | CHUNK_END;
+
+        let mut out = [[0xA5; 32]; 4];
+
+        // SAFETY: the CPU has AVX-512F and AVX-512VL, and the operating system saves their
+        // registers; each lane has one block behind it, and out holds three values.
+        unsafe { hash4_zmm(&lanes, 1, &key, 9, &ROW_STEPS, &flags, &mut out[..3]) };
+
+        for (i, got) in out[..3].iter().enumerate() {
+            let v = compress3(&key, &input[i], 9 + i as u64, 64, flags[0]);
+
+            let cv: [u32; 8] = core::array::from_fn(|j| v[j]);
+
+            assert_eq!(*got, key_bytes(&cv), "hash4_zmm, lane {i}");
+        }
+
+        assert_eq!(out[3], [0xA5; 32], "hash4_zmm wrote past its third value");
+
+        run += 1;
+
+        let bytes = padded64(&random(&mut inputs, 64));
+
+        let block: [u32; 16] = block_words(&bytes);
+
+        let mut out = [[0xA5; 64]; 4];
+
+        let tail = u64::from(ROOT) << 32 | 64;
+
+        // SAFETY: as above; out holds three blocks.
+        unsafe { xof4_zmm(&key, &block, 11, tail, &mut out[..3]) };
+
+        for (i, got) in out[..3].iter().enumerate() {
+            let v = compress3(&key, &bytes, 11 + i as u64, 64, ROOT);
+
+            let expected: Vec<u8> = v.iter().flat_map(|word| word.to_le_bytes()).collect();
+
+            assert_eq!(got[..], expected[..], "xof4_zmm, block {i}");
+        }
+
+        assert_eq!(out[3], [0xA5; 64], "xof4_zmm wrote past its third block");
+
+        run += 1;
+
+        for count in 5..=8 {
+            let mut out = [[0xA5; 64]; 9];
+
+            let counter = 0xFFFF_FFFC;
+
+            // SAFETY: as above; out holds five to eight blocks.
+            unsafe { xof8_ymm(&key, &block, counter, tail, &mut out[..count]) };
+
+            for (i, got) in out[..count].iter().enumerate() {
+                let v = compress3(&key, &bytes, counter + i as u64, 64, ROOT);
+
+                let expected: Vec<u8> = v.iter().flat_map(|word| word.to_le_bytes()).collect();
+
+                assert_eq!(got[..], expected[..], "xof8_ymm, {count} blocks, block {i}");
+            }
+
+            for got in &out[count..] {
+                assert_eq!(*got, [0xA5; 64], "xof8_ymm wrote past its {count} blocks");
             }
 
             run += 1;
