@@ -52,6 +52,10 @@ Implements specification 1.1 (draft).
 - BLAKE3 on x86-64 with AVX2 or SSE4.1: the groups of an extended output on eight or four lanes
   broadcast the message and the chaining value once for all groups, with one scratch state. Outputs
   are unchanged.
+- SHA-224 and SHA-256 on WebAssembly: the compression runs the first group of rounds ahead of a loop
+  over the other three, and padding blocks, HMAC key blocks and one-shot inputs of under four blocks
+  share one copy of it out of line ([decision D-85](spec/decisions.md#decision-d-85)). Outputs are
+  unchanged.
 - BLAKE3 on WebAssembly: the last two inputs of `hash_many` run one after the other, and the whole
   blocks of an extended output go straight into the output, as on 32-bit x86
   ([decision D-84](spec/decisions.md#decision-d-84)). Outputs are unchanged.
