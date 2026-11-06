@@ -64,6 +64,11 @@ Implements specification 1.1 (draft).
 - BLAKE3 on WebAssembly: the last two inputs of `hash_many` run one after the other, and the whole
   blocks of an extended output go straight into the output, as on 32-bit x86
   ([decision D-84](spec/decisions.md#decision-d-84)). Outputs are unchanged.
+- BLAKE3 of at most a block on WebAssembly and 32-bit Arm, and BLAKE2 of at most a block on 32-bit
+  Arm ([decision D-86](spec/decisions.md#decision-d-86)): the message goes from its slice into
+  locals and the output from locals to the caller, with no block in memory. A hash or MAC of at most
+  a block and `derive_key` take up to 15% less time on armv7, and BLAKE3's take up to 15% less under
+  wasmtime and Node.js. The machine code of other targets is unchanged. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
