@@ -283,6 +283,10 @@ Implements specification 1.1 (draft).
   FrodoKEM-976-AES takes 9 to 23% less time in key generation and up to 16% less in encapsulation and
   decapsulation under wasmtime and Node.js; FrodoKEM-976-SHAKE takes 20 to 34% and 10 to 24% less. The
   machine code of other targets is unchanged. Outputs are unchanged.
+- Keccak-f[1600] on WebAssembly keeps the state in locals through the rounds, from one block to the
+  next and, for a digest in one call, from the last block to the output. SHA-3 and SHAKE take up to
+  19% less time, KMAC up to 16% and ML-KEM up to 10% less under wasmtime and Node.js. The machine code
+  of other targets is unchanged. Outputs are unchanged.
 
 ### Fixed
 
