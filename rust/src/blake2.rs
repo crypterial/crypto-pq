@@ -273,6 +273,7 @@ fn store_fixed<W: Word, const N: usize>(h: &[W; 8], out: &mut [u8; N]) {
 
 // The leading out.len() bytes of the chaining value, of any length up to the whole: the last
 // partial word only where there is one, as its copy is a call of memcpy.
+#[cfg(not(target_arch = "arm"))]
 #[inline(always)]
 fn store_any<W: Word>(h: &[W; 8], out: &mut [u8]) {
     let partial = h.get(out.len() / W::BYTES);
@@ -296,6 +297,42 @@ fn store_any<W: Word>(h: &[W; 8], out: &mut [u8]) {
 
         wipe(&mut bytes);
     }
+}
+
+#[cfg(target_arch = "arm")]
+use store_in_locals as store_any;
+
+// store_any with no run-time index into h, which stays in locals, and a frame only for a partial word.
+#[cfg(any(test, target_arch = "arm"))]
+#[inline(always)]
+fn store_in_locals<W: Word>(h: &[W; 8], out: &mut [u8]) {
+    let mut chunks = out.chunks_exact_mut(W::BYTES);
+
+    for &word in h {
+        let Some(bytes) = chunks.next() else {
+            let rest = chunks.into_remainder();
+
+            if !rest.is_empty() {
+                store_partial(word, rest);
+            }
+
+            return;
+        };
+
+        word.write_le(bytes);
+    }
+}
+
+#[cfg(any(test, target_arch = "arm"))]
+#[inline(never)]
+fn store_partial<W: Word>(word: W, rest: &mut [u8]) {
+    let mut bytes = [0; 8];
+
+    word.write_le(&mut bytes[..W::BYTES]);
+
+    rest.copy_from_slice(&bytes[..rest.len()]);
+
+    wipe(&mut bytes);
 }
 
 // The BLAKE2b chaining value for a digest of `digest` bytes, without a key: the IV XORed with the
@@ -747,6 +784,14 @@ fn portable<W: Word>(
     }
 }
 
+// The counter of whole_blocks, BLAKE2s only, which counts at most 2^64 - 1 bytes. A u128 on 32-bit
+// Arm keeps its upper half live through the loop, 10 instructions per block.
+#[cfg(target_arch = "arm")]
+type BlockCounter = u64;
+
+#[cfg(not(target_arch = "arm"))]
+type BlockCounter = u128;
+
 // The whole blocks of bytes into h, counter the number of bytes before them. One loop with the
 // compression inlined, so that the chaining value stays in registers from block to block and the
 // message words come from the input, where a call per block took h and m through memory. A MAC's
@@ -754,9 +799,9 @@ fn portable<W: Word>(
 // whole blocks keeps a small frame.
 #[inline(never)]
 fn whole_blocks<W: Word>(h: &mut [W; 8], blocks: &[u8], counter: u128) {
-    let size = 16 * W::BYTES as u128;
+    let size = 16 * W::BYTES as BlockCounter;
 
-    let mut counter = counter;
+    let mut counter: BlockCounter = counter as BlockCounter;
 
     let mut state = *h;
 
@@ -769,7 +814,7 @@ fn whole_blocks<W: Word>(h: &mut [W; 8], blocks: &[u8], counter: u128) {
 
         counter = counter.wrapping_add(size);
 
-        rounds(&mut state, &m, counter, false);
+        rounds(&mut state, &m, counter as u128, false);
     }
 
     *h = state;
@@ -912,6 +957,82 @@ fn run<W: Word>(
     portable(h, first, blocks, counter, last);
 }
 
+// A digest, or a MAC with its key, of at most a block of data on 32-bit Arm: state and message in
+// registers and in the spills of the compiler, with no block in memory to fill, read and wipe.
+#[cfg(any(test, target_arch = "arm"))]
+#[inline(never)]
+fn in_locals<W: Word>(h: &[W; 8], key: Option<&[u8]>, data: &[u8], out: &mut [u8]) {
+    let mut state = *h;
+
+    if let Some(key) = key {
+        state[0] = state[0] ^ W::key_length(key.len());
+    }
+
+    let block = 16 * W::BYTES;
+
+    let mut m = [W::default(); 16];
+
+    let mut source = key.unwrap_or(data);
+
+    let mut counter = if key.is_some() { block } else { data.len() };
+
+    let mut last = key.is_none() || data.is_empty();
+
+    loop {
+        short_words(source, &mut m);
+
+        rounds(&mut state, &m, counter as u128, last);
+
+        if last {
+            break;
+        }
+
+        source = data;
+
+        counter = block + data.len();
+
+        last = true;
+    }
+
+    W::store(&state, out);
+
+    wipe_unless_optimized!(&mut state);
+
+    wipe_unless_optimized!(&mut m);
+}
+
+// The words of at most a block of bytes, zeros after them. Leaves at the word that takes the last
+// bytes, with no test on the zero words after it.
+#[cfg(any(test, target_arch = "arm"))]
+#[inline(always)]
+fn short_words<W: Word>(data: &[u8], m: &mut [W; 16]) {
+    *m = [W::default(); 16];
+
+    let mut chunks = data.chunks_exact(W::BYTES);
+
+    let mut partial = 0;
+
+    for (i, &byte) in chunks.remainder().iter().enumerate() {
+        partial |= u64::from(byte) << (8 * i);
+    }
+
+    macro_rules! word {
+        ($($i:literal)*) => {
+            $(
+                let Some(bytes) = chunks.next() else {
+                    m[$i] = W::from_value(u128::from(partial));
+
+                    return;
+                };
+
+                m[$i] = W::from_le(bytes);
+            )*
+        };
+    }
+
+    word!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
+}
+
 // The digest of data, out.len() bytes, from the chaining value h, in one pass over data.
 pub(crate) fn digest<W: Word>(h: &[W; 8], data: &[u8], out: &mut [u8]) {
     let kernel = match W::digest_kernel(h, data, out) {
@@ -919,6 +1040,11 @@ pub(crate) fn digest<W: Word>(h: &[W; 8], data: &[u8], out: &mut [u8]) {
         Kernel::Blocks => true,
         Kernel::Portable => false,
     };
+
+    #[cfg(target_arch = "arm")]
+    if data.len() <= 16 * W::BYTES {
+        return in_locals(h, None, data, out);
+    }
 
     let mut h = *h;
 
@@ -952,6 +1078,11 @@ pub(crate) fn mac<W: Word>(h: &[W; 8], key: &[u8], data: &[u8], out: &mut [u8]) 
         Kernel::Blocks => true,
         Kernel::Portable => false,
     };
+
+    #[cfg(target_arch = "arm")]
+    if data.len() <= 16 * W::BYTES {
+        return in_locals(h, Some(key), data, out);
+    }
 
     let mut h = *h;
 
@@ -1397,5 +1528,84 @@ mod tests {
         one_shot_matches_engine::<u64>();
 
         one_shot_matches_engine::<u32>();
+    }
+
+    // in_locals against compress, for a digest and for a MAC.
+    fn in_locals_matches_compress<W: Word>() {
+        let block = 16 * W::BYTES;
+
+        let whole = 8 * W::BYTES;
+
+        let message: [u8; 128] =
+            core::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(3));
+
+        let key: [u8; 128] = core::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(1));
+
+        let padded = |bytes: &[u8]| {
+            let mut m = [W::default(); 16];
+
+            words(bytes, 0, &mut m);
+
+            m
+        };
+
+        let check = |expected: &[W; 8], key: Option<&[u8]>, data: &[u8]| {
+            let mut all = [0; 64];
+
+            W::store(expected, &mut all[..whole]);
+
+            for size in 0..=whole {
+                let mut out = [0xA5; 65];
+
+                in_locals(&W::IV, key, data, &mut out[..size]);
+
+                assert_eq!(out[..size], all[..size]);
+
+                assert!(out[size..].iter().all(|&byte| byte == 0xA5));
+
+                let mut out = [0xA5; 65];
+
+                store_in_locals(expected, &mut out[..size]);
+
+                assert_eq!(out[..size], all[..size]);
+
+                assert!(out[size..].iter().all(|&byte| byte == 0xA5));
+            }
+        };
+
+        for length in 0..=block {
+            let data = &message[..length];
+
+            let mut expected = W::IV;
+
+            compress(&mut expected, &padded(data), length as u128, true);
+
+            check(&expected, None, data);
+
+            for size in [1, 7, whole, block - 1, block] {
+                let key = &key[..size];
+
+                let mut expected = W::IV;
+
+                expected[0] = expected[0] ^ W::key_length(size);
+
+                if length == 0 {
+                    compress(&mut expected, &padded(key), block as u128, true);
+                } else {
+                    compress(&mut expected, &padded(key), block as u128, false);
+
+                    compress(&mut expected, &padded(data), (block + length) as u128, true);
+                }
+
+                check(&expected, Some(key), data);
+            }
+        }
+    }
+
+    #[test]
+    fn in_locals_matches_compress_for_both_words() {
+        in_locals_matches_compress::<u32>();
+
+        in_locals_matches_compress::<u64>();
     }
 }

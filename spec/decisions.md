@@ -916,3 +916,37 @@ Neoverse N2 at each place measured. Outside WebAssembly the code is the same as 
 function, on x86-64, ARM64, armv7 and i686. A scan of the wasm32 code at opt-levels 1, 2, 3, s and z
 finds no select in these functions, and at opt-level 3 the only branch of the copy out of line is
 its loop counter.
+
+## Decision D-86
+
+A BLAKE3 hash of at most a block, keyed or not, on WebAssembly and on 32-bit Arm takes the message
+words straight from the input into locals and writes the output from locals, with no block in memory
+to fill, read and wipe. On both targets the dispatch of a keyed hash is inlined, and the full HMAC of
+a truncated output stays out of line, with the frame it needs. On WebAssembly the last compression
+of `derive_key` is out of line too.
+
+On 32-bit Arm, a BLAKE2 digest or MAC of at most a block of data runs one function of the same form,
+which holds both, with its one copy of the rounds, and the block counter of BLAKE2s's whole blocks
+takes 64 bits, its full range. On WebAssembly, BLAKE2 keeps its form before.
+
+These are forms of the portable code that the target chooses at compile time, not CPU-specific code
+under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on public lengths.
+The words are arrays indexed by constants only, so [D-76](#decision-d-76) treats them as register
+values at opt-level 3, whose spills are copies that the compiler makes, and they are wiped at other
+levels; a partial output word, in a buffer with a run-time length, is wiped on every path.
+
+Rationale: the buffers took more than their stores, since each read of a word came right after its
+store. In bench run 42297409561, the time before over the time here for BLAKE3, as a median over the
+13 classes of CPU and runtime under wasmtime and Node.js, was 1.058 for an empty message, 1.040 for
+64 bytes, 1.081 and 1.046 keyed, 1.104 for `derive_key` and 1.112 with two contexts in turn. In bench
+run 42302165419, on armv7 on Neoverse N2, it was 1.170 and 1.162 for BLAKE3, 1.175 and 1.160 keyed,
+1.039 to 1.093 for BLAKE2 digests of one block and 1.043 to 1.161 for its MACs, and 0.994 to 1.012
+for the rows of many blocks.
+
+BLAKE2 stays out of WebAssembly because of one compiler. Its 16 words of state, 16 of message and 8
+of chaining value in locals took Cranelift 166 stack slots against 37 for BLAKE2b, most of them for
+one store and one reload. In that run, for BLAKE2b of one block, the time before over the time here
+was 1.01 to 1.24 under Node.js and 1.05 to 1.12 under wasmtime on Ice Lake, Emerald Rapids and
+Neoverse N2, but 0.70 to 0.86 under wasmtime on Zen 3, Zen 4 and Zen 5. Why those cores take these
+slots so badly was not established. The state in memory and a block out of line each left 142 to 163
+slots, so no form was found that holds for both runtimes.

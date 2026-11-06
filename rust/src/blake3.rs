@@ -18,7 +18,7 @@ use crate::cpu;
 use crate::sha2::IV_256;
 use crate::wipe::{registers, wipe, wipe_unless_optimized};
 
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", target_arch = "arm"))]
 use digest1_in_locals as digest1;
 
 pub(crate) const KEY: usize = 32;
@@ -1497,7 +1497,7 @@ impl KeyWords for [u8; KEY] {
 // slice into the registers of the state, with no copy in memory to wipe. Always inlined: with
 // keyed_hash and derive_key both calling it, it went out of line and the keyed MAC of an empty
 // message took 2 percent more time on Apple M3.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(not(any(target_family = "wasm", target_arch = "arm")))]
 #[inline(always)]
 fn digest1<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
@@ -1538,9 +1538,9 @@ fn digest1<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
     wipe(&mut copy);
 }
 
-// digest1 for WebAssembly: the message goes from its slice into locals and the output from locals
-// into out, with no buffer in memory to clear and no load from a store just made.
-#[cfg(any(test, target_family = "wasm"))]
+// digest1 for WebAssembly and 32-bit Arm: the message goes from its slice into locals and the output
+// from locals into out, with no buffer in memory to clear and no load from a store just made.
+#[cfg(any(test, target_family = "wasm", target_arch = "arm"))]
 #[inline(always)]
 fn digest1_in_locals<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
@@ -1586,7 +1586,7 @@ fn digest1_in_locals<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u
 
 // The words of a block of less than 64 bytes, zeros after the message. Leaves at the word that
 // takes the last bytes, with no test on the zero words after it.
-#[cfg(any(test, target_family = "wasm"))]
+#[cfg(any(test, target_family = "wasm", target_arch = "arm"))]
 #[inline(always)]
 fn short_words(data: &[u8]) -> [u32; 16] {
     let (whole, rest) = data.as_chunks::<4>();
