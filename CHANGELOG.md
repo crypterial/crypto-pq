@@ -278,6 +278,11 @@ Implements specification 1.1 (draft).
   loop. FrodoKEM-976-AES takes 18% less time on AMD Zen 3 under wasmtime and 14% less under Node.js,
   and about 14% less on Zen 4 under wasmtime; under wasmtime on Emerald Rapids it takes 1.5% more.
   The machine code of other targets is unchanged. Outputs are unchanged.
+- FrodoKEM's matrix products on WebAssembly work on 64-bit words: a multiplication of an entry by a
+  masked word gives two products of 16-bit entries at once, and four entries load as one word.
+  FrodoKEM-976-AES takes 9 to 23% less time in key generation and up to 16% less in encapsulation and
+  decapsulation under wasmtime and Node.js; FrodoKEM-976-SHAKE takes 20 to 34% and 10 to 24% less. The
+  machine code of other targets is unchanged. Outputs are unchanged.
 
 ### Fixed
 
