@@ -566,10 +566,10 @@ impl MacAlgorithm {
         }
     }
 
-    // Inlined on WebAssembly: as a call, with its arguments on the stack, this took 2 percent of
-    // the instructions of a keyed BLAKE3 of an empty message.
+    // Inlined on WebAssembly and 32-bit Arm: as a call, with its arguments on the stack, this took 2
+    // percent of the instructions of a keyed BLAKE3 of an empty message.
     #[cfg(not(target_arch = "aarch64"))]
-    #[cfg_attr(target_family = "wasm", inline(always))]
+    #[cfg_attr(any(target_family = "wasm", target_arch = "arm"), inline(always))]
     fn mac(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
         match &self.kind {
             #[cfg(any(
@@ -600,8 +600,8 @@ impl MacAlgorithm {
     }
 }
 
-// The first bytes of a full HMAC. Out of line on WebAssembly, so that mac's frame in linear memory
-// is paid only here.
+// The first bytes of a full HMAC. Out of line on WebAssembly and 32-bit Arm, so that mac's frame is
+// paid only here.
 #[cfg(not(target_arch = "aarch64"))]
 #[cfg(any(
     feature = "hmac",
@@ -609,8 +609,8 @@ impl MacAlgorithm {
     feature = "lms",
     feature = "xmss"
 ))]
-#[cfg_attr(target_family = "wasm", inline(never))]
-#[cfg_attr(not(target_family = "wasm"), inline(always))]
+#[cfg_attr(any(target_family = "wasm", target_arch = "arm"), inline(never))]
+#[cfg_attr(not(any(target_family = "wasm", target_arch = "arm")), inline(always))]
 fn hmac_truncated(hash: &HashAlgorithm, key: &[u8], data: &[u8], out: &mut [u8]) {
     let mut full = [0; 64];
 
