@@ -2143,9 +2143,11 @@ fn rounds512<const N: usize>(s: &mut [[uint64x2_t; 4]; N], m: &mut [[uint64x2_t;
     wipe_unless_optimized!(vector_lanes(&mut start));
 }
 
-// rounds512 in one loop over the five groups, with the flag tested inside it, for the loop over
-// blocks in tail512. With the split form there, LLVM kept the last group's eight constant vectors
-// in registers across the blocks and moved three other vectors through the stack at every block.
+// rounds512 in one loop over the five groups, with the flag tested inside it, for the loops over
+// blocks in compress512_sha3 and tail512. With the split form in tail512, LLVM kept the last
+// group's eight constant vectors in registers across the blocks and moved three other vectors
+// through the stack at every block. In compress512_sha3 the split form kept nothing on the stack
+// and took 2.4% longer per block on Neoverse N2; why was not established.
 #[target_feature(enable = "sha3")]
 #[inline]
 fn rounds512_looped<const N: usize>(s: &mut [[uint64x2_t; 4]; N], m: &mut [[uint64x2_t; 8]; N]) {
@@ -2193,7 +2195,7 @@ fn compress512_sha3(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128
     for block in blocks.iter().chain(more) {
         m[0] = message512(block);
 
-        rounds512(&mut s, &mut m);
+        rounds512_looped(&mut s, &mut m);
     }
 
     store512(&s[0], state);
