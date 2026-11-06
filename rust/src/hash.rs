@@ -32,6 +32,10 @@ const SHA3_SUFFIX: u8 = 0x06;
 #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
 const SHAKE_SUFFIX: u8 = 0x1F;
 
+// The padding of the Keccak submission, before FIPS 202 added SHA-3's domain bits.
+#[cfg(feature = "sha3")]
+const KECCAK_SUFFIX: u8 = 0x01;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     #[cfg(any(
@@ -52,6 +56,8 @@ pub(crate) enum Kind {
     Sha512(&'static [u64; 8]),
     #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
     Sha3,
+    #[cfg(feature = "sha3")]
+    Keccak,
     // The chaining value after the parameter block.
     #[cfg(feature = "blake2")]
     Blake2b([u64; 8]),
@@ -405,6 +411,8 @@ impl HashAlgorithm {
             Kind::Sha512(iv) => finish512(iv, 0, data, out),
             #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
             Kind::Sha3 => Keccak::digest_into(self.block_size(), SHA3_SUFFIX, data, out),
+            #[cfg(feature = "sha3")]
+            Kind::Keccak => Keccak::digest_into(self.block_size(), KECCAK_SUFFIX, data, out),
             #[cfg(feature = "blake2")]
             Kind::Blake2b(h) => blake2::digest(h, data, out),
             #[cfg(feature = "blake2")]
@@ -438,6 +446,8 @@ impl HashAlgorithm {
             Kind::Sha512(iv) => Engine::Sha512(Sha512::new(iv)),
             #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
             Kind::Sha3 => Engine::Keccak(Keccak::new(self.block_size(), SHA3_SUFFIX)),
+            #[cfg(feature = "sha3")]
+            Kind::Keccak => Engine::Keccak(Keccak::new(self.block_size(), KECCAK_SUFFIX)),
             #[cfg(feature = "blake2")]
             Kind::Blake2b(h) => Engine::Blake2b(blake2::Engine::new(h)),
             #[cfg(feature = "blake2")]
@@ -478,6 +488,8 @@ impl HashAlgorithm {
             Kind::Sha512(iv) => create_sha512(iv, size),
             #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
             Kind::Sha3 => create_sha3(self.block_size(), size),
+            #[cfg(feature = "sha3")]
+            Kind::Keccak => create_keccak(self.block_size(), size),
             #[cfg(feature = "blake2")]
             Kind::Blake2b(h) => create_blake2b(h, size),
             #[cfg(feature = "blake2")]
@@ -516,6 +528,8 @@ impl HashAlgorithm {
             Kind::Blake3 => 64,
             #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
             Kind::Sha3 => 200 - 2 * self.digest_size,
+            #[cfg(feature = "sha3")]
+            Kind::Keccak => 200 - 2 * self.digest_size,
             #[cfg(feature = "ascon")]
             Kind::Ascon => 8,
         }
@@ -564,6 +578,16 @@ fn create_sha512(iv: &[u64; 8], size: usize) -> Hasher {
 fn create_sha3(rate: usize, size: usize) -> Hasher {
     Hasher {
         engine: Engine::Keccak(Keccak::new(rate, SHA3_SUFFIX)),
+        size,
+    }
+}
+
+#[cfg(feature = "sha3")]
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn create_keccak(rate: usize, size: usize) -> Hasher {
+    Hasher {
+        engine: Engine::Keccak(Keccak::new(rate, KECCAK_SUFFIX)),
         size,
     }
 }
@@ -1129,6 +1153,16 @@ pub const SHA3_512: HashAlgorithm = HashAlgorithm {
     digest_size: 64,
     kind: Kind::Sha3,
     oid_arc: 10,
+};
+
+/// Keccak-256, the 256-bit function of the Keccak submission to the SHA-3 competition, as Ethereum
+/// uses it. Its padding differs from that of [`SHA3_256`], so the two give different digests.
+#[cfg(feature = "sha3")]
+pub const KECCAK_256: HashAlgorithm = HashAlgorithm {
+    name: "Keccak-256",
+    digest_size: 32,
+    kind: Kind::Keccak,
+    oid_arc: 0,
 };
 
 // RFC 7693, 4: BLAKE2b and BLAKE2s at their recommended digest sizes, unkeyed.

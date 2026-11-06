@@ -950,3 +950,21 @@ was 1.01 to 1.24 under Node.js and 1.05 to 1.12 under wasmtime on Ice Lake, Emer
 Neoverse N2, but 0.70 to 0.86 under wasmtime on Zen 3, Zen 4 and Zen 5. Why those cores take these
 slots so badly was not established. The state in memory and a block out of line each left 142 to 163
 slots, so no form was found that holds for both runtimes.
+
+## Decision D-87
+
+Keccak-256 is a hash function of the crate, `KECCAK_256`, in the `sha3` feature: KECCAK[512](M, 256)
+in the terms of FIPS 202 §5.2, with 32 bytes of output, the function that the Keccak submission to
+the SHA-3 competition defines at this capacity. It differs from SHA3-256 only in the domain bits that
+FIPS 202 §6.1 adds, so its padding starts with the byte `01` where SHA3-256's starts with `06`, and it
+runs on the code and the kernels of SHA-3. It has no NIST identifier, so it is refused as a pre-hash,
+and no MAC or KDF takes it.
+
+Rationale: FIPS 202 did not take this padding, but Keccak-256 is the hash of Ethereum, for its
+addresses, its transactions and its state, so software for that chain needs it, and AWS-LC ships it
+as `EVP_keccak256`. Its security rests on the permutation, the rate and the sponge of SHA3-256.
+
+No standard publishes vectors for it. `tools/keccak_vectors.py` derives `derived/keccak256.txt` with
+its own Keccak-f[1600], written from FIPS 202 §3, which must agree with hashlib's SHA3-256 under the
+padding of SHA-3 and with three published digests under the padding of Keccak. RustCrypto's sha3 0.10.9
+and tiny-keccak 2.0.2 give the same values for each of the 284 messages.

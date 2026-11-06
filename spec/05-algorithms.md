@@ -165,6 +165,7 @@ Sizes:
 | `SHA3_256` | `SHA3-256` | 32 | FIPS 202 §6.1 |
 | `SHA3_384` | `SHA3-384` | 48 | FIPS 202 §6.1 |
 | `SHA3_512` | `SHA3-512` | 64 | FIPS 202 §6.1 |
+| `KECCAK_256` | `Keccak-256` | 32 | [KECCAK], capacity 512; not a NIST function [[D-87](decisions.md#decision-d-87)] |
 | `BLAKE2B_160`, `BLAKE2B_256`, `BLAKE2B_384`, `BLAKE2B_512` | `BLAKE2b-160` ... `BLAKE2b-512` | 20, 32, 48, 64 | RFC 7693; parameter block [BLAKE2] §2.5 |
 | `BLAKE2S_128`, `BLAKE2S_160`, `BLAKE2S_224`, `BLAKE2S_256` | `BLAKE2s-128` ... `BLAKE2s-256` | 16, 20, 28, 32 | RFC 7693; [BLAKE2] §2.5 |
 | `ASCON_HASH256` | `Ascon-Hash256` | 32 | NIST SP 800-232 §5.1 |

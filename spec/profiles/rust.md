@@ -113,7 +113,7 @@
    | `lms` | `HSS_LMS`; the stateful types | |
    | `xmss` | `XMSS`, `XMSS_MT`; the stateful types | |
    | `sha2` | `SHA_*`; the hash types | |
-   | `sha3` | `SHA3_*`, `SHAKE*`, `CSHAKE*`, `KMAC*`; the hash, XOF and MAC types | |
+   | `sha3` | `SHA3_*`, `SHAKE*`, `CSHAKE*`, `KMAC*`, `KECCAK_256`; the hash, XOF and MAC types | |
    | `blake2` | `BLAKE2B_*`, `BLAKE2S_*`, `BLAKE2B_MAC`, `BLAKE2S_MAC`; the hash and MAC types | |
    | `blake3` | `BLAKE3`, `BLAKE3_256`, `BLAKE3_MAC`, `BLAKE3_KDF`; the hash, XOF, MAC and KDF types | |
    | `ascon` | `ASCON_HASH256`, `ASCON_XOF128`, `ASCON_CXOF128`; the hash and XOF types | |
