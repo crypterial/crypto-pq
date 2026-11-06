@@ -566,7 +566,10 @@ impl MacAlgorithm {
         }
     }
 
+    // Inlined on WebAssembly: as a call, with its arguments on the stack, this took 2 percent of
+    // the instructions of a keyed BLAKE3 of an empty message.
     #[cfg(not(target_arch = "aarch64"))]
+    #[cfg_attr(target_family = "wasm", inline(always))]
     fn mac(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
         match &self.kind {
             #[cfg(any(
@@ -582,15 +585,7 @@ impl MacAlgorithm {
                 feature = "lms",
                 feature = "xmss"
             ))]
-            MacKind::Hmac(hash) => {
-                let mut full = [0; 64];
-
-                hmac(hash, key, data, &mut full[..hash.digest_size]);
-
-                out.copy_from_slice(&full[..out.len()]);
-
-                wipe(&mut full);
-            }
+            MacKind::Hmac(hash) => hmac_truncated(hash, key, data, out),
             #[cfg(feature = "sha3")]
             MacKind::Kmac { prefix, rate, xof } => {
                 sp800_185::kmac(prefix, *rate, key, data, *xof, out);
@@ -603,6 +598,27 @@ impl MacAlgorithm {
             MacKind::Blake3 => blake3::keyed_hash(key, data, out),
         }
     }
+}
+
+// The first bytes of a full HMAC. Out of line on WebAssembly, so that mac's frame in linear memory
+// is paid only here.
+#[cfg(not(target_arch = "aarch64"))]
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[cfg_attr(target_family = "wasm", inline(never))]
+#[cfg_attr(not(target_family = "wasm"), inline(always))]
+fn hmac_truncated(hash: &HashAlgorithm, key: &[u8], data: &[u8], out: &mut [u8]) {
+    let mut full = [0; 64];
+
+    hmac(hash, key, data, &mut full[..hash.digest_size]);
+
+    out.copy_from_slice(&full[..out.len()]);
+
+    wipe(&mut full);
 }
 
 // HMAC's engines before the key: the inner one at the hash's initial state.

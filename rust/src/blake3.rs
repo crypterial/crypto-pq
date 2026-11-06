@@ -18,6 +18,9 @@ use crate::cpu;
 use crate::sha2::IV_256;
 use crate::wipe::{registers, wipe, wipe_unless_optimized};
 
+#[cfg(target_family = "wasm")]
+use digest1_in_locals as digest1;
+
 pub(crate) const KEY: usize = 32;
 
 const BLOCK: usize = 64;
@@ -1494,6 +1497,7 @@ impl KeyWords for [u8; KEY] {
 // slice into the registers of the state, with no copy in memory to wipe. Always inlined: with
 // keyed_hash and derive_key both calling it, it went out of line and the keyed MAC of an empty
 // message took 2 percent more time on Apple M3.
+#[cfg(not(target_family = "wasm"))]
 #[inline(always)]
 fn digest1<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
@@ -1534,6 +1538,86 @@ fn digest1<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
     wipe(&mut copy);
 }
 
+// digest1 for WebAssembly: the message goes from its slice into locals and the output from locals
+// into out, with no buffer in memory to clear and no load from a store just made.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+fn digest1_in_locals<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut cv: [u32; 8] = registers!(|i| key.word(i); 0 1 2 3 4 5 6 7);
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut m = match <&[u8; BLOCK]>::try_from(data) {
+        Ok(block) => words(block),
+        Err(_) => short_words(data),
+    };
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut v = rounds(&cv, &m, 0, data.len() as u32, flags);
+
+    wipe_unless_optimized!(&mut cv);
+
+    wipe_unless_optimized!(&mut m);
+
+    if let Ok(whole) = <&mut [u8; 32]>::try_from(&mut *out) {
+        for (i, chunk) in whole.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *chunk = (v[i] ^ v[i + 8]).to_le_bytes();
+        }
+    } else {
+        let (chunks, rest) = out.as_chunks_mut::<4>();
+
+        for i in 0..8 {
+            let word = (v[i] ^ v[i + 8]).to_le_bytes();
+
+            if let Some(chunk) = chunks.get_mut(i) {
+                *chunk = word;
+            } else {
+                for (byte, value) in rest.iter_mut().zip(word) {
+                    *byte = value;
+                }
+
+                break;
+            }
+        }
+    }
+
+    wipe_unless_optimized!(&mut v);
+}
+
+// The words of a block of less than 64 bytes, zeros after the message. Leaves at the word that
+// takes the last bytes, with no test on the zero words after it.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+fn short_words(data: &[u8]) -> [u32; 16] {
+    let (whole, rest) = data.as_chunks::<4>();
+
+    let mut partial = 0;
+
+    for (i, &byte) in rest.iter().enumerate() {
+        partial |= u32::from(byte) << (8 * i);
+    }
+
+    let mut m = [0; 16];
+
+    macro_rules! word {
+        ($($i:literal)*) => {
+            $(
+                let Some(word) = whole.get($i) else {
+                    m[$i] = partial;
+
+                    return m;
+                };
+
+                m[$i] = u32::from_le_bytes(*word);
+            )*
+        };
+    }
+
+    word!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
+
+    m
+}
+
 // out.len() bytes of output for data in one call.
 // Inlined into its callers with the tests of a short input and of the word of features, so that
 // the kernel's call comes before any frame: out of line, one_shot saved six registers and set up a
@@ -1569,6 +1653,14 @@ fn short_rest(key: &[u32; 8], root: u32, data: &[u8], out: &mut [u8]) {
     if !cpu::blake3_digest1(key, root, data, out) {
         digest1(key, root, data, out);
     }
+}
+
+// digest1 for a key in bytes on WebAssembly, for derive_key: its rounds inlined into the KDF
+// dispatch took 19 percent more time on Zen 5 under wasmtime.
+#[cfg(target_family = "wasm")]
+#[inline(never)]
+fn digest1_bytes(key: &[u8; KEY], flags: u32, data: &[u8], out: &mut [u8]) {
+    digest1(key, flags, data, out);
 }
 
 // digest1 for a key in words, out of line so that one_shot's callers hold no copy of its rounds.
@@ -1673,6 +1765,13 @@ pub(crate) fn derive_key(context: &[u8], material: &[u8], out: &mut [u8]) {
     let mut k = [0; KEY];
 
     one_shot(&IV_256, DERIVE_KEY_CONTEXT, context, &mut k);
+
+    #[cfg(target_family = "wasm")]
+    if material.len() <= BLOCK && out.len() <= 32 {
+        let root = DERIVE_KEY_MATERIAL | CHUNK_START | CHUNK_END | ROOT;
+
+        return digest1_bytes(&k, root, material, out);
+    }
 
     keyed(&k, DERIVE_KEY_MATERIAL, material, out);
 }
@@ -2626,6 +2725,54 @@ mod tests {
                     actual, tail,
                     "length {length} flags {flags} read from {offset}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn digest1_in_locals_matches_the_rounds() {
+        let key: [u8; KEY] = core::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(1));
+
+        let key_in_words = key_words(&key);
+
+        let message: [u8; BLOCK] =
+            core::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(3));
+
+        let root = CHUNK_START | CHUNK_END | ROOT;
+
+        for flags in [
+            root,
+            KEYED_HASH | root,
+            DERIVE_KEY_CONTEXT | root,
+            DERIVE_KEY_MATERIAL | root,
+        ] {
+            for length in 0..=BLOCK {
+                let mut block = [0; BLOCK];
+
+                block[..length].copy_from_slice(&message[..length]);
+
+                let v = rounds(&key_in_words, &words(&block), 0, length as u32, flags);
+
+                let expected: [u8; 32] =
+                    core::array::from_fn(|i| (v[i / 4] ^ v[i / 4 + 8]).to_le_bytes()[i % 4]);
+
+                for size in 0..=32 {
+                    let mut out = [0xA5; 33];
+
+                    digest1_in_locals(&key, flags, &message[..length], &mut out[..size]);
+
+                    assert_eq!(out[..size], expected[..size]);
+
+                    assert!(out[size..].iter().all(|&byte| byte == 0xA5));
+
+                    out = [0xA5; 33];
+
+                    digest1_in_locals(&key_in_words, flags, &message[..length], &mut out[..size]);
+
+                    assert_eq!(out[..size], expected[..size]);
+
+                    assert!(out[size..].iter().all(|&byte| byte == 0xA5));
+                }
             }
         }
     }
