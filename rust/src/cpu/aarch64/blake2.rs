@@ -10,8 +10,10 @@ use crate::blake2::{Last, SIGMA, Word};
 use crate::wipe::wipe_unless_optimized;
 
 // A value that the compiler cannot see through: its rotation stays one of its own.
-pub(super) trait Opaque: Copy {
+pub(super) trait Opaque: Copy + 'static {
     fn opaque(self) -> Self;
+
+    fn iv() -> &'static [Self; 8];
 }
 
 impl Opaque for u64 {
@@ -32,6 +34,29 @@ impl Opaque for u64 {
 
         out
     }
+
+    // The IV as memory that the compiler cannot see through. As constants in the code its words
+    // took 32 MOV and MOVK per block, and BLAKE2b of 16 KiB took 1.1% more time on Neoverse N2. In
+    // BLAKE2s, with half of them, it was the loads that took up to 0.8% more time there.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn iv() -> &'static [Self; 8] {
+        let table: *const [Self; 8] = &<Self as Word>::IV;
+
+        let mut address = table as usize;
+
+        // SAFETY: as for opaque.
+        unsafe {
+            core::arch::asm!(
+                "/* {0} */",
+                inout(reg) address,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+
+        // SAFETY: the address of the constant above, unchanged.
+        unsafe { &*(address as *const [Self; 8]) }
+    }
 }
 
 impl Opaque for u32 {
@@ -50,6 +75,11 @@ impl Opaque for u32 {
         }
 
         out
+    }
+
+    #[inline(always)]
+    fn iv() -> &'static [Self; 8] {
+        &<Self as Word>::IV
     }
 }
 
@@ -102,7 +132,7 @@ fn round<W: Word + Opaque>(v: &mut [W; 16], m: &[W; 16], s: &[usize; 16]) {
 // The compression of RFC 7693, 3.2, into h.
 #[inline(always)]
 fn compress<W: Word + Opaque>(h: &mut [W; 8], m: &[W; 16], counter: u128, last: bool) {
-    let iv = W::IV;
+    let iv = W::iv();
 
     let [t0, t1] = W::counter(counter);
 
