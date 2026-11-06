@@ -243,39 +243,89 @@ impl Aes {
 // state to the order of FIPS 197. The S-box and the other pieces are inlined here: a call would
 // pass the planes through memory.
 fn encrypt_group<P: Plane>(keys: &[[P; 8]], blocks: &mut [[u8; 16]]) {
-    let rounds = keys.len() - 1;
-
     let mut q = [P::default(); 8];
 
     P::spread(blocks, &mut q);
 
     ortho(&mut q);
 
-    add_round_key(&mut q, &keys[0]);
+    if cfg!(target_family = "wasm") {
+        rounds_in_one_loop(&mut q, keys);
+    } else {
+        let rounds = keys.len() - 1;
 
-    for r in (1..rounds - 1).step_by(4) {
-        round::<P, 1>(&mut q, &keys[r]);
+        add_round_key(&mut q, &keys[0]);
 
-        round::<P, 2>(&mut q, &keys[r + 1]);
+        for r in (1..rounds - 1).step_by(4) {
+            round::<P, 1>(&mut q, &keys[r]);
 
-        round::<P, 3>(&mut q, &keys[r + 2]);
+            round::<P, 2>(&mut q, &keys[r + 1]);
 
-        round::<P, 0>(&mut q, &keys[r + 3]);
+            round::<P, 3>(&mut q, &keys[r + 2]);
+
+            round::<P, 0>(&mut q, &keys[r + 3]);
+        }
+
+        round::<P, 1>(&mut q, &keys[rounds - 1]);
+
+        sbox(&mut q);
+
+        shift_rows_2(&mut q);
+
+        add_round_key(&mut q, &keys[rounds]);
     }
-
-    round::<P, 1>(&mut q, &keys[rounds - 1]);
-
-    sbox(&mut q);
-
-    shift_rows_2(&mut q);
-
-    add_round_key(&mut q, &keys[rounds]);
 
     ortho(&mut q);
 
     P::gather(&q, blocks);
 
     wipe(&mut q);
+}
+
+// The rounds on WebAssembly, in one loop that leaves after the S-box of the round before the last.
+// LLVM unrolls the loop of the other form into three copies of its body, about 31 KB of x86-64 code
+// under Cranelift against 12 KB here. The slice patterns give the key loads constant offsets, and
+// the planes in memory once per cycle hold no spill slot through the loop, 50 slots against 72
+// without it. Native code stays on the other form: on i686 this one took 2 to 9% more time.
+#[inline(always)]
+fn rounds_in_one_loop<P: Plane>(q: &mut [P; 8], keys: &[[P; 8]]) {
+    let [first, rest @ ..] = keys else {
+        unreachable!();
+    };
+
+    let mut rest = rest;
+
+    add_round_key(q, first);
+
+    let last = loop {
+        let [a, tail @ ..] = rest else {
+            unreachable!();
+        };
+
+        round::<P, 1>(q, a);
+
+        sbox(q);
+
+        core::hint::black_box(&mut *q);
+
+        let [b, c, d, more @ ..] = tail else {
+            break &tail[0];
+        };
+
+        mix_columns::<P, 2>(q);
+
+        add_round_key(q, b);
+
+        round::<P, 3>(q, c);
+
+        round::<P, 0>(q, d);
+
+        rest = more;
+    };
+
+    shift_rows_2(q);
+
+    add_round_key(q, last);
 }
 
 // The expanded key as bitsliced round keys, each in every block of a group. Round key r but the
@@ -930,6 +980,47 @@ mod tests {
             }
 
             assert_eq!(wide, narrow, "case {n}");
+        }
+    }
+
+    // The rounds for WebAssembly against encrypt_group, which takes the other form on the targets
+    // that CI tests, on random keys and blocks.
+    #[test]
+    fn rounds_in_one_loop_agree() {
+        fn check<P: Plane>(key: &[u8], blocks: &[[u8; 16]; 4]) {
+            let keys = keys_for::<P>(key);
+
+            let (mut expected, mut got) = (*blocks, *blocks);
+
+            encrypt_group(&keys, &mut expected);
+
+            let mut q = [P::default(); 8];
+
+            P::spread(&got, &mut q);
+
+            ortho(&mut q);
+
+            rounds_in_one_loop(&mut q, &keys);
+
+            ortho(&mut q);
+
+            P::gather(&q, &mut got);
+
+            assert_eq!(got, expected);
+        }
+
+        let mut inputs = crate::cpu::testing::Inputs::new(0xAE7);
+
+        for n in 0..500 {
+            let key: [u8; 32] = inputs.bytes();
+
+            let key = &key[..if n % 2 == 0 { 16 } else { 32 }];
+
+            let blocks: [[u8; 16]; 4] = core::array::from_fn(|_| inputs.bytes());
+
+            check::<u64>(key, &blocks);
+
+            check::<u32>(key, &blocks);
         }
     }
 
