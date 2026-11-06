@@ -273,6 +273,12 @@ Implements specification 1.1 (draft).
 - The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
   intrinsics are stable.
 
+- FrodoKEM with AES on WebAssembly: the bitsliced rounds of AES run in one loop over the round
+  keys, with the state in memory once per cycle, where LLVM made three copies of the body of the
+  loop. FrodoKEM-976-AES takes 18% less time on AMD Zen 3 under wasmtime and 14% less under Node.js,
+  and about 14% less on Zen 4 under wasmtime; under wasmtime on Emerald Rapids it takes 1.5% more.
+  The machine code of other targets is unchanged. Outputs are unchanged.
+
 ### Fixed
 
 - Constant time on RISC-V and s390x: the compiler turned the masked reductions of ML-DSA and
