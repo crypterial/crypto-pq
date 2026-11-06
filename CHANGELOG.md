@@ -59,6 +59,8 @@ Implements specification 1.1 (draft).
 - SHA-384 and SHA-512 on ARM64 with the SHA-512 instructions: the loop over the blocks of an update
   takes the same one-loop form of the rounds as the loop over the blocks of a one-shot input, which
   took less time per block on Neoverse N2. Outputs are unchanged.
+- BLAKE2b on ARM64 cores that run it on the general registers: the compression reads the IV from
+  memory, not from constants in its code. Outputs are unchanged.
 - BLAKE3 on WebAssembly: the last two inputs of `hash_many` run one after the other, and the whole
   blocks of an extended output go straight into the output, as on 32-bit x86
   ([decision D-84](spec/decisions.md#decision-d-84)). Outputs are unchanged.
