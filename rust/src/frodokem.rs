@@ -372,7 +372,65 @@ fn mul_add_rows(acc: &mut [[u16; BAR]; ROWS], rows: &[u16], s: &[u16], st: &[u8]
         return;
     }
 
-    mul_add_rows_portable(acc, rows, s, n);
+    if cfg!(target_family = "wasm") {
+        mul_add_rows_in_words(acc, rows, s, n);
+    } else {
+        mul_add_rows_portable(acc, rows, s, n);
+    }
+}
+
+// The low 16 bits of each half of a word. For WebAssembly, without SIMD: a 64-bit multiplication of
+// an entry by a word masked with this gives two products of 16-bit entries at once, each in its own
+// half, and four entries load as one word. Under Cranelift on x86-64, about 4 instructions and 0.4
+// memory accesses per product in key generation, against 9 and 3.6 in the portable form; about 6
+// and 1 in encapsulation, against 9.5 and 3.
+const HALVES: u64 = 0x0000_ffff_0000_ffff;
+
+#[inline(always)]
+fn word(x: &[u16; 4]) -> u64 {
+    u64::from(x[0]) | (u64::from(x[1]) << 16) | (u64::from(x[2]) << 32) | (u64::from(x[3]) << 48)
+}
+
+// The low 16 bits of the products of c by the entries in the low 16 bits of each half of x.
+#[inline(always)]
+fn products(c: u64, x: u64, halves: u64) -> u64 {
+    (c * (x & halves)) & halves
+}
+
+// A row's sums stay below n * 2^16 in their halves, so no carry reaches the next sum. The mask is
+// opaque as LLVM, with the constant in sight, splits the words back into 16-bit loads.
+fn mul_add_rows_in_words(acc: &mut [[u16; BAR]; ROWS], rows: &[u16], s: &[u16], n: usize) {
+    let halves = *black_box(&HALVES);
+
+    let (s, _) = s.as_chunks::<4>();
+
+    let (s, _) = s.as_chunks::<2>();
+
+    for (acc, row) in acc.iter_mut().zip(rows.chunks_exact(n)) {
+        let mut sum = [0u64; 4];
+
+        for (&a, [x, y]) in row.iter().zip(s) {
+            let a = u64::from(a);
+
+            let (x, y) = (word(x), word(y));
+
+            sum[0] += products(a, x, halves);
+
+            sum[1] += products(a, x >> 16, halves);
+
+            sum[2] += products(a, y, halves);
+
+            sum[3] += products(a, y >> 16, halves);
+        }
+
+        for (i, acc) in acc.iter_mut().enumerate() {
+            let half = sum[i / 4 * 2 + i % 2] >> (i / 2 % 2 * 32);
+
+            *acc = acc.wrapping_add(half as u16);
+        }
+
+        wipe_unless_optimized!(&mut sum);
+    }
 }
 
 // Column by column, for all the rows at once: the rows' sums do not wait on each other.
@@ -397,7 +455,47 @@ fn mul_add_columns(acc: &mut [u16], rows: &[u16], column: &[[u16; BAR]; ROWS], n
         return;
     }
 
-    mul_add_columns_portable(acc, rows, column, n);
+    if cfg!(target_family = "wasm") {
+        mul_add_columns_in_words(acc, rows, column, n);
+    } else {
+        mul_add_columns_portable(acc, rows, column, n);
+    }
+}
+
+// Two rows of A at a time, n a multiple of 4: each half of a word adds an entry and two masked
+// products, below 3 * 2^16. The four entries of a word go back as separate stores, the low 16 bits
+// of each half.
+fn mul_add_columns_in_words(acc: &mut [u16], rows: &[u16], column: &[[u16; BAR]; ROWS], n: usize) {
+    debug_assert_eq!(n % 4, 0);
+
+    let halves = *black_box(&HALVES);
+
+    for (rows, column) in rows.chunks_exact(2 * n).zip(column.as_chunks::<2>().0) {
+        let (r0, r1) = rows.split_at(n);
+
+        let (r0, r1) = (r0.as_chunks::<4>().0, r1.as_chunks::<4>().0);
+
+        for (k, dst) in acc.chunks_exact_mut(n).take(BAR).enumerate() {
+            let (c0, c1) = (u64::from(column[0][k]), u64::from(column[1][k]));
+
+            for ((d, a), b) in dst.as_chunks_mut::<4>().0.iter_mut().zip(r0).zip(r1) {
+                let (x, a, b) = (word(d), word(a), word(b));
+
+                let low = (x & halves) + products(c0, a, halves) + products(c1, b, halves);
+
+                let high = ((x >> 16) & halves)
+                    + products(c0, a >> 16, halves)
+                    + products(c1, b >> 16, halves);
+
+                *d = [
+                    low as u16,
+                    high as u16,
+                    (low >> 32) as u16,
+                    (high >> 32) as u16,
+                ];
+            }
+        }
+    }
 }
 
 fn mul_add_columns_portable(acc: &mut [u16], rows: &[u16], column: &[[u16; BAR]; ROWS], n: usize) {
@@ -942,6 +1040,59 @@ mod tests {
             mul_add_columns_portable(&mut expected, &rows, &column, n);
 
             assert_eq!(kernel, expected, "S' A, case {case}");
+        }
+    }
+
+    fn check_words(rows: &[u16], s: &[u16], column: &[[u16; BAR]; ROWS], start: u16, n: usize) {
+        let (mut words, mut expected) = ([[start; BAR]; ROWS], [[start; BAR]; ROWS]);
+
+        mul_add_rows_in_words(&mut words, rows, s, n);
+
+        mul_add_rows_portable(&mut expected, rows, s, n);
+
+        assert_eq!(words, expected, "A S, n {n}");
+
+        let mut words = vec![start; BAR * n];
+
+        let mut expected = words.clone();
+
+        mul_add_columns_in_words(&mut words, rows, column, n);
+
+        mul_add_columns_portable(&mut expected, rows, column, n);
+
+        assert_eq!(words, expected, "S' A, n {n}");
+    }
+
+    // The forms for WebAssembly against the portable code, on every target as CI runs none on
+    // WebAssembly: random entries, and constant ones that give the largest products and sums, where
+    // a carry would reach the next entry.
+    #[test]
+    fn matrix_words_match_portable() {
+        let mut inputs = crate::cpu::testing::Inputs::new(0xF20D1);
+
+        for n in [640, 976, 1344, 8, 16, 24] {
+            for (a, c) in [
+                (1, u16::MAX),
+                (u16::MAX, 1),
+                (u16::MAX, u16::MAX),
+                (0, u16::MAX),
+            ] {
+                let rows = vec![a; ROWS * n];
+
+                let s = vec![c; BAR * n];
+
+                check_words(&rows, &s, &[[c; BAR]; ROWS], u16::MAX, n);
+            }
+
+            for _ in 0..4 {
+                let rows = entries(&mut inputs, ROWS * n);
+
+                let s = entries(&mut inputs, BAR * n);
+
+                let column = array::from_fn(|_| array::from_fn(|_| inputs.next() as u16));
+
+                check_words(&rows, &s, &column, inputs.next() as u16, n);
+            }
         }
     }
 
