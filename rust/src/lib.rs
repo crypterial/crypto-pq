@@ -25,7 +25,7 @@
 //! | `lms` | `HSS_LMS` (RFC 8554, NIST SP 800-208) |
 //! | `xmss` | `XMSS`, `XMSS_MT` (RFC 8391, NIST SP 800-208) |
 //! | `sha2` | SHA-2, such as `SHA_256` (FIPS 180-4) |
-//! | `sha3` | SHA-3, SHAKE, cSHAKE and KMAC, such as `SHA3_256` (FIPS 202, NIST SP 800-185) |
+//! | `sha3` | SHA-3, SHAKE, cSHAKE and KMAC, such as `SHA3_256` (FIPS 202, NIST SP 800-185), and Keccak-256 |
 //! | `blake2` | BLAKE2b, BLAKE2s and their MACs, such as `BLAKE2B_512` (RFC 7693) |
 //! | `blake3` | `BLAKE3`, `BLAKE3_256`, `BLAKE3_MAC`, `BLAKE3_KDF` |
 //! | `ascon` | `ASCON_HASH256`, `ASCON_XOF128`, `ASCON_CXOF128` (NIST SP 800-232) |
@@ -427,6 +427,9 @@ pub use hash::{
     BLAKE2B_160, BLAKE2B_256, BLAKE2B_384, BLAKE2B_512, BLAKE2S_128, BLAKE2S_160, BLAKE2S_224,
     BLAKE2S_256,
 };
+
+#[cfg(feature = "sha3")]
+pub use hash::KECCAK_256;
 
 #[cfg(feature = "blake3")]
 pub use hash::{BLAKE3, BLAKE3_256};

@@ -5,9 +5,9 @@ use crypto_pq::{
     BLAKE2B_MAC, BLAKE2S_128, BLAKE2S_160, BLAKE2S_224, BLAKE2S_256, BLAKE2S_MAC, BLAKE3,
     BLAKE3_256, BLAKE3_KDF, BLAKE3_MAC, CSHAKE128, CSHAKE256, Error, HKDF_SHA_256, HKDF_SHA_384,
     HKDF_SHA_512, HMAC_SHA_224, HMAC_SHA_256, HMAC_SHA_384, HMAC_SHA_512, HashAlgorithm,
-    HashOptions, KMAC128, KMAC256, KdfAlgorithm, KdfOptions, MacAlgorithm, MacOptions, SHA_224,
-    SHA_256, SHA_384, SHA_512, SHA_512_224, SHA_512_256, SHA3_224, SHA3_256, SHA3_384, SHA3_512,
-    SHAKE128, SHAKE256, XofAlgorithm, XofOptions, hazmat,
+    HashOptions, KECCAK_256, KMAC128, KMAC256, KdfAlgorithm, KdfOptions, MacAlgorithm, MacOptions,
+    SHA_224, SHA_256, SHA_384, SHA_512, SHA_512_224, SHA_512_256, SHA3_224, SHA3_256, SHA3_384,
+    SHA3_512, SHAKE128, SHAKE256, XofAlgorithm, XofOptions, hazmat,
 };
 use vectors::{Fields, fixture, get, groups, header, hex, records, remove, set, unhex};
 
@@ -22,7 +22,7 @@ enum Algorithm {
     Kdf(KdfAlgorithm),
 }
 
-const HASHES: [HashAlgorithm; 20] = [
+const HASHES: [HashAlgorithm; 21] = [
     SHA_224,
     SHA_256,
     SHA_384,
@@ -33,6 +33,7 @@ const HASHES: [HashAlgorithm; 20] = [
     SHA3_256,
     SHA3_384,
     SHA3_512,
+    KECCAK_256,
     BLAKE2B_160,
     BLAKE2B_256,
     BLAKE2B_384,

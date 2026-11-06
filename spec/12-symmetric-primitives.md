@@ -12,6 +12,10 @@
    same as the shorter value; an absent value is all zeros.
 4. Ascon-Hash256 follows SP 800-232 §5.1. BLAKE3-256 is the BLAKE3 hash mode with a 32-byte output
    ([BLAKE3] §2).
+5. In the terms of FIPS 202 §5.2, Keccak-256(M) = KECCAK[512](M, 256), where SHA3-256(M) =
+   KECCAK[512](M || 01, 256) (§6.1): the padding starts with the byte `01` where SHA3-256's starts
+   with `06` [[D-87](decisions.md#decision-d-87)]. It has no NIST identifier, so it is refused as a
+   pre-hash.
 
 ## 12.2 XOF streaming
 

@@ -24,7 +24,7 @@ its source URL and SHA-256 in the fetch or generation tool that produced it.
 | `rfc/` | test vectors and examples from RFCs |
 | `nist-examples/` | NIST example values for cSHAKE and KMAC |
 | `ascon/` | Ascon known-answer tests |
-| `blake2/`, `derived/` | BLAKE2 known-answer tests and derived parameter tests |
+| `blake2/`, `derived/` | BLAKE2 known-answer tests and derived parameter tests; the derived Keccak-256 vectors [[D-87](decisions.md#decision-d-87)] |
 | `blake3/` | BLAKE3 `test_vectors.json`, pinned ([19.4](#194-official-vector-sets)) |
 | `frodokem/` | FrodoKEM known-answer tests ([19.4](#194-official-vector-sets)) |
 | `xmss/` | XMSS and XMSS^MT vectors produced by the RFC 8391 reference implementation |

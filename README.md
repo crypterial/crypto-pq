@@ -27,6 +27,7 @@ and HKDF. It is `no_std` with `alloc`, has no dependencies, and implements a
 | XMSS, XMSS^MT | RFC 8391, NIST SP 800-208 | the SP 800-208 sets: SHA-2 or SHAKE256, n = 24 or 32; XMSS heights 10, 16, 20; XMSS^MT with 8 height and layer combinations | `xmss` |
 | SHA-2 | FIPS 180-4 | SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224, SHA-512/256 | `sha2` |
 | SHA-3 | FIPS 202, NIST SP 800-185 | SHA3-224, SHA3-256, SHA3-384, SHA3-512, SHAKE128, SHAKE256, cSHAKE128, cSHAKE256, KMAC128, KMAC256 | `sha3` |
+| Keccak-256 | the Keccak submission to the SHA-3 competition | Keccak-256, as Ethereum uses it | `sha3` |
 | BLAKE2 | RFC 7693 | BLAKE2b-160, -256, -384, -512; BLAKE2s-128, -160, -224, -256; BLAKE2b-MAC, BLAKE2s-MAC | `blake2` |
 | BLAKE3 | BLAKE3 specification | BLAKE3 (XOF), BLAKE3-256, BLAKE3-MAC, BLAKE3-KDF | `blake3` |
 | Ascon | NIST SP 800-232 | Ascon-Hash256, Ascon-XOF128, Ascon-CXOF128 | `ascon` |

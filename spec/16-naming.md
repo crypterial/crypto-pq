@@ -16,7 +16,7 @@ its language needs (for example the Rust `_into` forms); such items are listed i
    `SHA-512/224` → `SHA_512_224`; `BLAKE2b-512` → `BLAKE2B_512`; `HKDF-SHA-256` → `HKDF_SHA_256`;
    `HMAC-SHA-256` → `HMAC_SHA_256`; `cSHAKE128` → `CSHAKE128`; `Ascon-Hash256` → `ASCON_HASH256`;
    `FrodoKEM-976-AES` → `FRODOKEM_976_AES`; `eFrodoKEM-976-AES` → `EFRODOKEM_976_AES`;
-   `BLAKE3-256` → `BLAKE3_256`.
+   `BLAKE3-256` → `BLAKE3_256`; `Keccak-256` → `KECCAK_256`.
 2. Exception to item 1: the prefix `HashSLH-DSA` becomes `HASH_SLH_DSA`, following the RFC 9909
    identifiers `id-hash-slh-dsa-…-with-…`: `HashSLH-DSA-SHA2-128s-with-SHA256` →
    `HASH_SLH_DSA_SHA2_128S_WITH_SHA256`.

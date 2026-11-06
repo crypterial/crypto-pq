@@ -17,6 +17,7 @@
 | [FRODO-DRAFT] | P. Longa et al., FrodoKEM: key encapsulation from learning with errors, draft-longa-cfrg-frodokem-03, 2026-06-22 (SHA-256 3b5e5ba02aeb15c633126b27e90cd9cb8a30151a67a74790045c9000aab89b29). Used as the public text of the algorithm standardized by [ISO18033-2-AMD2]. |
 | [BLAKE2] | J.-P. Aumasson, S. Neves, Z. Wilcox-O'Hearn, C. Winnerlein, BLAKE2: simpler, smaller, fast as MD5, 2013 (parameter block, §2.5). |
 | [BLAKE3] | J. O'Connor, J.-P. Aumasson, S. Neves, Z. Wilcox-O'Hearn, the BLAKE3 specification, BLAKE3-team/BLAKE3-specs at commit ac784c9f22a48327782f042ec2f4d8126b3b1744. |
+| [KECCAK] | G. Bertoni, J. Daemen, M. Peeters, G. Van Assche, The Keccak SHA-3 submission, version 3, 2011. |
 | [RFC2104] | HMAC: Keyed-Hashing for Message Authentication. |
 | [RFC2119], [RFC8174] | Key words for use in RFCs to indicate requirement levels. |
 | [RFC4648] | The Base16, Base32, and Base64 Data Encodings. |

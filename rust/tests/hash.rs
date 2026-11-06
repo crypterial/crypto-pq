@@ -3,9 +3,9 @@ mod vectors;
 use crypto_pq::{
     ASCON_CXOF128, ASCON_HASH256, ASCON_XOF128, BLAKE2B_512, BLAKE2S_256, CSHAKE128, CSHAKE256,
     Error, HMAC_SHA_224, HMAC_SHA_256, HMAC_SHA_384, HMAC_SHA_512, HashAlgorithm, HashOptions,
-    ML_DSA_65, MacAlgorithm, MacOptions, PreHash, SHA_224, SHA_256, SHA_384, SHA_512, SHA_512_224,
-    SHA_512_256, SHA3_224, SHA3_256, SHA3_384, SHA3_512, SHAKE128, SHAKE256, SLH_DSA_SHAKE_128F,
-    SignOptions, VerifyOptions, XofAlgorithm, XofOptions, hazmat,
+    KECCAK_256, ML_DSA_65, MacAlgorithm, MacOptions, PreHash, SHA_224, SHA_256, SHA_384, SHA_512,
+    SHA_512_224, SHA_512_256, SHA3_224, SHA3_256, SHA3_384, SHA3_512, SHAKE128, SHAKE256,
+    SLH_DSA_SHAKE_128F, SignOptions, VerifyOptions, XofAlgorithm, XofOptions, hazmat,
 };
 use vectors::{Fields, parallel, pieces, records, unhex};
 
@@ -45,6 +45,34 @@ fn message(record: &Fields) -> Vec<u8> {
     data.truncate(bits / 8);
 
     data
+}
+
+// Keccak-256 has no official set: the values of tools/keccak_vectors.py, whose Keccak-f[1600] agrees
+// with hashlib's SHA3-256 and with published digests, one-shot and streamed in uneven pieces, and
+// never the digest of SHA3-256.
+#[test]
+fn keccak_256_vectors() {
+    let found = records("derived/keccak256.txt", "out");
+
+    assert_eq!(found.len(), 284);
+
+    for (header, record) in found {
+        assert_eq!(header["hash"], KECCAK_256.name());
+
+        let (data, expected) = (unhex(&record["in"]), unhex(&record["out"]));
+
+        assert_eq!(KECCAK_256.digest(&data), expected, "in {}", data.len());
+
+        assert_ne!(SHA3_256.digest(&data), expected, "in {}", data.len());
+
+        let mut hasher = KECCAK_256.create();
+
+        for piece in pieces(&data, &PIECES) {
+            hasher.update(piece);
+        }
+
+        assert_eq!(hasher.digest(), expected, "pieces of {}", data.len());
+    }
 }
 
 #[test]
@@ -587,7 +615,8 @@ fn unapproved_pre_hashes_are_refused() {
             .configure(&XofOptions::default().with_customization(b"x"))
             .unwrap();
 
-        let refused: [PreHash; 7] = [
+        let refused: [PreHash; 8] = [
+            KECCAK_256.into(),
             BLAKE2B_512.into(),
             BLAKE2S_256.into(),
             ASCON_HASH256.into(),

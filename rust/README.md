@@ -38,7 +38,7 @@ crypto-pq = { version = "1", default-features = false, features = ["ml-kem", "ml
 | `lms` | HSS/LMS |
 | `xmss` | XMSS, XMSS^MT |
 | `sha2` | SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224, SHA-512/256 |
-| `sha3` | SHA3-224, SHA3-256, SHA3-384, SHA3-512, SHAKE128, SHAKE256, cSHAKE128, cSHAKE256, KMAC128, KMAC256 |
+| `sha3` | SHA3-224, SHA3-256, SHA3-384, SHA3-512, SHAKE128, SHAKE256, cSHAKE128, cSHAKE256, KMAC128, KMAC256, Keccak-256 |
 | `blake2` | BLAKE2b, BLAKE2s, BLAKE2b-MAC, BLAKE2s-MAC |
 | `blake3` | BLAKE3, BLAKE3-256, BLAKE3-MAC, BLAKE3-KDF |
 | `ascon` | Ascon-Hash256, Ascon-XOF128, Ascon-CXOF128 |
