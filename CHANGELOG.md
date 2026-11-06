@@ -283,6 +283,11 @@ Implements specification 1.1 (draft).
   FrodoKEM-976-AES takes 9 to 23% less time in key generation and up to 16% less in encapsulation and
   decapsulation under wasmtime and Node.js; FrodoKEM-976-SHAKE takes 20 to 34% and 10 to 24% less. The
   machine code of other targets is unchanged. Outputs are unchanged.
+- BLAKE3 of at most a block on WebAssembly: the message goes from its slice into locals and the
+  output from locals to the caller, with no block in memory. `derive_key` keeps its last compression
+  out of its dispatch, and the dispatch of a keyed hash is inlined there, with no frame in linear
+  memory. A hash of at most a block, keyed or not, and `derive_key` take up to 15% less time under
+  wasmtime and Node.js. The machine code of other targets is unchanged. Outputs are unchanged.
 
 ### Fixed
 
