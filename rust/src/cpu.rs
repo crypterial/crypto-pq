@@ -196,6 +196,7 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     #[cfg(any(
         feature = "ml-kem",
         feature = "frodokem",
@@ -210,6 +211,7 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     #[cfg(any(
         feature = "ml-kem",
         feature = "frodokem",
@@ -637,7 +639,21 @@ pub(crate) use x86_64::{
     feature = "xmss",
     feature = "sha3"
 ))]
-pub(crate) use arch::{absorb, digest, keccak_group, permute_many};
+pub(crate) use arch::{keccak_group, permute_many};
+
+#[cfg(all(
+    any(test, not(target_family = "wasm")),
+    any(
+        feature = "ml-kem",
+        feature = "frodokem",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss",
+        feature = "sha3"
+    )
+))]
+pub(crate) use arch::{absorb, digest};
 
 #[cfg(feature = "slh-dsa")]
 pub(crate) use arch::{ONE_BLOCK4, one_block4};
