@@ -19,6 +19,9 @@ Implements specification 1.1 (draft).
   for the key setup once: HMAC and KMAC process no key block again. A `MacKey` may be used from
   several threads at once, does not implement `Clone`, and wipes its keyed state when dropped.
   `Mac` is unchanged.
+- `KECCAK_256`, in the `sha3` feature ([decision D-87](spec/decisions.md#decision-d-87)): Keccak-256,
+  as Ethereum uses it, on the code and the kernels of SHA-3. Its padding differs from that of
+  `SHA3_256`, so the two give different digests. It is refused as a pre-hash.
 
 ### Changed
 
