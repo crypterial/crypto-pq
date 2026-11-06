@@ -56,6 +56,9 @@ Implements specification 1.1 (draft).
   over the other three, and padding blocks, HMAC key blocks and one-shot inputs of under four blocks
   share one copy of it out of line ([decision D-85](spec/decisions.md#decision-d-85)). Outputs are
   unchanged.
+- SHA-384 and SHA-512 on ARM64 with the SHA-512 instructions: the loop over the blocks of an update
+  takes the same one-loop form of the rounds as the loop over the blocks of a one-shot input, which
+  took less time per block on Neoverse N2. Outputs are unchanged.
 - BLAKE3 on WebAssembly: the last two inputs of `hash_many` run one after the other, and the whole
   blocks of an extended output go straight into the output, as on 32-bit x86
   ([decision D-84](spec/decisions.md#decision-d-84)). Outputs are unchanged.
