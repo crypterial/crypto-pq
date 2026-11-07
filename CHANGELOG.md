@@ -117,6 +117,11 @@ Implements specification 1.1 (draft).
   Zen 5, Ice Lake and Emerald Rapids, other than BLAKE2s of 100 and 127 bytes and its MAC of 127
   bytes on Zen 5, which take up to 0.9% more. The machine code of other targets is unchanged.
   Outputs are unchanged.
+- BLAKE2s on 32-bit Arm ([decision D-96](spec/decisions.md#decision-d-96)): a digest or MAC of
+  more than a block runs its key block and last block in registers, with no call of memset or
+  memcpy. Digests of 65 to 192 bytes take 2.9% to 5.7% less time on Neoverse N2, and MACs of 65 to
+  128 bytes 5.7% to 6.6% less. The machine code of other targets is unchanged. Outputs are
+  unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
