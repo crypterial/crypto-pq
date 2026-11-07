@@ -112,6 +112,7 @@ impl KdfAlgorithm {
 
     // RFC 5869, 2.3: L is at most 255 HashLen, and BLAKE3-KDF's at most 2^32 - 1 (SPEC 12.8).
     // Every KDF refuses an empty output.
+    #[cfg_attr(target_family = "wasm", inline(always))]
     const fn check_output(&self, length: usize) -> Result<(), Error> {
         let fits = match self.kind {
             #[cfg(feature = "hkdf")]
@@ -148,6 +149,8 @@ impl KdfAlgorithm {
     }
 
     /// Derives `out.len()` bytes into `out`, as [`derive`](Self::derive) does.
+    // On WebAssembly this is inlined into the caller, where a constant algorithm leaves one call.
+    #[cfg_attr(target_family = "wasm", inline(always))]
     pub fn derive_into(
         &self,
         ikm: &[u8],
@@ -164,6 +167,7 @@ impl KdfAlgorithm {
     }
 
     // BLAKE3-KDF has no salt.
+    #[cfg_attr(target_family = "wasm", inline(always))]
     const fn check_derive(&self, options: &KdfOptions) -> Result<(), Error> {
         match self.kind {
             #[cfg(feature = "blake3")]
@@ -175,25 +179,14 @@ impl KdfAlgorithm {
     // On aarch64 BLAKE3-KDF leaves to its own function, out of HKDF's frame: inlined, it gave HKDF
     // one more saved register pair and a frame of 0x140 bytes against 0xe0.
     #[cfg_attr(target_arch = "aarch64", inline(never))]
+    #[cfg_attr(target_family = "wasm", inline(always))]
     fn derive_unchecked(&self, ikm: &[u8], out: &mut [u8], options: &KdfOptions) {
-        let hash = match self.kind {
+        match &self.kind {
             #[cfg(feature = "hkdf")]
-            KdfKind::Hkdf(hash) => hash,
+            KdfKind::Hkdf(hash) => derive_hkdf(hash, ikm, out, options),
             #[cfg(feature = "blake3")]
-            KdfKind::Blake3 => return derive_blake3(options.info, ikm, out),
-        };
-
-        let _dit = Dit::keyed();
-
-        let mut prk = [0; 64];
-
-        let size = self.prk_size();
-
-        hmac(&hash, options.salt, ikm, &mut prk[..size]);
-
-        expand_unchecked(&hash, &prk[..size], options.info, out);
-
-        wipe(&mut prk);
+            KdfKind::Blake3 => derive_blake3(options.info, ikm, out),
+        }
     }
 
     /// HKDF Extract: the pseudorandom key HMAC(salt, ikm), of [`prk_size`](Self::prk_size) bytes.
@@ -287,6 +280,26 @@ impl KdfAlgorithm {
 
         Ok(hash)
     }
+}
+
+// HKDF under its keyed DIT guard. On WebAssembly derive_unchecked is inlined into callers in other
+// crates, and this function holds the key that it derives, so it stays out of line, compiled in this
+// crate.
+#[cfg(feature = "hkdf")]
+#[cfg_attr(target_family = "wasm", inline(never))]
+#[cfg_attr(not(target_family = "wasm"), inline(always))]
+fn derive_hkdf(hash: &HashAlgorithm, ikm: &[u8], out: &mut [u8], options: &KdfOptions) {
+    let _dit = Dit::keyed();
+
+    let mut prk = [0; 64];
+
+    let size = hash.digest_size();
+
+    hmac(hash, options.salt, ikm, &mut prk[..size]);
+
+    expand_unchecked(hash, &prk[..size], options.info, out);
+
+    wipe(&mut prk);
 }
 
 // BLAKE3-KDF under its keyed DIT guard.

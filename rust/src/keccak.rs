@@ -299,7 +299,9 @@ fn absorb_lanes<const LANES: usize>(state: &mut [u64; 25], data: &[u8], last: &[
 }
 
 // One digest for WebAssembly: the last bytes of the message and the state stay in locals from there
-// to the end, out of memory. False for other rates and for more than a block of output.
+// to the end, out of memory. False for other rates and for more than a block of output. Inlined, so
+// that a constant rate leaves one call in the caller: the functions that it calls are not generic,
+// so that they stay compiled in this crate (D-76).
 #[cfg(any(test, target_family = "wasm"))]
 #[inline(always)]
 fn digest_in_locals(
@@ -313,10 +315,19 @@ fn digest_in_locals(
         return false;
     }
 
-    if data.len() < rate {
-        digest_last(start, rate, suffix, data, out);
-    } else {
+    if data.len() >= rate {
         digest_blocks(start, rate, suffix, data, out);
+
+        return true;
+    }
+
+    match (start, rate) {
+        (Some(start), _) => digest_last(start, rate, suffix, data, out),
+        (None, 72) => first_block_72(suffix, data, out),
+        (None, 104) => first_block_104(suffix, data, out),
+        (None, 136) => first_block_136(suffix, data, out),
+        (None, 144) => first_block_144(suffix, data, out),
+        _ => first_block_168(suffix, data, out),
     }
 
     true
@@ -364,35 +375,17 @@ fn digest_blocks(start: Option<&[u64; 25]>, rate: usize, suffix: u8, data: &[u8]
     wipe(&mut state);
 }
 
+// The last block of a message from a state at a block boundary.
 #[cfg(any(test, target_family = "wasm"))]
 #[inline(never)]
-fn digest_last(start: Option<&[u64; 25]>, rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) {
+fn digest_last(start: &[u64; 25], rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) {
     let (lanes, rest) = data.as_chunks::<8>();
 
-    let mut partial = u64::from(suffix) << (8 * rest.len());
+    let partial = partial_lane(suffix, rest);
 
-    for (i, &byte) in rest.iter().enumerate() {
-        partial |= u64::from(byte) << (8 * i);
-    }
-
-    match start {
-        Some(start) => last_block(|x| start[x], rate, lanes, partial, out),
-        None => last_block(|_| 0, rate, lanes, partial, out),
-    }
-}
-
-#[cfg(any(test, target_family = "wasm"))]
-#[inline(always)]
-fn last_block(
-    start: impl Fn(usize) -> u64,
-    rate: usize,
-    lanes: &[[u8; 8]],
-    partial: u64,
-    out: &mut [u8],
-) {
     macro_rules! lane {
         ($x:literal) => {
-            start($x) ^ message_lane($x, rate, lanes, partial)
+            start[$x] ^ message_lane($x, rate, lanes, partial)
         };
     }
 
@@ -418,12 +411,74 @@ fn last_block(
         lane!(18),
         lane!(19),
         lane!(20),
-        start(21),
-        start(22),
-        start(23),
-        start(24),
+        start[21],
+        start[22],
+        start[23],
+        start[24],
         out,
     );
+}
+
+// A message shorter than a block from the zero state. With a call for each number of whole lanes and
+// a constant rate, no lane is tested at run time: those tests took 2 percent of a digest under
+// wasmtime.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+fn first_block<const RATE: usize>(suffix: u8, data: &[u8], out: &mut [u8]) {
+    let (lanes, rest) = data.as_chunks::<8>();
+
+    let partial = partial_lane(suffix, rest);
+
+    macro_rules! call {
+        ($($x:literal)*) => {
+            last_rounds($(message_lane($x, RATE, lanes, partial),)* 0, 0, 0, 0, out)
+        };
+    }
+
+    macro_rules! arms {
+        ($($whole:literal)*) => {
+            match lanes.len() {
+                $($whole if $whole < RATE / 8 => {
+                    call!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20)
+                })*
+                _ => {}
+            }
+        };
+    }
+
+    arms!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20);
+}
+
+macro_rules! first_blocks {
+    ($($name:ident $rate:literal)*) => {
+        $(
+            #[cfg(any(test, target_family = "wasm"))]
+            #[inline(never)]
+            fn $name(suffix: u8, data: &[u8], out: &mut [u8]) {
+                first_block::<$rate>(suffix, data, out);
+            }
+        )*
+    };
+}
+
+first_blocks!(
+    first_block_72 72
+    first_block_104 104
+    first_block_136 136
+    first_block_144 144
+    first_block_168 168
+);
+
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+fn partial_lane(suffix: u8, rest: &[u8]) -> u64 {
+    let mut partial = u64::from(suffix) << (8 * rest.len());
+
+    for (i, &byte) in rest.iter().enumerate() {
+        partial |= u64::from(byte) << (8 * i);
+    }
+
+    partial
 }
 
 #[cfg(any(test, target_family = "wasm"))]
@@ -1373,11 +1428,32 @@ impl Keccak {
 
     // The first out.len() bytes of output for data, read once. A kernel absorbs and squeezes in
     // one call with the state in its registers.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn digest_into(rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) {
         if digest(None, rate, suffix, data, out) {
             return;
         }
 
+        let mut engine = Self::new(rate, suffix);
+
+        engine.update(data);
+
+        engine.read(out);
+    }
+
+    // On WebAssembly the choice of the form is inlined into the caller, where it folds for a
+    // constant rate: as a function it took 60 instructions of each call.
+    #[cfg(target_family = "wasm")]
+    #[inline(always)]
+    pub(crate) fn digest_into(rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) {
+        if !digest(None, rate, suffix, data, out) {
+            Self::digest_engine(rate, suffix, data, out);
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    #[inline(never)]
+    fn digest_engine(rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) {
         let mut engine = Self::new(rate, suffix);
 
         engine.update(data);
@@ -1481,6 +1557,33 @@ mod tests {
 
         for byte in out {
             *byte = bytes.next().unwrap();
+        }
+    }
+
+    #[test]
+    fn first_blocks_match_the_sponge_for_every_length() {
+        let data = Inputs::new(0x6B66).bytes::<168>();
+
+        for rate in [72, 104, 136, 144, 168] {
+            for length in 0..rate {
+                for (suffix, size) in [(0x06u8, 32), (0x1F, rate)] {
+                    let mut expected = vec![0; size];
+
+                    let mut actual = vec![0xA5; size];
+
+                    sponge(&[0; 25], rate, suffix, &data[..length], &mut expected);
+
+                    assert!(digest_in_locals(
+                        None,
+                        rate,
+                        suffix,
+                        &data[..length],
+                        &mut actual
+                    ));
+
+                    assert_eq!(actual, expected);
+                }
+            }
         }
     }
 

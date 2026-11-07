@@ -1147,22 +1147,6 @@ pub(crate) fn short<W: Word>(h: &[W; 8], key: Option<&[u8]>, data: &[u8], out: &
     wipe(&mut state);
 }
 
-// A digest of at most a block for each word size. These are the functions that a digest in another
-// crate calls: HashAlgorithm::digest_into is inlined there, and a generic function would be compiled
-// there too, at the opt-level of that crate, with the wipes chosen for the opt-level of this one
-// (D-76).
-#[cfg(any(test, target_family = "wasm"))]
-#[inline(never)]
-pub(crate) fn short_digest_b(h: &[u64; 8], data: &[u8], out: &mut [u8]) {
-    short(h, None, data, out);
-}
-
-#[cfg(any(test, target_family = "wasm"))]
-#[inline(never)]
-pub(crate) fn short_digest_s(h: &[u32; 8], data: &[u8], out: &mut [u8]) {
-    short(h, None, data, out);
-}
-
 #[cfg(any(test, target_family = "wasm"))]
 #[inline(always)]
 fn short_last<W: Word>(h: &[W; 8], first: W, message: &[u8], counter: usize, out: &mut [u8]) {
@@ -1385,6 +1369,77 @@ pub(crate) fn digest<W: Word>(h: &[W; 8], data: &[u8], out: &mut [u8]) {
     if !matches!(W::digest_kernel(h, data, out), Kernel::Done) {
         long(h, None, data, out);
     }
+}
+
+// A digest and a MAC for each word size. These are the functions that a caller in another crate
+// calls, with the dispatchers inlined there: a generic function would be compiled there too, at the
+// opt-level of that crate, with the wipes chosen for the opt-level of this one (D-76).
+#[cfg(target_family = "wasm")]
+#[inline(always)]
+pub(crate) fn digest_b(h: &[u64; 8], data: &[u8], out: &mut [u8]) {
+    if fits::<u64>(data, out) {
+        short_digest_b(h, data, out);
+    } else {
+        long_digest_b(h, data, out);
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[inline(always)]
+pub(crate) fn digest_s(h: &[u32; 8], data: &[u8], out: &mut [u8]) {
+    if fits::<u32>(data, out) {
+        short_digest_s(h, data, out);
+    } else {
+        long_digest_s(h, data, out);
+    }
+}
+
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(never)]
+fn short_digest_b(h: &[u64; 8], data: &[u8], out: &mut [u8]) {
+    short(h, None, data, out);
+}
+
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(never)]
+fn short_digest_s(h: &[u32; 8], data: &[u8], out: &mut [u8]) {
+    short(h, None, data, out);
+}
+
+#[cfg(target_family = "wasm")]
+#[inline(never)]
+fn long_digest_b(h: &[u64; 8], data: &[u8], out: &mut [u8]) {
+    digest(h, data, out);
+}
+
+#[cfg(target_family = "wasm")]
+#[inline(never)]
+fn long_digest_s(h: &[u32; 8], data: &[u8], out: &mut [u8]) {
+    digest(h, data, out);
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[inline(always)]
+pub(crate) fn digest_b(h: &[u64; 8], data: &[u8], out: &mut [u8]) {
+    digest(h, data, out);
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[inline(always)]
+pub(crate) fn digest_s(h: &[u32; 8], data: &[u8], out: &mut [u8]) {
+    digest(h, data, out);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(never)]
+pub(crate) fn mac_b(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
+    mac(h, key, data, out);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(never)]
+pub(crate) fn mac_s(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
+    mac(h, key, data, out);
 }
 
 // The keyed hash of data under a key of 1 to 16 * W::BYTES bytes, from the unkeyed chaining value
