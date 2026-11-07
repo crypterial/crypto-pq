@@ -1284,3 +1284,54 @@ this is the class that loses: the rival that leads the row there, krypteia-tesse
 
 The machine code of x86-64, ARM64, armv7, riscv64 and WebAssembly is the same as before, function
 by function, and on i686 only this function changes.
+
+## Decision D-95
+
+On 32-bit x86, BLAKE2b and BLAKE2s copy the whole words of a last block that is neither a whole
+block nor half a block in a function of their own, out of line, which tests the length before each
+word. There the loop before, which every other target keeps, compiled to a call of memcpy. A partial
+last word, half a block and a whole block are read as before. Which words are copied depends only
+on the length of the input, which is public.
+
+This is a form of the portable code that the target chooses at compile time, not CPU-specific code
+under [15.3](15-platforms.md#153-cpu-specific-code).
+
+Rationale: under QEMU, an input runs from 20 fewer to 32 more instructions with the copy here.
+BLAKE2s of 16 bytes runs 1919 instructions against 1930 before, of 63 bytes 1990 against 1959 and
+of 127 bytes 3842 against 3811, and BLAKE2b of 16 bytes 2526 against 2546. The time drops all the
+same: the call of memcpy took more time than the instructions of the copy here. In bench run
+42392545478, in one process where the copies run in turn, the time before over the time here, each
+the median over the processes, as a geometric mean over the 23 rows of BLAKE2b, BLAKE2s and their
+MACs whose last block takes this copy, was 1.046 on Zen 3, 1.023 on Zen 4, 1.016 on Zen 5, 1.046 on
+Ice Lake and 1.105 on Emerald Rapids, and by row 1.019 to 1.072, 1.004 to 1.050, 0.991 to 1.056,
+1.015 to 1.084 and 1.032 to 1.239. Over the 72 rows that run the same instructions as before, the
+other lengths of BLAKE2, BLAKE3, and SHA-256, SHA-512, SHA3-256 and Keccak-256, which the same
+dispatcher of digests runs on 32-bit x86, it was 0.999 to 1.002 in each class and 0.927 to 1.063 by
+row, with rows on both sides of 1 in each class, as the place of the code moves them
+([D-85](#decision-d-85)). Of the 270 rows of BLAKE2 in these five classes, rivals led 41 and 44 in
+the two copies of the code before and 12 and 17 in the two copies here.
+
+Inlined into its callers on every target, in bench run 42388218855, the copy took more time under
+wasmtime, up to 22 percent for BLAKE2s of 48 and 63 bytes on Zen 3, and up to 2.5 percent at those
+lengths on Neoverse N2 in ARM64 code, so the other targets keep the loop. On 32-bit x86 it took Ice
+Lake 7 to 11 ns more, inlined, for BLAKE2s and its MAC of 0, 1, 32 and 64 bytes, which do not run
+it. Out of line, those inputs are among the 72 rows above.
+
+On Zen 5, BLAKE2s of 100 and 127 bytes and its MAC of 127 bytes took 0.0, 0.9 and 0.2 percent more
+time, and there the time follows the place of the code. In each of the three processes, one copy of
+the code here took 1.8 to 2.8 percent less time than the code before for BLAKE2s of 100 and 127
+bytes, and the other copy, the same machine code, 2.4 to 3.8 percent more, while the two copies of
+the code before were within 0.5 percent of each other. 32-bit x86 runs one form of the portable
+code on every processor, and this is the class that does not gain at these lengths: p3-blake2s,
+which leads both rows there, took 179.5 and 180.4 ns, against 184.1 to 184.7 ns before and 179.0 to
+191.5 ns here.
+
+The copy reads the input only below its length and writes only the block of message words, which
+its callers wipe as before. It keeps each word in a register and stores nothing on the stack but a
+saved register. A MAC key that is neither a whole block nor half a block is copied the same way. The
+reference answers of BLAKE2 for inputs of 0 to 255 bytes and the self-test of RFC 7693, whose keys
+are of 16 to 64 bytes, pass on i686 at opt-level 3 and z and in debug builds.
+
+The machine code of x86-64, ARM64, armv7, riscv64 and WebAssembly is the same as before, function
+by function. On i686 the copy is a new function, and the functions that call it change: the
+dispatcher of digests, the finish of the incremental forms of BLAKE2b and BLAKE2s, and their MACs.

@@ -1017,6 +1017,14 @@ fn words<W: Word>(data: &[u8], start: usize, out: &mut [W; 16]) {
 
     let whole = tail.len() / W::BYTES;
 
+    // On 32-bit x86 the loop below is a call of memcpy, which takes more time there than the copy
+    // of whole_words (D-95).
+    #[cfg(target_arch = "x86")]
+    if whole > 0 {
+        whole_words(tail, out);
+    }
+
+    #[cfg(not(target_arch = "x86"))]
     for (word, bytes) in out.iter_mut().zip(tail.chunks_exact(W::BYTES)) {
         *word = W::from_le(bytes);
     }
@@ -1025,6 +1033,21 @@ fn words<W: Word>(data: &[u8], start: usize, out: &mut [W; 16]) {
 
     if rest > 0 {
         out[whole] = W::from_value(last_bytes(data, rest));
+    }
+}
+
+// The whole words of tail into out, each under a test of its own, so that the copy is no call of
+// memcpy. Out of line: inlined, it cost Ice Lake 7 to 11 ns on BLAKE2s inputs of 0, 1, 32 and 64
+// bytes, which do not run it.
+#[cfg(target_arch = "x86")]
+#[inline(never)]
+fn whole_words<W: Word>(tail: &[u8], out: &mut [W; 16]) {
+    let whole = tail.len() / W::BYTES;
+
+    for (i, word) in out.iter_mut().enumerate() {
+        if i < whole {
+            *word = W::from_le(&tail[i * W::BYTES..]);
+        }
     }
 }
 
