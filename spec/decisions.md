@@ -1335,3 +1335,44 @@ are of 16 to 64 bytes, pass on i686 at opt-level 3 and z and in debug builds.
 The machine code of x86-64, ARM64, armv7, riscv64 and WebAssembly is the same as before, function
 by function. On i686 the copy is a new function, and the functions that call it change: the
 dispatcher of digests, the finish of the incremental forms of BLAKE2b and BLAKE2s, and their MACs.
+
+## Decision D-96
+
+On 32-bit Arm, a BLAKE2s digest or MAC of more than a block of data runs its key block and its last
+block in a function of their own, out of line, which reads the bytes into words held in registers
+and the spills of the compiler, with zeros after them, as digests and MACs of at most a block do.
+The blocks between them run in the loop over whole blocks of [D-91](#decision-d-91), as before.
+There each of the two blocks was an array in memory, which took a call of memset to fill and
+another to wipe and a call of memcpy for its words, and the output took one more call of memcpy:
+32-bit Arm has no NEON in its baseline. BLAKE2b and the incremental forms keep the code before.
+
+This is a form of the portable code that the target chooses at compile time, not CPU-specific code
+under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on the length of
+the data, which is public.
+
+Rationale: under QEMU, BLAKE2s of 65 bytes runs 2857 instructions against 3033 before, of 128 bytes
+2911 against 3028 and of 192 bytes 4263 against 4380, and its MAC of 65 bytes 4288 against 4561.
+p3-blake2s runs 2916, 2940 and 4325 instructions for these digests. In bench run 42401270582, on
+armv7 on Neoverse N2, in one process where the copies run in turn, the time before over the time
+here, each the median over the processes, was 1.030 to 1.060 for BLAKE2s of 65, 100, 127, 128, 129
+and 192 bytes, 1.060 to 1.071 for its MAC of 65, 127 and 128 bytes, 1.004 and 1.011 for both of
+1 KiB and 0.998 to 1.000 for both of 16 KiB. Over the 66 rows that run the same code as before, the
+other lengths, BLAKE2b and BLAKE3, it was 0.994 to 1.004. The time of p3-blake2s over the time
+here, for these digests, is 0.998 to 1.015, against 0.944 to 0.975 before, and that of blake2-rfc
+for these MACs is 1.032 to 1.055, against 0.967 to 0.987. Among the rivals counted on 32-bit Arm,
+these two led all nine rows before.
+
+The words and the state in the new function are arrays indexed by constants only, so
+[D-76](#decision-d-76) treats them as register values at opt-level 3, and they are wiped at other
+levels. The state that the loop over whole blocks takes stays in memory and is wiped at the end, as
+before. The function reads the data only below its length and writes only the output. A unit test
+checks this path against the compression of padded blocks, for both word sizes, data of a block and
+a byte to three blocks, keys of a byte, 7 bytes, half a block and a block, and outputs of a byte, 7
+bytes and a whole digest. The reference answers of BLAKE2 for inputs of 0 to 255 bytes and the
+self-test of RFC 7693 pass on armv7 at opt-level 3.
+
+The machine code of x86-64, ARM64, i686, riscv64 and WebAssembly is the same as before, function by
+function. On armv7 the new function has 1618 instructions. Its callers, the dispatcher of digests
+and the MAC of BLAKE2s, have 158 and 280 fewer. The compression of BLAKE2s, now called only by the
+finish of the incremental form, with the final flag, has 32 fewer, and the finish one fewer. The MAC
+of BLAKE2b has a compare in another form and the same number of instructions.

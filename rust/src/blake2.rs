@@ -1129,6 +1129,60 @@ fn in_locals<W: Word>(h: &[W; 8], key: Option<&[u8]>, data: &[u8], out: &mut [u8
     wipe_unless_optimized!(&mut m);
 }
 
+// A digest, or a MAC with its key, of more than a block of data on 32-bit Arm: the key block and
+// the last block in registers and the spills of the compiler, as in in_locals, and the blocks
+// between them in whole_blocks. In memory, each of those two blocks took calls of memset to fill
+// and wipe it and of memcpy for its words, as 32-bit Arm has no NEON in its baseline (D-96).
+#[cfg(any(test, target_arch = "arm"))]
+#[inline(always)]
+fn long_in_locals<W: Word>(h: &[W; 8], key: Option<&[u8]>, data: &[u8], out: &mut [u8]) {
+    let whole = leading::<W>(data.len());
+
+    let mut state = *h;
+
+    let mut before = 0;
+
+    if let Some(key) = key {
+        state[0] = state[0] ^ W::key_length(key.len());
+
+        before = 16 * W::BYTES as u64;
+
+        block_in_locals(&mut state, key, before, None);
+    }
+
+    whole_blocks(&mut state, &data[..whole], u128::from(before));
+
+    let total = before + data.len() as u64;
+
+    block_in_locals(&mut state, &data[whole..], total, Some(out));
+
+    wipe(&mut state);
+}
+
+// One block of at most a block of bytes, zeros after them, into h, counter the bytes up to its end:
+// the last block of the message into out where out is given. One function for the key block and the
+// last block, so that both run one copy of the rounds.
+#[cfg(any(test, target_arch = "arm"))]
+#[inline(never)]
+fn block_in_locals<W: Word>(h: &mut [W; 8], bytes: &[u8], counter: u64, out: Option<&mut [u8]>) {
+    let mut state = *h;
+
+    let mut m = [W::default(); 16];
+
+    short_words(bytes, &mut m);
+
+    rounds::<_, false>(&mut state, &m, u128::from(counter), out.is_some());
+
+    match out {
+        Some(out) => W::store(&state, out),
+        None => *h = state,
+    }
+
+    wipe_unless_optimized!(&mut state);
+
+    wipe_unless_optimized!(&mut m);
+}
+
 // The words of at most a block of bytes, zeros after them. Leaves at the word that takes the last
 // bytes, with no test on the zero words after it.
 #[cfg(any(test, target_arch = "arm"))]
@@ -1534,6 +1588,11 @@ pub(crate) fn digest<W: Word>(h: &[W; 8], data: &[u8], out: &mut [u8]) {
         return in_locals(h, None, data, out);
     }
 
+    #[cfg(target_arch = "arm")]
+    if W::BYTES == 4 {
+        return long_in_locals(h, None, data, out);
+    }
+
     let mut h = *h;
 
     let whole = leading::<W>(data.len());
@@ -1571,6 +1630,11 @@ pub(crate) fn mac<W: Word>(h: &[W; 8], key: &[u8], data: &[u8], out: &mut [u8]) 
     #[cfg(target_arch = "arm")]
     if data.len() <= 16 * W::BYTES {
         return in_locals(h, Some(key), data, out);
+    }
+
+    #[cfg(target_arch = "arm")]
+    if W::BYTES == 4 {
+        return long_in_locals(h, Some(key), data, out);
     }
 
     let mut h = *h;
@@ -2162,8 +2226,8 @@ mod tests {
         in_locals_matches_compress::<u64>();
     }
 
-    // long against compress over more than a block, whole blocks and odd tails, for a digest and for
-    // a MAC, and its loop alone over whole blocks.
+    // long and long_in_locals against compress over more than a block, whole blocks and odd tails,
+    // for a digest and for a MAC, and the loop of long alone over whole blocks.
     fn long_matches_compress<W: Word>() {
         let block = 16 * W::BYTES;
 
@@ -2239,6 +2303,14 @@ mod tests {
                     let mut out = [0xA5; 65];
 
                     long(&W::IV, key, data, &mut out[..size]);
+
+                    assert_eq!(out[..size], all[..size]);
+
+                    assert!(out[size..].iter().all(|&byte| byte == 0xA5));
+
+                    let mut out = [0xA5; 65];
+
+                    long_in_locals(&W::IV, key, data, &mut out[..size]);
 
                     assert_eq!(out[..size], all[..size]);
 
