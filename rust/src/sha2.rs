@@ -168,15 +168,13 @@ fn copy_in_line(to: &mut [u8], from: &[u8]) {
 
     let to = &mut to[..from.len()];
 
-    let mut at = 0;
-
     macro_rules! copy {
         ($($size:literal)*) => {
             $(
                 if from.len() & $size != 0 {
-                    to[at..at + $size].copy_from_slice(&from[at..at + $size]);
+                    let at = from.len() & !(2 * $size - 1);
 
-                    at += $size;
+                    to[at..at + $size].copy_from_slice(&from[at..at + $size]);
                 }
             )*
         };
