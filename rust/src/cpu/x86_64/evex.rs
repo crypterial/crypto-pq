@@ -9,6 +9,7 @@ use core::arch::x86_64::*;
 /// # Safety
 ///
 /// The CPU has AVX-512F and AVX-512VL, and the operating system saves their registers.
+#[cfg(any(feature = "blake2", feature = "blake3"))]
 #[target_feature(enable = "avx2")]
 #[inline]
 #[allow(unsafe_code)]
@@ -47,6 +48,39 @@ pub(super) unsafe fn ror64<const R: u32>(x: __m256i) -> __m256i {
             "vprorq {x}, {x}, {r}",
             x = inout(ymm_reg) x => out,
             r = const R,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+
+    out
+}
+
+/// A sigma function of SHA-512 in each 64-bit lane: x rotated right by R0 and by R1, xored with x
+/// shifted right by S.
+///
+/// # Safety
+///
+/// As for ror32.
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(unsafe_code)]
+pub(super) unsafe fn sigma64<const R0: u32, const R1: u32, const S: u32>(x: __m256i) -> __m256i {
+    let out;
+
+    // SAFETY: as in ror32: two VPRORQ, a VPSRLQ and a VPTERNLOGQ, on registers.
+    unsafe {
+        asm!(
+            "vprorq {out}, {x}, {r0}",
+            "vprorq {a}, {x}, {r1}",
+            "vpsrlq {b}, {x}, {s}",
+            "vpternlogq {out}, {a}, {b}, 0x96",
+            out = out(ymm_reg) out,
+            a = out(ymm_reg) _,
+            b = out(ymm_reg) _,
+            x = in(ymm_reg) x,
+            r0 = const R0,
+            r1 = const R1,
+            s = const S,
             options(pure, nomem, nostack, preserves_flags),
         );
     }

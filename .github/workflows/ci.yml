@@ -339,8 +339,9 @@ jobs:
   # recording its CPU and whether it took the AVX-512VL paths, and the next job fails unless one
   # took the four-state path, one the one-state path, which only the cores in the table of
   # cpu/x86_64.rs one_state() select (AMD Zen 4 and Zen 5, Intel Ice Lake Xeon), one the SHA-256
-  # lane kernel, and one ran BLAKE's AVX-512VL kernels and BLAKE3's 512-bit kernels, which every
-  # CPU with AVX-512 runs (cpu/x86_64/blake_vl_tests.rs).
+  # lane kernel, and one ran BLAKE's AVX-512VL kernels, BLAKE3's 512-bit kernels and the SHA-512
+  # schedule of AVX-512VL, which every CPU with AVX-512 runs (cpu/x86_64/blake_vl_tests.rs and
+  # cpu/x86_64/sha2.rs).
   rust-avx512:
     name: rust AVX-512VL kernels (runner ${{ matrix.copy }})
     runs-on: ubuntu-latest
@@ -365,13 +366,14 @@ jobs:
       - run: cargo test --locked --release --all-features
       - run: |
           mkdir -p "$RUNNER_TEMP/avx512"
-          four=no one=no sha256=no vl=no zmm=no
+          four=no one=no sha256=no sha512=no vl=no zmm=no
           if grep -q 'AVX-512VL: true' "$RUNNER_TEMP/kernels.txt"; then four=yes; fi
           if grep -q 'one state: true' "$RUNNER_TEMP/kernels.txt"; then one=yes; fi
           if grep -q 'SHA-256 lanes: AVX-512VL kernel true' "$RUNNER_TEMP/kernels.txt"; then sha256=yes; fi
+          if grep -q 'SHA-512 schedule: AVX-512VL form true' "$RUNNER_TEMP/kernels.txt"; then sha512=yes; fi
           if grep -Eq 'BLAKE VL kernels: ([1-9][0-9]*) of \1 run' "$RUNNER_TEMP/kernels.txt"; then vl=yes; fi
           if grep -Eq 'BLAKE3 zmm kernels: ([1-9][0-9]*) of \1 run' "$RUNNER_TEMP/kernels.txt"; then zmm=yes; fi
-          echo "four=$four one=$one sha256=$sha256 vl=$vl zmm=$zmm $(lscpu | sed -n 's/^Model name: *//p')" | tee "$RUNNER_TEMP/avx512/copy-${{ matrix.copy }}.txt"
+          echo "four=$four one=$one sha256=$sha256 sha512=$sha512 vl=$vl zmm=$zmm $(lscpu | sed -n 's/^Model name: *//p')" | tee "$RUNNER_TEMP/avx512/copy-${{ matrix.copy }}.txt"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: avx512-${{ matrix.copy }}
@@ -392,6 +394,7 @@ jobs:
           grep -q '^four=yes ' copy-*.txt || { echo "four-state AVX-512VL kernel: $retry"; exit 1; }
           grep -q ' one=yes ' copy-*.txt || { echo "one-state AVX-512VL kernels: $retry"; exit 1; }
           grep -q ' sha256=yes ' copy-*.txt || { echo "SHA-256 AVX-512VL lanes kernel: $retry"; exit 1; }
+          grep -q ' sha512=yes ' copy-*.txt || { echo "SHA-512 AVX-512VL schedule: $retry"; exit 1; }
           grep -q ' vl=yes ' copy-*.txt || { echo "BLAKE AVX-512VL kernels: $retry"; exit 1; }
           grep -q ' zmm=yes ' copy-*.txt || { echo "BLAKE3 512-bit kernels: $retry"; exit 1; }
 

@@ -15,6 +15,7 @@
 use core::arch::x86_64::*;
 use core::mem::MaybeUninit;
 
+use super::evex;
 #[cfg(not(crypto_pq_optimized))]
 use super::memory::words_of;
 use super::memory::{load128, load256, store256, store256_at};
@@ -311,31 +312,47 @@ fn ror64<const RIGHT: i32, const LEFT: i32>(x: __m256i) -> __m256i {
     _mm256_or_si256(_mm256_srli_epi64::<RIGHT>(x), _mm256_slli_epi64::<LEFT>(x))
 }
 
-// Words t and t + 1 of both blocks, x[0] holding words t - 16 and t - 15.
+// Words t and t + 1 of both blocks, x[0] holding words t - 16 and t - 15. With VL, each sigma
+// function takes the 4 instructions of AVX-512VL, against 7 and 9.
 #[target_feature(enable = "avx2")]
 #[inline]
-fn step512(x: &mut [__m256i; 8], k: __m256i) -> __m256i {
-    // A rotation right by eight bytes of each 64-bit lane.
-    let by8 = _mm256_setr_epi8(
-        1, 2, 3, 4, 5, 6, 7, 0, 9, 10, 11, 12, 13, 14, 15, 8, 1, 2, 3, 4, 5, 6, 7, 0, 9, 10, 11,
-        12, 13, 14, 15, 8,
-    );
-
+#[allow(unsafe_code)]
+fn step512<const VL: bool>(x: &mut [__m256i; 8], k: __m256i) -> __m256i {
     let w15 = _mm256_alignr_epi8::<8>(x[1], x[0]);
 
     let w7 = _mm256_alignr_epi8::<8>(x[5], x[4]);
 
-    let sigma0 = _mm256_xor_si256(
-        _mm256_xor_si256(ror64::<1, 63>(w15), _mm256_shuffle_epi8(w15, by8)),
-        _mm256_srli_epi64::<7>(w15),
-    );
+    let sigmas = if VL {
+        // SAFETY: first512 takes VL only on a CPU with the AVX-512 tier.
+        let (sigma0, sigma1) = unsafe {
+            (
+                evex::sigma64::<1, 8, 7>(w15),
+                evex::sigma64::<19, 61, 6>(x[7]),
+            )
+        };
 
-    let sigma1 = _mm256_xor_si256(
-        _mm256_xor_si256(ror64::<19, 45>(x[7]), ror64::<61, 3>(x[7])),
-        _mm256_srli_epi64::<6>(x[7]),
-    );
+        _mm256_add_epi64(sigma0, sigma1)
+    } else {
+        // A rotation right by eight bytes of each 64-bit lane.
+        let by8 = _mm256_setr_epi8(
+            1, 2, 3, 4, 5, 6, 7, 0, 9, 10, 11, 12, 13, 14, 15, 8, 1, 2, 3, 4, 5, 6, 7, 0, 9, 10,
+            11, 12, 13, 14, 15, 8,
+        );
 
-    let w = _mm256_add_epi64(_mm256_add_epi64(x[0], w7), _mm256_add_epi64(sigma0, sigma1));
+        let sigma0 = _mm256_xor_si256(
+            _mm256_xor_si256(ror64::<1, 63>(w15), _mm256_shuffle_epi8(w15, by8)),
+            _mm256_srli_epi64::<7>(w15),
+        );
+
+        let sigma1 = _mm256_xor_si256(
+            _mm256_xor_si256(ror64::<19, 45>(x[7]), ror64::<61, 3>(x[7])),
+            _mm256_srli_epi64::<6>(x[7]),
+        );
+
+        _mm256_add_epi64(sigma0, sigma1)
+    };
+
+    let w = _mm256_add_epi64(_mm256_add_epi64(x[0], w7), sigmas);
 
     *x = [x[1], x[2], x[3], x[4], x[5], x[6], x[7], w];
 
@@ -453,9 +470,29 @@ fn second256(state: &mut [u32; 8], wk: &Schedule256) {
     }
 }
 
+// On a CPU with the AVX-512 tier, the schedule takes the sigma functions of AVX-512VL. Rotations
+// and logic share their ports with the scalar rounds on Intel's cores, and the 8 instructions saved
+// of each step's 22 are 9 percent of the instructions of a lone block and 5 percent of a pair's.
+// The test is made here, once a block or pair, so that the code of the callers stays as it is on
+// every other CPU.
 #[target_feature(enable = "avx2,bmi1,bmi2")]
 #[inline(never)]
 fn first512(state: &mut [u64; 8], a: &[u8; 128], b: &[u8; 128], wk: &mut Schedule512) {
+    if super::has(super::AVX512) {
+        first512_with::<true>(state, a, b, wk);
+    } else {
+        first512_with::<false>(state, a, b, wk);
+    }
+}
+
+#[target_feature(enable = "avx2,bmi1,bmi2")]
+#[inline]
+fn first512_with<const VL: bool>(
+    state: &mut [u64; 8],
+    a: &[u8; 128],
+    b: &[u8; 128],
+    wk: &mut Schedule512,
+) {
     let swap = _mm256_setr_epi8(
         7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13,
         12, 11, 10, 9, 8,
@@ -477,7 +514,7 @@ fn first512(state: &mut [u64; 8], a: &[u8; 128], b: &[u8; 128], wk: &mut Schedul
     for g in (0..40).step_by(4) {
         if g < 32 {
             for i in 0..4 {
-                let words = step512(&mut x, load_k512(8 + g + i));
+                let words = step512::<VL>(&mut x, load_k512(8 + g + i));
 
                 store256_at(words, wk, 8 + g + i);
             }
@@ -1045,5 +1082,64 @@ pub(super) fn compress256_lanes_avx512<const LANES: usize>(
 
         #[cfg(not(crypto_pq_optimized))]
         wipe_apart(words_of(&mut w));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Aligned, Schedule512, first512_with, second512};
+
+    // The schedule with the AVX-512VL sigma functions against its AVX2 form, on pairs of random
+    // blocks with zero and all-ones bytes, and on lone blocks: block A's state after first512,
+    // block B's after the rounds that read the stored schedule.
+    #[test]
+    #[allow(unsafe_code)]
+    fn sha512_schedule_avx512_kernel_matches_avx2() {
+        let ran = super::super::has(super::super::AVX2) && super::super::has(super::super::AVX512);
+
+        std::eprintln!("SHA-512 schedule: AVX-512VL form {ran}");
+
+        if !ran {
+            return;
+        }
+
+        let mut inputs = crate::cpu::testing::Inputs::new(512);
+
+        for round in 0..2000 {
+            let mut blocks = [[0u8; 128]; 2];
+
+            for (i, byte) in blocks.as_flattened_mut().iter_mut().enumerate() {
+                *byte = match (round + i) % 11 {
+                    0 => 0,
+                    1 => 0xFF,
+                    _ => inputs.next() as u8,
+                };
+            }
+
+            let a = blocks[0];
+
+            let b = if round % 4 == 0 { a } else { blocks[1] };
+
+            let start: [[u64; 8]; 2] =
+                core::array::from_fn(|_| core::array::from_fn(|_| inputs.next()));
+
+            let (mut vl, mut avx2) = (start, start);
+
+            let mut wk = Aligned(Schedule512::uninit());
+
+            // SAFETY: the CPU has the AVX2 tier, BMI1 and BMI2, and AVX-512F and AVX-512VL.
+            unsafe { first512_with::<true>(&mut vl[0], &a, &b, &mut wk.0) };
+
+            // SAFETY: as above; first512_with stored the schedule of both blocks.
+            unsafe { second512(&mut vl[1], &wk.0) };
+
+            // SAFETY: as above.
+            unsafe { first512_with::<false>(&mut avx2[0], &a, &b, &mut wk.0) };
+
+            // SAFETY: as above.
+            unsafe { second512(&mut avx2[1], &wk.0) };
+
+            assert_eq!(vl, avx2, "round {round}");
+        }
     }
 }
