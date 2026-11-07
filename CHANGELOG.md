@@ -106,6 +106,11 @@ Implements specification 1.1 (draft).
   geometric mean, and SLH-DSA over SHA2 at the 192-bit and 256-bit levels up to 2.7% less.
   Processors without AVX-512 run the AVX2 form as before, and the machine code of other targets is
   unchanged. Outputs are unchanged.
+- BLAKE3 extended outputs on 32-bit x86 ([decision D-94](spec/decisions.md#decision-d-94)): the
+  compression of each whole block of output adds each message word after b, with less of the state
+  on the stack. Outputs of 1 and 16 KiB take 0.5% to 5.3% less time on Zen 3, Zen 4, Zen 5, Ice
+  Lake, Emerald Rapids and Granite Rapids, and an output of one block up to 4.9% more on Ice Lake.
+  The machine code of other targets is unchanged. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a

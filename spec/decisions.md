@@ -1250,3 +1250,37 @@ lines of assembly. It is the machine code measured, and every other function of 
 machine code before. The machine code of ARM64, i686, armv7, riscv64 and WebAssembly is the same as
 before, function by function. A test compares the state and the stored schedule of both forms on
 random pairs of blocks and on lone blocks, and CI fails unless a runner with AVX-512 ran it.
+
+## Decision D-94
+
+On 32-bit x86, the compression of each whole block of a BLAKE3 extended output adds each message
+word to a after b, where the other compressions add it before b. The sum modulo 2^32 is the same,
+so the outputs are unchanged. The other compressions of 32-bit x86, and every other target, keep
+the order before.
+
+This is a form of the portable code that the target chooses at compile time, not CPU-specific code
+under [15.3](15-platforms.md#153-cpu-specific-code).
+
+Rationale: in this compression the message words come from memory in the rounds of each block of
+output, and added first they made LLVM keep more of the state on the stack. The function had 1338
+instructions against 1287 here, with 122 ALU operations on a stack operand against 109, and a block
+of output ran 1353 instructions against 1302, where purecrypto's portable code runs 1313. In bench
+runs 42379815803 and 42383650346, in one process where the copies run in turn, the time before over
+the time here, each the median over the processes, for outputs of 1 KiB and 16 KiB from 64 bytes,
+was 1.046 to 1.056 on Zen 3 and Zen 4, 1.025 to 1.052 on Ice Lake, 1.025 to 1.032 on Emerald
+Rapids, 1.029 to 1.039 on Granite Rapids and 1.005 to 1.018 on Zen 5. For the output of 16 KiB, the
+time of the rival that leads it, purecrypto, over the time before was 0.977 to 0.979 on Zen 4 and
+0.998 to 1.006 on Zen 3, and over the time here it is 1.030 and 1.050 to 1.053.
+
+An output of one block runs the function once. There the time before over the time here was 0.995
+to 1.015 in the other classes, while on Ice Lake the time follows the place of the code, as in
+[D-85](#decision-d-85). In each process of both runs, the two copies of the code here, the same
+machine code, took 122.2 to 122.6 ns and 133.2 to 133.9 ns. The two copies of the code before took
+116.5 to 118.5 ns in run 42383650346, and 118.3 to 118.6 ns and 135.3 to 135.5 ns in run
+42379815803. At the best place measured for each, 122.2 ns against 116.5 ns, this output takes 4.9
+percent more on Ice Lake. 32-bit x86 runs one form of the portable code on every processor, and
+this is the class that loses: the rival that leads the row there, krypteia-tessera, took 216.5 to
+219.3 ns.
+
+The machine code of x86-64, ARM64, armv7, riscv64 and WebAssembly is the same as before, function
+by function, and on i686 only this function changes.
