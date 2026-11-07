@@ -28,8 +28,9 @@ its result is kept in an atomic.
    [[D-85](decisions.md#decision-d-85)], the short inputs of BLAKE3 on WebAssembly and of BLAKE2
    and BLAKE3 on 32-bit Arm [[D-86](decisions.md#decision-d-86)], the digests of Keccak on
    WebAssembly [[D-88](decisions.md#decision-d-88)], BLAKE2 on WebAssembly and the words of BLAKE2
-   and chains of BLAKE3 on 32-bit Arm [[D-89](decisions.md#decision-d-89)], and the public entries
-   and first block of Keccak on WebAssembly [[D-90](decisions.md#decision-d-90)], are not CPU-specific
+   and chains of BLAKE3 on 32-bit Arm [[D-89](decisions.md#decision-d-89)], the public entries and
+   first block of Keccak on WebAssembly [[D-90](decisions.md#decision-d-90)], and the words of the
+   block loops of BLAKE2 on 32-bit Arm [[D-91](decisions.md#decision-d-91)], are not CPU-specific
    code.
 2. x86-64 tiers: AVX2 with BMI1 and BMI2 and operating-system support for the YMM state (checked with
    XGETBV); AVX-512F and AVX-512VL on top of the AVX2 tier, with operating-system support for the
