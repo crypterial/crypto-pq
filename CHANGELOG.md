@@ -90,6 +90,10 @@ Implements specification 1.1 (draft).
   uses one family leaves the code of the others out: 318 KB to 141 KB in a test module of BLAKE3. On
   other targets the MAC entry is inlined too: keyed BLAKE3 of at most a block takes up to 3% less
   time on x86-64 and up to 6% less on i686. Outputs are unchanged.
+- BLAKE2 on 32-bit Arm ([decision D-91](spec/decisions.md#decision-d-91)): the loops over whole
+  blocks read the message words after the state. Inputs of many blocks take 0.6 to 0.8% less time on
+  Neoverse N2 for BLAKE2s and 0.1% less for BLAKE2b. Inputs of at most a block are unchanged. The
+  machine code of other targets is unchanged. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
