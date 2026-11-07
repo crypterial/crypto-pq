@@ -122,6 +122,15 @@ Implements specification 1.1 (draft).
   memcpy. Digests of 65 to 192 bytes take 2.9% to 5.7% less time on Neoverse N2, and MACs of 65 to
   128 bytes 5.7% to 6.6% less. The machine code of other targets is unchanged. Outputs are
   unchanged.
+- BLAKE2b and BLAKE2s on WebAssembly ([decision D-97](spec/decisions.md#decision-d-97)): the key
+  block and a partial last block of an input of more than a block, and the data of a digest or MAC
+  of at most a block of another length than a block, half a block or none, are padded in aligned
+  groups of 8 bytes, and the rounds of a whole block read them. A digest or MAC of more than a
+  block runs its loop in the function that the dispatcher calls, and a MAC of at most a block runs a
+  function of its own. Over the rows whose code changed, the time drops by 1.5% to 3.7% as a
+  geometric mean in each class measured under wasmtime and Node.js, while some rows take up to 11%
+  more, which the decision lists. The machine code of other targets is unchanged. Outputs are
+  unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
