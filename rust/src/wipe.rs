@@ -67,6 +67,36 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
 ))]
 #[allow(unsafe_code)]
 pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
+    // A group is built in a temporary and copied, and on WebAssembly a temporary of 128 bytes takes a
+    // call of memory.fill, into the runtime. Values of a word and more get a store each.
+    #[inline(always)]
+    fn stores<T: Copy + Default>(values: &mut [T]) {
+        for value in values {
+            // SAFETY: `value` comes from a mutable slice, so it is valid, aligned and exclusive.
+            unsafe { core::ptr::write_volatile(value, T::default()) };
+        }
+    }
+
+    if size_of::<T>() >= 4 {
+        let (wide, rest) = values.as_chunks_mut::<16>();
+
+        let (groups, rest) = rest.as_chunks_mut::<8>();
+
+        for group in wide {
+            stores(group);
+        }
+
+        for group in groups {
+            stores(group);
+        }
+
+        stores(rest);
+
+        compiler_fence(Ordering::SeqCst);
+
+        return;
+    }
+
     let (wide, rest) = values.as_chunks_mut::<16>();
 
     for group in wide {
