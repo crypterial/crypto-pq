@@ -147,6 +147,44 @@ pub(crate) const IV_512_256: [u64; 8] = [
     0x0EB72DDC81C52CA2,
 ];
 
+#[cfg(not(target_family = "wasm"))]
+#[inline(always)]
+fn copy_bytes(to: &mut [u8], from: &[u8]) {
+    to.copy_from_slice(from);
+}
+
+#[cfg(target_family = "wasm")]
+use copy_in_line as copy_bytes;
+
+// copy_from_slice for WebAssembly under a block of SHA-512, with no memory.copy: there it is a call
+// into the runtime, twice per block for updates of 64 bytes. Copies of a constant size are loads and
+// stores.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+fn copy_in_line(to: &mut [u8], from: &[u8]) {
+    if from.len() >= 128 {
+        return to.copy_from_slice(from);
+    }
+
+    let to = &mut to[..from.len()];
+
+    let mut at = 0;
+
+    macro_rules! copy {
+        ($($size:literal)*) => {
+            $(
+                if from.len() & $size != 0 {
+                    to[at..at + $size].copy_from_slice(&from[at..at + $size]);
+
+                    at += $size;
+                }
+            )*
+        };
+    }
+
+    copy!(64 32 16 8 4 2 1);
+}
+
 #[derive(Clone)]
 struct Blocks<const N: usize> {
     bytes: [u8; N],
@@ -167,7 +205,7 @@ impl<const N: usize> Blocks<N> {
         if self.len > 0 {
             let take = (N - self.len).min(data.len());
 
-            self.bytes[self.len..self.len + take].copy_from_slice(&data[..take]);
+            copy_bytes(&mut self.bytes[self.len..self.len + take], &data[..take]);
 
             self.len += take;
 
@@ -192,7 +230,7 @@ impl<const N: usize> Blocks<N> {
 
         // An empty copy would still call memcpy.
         if !rest.is_empty() {
-            self.bytes[..rest.len()].copy_from_slice(rest);
+            copy_bytes(&mut self.bytes[..rest.len()], rest);
         }
 
         self.len = rest.len();
@@ -618,7 +656,7 @@ fn finish256_words(state: &mut [u32; 8], data: &[u8], bits: u64) {
     let (blocks, tail) = data.as_chunks::<64>();
 
     if !blocks.is_empty() {
-        if PEEL256 && blocks.len() < 4 {
+        if PEEL_ROUNDS && blocks.len() < 4 {
             compress256_few(state, blocks);
         } else {
             compress256(state, blocks, &[]);
@@ -632,7 +670,7 @@ fn finish256_words(state: &mut [u32; 8], data: &[u8], bits: u64) {
 
     // On WebAssembly a hash of a single block in all keeps its words in registers, here, and any
     // other padding block runs the one copy of compress256_shared. See D-85.
-    let shared = PEEL256 && (padding > 1 || bits != tail.len() as u64 * 8);
+    let shared = PEEL_ROUNDS && (padding > 1 || bits != tail.len() as u64 * 8);
 
     for block in 0..padding {
         if shared {
@@ -650,7 +688,7 @@ fn finish256_words(state: &mut [u32; 8], data: &[u8], bits: u64) {
                 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
             );
 
-            compress256_words::<PEEL256>(state, &mut w, &mut v);
+            compress256_words::<PEEL_ROUNDS>(state, &mut w, &mut v);
 
             wipe_unless_optimized!(&mut w);
         }
@@ -727,22 +765,39 @@ fn finish512_words(state: &mut [u64; 8], data: &[u8], bits: u128) {
     let (blocks, tail) = data.as_chunks::<128>();
 
     if !blocks.is_empty() {
-        compress512(state, blocks, &[]);
+        if PEEL_ROUNDS && blocks.len() < 4 {
+            compress512_few(state, blocks);
+        } else {
+            compress512(state, blocks, &[]);
+        }
     }
 
     let padding = if tail.len() + 17 > 128 { 2 } else { 1 };
 
     let mut v = [0; 8];
 
+    let shared = PEEL_ROUNDS && (padding > 1 || bits != tail.len() as u128 * 8);
+
     for block in 0..padding {
-        let mut w: [u64; 16] = registers!(
-            |i| padding_word512(tail, bits, padding, 16 * block + i);
-            0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
-        );
+        if shared {
+            let mut w: [u64; 16] = registers!(
+                |i| padding_word512(tail, bits, padding, 16 * block + i);
+                0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+            );
 
-        compress512_words(state, &mut w, &mut v);
+            compress512_shared(state, &w);
 
-        wipe_unless_optimized!(&mut w);
+            wipe(&mut w);
+        } else {
+            let mut w: [u64; 16] = registers!(
+                |i| padding_word512(tail, bits, padding, 16 * block + i);
+                0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+            );
+
+            compress512_words(state, &mut w, &mut v);
+
+            wipe_unless_optimized!(&mut w);
+        }
     }
 
     wipe_unless_optimized!(&mut v);
@@ -819,7 +874,7 @@ fn keyed256_words(iv: &[u32; 8], key: &[u8], states: &mut [[u32; 8]; 2]) {
 
         *state = *iv;
 
-        if PEEL256 {
+        if PEEL_ROUNDS {
             compress256_shared(state, &w);
 
             wipe(&mut w);
@@ -881,9 +936,15 @@ fn keyed512_words(iv: &[u64; 8], key: &[u8], states: &mut [[u64; 8]; 2]) {
 
         *state = *iv;
 
-        compress512_words(state, &mut w, &mut v);
+        if PEEL_ROUNDS {
+            compress512_shared(state, &w);
 
-        wipe_unless_optimized!(&mut w);
+            wipe(&mut w);
+        } else {
+            compress512_words(state, &mut w, &mut v);
+
+            wipe_unless_optimized!(&mut w);
+        }
     }
 
     wipe_unless_optimized!(&mut v);
@@ -1011,7 +1072,7 @@ fn compress256_block(state: &mut [u32; 8], block: &[u8; 64], w: &mut [u32; 16], 
         *word = u32::from_be_bytes(*bytes);
     }
 
-    compress256_words::<PEEL256>(state, w, v);
+    compress256_words::<PEEL_ROUNDS>(state, w, v);
 }
 
 // The compression of one block whose big-endian word t is word(t), into state, for a caller that
@@ -1027,19 +1088,19 @@ pub(crate) fn compress256_built(state: &mut [u32; 8], word: impl Fn(usize) -> u3
 
     let mut v = [0; 8];
 
-    compress256_words::<PEEL256>(state, &mut w, &mut v);
+    compress256_words::<PEEL_ROUNDS>(state, &mut w, &mut v);
 
     wipe_unless_optimized!(&mut w);
 
     wipe_unless_optimized!(&mut v);
 }
 
-// Whether compress256_words runs the rounds of the first group ahead of a loop over the other
-// three, whose pass then holds the schedule of a group and its rounds in one block. Cranelift
-// places each pure value right before its first use, so each word of the schedule then lands next
-// to the round that reads it; under the if of a loop over all four groups, the schedule ran as a
-// block of its own ahead of the rounds.
-const PEEL256: bool = cfg!(target_family = "wasm");
+// Whether compress256_words and compress512_words run the rounds of the first group ahead of a loop
+// over the other groups, whose pass then holds the schedule of a group and its rounds in one block.
+// Cranelift places each pure value right before its first use, so each word of the schedule then
+// lands next to the round that reads it; under the if of a loop over all the groups, the schedule
+// ran as a block of its own ahead of the rounds.
+const PEEL_ROUNDS: bool = cfg!(target_family = "wasm");
 
 // compress256_words on a copy of the block, in one place for the padding blocks and HMAC key blocks
 // of WebAssembly and compress256_few. See D-85.
@@ -1182,7 +1243,7 @@ fn compress256_lanes_each<const LANES: usize>(
             *word = words[lane];
         }
 
-        compress256_words::<false>(&mut state, &mut block, &mut v);
+        compress256_words::<PEEL_ROUNDS>(&mut state, &mut block, &mut v);
 
         for (words, word) in states.iter_mut().zip(&state) {
             words[lane] = *word;
@@ -1541,6 +1602,22 @@ fn compress512_slice(state: &mut [u64; 8], blocks: &[[u8; 128]]) {
     compress512_blocks(state, blocks);
 }
 
+// compress256_few for SHA-512.
+#[inline(never)]
+fn compress512_few(state: &mut [u64; 8], blocks: &[[u8; 128]]) {
+    for block in blocks {
+        let mut w = [0; 16];
+
+        for (word, bytes) in w.iter_mut().zip(block.as_chunks::<8>().0) {
+            *word = u64::from_be_bytes(*bytes);
+        }
+
+        compress512_shared(state, &w);
+
+        wipe(&mut w);
+    }
+}
+
 // compress256_blocks for SHA-512.
 fn compress512_blocks<'a>(state: &mut [u64; 8], blocks: impl IntoIterator<Item = &'a [u8; 128]>) {
     let mut w = [0; 16];
@@ -1587,17 +1664,43 @@ fn compress512_block(state: &mut [u64; 8], block: &[u8; 128], w: &mut [u64; 16],
     compress512_words(state, w, v);
 }
 
+// compress256_shared for SHA-512.
+#[inline(never)]
+fn compress512_shared(state: &mut [u64; 8], w: &[u64; 16]) {
+    let mut w = *w;
+
+    let mut v = [0; 8];
+
+    compress512_words(state, &mut w, &mut v);
+
+    wipe_unless_optimized!(&mut w);
+
+    wipe_unless_optimized!(&mut v);
+}
+
 // compress256_words for SHA-512, with its five groups of rounds.
 #[inline(always)]
 fn compress512_words(state: &mut [u64; 8], w: &mut [u64; 16], v: &mut [u64; 8]) {
     *v = *state;
 
-    for (group, k) in K512.as_chunks::<16>().0.iter().enumerate() {
-        if group > 0 {
-            schedule512(w);
-        }
+    let groups = K512.as_chunks::<16>().0;
 
-        rounds512(v, w, k);
+    if PEEL_ROUNDS {
+        rounds512(v, w, &groups[0]);
+
+        for k in &groups[1..] {
+            schedule512(w);
+
+            rounds512(v, w, k);
+        }
+    } else {
+        for (group, k) in groups.iter().enumerate() {
+            if group > 0 {
+                schedule512(w);
+            }
+
+            rounds512(v, w, k);
+        }
     }
 
     for (word, value) in state.iter_mut().zip(v.iter()) {
@@ -2450,5 +2553,20 @@ mod tests {
         }
 
         std::eprintln!("HMAC: {accelerated} of 1032 cases through a CPU kernel");
+    }
+
+    #[test]
+    fn copy_in_line_copies_every_length() {
+        let from: [u8; 256] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(1));
+
+        for length in 0..=from.len() {
+            let mut to = [0xA5; 257];
+
+            copy_in_line(&mut to[..length], &from[..length]);
+
+            assert_eq!(to[..length], from[..length]);
+
+            assert!(to[length..].iter().all(|&byte| byte == 0xA5));
+        }
     }
 }
