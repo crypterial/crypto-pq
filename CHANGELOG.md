@@ -304,6 +304,10 @@ Implements specification 1.1 (draft).
   next and, for a digest in one call, from the last block to the output. SHA-3 and SHAKE take up to
   19% less time, KMAC up to 16% and ML-KEM up to 10% less under wasmtime and Node.js. The machine code
   of other targets is unchanged. Outputs are unchanged.
+- Keccak digests of at least a block in one call on WebAssembly: the padded last block takes the loop
+  over the other blocks, with no second copy of the rounds, and the state and buffers are set up and
+  wiped with no call into the runtime ([decision D-88](spec/decisions.md#decision-d-88)). Keccak-256
+  of 136 bytes takes up to 19% less time under wasmtime. Outputs are unchanged.
 
 ### Fixed
 
