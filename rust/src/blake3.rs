@@ -58,9 +58,15 @@ const DERIVE_KEY_MATERIAL: u32 = 64;
 pub(crate) const PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
 #[inline(always)]
-fn g(v: &mut [u32; 16], [a, b, c, d]: [usize; 4], x: u32, y: u32) {
-    // The message word is added first: it is ready long before b, whose chain this shortens.
-    v[a] = v[a].wrapping_add(x).wrapping_add(v[b]);
+fn g(v: &mut [u32; 16], abcd: [usize; 4], x: u32, y: u32) {
+    g_order::<true>(v, abcd, x, y);
+}
+
+// g with each message word added before b (WORD_FIRST) or after it. A word added first is ready
+// long before b, and that shortens the chain of b.
+#[inline(always)]
+fn g_order<const WORD_FIRST: bool>(v: &mut [u32; 16], [a, b, c, d]: [usize; 4], x: u32, y: u32) {
+    v[a] = add3::<WORD_FIRST>(v[a], x, v[b]);
 
     v[d] = (v[d] ^ v[a]).rotate_right(16);
 
@@ -68,7 +74,7 @@ fn g(v: &mut [u32; 16], [a, b, c, d]: [usize; 4], x: u32, y: u32) {
 
     v[b] = (v[b] ^ v[c]).rotate_right(12);
 
-    v[a] = v[a].wrapping_add(y).wrapping_add(v[b]);
+    v[a] = add3::<WORD_FIRST>(v[a], y, v[b]);
 
     v[d] = (v[d] ^ v[a]).rotate_right(8);
 
@@ -77,23 +83,33 @@ fn g(v: &mut [u32; 16], [a, b, c, d]: [usize; 4], x: u32, y: u32) {
     v[b] = (v[b] ^ v[c]).rotate_right(7);
 }
 
+// a + x + b, with x added first if WORD_FIRST and last otherwise.
 #[inline(always)]
-fn round(v: &mut [u32; 16], m: &[u32; 16]) {
-    g(v, [0, 4, 8, 12], m[0], m[1]);
+fn add3<const WORD_FIRST: bool>(a: u32, x: u32, b: u32) -> u32 {
+    if WORD_FIRST {
+        a.wrapping_add(x).wrapping_add(b)
+    } else {
+        a.wrapping_add(b).wrapping_add(x)
+    }
+}
 
-    g(v, [1, 5, 9, 13], m[2], m[3]);
+#[inline(always)]
+fn round<const WORD_FIRST: bool>(v: &mut [u32; 16], m: &[u32; 16]) {
+    g_order::<WORD_FIRST>(v, [0, 4, 8, 12], m[0], m[1]);
 
-    g(v, [2, 6, 10, 14], m[4], m[5]);
+    g_order::<WORD_FIRST>(v, [1, 5, 9, 13], m[2], m[3]);
 
-    g(v, [3, 7, 11, 15], m[6], m[7]);
+    g_order::<WORD_FIRST>(v, [2, 6, 10, 14], m[4], m[5]);
 
-    g(v, [0, 5, 10, 15], m[8], m[9]);
+    g_order::<WORD_FIRST>(v, [3, 7, 11, 15], m[6], m[7]);
 
-    g(v, [1, 6, 11, 12], m[10], m[11]);
+    g_order::<WORD_FIRST>(v, [0, 5, 10, 15], m[8], m[9]);
 
-    g(v, [2, 7, 8, 13], m[12], m[13]);
+    g_order::<WORD_FIRST>(v, [1, 6, 11, 12], m[10], m[11]);
 
-    g(v, [3, 4, 9, 14], m[14], m[15]);
+    g_order::<WORD_FIRST>(v, [2, 7, 8, 13], m[12], m[13]);
+
+    g_order::<WORD_FIRST>(v, [3, 4, 9, 14], m[14], m[15]);
 }
 
 // Two independent rounds, G function by G function: a compression is longer than the CPU's window
@@ -144,6 +160,18 @@ fn permute(m: &[u32; 16]) -> [u32; 16] {
 // 64-bit counter, the block's length and the domain flags.
 #[inline(always)]
 fn rounds(cv: &[u32; 8], m: &[u32; 16], counter: u64, length: u32, flags: u32) -> [u32; 16] {
+    rounds_order::<true>(cv, m, counter, length, flags)
+}
+
+// rounds with each message word added before b (WORD_FIRST) or after it.
+#[inline(always)]
+fn rounds_order<const WORD_FIRST: bool>(
+    cv: &[u32; 8],
+    m: &[u32; 16],
+    counter: u64,
+    length: u32,
+    flags: u32,
+) -> [u32; 16] {
     let mut v = [
         cv[0],
         cv[1],
@@ -164,31 +192,31 @@ fn rounds(cv: &[u32; 8], m: &[u32; 16], counter: u64, length: u32, flags: u32) -
     ];
 
     // Written out: as a loop, the permutation became moves between registers and the stack.
-    round(&mut v, m);
+    round::<WORD_FIRST>(&mut v, m);
 
     let m = permute(m);
 
-    round(&mut v, &m);
+    round::<WORD_FIRST>(&mut v, &m);
 
     let m = permute(&m);
 
-    round(&mut v, &m);
+    round::<WORD_FIRST>(&mut v, &m);
 
     let m = permute(&m);
 
-    round(&mut v, &m);
+    round::<WORD_FIRST>(&mut v, &m);
 
     let m = permute(&m);
 
-    round(&mut v, &m);
+    round::<WORD_FIRST>(&mut v, &m);
 
     let m = permute(&m);
 
-    round(&mut v, &m);
+    round::<WORD_FIRST>(&mut v, &m);
 
     let m = permute(&m);
 
-    round(&mut v, &m);
+    round::<WORD_FIRST>(&mut v, &m);
 
     v
 }
@@ -236,6 +264,12 @@ fn compress_portable(
     }
 }
 
+// Whether compress_bytes adds each message word before b, as the other rounds do. Not on i686,
+// where its words come from memory in the rounds of each block of output, and with them first LLVM
+// kept more of the state on the stack: 1338 instructions against 1287, and per block of output 1353
+// executed against 1302, where purecrypto's portable code runs 1313.
+const XOF_WORD_FIRST: bool = !cfg!(target_arch = "x86");
+
 // The output of the compression of the block of words m, as bytes into out, for the whole blocks
 // of an extended output on 32-bit x86 and WebAssembly (root_whole). Its words go into out from the
 // registers that hold them: stored as words and then copied as bytes, they were loaded back with
@@ -250,7 +284,7 @@ fn compress_bytes(
     flags: u32,
     out: &mut [u8; BLOCK],
 ) {
-    let v = rounds(cv, m, counter, length, flags);
+    let v = rounds_order::<XOF_WORD_FIRST>(cv, m, counter, length, flags);
 
     for (i, bytes) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let word = if i < 8 {
