@@ -887,13 +887,14 @@ words stored and then copied took 1.06, 1.09, 1.10 and 1.05 times the time here 
 
 ## Decision D-85
 
-On WebAssembly, the compression of SHA-224 and SHA-256 runs the rounds of the first group of sixteen
-ahead of a loop over the other three groups, so that each pass of the loop holds a group's schedule
-and its rounds in one block. A hash of a single block runs that form inline, with its words in
-registers. Any other padding block, an HMAC key block and the blocks of a one-shot input of under
-four take one copy of it out of line, with the block's words in memory, which are wiped after each
-call at every optimization level. Longer inputs and streaming updates run it in a loop of their own.
-Other targets keep the form before.
+On WebAssembly, the compressions of SHA-2 run the rounds of the first group of sixteen ahead of a
+loop over the other groups, so that each pass of the loop holds a group's schedule and its rounds in
+one block. A hash of a single block runs that form inline, with its words in registers. Any other
+padding block, an HMAC key block and the blocks of a one-shot input of under four take one copy of it
+out of line, with the block's words in memory, which are wiped after each call at every optimization
+level. Longer inputs and streaming updates run it in a loop of their own. Streaming updates copy what
+they buffer as loads and stores, with no `memory.copy`, which is a call into the runtime. Other
+targets keep the form before.
 
 The form is portable code, Rust without intrinsics or assembly that is correct on any target, which
 the target chooses at compile time. It is not CPU-specific code under
@@ -912,10 +913,22 @@ to 7 under wasmtime on Granite Rapids, where 7 XMSS-192 rows stay behind RustCry
 on Zen 5. The lowest rows were the hashes of 0 bytes, at 0.955 under Node.js on Neoverse N2 and 0.972
 under wasmtime on Zen 3, which place decides: the same source at another place in the module was at
 1.05 and 0.995 there. Out of line, as the other padding blocks, those rows held at 0.95 to 0.96 on
-Neoverse N2 at each place measured. Outside WebAssembly the code is the same as before, function by
-function, on x86-64, ARM64, armv7 and i686. A scan of the wasm32 code at opt-levels 1, 2, 3, s and z
-finds no select in these functions, and at opt-level 3 the only branch of the copy out of line is
-its loop counter.
+Neoverse N2 at each place measured.
+
+SHA-384 and SHA-512 took the same form in bench run 42308429929. The time before over the time here,
+as a geometric mean over the 40 rows of SHA-384, SHA-512, HMAC and HKDF, was 1.13 (Emerald Rapids),
+1.12 (Neoverse N2), 1.07 (Zen 4), 1.06 (Zen 5) and 1.01 (Zen 3) under wasmtime, and 1.09, 1.04, 1.05,
+1.06, 1.15 and 1.11 (Emerald Rapids, Ice Lake, Neoverse N2, Zen 3, Zen 4, Zen 5) under Node.js. Over
+the 22 rows of XMSS and XMSS^MT it was 1.03 to 1.18. The rows that rivals led over all of SHA-2 and its
+signatures went from 40 to 6 in the eleven classes measured, where 6 XMSS-192 rows stay behind
+RustCrypto under wasmtime on Emerald Rapids. One class loses: under wasmtime on Zen 3, for the hashes
+of a single block of SHA-384 and SHA-512, this ratio is 0.92 to 0.93, with each rival there still
+behind by 5 percent or more. A WebAssembly module has one form for every CPU, and the ten other
+classes gain 3 to 16 percent on these rows.
+
+Outside WebAssembly the code is the same as before, function by function, on x86-64, ARM64, armv7 and
+i686. A scan of the wasm32 code at opt-levels 1, 2, 3, s and z finds no select in these functions, and
+at opt-level 3 the only branch of the copy out of line is its loop counter.
 
 ## Decision D-86
 

@@ -24,7 +24,7 @@ its result is kept in an atomic.
    [[D-81](decisions.md#decision-d-81)], the BLAKE2b state and BLAKE3 chains of 32-bit x86
    [[D-82](decisions.md#decision-d-82)] and its SHA-512 schedule
    [[D-83](decisions.md#decision-d-83)], and the BLAKE3 chains and output blocks of WebAssembly
-   [[D-84](decisions.md#decision-d-84)] and its SHA-256 compression
+   [[D-84](decisions.md#decision-d-84)] and its SHA-2 compressions
    [[D-85](decisions.md#decision-d-85)], and the short inputs of BLAKE3 on WebAssembly and of BLAKE2
    and BLAKE3 on 32-bit Arm [[D-86](decisions.md#decision-d-86)], are not CPU-specific code.
 2. x86-64 tiers: AVX2 with BMI1 and BMI2 and operating-system support for the YMM state (checked with
