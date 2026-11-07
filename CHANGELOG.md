@@ -94,6 +94,12 @@ Implements specification 1.1 (draft).
   blocks read the message words after the state. Inputs of many blocks take 0.6 to 0.8% less time on
   Neoverse N2 for BLAKE2s and 0.1% less for BLAKE2b. Inputs of at most a block are unchanged. The
   machine code of other targets is unchanged. Outputs are unchanged.
+- Ascon on 32-bit Arm and WebAssembly ([decision D-92](spec/decisions.md#decision-d-92)): a hash,
+  XOF or CXOF in one call takes the padded last block through a permutation of its own.
+  Ascon-Hash256 of 1 KiB takes 1.6% less time on Neoverse N2 in 32-bit Arm code, up to 3.7% less
+  under wasmtime and up to 2.0% less under Node.js. Under wasmtime on Zen 4, inputs of 1 and 16 KiB
+  take up to 1.3% more, and under Node.js on Zen 5, Ascon-CXOF128 of 64 bytes takes 3.6% more. The
+  machine code of other targets is unchanged. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
