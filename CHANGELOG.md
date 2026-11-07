@@ -100,6 +100,12 @@ Implements specification 1.1 (draft).
   under wasmtime and up to 2.0% less under Node.js. Under wasmtime on Zen 4, inputs of 1 and 16 KiB
   take up to 1.3% more, and under Node.js on Zen 5, Ascon-CXOF128 of 64 bytes takes 3.6% more. The
   machine code of other targets is unchanged. Outputs are unchanged.
+- SHA-384 and SHA-512 on x86-64 with AVX-512 ([decision D-93](spec/decisions.md#decision-d-93)):
+  the message schedule computes its sigma functions with AVX-512VL. SHA-384, SHA-512, HMAC and HKDF
+  take 3.5% to 6.9% less time on Ice Lake, Emerald Rapids, Granite Rapids, Zen 4 and Zen 5, as a
+  geometric mean, and SLH-DSA over SHA2 at the 192-bit and 256-bit levels up to 2.7% less.
+  Processors without AVX-512 run the AVX2 form as before, and the machine code of other targets is
+  unchanged. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
