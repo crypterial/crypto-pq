@@ -1150,3 +1150,31 @@ adds about 3.5 KB of functions for its first block: from 310969 to 317376 bytes 
 
 The machine code of x86-64, ARM64, i686, armv7 and riscv64 differs, function by function, only in the
 MAC entries.
+
+## Decision D-91
+
+On 32-bit Arm, the loops over the whole blocks of BLAKE2 read the message words of each block after
+the state, where [D-89](#decision-d-89) reads them ahead of it. They take every block of an
+incremental hash or MAC but the last, and every block of a digest or MAC of more than a block in one
+call but, for BLAKE2s, its key block and last block. Those blocks, and digests and MACs of at most a
+block, keep the order of D-89.
+
+This is a form of the portable code that the target chooses at compile time, not CPU-specific code
+under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on public lengths.
+The words and the state are arrays indexed by constants only, so [D-76](#decision-d-76) treats them
+as register values at opt-level 3, and they are wiped at other levels.
+
+Rationale: in bench run 42357880614, on armv7 on Neoverse N2, the time with the words after the
+state on every path over the time in the order of D-89, as a median over 20 processes, was 0.993 and
+0.992 for BLAKE2s of 1 KiB and 16 KiB, 0.993 and 0.982 for its MAC, and 0.999 for BLAKE2b of both
+lengths, keyed or not. In that order, rows of at most a block took 1.010 to 1.020 for BLAKE2s and
+0.995 to 0.998 for BLAKE2b; the rounds of a lone block are not changed here. The cause was not
+measured. In bench run 42362652467, over 20 processes, this form took 0.994 and 0.992 for BLAKE2s,
+0.993 and 0.992 for its MAC, 0.999 for BLAKE2b and 1.000 to 1.002 for rows of at most a block,
+while a copy of the code before took 0.999 to 1.000 of the time of the other. The time of the
+leading rival over the time here was 0.991 for BLAKE2s of 1 KiB, against 0.984 before, 0.996 for
+16 KiB, against 0.988, and 0.992 for its MAC of 16 KiB, against 0.984.
+
+The two loops, `whole_blocks` of BLAKE2s and `all_blocks` of BLAKE2b, are the machine code measured
+in the first run, and every other function of armv7 is the machine code before. The machine code of
+x86-64, ARM64, i686, riscv64 and WebAssembly is the same as before, function by function.

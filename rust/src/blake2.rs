@@ -10,7 +10,6 @@ use crate::cpu;
 #[cfg(any(test, target_family = "wasm"))]
 use crate::sha2::copy_in_line;
 use crate::sha2::{IV_256, IV_512, last_bytes};
-#[cfg(any(test, target_family = "wasm", target_arch = "arm"))]
 use crate::wipe::registers;
 use crate::wipe::{wipe, wipe_unless_optimized};
 
@@ -500,7 +499,7 @@ fn round<W: Word>(v: &mut [W; 16], m: &[W; 16], s: &[usize; 16]) {
 // before the loop of whole blocks took its own copy of the rounds.
 #[inline(never)]
 pub(crate) fn compress<W: Word>(h: &mut [W; 8], m: &[W; 16], counter: u128, last: bool) {
-    rounds(h, m, counter, last);
+    rounds::<_, false>(h, m, counter, last);
 }
 
 // Whether each block on WebAssembly takes a call of the rounds, with the chaining value in memory.
@@ -512,16 +511,26 @@ pub(crate) fn compress<W: Word>(h: &mut [W; 8], m: &[W; 16], counter: u128, last
 // time on Ice Lake (D-89).
 const BLOCK_CALLS: bool = cfg!(target_family = "wasm");
 
-// compress, inlined into the loop over whole blocks too.
+// Whether the loops over whole blocks read the message words after the state (mix_late), on 32-bit
+// Arm. BLAKE2s messages of 1 and 16 KiB then took 0.7 to 1.8 percent less time on Neoverse N2 and
+// BLAKE2b's 0.1 percent less, but BLAKE2s of at most a block, in in_locals, took 1.0 to 2.0 percent
+// more, so in_locals and compress keep mix (D-91).
+const LOOP_LATE: bool = cfg!(target_arch = "arm");
+
+// compress, inlined into the loop over whole blocks too; mix_late with LATE.
 #[inline(always)]
-fn rounds<W: Word>(h: &mut [W; 8], m: &[W; 16], counter: u128, last: bool) {
+fn rounds<W: Word, const LATE: bool>(h: &mut [W; 8], m: &[W; 16], counter: u128, last: bool) {
     if W::pair_rounds(h, m, counter, last) {
         return;
     }
 
     let mut v = [W::default(); 16];
 
-    mix(h, m, counter, last, &mut v);
+    if LATE {
+        mix_late(h, m, counter, last, &mut v);
+    } else {
+        mix(h, m, counter, last, &mut v);
+    }
 
     for (i, word) in h.iter_mut().enumerate() {
         *word = *word ^ v[i] ^ v[i + 8];
@@ -547,11 +556,40 @@ fn mix<W: Word>(h: &[W; 8], m: &[W; 16], counter: u128, last: bool, v: &mut [W; 
     #[cfg(any(target_family = "wasm", target_arch = "arm"))]
     let m = &words;
 
+    *v = start(h, counter, last);
+
+    every_round(v, m);
+
+    #[cfg(any(target_family = "wasm", target_arch = "arm"))]
+    wipe_unless_optimized!(&mut words);
+}
+
+// mix with the message words read after the state, in the loops over whole blocks on 32-bit Arm
+// (LOOP_LATE).
+#[inline(always)]
+fn mix_late<W: Word>(h: &[W; 8], m: &[W; 16], counter: u128, last: bool, v: &mut [W; 16]) {
+    *v = start(h, counter, last);
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut words: [W; 16] = registers!(
+        |i| m[i];
+        0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+    );
+
+    every_round(v, &words);
+
+    wipe_unless_optimized!(&mut words);
+}
+
+// v at the start of the rounds: the chaining value, the IV, the counter and the flag of the last
+// block.
+#[inline(always)]
+fn start<W: Word>(h: &[W; 8], counter: u128, last: bool) -> [W; 16] {
     let iv = W::IV;
 
     let [t0, t1] = W::counter(counter);
 
-    *v = [
+    [
         h[0],
         h[1],
         h[2],
@@ -568,8 +606,12 @@ fn mix<W: Word>(h: &[W; 8], m: &[W; 16], counter: u128, last: bool, v: &mut [W; 
         iv[5] ^ t1,
         if last { !iv[6] } else { iv[6] },
         iv[7],
-    ];
+    ]
+}
 
+// The rounds on v.
+#[inline(always)]
+fn every_round<W: Word>(v: &mut [W; 16], m: &[W; 16]) {
     // Written out, so that every index into the message is a constant.
     round(v, m, &SIGMA[0]);
 
@@ -596,9 +638,6 @@ fn mix<W: Word>(h: &[W; 8], m: &[W; 16], counter: u128, last: bool, v: &mut [W; 
 
         round(v, m, &SIGMA[1]);
     }
-
-    #[cfg(any(target_family = "wasm", target_arch = "arm"))]
-    wipe_unless_optimized!(&mut words);
 }
 
 // On 32-bit x86 with SSE2 (crypto_pq_pairs, which build.rs sets), BLAKE2b's state goes in pairs
@@ -869,7 +908,7 @@ fn whole_blocks<W: Word>(h: &mut [W; 8], blocks: &[u8], counter: u128) {
 
         counter = counter.wrapping_add(size);
 
-        rounds(&mut state, &m, counter as u128, false);
+        rounds::<_, LOOP_LATE>(&mut state, &m, counter as u128, false);
     }
 
     *h = state;
@@ -937,7 +976,7 @@ fn all_blocks<W: Word>(
         if BLOCK_CALLS {
             compress(&mut state, &m, total, end);
         } else {
-            rounds(&mut state, &m, total, end);
+            rounds::<_, LOOP_LATE>(&mut state, &m, total, end);
         }
     }
 
@@ -1047,7 +1086,7 @@ fn in_locals<W: Word>(h: &[W; 8], key: Option<&[u8]>, data: &[u8], out: &mut [u8
     loop {
         short_words(source, &mut m);
 
-        rounds(&mut state, &m, counter as u128, last);
+        rounds::<_, false>(&mut state, &m, counter as u128, last);
 
         if last {
             break;
@@ -1202,7 +1241,7 @@ fn key_block_half<W: Word>(state: &mut [W; 8], key: &[u8]) {
         0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
     );
 
-    rounds(state, &m, 16 * W::BYTES as u128, false);
+    rounds::<_, false>(state, &m, 16 * W::BYTES as u128, false);
 
     wipe_unless_optimized!(&mut m);
 }
@@ -1321,7 +1360,7 @@ fn block_call<W: Word>(h: &mut [W; 8], block: &[u8], counter: u64, last: bool) {
         0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
     );
 
-    rounds(h, &m, counter as u128, last);
+    rounds::<_, false>(h, &m, counter as u128, last);
 
     wipe_unless_optimized!(&mut m);
 }
