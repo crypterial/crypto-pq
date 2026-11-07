@@ -75,6 +75,14 @@ Implements specification 1.1 (draft).
   locals and the output from locals to the caller, with no block in memory. A hash or MAC of at most
   a block and `derive_key` take up to 15% less time on armv7, and BLAKE3's take up to 15% less under
   wasmtime and Node.js. The machine code of other targets is unchanged. Outputs are unchanged.
+- BLAKE2 on WebAssembly ([decision D-89](spec/decisions.md#decision-d-89)): each block takes a call
+  of one function, with the chaining value in memory, and a digest or MAC of at most a block takes the
+  message straight from its slice into the rounds. Under wasmtime, inputs of many blocks take up to 34%
+  less time on Zen cores and 5% less on Ice Lake, and one block takes 10 to 17% less. Under Node.js one
+  block takes 13 to 21% less, and inputs of many blocks take up to 3% more on Zen cores. On 32-bit Arm
+  the compression reads the message words ahead of the state, 1% less time, and BLAKE3's chains run
+  one at a time. The machine code of x86-64, ARM64, i686 and riscv64 is unchanged. Outputs are
+  unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
