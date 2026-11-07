@@ -161,7 +161,7 @@ use copy_in_line as copy_bytes;
 // stores.
 #[cfg(any(test, target_family = "wasm"))]
 #[inline(always)]
-fn copy_in_line(to: &mut [u8], from: &[u8]) {
+pub(crate) fn copy_in_line(to: &mut [u8], from: &[u8]) {
     if from.len() >= 128 {
         return to.copy_from_slice(from);
     }

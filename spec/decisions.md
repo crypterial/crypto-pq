@@ -981,3 +981,31 @@ No standard publishes vectors for it. `tools/keccak_vectors.py` derives `derived
 its own Keccak-f[1600], written from FIPS 202 §3, which must agree with hashlib's SHA3-256 under the
 padding of SHA-3 and with three published digests under the padding of Keccak. RustCrypto's sha3 0.10.9
 and tiny-keccak 2.0.2 give the same values for each of the 284 messages.
+
+## Decision D-88
+
+On WebAssembly, a digest of Keccak of at least a block in one call copies what follows the whole blocks
+into a block in memory, pads it there, and absorbs it in the loop over the whole blocks, so that one
+copy of the rounds runs every block of the call. That block is a stack buffer, wiped before the
+function returns, as the state is. A digest of less than a block keeps the form that takes its lanes as
+arguments, and streaming updates keep the loop over the blocks. On the same target the zero state, the
+zero block and the wipes of values of four bytes and more are stores of a word each, with no
+`memory.fill`, which is a call into the runtime. A tail of under 128 bytes goes into the block with no
+`memory.copy`. On the other targets without stable inline assembly, and under Miri, `wipe` takes the
+same stores; these targets are not measured, and CI runs this path on them.
+
+The form is portable code that the target chooses at compile time, not CPU-specific code under
+[15.3](15-platforms.md#153-cpu-specific-code). Which path runs, and how many bytes each copy takes,
+depend only on public lengths.
+
+Rationale: with a copy of the rounds of its own for the last block, a digest of a block or two took
+more time than the instructions it runs. In bench run 42329884751, the time before over the time
+here for Keccak-256 of 136 bytes was 1.24 (Ice Lake), 1.13 (Zen 3), 1.07 (Emerald Rapids), 1.07 (Zen
+4), 1.05 (Neoverse N2) and 1.00 (Zen 5) under wasmtime, and 1.01 to 1.04 under Node.js on Emerald
+Rapids, Neoverse N2, Zen 3 and Zen 5. At 1 KiB, as a median over the rows of SHA-3, SHAKE, cSHAKE,
+KMAC and Keccak-256, it was 1.07, 1.03, 1.07, 1.03, 1.01 and 1.01 under wasmtime in that order.
+Hashes of less than a block take the same code as before. At 16 KiB no class loses more than 2
+percent, except under Node.js on Zen 4, where the one job there measured long rows at 0.96; the loop
+of V8 has 621 instructions on ARM64 here and 655 before, so the bench of the release has to confirm
+that class on more jobs. Over the 33 rows of the sponge in eleven classes, rows that rivals led went
+from 7 to 3, and rows ahead by 3 percent or more from 315 to 319.
