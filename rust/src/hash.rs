@@ -323,8 +323,12 @@ impl HashAlgorithm {
 
     /// The digest of `data` written into `out`, which must be [`digest_size`](Self::digest_size)
     /// bytes, without allocating. Fails with [`Error::InvalidLength`] if `out` has another length.
-    // Inline, so that a caller's buffer of the right size needs no check at run time.
-    #[inline]
+    // Inline, so that a caller's buffer of the right size needs no check at run time. On WebAssembly
+    // a hint is not enough: with the arms of digest_unchecked this went out of line, and the call of
+    // one more function, with its frame, took a hash of one block 3 to 10 percent more time under
+    // wasmtime.
+    #[cfg_attr(target_family = "wasm", inline(always))]
+    #[cfg_attr(not(target_family = "wasm"), inline)]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         check_length(out.len(), self.digest_size)?;
 
@@ -362,15 +366,28 @@ impl HashAlgorithm {
     }
 
     // On WebAssembly and 32-bit x86 Ascon-Hash256 leaves before the dispatcher, whose frame holds
-    // the registers and the stack arrays of the digests that it inlines.
+    // the registers and the stack arrays of the digests that it inlines, and on WebAssembly so does
+    // BLAKE2 of at most a block.
     #[cfg(any(target_family = "wasm", target_arch = "x86"))]
-    #[inline]
+    #[cfg_attr(target_family = "wasm", inline(always))]
+    #[cfg_attr(target_arch = "x86", inline)]
     pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
         #[cfg(feature = "ascon")]
         if matches!(self.kind, Kind::Ascon) {
             ascon::digest(&ascon::HASH256, data, out);
 
             return;
+        }
+
+        #[cfg(all(feature = "blake2", target_family = "wasm"))]
+        match &self.kind {
+            Kind::Blake2b(h) if blake2::fits::<u64>(data, out) => {
+                return blake2::short(h, None, data, out);
+            }
+            Kind::Blake2s(h) if blake2::fits::<u32>(data, out) => {
+                return blake2::short(h, None, data, out);
+            }
+            _ => {}
         }
 
         self.digest_other(data, out);
