@@ -252,6 +252,12 @@ Implements specification 1.1 (draft).
   coefficients held in registers, with the twiddle factors and their products by QINV from static
   tables, in place of one pass through memory for each layer. The inverse reduces in its first
   pass and folds its final scaling into its last layer. Outputs are unchanged.
+- ML-KEM on the same targets: the first pass of the NTT reads the coefficients where they are, with
+  no pass to widen them first, and key generation transforms e inside the sums of t, which start
+  from NTT(e), with no canonical form of it and no loop to add it. The array of the sums is wiped
+  after use. Key generation takes 4 to 12 percent less time on i686, armv7, and under wasmtime and
+  Node.js, and encapsulation and decapsulation up to 6 percent less, within 1 percent of before
+  under Node.js on Zen 4. Outputs are unchanged.
 - ML-DSA signing on 32-bit Arm and x86, WebAssembly, RISC-V and s390x runs the constant-time
   passes of SampleInBall on 64-bit words, eight lanes an operation, with the mask of each lane
   taken from its byte of a word by arithmetic that no single bit decides
