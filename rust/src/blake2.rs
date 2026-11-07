@@ -7,9 +7,9 @@
 use core::ops::{BitXor, Not};
 
 use crate::cpu;
-#[cfg(any(test, target_family = "wasm"))]
-use crate::sha2::copy_in_line;
 use crate::sha2::{IV_256, IV_512, last_bytes};
+#[cfg(any(test, target_family = "wasm"))]
+use crate::wipe::Groups;
 use crate::wipe::registers;
 use crate::wipe::{wipe, wipe_unless_optimized};
 
@@ -1224,9 +1224,9 @@ pub(crate) fn fits<W: Word>(data: &[u8], out: &[u8]) -> bool {
 
 // A digest, or a MAC with its key, of at most a block of data on WebAssembly, with no state to copy,
 // fill and wipe for the last block. A message of a whole block, half a block or nothing goes straight
-// from its slice into the rounds, with the zero words folded away. Any other length goes through
-// words in memory, where the rounds read them: inside the rounds, a word that came through a branch
-// took Cranelift most of its 166 spill slots, which cost Zen cores up to 43 percent.
+// from its slice into the rounds, with the zero words folded away. Any other length goes through a
+// padded block in memory, where the rounds read it: inside the rounds, a word that came through a
+// branch took Cranelift most of its 166 spill slots, which cost Zen cores up to 43 percent.
 #[cfg(any(test, target_family = "wasm"))]
 #[inline(always)]
 pub(crate) fn short<W: Word>(h: &[W; 8], key: Option<&[u8]>, data: &[u8], out: &mut [u8]) {
@@ -1275,13 +1275,9 @@ fn short_last<W: Word>(h: &[W; 8], first: W, message: &[u8], counter: usize, out
     } else if message.is_empty() {
         last_known::<W, 0>(h, first, message, counter, out);
     } else {
-        let mut m = zero_words();
-
-        words(message, 0, &mut m);
-
-        last_block(h, first, &m, counter, out);
-
-        wipe(&mut m);
+        in_padded::<W, _>(message, |padded| {
+            last_known::<W, 16>(h, first, padded, counter, out)
+        });
     }
 }
 
@@ -1345,17 +1341,14 @@ fn last_known<W: Word, const K: usize>(
     wipe_unless_optimized!(&mut m);
 }
 
-#[cfg(any(test, target_family = "wasm"))]
-#[inline(never)]
-fn last_block<W: Word>(h: &[W; 8], first: W, m: &[W; 16], counter: usize, out: &mut [u8]) {
-    last_rounds(h, first, m, counter, out);
-}
-
 // A digest or MAC on WebAssembly past what short takes. One copy of the rounds runs every block: a
 // second copy for the last block took Zen 3 about the time of a block more per call, above the
 // instructions it runs. With no runtime call: memory.fill and memory.copy leave the module.
+// Inlined, with its loop and its padded blocks, into the function that the dispatcher calls: out of
+// line, each call took a frame on the stack, and this one and each padded block one in linear
+// memory as well (D-97).
 #[cfg(any(test, target_family = "wasm"))]
-#[inline(never)]
+#[inline(always)]
 pub(crate) fn long<W: Word>(h: &[W; 8], key: Option<&[u8]>, data: &[u8], out: &mut [u8]) {
     let size = 16 * W::BYTES;
 
@@ -1392,25 +1385,116 @@ pub(crate) fn long<W: Word>(h: &[W; 8], key: Option<&[u8]>, data: &[u8], out: &m
     wipe(&mut state);
 }
 
-// in_blocks of at most a block of bytes, with zeros after them.
+// block_call of at most a block of bytes, with zeros after them.
 #[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
 fn padded_block<W: Word>(h: &mut [W; 8], bytes: &[u8], total: u64, last: bool) {
-    // As a constant, the 128 bytes would be memory.fill.
-    let mut block = [core::hint::black_box(0u64).to_ne_bytes(); 16];
+    in_padded::<W, _>(bytes, |block| block_call(h, block, total, last));
+}
 
-    let padded = &mut block.as_flattened_mut()[..16 * W::BYTES];
+// f of the bytes, at most a block, in a padded block of the word's size (in_groups).
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+fn in_padded<W: Word, R>(bytes: &[u8], f: impl FnOnce(&[u8]) -> R) -> R {
+    if W::BYTES == 4 {
+        in_groups::<8, R>(bytes, f)
+    } else {
+        in_groups::<16, R>(bytes, f)
+    }
+}
 
-    copy_in_line(&mut padded[..bytes.len()], bytes);
+// f of N groups of 8 bytes with the bytes, at most 8 * N, and zeros after them, wiped after f. Each
+// group takes one aligned store, so that each word the rounds read comes from one store: a load of
+// a word that two stores wrote waits until both reach the cache, and a copy of pieces of the
+// length's bits, or of two pieces that overlap, wrote such words. No memory.fill or memory.copy,
+// which are calls into the runtime.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+fn in_groups<const N: usize, R>(bytes: &[u8], f: impl FnOnce(&[u8]) -> R) -> R {
+    assert!(bytes.len() <= 8 * N);
 
-    in_blocks::<W>(h, padded, total, last);
+    // As a constant, 128 bytes would be memory.fill.
+    let zero = if N > 8 {
+        core::hint::black_box(0u64)
+    } else {
+        0
+    };
 
-    wipe(&mut block);
+    let mut block = Groups([zero.to_ne_bytes(); N]);
+
+    let (groups, rest) = bytes.as_chunks::<8>();
+
+    let whole = groups.len();
+
+    // The whole groups as two copies of a power of two of them, at least half of them, from the
+    // first group and up to the last, which overlap: each group lands where it belongs, so the
+    // words stay whole.
+    macro_rules! two {
+        ($k:literal) => {{
+            block.0[..$k].copy_from_slice(&groups[..$k]);
+
+            block.0[whole - $k..whole].copy_from_slice(&groups[whole - $k..]);
+        }};
+    }
+
+    if N > 8 && whole >= 8 {
+        two!(8)
+    } else if whole >= 4 {
+        two!(4)
+    } else if whole >= 2 {
+        two!(2)
+    } else if whole == 1 {
+        block.0[0] = groups[0];
+    }
+
+    if !rest.is_empty() {
+        block.0[whole] = partial_group(bytes, rest.len());
+    }
+
+    // Sliced to its length, a constant to LLVM where it runs the functions that f calls: from
+    // as_flattened alone, which serves both sizes of block, it was either size.
+    let result = f(&block.0.as_flattened()[..8 * N]);
+
+    block.wipe();
+
+    result
+}
+
+// The last n bytes, one to seven, and zeros after them: from the last 8 bytes, shifted, where
+// there are 8, and otherwise from two loads that overlap, none past the bytes. The lengths are
+// public, and the bytes take no branch.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+fn partial_group(bytes: &[u8], n: usize) -> [u8; 8] {
+    if let Some(last) = bytes.last_chunk::<8>() {
+        return (u64::from_le_bytes(*last) >> (8 * (8 - n))).to_le_bytes();
+    }
+
+    let bytes = &bytes[bytes.len() - n..];
+
+    let value = if n >= 4 {
+        let low = u32::from_le_bytes(*bytes.first_chunk().expect("4 bytes"));
+
+        let high = u32::from_le_bytes(*bytes.last_chunk().expect("4 bytes"));
+
+        u64::from(low) | u64::from(high) << (8 * (n - 4))
+    } else if n >= 2 {
+        let low = u16::from_le_bytes(*bytes.first_chunk().expect("2 bytes"));
+
+        let high = u16::from_le_bytes(*bytes.last_chunk().expect("2 bytes"));
+
+        u64::from(low) | u64::from(high) << (8 * (n - 2))
+    } else {
+        u64::from(bytes[0])
+    };
+
+    value.to_le_bytes()
 }
 
 // The blocks into h, total the counter at the end of them, the last one the last of the message if
 // last says so.
 #[cfg(any(test, target_family = "wasm"))]
-#[inline(never)]
+#[inline(always)]
 fn in_blocks<W: Word>(h: &mut [W; 8], blocks: &[u8], total: u64, last: bool) {
     let mut rest = blocks;
 
@@ -1534,6 +1618,50 @@ fn long_digest_s(h: &[u32; 8], data: &[u8], out: &mut [u8]) {
     digest(h, data, out);
 }
 
+#[cfg(target_family = "wasm")]
+#[inline(always)]
+pub(crate) fn mac_b(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
+    if fits::<u64>(data, out) {
+        short_mac_b(h, key, data, out);
+    } else {
+        long_mac_b(h, key, data, out);
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[inline(always)]
+pub(crate) fn mac_s(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
+    if fits::<u32>(data, out) {
+        short_mac_s(h, key, data, out);
+    } else {
+        long_mac_s(h, key, data, out);
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[inline(never)]
+fn short_mac_b(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
+    short(h, Some(key), data, out);
+}
+
+#[cfg(target_family = "wasm")]
+#[inline(never)]
+fn short_mac_s(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
+    short(h, Some(key), data, out);
+}
+
+#[cfg(target_family = "wasm")]
+#[inline(never)]
+fn long_mac_b(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
+    mac(h, key, data, out);
+}
+
+#[cfg(target_family = "wasm")]
+#[inline(never)]
+fn long_mac_s(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
+    mac(h, key, data, out);
+}
+
 #[cfg(not(target_family = "wasm"))]
 #[inline(always)]
 pub(crate) fn digest_b(h: &[u64; 8], data: &[u8], out: &mut [u8]) {
@@ -1546,30 +1674,24 @@ pub(crate) fn digest_s(h: &[u32; 8], data: &[u8], out: &mut [u8]) {
     digest(h, data, out);
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_family = "wasm")))]
 #[inline(never)]
 pub(crate) fn mac_b(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
     mac(h, key, data, out);
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_family = "wasm")))]
 #[inline(never)]
 pub(crate) fn mac_s(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
     mac(h, key, data, out);
 }
 
 // The keyed hash of data under a key of 1 to 16 * W::BYTES bytes, from the unkeyed chaining value
-// h of the configured digest length.
+// h of the configured digest length, in one pass over data.
 #[cfg(target_family = "wasm")]
 #[inline(always)]
 pub(crate) fn mac<W: Word>(h: &[W; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
-    if matches!(W::mac_kernel(h, key, data, out), Kernel::Done) {
-        return;
-    }
-
-    if fits::<W>(data, out) {
-        short(h, Some(key), data, out);
-    } else {
+    if !matches!(W::mac_kernel(h, key, data, out), Kernel::Done) {
         long(h, Some(key), data, out);
     }
 }
@@ -2081,6 +2203,28 @@ mod tests {
         one_shot_matches_engine::<u64>();
 
         one_shot_matches_engine::<u32>();
+    }
+
+    // The padded block for every length and both word sizes: the bytes, then zeros.
+    #[test]
+    fn in_padded_holds_bytes_and_zeros() {
+        let bytes: [u8; 128] = core::array::from_fn(|i| (i as u8).wrapping_mul(37) | 1);
+
+        for length in 0..=128 {
+            let check = |block: &[u8], size: usize| {
+                assert_eq!(block.len(), size);
+
+                assert_eq!(block[..length], bytes[..length]);
+
+                assert!(block[length..].iter().all(|&byte| byte == 0));
+            };
+
+            if length <= 64 {
+                in_padded::<u32, _>(&bytes[..length], |block| check(block, 64));
+            }
+
+            in_padded::<u64, _>(&bytes[..length], |block| check(block, 128));
+        }
     }
 
     #[test]
