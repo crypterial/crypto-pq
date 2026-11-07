@@ -1,6 +1,8 @@
 use core::ops::Deref;
 
 use crate::cpu;
+#[cfg(any(test, target_family = "wasm"))]
+use crate::sha2::copy_in_line;
 use crate::sha2::low_bytes;
 use crate::wipe::{registers, wipe, wipe_unless_optimized};
 
@@ -256,30 +258,32 @@ fn absorb_in_locals(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
         return 0;
     }
 
-    absorb_blocks(state, rate, data)
+    absorb_blocks(state, rate, data, &[])
 }
 
 #[cfg(any(test, target_family = "wasm"))]
 #[inline(never)]
-fn absorb_blocks(state: &mut [u64; 25], rate: usize, data: &[u8]) -> usize {
+fn absorb_blocks(state: &mut [u64; 25], rate: usize, data: &[u8], last: &[u8]) -> usize {
     match rate {
-        72 => absorb_lanes::<9>(state, data),
-        104 => absorb_lanes::<13>(state, data),
-        136 => absorb_lanes::<17>(state, data),
-        144 => absorb_lanes::<18>(state, data),
-        168 => absorb_lanes::<21>(state, data),
+        72 => absorb_lanes::<9>(state, data, last),
+        104 => absorb_lanes::<13>(state, data, last),
+        136 => absorb_lanes::<17>(state, data, last),
+        144 => absorb_lanes::<18>(state, data, last),
+        168 => absorb_lanes::<21>(state, data, last),
         _ => 0,
     }
 }
 
 #[cfg(any(test, target_family = "wasm"))]
 #[inline(never)]
-fn absorb_lanes<const LANES: usize>(state: &mut [u64; 25], data: &[u8]) -> usize {
+fn absorb_lanes<const LANES: usize>(state: &mut [u64; 25], data: &[u8], last: &[u8]) -> usize {
     let (blocks, _) = data.as_chunks::<8>().0.as_chunks::<LANES>();
+
+    let (last, _) = last.as_chunks::<8>().0.as_chunks::<LANES>();
 
     let mut a = *state;
 
-    for block in blocks {
+    for block in blocks.iter().chain(last) {
         for x in 0..LANES {
             a[x] ^= u64::from_le_bytes(block[x]);
         }
@@ -318,17 +322,44 @@ fn digest_in_locals(
     true
 }
 
+// A digest of a block or more. The last block, padded in memory, takes the loop of the others: with
+// a copy of the rounds of its own a message of one or two blocks took up to 24 percent more under
+// wasmtime (D-88).
 #[cfg(any(test, target_family = "wasm"))]
 #[inline(never)]
 fn digest_blocks(start: Option<&[u64; 25]>, rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) {
+    // As a constant, the 200 bytes would be memory.fill, a call into the runtime.
     let mut state = match start {
         Some(start) => *start,
-        None => [0; 25],
+        None => [core::hint::black_box(0); 25],
     };
 
-    let absorbed = absorb_in_locals(&mut state, rate, data);
+    let rest = data.len() % rate;
 
-    digest_last(Some(&state), rate, suffix, &data[absorbed..], out);
+    // As a constant, the bytes would be memory.fill.
+    let mut block = [core::hint::black_box(0u64).to_ne_bytes(); 21];
+
+    let padded = &mut block.as_flattened_mut()[..rate];
+
+    copy_in_line(&mut padded[..rest], &data[data.len() - rest..]);
+
+    padded[rest] = suffix;
+
+    padded[rate - 1] |= 0x80;
+
+    absorb_blocks(&mut state, rate, &data[..data.len() - rest], padded);
+
+    let (chunks, tail) = out.as_chunks_mut::<8>();
+
+    for (chunk, lane) in chunks.iter_mut().zip(&state) {
+        *chunk = lane.to_le_bytes();
+    }
+
+    if !tail.is_empty() {
+        low_bytes(state[chunks.len()], tail);
+    }
+
+    wipe(&mut block);
 
     wipe(&mut state);
 }
