@@ -1214,3 +1214,39 @@ The function grows from 2372 to 3419 lines of assembly on armv7 and from 2444 to
 WebAssembly. It is the machine code measured, and every other function of these targets is the
 machine code before. The machine code of x86-64, ARM64, i686 and riscv64 is the same as before,
 function by function.
+
+## Decision D-93
+
+On x86-64 processors of the AVX-512 tier of [15.3](15-platforms.md#153-cpu-specific-code) item 2,
+the message schedule of the AVX2 kernel of SHA-512, which SHA-384, SHA-512/224 and SHA-512/256
+share, computes each sigma function with the instructions of AVX-512VL on 256-bit registers: two
+VPRORQ rotations, a VPSRLQ shift and a VPTERNLOGQ three-input XOR, in place of 7 and 9 instructions
+of AVX2. The kernel tests the tier once for each block or pair of blocks. The rounds and the rest of
+the schedule are as before, and other processors run the AVX2 form.
+
+The instructions work on registers only, with no branch or memory access that depends on the data,
+as in the other AVX-512 kernels of [D-44](#decision-d-44). The build for the constant-time check
+under valgrind leaves the tier out, as it does for those kernels.
+
+Rationale: the rotations and logic of the schedule share their ports with the scalar rounds on
+Intel's cores. The 8 instructions saved of each step's 22 are 9 percent of the instructions of a
+lone block, 2636 against 2903, and 5 percent of a pair's, 4637 against 4904. In bench run
+42362652467, in one process where the copies run in turn, the time before over the time here, as a
+geometric mean over the 40 rows of SHA-384, SHA-512, HMAC and HKDF, was 1.066 and 1.074 for the two
+copies here on Ice Lake, 1.058 on Emerald Rapids, 1.050 on Granite Rapids, 1.037 on Zen 5 and 1.036
+on Zen 4. On Zen 3, which has no AVX-512 and runs the AVX2 form, it was 1.005 and 1.006, and a copy
+of the code before took 0.972 to 1.021 of the time of the other, by row. SLH-DSA over SHA2 at the
+192-bit and 256-bit levels took 0.2 to 2.7 percent less time in the five classes with AVX-512.
+
+Rows that rivals led over those 40 rows in these five classes went from 4 of 200 to 0 in one copy
+and 2 in the other. On Ice Lake, SHA-384 and SHA-512 of nothing were at 1.055 and 1.054 against
+aws-lc-rs in the first copy and at 0.946 and 0.940 in the second, with the same machine code,
+against 0.951 and 0.953 before. As in [D-85](#decision-d-85), the place of the code decides the
+hashes of nothing. Intel's cores with AVX-512 other than Ice Lake, Emerald Rapids and Granite Rapids
+were not measured.
+
+The test of the tier and both forms are in one function out of line, which grows from 415 to 759
+lines of assembly. It is the machine code measured, and every other function of x86-64 is the
+machine code before. The machine code of ARM64, i686, armv7, riscv64 and WebAssembly is the same as
+before, function by function. A test compares the state and the stored schedule of both forms on
+random pairs of blocks and on lone blocks, and CI fails unless a runner with AVX-512 ran it.

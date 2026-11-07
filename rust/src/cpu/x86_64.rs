@@ -65,7 +65,6 @@ mod blake3;
 #[cfg(feature = "blake3")]
 mod blake3_zmm;
 
-#[cfg(any(feature = "blake2", feature = "blake3"))]
 mod evex;
 
 // BLAKE's AVX-512VL kernels on every CPU with AVX512, whatever the dispatch chooses.
