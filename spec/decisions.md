@@ -1376,3 +1376,101 @@ function. On armv7 the new function has 1618 instructions. Its callers, the disp
 and the MAC of BLAKE2s, have 158 and 280 fewer. The compression of BLAKE2s, now called only by the
 finish of the incremental form, with the final flag, has 32 fewer, and the finish one fewer. The MAC
 of BLAKE2b has a compare in another form and the same number of instructions.
+
+## Decision D-97
+
+On WebAssembly, BLAKE2b and BLAKE2s pad a block that holds fewer bytes than a block in groups of 8
+bytes at an address aligned to 8: the key block and a partial last block of a digest or MAC of more
+than a block of data, and the data of one of at most a block whose length is neither a block, half a
+block nor zero. The whole groups of the bytes are copied 8 bytes at a time, in two copies of a power
+of two of groups that overlap, and the bytes of a last partial group are read with loads within the
+input, put together in a register and stored as one group. The other groups are zeros, stored as
+groups, and a volatile store of 8 bytes for each group wipes the block. In a digest or MAC of at
+most a block, the function of the rounds of a whole block reads this block, and the function that
+read the words of these lengths from memory, a second copy of the rounds, is gone. Before, the bytes
+of a block of a longer input went into the zero block in pieces of the bits of their length, and the
+data of at most a block went into words in memory, its whole words through `memory.copy`, a call
+into the runtime.
+
+The loop of a digest or MAC of more than a block, with its key block and its padded blocks, is
+inlined into the function that the dispatcher calls, which calls the function of the rounds for each
+block, as in [D-89](#decision-d-89). Before, the loop and the padding of a block were functions of
+their own, each call with a frame on the stack, and the padding and the function around the loop
+with one in linear memory as well. A MAC dispatches as the digests do: by the lengths, in the
+caller, to a function for at most a block of data or to one for more, each not generic and out of
+line, so that the loop inlined into the one for more adds nothing to the frame of a MAC of at most a
+block. A MAC with a key of other than half a block and at most a block of data keeps the code before
+for its key block.
+
+These are forms of the portable code that the target chooses at compile time, not CPU-specific code
+under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs and which copies run depend
+only on the lengths, which are public.
+
+Rationale: a load of a word that two stores wrote, in part each, cannot take its value from the
+stores and waits until they reach the cache. In pieces of the bits of its length, a tail of 31 bytes
+was stores of 16, 8, 4, 2 and 1 bytes, and the last word of BLAKE2s came from three stores. Here
+each word that the rounds read comes from one store. Under QEMU, in the x86-64 code that wasmtime
+compiles, BLAKE2s of 31 bytes runs 2033 instructions against 2098 before, of 65 bytes 3878 against
+4055 and of 127 bytes 3888 against 4107, and its MAC of 65 bytes 5775 against 6086. BLAKE2b of 31
+bytes runs 2411 against 2461 and of 255 bytes 4676 against 4887, and its MAC of 31 bytes 4410
+against 4509. Digests of no data, half a block and a block run the same instructions of this crate
+as before. In a module of these digests and MACs, the code that wasmtime compiles for the functions
+of BLAKE2 is 113888 bytes against 126496.
+
+In bench run 42410946244, in one process where the copies run in turn, two copies of the code here
+and two of the code before, the time before over the time here, each the geometric mean of its two
+copies of the median over the processes, as a geometric mean over the 47 rows of BLAKE2b, BLAKE2s
+and their MACs whose code changed, was 1.016 on Emerald Rapids, 1.017 on Granite Rapids, 1.023 on
+Neoverse N2, 1.038 on Zen 3, 1.025 on Zen 4 and 1.031 on Zen 5 under wasmtime, and 1.015 on Ice
+Lake, 1.036 on Neoverse N2 and 1.024 on Zen 3, Zen 4 and Zen 5 under Node.js. Over the 25 rows of
+BLAKE3, whose code is the same, it was 0.999 to 1.001 in each class, and by row 0.966 to 1.107. Of
+the 594 rows of BLAKE2 in these eleven classes, rivals led 160 by more than 1 percent in both copies
+of the code before and 59 in both copies here.
+
+A module has one form for every CPU and every runtime, and these rows take more time here against
+both copies of the code before, by more than the rows of BLAKE3 moved in their class. Under Node.js
+on Ice Lake, BLAKE2s of 1, 16, 33, 48 and 63 bytes takes 0.9 to 4.5 percent more, and digests of no
+data 2.9 to 4.9 percent more; p3-blake2s led those five rows by 0.1 to 3.2 percent before and leads
+them by 2.3 to 5.4 percent here. Under Node.js digests of no data take 3.9 to 6.2 percent more on
+Zen 3, BLAKE2b of 64 bytes and its MAC 1.2 to 3.5 percent more on Zen 4, and BLAKE2b of 64 and 128
+bytes and its MAC of 128 bytes up to 2.4 percent more on Zen 5. Under wasmtime BLAKE2s of 64 bytes
+and BLAKE2b of 100 bytes take 1.0 to 1.6 percent more on Granite Rapids, BLAKE2s of 16 KiB 1.7 to
+1.9 percent more on Zen 4, which blake2 now leads by 1.3 percent, and the BLAKE2b MAC of no data 5.9
+to 11 percent more on Zen 3, where rows of BLAKE3 moved by up to 3.5 percent. Rivals lead none of
+the other rows of this list.
+
+Under wasmtime on Zen 4 and Zen 5, the time of BLAKE2s MACs of 1 to 64 bytes follows the place of
+the code, as in [D-85](#decision-d-85). In each process, for each of these rows, one copy of the
+code here took 27 to 35 percent more time than the other, the same machine code, on Zen 5, and 6 to
+13 percent more on Zen 4. The other copy took from 4.9 percent less to 1.8 percent more than the
+copy of the code before that took less, on Zen 5, and from 9.1 percent less to 2.1 percent more on
+Zen 4. In bench run 42388218855 two copies of other code, the same machine code, differed by up to
+28 percent on these rows on Zen 5, and here the two copies of the code before differ by 17 percent
+on the BLAKE2b MAC of 1 byte there. On Zen 3 the two copies of the code here are within 2.3 percent
+of each other on these rows.
+
+Other forms ran more instructions under QEMU: with the chaining value held in the output between
+blocks, 21 to 50 more for each block, and with the loop over the blocks in `chunks_exact`, where the
+length of a block is no longer a constant, 12 more for each call. The padded block is sliced to its
+length where the rounds take it: one function of the standard library flattens the groups of both
+sizes of block, and from it LLVM knew the length of the block of BLAKE2b only as a range, so the
+function of its rounds checked the length.
+
+The block holds bytes of the key or of the data, and it is wiped after the rounds on every path, by
+the wipe module, which [23.2](profiles/rust.md#232-security-mechanics) item 1 lists for unsafe code.
+The loads of the last bytes stay within the input. The dispatchers of the MAC are inlined into the
+caller and test lengths only; what they call is not generic, so the code that reads the key and the
+data is compiled in this crate, at its opt-level, as [D-89](#decision-d-89) requires. With this
+crate at opt-level 3 and the application at 1, on x86-64, ARM64, i686, armv7, riscv64 and
+WebAssembly, what the application's crate compiles of this one is drop glue and `Debug`, as before.
+On WebAssembly the hook for a CPU kernel of a MAC returns that there is none, and the path for at
+most a block no longer calls it, as the digests do not. A unit test checks the padded block of every
+length from none to a block, for both word sizes: its length, the bytes, then zeros. The reference
+answers of BLAKE2 for inputs of 0 to 255 bytes and the self-test of RFC 7693 pass on wasm32-wasip1
+at opt-level 3 and z.
+
+The machine code of x86-64, ARM64, i686, armv7 and riscv64 is the same as before, function by
+function. On WebAssembly the functions of BLAKE2 above change, with `MacAlgorithm::digest` and
+`verify`, into which the dispatch of the MAC is inlined, and the one-call digest of Keccak, whose
+test of the rate against its block takes the other form of the same compare, with the same number of
+instructions.
