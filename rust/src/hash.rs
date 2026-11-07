@@ -365,12 +365,10 @@ impl HashAlgorithm {
         }
     }
 
-    // On WebAssembly and 32-bit x86 Ascon-Hash256 leaves before the dispatcher, whose frame holds
-    // the registers and the stack arrays of the digests that it inlines, and on WebAssembly so does
-    // BLAKE2 of at most a block.
-    #[cfg(any(target_family = "wasm", target_arch = "x86"))]
-    #[cfg_attr(target_family = "wasm", inline(always))]
-    #[cfg_attr(target_arch = "x86", inline)]
+    // On 32-bit x86 Ascon-Hash256 leaves before the dispatcher, whose frame holds the registers and
+    // the stack arrays of the digests that it inlines.
+    #[cfg(target_arch = "x86")]
+    #[inline]
     pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
         #[cfg(feature = "ascon")]
         if matches!(self.kind, Kind::Ascon) {
@@ -379,35 +377,22 @@ impl HashAlgorithm {
             return;
         }
 
-        #[cfg(all(feature = "blake2", target_family = "wasm"))]
-        match &self.kind {
-            Kind::Blake2b(h) if blake2::fits::<u64>(data, out) => {
-                return blake2::short_digest_b(h, data, out);
-            }
-            Kind::Blake2s(h) if blake2::fits::<u32>(data, out) => {
-                return blake2::short_digest_s(h, data, out);
-            }
-            _ => {}
-        }
-
         self.digest_other(data, out);
     }
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_family = "wasm")))]
+    // On WebAssembly this is inlined into the caller, where a constant algorithm leaves one arm: a
+    // dispatcher out of line took 50 instructions of each call.
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86")))]
+    #[cfg_attr(target_family = "wasm", inline(always))]
     pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
         self.digest_other(data, out);
     }
 
-    // Every kind; on aarch64 the kinds other than SHA-2, on WebAssembly and 32-bit x86 those other
-    // than Ascon-Hash256.
-    #[cfg_attr(
-        any(target_arch = "aarch64", target_arch = "x86", target_family = "wasm"),
-        inline(never)
-    )]
-    #[cfg_attr(
-        not(any(target_arch = "aarch64", target_arch = "x86", target_family = "wasm")),
-        inline(always)
-    )]
+    // Every kind; on aarch64 the kinds other than SHA-2, on 32-bit x86 those other than
+    // Ascon-Hash256. On WebAssembly each arm is a call of a function that is not generic, so that
+    // the code that holds the message stays compiled in this crate (D-76).
+    #[cfg_attr(any(target_arch = "aarch64", target_arch = "x86"), inline(never))]
+    #[cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86")), inline(always))]
     fn digest_other(&self, data: &[u8], out: &mut [u8]) {
         match &self.kind {
             #[cfg(any(
@@ -431,9 +416,9 @@ impl HashAlgorithm {
             #[cfg(feature = "sha3")]
             Kind::Keccak => Keccak::digest_into(self.block_size(), KECCAK_SUFFIX, data, out),
             #[cfg(feature = "blake2")]
-            Kind::Blake2b(h) => blake2::digest(h, data, out),
+            Kind::Blake2b(h) => blake2::digest_b(h, data, out),
             #[cfg(feature = "blake2")]
-            Kind::Blake2s(h) => blake2::digest(h, data, out),
+            Kind::Blake2s(h) => blake2::digest_s(h, data, out),
             #[cfg(feature = "ascon")]
             Kind::Ascon => ascon::digest(&ascon::HASH256, data, out),
             #[cfg(feature = "blake3")]
@@ -519,6 +504,7 @@ impl HashAlgorithm {
     }
 
     // The block size of HMAC's key blocks, and the rate of SHA-3.
+    #[cfg_attr(target_family = "wasm", inline(always))]
     pub(crate) const fn block_size(&self) -> usize {
         match self.kind {
             #[cfg(any(
@@ -857,9 +843,10 @@ impl XofAlgorithm {
     /// `out.len()` bytes of output for `data`, without allocating. Fails with
     /// [`Error::InvalidLength`] if `out` is longer than 2^32 - 1 bytes or, for the Ascon XOFs,
     /// empty.
-    // Inline on WebAssembly and 32-bit x86, so that the Ascon arms of digest_unchecked are inline
-    // in the caller.
-    #[cfg_attr(any(target_family = "wasm", target_arch = "x86"), inline)]
+    // Inline on WebAssembly and 32-bit x86, so that the arms of digest_unchecked are inline in the
+    // caller.
+    #[cfg_attr(target_family = "wasm", inline(always))]
+    #[cfg_attr(target_arch = "x86", inline)]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         self.check_output(out.len())?;
 
@@ -868,9 +855,8 @@ impl XofAlgorithm {
         Ok(())
     }
 
-    // On WebAssembly and 32-bit x86 the Ascon XOFs leave before the dispatcher, as in
-    // HashAlgorithm's.
-    #[cfg(any(target_family = "wasm", target_arch = "x86"))]
+    // On 32-bit x86 the Ascon XOFs leave before the dispatcher, as in HashAlgorithm's.
+    #[cfg(target_arch = "x86")]
     #[inline]
     pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
         match &self.kind {
@@ -883,14 +869,15 @@ impl XofAlgorithm {
         }
     }
 
-    #[cfg(not(any(target_family = "wasm", target_arch = "x86")))]
+    #[cfg(not(target_arch = "x86"))]
+    #[cfg_attr(target_family = "wasm", inline(always))]
     pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
         self.digest_other(data, out);
     }
 
-    // Every kind; on WebAssembly and 32-bit x86 those other than the Ascon XOFs.
-    #[cfg_attr(any(target_family = "wasm", target_arch = "x86"), inline(never))]
-    #[cfg_attr(not(any(target_family = "wasm", target_arch = "x86")), inline(always))]
+    // Every kind; on 32-bit x86 those other than the Ascon XOFs.
+    #[cfg_attr(target_arch = "x86", inline(never))]
+    #[cfg_attr(not(target_arch = "x86"), inline(always))]
     fn digest_other(&self, data: &[u8], out: &mut [u8]) {
         match &self.kind {
             #[cfg(feature = "sha3")]

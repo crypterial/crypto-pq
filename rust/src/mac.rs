@@ -319,6 +319,8 @@ impl MacAlgorithm {
 
     // RFC 7693, 2.1: a BLAKE2 key has 1 to 64 (BLAKE2b) or 32 (BLAKE2s) bytes, and a BLAKE3 key
     // exactly 32. HMAC and KMAC take keys of any length.
+    #[cfg_attr(target_family = "wasm", inline(always))]
+    #[cfg_attr(not(target_family = "wasm"), inline)]
     const fn key_sizes(&self) -> (usize, usize) {
         match self.kind {
             #[cfg(feature = "blake2")]
@@ -331,12 +333,16 @@ impl MacAlgorithm {
         }
     }
 
+    #[cfg_attr(target_family = "wasm", inline(always))]
+    #[cfg_attr(not(target_family = "wasm"), inline)]
     const fn key_fits(&self, key: &[u8]) -> bool {
         let (minimum, maximum) = self.key_sizes();
 
         key.len() >= minimum && key.len() <= maximum
     }
 
+    #[cfg_attr(target_family = "wasm", inline(always))]
+    #[cfg_attr(not(target_family = "wasm"), inline)]
     const fn check_key(&self, key: &[u8]) -> Result<(), Error> {
         if self.key_fits(key) {
             Ok(())
@@ -362,16 +368,33 @@ impl MacAlgorithm {
     /// The tag of `data` under `key`, written into `out`, which must be
     /// [`digest_size`](Self::digest_size) bytes. Fails with [`Error::InvalidLength`] if the key
     /// length is not accepted or `out` has another length.
+    // Inline, so that a constant algorithm needs no test of its kind and of a key of a constant
+    // length at run time: these took 3 to 6 percent of a MAC of a block on WebAssembly and of a keyed
+    // BLAKE3 on x86-64. What holds the key is compiled in this crate: each arm of mac is a call.
+    #[cfg_attr(target_family = "wasm", inline(always))]
+    #[cfg_attr(not(target_family = "wasm"), inline)]
     pub fn digest_into(&self, key: &[u8], data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         self.check_key(key)?;
 
         check_length(out.len(), self.size)?;
 
-        let _dit = Dit::keyed();
+        #[cfg(target_arch = "aarch64")]
+        self.mac_keyed(key, data, out);
 
+        #[cfg(not(target_arch = "aarch64"))]
         self.mac(key, data, out);
 
         Ok(())
+    }
+
+    // mac under the keyed DIT guard. Out of line, as the guard reads a flag of this crate: from code
+    // inlined in another crate each read of it, here too, would go through the GOT.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(never)]
+    fn mac_keyed(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
+        let _dit = Dit::keyed();
+
+        self.mac(key, data, out);
     }
 
     /// An incremental MAC under `key`.
@@ -570,7 +593,27 @@ impl MacAlgorithm {
     // percent of the instructions of a keyed BLAKE3 of an empty message.
     #[cfg(not(target_arch = "aarch64"))]
     #[cfg_attr(any(target_family = "wasm", target_arch = "arm"), inline(always))]
+    #[cfg_attr(not(any(target_family = "wasm", target_arch = "arm")), inline)]
     fn mac(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
+        match &self.kind {
+            #[cfg(feature = "blake2")]
+            MacKind::Blake2b(h) => blake2::mac_b(h, key, data, out),
+            #[cfg(feature = "blake2")]
+            MacKind::Blake2s(h) => blake2::mac_s(h, key, data, out),
+            #[cfg(feature = "blake3")]
+            MacKind::Blake3 => blake3::keyed_hash(key, data, out),
+            #[allow(unreachable_patterns)]
+            _ => self.mac_standard(key, data, out),
+        }
+    }
+
+    // HMAC and KMAC. Out of line on x86 and RISC-V: called from code inlined in another crate, hmac
+    // would be exported, and its callers in this crate would call it through the GOT and, on 32-bit
+    // x86, with its arguments on the stack.
+    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg_attr(any(target_family = "wasm", target_arch = "arm"), inline(always))]
+    #[cfg_attr(not(any(target_family = "wasm", target_arch = "arm")), inline(never))]
+    fn mac_standard(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
         match &self.kind {
             #[cfg(any(
                 feature = "hmac",
@@ -590,12 +633,8 @@ impl MacAlgorithm {
             MacKind::Kmac { prefix, rate, xof } => {
                 sp800_185::kmac(prefix, *rate, key, data, *xof, out);
             }
-            #[cfg(feature = "blake2")]
-            MacKind::Blake2b(h) => blake2::mac(h, key, data, out),
-            #[cfg(feature = "blake2")]
-            MacKind::Blake2s(h) => blake2::mac(h, key, data, out),
-            #[cfg(feature = "blake3")]
-            MacKind::Blake3 => blake3::keyed_hash(key, data, out),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("mac takes the BLAKE kinds"),
         }
     }
 }

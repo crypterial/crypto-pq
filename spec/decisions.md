@@ -1093,3 +1093,60 @@ over the others, and the rows that rivals led went from 12 to 1 of 36. That row 
 against rscrypto, which keeps the last context's key in a `thread_local`.
 
 The machine code of x86-64, ARM64, i686 and riscv64 is the same as before, function by function.
+
+## Decision D-90
+
+On WebAssembly, the public entries of digests, extended outputs, MACs and key derivation are inlined
+into their callers, where a constant algorithm leaves one arm. What is inlined checks lengths and
+routes, and each arm is a call of a function that is neither generic nor inlined: the code that holds
+a message, a key or a state stays compiled in this crate, at its opt-level, which the wipes of
+[D-76](#decision-d-76) follow. A message of Keccak shorter than a block from the zero state takes one
+function for each rate, with one call of the rounds for each number of whole lanes, so that no lane
+is tested at run time. cSHAKE and KMAC, which start from a state of their own, keep the tests.
+
+On the other targets `MacAlgorithm::digest_into` is inlined too, as a hint, and it reaches BLAKE2 and
+BLAKE3 by calls of their own functions. HMAC and KMAC stay behind one function out of line on x86 and
+riscv64, and all of the MAC on ARM64: called from code inlined in another crate, the functions of this
+crate that they call would be exported, and the other callers in this crate would reach them through
+the GOT, on 32-bit x86 with their arguments on the stack.
+
+These are forms of the portable code that the target chooses at compile time, not CPU-specific code
+under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on public lengths.
+With this crate at opt-level 3 and the application at 1, on x86-64, ARM64, i686, armv7, riscv64 and
+WebAssembly, what the application's crate compiles of this one is drop glue, `Debug` and, on armv7,
+`MacAlgorithm::digest_into`, which checks lengths and routes.
+
+Rationale: a dispatcher out of line took about 50 instructions of each call on WebAssembly, a test
+of the kind and of a key of a constant length 3 to 6 percent of a MAC of a block, and the tests of
+the lanes 2 percent of a digest of SHA-3. Instructions on ARM64 under wasmtime, before and here:
+SHA3-256 of 64 bytes 5354 and 5145 (libcrux 5164), keyed BLAKE3 of nothing 1116 and 1046 and of 64
+bytes 1124 and 1057 (ab-blake3 1118 and 1147), `derive_key` of 32 bytes 2228 and 2157 (ab-blake3
+2228), the BLAKE2s MAC of 64 bytes 2788 and 2736 (rscrypto 3182).
+
+In bench run 42350709458, the time before over the time here, as a median per class:
+
+- SHA-3 and SHAKE of 64 bytes: 1.06 (Zen 5), 1.06 (Zen 4), 1.05 (Zen 3), 1.04 (Neoverse N2) and 1.04
+  (Granite Rapids) under wasmtime, and 1.05 (Granite Rapids, Ice Lake, Neoverse N2, Zen 3), 1.04 (Zen
+  4) and 1.03 (Zen 5) under Node.js.
+- BLAKE3 of at most a block, keyed or not, and `derive_key`: 1.06 (Zen 4, Neoverse N2, Zen 3), 1.04
+  (Zen 5, Granite Rapids) under wasmtime, and 1.03 (Neoverse N2), 1.02 (Granite Rapids, Zen 3, Zen 5),
+  1.01 (Zen 4) and 1.00 (Ice Lake) under Node.js. Rows of these that rivals led went from 12 to 5 of
+  55, and rows ahead by 3 percent or more from 23 to 36.
+- On x86-64, keyed BLAKE3 of at most a block: 1.03 on Zen 5, 1.02 on Emerald Rapids and Ice Lake, 1.01
+  on Zen 4 and 1.00 on Zen 3; on i686, 1.01 to 1.07 by row.
+
+Over all rows of BLAKE2 and BLAKE3 in those eleven classes, rows that rivals led went from 44 to 33 of
+330, and of Keccak from 4 to 3 of 275.
+
+In one process, where the copies run in turn, no row of BLAKE2 and BLAKE3 took more than 2 percent
+more, except BLAKE2b of nothing under Node.js on Ice Lake, at 0.97, with crypto-pq ahead of the rivals
+by 19 percent. Rows measured in separate processes, as SHA-2, HMAC and HKDF are here, moved by up to 11
+percent on code that did not change: SHA-224 in updates of 64 bytes under wasmtime on Zen 3 took 0.89
+to 0.91.
+
+A module holds what it calls. In test modules with one family and its rivals, the size went from
+318157 to 141131 bytes for BLAKE3 and from 325329 to 199380 for BLAKE2. Each rate of Keccak in use
+adds about 3.5 KB of functions for its first block: from 310969 to 317376 bytes with two rates.
+
+The machine code of x86-64, ARM64, i686, armv7 and riscv64 differs, function by function, only in the
+MAC entries.
