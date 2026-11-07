@@ -192,6 +192,9 @@ fn canonical(w: &Wide, f: &mut Poly) {
     }
 }
 
+// Out of line on WebAssembly: inside a large function, Cranelift reloads the addresses of this loop
+// from the stack in each pass.
+#[cfg_attr(target_family = "wasm", inline(never))]
 fn canonical_portable(w: &Wide, f: &mut Poly) {
     let (r, r_qinv) = (i32::from(R_MOD_Q), i32::from(R_MOD_Q).wrapping_mul(QINV));
 
@@ -258,7 +261,24 @@ pub(crate) static FIELD16: Field16 = Field16::new(
     QINV,
 );
 
+// Whether the target can have CPU kernels for the transforms, which take their input in a wide array
+// and, for key generation, e already transformed. On the others, the first pass of the transform
+// reads f, with no pass to widen it, and key generation transforms e inside the sums of t.
+const KERNEL_TARGET: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
+
 fn ntt(f: &mut Poly) {
+    if !KERNEL_TARGET {
+        let mut w = [0; 256];
+
+        ntt_layers_of(f, &mut w);
+
+        canonical_portable(&w, f);
+
+        wipe(&mut w);
+
+        return;
+    }
+
     if cpu::ntt16(f, &FIELD16) {
         return;
     }
@@ -437,6 +457,32 @@ fn ntt_layers(w: &mut Wide) {
 
         wipe_unless_optimized!(&mut v);
     }
+
+    ntt_passes_after_outer(w);
+}
+
+// ntt_layers of the coefficients of f, into w.
+fn ntt_layers_of(f: &Poly, w: &mut Wide) {
+    let (rows, _) = w.as_chunks_mut::<32>();
+
+    for j in 0..32 {
+        let mut v = registers!(|t| i32::from(f[32 * t + j]); 0 1 2 3 4 5 6 7);
+
+        forward_eight(&mut v, &FORWARD.outer);
+
+        for (row, &x) in rows.iter_mut().zip(&v) {
+            row[j] = x;
+        }
+
+        wipe_unless_optimized!(&mut v);
+    }
+
+    ntt_passes_after_outer(w);
+}
+
+#[inline(always)]
+fn ntt_passes_after_outer(w: &mut Wide) {
+    let (rows, _) = w.as_chunks_mut::<32>();
 
     for (row, z) in rows.iter_mut().zip(&FORWARD.middle) {
         for j in 0..4 {
@@ -1199,11 +1245,38 @@ impl Drop for DecapsulationKey {
     }
 }
 
-// t = A * s + e of key generation, canonical, with s's products caches.
+// t = A * s + e of key generation, canonical, with s's products caches. e is in the NTT domain on a
+// KERNEL_TARGET and in the coefficient domain elsewhere.
 fn matrix_vector(t: &mut [Poly], matrix: &[Poly], s: &[Poly], caches: &[Cache], e: &[Poly]) {
-    if !cpu::mlkem_matrix_vector(t, matrix, s, caches, e, Q as u16) {
+    if !KERNEL_TARGET {
+        matrix_vector_in_sums(t, matrix, s, caches, e);
+    } else if !cpu::mlkem_matrix_vector(t, matrix, s, caches, e, Q as u16) {
         matrix_vector_portable(t, matrix, s, caches, e);
     }
+}
+
+// t = A * s + NTT(e) with e in the coefficient domain: NTT(e), below 8q, starts each sum, and the
+// products keep it below 2^28. So e needs no canonical form and no loop of its own to add it.
+fn matrix_vector_in_sums(
+    t: &mut [Poly],
+    matrix: &[Poly],
+    s: &[Poly],
+    caches: &[Cache],
+    e: &[Poly],
+) {
+    let mut acc = [0; 256];
+
+    for ((t, row), e) in t.iter_mut().zip(matrix.chunks_exact(s.len())).zip(e) {
+        ntt_layers_of(e, &mut acc);
+
+        for ((a, b), cache) in row.iter().zip(s).zip(caches) {
+            multiply_accumulate_portable(&mut acc, a, b, cache);
+        }
+
+        canonical_portable(&acc, t);
+    }
+
+    wipe(&mut acc);
 }
 
 fn matrix_vector_portable(
@@ -1271,7 +1344,7 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) -> [u8; 32
 
     sample_noise(&mut sponges, p.eta1, sigma, 0, &mut noise[..2 * k]);
 
-    for f in &mut noise[..2 * k] {
+    for f in &mut noise[..if KERNEL_TARGET { 2 * k } else { k }] {
         ntt(f);
     }
 
@@ -1870,6 +1943,68 @@ mod tests {
         }
 
         std::eprintln!("ML-KEM sampling: {accelerated} of 20000 cases through a CPU kernel");
+    }
+
+    // ntt_layers_of against ntt_layers, and the sums of matrix_vector_in_sums against the portable
+    // code on e in the NTT domain, for k = 2 to 4, one to k rows, at the bounds first.
+    #[test]
+    fn matrix_vector_in_sums_matches_portable() {
+        let mut inputs = Inputs::new(2048);
+
+        for n in 0..2_000 {
+            let k = 2 + n % 3;
+
+            let mut canonical =
+                |case: usize| values(&mut inputs, case, 0, i64::from(Q), |x| x as u16);
+
+            let matrix: [Poly; 16] = core::array::from_fn(|i| canonical(n + i));
+
+            let s: [Poly; 4] = core::array::from_fn(|i| canonical(n + i + 1));
+
+            let e: [Poly; 4] = core::array::from_fn(|i| canonical(n + i + 2));
+
+            let caches = s.each_ref().map(|s| cache(|c| multiply_cache(s, c)));
+
+            let e_in_ntt_domain = e.map(|e| {
+                let mut wide = e.map(i32::from);
+
+                ntt_layers(&mut wide);
+
+                let mut of = [0; 256];
+
+                ntt_layers_of(&e, &mut of);
+
+                assert_eq!(of, wide);
+
+                let mut out = [0; 256];
+
+                canonical_portable(&wide, &mut out);
+
+                out
+            });
+
+            let rows = 1 + n / 3 % k;
+
+            let (mut expected, mut actual) = ([[0; 256]; 4], [[0; 256]; 4]);
+
+            matrix_vector_portable(
+                &mut expected[..rows],
+                &matrix[..rows * k],
+                &s[..k],
+                &caches[..k],
+                &e_in_ntt_domain[..rows],
+            );
+
+            matrix_vector_in_sums(
+                &mut actual[..rows],
+                &matrix[..rows * k],
+                &s[..k],
+                &caches[..k],
+                &e[..rows],
+            );
+
+            assert_eq!(actual, expected);
+        }
     }
 
     // The product kernel of key generation against the portable code, for k = 2 to 4, one to k
