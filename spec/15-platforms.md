@@ -26,8 +26,10 @@ its result is kept in an atomic.
    [[D-83](decisions.md#decision-d-83)], and the BLAKE3 chains and output blocks of WebAssembly
    [[D-84](decisions.md#decision-d-84)] and its SHA-2 compressions
    [[D-85](decisions.md#decision-d-85)], the short inputs of BLAKE3 on WebAssembly and of BLAKE2
-   and BLAKE3 on 32-bit Arm [[D-86](decisions.md#decision-d-86)], and the digests of Keccak on
-   WebAssembly [[D-88](decisions.md#decision-d-88)], are not CPU-specific code.
+   and BLAKE3 on 32-bit Arm [[D-86](decisions.md#decision-d-86)], the digests of Keccak on
+   WebAssembly [[D-88](decisions.md#decision-d-88)], and BLAKE2 on WebAssembly and the words of
+   BLAKE2 and chains of BLAKE3 on 32-bit Arm [[D-89](decisions.md#decision-d-89)], are not
+   CPU-specific code.
 2. x86-64 tiers: AVX2 with BMI1 and BMI2 and operating-system support for the YMM state (checked with
    XGETBV); AVX-512F and AVX-512VL on top of the AVX2 tier, with operating-system support for the
    opmask and ZMM state, for Keccak-f[1600], SHA-256 on eight lanes, BLAKE2 and BLAKE3

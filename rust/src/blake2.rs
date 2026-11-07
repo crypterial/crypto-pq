@@ -7,7 +7,11 @@
 use core::ops::{BitXor, Not};
 
 use crate::cpu;
+#[cfg(any(test, target_family = "wasm"))]
+use crate::sha2::copy_in_line;
 use crate::sha2::{IV_256, IV_512, last_bytes};
+#[cfg(any(test, target_family = "wasm", target_arch = "arm"))]
+use crate::wipe::registers;
 use crate::wipe::{wipe, wipe_unless_optimized};
 
 pub(crate) const SIGMA: [[usize; 16]; 10] = [
@@ -499,6 +503,15 @@ pub(crate) fn compress<W: Word>(h: &mut [W; 8], m: &[W; 16], counter: u128, last
     rounds(h, m, counter, last);
 }
 
+// Whether each block on WebAssembly takes a call of the rounds, with the chaining value in memory.
+// Under Cranelift, which compiles WebAssembly in wasmtime, a value live through the rounds holds a
+// spill slot that the values of the rounds cannot share, and regalloc2 looks at only ten slots
+// before it opens a new one: in a loop with h in locals, each spill took a slot of its own, 157 for
+// BLAKE2b against 37 here. In a loop with h in memory, the values of the loop took the slots that a
+// byte of displacement reaches: 8 KB of code against 7.6 KB here for BLAKE2s, and 3 percent more
+// time on Ice Lake (D-89).
+const BLOCK_CALLS: bool = cfg!(target_family = "wasm");
+
 // compress, inlined into the loop over whole blocks too.
 #[inline(always)]
 fn rounds<W: Word>(h: &mut [W; 8], m: &[W; 16], counter: u128, last: bool) {
@@ -506,11 +519,39 @@ fn rounds<W: Word>(h: &mut [W; 8], m: &[W; 16], counter: u128, last: bool) {
         return;
     }
 
+    let mut v = [W::default(); 16];
+
+    mix(h, m, counter, last, &mut v);
+
+    for (i, word) in h.iter_mut().enumerate() {
+        *word = *word ^ v[i] ^ v[i + 8];
+    }
+
+    wipe_unless_optimized!(&mut v);
+}
+
+// The rounds of compress, on v.
+#[inline(always)]
+fn mix<W: Word>(h: &[W; 8], m: &[W; 16], counter: u128, last: bool, v: &mut [W; 16]) {
+    // The words come out of memory ahead of the state, here and not where the rounds read them. LLVM's
+    // Reassociate adds the values of an expression by rank, and a load ranks by its place in the
+    // block: read in the rounds, a word had the higher rank through the first rounds, and went into
+    // a = a + b + x after b, one step more on the longest chain of dependencies for each.
+    #[cfg(any(target_family = "wasm", target_arch = "arm"))]
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut words: [W; 16] = registers!(
+        |i| m[i];
+        0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+    );
+
+    #[cfg(any(target_family = "wasm", target_arch = "arm"))]
+    let m = &words;
+
     let iv = W::IV;
 
     let [t0, t1] = W::counter(counter);
 
-    let mut v = [
+    *v = [
         h[0],
         h[1],
         h[2],
@@ -530,37 +571,34 @@ fn rounds<W: Word>(h: &mut [W; 8], m: &[W; 16], counter: u128, last: bool) {
     ];
 
     // Written out, so that every index into the message is a constant.
-    round(&mut v, m, &SIGMA[0]);
+    round(v, m, &SIGMA[0]);
 
-    round(&mut v, m, &SIGMA[1]);
+    round(v, m, &SIGMA[1]);
 
-    round(&mut v, m, &SIGMA[2]);
+    round(v, m, &SIGMA[2]);
 
-    round(&mut v, m, &SIGMA[3]);
+    round(v, m, &SIGMA[3]);
 
-    round(&mut v, m, &SIGMA[4]);
+    round(v, m, &SIGMA[4]);
 
-    round(&mut v, m, &SIGMA[5]);
+    round(v, m, &SIGMA[5]);
 
-    round(&mut v, m, &SIGMA[6]);
+    round(v, m, &SIGMA[6]);
 
-    round(&mut v, m, &SIGMA[7]);
+    round(v, m, &SIGMA[7]);
 
-    round(&mut v, m, &SIGMA[8]);
+    round(v, m, &SIGMA[8]);
 
-    round(&mut v, m, &SIGMA[9]);
+    round(v, m, &SIGMA[9]);
 
     if W::ROUNDS == 12 {
-        round(&mut v, m, &SIGMA[0]);
+        round(v, m, &SIGMA[0]);
 
-        round(&mut v, m, &SIGMA[1]);
+        round(v, m, &SIGMA[1]);
     }
 
-    for (i, word) in h.iter_mut().enumerate() {
-        *word = *word ^ v[i] ^ v[i + 8];
-    }
-
-    wipe_unless_optimized!(&mut v);
+    #[cfg(any(target_family = "wasm", target_arch = "arm"))]
+    wipe_unless_optimized!(&mut words);
 }
 
 // On 32-bit x86 with SSE2 (crypto_pq_pairs, which build.rs sets), BLAKE2b's state goes in pairs
@@ -794,18 +832,35 @@ type BlockCounter = u128;
 
 // The whole blocks of bytes into h, counter the number of bytes before them. One loop with the
 // compression inlined, so that the chaining value stays in registers from block to block and the
-// message words come from the input, where a call per block took h and m through memory. A MAC's
-// key block comes here as the first buffered block. Out of line, so that a call of process without
-// whole blocks keeps a small frame.
+// message words come from the input, where a call per block took h and m through memory; on
+// WebAssembly a call per block is the better form (BLOCK_CALLS). A MAC's key block comes here as the
+// first buffered block. Out of line, so that a call of process without whole blocks keeps a small
+// frame.
 #[inline(never)]
 fn whole_blocks<W: Word>(h: &mut [W; 8], blocks: &[u8], counter: u128) {
     let size = 16 * W::BYTES as BlockCounter;
 
     let mut counter: BlockCounter = counter as BlockCounter;
 
-    let mut state = *h;
-
     let mut m = [W::default(); 16];
+
+    if BLOCK_CALLS {
+        for block in blocks.chunks_exact(16 * W::BYTES) {
+            for (word, bytes) in m.iter_mut().zip(block.chunks_exact(W::BYTES)) {
+                *word = W::from_le(bytes);
+            }
+
+            counter = counter.wrapping_add(size);
+
+            compress(h, &m, counter as u128, false);
+        }
+
+        wipe(&mut m);
+
+        return;
+    }
+
+    let mut state = *h;
 
     for block in blocks.chunks_exact(16 * W::BYTES) {
         for (word, bytes) in m.iter_mut().zip(block.chunks_exact(W::BYTES)) {
@@ -827,7 +882,8 @@ fn whole_blocks<W: Word>(h: &mut [W; 8], blocks: &[u8], counter: u128) {
 // The first block, the whole blocks of bytes and the last block into h, counter the number of
 // bytes before them. One loop with the compression inlined once, so that the chaining value stays
 // in registers from block to block and the message words come from the input, where a call per
-// block took h and m through memory. The first and last blocks take the same code: a second copy
+// block took h and m through memory; on WebAssembly a call per block is the better form
+// (BLOCK_CALLS). The first and last blocks take the same code: a second copy
 // of the compression for them doubled the code that a message of a few blocks runs (on an AMD Zen
 // 5 core, BLAKE2b of 1 KiB took 70 ns more than the time of its blocks). BLAKE2b only: BLAKE2s,
 // whose compression is smaller, took 3 to 4% more time this way for a MAC of 1 KiB on Zen 5 (EPYC
@@ -878,10 +934,20 @@ fn all_blocks<W: Word>(
             break;
         };
 
-        rounds(&mut state, &m, total, end);
+        if BLOCK_CALLS {
+            compress(&mut state, &m, total, end);
+        } else {
+            rounds(&mut state, &m, total, end);
+        }
     }
 
     *h = state;
+
+    if BLOCK_CALLS {
+        wipe(&mut state);
+
+        wipe(&mut m);
+    }
 
     wipe_unless_optimized!(&mut state);
 
@@ -1033,7 +1099,312 @@ fn short_words<W: Word>(data: &[u8], m: &mut [W; 16]) {
     word!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
 }
 
+// Whether short takes this data and out.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+pub(crate) fn fits<W: Word>(data: &[u8], out: &[u8]) -> bool {
+    data.len() <= 16 * W::BYTES && (out.len() == 8 * W::BYTES || out.len() == 4 * W::BYTES)
+}
+
+// A digest, or a MAC with its key, of at most a block of data on WebAssembly, with no state to copy,
+// fill and wipe for the last block. A message of a whole block, half a block or nothing goes straight
+// from its slice into the rounds, with the zero words folded away. Any other length goes through
+// words in memory, where the rounds read them: inside the rounds, a word that came through a branch
+// took Cranelift most of its 166 spill slots, which cost Zen cores up to 43 percent.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+pub(crate) fn short<W: Word>(h: &[W; 8], key: Option<&[u8]>, data: &[u8], out: &mut [u8]) {
+    let block = 16 * W::BYTES;
+
+    let Some(key) = key else {
+        return short_last(h, W::default(), data, data.len(), out);
+    };
+
+    let first = W::key_length(key.len());
+
+    if data.is_empty() {
+        return short_last(h, first, key, block, out);
+    }
+
+    let mut state = *h;
+
+    state[0] = state[0] ^ first;
+
+    if key.len() == block / 2 {
+        key_block_half(&mut state, key);
+    } else {
+        let mut m = zero_words();
+
+        words(key, 0, &mut m);
+
+        compress(&mut state, &m, block as u128, false);
+
+        wipe(&mut m);
+    }
+
+    short_last(&state, W::default(), data, block + data.len(), out);
+
+    wipe(&mut state);
+}
+
+// A digest of at most a block for each word size. These are the functions that a digest in another
+// crate calls: HashAlgorithm::digest_into is inlined there, and a generic function would be compiled
+// there too, at the opt-level of that crate, with the wipes chosen for the opt-level of this one
+// (D-76).
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(never)]
+pub(crate) fn short_digest_b(h: &[u64; 8], data: &[u8], out: &mut [u8]) {
+    short(h, None, data, out);
+}
+
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(never)]
+pub(crate) fn short_digest_s(h: &[u32; 8], data: &[u8], out: &mut [u8]) {
+    short(h, None, data, out);
+}
+
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+fn short_last<W: Word>(h: &[W; 8], first: W, message: &[u8], counter: usize, out: &mut [u8]) {
+    let block = 16 * W::BYTES;
+
+    if message.len() == block {
+        last_known::<W, 16>(h, first, message, counter, out);
+    } else if message.len() == block / 2 {
+        last_known::<W, 8>(h, first, message, counter, out);
+    } else if message.is_empty() {
+        last_known::<W, 0>(h, first, message, counter, out);
+    } else {
+        let mut m = zero_words();
+
+        words(message, 0, &mut m);
+
+        last_block(h, first, &m, counter, out);
+
+        wipe(&mut m);
+    }
+}
+
+// 16 zero words. 128 bytes of a constant would be memory.fill, a call into the runtime.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+fn zero_words<W: Word>() -> [W; 16] {
+    if W::BYTES == 8 {
+        [core::hint::black_box(W::default()); 16]
+    } else {
+        [W::default(); 16]
+    }
+}
+
+// Word i of a message of K whole words and zeros after them.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+fn known_word<W: Word, const K: usize>(message: &[u8], i: usize) -> W {
+    if i < K {
+        W::from_le(&message[i * W::BYTES..(i + 1) * W::BYTES])
+    } else {
+        W::default()
+    }
+}
+
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(never)]
+fn key_block_half<W: Word>(state: &mut [W; 8], key: &[u8]) {
+    let key = &key[..8 * W::BYTES];
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut m: [W; 16] = registers!(
+        |i| known_word::<W, 8>(key, i);
+        0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+    );
+
+    rounds(state, &m, 16 * W::BYTES as u128, false);
+
+    wipe_unless_optimized!(&mut m);
+}
+
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(never)]
+fn last_known<W: Word, const K: usize>(
+    h: &[W; 8],
+    first: W,
+    message: &[u8],
+    counter: usize,
+    out: &mut [u8],
+) {
+    let message = &message[..K * W::BYTES];
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut m: [W; 16] = registers!(
+        |i| known_word::<W, K>(message, i);
+        0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+    );
+
+    last_rounds(h, first, &m, counter, out);
+
+    wipe_unless_optimized!(&mut m);
+}
+
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(never)]
+fn last_block<W: Word>(h: &[W; 8], first: W, m: &[W; 16], counter: usize, out: &mut [u8]) {
+    last_rounds(h, first, m, counter, out);
+}
+
+// A digest or MAC on WebAssembly past what short takes. One copy of the rounds runs every block: a
+// second copy for the last block took Zen 3 about the time of a block more per call, above the
+// instructions it runs. With no runtime call: memory.fill and memory.copy leave the module.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(never)]
+pub(crate) fn long<W: Word>(h: &[W; 8], key: Option<&[u8]>, data: &[u8], out: &mut [u8]) {
+    let size = 16 * W::BYTES;
+
+    let mut state = *h;
+
+    let mut total = 0;
+
+    if let Some(key) = key {
+        state[0] = state[0] ^ W::key_length(key.len());
+
+        total += size as u64;
+
+        padded_block(&mut state, key, total, data.is_empty());
+    }
+
+    let rest = data.len() % size;
+
+    let (blocks, tail) = data.split_at(data.len() - rest);
+
+    if !blocks.is_empty() {
+        total += blocks.len() as u64;
+
+        in_blocks::<W>(&mut state, blocks, total, rest == 0);
+    }
+
+    if rest != 0 || (data.is_empty() && key.is_none()) {
+        total += rest as u64;
+
+        padded_block(&mut state, tail, total, true);
+    }
+
+    W::store(&state, out);
+
+    wipe(&mut state);
+}
+
+// in_blocks of at most a block of bytes, with zeros after them.
+#[cfg(any(test, target_family = "wasm"))]
+fn padded_block<W: Word>(h: &mut [W; 8], bytes: &[u8], total: u64, last: bool) {
+    // As a constant, the 128 bytes would be memory.fill.
+    let mut block = [core::hint::black_box(0u64).to_ne_bytes(); 16];
+
+    let padded = &mut block.as_flattened_mut()[..16 * W::BYTES];
+
+    copy_in_line(&mut padded[..bytes.len()], bytes);
+
+    in_blocks::<W>(h, padded, total, last);
+
+    wipe(&mut block);
+}
+
+// The blocks into h, total the counter at the end of them, the last one the last of the message if
+// last says so.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(never)]
+fn in_blocks<W: Word>(h: &mut [W; 8], blocks: &[u8], total: u64, last: bool) {
+    let mut rest = blocks;
+
+    while let Some((block, after)) = rest.split_at_checked(16 * W::BYTES) {
+        rest = after;
+
+        let counter = total.wrapping_sub(rest.len() as u64);
+
+        block_call(h, block, counter, last && rest.is_empty());
+    }
+}
+
+// compress of a block of bytes, the message words read ahead of the state. A parameter, the block
+// gets the offsets of its loads folded on WebAssembly, where the pointer of a loop takes an addition
+// for each.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(never)]
+fn block_call<W: Word>(h: &mut [W; 8], block: &[u8], counter: u64, last: bool) {
+    let block = &block[..16 * W::BYTES];
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut m: [W; 16] = registers!(
+        |i| W::from_le(&block[i * W::BYTES..(i + 1) * W::BYTES]);
+        0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+    );
+
+    rounds(h, &m, counter as u128, last);
+
+    wipe_unless_optimized!(&mut m);
+}
+
+// compress of the last block into out, of 4 or 8 words, with no state to write back, from h with first
+// XORed into its first word. The word indexes are constants, which keeps v out of memory, and the
+// first store is not under a branch: Cranelift places each pure value right before its first use, so
+// it would repeat the rounds in each arm.
+#[cfg(any(test, target_family = "wasm"))]
+#[inline(always)]
+fn last_rounds<W: Word>(h: &[W; 8], first: W, m: &[W; 16], counter: usize, out: &mut [u8]) {
+    let (low, high) = out.split_at_mut(4 * W::BYTES);
+
+    let mut s = *h;
+
+    s[0] = s[0] ^ first;
+
+    let mut v = [W::default(); 16];
+
+    mix(&s, m, counter as u128, true, &mut v);
+
+    macro_rules! store {
+        ($to:ident, $at:literal: $($i:literal)*) => {
+            $(
+                (s[$at + $i] ^ v[$at + $i] ^ v[$at + $i + 8])
+                    .write_le(&mut $to[$i * W::BYTES..($i + 1) * W::BYTES]);
+            )*
+        };
+    }
+
+    store!(low, 0: 0 1 2 3);
+
+    if high.len() == 4 * W::BYTES {
+        store!(high, 4: 0 1 2 3);
+    }
+
+    wipe_unless_optimized!(&mut s);
+
+    wipe_unless_optimized!(&mut v);
+}
+
 // The digest of data, out.len() bytes, from the chaining value h, in one pass over data.
+#[cfg(target_family = "wasm")]
+pub(crate) fn digest<W: Word>(h: &[W; 8], data: &[u8], out: &mut [u8]) {
+    if !matches!(W::digest_kernel(h, data, out), Kernel::Done) {
+        long(h, None, data, out);
+    }
+}
+
+// The keyed hash of data under a key of 1 to 16 * W::BYTES bytes, from the unkeyed chaining value
+// h of the configured digest length.
+#[cfg(target_family = "wasm")]
+#[inline(always)]
+pub(crate) fn mac<W: Word>(h: &[W; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
+    if matches!(W::mac_kernel(h, key, data, out), Kernel::Done) {
+        return;
+    }
+
+    if fits::<W>(data, out) {
+        short(h, Some(key), data, out);
+    } else {
+        long(h, Some(key), data, out);
+    }
+}
+
+// The digest of data, out.len() bytes, from the chaining value h, in one pass over data.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn digest<W: Word>(h: &[W; 8], data: &[u8], out: &mut [u8]) {
     let kernel = match W::digest_kernel(h, data, out) {
         Kernel::Done => return,
@@ -1072,6 +1443,7 @@ pub(crate) fn digest<W: Word>(h: &[W; 8], data: &[u8], out: &mut [u8]) {
 
 // The keyed hash of data under a key of 1 to 16 * W::BYTES bytes, from the unkeyed chaining value
 // h of the configured digest length.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn mac<W: Word>(h: &[W; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
     let kernel = match W::mac_kernel(h, key, data, out) {
         Kernel::Done => return,
@@ -1530,6 +1902,52 @@ mod tests {
         one_shot_matches_engine::<u32>();
     }
 
+    #[test]
+    fn short_digests_match_compress() {
+        let message: [u8; 128] =
+            core::array::from_fn(|i| (i as u8).wrapping_mul(31).wrapping_add(7));
+
+        for length in 0..=128 {
+            let data = &message[..length];
+
+            let mut m = [0u64; 16];
+
+            words(data, 0, &mut m);
+
+            let mut expected = <u64 as Word>::IV;
+
+            compress(&mut expected, &m, length as u128, true);
+
+            let mut out = [0; 64];
+
+            short_digest_b(&<u64 as Word>::IV, data, &mut out);
+
+            for (bytes, word) in out.chunks(8).zip(&expected) {
+                assert_eq!(bytes, word.to_le_bytes());
+            }
+        }
+
+        for length in 0..=64 {
+            let data = &message[..length];
+
+            let mut m = [0u32; 16];
+
+            words(data, 0, &mut m);
+
+            let mut expected = <u32 as Word>::IV;
+
+            compress(&mut expected, &m, length as u128, true);
+
+            let mut out = [0; 32];
+
+            short_digest_s(&<u32 as Word>::IV, data, &mut out);
+
+            for (bytes, word) in out.chunks(4).zip(&expected) {
+                assert_eq!(bytes, word.to_le_bytes());
+            }
+        }
+    }
+
     // in_locals against compress, for a digest and for a MAC.
     fn in_locals_matches_compress<W: Word>() {
         let block = 16 * W::BYTES;
@@ -1558,6 +1976,24 @@ mod tests {
                 let mut out = [0xA5; 65];
 
                 in_locals(&W::IV, key, data, &mut out[..size]);
+
+                assert_eq!(out[..size], all[..size]);
+
+                assert!(out[size..].iter().all(|&byte| byte == 0xA5));
+
+                if fits::<W>(data, &out[..size]) {
+                    let mut out = [0xA5; 65];
+
+                    short(&W::IV, key, data, &mut out[..size]);
+
+                    assert_eq!(out[..size], all[..size]);
+
+                    assert!(out[size..].iter().all(|&byte| byte == 0xA5));
+                }
+
+                let mut out = [0xA5; 65];
+
+                long(&W::IV, key, data, &mut out[..size]);
 
                 assert_eq!(out[..size], all[..size]);
 
@@ -1607,5 +2043,110 @@ mod tests {
         in_locals_matches_compress::<u32>();
 
         in_locals_matches_compress::<u64>();
+    }
+
+    // long against compress over more than a block, whole blocks and odd tails, for a digest and for
+    // a MAC, and its loop alone over whole blocks.
+    fn long_matches_compress<W: Word>() {
+        let block = 16 * W::BYTES;
+
+        let whole = 8 * W::BYTES;
+
+        let message: [u8; 400] =
+            core::array::from_fn(|i| (i as u8).wrapping_mul(31).wrapping_add(7));
+
+        let key: [u8; 128] = core::array::from_fn(|i| (i as u8).wrapping_mul(17).wrapping_add(5));
+
+        let padded = |bytes: &[u8]| {
+            let mut m = [W::default(); 16];
+
+            words(bytes, 0, &mut m);
+
+            m
+        };
+
+        let lengths = [
+            block + 1,
+            2 * block - 1,
+            2 * block,
+            2 * block + 1,
+            3 * block - 5,
+            3 * block,
+        ];
+
+        let keys: [Option<&[u8]>; 5] = [
+            None,
+            Some(&key[..1]),
+            Some(&key[..7]),
+            Some(&key[..whole]),
+            Some(&key[..block]),
+        ];
+
+        for length in lengths {
+            let data = &message[..length];
+
+            for key in keys {
+                let mut expected = W::IV;
+
+                let mut counter = 0;
+
+                if let Some(key) = key {
+                    expected[0] = expected[0] ^ W::key_length(key.len());
+
+                    counter += block;
+
+                    compress(&mut expected, &padded(key), counter as u128, false);
+                }
+
+                let mut rest = data;
+
+                while rest.len() > block {
+                    let (first, after) = rest.split_at(block);
+
+                    counter += block;
+
+                    compress(&mut expected, &padded(first), counter as u128, false);
+
+                    rest = after;
+                }
+
+                counter += rest.len();
+
+                compress(&mut expected, &padded(rest), counter as u128, true);
+
+                let mut all = [0; 64];
+
+                W::store(&expected, &mut all[..whole]);
+
+                for size in [1, 7, whole] {
+                    let mut out = [0xA5; 65];
+
+                    long(&W::IV, key, data, &mut out[..size]);
+
+                    assert_eq!(out[..size], all[..size]);
+
+                    assert!(out[size..].iter().all(|&byte| byte == 0xA5));
+                }
+
+                if key.is_none() && length % block == 0 {
+                    let mut h = W::IV;
+
+                    in_blocks::<W>(&mut h, data, length as u64, true);
+
+                    let mut out = [0; 64];
+
+                    W::store(&h, &mut out[..whole]);
+
+                    assert_eq!(out, all);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_matches_compress_for_both_words() {
+        long_matches_compress::<u32>();
+
+        long_matches_compress::<u64>();
     }
 }
