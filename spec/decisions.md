@@ -940,7 +940,8 @@ of `derive_key` is out of line too.
 
 On 32-bit Arm, a BLAKE2 digest or MAC of at most a block of data runs one function of the same form,
 which holds both, with its one copy of the rounds, and the block counter of BLAKE2s's whole blocks
-takes 64 bits, its full range. On WebAssembly, BLAKE2 keeps its form before.
+takes 64 bits, its full range. On WebAssembly, BLAKE2 kept its form before, until
+[D-89](#decision-d-89).
 
 These are forms of the portable code that the target chooses at compile time, not CPU-specific code
 under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on public lengths.
@@ -956,13 +957,13 @@ run 42302165419, on armv7 on Neoverse N2, it was 1.170 and 1.162 for BLAKE3, 1.1
 1.039 to 1.093 for BLAKE2 digests of one block and 1.043 to 1.161 for its MACs, and 0.994 to 1.012
 for the rows of many blocks.
 
-BLAKE2 stays out of WebAssembly because of one compiler. Its 16 words of state, 16 of message and 8
+BLAKE2 stayed out of WebAssembly here because of one compiler. Its 16 words of state, 16 of message and 8
 of chaining value in locals took Cranelift 166 stack slots against 37 for BLAKE2b, most of them for
 one store and one reload. In that run, for BLAKE2b of one block, the time before over the time here
 was 1.01 to 1.24 under Node.js and 1.05 to 1.12 under wasmtime on Ice Lake, Emerald Rapids and
 Neoverse N2, but 0.70 to 0.86 under wasmtime on Zen 3, Zen 4 and Zen 5. Why those cores take these
 slots so badly was not established. The state in memory and a block out of line each left 142 to 163
-slots, so no form was found that holds for both runtimes.
+slots, so no form was found then that holds for both runtimes; [D-89](#decision-d-89) has one.
 
 ## Decision D-87
 
@@ -1009,3 +1010,86 @@ percent, except under Node.js on Zen 4, where the one job there measured long ro
 of V8 has 621 instructions on ARM64 here and 655 before, so the bench of the release has to confirm
 that class on more jobs. Over the 33 rows of the sponge in eleven classes, rows that rivals led went
 from 7 to 3, and rows ahead by 3 percent or more from 315 to 319.
+
+## Decision D-89
+
+On WebAssembly, each block of a BLAKE2 digest or MAC of more than a block takes a call of one
+function, with the chaining value in memory and the message words read from the input ahead of the
+state. A key block and the tail of a message, padded in a block in memory that is wiped before the
+function returns, take the same function. A digest or MAC of at most a block, with an output of 4 or
+8 words, takes the message straight from its slice into the rounds: a whole block, half a block or
+nothing with the zero words folded away, and any other length through words in memory, which are
+wiped. The zero block, the zero words of BLAKE2b and the wipes of its state are stores, with no
+`memory.fill`, and the tail goes into its block with no `memory.copy`. Streaming updates call the
+compression for each block, with the words in memory, which are wiped. `HashAlgorithm::digest_into`
+and `digest_unchecked` are inlined into their callers on WebAssembly, and what they call for BLAKE2 is
+not generic: a generic function would be compiled in the crate of the caller, at the opt-level of
+that crate, while the wipes of [D-76](#decision-d-76) follow the opt-level of this one.
+
+On WebAssembly and 32-bit Arm, the compression copies the message words into locals ahead of the
+state. On 32-bit Arm, the chains of BLAKE3 run one at a time, and the whole blocks of an extended
+output go straight into the output, as on 32-bit x86 and WebAssembly.
+
+These are forms of the portable code that the target chooses at compile time, not CPU-specific code
+under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on public lengths.
+The words and the state of the rounds are arrays indexed by constants only, so
+[D-76](#decision-d-76) treats them as register values at opt-level 3, and they are wiped at other
+levels; what a call takes the address of is wiped on every path.
+
+Rationale: under Cranelift, the compiler of wasmtime, a value live through the rounds holds a spill
+slot that the values of the rounds cannot share, and regalloc2 looks at only ten slots before it
+opens a new one. In a loop with the chaining value in locals, each spill took a slot of its own: 157
+for BLAKE2b against 37 in this form. A loop with the chaining value in memory took as few slots, but
+the values of the loop took the slots that a byte of displacement reaches, with 8047 bytes of code
+for BLAKE2s against 7588 here and 7562 in p3-blake2s, and in bench run 42333112013 it took 3 percent
+more time than here on Ice Lake. That core decodes 16 bytes a cycle outside its cache of
+micro-operations, which fits the difference; the cause was not measured directly.
+
+In bench run 42337573871, the time before over the time here, as a median over the rows of 1 KiB and
+16 KiB and over the rows of at most a block, was 1.47 and 1.20 (Zen 3), 1.51 and 1.12 (Zen 4), 1.14
+and 1.18 (Zen 5), 1.06 and 1.20 (Ice Lake), 1.03 and 1.14 (Granite Rapids) and 1.00 and 1.16
+(Neoverse N2) under wasmtime, and 1.00 and 1.23 (Neoverse N2), 0.97 and 1.21 (Zen 3), 0.97 and 1.27
+(Zen 5) and 1.02 and 1.15 (Emerald Rapids) under Node.js. The rows that rivals led went from 141 to
+26 of 170 in those ten classes.
+
+Under wasmtime on Zen cores, one process can take 1.5 to 2.5 times the time of another on the same
+code with the same input, on all the rows of one function; the cause was not measured. In that run
+this took long rows before this change, of BLAKE2s in 6 of 10 processes on Zen 3 and 2 of 4 on Zen 4
+and of BLAKE2b in 2 of 4 on Zen 5, and here BLAKE2b in 1 of 4 on Zen 5 and no other row. The median
+of 1.14 holds that process: the same form without the change of `digest_into` below had none, and a
+median of 1.33.
+
+Out of line, `HashAlgorithm::digest_into` was one more call, with its frame, on every digest of a
+caller's buffer. With the arms of BLAKE2 in `digest_unchecked`, LLVM stopped inlining it, as
+`#[inline]` is a hint. In that run this took `blake3/0` and `blake3/64` 3 to 10 percent more time
+under wasmtime and 1 to 5 percent more under Node.js. With the attribute on WebAssembly they take at
+most 1.1 percent more than before the arms of BLAKE2. After that run the digests of at most a block
+were made not generic, which is 14 more instructions on ARM64 for BLAKE2s, of 1152 for an empty
+message, and 5 fewer for BLAKE2b. With this crate at opt-level 3 and the application at 1, on x86-64,
+ARM64, i686, armv7, riscv64 and WebAssembly, what the application's crate compiles of this one is drop
+glue and `Debug`.
+
+A module has one form for every CPU, and this one has costs. Long rows under Node.js take 3 percent
+more on Zen 3, Zen 4 and Zen 5, where the median of the leading rival over this code goes from 1.02
+to 1.04 down to about 1.00, while rows of at most a block there take 17 to 22 percent less. On
+Neoverse N2 under wasmtime a block takes 2 percent more than in the loop with the chaining value in
+memory. With the chaining value in locals, in bench run 42329048951, long rows took 24 to 56 percent
+more than that loop under wasmtime on Zen cores, and under Node.js 2 percent less on Neoverse N2,
+Zen 4 and Zen 5 and 3 percent more on Zen 3, so that form does not hold for both runtimes.
+
+LLVM's Reassociate adds the values of an expression by rank, and a load ranks by its place in the
+block. A word read in the rounds had the higher rank through the first rounds, and went into `a + b
++ x` after `b`, one more step on the longest chain of dependencies, in 32 of the 160 sums of BLAKE2s.
+Read ahead of the state, it goes in first. In bench run 42329048951 that took 1 percent less time on
+armv7 on Neoverse N2. On i686 it gave nothing on long rows and took up to 1 percent more on short
+ones, and an A/B on one ARM64 core gave no gain, so these targets, x86-64 and riscv64 keep the form
+before.
+
+On armv7, BLAKE3 executes fewer instructions with its chains one at a time: 2341 against 2589 for an
+extended output of 128 bytes from 64, 16019 against 17219 for 1024 bytes, 31398 against 32117 for a
+hash of 2 KiB and 63681 against 63804 for 4 KiB. In bench run 42329048951, on armv7 on Neoverse N2,
+the median of the time before over the time here was 1.00 over the rows of 1 KiB and 16 KiB and 1.03
+over the others, and the rows that rivals led went from 12 to 1 of 36. That row is `derive_key`
+against rscrypto, which keeps the last context's key in a `thread_local`.
+
+The machine code of x86-64, ARM64, i686 and riscv64 is the same as before, function by function.
