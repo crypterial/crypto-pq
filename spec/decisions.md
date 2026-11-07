@@ -1178,3 +1178,39 @@ leading rival over the time here was 0.991 for BLAKE2s of 1 KiB, against 0.984 b
 The two loops, `whole_blocks` of BLAKE2s and `all_blocks` of BLAKE2b, are the machine code measured
 in the first run, and every other function of armv7 is the machine code before. The machine code of
 x86-64, ARM64, i686, riscv64 and WebAssembly is the same as before, function by function.
+
+## Decision D-92
+
+On 32-bit Arm and WebAssembly, Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128 of data given in one
+call take the padded last block through a permutation of its own after the loop over the whole
+blocks, where before it was the last step of that loop. The output words, and the wipe of the state
+at the end at every opt-level, are as before. ARM64, where the same form took more time, riscv64 and
+x86-64 without AVX2, where it was not measured, and 32-bit x86, which has a digest of its own, keep
+the code before.
+
+This is a form of the portable code that the target chooses at compile time, not CPU-specific code
+under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on public lengths.
+
+Rationale: in bench run 42362652467, in one process where the copies run in turn, the time here over
+the time before, as a median over the processes, for Ascon-Hash256 of 1 KiB, was 0.984 on armv7 on
+Neoverse N2; 0.963 (Ice Lake), 0.974 (Neoverse N2), 0.988 (Zen 3), 0.991 (Zen 5), 0.997 (Granite
+Rapids) and 1.012 (Zen 4) under wasmtime; and 0.980 (Zen 3), 0.989 (Zen 5), 0.993 (Ice Lake, Zen 4)
+and 0.998 (Emerald Rapids, Neoverse N2) under Node.js. Over the 15 rows of Ascon in these 13
+classes, rows that rivals led went from 2 to 1 of 195, and rows ahead by 3 percent or more from 90
+to 122. The two rows led before, Ascon-Hash256 and Ascon-CXOF128 of nothing under wasmtime on
+Neoverse N2, where the time of the leading rival over the time before was 0.985 and 0.989, are at
+1.006 and 0.998.
+
+Under Node.js on Zen 3, outputs of 1 KiB and 16 KiB took 1.004 to 1.007, and Ascon-XOF128 of 64
+bytes to 16 KiB, where the time of the leading rival over the time before was 0.993, is at 0.986,
+the one row led here. Under wasmtime on Zen 4, inputs of 1 KiB and 16 KiB took 1.011 to 1.013, and
+under Node.js on Zen 5, Ascon-CXOF128 of 64 bytes to 32 took 1.036, with crypto-pq still ahead of
+the rivals there by 8.6 percent. A WebAssembly module has one form for every CPU
+([D-85](#decision-d-85)). In the same processes, a copy of the code before took 0.990 to 1.004 of
+the time of the other, by row, the widest on inputs of nothing. On ARM64 on Neoverse N2, the same
+form took 0.995 to 1.014 of the time, by row. The cause was not measured.
+
+The function grows from 2372 to 3419 lines of assembly on armv7 and from 2444 to 3461 on
+WebAssembly. It is the machine code measured, and every other function of these targets is the
+machine code before. The machine code of x86-64, ARM64, i686 and riscv64 is the same as before,
+function by function.

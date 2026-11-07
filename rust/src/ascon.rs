@@ -293,9 +293,18 @@ pub(crate) fn permute(s: &mut [u64; 5]) {
     rounds(s);
 }
 
+// Whether digest takes the padded last block through a permutation of its own after the loop over
+// the blocks, on 32-bit Arm and WebAssembly. There a hash of 1 KiB took 1.6 percent less time in
+// 32-bit Arm code on Neoverse N2, and less in 11 of the 12 classes measured under wasmtime and
+// Node.js, but on ARM64 some rows took up to 1.4 percent more; riscv64 and x86-64 without AVX2
+// were not measured (D-92).
+#[cfg(not(target_arch = "x86"))]
+const LAST_APART: bool = cfg!(any(target_arch = "arm", target_family = "wasm"));
+
 // The output for data from a start state, read once. cpu::ascon_digest declines exactly where
 // cpu::ascon does, so the portable rounds run here with the state in registers: the blocks and
-// the padded last block through one permutation, then the output words through another.
+// the padded last block through one permutation, or two with LAST_APART, then the output words
+// through another.
 #[cfg(not(target_arch = "x86"))]
 pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
     if cpu::ascon_digest(start, data, out) {
@@ -306,14 +315,26 @@ pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
 
     let (blocks, tail) = data.as_chunks::<8>();
 
-    let last = last_bytes(data, tail.len()) as u64 ^ 1 << (8 * tail.len());
+    if LAST_APART {
+        for block in blocks {
+            s[0] ^= to_lane(u64::from_le_bytes(*block));
 
-    let words = blocks.iter().map(|block| u64::from_le_bytes(*block));
+            rounds(&mut s);
+        }
 
-    for word in words.chain([last]) {
-        s[0] ^= to_lane(word);
+        s[0] ^= to_lane(last_bytes(data, tail.len()) as u64 ^ 1 << (8 * tail.len()));
 
         rounds(&mut s);
+    } else {
+        let last = last_bytes(data, tail.len()) as u64 ^ 1 << (8 * tail.len());
+
+        let words = blocks.iter().map(|block| u64::from_le_bytes(*block));
+
+        for word in words.chain([last]) {
+            s[0] ^= to_lane(word);
+
+            rounds(&mut s);
+        }
     }
 
     for (i, chunk) in out.chunks_mut(8).enumerate() {
