@@ -539,8 +539,9 @@ pub(crate) struct Many<'a> {
 
 // Whether hash_many runs the last two inputs side by side. Under the WebAssembly runtimes that was
 // the longer way for 2 KiB, by 1.29 (Zen 3), 1.33 (Zen 4), 1.10 (Zen 5) and 1.02 (Neoverse N2) under
-// wasmtime and 1.34, 1.02, 1.04 and 1.03 under Node.js; why was not established.
-const PAIR_CHAINS: bool = !cfg!(target_family = "wasm");
+// wasmtime and 1.34, 1.02, 1.04 and 1.03 under Node.js; why was not established. On 32-bit Arm a pair
+// executes more instructions than the two in turn, for lack of registers.
+const PAIR_CHAINS: bool = !cfg!(any(target_family = "wasm", target_arch = "arm"));
 
 // The chaining values of the inputs into out, input i being input[i * blocks * 64..] for
 // out.len() inputs: as many as the kernels take, side by side, and the rest one by one.
@@ -629,9 +630,13 @@ fn root_whole(cv: &[u32; 8], m: &[u32; 16], index: u64, info: [u32; 2], out: &mu
 
     let done = cpu::blake3_xof(cv, m, index, info, blocks);
 
-    // 32-bit x86 and WebAssembly, which have no kernel for them, compress the whole blocks one at
-    // a time, straight into out.
-    if cfg!(any(target_arch = "x86", target_family = "wasm")) {
+    // 32-bit x86, 32-bit Arm and WebAssembly, which have no kernel for them, compress the whole
+    // blocks one at a time, straight into out.
+    if cfg!(any(
+        target_arch = "x86",
+        target_arch = "arm",
+        target_family = "wasm"
+    )) {
         let [length, flags] = info;
 
         for (i, block) in blocks.iter_mut().enumerate().skip(done) {
