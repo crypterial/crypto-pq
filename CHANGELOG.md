@@ -83,6 +83,13 @@ Implements specification 1.1 (draft).
   the compression reads the message words ahead of the state, 1% less time, and BLAKE3's chains run
   one at a time. The machine code of x86-64, ARM64, i686 and riscv64 is unchanged. Outputs are
   unchanged.
+- Public entries on WebAssembly ([decision D-90](spec/decisions.md#decision-d-90)): digests, extended
+  outputs, MACs and key derivation are inlined into the caller, each arm a call of a function compiled
+  in this crate, and a message of SHA-3 or SHAKE shorter than a block takes no test per lane. SHA-3 and
+  SHAKE of 64 bytes take 3 to 6% less time and BLAKE3 of at most a block up to 6% less. A module that
+  uses one family leaves the code of the others out: 318 KB to 141 KB in a test module of BLAKE3. On
+  other targets the MAC entry is inlined too: keyed BLAKE3 of at most a block takes up to 3% less
+  time on x86-64 and up to 6% less on i686. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
