@@ -143,6 +143,13 @@ Implements specification 1.1 (draft).
   through one copy of the rounds, with no call of memset or memcpy. On Neoverse N2, a digest of 255
   bytes takes 2.9% less time, one of 1 KiB 0.7% less and a MAC of 1 KiB 1.1% less. The machine code
   of other targets is unchanged. Outputs are unchanged.
+- BLAKE2s on 32-bit x86 ([decision D-100](spec/decisions.md#decision-d-100)): one or two whole
+  blocks before the last block take a call of the compression function each, out of line, so that a
+  digest or MAC of 65 to 192 bytes runs one copy of the rounds. Over these lengths the time drops by
+  3.4% on Zen 3, 7.6% on Ice Lake and 8.3% on Zen 5 as a geometric mean, and by 18% for digests of
+  129 to 192 bytes on Zen 5, and is unchanged on Emerald Rapids, while on Zen 4 digests of these
+  lengths take 0.7% to 1.4% more. The machine code of other targets is unchanged. Outputs are
+  unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
