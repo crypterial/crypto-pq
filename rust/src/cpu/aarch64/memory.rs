@@ -110,3 +110,19 @@ pub(super) fn load3_u8(values: &[u64; 6]) -> uint8x16x3_t {
     // its lanes in memory order.
     unsafe { vld3q_u8(values.as_ptr().cast()) }
 }
+
+#[target_feature(enable = "neon")]
+#[inline]
+#[allow(unsafe_code)]
+pub(super) fn load3_bytes(values: &[u8; 48]) -> uint8x16x3_t {
+    // SAFETY: values is readable for the 48 bytes that the deinterleaving load reads.
+    unsafe { vld3q_u8(values.as_ptr()) }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+#[allow(unsafe_code)]
+pub(super) fn store2_u16(vectors: uint16x8x2_t, out: &mut [u16; 16]) {
+    // SAFETY: out is writable for the 32 bytes that the interleaving store writes.
+    unsafe { vst2q_u16(out.as_mut_ptr(), vectors) }
+}

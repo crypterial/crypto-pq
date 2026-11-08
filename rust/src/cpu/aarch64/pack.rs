@@ -1,10 +1,10 @@
-// ML-KEM's reduction of the sums of products to canonical coefficients and its 12-bit encoding,
-// with NEON. Both compute exactly what the portable code computes, with data-processing
+// ML-KEM's reduction of the sums of products to canonical coefficients and its 12-bit encoding and
+// decoding, with NEON. All compute exactly what the portable code computes, with data-processing
 // instructions only.
 
 use core::arch::aarch64::*;
 
-use super::memory::{load_i32, load_u16, store_u16, store3_u8};
+use super::memory::{load_i32, load_u16, load3_bytes, store_u16, store2_u16, store3_u8};
 #[cfg(not(crypto_pq_optimized))]
 use super::vector_lanes;
 use crate::cpu::Field;
@@ -22,6 +22,14 @@ pub(crate) fn reduce(w: &[i32; 256], factor: i32, field: &Field, out: &mut [u16;
 pub(crate) fn encode12(f: &[u16; 256], out: &mut [u8; 384]) -> bool {
     // SAFETY: as in reduce.
     unsafe { encode12_neon(f, out) };
+
+    true
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn decode12(data: &[u8; 384], q: u16, out: &mut [u16; 256]) -> bool {
+    // SAFETY: as in reduce.
+    unsafe { decode12_neon(data, q, out) };
 
     true
 }
@@ -92,5 +100,51 @@ fn encode12_neon(f: &[u16; 256], out: &mut [u8; 384]) {
         );
 
         store3_u8(bytes, out);
+    }
+}
+
+// ByteDecode_12 followed by the reduction of every value modulo q, sixteen pairs (x, y) at a time:
+// the deinterleaving load splits their bytes a, b and c, of which x = a | (b & 15) << 8 and
+// y = (b | c << 8) >> 4, and the interleaving store puts each x before its y.
+#[target_feature(enable = "neon")]
+fn decode12_neon(data: &[u8; 384], q: u16, out: &mut [u16; 256]) {
+    let (q, nibble) = (vdupq_n_u16(q), vdupq_n_u8(0x0F));
+
+    // A value of 12 bits is below 2q, so one subtraction reduces it.
+    let x = |bytes: uint8x16_t| {
+        let x = vreinterpretq_u16_u8(bytes);
+
+        vminq_u16(x, vsubq_u16(x, q))
+    };
+
+    let y = |bytes: uint8x16_t| {
+        let y = vshrq_n_u16::<4>(vreinterpretq_u16_u8(bytes));
+
+        vminq_u16(y, vsubq_u16(y, q))
+    };
+
+    for (out, bytes) in out
+        .as_chunks_mut::<32>()
+        .0
+        .iter_mut()
+        .zip(data.as_chunks::<48>().0)
+    {
+        let [first, second] = out.as_chunks_mut::<16>().0 else {
+            unreachable!("32 values are two groups of 16")
+        };
+
+        let uint8x16x3_t(a, b, c) = load3_bytes(bytes);
+
+        let low = vandq_u8(b, nibble);
+
+        store2_u16(
+            uint16x8x2_t(x(vzip1q_u8(a, low)), y(vzip1q_u8(b, c))),
+            first,
+        );
+
+        store2_u16(
+            uint16x8x2_t(x(vzip2q_u8(a, low)), y(vzip2q_u8(b, c))),
+            second,
+        );
     }
 }
