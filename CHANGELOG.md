@@ -236,6 +236,13 @@ Implements specification 1.1 (draft).
   layers within each block of 32 coefficients four blocks at a time, so that four independent
   butterflies are in flight. The inverse stores each block, transposed, in its output first, so
   that the compiler keeps no block of secret coefficients on the stack. Outputs are unchanged.
+- ML-KEM on ARM64: ByteDecode_12 runs in a NEON kernel, which splits the three bytes of each pair
+  of coefficients with one deinterleaving load and reduces each value modulo q with one
+  subtraction. It decodes an encapsulation key imported from bytes and the secret vector of an
+  expanded decapsulation key, and the modulus check of the encapsulation key,
+  ByteEncode_12(ByteDecode_12(ek)) = ek, runs in the NEON kernels as on x86-64 with AVX2. An
+  encapsulation with a key imported from bytes takes 1.7 to 2.0% less time on Neoverse N2. Outputs
+  and the keys accepted are unchanged.
 - ML-DSA verification samples the challenge of the signature it is given by plain rejection, as
   FIPS 204 Algorithm 29 is written, since that signature, c̃ with it, is public
   ([decision D-72](spec/decisions.md#decision-d-72), revised for specification 1.1). Signing, and
