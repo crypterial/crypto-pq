@@ -1474,3 +1474,64 @@ function. On WebAssembly the functions of BLAKE2 above change, with `MacAlgorith
 `verify`, into which the dispatch of the MAC is inlined, and the one-call digest of Keccak, whose
 test of the rate against its block takes the other form of the same compare, with the same number of
 instructions.
+
+## Decision D-98
+
+On x86-64, the one-call digest and MAC of BLAKE2b in the AVX2 and AVX-512VL kernels put the 16
+bytes that end a key or a final block, when those are not a whole number of 16-byte pieces, in both
+halves of their vector with one instruction in inline assembly, and store the vector with one
+32-byte store. The 16 bytes are made in registers from the bytes that end the input, as before.
+Before, the vector was the same 16 bytes twice to the compiler, which stored its halves with two
+16-byte stores.
+
+This is CPU-specific code under [15.3](15-platforms.md#153-cpu-specific-code), in the kernels of
+x86-64. Which path runs depends only on the lengths, which are public.
+
+Rationale: the rounds read each vector of the message with one 32-byte load, and a load of bytes
+that two stores wrote cannot take its value from them: it waits until both reach the cache. In a
+MAC, the final block is stored after the rounds of the key block, so its stores reach the cache
+only after those rounds retire, and the rounds of the final block wait for them. In bench run
+42388218855, a BLAKE2b MAC of 63 bytes took 280.6 ns against 270.1 for 64 bytes on Zen 3, where
+blake2-rfc took 277.1 and 274.3. Lengths whose pieces are all whole, as 16, 64 and 128 bytes, did
+not pay this. Intel's cores run the AVX-512VL kernel, Zen 3 and Zen 4 the AVX2 one, and Zen 5 the
+portable code. Under QEMU, the AVX2 kernel runs 1 or 2 instructions fewer for a digest of at most a
+block, 1 to 3 more for one of 255 or 256 bytes, 2 to 6 more for a MAC of 1 to 256 bytes and 2 fewer
+for a MAC of no data, as the registers that the compiler gives the rest of the function moved.
+
+In bench runs 42428878012 and 42430044275, in one process where the copies run in turn, two copies
+of the code here and two of the code before, the time before over the time here, each the geometric
+mean of its two copies of the median over the processes, as a geometric mean over the 12 rows of
+BLAKE2b and its MAC whose input ends in a partial piece, was 1.057 on Ice Lake, 1.088 on Emerald
+Rapids, 1.089 on Granite Rapids, 1.029 on Zen 3, 1.021 on Zen 4 and 1.000 on Zen 5, whose machine
+code is the same. Over the other 12 rows of BLAKE2b it was 1.000 to 1.004 in each class, and over
+the 55 rows of BLAKE2s and BLAKE3, whose code is the same, 0.996 to 1.000. A digest of 63 bytes now
+takes as long as one of 64 on Zen 3, 136.2 ns against 135.8, and 2.4 to 3.7 ns more on Intel's
+cores, where it took 13 to 19 ns more. On Zen 4 a MAC of 63 bytes takes as long as one of 64, 225.1
+ns against 226.7, but a digest of 63 bytes still takes 19.2 ns more than one of 64, against 23.5
+before: a wait that this change does not remove. The BLAKE2b MAC of 63 bytes on Zen 3, which
+blake2-rfc led by 1.3 percent, now leads it by 2.4 percent, and rivals lead none of the rows of
+BLAKE2b in these six classes.
+
+Against both copies of the code before, beyond the spread of the rows of BLAKE2s and BLAKE3 of the
+same class, seven rows take more time here, all in the AVX2 kernel, which has one form for Zen 3
+and Zen 4. On Zen 3 a digest of 16 bytes, which runs one instruction fewer than before, with other
+registers, takes 1.3 percent more, 136.8 and 136.9 ns against 135.0 and 135.1. On Zen 4 a digest of
+1 byte takes 1.3 percent more, 125.0 ns against 123.3 and 123.6, MACs of 64 and 128 bytes 0.8 and
+0.9 percent more, and a BLAKE2b-256 digest of 64 bytes and digests of 1 KiB and 16 KiB 0.6 to 0.8
+percent more. The rounds of these rows run the instructions before, with other registers and stack
+offsets, and on Zen 3 the last five take as long as before, 0.999 to 1.003. On the other rows with
+a partial piece, the ratio above is 1.006 to 1.044 on Zen 4 and 1.014 to 1.048 on Zen 3. Rivals
+lead none of the seven rows: the rival that leads the others on each still takes 1.6 to 20.7
+percent more time than the code here.
+
+The vector holds bytes of the key or the data, and it is cleared with the rest of the message at
+the end, as before. The instruction takes registers only and touches no memory, stack or flags; it
+is emitted by the macro of the other instructions of the module. The reference answers of BLAKE2
+for inputs of 0 to 255 bytes, keyed and unkeyed, and the self-test of RFC 7693 pass on x86-64 under
+QEMU with AVX2, and the unit tests compare the one-call digest and MAC with the compression of
+padded blocks. In the bench runs, before any timing, the output of every row agrees with those of
+the rivals, on Intel's cores through the AVX-512VL kernel. The machine code of ARM64, armv7, i686,
+riscv64 and WebAssembly is the same as before, function by function, and on x86-64 only the
+one-call digests of BLAKE2b of both kernels change. With this crate at opt-level 3 and the
+application at 1, on all six, what the application's crate compiles of this one is drop glue,
+`Debug` and, on armv7, `MacAlgorithm::digest_into`, as before.
