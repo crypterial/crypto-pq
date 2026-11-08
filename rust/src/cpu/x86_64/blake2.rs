@@ -88,6 +88,14 @@ instruction!(
 );
 
 instruction!(
+    both_halves,
+    __m256i,
+    ymm_reg,
+    "vinserti128 {out}, {x}, {x:x}, 1",
+    x
+);
+
+instruction!(
     shuffle128,
     __m128i,
     xmm_reg,
@@ -169,7 +177,10 @@ fn padded64(data: &[u8], length: usize, m: &mut [__m256i; 8]) {
 
         let (low, high) = (value as i64, (value >> 64) as i64);
 
-        *words = _mm256_set_epi64x(high, low, high, low);
+        // One 32-byte store, from an instruction that the compiler cannot see through. As a splat,
+        // the halves were stored apart, and the 32-byte loads of the rounds waited for both stores
+        // to reach the cache: a MAC of 63 bytes took 10 ns more than one of 64 on Zen 3 (D-98).
+        *words = both_halves(_mm256_castsi128_si256(_mm_set_epi64x(high, low)));
     }
 }
 
