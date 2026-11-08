@@ -86,7 +86,7 @@ pub(crate) use dsa::{
 };
 
 #[cfg(feature = "ml-kem")]
-pub(crate) use pack::{encode12, reduce};
+pub(crate) use pack::{decode12, encode12, reduce};
 
 #[cfg(feature = "ml-dsa")]
 pub(crate) use sample::{bounded, uniform23};
@@ -1003,14 +1003,8 @@ pub(crate) fn mlkem_inner_product(
     false
 }
 
-// ML-KEM's decoding, compression and message encoding stay portable, which NEON's compiled loops
-// already serve.
-#[inline(always)]
-#[cfg(feature = "ml-kem")]
-pub(crate) fn decode12(_: &[u8; 384], _: u16, _: &mut [u16; 256]) -> bool {
-    false
-}
-
+// ML-KEM's compression, decompression and message encoding stay portable, which NEON's compiled
+// loops already serve.
 #[inline(always)]
 #[cfg(feature = "ml-kem")]
 pub(crate) fn mlkem_compress(
