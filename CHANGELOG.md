@@ -138,6 +138,11 @@ Implements specification 1.1 (draft).
   2.1% to 8.2% as a geometric mean on Ice Lake, Emerald Rapids, Granite Rapids, Zen 3 and Zen 4,
   while seven rows on Zen 3 and Zen 4 take 0.6% to 1.3% more, which the decision lists. The machine
   code of other targets is unchanged. Outputs are unchanged.
+- BLAKE2b on 32-bit Arm ([decision D-99](spec/decisions.md#decision-d-99)): a digest or MAC of
+  more than a block runs its key block, its whole blocks and its last block in one function,
+  through one copy of the rounds, with no call of memset or memcpy. On Neoverse N2, a digest of 255
+  bytes takes 2.9% less time, one of 1 KiB 0.7% less and a MAC of 1 KiB 1.1% less. The machine code
+  of other targets is unchanged. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
