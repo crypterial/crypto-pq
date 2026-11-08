@@ -181,7 +181,7 @@ def check_unlinked_references():
 def check_decisions():
     text = chapter("decisions.md")
 
-    defined = re.findall(r"^## Decision (D-\d\d)", text, re.M)
+    defined = re.findall(r"^## Decision (D-\d{2,3})", text, re.M)
 
     expected = [f"D-{n:02d}" for n in range(1, len(defined) + 1)]
 
@@ -193,7 +193,7 @@ def check_decisions():
     for path in all_markdown():
         for line in read(path).split("\n"):
             for segment in plain_segments(line):
-                referenced.update(re.findall(r"(?<![\w\-])(D-\d\d)(?!\d)", LINK_RE.sub(r"\1", segment)))
+                referenced.update(re.findall(r"(?<![\w\-])(D-\d{2,3})(?!\d)", LINK_RE.sub(r"\1", segment)))
 
     missing = sorted(referenced - set(defined))
 
