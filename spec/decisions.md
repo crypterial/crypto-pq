@@ -1535,3 +1535,62 @@ riscv64 and WebAssembly is the same as before, function by function, and on x86-
 one-call digests of BLAKE2b of both kernels change. With this crate at opt-level 3 and the
 application at 1, on all six, what the application's crate compiles of this one is drop glue,
 `Debug` and, on armv7, `MacAlgorithm::digest_into`, as before.
+
+## Decision D-99
+
+On 32-bit Arm, a BLAKE2b digest or MAC of more than a block of data runs in one function, out of
+line, that reads the words of the key block and of the last block from their bytes, with zeros
+after them, as the function of [D-86](#decision-d-86) for at most a block does, and those of the
+whole blocks between them from the input, and runs every block through one copy of the rounds.
+Before, it took the portable code of the other targets, where the key block and the last block were
+arrays in memory: calls of memset filled and wiped them, a call of memcpy copied the bytes of each,
+and another the output. BLAKE2s keeps the form of [D-96](#decision-d-96), and digests and MACs of
+at most a block and the incremental form keep the code before.
+
+This is a form of the portable code that the target chooses at compile time, not CPU-specific code
+under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on the lengths,
+which are public.
+
+Rationale: under QEMU, BLAKE2b of 129 bytes runs 10531 instructions against 10846 before, of 255
+bytes 10641 against 10922, of 1 KiB 41653 against 42040 and of 16 KiB 662413 against 665200, and
+its MAC of 255 bytes 15857 against 16326. blake2-rfc runs 10905, 10890, 42301, 670861 and 16111.
+Over the instructions that BLAKE2b of 255 bytes executes, llvm-mca for Cortex-A57 counts 3552 cycles
+against 3653 before and 3631 for blake2-rfc.
+
+The form of D-96, a function for the key block and the last block and the loop over whole blocks,
+ran BLAKE2b through two copies of the rounds: 44 KB of code for a digest of 255 bytes, where one
+copy takes 21 to 24 KB on 32-bit Arm, and one of BLAKE2s 6 KB. Cortex-A15 has 32 KB of instruction
+cache, and Cortex-A7, A9 and A53 have 8 to 64 KB as built; the bench runs on Neoverse N2, which has
+64 KB, and would not show the misses. With the flag of the last block set in each branch of the
+loop, the function took a copy of the rounds for each value of the flag there, 64 KB; computed from
+the counter after the branches, it takes one, 24 KB. Each call runs one copy of the rounds, as
+before, and the code of BLAKE2b on 32-bit Arm has one copy more.
+
+In bench run 42428878012 on Neoverse N2, in one process where the copies run in turn, two copies of
+the code here and two of the code before, the time before over the time here, each the geometric
+mean of its two copies of the median over the processes, was 1.030 for BLAKE2b of 255 bytes, 1.007
+for 1 KiB and 1.000 for 16 KiB, and 1.011 and 1.000 for its MACs of 1 KiB and 16 KiB. Over the
+other 19 rows of BLAKE2b it was 1.000 to 1.002, and over the 55 rows of BLAKE2s and BLAKE3 0.991 to
+1.004, 1.000 as a geometric mean. BLAKE2b of 255 bytes, which blake2b_simd led by 1.8 percent, now
+leads it by 1.1 percent, and BLAKE2b of 1 KiB takes 0.1 percent more time than blake2b_simd, against
+0.8 before. Rivals led 5 of the 79 rows of this class before and 3 here. No row takes more time
+than before beyond the spread of the rows of BLAKE2s and BLAKE3: the digest and MAC of 16 KiB take
+0.03 and 0.01 percent more.
+
+The state and the words are held as in the function of D-86 and in the loop over whole blocks of
+[D-91](#decision-d-91): [D-76](#decision-d-76) treats them as register values at opt-level 3, and
+they are wiped at other levels. The counter is a usize, as it counts at most a block more than a
+slice holds. The unit tests check the function against the compression of padded blocks, for both
+word sizes, for data of up to three blocks, with and without a key. The reference answers of BLAKE2
+for inputs of 0 to 255 bytes and the self-test of RFC 7693 pass on armv7 at opt-level 3 and z.
+
+The machine code of x86-64, ARM64, i686, riscv64 and WebAssembly is the same as before, function by
+function. On armv7 the new function is the only one added, and the dispatcher of the digests and
+the MAC of BLAKE2b no longer hold the portable code for more than a block: 409 and 17 lines of
+assembly against 731 and 520. The compression of BLAKE2b, its loop over whole blocks and the update
+and finish of its incremental form, whose source is the same, change by at most 2 percent of their
+lines. Under QEMU, the incremental form of BLAKE2b and of its MAC runs 13 to 100 instructions fewer
+for 0 to 256 bytes, 251 and 291 fewer for 1 KiB and 4211 and 4251 fewer for 16 KiB, and the one-call
+digest and MAC of at most a block run 2 and 6 fewer. With this crate at opt-level 3 and the
+application at 1, on all six, what the application's crate compiles of this one is drop glue,
+`Debug` and, on armv7, `MacAlgorithm::digest_into`, as before.
