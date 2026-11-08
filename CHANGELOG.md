@@ -131,6 +131,13 @@ Implements specification 1.1 (draft).
   geometric mean in each class measured under wasmtime and Node.js, while some rows take up to 11%
   more, which the decision lists. The machine code of other targets is unchanged. Outputs are
   unchanged.
+- BLAKE2b on x86-64 with AVX2 ([decision D-98](spec/decisions.md#decision-d-98)): in a digest or
+  MAC in one call, the vector that holds the last bytes of a key or of a final block whose length
+  is not a multiple of 16 is written with one 32-byte store, from which the loads of the rounds
+  take their bytes. Over the rows whose input ends in a partial 16-byte piece, the time drops by
+  2.1% to 8.2% as a geometric mean on Ice Lake, Emerald Rapids, Granite Rapids, Zen 3 and Zen 4,
+  while seven rows on Zen 3 and Zen 4 take 0.6% to 1.3% more, which the decision lists. The machine
+  code of other targets is unchanged. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
