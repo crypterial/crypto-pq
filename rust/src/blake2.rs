@@ -852,13 +852,54 @@ fn portable<W: Word>(
         compress(h, first, counter, false);
     }
 
-    if !blocks.is_empty() {
+    if FEW_CALLS && !blocks.is_empty() && blocks.len() <= FEW_BLOCKS * 16 * W::BYTES {
+        few_blocks(h, blocks, counter);
+    } else if !blocks.is_empty() {
+        // black_box keeps the length past FEW_BLOCKS from LLVM, which would take it into
+        // whole_blocks and allocate the registers of its loop anew: the loop laid out anew took
+        // 2.0 to 3.6 percent more time for 1 KiB and 16 KiB on Zen 3 and Zen 4 (D-100).
+        let blocks = if FEW_CALLS {
+            core::hint::black_box(blocks)
+        } else {
+            blocks
+        };
+
         whole_blocks(h, blocks, counter);
     }
 
     if let Some((m, total)) = last {
         compress(h, m, total, true);
     }
+}
+
+// Whether up to FEW_BLOCKS whole blocks before the last block take a call of compress each on
+// 32-bit x86, where whole_blocks holds a second copy of the rounds, so that BLAKE2s of 65 to 192
+// bytes runs one copy: it took 2 to 9 percent less time on Zen 3 and Ice Lake, 18 percent less at
+// 129 to 192 bytes on Zen 5 and up to 1.4 percent more on Zen 4 (D-100).
+const FEW_CALLS: bool = cfg!(target_arch = "x86");
+
+const FEW_BLOCKS: usize = 2;
+
+// At most FEW_BLOCKS whole blocks of bytes into h with a call of compress each, counter the number
+// of bytes before them, as whole_blocks takes them on WebAssembly. A function of its own: inside
+// whole_blocks, the test of the length changed the loop (D-100).
+#[inline(never)]
+fn few_blocks<W: Word>(h: &mut [W; 8], blocks: &[u8], counter: u128) {
+    let mut counter = counter;
+
+    let mut m = [W::default(); 16];
+
+    for block in blocks.chunks_exact(16 * W::BYTES) {
+        for (word, bytes) in m.iter_mut().zip(block.chunks_exact(W::BYTES)) {
+            *word = W::from_le(bytes);
+        }
+
+        counter = counter.wrapping_add(16 * W::BYTES as u128);
+
+        compress(h, &m, counter, false);
+    }
+
+    wipe(&mut m);
 }
 
 // The counter of whole_blocks, BLAKE2s only, which counts at most 2^64 - 1 bytes. A u128 on 32-bit
@@ -2576,5 +2617,43 @@ mod tests {
         long_matches_compress::<u32>();
 
         long_matches_compress::<u64>();
+    }
+
+    // few_blocks against whole_blocks: one to FEW_BLOCKS whole blocks, from the IV and from a
+    // compressed state, at counters that carry into the second word of the counter of BLAKE2s.
+    fn few_matches_whole<W: Word>() {
+        let block = 16 * W::BYTES;
+
+        let message: [u8; 256] =
+            core::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(3));
+
+        let mut mixed = W::IV;
+
+        compress(&mut mixed, &[W::default(); 16], 1, false);
+
+        for count in 1..=FEW_BLOCKS {
+            let data = &message[..count * block];
+
+            for start in [W::IV, mixed] {
+                for counter in [0, 64, (1u128 << 32) - 64] {
+                    let mut few = start;
+
+                    few_blocks(&mut few, data, counter);
+
+                    let mut whole = start;
+
+                    whole_blocks(&mut whole, data, counter);
+
+                    assert!(few == whole, "{count} blocks from {counter}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn few_blocks_match_whole_blocks_for_both_words() {
+        few_matches_whole::<u32>();
+
+        few_matches_whole::<u64>();
     }
 }

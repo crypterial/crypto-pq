@@ -1594,3 +1594,81 @@ for 0 to 256 bytes, 251 and 291 fewer for 1 KiB and 4211 and 4251 fewer for 16 K
 digest and MAC of at most a block run 2 and 6 fewer. With this crate at opt-level 3 and the
 application at 1, on all six, what the application's crate compiles of this one is drop glue,
 `Debug` and, on armv7, `MacAlgorithm::digest_into`, as before.
+
+## Decision D-100
+
+On 32-bit x86, BLAKE2s takes one or two whole blocks before its last block with a call of the
+compression function for each, in a function of its own, out of line. Three or more go through the
+loop over whole blocks, which inlines a second copy of the rounds, as before. A digest or MAC of 65
+to 192 bytes of data thus runs one copy of the rounds, as one of at most 64 bytes does, and so do,
+in the incremental form, the buffered block and the whole blocks of an update when they are one or
+two. BLAKE2b and the other targets keep the code before. Which path runs depends only on the
+lengths, which are public.
+
+This is a form of the portable code that the target chooses at compile time, not CPU-specific code
+under [15.3](15-platforms.md#153-cpu-specific-code).
+
+Rationale: on 32-bit x86 the loop over whole blocks takes 5735 bytes of code and the compression
+function 5303, and a digest of 65 to 192 bytes ran both; it now runs the compression function and
+the new function, 307 bytes. It runs about as many instructions as before: under QEMU, BLAKE2s of 65
+bytes runs 3782 instructions against 3783 before, of 128 bytes 3753 against 3756, of 129 bytes 5581
+against 5568, of 192 bytes 5556 against 5539 and of 1 KiB 28721 against 28715, and its MAC of 129
+bytes 7377 against 7355. p3-blake2s runs 3749, 5563 and 5598 for 65, 129 and 192 bytes.
+
+In bench run 42458361223, in one process where the copies run in turn, two copies of the code here
+and two of the code before, the time before over the time here, each the geometric mean of its two
+copies of the median over the processes, as a geometric mean over the 12 rows of BLAKE2s of 65 to
+192 bytes (digests of 65, 100, 127, 128, 129 and 192 bytes, digests of 129, 160 and 192 bytes from
+other buffers, and MACs of 65, 127 and 128 bytes), was 1.035 on Zen 3, 1.082 on Ice Lake, 1.091 on
+Zen 5, 1.000 on Emerald Rapids and 0.992 on Zen 4. By row it was 1.021 to 1.045 on Zen 3, 1.054 to
+1.101 on Ice Lake and 0.985 to 1.016 on Emerald Rapids. On Zen 5 it was 1.213 to 1.223 for the
+digests of 129 to 192 bytes, where the loop ran two blocks, and 0.996 to 1.023 for the other rows.
+On Zen 4 the digests take 0.7 to 1.4 percent more time (0.986 to 0.993), 0.1 to 1.0 percent in one
+copy and 1.2 to 1.8 percent in the other, and the MACs the same time (0.999 to 1.000). Three more
+processes in each job, which ran only the copies of crypto-pq and the rivals without AVX2 code, gave
+the same geometric means within 0.005 and the same rows on Zen 4 within 0.001, so that the cost on
+Zen 4 does not come from the AVX2 code of other crates in the process. 32-bit x86 runs one form of
+the portable code on every processor ([D-95](#decision-d-95)), and Zen 4 is the one class of the
+five where these digests take more time.
+
+Over these 60 rows in the five classes, rivals led 22 and 23 in the two copies of the code before
+and 8 and 14 here, and by more than 1 percent 19 and 20 before and 3 and 6 here. p3-blake2s led the
+digests of 129 to 192 bytes on Zen 5 by 14.9 to 18.8 percent and now takes 0.7 to 2.0 percent more
+time than this code. On Ice Lake it led the digests of 100, 127, 160 and 192 bytes by 2.0 to 5.0
+percent; this code now leads them by 4.4 to 7.6 percent in one copy and by 0.1 to 4.0 percent in the
+other, but for 127 bytes, which p3-blake2s leads there by 0.6 percent. On Zen 3, where it led all
+nine digests by 2.3 to 6.8 percent, it still leads those of 65 and 129 bytes, by 1.8 to 4.7 percent,
+and those of 100 to 160 bytes in one copy, by 0.6 to 1.5 percent, and no longer those of 192 bytes.
+On Zen 4 it took 0.998 to 1.025 times the time of the code before for these digests and takes 0.982
+to 1.016 times the time of the code here: it led only 65 bytes, by 0.2 percent, and now leads 65,
+127 and 129 bytes, by 0.4 to 1.8 percent.
+
+Over the 70 other rows of BLAKE2b, BLAKE2s and BLAKE3 in each class, the time before over the time
+here was 0.995 to 1.009 as a geometric mean, and on Zen 4 the first copy here took the same time as
+the code before (1.000). For digests of BLAKE2s of 0 to 64 bytes, the second copy here took 7 to 10
+percent more time than the first on Zen 4, 5 to 7 percent on Zen 3 and 9 to 11 percent on Ice Lake,
+where the second copy of the code before took 0.1 percent at most, 2.5 to 3.6 and 4.4 to 8.9 percent
+more than its first: the copies run the same machine code at other places.
+
+With the test of the length inside the loop over whole blocks, LLVM allocated the registers of the
+loop anew, and in bench run 42453852559 BLAKE2s of 1 KiB and 16 KiB took 2.0 to 3.6 percent more
+time on Zen 3 and Zen 4. Out of line, the test still gave LLVM the range of the length that reaches
+the loop, and it compiled the loop anew as well. `core::hint::black_box` on the blocks before the
+loop keeps that range from it.
+
+The new function reads the input only below its length and wipes its message words, as the loop over
+whole blocks does on WebAssembly; the compression function wipes its own state, as before. The unit
+tests check it against the loop over whole blocks, for both word sizes, for one and two blocks, from
+the IV and from a compressed state, at counters that carry into the second word of the counter of
+BLAKE2s. The reference answers of BLAKE2 for inputs of 0 to 255 bytes, also fed in uneven pieces,
+and the self-test of RFC 7693 pass on i686 at opt-level 3 and in debug builds.
+
+The machine code of x86-64, ARM64, armv7, riscv64 and WebAssembly is the same as before, function by
+function. On i686 the new function is the only one added, and the loop over whole blocks and the
+compression function are the same as before; the functions that run BLAKE2s change: the dispatcher
+of digests, the MAC of BLAKE2s and the update of its incremental form. Under QEMU, the incremental
+form runs 173 instructions fewer for 1 KiB in updates of 32 or 64 bytes (33993 against 34166 and
+32443 against 32616), 9 fewer for one update of 65 or 128 bytes and 11 more for one of 129 or 192
+bytes. With this crate at opt-level 3 and the application at 1, on all six, what the application's
+crate compiles of this one is drop glue, `Debug` and, on armv7, `MacAlgorithm::digest_into`, as
+before.
