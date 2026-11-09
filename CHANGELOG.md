@@ -150,6 +150,13 @@ Implements specification 1.1 (draft).
   129 to 192 bytes on Zen 5, and is unchanged on Emerald Rapids, while on Zen 4 digests of these
   lengths take 0.7% to 1.4% more. The machine code of other targets is unchanged. Outputs are
   unchanged.
+- BLAKE2b on ARM64 on Neoverse N2 ([decision D-101](spec/decisions.md#decision-d-101)): a call
+  that compresses two or more blocks, as a digest of more than 128 bytes or a MAC of a message of
+  at least one byte does, runs them in one loop of assembly, out of line, with the state and words
+  0 to 8 of the block in registers. On Neoverse N2, a digest of 255 bytes takes 0.7% less time, one
+  of 1 KiB 2.5% less and one of 16 KiB 2.4% less, and MACs of 1 byte to 16 KiB 0.9% to 2.7% less.
+  A call of one block, BLAKE2s and other cores run the code before. The machine code of other
+  targets is unchanged. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a

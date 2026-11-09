@@ -1672,3 +1672,69 @@ form runs 173 instructions fewer for 1 KiB in updates of 32 or 64 bytes (33993 a
 bytes. With this crate at opt-level 3 and the application at 1, on all six, what the application's
 crate compiles of this one is drop glue, `Debug` and, on armv7, `MacAlgorithm::digest_into`, as
 before.
+
+## Decision D-101
+
+On an ARM64 core with LAZY, Neoverse N2 by the implementer and part numbers of MIDR_EL1, a call of
+BLAKE2b that compresses two or more blocks (a MAC's key block, the whole blocks and the final block,
+those there are) runs them in one loop of inline assembly, out of line: the sixteen words of the
+state in sixteen general registers, words 0 to 8 of the block in nine more, and each of the other
+seven words of a round loaded from the block where a G function adds it. The chaining value goes
+from one block to the next in the registers of the state, and its copy in memory, stored after each
+block, is read back for the next block's final XOR. A call that compresses one block keeps the
+compiled rounds, and so do BLAKE2s, other cores and other targets. Which path runs depends only on
+the number of blocks, which the lengths give, and the lengths are public.
+
+This is CPU-specific code under [15.3](15-platforms.md#153-cpu-specific-code), and the portable
+compression is its twin. The kernel test compares them on random inputs for every form of call, a
+key block or none, zero to three whole blocks and a final block or none, in the build of the
+constant-time check (`--cfg crypto_pq_ct`), which takes LAZY on every core.
+
+The assembly runs ADD, EOR and ROR, with or without a rotated operand, in the rounds, ADDS and ADC
+on the counter, and LDR, LDP, STR and STP at immediate offsets from the addresses it is given. Its
+conditional branches, B.NE after SUBS and CBNZ, test the counts of blocks only. The data-processing
+instructions are on Arm's data-independent-timing list, and no address depends on the data. Nothing
+secret goes to the stack: the words of the blocks and of the state stay in registers, and the
+assembly stores only the chaining value, into the caller's h as before, and the counters, counts and
+positions of the runs it works through, which are public. Where pointers have 32 bits (the ILP32 ABI
+of ARM64), the layout that the assembly reads fails its assertions at compile time; the other
+assembly of this module, which takes addresses in 64-bit registers, does not support that ABI
+either.
+
+Rationale: compiled from Rust, the rounds of a block keep the sixteen message words beside the
+sixteen words of the state, more values than there are registers, and LLVM stores some of them to
+the stack and loads them back in every block. Under QEMU, in the build of the constant-time check, a
+block takes 1476 instructions here against 1528 before. A digest of 255 bytes runs 3203 against
+3253, one of 1 KiB 12015 against 12375 and one of 16 KiB 189135 against 195735, and a MAC of 1, 64
+and 127 bytes 3191, 3173 and 3227 against 3239, 3221 and 3275. A digest of one block runs the code
+before, and 1 to 3 more instructions in its caller.
+
+In bench run 42556051228, in one process where four copies of crypto-pq run in turn (this code, the
+code with every call on the assembly, and two copies of the code before), the time before over the
+time here on Neoverse N2, the time before the geometric mean of its two copies and each copy's time
+the median over five processes, as a geometric mean over six jobs, was 1.007 for a digest of 255
+bytes, 1.026 for 1 KiB, 1.025 for 16 KiB, 1.009 to 1.012 for the MACs of 1 to 128 bytes, 1.028 for a
+MAC of 1 KiB and 1.027 for one of 16 KiB, and 1.001 for the MAC of 0 bytes. For the eleven digests
+of one block it was 0.997 to 0.999, and 0.996 to 1.000 by job, while the two copies of the code
+before, the same machine code at other places, differed by up to 0.5 percent in a job; with every
+call on the assembly it was 0.990 to 0.997. BLAKE2s and BLAKE3, whose machine code is unchanged,
+gave 0.999 as geometric means over their rows. dryoc, which led the digest of 16 KiB by 1.1 percent,
+takes 1.5 percent more time than this code.
+
+In bench run 42553148391, with every call on the assembly and an earlier form of the function that
+fills the runs, the time before over the time here on Neoverse N2 was 1.007 for a digest of 255
+bytes, 1.026 for 1 KiB and 16 KiB and 1.010 to 1.029 for the MACs of 1 byte to 16 KiB, but 0.988 to
+0.997 for the eleven digests of one block, although under QEMU those of 0, 31, 64, 127 and 128 bytes
+ran 3 to 5 fewer instructions than before; the MAC of 0 bytes, also one block, took 1.4 percent less
+time. A call that compresses one block therefore keeps the compiled rounds.
+
+Given the assembly of one block inside a loop in Rust, LLVM copied it into each path of the loop. A
+first form of the loop in assembly, in bench run 42547091038, was called once for each run of
+blocks, the key block, the whole blocks and the final block, and loaded every message word from the
+block: the digests of 1 KiB and 16 KiB took 3.6 percent less time than before, but one of 255 bytes
+2.2 to 2.8 percent more and the MACs of up to 127 bytes 0.6 to 1.5 percent more.
+
+The machine code of 32-bit Arm, x86-64, 32-bit x86, RISC-V and WebAssembly is unchanged, function by
+function. On ARM64 the rounds compiled from Rust are unchanged, the three callers that reach them
+change, and the assembly is new. In a crate that depends on crypto-pq, built at a lower opt-level,
+the functions of crypto-pq that are compiled in the crate are those before.
