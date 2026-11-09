@@ -2077,7 +2077,7 @@ mod tests {
                 _ => u128::MAX - 300,
             };
 
-            let first = (n % 2 == 1).then_some(&first);
+            let first = ((n / 4) % 2 == 1).then_some(&first);
 
             let total = counter.wrapping_add(u128::from(inputs.next() % 1000));
 

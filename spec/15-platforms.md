@@ -47,7 +47,10 @@ its result is kept in an atomic.
    target.
 3. ARM64 tiers: NEON (baseline), the AES, SHA-2, SHA-3 and SHA-512 extensions, and DIT. Detection reads the
    hardware capabilities on Linux and Android, `IsProcessorFeaturePresent` on Windows, and assumes the
-   Apple baseline on Apple systems. Other systems run the portable code.
+   Apple baseline on Apple systems. Other systems run the portable code. On Linux and Android, the
+   implementer and part numbers of MIDR_EL1 choose among the kernels of a tier, or the portable code,
+   for some functions, as for BLAKE2b on Neoverse N2 [[D-101](decisions.md#decision-d-101)]; like the
+   x86-64 tables, they depend on the processor only, never on the data.
 4. RISC-V runs the portable code: crypto-pq 1.1 contains no RISC-V kernel.
 5. Every kernel MUST have a test that compares it with its portable twin on random inputs, and the
    official vectors MUST pass on every tier ([18.2](18-testing.md#182-cpu-tiers)).

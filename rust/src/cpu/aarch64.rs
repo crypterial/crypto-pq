@@ -1031,9 +1031,10 @@ pub(crate) fn mlkem_message(_: &[u16; 256], _: &[u16; 256], _: u16, _: &mut [u8;
 }
 
 // BLAKE2 stays on the scalar pipes, measured ahead of NEON: four independent G functions per step
-// keep them busy, a hand-ordered assembly version measured the same, and NEON's two-cycle
-// instructions and two-instruction rotations lengthen the chain. A core with LAZY takes each
-// rotation off the chain (blake2.rs); the others run the portable code.
+// keep them busy, a hand-ordered assembly version of the portable form measured the same, and
+// NEON's two-cycle instructions and two-instruction rotations lengthen the chain. A core with
+// LAZY takes each rotation off the chain, and BLAKE2b's compressions, when there are two or more,
+// in assembly (blake2.rs, D-101); the others run the portable code.
 #[inline(always)]
 #[cfg(feature = "blake2")]
 pub(crate) fn blake2b(
@@ -1047,7 +1048,13 @@ pub(crate) fn blake2b(
         return false;
     }
 
-    blake2::process(h, first, blocks.as_flattened(), counter, last);
+    // A call with one compression keeps the compiled rounds, which took less time than the
+    // assembly for a one-block digest (D-101).
+    if usize::from(first.is_some()) + blocks.len() + usize::from(last.is_some()) > 1 {
+        blake2::process_b(h, first, blocks, counter, last);
+    } else {
+        blake2::process(h, first, blocks.as_flattened(), counter, last);
+    }
 
     true
 }
