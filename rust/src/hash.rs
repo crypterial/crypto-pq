@@ -111,7 +111,7 @@ impl Engine {
                 feature = "lms",
                 feature = "xmss"
             ))]
-            Self::Sha256(engine) => engine.update(data),
+            Self::Sha256(engine) => engine.update_stream(data),
             #[cfg(any(
                 feature = "sha2",
                 feature = "ml-dsa",
@@ -119,7 +119,7 @@ impl Engine {
                 feature = "lms",
                 feature = "xmss"
             ))]
-            Self::Sha512(engine) => engine.update(data),
+            Self::Sha512(engine) => engine.update_stream(data),
             #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
             Self::Keccak(engine) => engine.update(data),
             #[cfg(feature = "blake2")]
