@@ -81,7 +81,8 @@ jobs:
       - if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
         env:
           RUSTFLAGS: -C target-cpu=x86-64-v3
-        run: cargo test --locked --release --all-features --lib -- --nocapture sha2:: hash:: mac::
+        run: |
+          cargo test --locked --release --all-features --lib -- --nocapture sha2:: hash:: mac::
 
   # Under emulation the s390x and 32-bit ARM suites take over an hour in one job, so their unit
   # tests, integration tests and doctests run as three jobs, which together make the `cargo test`
