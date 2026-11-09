@@ -1738,3 +1738,59 @@ The machine code of 32-bit Arm, x86-64, 32-bit x86, RISC-V and WebAssembly is un
 function. On ARM64 the rounds compiled from Rust are unchanged, the three callers that reach them
 change, and the assembly is new. In a crate that depends on crypto-pq, built at a lower opt-level,
 the functions of crypto-pq that are compiled in the crate are those before.
+
+## Decision D-102
+
+On an ARM64 core with LAZY, a BLAKE3 hash of at most a block with an output of at most 32 bytes, a
+hash, a keyed hash or the last compression of `derive_key`, takes the message words from the
+caller's slice, and a key given in bytes into the words of the state, and writes the output words
+into the caller's output: the scalar kernel keeps no copy of the block, the key or the output in
+memory. The words after a message of less than a block are zeros, and the word that takes its last
+bytes is built from them, as in [D-86](#decision-d-86); an output of less than 32 bytes takes its
+whole words, then the bytes left from the register of the next word. Other cores, longer inputs and
+other targets are unchanged.
+
+This is CPU-specific code under [15.3](15-platforms.md#153-cpu-specific-code), and the portable
+digest is its twin. The kernel test compares them with random keys, in words and in bytes, random
+flags, inputs of 0 to 64 bytes and outputs of 1 to 32 bytes, in the build of the constant-time check
+(`--cfg crypto_pq_ct`), which takes LAZY on every core. Which path runs depends only on the lengths
+of the input and of the output, which are public. The words of the key, the message and the state
+are arrays indexed with constants only, register values under [D-76](#decision-d-76), wiped below
+opt-level 3, and the last bytes of a partial output come from a register, not from an array of them.
+
+Rationale: a keyed hash and `derive_key` copied the key's words to the stack, with two stores of 16
+bytes, and the rounds loaded them four bytes at a time right after; a message of less than a block
+went into a block of zeros on the stack, and the output into a buffer of 32 bytes, both wiped after.
+In bench run 42564427681, in one process where four copies of crypto-pq run in turn (this code, the
+code with the last bytes of a partial output written through an array, and two copies of the code
+before), the time before over the time here on Neoverse N2, the time before the geometric mean of
+its two copies and each copy's time the median over five processes, as a geometric mean over six
+jobs, was 1.039, 1.089, 1.090, 1.084, 1.040, 1.088 and 1.013 for hashes of 0, 1, 4, 8, 32, 63 and 64
+bytes, 1.096, 1.135, 1.135, 1.127, 1.087, 1.143 and 1.065 for keyed hashes of these lengths, and
+1.021 for `derive_key` of 32 bytes and 1.016 with two contexts in turn. Inputs of 1 KiB and more and
+extended output gave 0.998 to 1.005, with the same machine code. The two copies of the code before
+differed by up to 0.34 percent in a job. On the hashes and keyed hashes of at most 64 bytes,
+ab-blake3, the nearest rival there, with its hash of one block or of one chunk, took 1.147 to 1.190
+times the time here, against 1.016 to 1.148 times the time before. The code with the array took
+keyed hashes 0.3 to 1.0 percent more time than here, through the register allocation of the kernel,
+and hashes, whose machine code is the same, the same time.
+
+In bench run 42562857052, with the key's words read from its bytes and the code before otherwise,
+keyed hashes of at most a block took 3.6 to 4.8 percent less time than before and hashes the same:
+the copy of the key, two stores read back at once as eight loads, and its wipe took that time. Under
+QEMU, in the build of the constant-time check, a hash of 1 byte runs 1010 instructions here against
+1050 before, one of 63 bytes 1055 against 1044, and keyed 1024 against 1073 and 1069 against 1067;
+the words of a short message, built in registers, take more instructions than a copy, and less time.
+
+In the same run, BLAKE2 on ARM64 with the copy of whole words that 32-bit x86 takes
+([D-95](#decision-d-95)), out of line, took more time on Neoverse N2: BLAKE2b of 16 and 31 bytes 0.5
+and 0.2 percent less, but of 63, 65, 100, 127 and 255 bytes 0.7 to 1.9 percent more, and BLAKE2s and
+its MAC of 31 to 127 bytes up to 3.1 percent more. On Apple M3, in one process, BLAKE2s of 16 and 33
+bytes took 3.5 and 3.9 percent more. BLAKE2 keeps the loop on ARM64.
+
+The machine code of 32-bit Arm, x86-64, 32-bit x86, RISC-V and WebAssembly is unchanged, function by
+function. On ARM64 the scalar digest changes and takes 1189 instructions against 922, the digest of
+a key in bytes is new, with its own copy of the rounds (1186 instructions), and the MAC and KDF
+dispatchers, which copied the key, change; the keyed MAC now reaches the kernel by a tail call. In a
+crate that depends on crypto-pq, built at a lower opt-level, the functions of crypto-pq that are
+compiled in the crate are those before.

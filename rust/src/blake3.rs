@@ -1625,9 +1625,19 @@ fn digest1_in_locals<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u
 
 // The words of a block of less than 64 bytes, zeros after the message. Leaves at the word that
 // takes the last bytes, with no test on the zero words after it.
-#[cfg(any(test, target_family = "wasm", target_arch = "arm"))]
+#[cfg(any(
+    test,
+    target_family = "wasm",
+    target_arch = "arm",
+    all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        target_feature = "neon",
+        not(crypto_pq_portable)
+    )
+))]
 #[inline(always)]
-fn short_words(data: &[u8]) -> [u32; 16] {
+pub(crate) fn short_words(data: &[u8]) -> [u32; 16] {
     let (whole, rest) = data.as_chunks::<4>();
 
     let mut partial = 0;

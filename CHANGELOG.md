@@ -157,6 +157,13 @@ Implements specification 1.1 (draft).
   of 1 KiB 2.5% less and one of 16 KiB 2.4% less, and MACs of 1 byte to 16 KiB 0.9% to 2.7% less.
   A call of one block, BLAKE2s and other cores run the code before. The machine code of other
   targets is unchanged. Outputs are unchanged.
+- BLAKE3 on ARM64 on Neoverse N2 ([decision D-102](spec/decisions.md#decision-d-102)): a hash, a
+  keyed hash or `derive_key` of at most 64 bytes with an output of at most 32 bytes reads the
+  message, and a key given in bytes, straight into the registers of its one compression and writes
+  the output words straight into the caller's buffer, with no copy of the block, the key or the
+  output on the stack. On Neoverse N2 such a hash takes 1.3% to 8.3% less time, a keyed hash 6.1%
+  to 12.5% less and `derive_key` of 32 bytes 2.1% less. Other cores and the machine code of other
+  targets are unchanged. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
