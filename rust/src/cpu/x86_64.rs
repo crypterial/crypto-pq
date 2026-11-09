@@ -1154,6 +1154,57 @@ pub(crate) fn digest256(state: &[u32; 8], data: &[u8], bits: u64, out: &mut [u8]
     true
 }
 
+// compress256 for Sha256Stream (D-103). With the SHA extensions the state is in the order of
+// stream_kept after the call, which kept records, and was before it when kept was set. Without
+// them, false, and the state stays in the order of the words.
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[allow(unsafe_code)]
+pub(crate) fn compress256_kept(state: &mut [u32; 8], kept: &mut bool, blocks: &[[u8; 64]]) -> bool {
+    if !has(SHA) {
+        return false;
+    }
+
+    if *kept {
+        // SAFETY: as in compress256.
+        unsafe { compress256_sha_kept::<true>(state, blocks) };
+    } else {
+        // SAFETY: as in compress256.
+        unsafe { compress256_sha_kept::<false>(state, blocks) };
+
+        *kept = true;
+    }
+
+    true
+}
+
+// digest256 for a state that compress256_kept keeps. False for a digest of a size other than 28
+// or 32 bytes; a state is kept only after has has found the SHA extensions, and the test of
+// detected keeps this function safe to call on its own.
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[allow(unsafe_code)]
+pub(crate) fn digest256_kept(state: &[u32; 8], data: &[u8], bits: u64, out: &mut [u8]) -> bool {
+    if !detected(SHA) || !matches!(out.len(), 28 | 32) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { digest256_sha_kept(state, data, bits, out) };
+
+    true
+}
+
 #[allow(unsafe_code)]
 pub(crate) fn finish512(state: &mut [u64; 8], data: &[u8], bits: u128) -> bool {
     if !has(AVX2) {
@@ -3001,6 +3052,317 @@ fn finish256_sha(state: &mut [u32; 8], data: &[u8], bits: u64) {
 #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
 fn digest256_sha(state: &[u32; 8], data: &[u8], bits: u64, out: &mut [u8]) {
     let mut streams = [stream_of(state)];
+
+    finish_stream256!(streams, data, bits);
+
+    digest_of(&streams[0], out);
+
+    wipe_unless_optimized!(memory::words_of(&mut streams));
+}
+
+// The order of a state that Sha256Stream keeps (D-103): the lanes of abef and then of cdgh, words
+// f, e, b, a, h, g, d and c, which load into the registers of the rounds and store from them with
+// no shuffle on the path from one block to the next.
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[target_feature(enable = "sse2")]
+#[inline]
+fn stream_kept(state: &[u32; 8]) -> Stream {
+    let [abef, cdgh] = state.as_chunks::<4>().0 else {
+        unreachable!("eight words are two groups of four")
+    };
+
+    Stream {
+        abef: memory::load128(abef),
+        cdgh: memory::load128(cdgh),
+        m: [_mm_setzero_si128(); 4],
+    }
+}
+
+// The inverse of stream_kept.
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[target_feature(enable = "sse2")]
+#[inline]
+fn kept_of(stream: &Stream, state: &mut [u32; 8]) {
+    let [abef, cdgh] = state.as_chunks_mut::<4>().0 else {
+        unreachable!("eight words are two groups of four")
+    };
+
+    memory::store128(stream.abef, abef);
+
+    memory::store128(stream.cdgh, cdgh);
+}
+
+// K256 for the memory operands of PADDD in compress256_sha_kept, which need 16-byte alignment.
+#[cfg(all(
+    any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ),
+    not(target_feature = "avx")
+))]
+static K256_TABLE: Aligned<[u32; 64]> = Aligned(K256);
+
+// compress256_sha for Sha256Stream: the state in the order of stream_kept after the call, and
+// before it when KEPT, else in the order of the words. Without AVX, the loop is that of
+// compress256_sha over its first slice, in the order LLVM gives it there, in assembly, from a
+// 64-byte boundary, where that loop is in a build that aligns functions to 64 bytes. On Ice Lake,
+// where SHA256MSG1 and SHA256MSG2 are 6 and 12 uops, HMAC-SHA-256 of 16 KiB took 2.5% more time
+// than with compress256_sha in the order LLVM gave this function, with each SHA256MSG2 between the
+// two SHA256RNDS2 of the next quarter, and 2.0% in this order, both with the loop 16 bytes past a
+// 64-byte boundary, and the same time from a boundary; with the loop 32 bytes past one, a stream
+// of 64-byte updates took 0.9% more time than from a boundary. With AVX, LLVM gives both loops one
+// order (D-103).
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+#[allow(unsafe_code)]
+fn compress256_sha_kept<const KEPT: bool>(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+    let mut streams = [if KEPT {
+        stream_kept(state)
+    } else {
+        stream_of(state)
+    }];
+
+    #[cfg(target_feature = "avx")]
+    for block in blocks {
+        block_words(block, &mut streams[0].m);
+
+        rounds256!(streams, 1);
+    }
+
+    #[cfg(not(target_feature = "avx"))]
+    if !blocks.is_empty() {
+        let k = K256.as_chunks::<4>().0;
+
+        let swap = _mm_set_epi64x(0x0C0D_0E0F_0809_0A0B, 0x0405_0607_0001_0203);
+
+        let stream = &mut streams[0];
+
+        // SAFETY: the assembly reads the blocks, up to end, and the first 176 bytes of K256_TABLE,
+        // whose alignment the memory operands of PADDD need; it writes the registers it names
+        // and the flags, and no memory or stack. Its instructions are those of this function's
+        // target features.
+        unsafe {
+            core::arch::asm!(
+                "movdqa %xmm7, %xmm5",
+                "movdqa %xmm8, %xmm6",
+                ".p2align 6",
+                "2:",
+                "movdqu ({p}), %xmm3",
+                "movdqu 16({p}), %xmm14",
+                "movdqu 32({p}), %xmm2",
+                "movdqu 48({p}), %xmm1",
+                "pshufb %xmm9, %xmm3",
+                "pshufb %xmm9, %xmm14",
+                "pshufb %xmm9, %xmm2",
+                "movdqa %xmm3, %xmm0",
+                "paddd {k}(%rip), %xmm0",
+                "pshufb %xmm9, %xmm1",
+                "sha256rnds2 %xmm0, %xmm8, %xmm5",
+                "pshufd $14, %xmm0, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "movdqa %xmm1, %xmm0",
+                "sha256msg1 %xmm14, %xmm3",
+                "palignr $4, %xmm2, %xmm0",
+                "paddd %xmm0, %xmm3",
+                "movdqa %xmm14, %xmm0",
+                "paddd {k}+16(%rip), %xmm0",
+                "sha256msg2 %xmm1, %xmm3",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "pshufd $14, %xmm0, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "sha256msg1 %xmm2, %xmm14",
+                "movdqa %xmm3, %xmm4",
+                "palignr $4, %xmm1, %xmm4",
+                "paddd %xmm14, %xmm4",
+                "movdqa %xmm2, %xmm0",
+                "paddd {k}+32(%rip), %xmm0",
+                "sha256msg2 %xmm3, %xmm4",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "pshufd $14, %xmm0, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "movdqa %xmm4, %xmm0",
+                "sha256msg1 %xmm1, %xmm2",
+                "palignr $4, %xmm3, %xmm0",
+                "paddd %xmm0, %xmm2",
+                "movdqa %xmm1, %xmm0",
+                "paddd {k}+48(%rip), %xmm0",
+                "sha256msg2 %xmm4, %xmm2",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "pshufd $14, %xmm0, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "movdqa %xmm2, %xmm0",
+                "sha256msg1 %xmm3, %xmm1",
+                "palignr $4, %xmm4, %xmm0",
+                "paddd %xmm0, %xmm1",
+                "movdqa %xmm3, %xmm0",
+                "paddd {k}+64(%rip), %xmm0",
+                "sha256msg2 %xmm2, %xmm1",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "pshufd $14, %xmm0, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "movdqa %xmm1, %xmm0",
+                "sha256msg1 %xmm4, %xmm3",
+                "palignr $4, %xmm2, %xmm0",
+                "paddd %xmm0, %xmm3",
+                "movdqa %xmm4, %xmm0",
+                "paddd {k}+80(%rip), %xmm0",
+                "sha256msg2 %xmm1, %xmm3",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "pshufd $14, %xmm0, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "movdqa %xmm3, %xmm0",
+                "sha256msg1 %xmm2, %xmm4",
+                "palignr $4, %xmm1, %xmm0",
+                "paddd %xmm0, %xmm4",
+                "movdqa %xmm2, %xmm0",
+                "paddd {k}+96(%rip), %xmm0",
+                "sha256msg2 %xmm3, %xmm4",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "pshufd $14, %xmm0, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "movdqa %xmm4, %xmm0",
+                "sha256msg1 %xmm1, %xmm2",
+                "palignr $4, %xmm3, %xmm0",
+                "paddd %xmm0, %xmm2",
+                "movdqa %xmm1, %xmm0",
+                "paddd {k}+112(%rip), %xmm0",
+                "sha256msg2 %xmm4, %xmm2",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "pshufd $14, %xmm0, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "movdqa %xmm2, %xmm0",
+                "sha256msg1 %xmm3, %xmm1",
+                "palignr $4, %xmm4, %xmm0",
+                "paddd %xmm0, %xmm1",
+                "movdqa %xmm3, %xmm0",
+                "paddd {k}+128(%rip), %xmm0",
+                "sha256msg2 %xmm2, %xmm1",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "pshufd $14, %xmm0, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "movdqa %xmm1, %xmm0",
+                "sha256msg1 %xmm4, %xmm3",
+                "palignr $4, %xmm2, %xmm0",
+                "paddd %xmm0, %xmm3",
+                "movdqa %xmm4, %xmm0",
+                "paddd {k}+144(%rip), %xmm0",
+                "sha256msg2 %xmm1, %xmm3",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "pshufd $14, %xmm0, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "movdqa %xmm2, %xmm0",
+                "paddd {k}+160(%rip), %xmm0",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "movdqa %xmm3, %xmm14",
+                "sha256msg1 %xmm2, %xmm4",
+                "palignr $4, %xmm1, %xmm14",
+                "pshufd $14, %xmm0, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "paddd %xmm14, %xmm4",
+                "sha256msg1 %xmm1, %xmm2",
+                "movdqa %xmm1, %xmm0",
+                "paddd %xmm15, %xmm0",
+                "sha256msg2 %xmm3, %xmm4",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "pshufd $14, %xmm0, %xmm0",
+                "movdqa %xmm4, %xmm14",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "sha256msg1 %xmm3, %xmm1",
+                "palignr $4, %xmm3, %xmm14",
+                "paddd %xmm10, %xmm3",
+                "movdqa %xmm3, %xmm0",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "paddd %xmm14, %xmm2",
+                "sha256msg2 %xmm4, %xmm2",
+                "pshufd $14, %xmm3, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "movdqa %xmm2, %xmm0",
+                "palignr $4, %xmm4, %xmm0",
+                "paddd %xmm11, %xmm4",
+                "paddd %xmm0, %xmm1",
+                "movdqa %xmm4, %xmm0",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "pshufd $14, %xmm4, %xmm0",
+                "sha256msg2 %xmm2, %xmm1",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "paddd %xmm12, %xmm2",
+                "movdqa %xmm2, %xmm0",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "paddd %xmm13, %xmm1",
+                "pshufd $14, %xmm2, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "movdqa %xmm1, %xmm0",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
+                "pshufd $14, %xmm1, %xmm0",
+                "sha256rnds2 %xmm0, %xmm5, %xmm6",
+                "paddd %xmm7, %xmm5",
+                "paddd %xmm8, %xmm6",
+                "addq $64, {p}",
+                "movdqa %xmm5, %xmm7",
+                "movdqa %xmm6, %xmm8",
+                "cmpq {end}, {p}",
+                "jne 2b",
+                p = inout(reg) blocks.as_ptr() => _,
+                end = in(reg) blocks.as_ptr_range().end,
+                k = sym K256_TABLE,
+                inout("xmm7") stream.cdgh,
+                inout("xmm8") stream.abef,
+                in("xmm9") swap,
+                in("xmm15") low_first(k[11]),
+                in("xmm10") low_first(k[12]),
+                in("xmm11") low_first(k[13]),
+                in("xmm12") low_first(k[14]),
+                in("xmm13") low_first(k[15]),
+                out("xmm0") _,
+                out("xmm1") _,
+                out("xmm2") _,
+                out("xmm3") _,
+                out("xmm4") _,
+                out("xmm5") _,
+                out("xmm6") _,
+                out("xmm14") _,
+                options(att_syntax, nostack, pure, readonly),
+            );
+        }
+    }
+
+    kept_of(&streams[0], state);
+
+    wipe_unless_optimized!(memory::words_of(&mut streams));
+}
+
+// digest256_sha for a state in the order of stream_kept.
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+fn digest256_sha_kept(state: &[u32; 8], data: &[u8], bits: u64, out: &mut [u8]) {
+    let mut streams = [stream_kept(state)];
 
     finish_stream256!(streams, data, bits);
 

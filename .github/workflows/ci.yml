@@ -75,6 +75,13 @@ jobs:
       # the generators write (SPEC 18.4 item 2).
       - if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
         run: cargo test --locked --release --all-features --test cross --test symmetric -- --ignored regenerate
+      # With AVX at compile time, the kept SHA-256 kernel of Hasher and Mac takes its loop from the
+      # rounds instead of the assembly (cpu/x86_64.rs, D-103): the SHA-2, hash and MAC tests in
+      # that build, on runners with the SHA extensions.
+      - if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v3
+        run: cargo test --locked --release --all-features --lib -- --nocapture sha2:: hash:: mac::
 
   # Under emulation the s390x and 32-bit ARM suites take over an hour in one job, so their unit
   # tests, integration tests and doctests run as three jobs, which together make the `cargo test`
@@ -193,6 +200,14 @@ jobs:
             for features in "" --all-features; do
               cargo clippy --all-targets --locked --release $features --target "$target" -- -D warnings
             done
+          done
+      # The other side of the kept SHA-256 kernel's cfg (D-103), with AVX at compile time.
+      - if: matrix.cfg == ''
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v3
+        run: |
+          for features in "" --all-features; do
+            cargo clippy --all-targets --locked --release $features --target x86_64-unknown-linux-gnu -- -D warnings
           done
       # The AVX-512VL kernels use 256-bit registers, and only BLAKE3's sixteen-lane and four-lane
       # kernels (cpu/x86_64/blake3_zmm.rs) use 512-bit ones: the build of every feature at each

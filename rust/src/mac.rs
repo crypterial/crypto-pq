@@ -31,7 +31,7 @@ use crate::keccak::Keccak;
     feature = "lms",
     feature = "xmss"
 ))]
-use crate::sha2::{self, Sha256, Sha512, finish256, finish512};
+use crate::sha2::{self, Sha256Stream, Sha512, finish256, finish512};
 #[cfg(feature = "sha3")]
 use crate::sp800_185;
 use crate::wipe::wipe;
@@ -670,7 +670,7 @@ fn hmac_truncated(hash: &HashAlgorithm, key: &[u8], data: &[u8], out: &mut [u8])
 fn unkeyed_hmac(hash: &HashAlgorithm) -> MacEngine {
     match hash.kind {
         Kind::Sha256(iv) => MacEngine::Hmac {
-            inner: Engine::Sha256(Sha256::new(iv)),
+            inner: Engine::Sha256(Sha256Stream::new(iv)),
             outer: Outer::Sha256([0; 8]),
             digest_size: hash.digest_size,
         },
@@ -999,7 +999,7 @@ fn copy(mac: &Mac) -> Mac {
     feature = "xmss"
 ))]
 #[inline(never)]
-fn copy_hmac256(inner: &Sha256, outer: &[u32; 8], digest_size: usize, size: usize) -> Mac {
+fn copy_hmac256(inner: &Sha256Stream, outer: &[u32; 8], digest_size: usize, size: usize) -> Mac {
     Mac {
         engine: MacEngine::Hmac {
             inner: Engine::Sha256(inner.clone()),

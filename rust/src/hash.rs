@@ -21,7 +21,8 @@ use crate::keccak::Keccak;
     feature = "xmss"
 ))]
 use crate::sha2::{
-    IV_224, IV_256, IV_384, IV_512, IV_512_224, IV_512_256, Sha256, Sha512, finish256, finish512,
+    IV_224, IV_256, IV_384, IV_512, IV_512_224, IV_512_256, Sha256Stream, Sha512, finish256,
+    finish512,
 };
 #[cfg(feature = "sha3")]
 use crate::sp800_185;
@@ -78,7 +79,7 @@ pub(crate) enum Engine {
         feature = "lms",
         feature = "xmss"
     ))]
-    Sha256(Sha256),
+    Sha256(Sha256Stream),
     #[cfg(any(
         feature = "sha2",
         feature = "ml-dsa",
@@ -437,7 +438,7 @@ impl HashAlgorithm {
                 feature = "lms",
                 feature = "xmss"
             ))]
-            Kind::Sha256(iv) => Engine::Sha256(Sha256::new(iv)),
+            Kind::Sha256(iv) => Engine::Sha256(Sha256Stream::new(iv)),
             #[cfg(any(
                 feature = "sha2",
                 feature = "ml-dsa",
@@ -554,7 +555,7 @@ impl HashAlgorithm {
 #[inline(never)]
 fn create_sha256(iv: &[u32; 8], size: usize) -> Hasher {
     Hasher {
-        engine: Engine::Sha256(Sha256::new(iv)),
+        engine: Engine::Sha256(Sha256Stream::new(iv)),
         size,
     }
 }

@@ -183,6 +183,49 @@ pub(crate) fn copy_in_line(to: &mut [u8], from: &[u8]) {
     copy!(64 32 16 8 4 2 1);
 }
 
+// The bytes of an update shorter than 64 into the buffer, with no call: the first and the last 32,
+// 16, 8, 4 or 2 of them, the largest that fits, whose two moves cover them all, or the one byte.
+#[cfg(all(
+    any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ),
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+#[inline(always)]
+fn copy_short(to: &mut [u8], from: &[u8]) {
+    let n = from.len();
+
+    let to = &mut to[..n];
+
+    macro_rules! ends {
+        ($size:literal) => {{
+            to[..$size].copy_from_slice(&from[..$size]);
+
+            to[n - $size..].copy_from_slice(&from[n - $size..]);
+        }};
+    }
+
+    if n >= 32 {
+        ends!(32)
+    } else if n >= 16 {
+        ends!(16)
+    } else if n >= 8 {
+        ends!(8)
+    } else if n >= 4 {
+        ends!(4)
+    } else if n >= 2 {
+        ends!(2)
+    } else if n == 1 {
+        to[0] = from[0];
+    }
+}
+
 #[derive(Clone)]
 struct Blocks<const N: usize> {
     bytes: [u8; N],
@@ -255,6 +298,57 @@ impl<const N: usize> Blocks<N> {
     // The buffered bytes: the message after its whole blocks.
     fn buffered(&self) -> &[u8] {
         &self.bytes[..self.len]
+    }
+
+    // Buffers data and returns true when it leaves the block unfilled, and otherwise leaves the
+    // buffer as it is. The slice is bounded once, before the paths: a check in each gave the
+    // function a frame on all of them. Fewer than 32 bytes are moved in line, into an empty buffer
+    // at its start, an address the stores have without the load of the length: through
+    // bytes[len..], a digest right after waited on them, 4% of the SHA-256 of 16 bytes on Zen 3.
+    // From 32, copy_bytes moves them as update does, through memcpy, on CPUs with AVX in two
+    // 32-byte stores, from which the 16-byte loads of the digest take more of their bytes than
+    // from the four 16-byte moves in line, which took 3% more time for 63 bytes on Zen 3 (D-103).
+    // The length is set first there, so that the copy is the caller's last call
+    // (Sha256Stream::update).
+    #[cfg(all(
+        any(
+            feature = "sha2",
+            feature = "ml-dsa",
+            feature = "slh-dsa",
+            feature = "lms",
+            feature = "xmss"
+        ),
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))]
+    #[inline(always)]
+    fn buffer_short(&mut self, data: &[u8]) -> bool {
+        let len = self.len;
+
+        let end = len + data.len();
+
+        if end >= N {
+            return false;
+        }
+
+        let to = &mut self.bytes[len..end];
+
+        if data.len() >= 32 {
+            self.len = end;
+
+            copy_bytes(to, data);
+        } else if len == 0 {
+            copy_short(&mut self.bytes[..data.len()], data);
+
+            self.len = data.len();
+        } else {
+            copy_short(to, data);
+
+            self.len = end;
+        }
+
+        true
     }
 
     // The second block of a buffer of two, Sha512's on x86-64, wiped as its bytes leave it: it
@@ -2043,6 +2137,171 @@ impl Drop for Sha512 {
     }
 }
 
+// The engine of Hasher and Mac for SHA-224 and SHA-256 (D-103). On x86-64 with the SHA extensions
+// its state stays, from the first update to the digest, in the order of the registers of the
+// rounds: in a stream of updates, the shuffles of each call to and from the order of the words
+// were on the path from one block to the next. Elsewhere it is Sha256.
+#[cfg(all(
+    any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ),
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+#[derive(Clone)]
+pub(crate) struct Sha256Stream {
+    engine: Sha256,
+    // Whether the state is in that order, which only cpu::compress256_kept sets.
+    kept: bool,
+}
+
+#[cfg(all(
+    any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ),
+    not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))
+))]
+pub(crate) type Sha256Stream = Sha256;
+
+#[cfg(all(
+    any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ),
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+impl Sha256Stream {
+    pub(crate) const fn new(iv: &[u32; 8]) -> Self {
+        Self {
+            engine: Sha256::new(iv),
+            kept: false,
+        }
+    }
+
+    // Sha256::key_hmac, for a new engine, whose state is in the order of the words.
+    pub(crate) fn key_hmac(&mut self, key: &[u8], outer: &mut [u32; 8]) {
+        debug_assert!(!self.kept, "a new engine");
+
+        self.engine.key_hmac(key, outer);
+    }
+
+    // Out of line, as Sha256::update is in Engine::update: inlined there, it gave that function a
+    // frame, and the update of every engine saved and restored six registers. Bytes that leave the
+    // block unfilled are buffered with no frame and the copy as the last call; the frame that the
+    // kernel's calls take is update_blocks'.
+    #[inline(never)]
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        let engine = &mut self.engine;
+
+        engine.length = engine.length.wrapping_add(data.len() as u64);
+
+        if !engine.blocks.buffer_short(data) {
+            self.update_blocks(data);
+        }
+    }
+
+    #[inline(never)]
+    fn update_blocks(&mut self, data: &[u8]) {
+        let engine = &mut self.engine;
+
+        let state = &mut engine.state;
+
+        let kept = &mut self.kept;
+
+        engine.blocks.update(data, |blocks| {
+            if !cpu::compress256_kept(state, kept, blocks) {
+                compress256(state, blocks, &[]);
+            }
+        });
+    }
+
+    // Sha256::digest_into, from a kept state in one call where the kernel stores the digest, and
+    // otherwise through digest_of_kept. The buffered bytes are taken once for both: a bounds check
+    // in each gave Engine::digest_into, for every engine, a frame to call its failure from.
+    pub(crate) fn digest_into(&self, out: &mut [u8]) {
+        let engine = &self.engine;
+
+        let data = engine.blocks.buffered();
+
+        if !self.kept {
+            finish256(
+                &engine.state,
+                engine.length.wrapping_sub(data.len() as u64),
+                data,
+                out,
+            );
+        } else if !cpu::digest256_kept(&engine.state, data, engine.length.wrapping_mul(8), out) {
+            digest_of_kept(engine, data, out);
+        }
+    }
+}
+
+// Sha256Stream::digest_into where the kernel does not store the digest (an output of another size),
+// through a copy of the kept state in the order of the words. Out of line and cold: inlined, that
+// copy on the stack gave a frame to Engine::digest_into, for every engine.
+#[cfg(all(
+    any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ),
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+#[cold]
+#[inline(never)]
+fn digest_of_kept(engine: &Sha256, data: &[u8], out: &mut [u8]) {
+    let mut state = words_of_kept(&engine.state);
+
+    finish256(
+        &state,
+        engine.length.wrapping_sub(data.len() as u64),
+        data,
+        out,
+    );
+
+    wipe(&mut state);
+}
+
+// A kept state of Sha256Stream, words f, e, b, a, h, g, d and c (the lanes of the registers of the
+// rounds, abef and cdgh), in the order of the words.
+#[cfg(all(
+    any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ),
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+fn words_of_kept(&[f, e, b, a, h, g, d, c]: &[u32; 8]) -> [u32; 8] {
+    [a, b, c, d, e, f, g, h]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2299,6 +2558,119 @@ mod tests {
 
             assert_eq!(states, expected, "SHA-512 case {n}");
         }
+    }
+
+    // Whether a Sha256Stream keeps its state in the order of the kernel's registers.
+    #[cfg(all(
+        any(
+            feature = "sha2",
+            feature = "ml-dsa",
+            feature = "slh-dsa",
+            feature = "lms",
+            feature = "xmss"
+        ),
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))]
+    fn is_kept(stream: &Sha256Stream) -> bool {
+        stream.kept
+    }
+
+    #[cfg(all(
+        any(
+            feature = "sha2",
+            feature = "ml-dsa",
+            feature = "slh-dsa",
+            feature = "lms",
+            feature = "xmss"
+        ),
+        not(all(
+            target_arch = "x86_64",
+            not(target_env = "sgx"),
+            not(crypto_pq_portable)
+        ))
+    ))]
+    fn is_kept(_: &Sha256Stream) -> bool {
+        false
+    }
+
+    // Sha256Stream against Sha256 for SHA-256 and SHA-224 messages fed in pieces of 1 to 130
+    // bytes, with a copy taken halfway that goes on with its own bytes, and a digest of every
+    // size from 1 to 32 bytes: the kernel's digest for 28 and 32, the others through the state in
+    // the order of the words.
+    #[test]
+    #[cfg(any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ))]
+    fn stream_matches_engine() {
+        let mut inputs = Inputs::new(259);
+
+        let data: [u8; 1100] = inputs.bytes();
+
+        let mut kept = 0;
+
+        for n in 0..400 {
+            let iv = if n % 2 == 0 { &IV_256 } else { &IV_224 };
+
+            let message = &data[..inputs.next() as usize % data.len()];
+
+            let mut stream = Sha256Stream::new(iv);
+
+            let mut engine = Sha256::new(iv);
+
+            let mut copies = None;
+
+            let mut rest = message;
+
+            while let Some(&first) = rest.first() {
+                let take = (1 + usize::from(first) % 130).min(rest.len());
+
+                let (piece, after) = rest.split_at(take);
+
+                stream.update(piece);
+
+                engine.update(piece);
+
+                if copies.is_none() && after.len() <= message.len() / 2 {
+                    copies = Some((stream.clone(), engine.clone()));
+                }
+
+                rest = after;
+            }
+
+            for size in 1..=32 {
+                let (mut actual, mut expected) = ([0; 32], [0; 32]);
+
+                stream.digest_into(&mut actual[..size]);
+
+                engine.digest_into(&mut expected[..size]);
+
+                assert_eq!(actual[..size], expected[..size], "case {n}, size {size}");
+            }
+
+            if let Some((mut stream, mut engine)) = copies {
+                let more = &data[n..n + n % 140];
+
+                stream.update(more);
+
+                engine.update(more);
+
+                let mut actual = [0; 32];
+
+                stream.digest_into(&mut actual);
+
+                assert_eq!(actual, engine.digest(), "copy of case {n}");
+            }
+
+            kept += usize::from(is_kept(&stream));
+        }
+
+        std::eprintln!("SHA-256 streams: {kept} of 400 cases through a kept state");
     }
 
     // The one-shot finish against the incremental engine, for every tail length around the
