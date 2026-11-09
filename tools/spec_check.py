@@ -222,7 +222,7 @@ def check_principles_and_citations():
 
                 used_tags.update(re.findall(r"\[([A-Z][A-Z0-9.\-]+)\](?!\()", bare))
 
-    used_tags = {tag for tag in used_tags if not re.fullmatch(r"D-\d\d", tag)}
+    used_tags = {tag for tag in used_tags if not re.fullmatch(r"D-\d{2,3}", tag)}
 
     if used_principles - defined:
         fail(f"principles referenced but not defined: {sorted(used_principles - defined)}")
