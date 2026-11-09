@@ -1881,3 +1881,134 @@ EPYC-Milan model, the SHA-256 of 16 bytes in one update runs 455.8 instructions 
 before, of 63 bytes 622.6 against 634.4, of 64 bytes 644.0 against 648.6 and of 1 KiB 4209 against
 4443; that of 1 KiB in updates of 1 byte 49157 against 75547, of 8 bytes 9353 against 12447 and of
 256 bytes 6598 against 8030.
+
+## Decision D-104
+
+On every target but WebAssembly, the update of `Hasher` and `Mac` for SHA-384, SHA-512, SHA-512/224
+and SHA-512/256, and for SHA-224 and SHA-256 where their engine is not that of
+[D-103](#decision-d-103), on x86-64 outside SGX and the portable build, is a function of its own,
+out of line as that of D-103. An update whose bytes leave the buffer unfilled is buffered there with
+no frame: fewer than 32 bytes in line, as in D-103, and 32 bytes or more through memcpy, as the last
+call, after the length is set, or on ARM64 in line, in moves of 16 bytes from the start of the bytes
+and one move of their last 16. On 32-bit Arm, every such update goes through memcpy. Into an empty
+buffer, the bytes go to its start and its length is that of the update, so that the stores do not
+wait on the load of the length: below 32 bytes, as in D-103, and from 32 for SHA-512 on ARM64. Whole
+buffers into an empty one, a block or, for SHA-512 on x86-64, two, go to the kernel as the last
+call, on x86-64 through a function of their own. Any other update fills the buffer, compresses it
+with the whole buffers after it and keeps the rest, without the tests that the paths before it
+decide: on 64-bit targets in another function, so that the update has no frame on its other paths,
+and on 32-bit targets in line, where it has one on every path. On WebAssembly, which has no tail
+calls, the update is the one before, with the same machine code. The SHA-2 of ML-DSA, SLH-DSA, LMS,
+XMSS and HKDF keeps the update it had, in line in it, and the one-shot digests are unchanged.
+
+The paths depend only on the length of the update and on that of the buffer, which are public, and
+the bytes move as before into the same buffer, which the engine's drop wipes. The moves on ARM64
+write the bytes of the update and no other, each once but for those of the last 16 that the moves of
+16 bytes also cover, and a constant assertion bounds the buffers they serve to 128 bytes, so that no
+move needs a check of its index. On x86-64, where the buffer of SHA-512 holds two blocks, a buffered
+update only raises the length and writes the bytes it then covers, so the second block holds bytes
+only while the length reaches into it, as before. The tests compare this update with that of the
+engine on 400 streams of SHA-512, SHA-384 and SHA-512/256 messages in random pieces of 1 to 300
+bytes, with empty updates between some of them and a copy taken halfway that goes on with its own
+bytes, and on messages in pieces of each of 25 sizes from 1 to 512 bytes, around the moves and the
+buffers, from an empty buffer and after one byte, for SHA-256 and SHA-512; the test of D-103, on 400
+streams of SHA-224 and SHA-256, now runs this update on the other targets, and that of the wipe of
+the second block of SHA-512's buffer after each piece runs through both updates. The tests pass
+natively on ARM64 at opt-levels 3 and 0 and in the portable build; under qemu-x86_64 with the SHA
+extensions at opt-levels 3, 2 and 0, with AVX2 alone and with neither, and in a build for x86-64-v3;
+under qemu-i386, qemu-arm and wasmtime; and in CI.
+
+Rationale: before, each update of these engines went through the update of the engine, which has a
+frame and calls memcpy for the bytes it buffers, in an update of a few bytes as in one of a block.
+
+On Neoverse N2, in bench run 42620714496, measured as in D-103 (40 processes), this code gave 1.619
+for a SHA-256 of 1 KiB in updates of 1 byte, 1.457 of 8 bytes, 1.115 of 16, 1.143 of 32, 1.002 of 64
+and 1.004 of 100, 1.000 for 16 KiB in updates of 64 bytes, 0.998 to 1.022 for one update of 16 to
+129 bytes and the digest and 1.008 for HMAC-SHA-256 of 64 bytes under a key set up once; 1.442 for a
+SHA-512 of 1 KiB in updates of 1 byte, 1.272 of 8 bytes, 1.084 of 16, 1.041 of 32, 1.008 of 64,
+SHA-384, SHA-512/224 and SHA-512/256 alike, and 1.008 of 100, 1.007 for 16 KiB in updates of 64
+bytes, 0.999 to 1.004 for one update of 16 to 257 bytes and 1.004 for HMAC-SHA-512 of 64 bytes. In
+bench run 42623847135, with the same machine code in another of the four copies, the same rows gave
+1.610, 1.455, 1.113, 1.143, 1.002, 1.006, 1.000, 0.999 to 1.034 and 1.003, and 1.427, 1.266, 1.082,
+1.040, 1.008, 1.011, 1.007, 1.000 to 1.004 and 1.002.
+
+On x86-64, in bench run 42629267787, on Zen 3, Zen 4, Zen 5, Ice Lake and Emerald Rapids (55, 35,
+15, 20 and 25 processes), a SHA-512 of 1 KiB in updates of 1 byte gave 1.117 to 1.630 over the five
+classes, of 8 bytes 1.055 to 1.203, of 16 bytes 1.071 to 1.100, of 32 bytes 1.009 to 1.034 and of 64
+bytes 1.003 to 1.015, SHA-384, SHA-512/224 and SHA-512/256 alike, of 100 bytes 1.002 to 1.008; 16
+KiB in updates of 64 bytes gave 1.004 to 1.018, one update of 16 to 257 bytes and the digest 0.997
+to 1.008, HMAC-SHA-512 of 64 bytes under a key set up once 1.003 to 1.007, and HMAC-SHA-384 and
+HMAC-SHA-512 of 1 KiB and 16 KiB 0.999 to 1.010. The machine code of SHA-224 and SHA-256 there is
+the same as before, and their rows gave 0.992 to 1.004. Under i686, on Zen 3, Zen 4, Zen 5 and Ice
+Lake, a SHA-256 of 1 KiB in updates of 1 byte gave 1.735 to 3.419, of 8 bytes 1.242 to 1.370 and of
+16 bytes 1.100 to 1.211, and a SHA-512 1.530 to 3.082, 1.121 to 1.231 and 1.062 to 1.112. Under
+32-bit Arm on Neoverse N2 (20 processes), the same rows gave 1.120, 1.033 and 1.019, and 1.080,
+1.015 and 1.012, and no row gave less than 1.000.
+
+On ARM64, `HashAlgorithm::create` builds every kind of hasher in one tail of stores that its arms
+share, which writes the length of SHA-512's buffer in four stores, of 1, 1, 4 and 2 bytes, where
+another arm keeps a byte of its own, so the first load of the length in an update waits for the four
+to be written to the cache. With the bytes of 32 or more into an empty buffer moved to its start and
+the length taken from the update, a SHA-512 of 63 bytes in one update and the digest gave 1.002
+against 0.992 through `bytes[len..]` (bench run 42606782608) and 1.007 against 0.995 (bench run
+42613729950). Built by a function of its own, which stores the length whole, the hasher of SHA-512
+gave 1.015 to 1.035 for one update of 16 to 257 bytes in bench run 42620714496, but the path of
+SHA-256 through `create` changed, and the rows of SHA-256 gave up to 0.6 percent less than this
+code. With the hashers of SHA-256 and SHA-512 each built by a function of its own, bench run
+42623847135 gave 1.044 to 1.133 for one update of SHA-256 of 16 to 129 bytes and 1.016 to 1.038 of
+SHA-512, but 0.993 and 0.992 for SHA-256 and SHA-224 of 1 KiB in updates of 64 bytes, 0.990 to 0.993
+on each of the 8 runners: about 5 ns more per hasher than this code, for 16 updates as for 256, in
+fewer instructions. Its cause is not known, and the hashers are built as before.
+
+Through memcpy, a SHA-256 of 1 KiB in updates of 32 bytes took 3.6 percent more time on Neoverse N2
+than with the moves in line (bench run 42601946382). On x86-64, a path of its own for 32 bytes or
+more into an empty buffer moved the code of the shorter updates, and a SHA-256 of 1 KiB in updates
+of 1 byte took 3.3 to 10.6 percent more time than before (bench run 42606782608); for SHA-512 alone,
+up to 3.2 percent less time in updates of 1 byte and up to 1.6 percent more in updates of 8 bytes
+(bench run 42620714496). On 32-bit targets it kept a register on the stack, an instruction more on
+each short update. On 32-bit Arm, the moves in line of fewer than 32 bytes run 1.1 percent more
+instructions than memcpy for a SHA-256 of 1 KiB in updates of 1 byte, under QEMU, and with them a
+SHA-256 of 1 KiB in updates of 32 and 100 bytes gave 0.998 and 0.999 on Neoverse N2 (bench run
+42606782608), against 1.007 and 1.002 through memcpy in the same copy of bench run 42613729950. On
+x86-64, the detection of the CPU's features at the first call, in line in the path of whole buffers,
+gave the update of SHA-512 a frame on every path; out of line, an update of 16 to 64 bytes runs 6 or
+7 fewer instructions. Through the update of the engine, an update that fills the buffer ran 8 to 10
+more instructions, on tests that the paths before it decide: on ARM64, a SHA-256 of 1 KiB in updates
+of 100 bytes ran 2.2 percent more instructions than before, and gave 0.997 and 0.998 on Neoverse N2
+in both copies of bench runs 42606782608 and 42613729950, against 1.004 to 1.006 with this code in
+bench runs 42620714496 and 42623847135; on i686, a SHA-256 of 1 KiB in updates of 32 or 100 bytes
+ran 0.16 percent more instructions than before, and on 32-bit Arm a SHA-512 of 1 KiB in updates of
+64 or 100 bytes 0.04 and 0.06 percent more.
+
+Some rows gave less than 1.000. On Zen 3, a SHA-512 of 16 bytes in one update and the digest gave
+0.997, 0.996 to 0.998 on the 11 runners, 0.65 ns more than before, and of 128 bytes 0.998, 0.80 ns
+more, where the two copies of the code before differed by 0.1 and 0.4 percent, in both copies of
+bench runs 42620714496 and 42629267787, with each form of the update measured, though this code runs
+26 fewer instructions for 16 bytes. Its cause is not known. The same path takes 197 ns less for 1
+KiB in updates of 16 bytes on Zen 3, the one-shot digest of a message in one piece is unchanged, and
+this code stays on Zen 3. On Ice Lake and Emerald Rapids, rows of SHA-224 and SHA-256, whose machine
+code is the same as before, gave 0.992 to 0.998, as placement moves them: in the same run, the other
+copy, with the same code of SHA-256, gave 0.923 for HMAC-SHA-256 of 64 bytes under a key set up once
+on Ice Lake. Under i686 on Zen 5, one update of SHA-256 of 16 to 129 bytes gave 0.957 to 0.974 in
+the copy of this code and 0.989 to 1.045 in that of the code without the function for updates that
+fill the buffer; in bench run 42613729950, the same machine code in these two copies gave 0.955 to
+0.975 and 0.990 to 1.045. Under i686 on Zen 4, with one runner, one update of SHA-256 of 63 to 129
+bytes gave 0.989 to 0.995, where this code runs 0.05 to 0.26 percent fewer instructions than before.
+Under i686 on Ice Lake, with one runner, where the two copies of the code before differed by up to
+7.6 percent, the one-shot digests, whose source is unchanged, gave 0.986 to 0.994, and other rows
+0.989 to 0.999.
+
+The machine code of WebAssembly is unchanged, function by function, and that of ARM64 is the code of
+bench runs 42620714496 and 42623847135. On x86-64, the update of the SHA-512 engine, out of line
+before, gives way to this update, the function for the updates that fill the buffer and the call of
+the kernel for whole buffers, and the other functions of crypto-pq in a build of the counts below
+are the same. Under QEMU, counting the instructions run in crypto-pq, in memcpy and memset and in
+the loop that calls them, with the Neoverse N2 model a SHA-256 of 16 bytes in one update runs 454.5
+instructions here against 471.5 before, of 129 bytes 851.5 against 890.5, of 1 KiB in updates of 1
+byte 46595 against 67651, of 8 bytes 8739 against 11203 and of 100 bytes 4082 against 4084, and a
+SHA-512 of 16 bytes 882.5 against 899.5 and of 1 KiB in updates of 16 bytes 8100 against 9444. With
+the EPYC-Milan model, a SHA-512 of 16 bytes runs 3481 against 3507, of 257 bytes 8742 against 8847
+and of 1 KiB in updates of 16 bytes 26367 against 28159, and SHA-256 the same as before. On i686, a
+SHA-256 of 1 KiB in updates of 1 byte runs 165236 against 189317, of 32 bytes 68341 against 68389
+and of 100 bytes 66123 against 66114; on 32-bit Arm 96151 against 109447, 40855 against 41255 and
+39673 against 39856.

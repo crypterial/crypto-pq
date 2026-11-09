@@ -179,6 +179,22 @@ Implements specification 1.1 (draft).
   measured, 2% more, depending on where its data lies in memory. One-shot digests, the SHA-256 of
   ML-DSA, SLH-DSA, LMS and XMSS, CPUs without the SHA extensions and other targets are unchanged.
   Outputs are unchanged.
+- SHA-384, SHA-512, SHA-512/224 and SHA-512/256 on every target but WebAssembly, and SHA-224 and
+  SHA-256 on the same targets but x86-64, where D-103 did this outside SGX and the portable build
+  ([decision D-104](spec/decisions.md#decision-d-104)): the update of a `Hasher` and of an HMAC
+  `Mac` is a function of its own that buffers bytes which leave the block unfilled with no stack
+  frame, in line below 32 bytes and on ARM64 at every length but through memcpy on 32-bit Arm,
+  passes whole blocks into an empty buffer straight to the kernel, and fills a block without the
+  tests that the paths before it decide. On Neoverse N2, 1 KiB hashed in updates of 1 byte takes 38%
+  less time with SHA-256 and 31% less with SHA-512, in updates of 8 bytes 31% and 21% less, of 16
+  bytes 10% and 8% less and of 32 bytes 13% and 4% less. On Zen 3, Zen 4, Zen 5, Ice Lake and
+  Emerald Rapids, SHA-512 in updates of 1 byte takes 10% to 39% less time, of 8 bytes 5% to 17%
+  less, of 16 bytes 7% to 9% less and of 32 or 64 bytes up to 3% less. Under i686, 1 KiB in updates
+  of 1 byte takes 42% to 71% less time with SHA-256 and 35% to 68% less with SHA-512, in updates of
+  8 bytes 19% to 27% and 11% to 19% less, and under 32-bit Arm, in updates of 1 byte, 11% and 7%
+  less. On Zen 3, a SHA-512 of 16 or 128 bytes in one update and the digest takes 0.2% to 0.3% more
+  time. One-shot digests, the SHA-2 of ML-DSA, SLH-DSA, LMS, XMSS and HKDF, and WebAssembly are
+  unchanged. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a

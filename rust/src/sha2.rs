@@ -185,18 +185,7 @@ pub(crate) fn copy_in_line(to: &mut [u8], from: &[u8]) {
 
 // The bytes of an update shorter than 64 into the buffer, with no call: the first and the last 32,
 // 16, 8, 4 or 2 of them, the largest that fits, whose two moves cover them all, or the one byte.
-#[cfg(all(
-    any(
-        feature = "sha2",
-        feature = "ml-dsa",
-        feature = "slh-dsa",
-        feature = "lms",
-        feature = "xmss"
-    ),
-    target_arch = "x86_64",
-    not(target_env = "sgx"),
-    not(crypto_pq_portable)
-))]
+#[cfg(not(target_family = "wasm"))]
 #[inline(always)]
 fn copy_short(to: &mut [u8], from: &[u8]) {
     let n = from.len();
@@ -224,6 +213,47 @@ fn copy_short(to: &mut [u8], from: &[u8]) {
     } else if n == 1 {
         to[0] = from[0];
     }
+}
+
+// The bytes of an update of 32 to N - 1 into the buffer on ARM64, in line: the first 32 in one pair
+// of stores, the 16-byte chunks after them, then the last 16. Through memcpy, 1 KiB of SHA-256 in
+// 32-byte pieces took 3.6% more time on Neoverse N2 (D-104). The chunks are bounded by N, so that
+// no path has a check.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn copy_chunks<const N: usize>(to: &mut [u8], from: &[u8]) {
+    const { assert!(N <= 128) };
+
+    let n = from.len();
+
+    let to = &mut to[..n];
+
+    to[..32].copy_from_slice(&from[..32]);
+
+    macro_rules! chunks {
+        ($($i:literal)*) => {
+            $(
+                if 16 * ($i + 1) < N && n >= 16 * ($i + 1) {
+                    to[16 * $i..16 * ($i + 1)].copy_from_slice(&from[16 * $i..16 * ($i + 1)]);
+                }
+            )*
+        };
+    }
+
+    chunks!(2 3 4 5 6);
+
+    to[n - 16..].copy_from_slice(&from[n - 16..]);
+}
+
+// The bytes of an update of 32 to N - 1 into the buffer.
+#[cfg(not(target_family = "wasm"))]
+#[inline(always)]
+fn copy_long<const N: usize>(to: &mut [u8], from: &[u8]) {
+    #[cfg(target_arch = "aarch64")]
+    copy_chunks::<N>(to, from);
+
+    #[cfg(not(target_arch = "aarch64"))]
+    copy_bytes(to, from);
 }
 
 #[derive(Clone)]
@@ -277,6 +307,39 @@ impl<const N: usize> Blocks<N> {
         self.len = rest.len();
     }
 
+    // update for bytes that reach the end of the block, len + data.len() >= N, which update_stream
+    // tests before it calls update_blocks: the bytes that fill the block, then the whole blocks,
+    // with no test of how many there are to take or of a block left unfilled. Through update, an
+    // update that fills the block ran 8 to 10 more instructions, and 1 KiB of SHA-256 in pieces of
+    // 100 bytes 2.2% more than the update of Hasher before on ARM64, 0.16% on i686 (D-104).
+    #[cfg(not(target_family = "wasm"))]
+    fn update_long(&mut self, mut data: &[u8], mut process: impl FnMut(&[[u8; N]])) {
+        if self.len > 0 {
+            let (head, tail) = data.split_at(N - self.len);
+
+            copy_bytes(&mut self.bytes[self.len..], head);
+
+            data = tail;
+
+            process(core::slice::from_ref(&self.bytes));
+
+            self.wipe_second();
+        }
+
+        let (blocks, rest) = data.as_chunks::<N>();
+
+        if !blocks.is_empty() {
+            process(blocks);
+        }
+
+        // An empty copy would still call memcpy.
+        if !rest.is_empty() {
+            copy_bytes(&mut self.bytes[..rest.len()], rest);
+        }
+
+        self.len = rest.len();
+    }
+
     // The whole blocks of M bytes in the buffer go to process, and the bytes after them to its
     // front.
     fn flush<const M: usize>(&mut self, process: impl FnOnce(&[[u8; M]])) {
@@ -302,26 +365,22 @@ impl<const N: usize> Blocks<N> {
 
     // Buffers data and returns true when it leaves the block unfilled, and otherwise leaves the
     // buffer as it is. The slice is bounded once, before the paths: a check in each gave the
-    // function a frame on all of them. Fewer than 32 bytes are moved in line, into an empty buffer
-    // at its start, an address the stores have without the load of the length: through
-    // bytes[len..], a digest right after waited on them, 4% of the SHA-256 of 16 bytes on Zen 3.
-    // From 32, copy_bytes moves them as update does, through memcpy, on CPUs with AVX in two
-    // 32-byte stores, from which the 16-byte loads of the digest take more of their bytes than
-    // from the four 16-byte moves in line, which took 3% more time for 63 bytes on Zen 3 (D-103).
-    // The length is set first there, so that the copy is the caller's last call
-    // (Sha256Stream::update).
-    #[cfg(all(
-        any(
-            feature = "sha2",
-            feature = "ml-dsa",
-            feature = "slh-dsa",
-            feature = "lms",
-            feature = "xmss"
-        ),
-        target_arch = "x86_64",
-        not(target_env = "sgx"),
-        not(crypto_pq_portable)
-    ))]
+    // function a frame on all of them. An empty buffer takes the bytes at its start and its length
+    // from data alone, which the stores have without the load of the length: through bytes[len..],
+    // a digest right after waited on them, 4% of the SHA-256 of 16 bytes on Zen 3 (D-103). Fewer
+    // than 32 bytes are moved in line. From 32, copy_bytes moves them as update does, through
+    // memcpy, on CPUs with AVX in two 32-byte stores, from which the 16-byte loads of the digest
+    // take more of their bytes than from the four 16-byte moves in line, which took 3% more time
+    // for 63 bytes on Zen 3 (D-103); copy_chunks moves them in line on ARM64. The length is set
+    // first there, so that the copy is the caller's last call (Sha256Stream::update_stream). From
+    // 32 bytes, only the empty buffer of SHA-512 on ARM64 takes them at its start, as
+    // HashAlgorithm::create stores its length there in pieces, which the load of the length waits
+    // on: through bytes[len..], the SHA-512 of 63 bytes took 1.2% more time on Neoverse N2. On
+    // x86-64 that path moved the code of the shorter updates, and 1 KiB of SHA-256 in pieces of 1
+    // byte took 3.3% to 10.6% more time; on 32-bit targets it kept a register on the stack, an
+    // instruction more on each short update. On 32-bit ARM memcpy moves every update: the moves in
+    // line ran 1.1% more instructions for 1 KiB of SHA-256 in pieces of 1 byte (D-104).
+    #[cfg(not(target_family = "wasm"))]
     #[inline(always)]
     fn buffer_short(&mut self, data: &[u8]) -> bool {
         let len = self.len;
@@ -334,10 +393,16 @@ impl<const N: usize> Blocks<N> {
 
         let to = &mut self.bytes[len..end];
 
-        if data.len() >= 32 {
-            self.len = end;
+        if data.len() >= 32 || cfg!(target_arch = "arm") {
+            if len != 0 || N != 128 || cfg!(not(target_arch = "aarch64")) {
+                self.len = end;
 
-            copy_bytes(to, data);
+                copy_long::<N>(to, data);
+            } else {
+                self.len = data.len();
+
+                copy_long::<N>(&mut self.bytes[..end], data);
+            }
         } else if len == 0 {
             copy_short(&mut self.bytes[..data.len()], data);
 
@@ -349,6 +414,19 @@ impl<const N: usize> Blocks<N> {
         }
 
         true
+    }
+
+    // The data as whole blocks, where the buffer is empty and the data fills whole blocks.
+    #[cfg(not(target_family = "wasm"))]
+    #[inline(always)]
+    fn whole<'a>(&self, data: &'a [u8]) -> Option<&'a [[u8; N]]> {
+        if self.len != 0 {
+            return None;
+        }
+
+        let (blocks, rest) = data.as_chunks::<N>();
+
+        rest.is_empty().then_some(blocks)
     }
 
     // The second block of a buffer of two, Sha512's on x86-64, wiped as its bytes leave it: it
@@ -1844,6 +1922,61 @@ impl Sha256 {
             .update(data, |blocks| compress256(state, blocks, &[]));
     }
 
+    // The update of Hasher and Mac where Sha256Stream is this engine, out of line as that of
+    // Sha256Stream (D-104): bytes that leave the block unfilled are buffered, and whole blocks
+    // into an empty buffer go to the kernel, with no frame and the copy or the kernel as the last
+    // call. The other callers keep update, in line in them.
+    #[cfg(not(any(
+        target_family = "wasm",
+        all(
+            target_arch = "x86_64",
+            not(target_env = "sgx"),
+            not(crypto_pq_portable)
+        )
+    )))]
+    #[inline(never)]
+    pub(crate) fn update_stream(&mut self, data: &[u8]) {
+        self.length = self.length.wrapping_add(data.len() as u64);
+
+        if self.blocks.buffer_short(data) {
+            return;
+        }
+
+        if let Some(blocks) = self.blocks.whole(data) {
+            compress256(&mut self.state, blocks, &[]);
+        } else {
+            self.update_blocks(data);
+        }
+    }
+
+    // Out of line on 64-bit targets, where update_stream then has no frame on its other paths. On
+    // the others it has one on every path, and a second one here took i686 23 more instructions
+    // per block of SHA-512 in updates of 64 bytes than update (D-104).
+    #[cfg(not(any(
+        target_family = "wasm",
+        all(
+            target_arch = "x86_64",
+            not(target_env = "sgx"),
+            not(crypto_pq_portable)
+        )
+    )))]
+    #[cfg_attr(target_pointer_width = "64", inline(never))]
+    #[cfg_attr(not(target_pointer_width = "64"), inline(always))]
+    fn update_blocks(&mut self, data: &[u8]) {
+        let state = &mut self.state;
+
+        self.blocks
+            .update_long(data, |blocks| compress256(state, blocks, &[]));
+    }
+
+    // update on WebAssembly, which has no tail calls: there each path of update_stream took a
+    // frame, and updates that fill a block took up to 1.2 percent more time (D-104).
+    #[cfg(target_family = "wasm")]
+    #[inline(always)]
+    pub(crate) fn update_stream(&mut self, data: &[u8]) {
+        self.update(data);
+    }
+
     pub(crate) fn digest(&self) -> [u8; 32] {
         let mut out = [0; 32];
 
@@ -2015,6 +2148,56 @@ impl Sha512 {
         self.blocks.update(data, |groups| {
             compress512(state, groups.as_flattened().as_chunks::<128>().0, &[])
         });
+    }
+
+    // Sha256::update_stream, the update of Hasher and Mac.
+    #[cfg(not(target_family = "wasm"))]
+    #[inline(never)]
+    pub(crate) fn update_stream(&mut self, data: &[u8]) {
+        self.length = self.length.wrapping_add(data.len() as u128);
+
+        if self.blocks.buffer_short(data) {
+            return;
+        }
+
+        if let Some(groups) = self.blocks.whole(data) {
+            self.update_whole(groups);
+        } else {
+            self.update_blocks(data);
+        }
+    }
+
+    // The whole groups of an update into an empty buffer, out of line on x86-64: there the first
+    // call's detection of the CPU's features, in line, gave update_stream a frame on every path, 6
+    // or 7 more instructions in an update of 16 to 64 bytes (D-104).
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(target_arch = "x86_64", inline(never))]
+    #[cfg_attr(not(target_arch = "x86_64"), inline(always))]
+    fn update_whole(&mut self, groups: &[[u8; BUFFER512]]) {
+        compress512(
+            &mut self.state,
+            groups.as_flattened().as_chunks::<128>().0,
+            &[],
+        );
+    }
+
+    // Sha256::update_blocks.
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(target_pointer_width = "64", inline(never))]
+    #[cfg_attr(not(target_pointer_width = "64"), inline(always))]
+    fn update_blocks(&mut self, data: &[u8]) {
+        let state = &mut self.state;
+
+        self.blocks.update_long(data, |groups| {
+            compress512(state, groups.as_flattened().as_chunks::<128>().0, &[])
+        });
+    }
+
+    // Sha256::update_stream on WebAssembly.
+    #[cfg(target_family = "wasm")]
+    #[inline(always)]
+    pub(crate) fn update_stream(&mut self, data: &[u8]) {
+        self.update(data);
     }
 
     // The whole blocks that the buffer holds compressed now, for a state that finish_message and
@@ -2203,12 +2386,12 @@ impl Sha256Stream {
         self.engine.key_hmac(key, outer);
     }
 
-    // Out of line, as Sha256::update is in Engine::update: inlined there, it gave that function a
-    // frame, and the update of every engine saved and restored six registers. Bytes that leave the
-    // block unfilled are buffered with no frame and the copy as the last call; the frame that the
-    // kernel's calls take is update_blocks'.
+    // Out of line: inlined in Engine::update, it gave that function a frame, and the update of
+    // every engine saved and restored six registers. Bytes that leave the block unfilled are
+    // buffered with no frame and the copy as the last call; the frame that the kernel's calls take
+    // is update_blocks'.
     #[inline(never)]
-    pub(crate) fn update(&mut self, data: &[u8]) {
+    pub(crate) fn update_stream(&mut self, data: &[u8]) {
         let engine = &mut self.engine;
 
         engine.length = engine.length.wrapping_add(data.len() as u64);
@@ -2632,7 +2815,7 @@ mod tests {
 
                 let (piece, after) = rest.split_at(take);
 
-                stream.update(piece);
+                stream.update_stream(piece);
 
                 engine.update(piece);
 
@@ -2656,7 +2839,7 @@ mod tests {
             if let Some((mut stream, mut engine)) = copies {
                 let more = &data[n..n + n % 140];
 
-                stream.update(more);
+                stream.update_stream(more);
 
                 engine.update(more);
 
@@ -2671,6 +2854,126 @@ mod tests {
         }
 
         std::eprintln!("SHA-256 streams: {kept} of 400 cases through a kept state");
+    }
+
+    // Sha512::update_stream against Sha512::update for SHA-512, SHA-384 and SHA-512/256 messages
+    // fed in pieces of 1 to 300 bytes, with empty updates between some of them, and a copy taken
+    // halfway that goes on with its own bytes.
+    #[test]
+    fn sha512_stream_matches_update() {
+        let mut inputs = Inputs::new(263);
+
+        let data: [u8; 2100] = inputs.bytes();
+
+        for n in 0..400 {
+            let iv = [&IV_512, &IV_384, &IV_512_256][n % 3];
+
+            let message = &data[..inputs.next() as usize % data.len()];
+
+            let mut stream = Sha512::new(iv);
+
+            let mut engine = Sha512::new(iv);
+
+            let mut copies = None;
+
+            let mut rest = message;
+
+            while !rest.is_empty() {
+                let take = (1 + inputs.next() as usize % 300).min(rest.len());
+
+                let (piece, after) = rest.split_at(take);
+
+                stream.update_stream(piece);
+
+                engine.update(piece);
+
+                if take.is_multiple_of(7) {
+                    stream.update_stream(&[]);
+                }
+
+                if copies.is_none() && after.len() <= message.len() / 2 {
+                    copies = Some((stream.clone(), engine.clone()));
+                }
+
+                rest = after;
+            }
+
+            assert_eq!(stream.digest(), engine.digest(), "case {n}");
+
+            if let Some((mut stream, mut engine)) = copies {
+                let more = &data[n..n + n % 300];
+
+                stream.update_stream(more);
+
+                engine.update(more);
+
+                assert_eq!(stream.digest(), engine.digest(), "copy of case {n}");
+            }
+        }
+    }
+
+    // The update of Hasher and Mac against update for messages fed in pieces of one size, from an
+    // empty buffer and after one byte, around the sizes of the short copies and of whole blocks,
+    // for SHA-256 and SHA-512.
+    #[test]
+    #[cfg(any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ))]
+    fn stream_pieces_of_each_size() {
+        let data: [u8; 1100] = Inputs::new(269).bytes();
+
+        let sizes = [
+            1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 192, 255, 256,
+            257, 384, 512,
+        ];
+
+        for size in sizes {
+            for skip in [0, 1] {
+                let (head, rest) = data.split_at(skip);
+
+                let mut stream = Sha256Stream::new(&IV_256);
+
+                let mut engine = Sha256::new(&IV_256);
+
+                let mut stream512 = Sha512::new(&IV_512);
+
+                let mut engine512 = Sha512::new(&IV_512);
+
+                stream.update_stream(head);
+
+                engine.update(head);
+
+                stream512.update_stream(head);
+
+                engine512.update(head);
+
+                for piece in rest.chunks(size) {
+                    stream.update_stream(piece);
+
+                    engine.update(piece);
+
+                    stream512.update_stream(piece);
+
+                    engine512.update(piece);
+                }
+
+                let mut actual = [0; 32];
+
+                stream.digest_into(&mut actual);
+
+                assert_eq!(actual, engine.digest(), "SHA-256, {size} after {skip}");
+
+                assert_eq!(
+                    stream512.digest(),
+                    engine512.digest(),
+                    "SHA-512, {size} after {skip}"
+                );
+            }
+        }
     }
 
     // The one-shot finish against the incremental engine, for every tail length around the
@@ -2747,9 +3050,9 @@ mod tests {
     }
 
     // The second block of SHA-512's buffer of two holds no bytes while the length stays within the
-    // first (Blocks::wipe_second): after each update in pieces of the sizes around one and two
-    // blocks, of a new state and of a keyed state's copy, and after a flush where the buffer
-    // reaches into the second block.
+    // first (Blocks::wipe_second): after each update, through update and update_stream, in pieces
+    // of the sizes around a short copy and one and two blocks, of a new state and of a keyed
+    // state's copy, and after a flush where the buffer reaches into the second block.
     #[test]
     fn second_block_wiped() {
         fn check(blocks: &Blocks<BUFFER512>, size: usize, piece: usize, step: &str) {
@@ -2767,8 +3070,15 @@ mod tests {
 
         keyed.key_hmac(b"key", &mut [0; 8]);
 
-        for size in [1, 63, 64, 65, 127, 128, 129, 255, 256, 257] {
-            for (copy, step) in [(false, "update"), (true, "update of a copy")] {
+        let steps = [
+            (false, false, "update"),
+            (true, false, "update of a copy"),
+            (false, true, "update_stream"),
+            (true, true, "update_stream of a copy"),
+        ];
+
+        for size in [1, 31, 32, 63, 64, 65, 127, 128, 129, 255, 256, 257] {
+            for (copy, stream, step) in steps {
                 let mut engine = Sha512::new(&IV_512);
 
                 if copy {
@@ -2776,7 +3086,11 @@ mod tests {
                 }
 
                 for (piece, bytes) in data.chunks(size).enumerate() {
-                    engine.update(bytes);
+                    if stream {
+                        engine.update_stream(bytes);
+                    } else {
+                        engine.update(bytes);
+                    }
 
                     check(&engine.blocks, size, piece, step);
 
