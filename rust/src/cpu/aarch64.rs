@@ -1188,15 +1188,7 @@ pub(crate) fn blake3_digest1_bytes(
         return false;
     }
 
-    let mut words = [0; 8];
-
-    for (word, bytes) in words.iter_mut().zip(key.as_chunks::<4>().0) {
-        *word = u32::from_le_bytes(*bytes);
-    }
-
-    blake3::digest1(&words, flags, data, out);
-
-    crate::wipe::wipe(&mut words);
+    blake3::digest1_bytes(key, flags, data, out);
 
     true
 }

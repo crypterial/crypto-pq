@@ -527,7 +527,6 @@ pub(super) fn xof(
 // The entry points are out of line, as blake2.rs's process.
 mod scalar {
     use super::{IV_256, PERMUTATION, wipe_unless_optimized};
-    use crate::wipe::wipe;
 
     // x, behind an empty assembly block, so that LLVM keeps its rotation one of its own.
     #[inline(always)]
@@ -605,6 +604,17 @@ mod scalar {
             *word = u32::from_le_bytes(*bytes);
         }
 
+        rounds_on(v, h, m, [counter, length, flags]);
+    }
+
+    // rounds, with the message words already in m.
+    #[inline(always)]
+    fn rounds_on(
+        v: &mut [u32; 16],
+        h: &[u32; 8],
+        m: &mut [u32; 16],
+        [counter, length, flags]: [u64; 3],
+    ) {
         *v = [
             h[0],
             h[1],
@@ -712,40 +722,68 @@ mod scalar {
     // gives, into out.
     #[inline(never)]
     pub(in crate::cpu) fn digest1(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
-        let mut copy = [0; 64];
+        one(key, flags, data, out);
+    }
 
-        let block = match <&[u8; 64]>::try_from(data) {
-            Ok(block) => block,
-            Err(_) => {
-                copy[..data.len()].copy_from_slice(data);
+    // digest1 for a key in bytes: its words go from the caller's bytes into the registers of the
+    // state (D-102). A copy of them on the stack, stored as two 16-byte halves just before the
+    // rounds loaded it a word at a time, cost a keyed hash 4 to 5 percent more time on Neoverse N2.
+    #[inline(never)]
+    pub(in crate::cpu) fn digest1_bytes(key: &[u8; 32], flags: u32, data: &[u8], out: &mut [u8]) {
+        let words = key.as_chunks::<4>().0;
 
-                &copy
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut h: [u32; 8] =
+            crate::wipe::registers!(|i| u32::from_le_bytes(words[i]); 0 1 2 3 4 5 6 7);
+
+        one(&h, flags, data, out);
+
+        wipe_unless_optimized!(&mut h);
+    }
+
+    // The words of the message go from its slice into registers, zeros after it, and the words of
+    // the output from registers into out, as in the portable digest1_in_locals (D-102): no block or
+    // output in memory to fill, read back and wipe.
+    #[inline(always)]
+    fn one(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
+        let mut m = match <&[u8; 64]>::try_from(data) {
+            Ok(block) => {
+                let words = block.as_chunks::<4>().0;
+
+                crate::wipe::registers!(
+                    |i| u32::from_le_bytes(words[i]);
+                    0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+                )
             }
+            Err(_) => crate::blake3::short_words(data),
         };
 
         let mut v = [0; 16];
 
-        let mut m = [0; 16];
+        rounds_on(&mut v, key, &mut m, [0, data.len() as u64, flags.into()]);
 
-        rounds(
-            &mut v,
-            key,
-            block,
-            &mut m,
-            [0, data.len() as u64, flags.into()],
-        );
+        if let Ok(whole) = <&mut [u8; 32]>::try_from(&mut *out) {
+            for (i, chunk) in whole.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                *chunk = (v[i] ^ v[i + 8]).to_le_bytes();
+            }
+        } else {
+            let (chunks, rest) = out.as_chunks_mut::<4>();
 
-        let mut bytes = [0; 32];
+            for i in 0..8 {
+                let word = v[i] ^ v[i + 8];
 
-        for (i, chunk) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            *chunk = (v[i] ^ v[i + 8]).to_le_bytes();
+                if let Some(chunk) = chunks.get_mut(i) {
+                    *chunk = word.to_le_bytes();
+                } else {
+                    // The last bytes from the word's register, as write_words: no array of them.
+                    for (j, byte) in rest.iter_mut().enumerate() {
+                        *byte = (word >> (8 * j)) as u8;
+                    }
+
+                    break;
+                }
+            }
         }
-
-        out.copy_from_slice(&bytes[..out.len()]);
-
-        wipe(&mut copy);
-
-        wipe(&mut bytes);
 
         wipe_unless_optimized!(&mut v);
 
@@ -787,4 +825,4 @@ mod scalar {
     }
 }
 
-pub(super) use scalar::{chain, compress, digest1};
+pub(super) use scalar::{chain, compress, digest1, digest1_bytes};
