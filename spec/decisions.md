@@ -1794,3 +1794,90 @@ a key in bytes is new, with its own copy of the rounds (1186 instructions), and 
 dispatchers, which copied the key, change; the keyed MAC now reaches the kernel by a tail call. In a
 crate that depends on crypto-pq, built at a lower opt-level, the functions of crypto-pq that are
 compiled in the crate are those before.
+
+## Decision D-103
+
+On x86-64 with the SHA extensions, the SHA-224 and SHA-256 engine of `Hasher` and `Mac` keeps its
+state, from the first compression of a stream to the digest, in the order of the registers of the
+rounds, the words f, e, b, a, h, g, d and c, and the digest kernel stores the digest from that
+order. A digest of another size, from a `Mac` truncated or a `Hasher` read into a shorter output,
+goes through a copy of the state in the order of the words, out of line, which it wipes. An update
+whose bytes leave the block unfilled is buffered in a function with no frame: fewer than 32 bytes in
+line, with two moves of the largest of 16, 8, 4 and 2 bytes that fits or one move of a byte, at the
+start of the buffer when it is empty; 32 bytes or more through memcpy, as the last call of the
+function. The blocks go to the kernel from another function. In a build without AVX, the loop of the
+kernel over the blocks is in assembly, from a 64-byte boundary: the instructions of the loop of
+`compress256_sha`, the kernel of the other engines, in their order. The one-shot digests, the
+SHA-256 of ML-DSA, SLH-DSA, LMS and XMSS, the other engines and the other targets are unchanged.
+
+This is CPU-specific code under [15.3](15-platforms.md#153-cpu-specific-code). The order is a
+permutation of the state's words, held in the same array, which the engine's drop wipes as before.
+Whether the state is in that order depends only on the CPU's features and on whether a block was
+compressed, and the moves of a short update only on its length and on that of the buffer, which are
+public. The assembly reads the blocks and the round constants and writes only the registers it
+names, with no branch but the loop's, on the number of blocks. The kernel's registers are register
+values under [D-76](#decision-d-76), wiped below opt-level 3. The test compares the engine with
+`Sha256` on 400 streams of random messages in random pieces, with the initial values of SHA-224 and
+SHA-256, copies taken halfway and continued, and digests of 1 to 32 bytes: under qemu-x86_64 with
+the SHA extensions, 380 of them go through a kept state at opt-levels 3, 2 and 0, and in a build
+with AVX (`-C target-cpu=x86-64-v3`) at 3 and 0, and none on a model without them. CI runs the tests
+of that build on its x86-64 runners, which have the SHA extensions.
+
+Rationale: in a stream of updates, each call took the state from the order of the words to the order
+of the rounds and back, two shuffles on the path from a block to the next, and the dispatch of the
+kernel, a call with its own frame; an update of less than a block called memcpy from a function with
+a frame. In bench run 42586796772, in one process where four copies of crypto-pq run in turn (this
+code, the code with the loop of the kernel for a kept state 32 bytes past a 64-byte boundary, and
+two copies of the code before), the time before over the time here, the time before the geometric
+mean of its two copies, each ratio taken within one process and the median over the processes of a
+class, on Zen 3, Zen 4, Zen 5, Ice Lake, Emerald Rapids and Granite Rapids (70, 40, 35, 10, 15 and
+10 processes), was 1.414, 1.531, 1.121, 1.205, 1.213 and 1.111 for a SHA-256 of 1 KiB in updates of
+1 byte; over the six classes, 1.129 to 1.181 in updates of 8 bytes, 1.046 to 1.219 of 16, 1.032 to
+1.065 of 32, 1.021 to 1.061 of 64 and 1.022 to 1.065 for 16 KiB in updates of 64 bytes, SHA-224
+alike, and 1.017 to 1.038 in updates of 100 bytes; 1.000 to 1.048 for an update of 16 bytes and the
+digest, 1.015 to 1.030 of 64, 1.011 to 1.033 of 65 and 1.011 to 1.019 of 129; 1.002 to 1.025 for
+HMAC-SHA-256 of 64 bytes under a key set up once, 0.999 to 1.004 of 1 KiB and 1.000 of 16 KiB. The
+one-shot digests, with the same machine code, gave 0.996 to 1.018. The two copies of the code before
+differed by up to 2.8 percent on a one-shot digest, 1.7 percent on an update of 16 bytes and 0.9
+percent on the other rows. RustCrypto's sha2, whose update the caller's crate compiles in line, took
+0.652 to 0.996 times the time here on updates of 1 byte and 0.955 on Zen 3 on updates of 8 bytes; on
+the other rows, the rival that leads each took more time than this code. In bench run 42572122614,
+where every update of less than a block went through memcpy, the SHA-256 of 1 KiB in updates of 1
+byte gave 1.141 on Zen 3 and 1.371 on Zen 4.
+
+On Ice Lake, where SHA256MSG1 and SHA256MSG2 are 6 and 12 uops, HMAC-SHA-256 of 16 KiB under a key
+set up once took 2.5 percent more time than before with the loop of the kernel in the order LLVM
+gave it, the instructions of the loop of `compress256_sha` with each SHA256MSG2 between the two
+SHA256RNDS2 of the next quarter (bench run 42572122614), and 2.0 percent more in the order of
+`compress256_sha` (bench run 42581716106), both with the loop 16 bytes past a 64-byte boundary,
+where the loop of `compress256_sha` is at one in these builds, which align functions to 64 bytes;
+from a boundary, the same time. With the loop 32 bytes past a boundary, the SHA-256 of 1 KiB and of
+16 KiB in updates of 64 bytes took 0.9 percent more time than from one, 1.2 and 1.3 percent less
+than before. The directive that aligns the loop also aligns the function, so the loop is at a
+boundary in any build. In builds with AVX, with x86-64-v3 or icelake-server as the target CPU, LLVM
+gives the kernel's loop the order of that of `compress256_sha` (128 and 127 instructions), and the
+rounds stay in Rust there.
+
+On Zen 3, an update of 16 bytes into an empty buffer, then the digest, took 4.3 percent more time
+than before with the bytes moved in line to `bytes[len..]` (bench run 42581716106): the address of
+the stores waited on the load of the length, and the loads of the digest on the stores; to the start
+of the buffer, 0.8 percent less (bench run 42586796772). An update of 63 bytes moved in line, in
+four stores of 16 bytes that leave two of the 16-byte loads of the digest with no store that holds
+all their bytes, took 3.0 and 1.9 percent more time on Zen 3 and Zen 4 (bench run 42581716106).
+Through memcpy, in two stores of 32 bytes where the CPU has AVX, it takes on Zen 4 the same time,
+and on Zen 3, in each process, about the same time or 2 percent more: 2 percent more in 18 of 70
+processes, 15 of them in both copies of this code, which points to the placement of the data in the
+process, 0.4 percent more as the median and 0.7 percent as the geometric mean of the processes
+(bench run 42586796772), against 0.4 percent less as the median of 20 processes in bench run
+42572122614, with the same stores in the same order.
+
+The machine code of ARM64, 32-bit Arm, 32-bit x86, RISC-V and WebAssembly is unchanged, function by
+function. On x86-64, in the build of the benchmark, the update and the buffering of blocks of the
+engine, its kernels for a state in the order of the words and for a kept state, the digest of a kept
+state and its copy for a digest of another size are new; the dispatchers of the update and the
+digest of a hasher, the creation of a SHA-256 hasher and of a MAC and the copy of an HMAC-SHA-256
+state change; the other 218 functions of crypto-pq in that build are the same. Under QEMU, with the
+EPYC-Milan model, the SHA-256 of 16 bytes in one update runs 455.8 instructions here against 471.2
+before, of 63 bytes 622.6 against 634.4, of 64 bytes 644.0 against 648.6 and of 1 KiB 4209 against
+4443; that of 1 KiB in updates of 1 byte 49157 against 75547, of 8 bytes 9353 against 12447 and of
+256 bytes 6598 against 8030.

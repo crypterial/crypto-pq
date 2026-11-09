@@ -601,6 +601,21 @@ pub(crate) use arch::{
     finish256, finish512, hmac256, hmac256_keyed, hmac512, hmac512_keyed,
 };
 
+// The kernels of sha2.rs's Sha256Stream, x86-64 only.
+#[cfg(all(
+    any(
+        feature = "sha2",
+        feature = "ml-dsa",
+        feature = "slh-dsa",
+        feature = "lms",
+        feature = "xmss"
+    ),
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+pub(crate) use x86_64::{compress256_kept, digest256_kept};
+
 #[cfg(feature = "frodokem")]
 pub(crate) use arch::{
     aes_encrypt, aes_expand, frodo_aes_rows, frodo_mul_add_as, frodo_mul_add_sa, frodo_shake_rows,

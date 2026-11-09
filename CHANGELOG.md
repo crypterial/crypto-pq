@@ -164,6 +164,21 @@ Implements specification 1.1 (draft).
   output on the stack. On Neoverse N2 such a hash takes 1.3% to 8.3% less time, a keyed hash 6.1%
   to 12.5% less and `derive_key` of 32 bytes 2.1% less. Other cores and the machine code of other
   targets are unchanged. Outputs are unchanged.
+- SHA-224 and SHA-256 on x86-64 CPUs with the SHA extensions
+  ([decision D-103](spec/decisions.md#decision-d-103)): a `Hasher` and an HMAC-SHA-224 or
+  HMAC-SHA-256 `Mac` keep their state in the order of the SHA256RNDS2 registers from the first block
+  they compress to the digest, so an update no longer shuffles the state into that order and back,
+  and an update whose bytes leave the block unfilled is buffered with no stack frame, in line below
+  32 bytes. Without AVX, the loop of the new kernel is inline assembly with the instructions of the
+  kernel it replaces, in their order, from a 64-byte boundary. On Zen 3, Zen 4, Zen 5, Ice Lake,
+  Emerald Rapids and Granite Rapids, 1 KiB hashed in updates of 1 byte takes 10% to 35% less time,
+  in updates of 8 bytes 11% to 15% less, of 16 bytes 4% to 18% less and of 32 or 64 bytes 2% to 6%
+  less, an update of 16, 64 or 129 bytes and the digest up to 4.6% less, and HMAC-SHA-256 of 64
+  bytes under a key from `MacAlgorithm::key` up to 2.4% less, with longer messages unchanged. On Zen
+  3, an update of 63 bytes and the digest take the same time or, in about a quarter of the processes
+  measured, 2% more, depending on where its data lies in memory. One-shot digests, the SHA-256 of
+  ML-DSA, SLH-DSA, LMS and XMSS, CPUs without the SHA extensions and other targets are unchanged.
+  Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
