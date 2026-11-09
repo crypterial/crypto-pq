@@ -450,6 +450,13 @@ Implements specification 1.1 (draft).
   LM-OTS chain starts; SK_PRF where XMSS derives its randomizer; and with SHAKE256 SK_SEED and
   the secret chain values of XMSS. The XMSS PRF_keygen state, keyed with SK_SEED, was copied
   when it was moved into the hashes of a tree. Outputs are unchanged.
+- BLAKE3 on WebAssembly and 32-bit Arm, in builds below opt-level 3: a hash, a keyed hash or
+  `derive_key` of at most a block, with an output of at most 32 bytes that is not a whole number
+  of words, wrote its last bytes through an iterator over an array of them, which the compiler
+  kept on the stack and nothing wiped (D-76). The bytes now come from the word's register, as in
+  the other output paths. At opt-level 3 the compiler kept them in registers already; there the
+  machine code of 32-bit Arm changes in its register allocation only, and that of WebAssembly is
+  unchanged. Outputs are unchanged.
 
 ## [1.0.1] - 2026-10-26
 

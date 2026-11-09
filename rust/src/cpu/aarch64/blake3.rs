@@ -762,28 +762,7 @@ mod scalar {
 
         rounds_on(&mut v, key, &mut m, [0, data.len() as u64, flags.into()]);
 
-        if let Ok(whole) = <&mut [u8; 32]>::try_from(&mut *out) {
-            for (i, chunk) in whole.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                *chunk = (v[i] ^ v[i + 8]).to_le_bytes();
-            }
-        } else {
-            let (chunks, rest) = out.as_chunks_mut::<4>();
-
-            for i in 0..8 {
-                let word = v[i] ^ v[i + 8];
-
-                if let Some(chunk) = chunks.get_mut(i) {
-                    *chunk = word.to_le_bytes();
-                } else {
-                    // The last bytes from the word's register, as write_words: no array of them.
-                    for (j, byte) in rest.iter_mut().enumerate() {
-                        *byte = (word >> (8 * j)) as u8;
-                    }
-
-                    break;
-                }
-            }
-        }
+        crate::blake3::root_words(&v, out);
 
         wipe_unless_optimized!(&mut v);
 

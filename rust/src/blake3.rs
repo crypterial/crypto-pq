@@ -1598,29 +1598,50 @@ fn digest1_in_locals<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u
 
     wipe_unless_optimized!(&mut m);
 
+    root_words(&v, out);
+
+    wipe_unless_optimized!(&mut v);
+}
+
+// The first out.len() bytes, at most 32, of the output words of a root compression's state v:
+// whole words straight into out, then the bytes of a last partial word from its register, as
+// write_words does, so that no copy of the output is left to wipe (D-76).
+#[cfg(any(
+    test,
+    target_family = "wasm",
+    target_arch = "arm",
+    all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        target_feature = "neon",
+        not(crypto_pq_portable)
+    )
+))]
+#[inline(always)]
+pub(crate) fn root_words(v: &[u32; 16], out: &mut [u8]) {
     if let Ok(whole) = <&mut [u8; 32]>::try_from(&mut *out) {
         for (i, chunk) in whole.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             *chunk = (v[i] ^ v[i + 8]).to_le_bytes();
         }
-    } else {
-        let (chunks, rest) = out.as_chunks_mut::<4>();
 
-        for i in 0..8 {
-            let word = (v[i] ^ v[i + 8]).to_le_bytes();
-
-            if let Some(chunk) = chunks.get_mut(i) {
-                *chunk = word;
-            } else {
-                for (byte, value) in rest.iter_mut().zip(word) {
-                    *byte = value;
-                }
-
-                break;
-            }
-        }
+        return;
     }
 
-    wipe_unless_optimized!(&mut v);
+    let (chunks, rest) = out.as_chunks_mut::<4>();
+
+    for i in 0..8 {
+        let word = v[i] ^ v[i + 8];
+
+        if let Some(chunk) = chunks.get_mut(i) {
+            *chunk = word.to_le_bytes();
+        } else {
+            for (j, byte) in rest.iter_mut().enumerate() {
+                *byte = (word >> (8 * j)) as u8;
+            }
+
+            break;
+        }
+    }
 }
 
 // The words of a block of less than 64 bytes, zeros after the message. Leaves at the word that
