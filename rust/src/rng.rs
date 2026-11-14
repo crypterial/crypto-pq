@@ -81,40 +81,13 @@ fn fill(out: &mut [u8]) -> Result<(), Error> {
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn fill(out: &mut [u8]) -> Result<(), Error> {
-    #[cfg_attr(
-        target_arch = "x86",
-        link(
-            name = "bcryptprimitives",
-            kind = "raw-dylib",
-            import_name_type = "undecorated"
-        )
-    )]
-    #[cfg_attr(
-        not(target_arch = "x86"),
-        link(name = "bcryptprimitives", kind = "raw-dylib")
-    )]
+    #[link(name = "bcryptprimitives", kind = "raw-dylib")]
     unsafe extern "system" {
         fn ProcessPrng(buffer: *mut u8, length: usize) -> i32;
     }
 
     // SAFETY: the pointer and length describe the writable slice `out`.
     if unsafe { ProcessPrng(out.as_mut_ptr(), out.len()) } == 0 {
-        return Err(Error::RngFailure);
-    }
-
-    Ok(())
-}
-
-#[cfg(all(target_os = "wasi", not(target_env = "p2")))]
-#[allow(unsafe_code)]
-fn fill(out: &mut [u8]) -> Result<(), Error> {
-    #[link(wasm_import_module = "wasi_snapshot_preview1")]
-    unsafe extern "C" {
-        fn random_get(buffer: *mut u8, length: usize) -> i32;
-    }
-
-    // SAFETY: the pointer and length describe the writable slice `out`.
-    if unsafe { random_get(out.as_mut_ptr(), out.len()) } != 0 {
         return Err(Error::RngFailure);
     }
 
@@ -132,7 +105,6 @@ fn fill(out: &mut [u8]) -> Result<(), Error> {
     target_vendor = "apple",
     target_os = "openbsd",
     windows,
-    all(target_os = "wasi", not(target_env = "p2")),
 )))]
 fn fill(_: &mut [u8]) -> Result<(), Error> {
     Err(Error::RngFailure)

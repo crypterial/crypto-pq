@@ -1,25 +1,18 @@
 // AES-128 and AES-256 encryption (FIPS 197). With the AES instructions (AES-NI on x86-64, the
 // ARMv8 AES instructions on arm64) the round keys are expanded and the blocks encrypted by them.
-// Everywhere else the portable code is constant time all the same: a group of blocks in bitsliced
-// form, as BearSSL's aes_ct64 and aes_ct pack them, eight planes of which plane b holds bit b of
-// every byte. A u64 plane holds four blocks; a u32 plane holds two, on the 32-bit targets other
-// than WebAssembly, where a 64-bit operation takes two instructions. The S-box is the circuit of
-// Boyar and Peralta (eprint 2009/191). The rounds are fixsliced (Adomnicai and Peyrin, eprint
-// 2020/1123): they leave out ShiftRows, so that after round r the state is ShiftRows applied r
-// times fewer than FIPS 197 has it, and MixColumns and the round key of round r are moved to
-// match. No table is indexed by data and no branch depends on it.
+// Everywhere else the portable code is constant time all the same: a group of four blocks in
+// bitsliced form, as BearSSL's aes_ct64 packs them, eight u64 planes of which plane b holds bit b
+// of every byte. The S-box is the circuit of Boyar and Peralta (eprint 2009/191). The rounds are
+// fixsliced (Adomnicai and Peyrin, eprint 2020/1123): they leave out ShiftRows, so that after
+// round r the state is ShiftRows applied r times fewer than FIPS 197 has it, and MixColumns and
+// the round key of round r are moved to match. No table is indexed by data and no branch depends
+// on it.
 
 use alloc::boxed::Box;
 use core::ops::{BitAnd, BitOr, BitXor, BitXorAssign, Not, Shl, Shr};
 
 use crate::cpu;
 use crate::wipe::wipe;
-
-#[cfg(any(target_pointer_width = "64", target_family = "wasm"))]
-type Native = u64;
-
-#[cfg(not(any(target_pointer_width = "64", target_family = "wasm")))]
-type Native = u32;
 
 // A bit plane of a group of BLOCKS blocks: bit ROW r + BLOCKS c + i of plane b is bit b of the
 // byte in row r, column c of block i. A row of the state is a run of ROW bits, a column of it a
@@ -90,41 +83,6 @@ impl Plane for u64 {
     }
 }
 
-// As BearSSL's aes_ct: word w of block i in q[2w + i].
-impl Plane for u32 {
-    const BLOCKS: usize = 2;
-
-    fn rotate(self, n: u32) -> Self {
-        self.rotate_right(n)
-    }
-
-    fn rows(pattern: u32) -> Self {
-        (pattern & 0xFF) * 0x0101_0101
-    }
-
-    fn bytes(pattern: u8) -> Self {
-        u32::from(pattern) * 0x0101_0101
-    }
-
-    #[inline(always)]
-    fn spread(blocks: &[[u8; 16]], q: &mut [u32; 8]) {
-        for (i, block) in blocks[..2].iter().enumerate() {
-            for (w, word) in words_of(block).into_iter().enumerate() {
-                q[2 * w + i] = word;
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn gather(q: &[u32; 8], blocks: &mut [[u8; 16]]) {
-        for (i, block) in blocks[..2].iter_mut().enumerate() {
-            for (w, bytes) in block.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                *bytes = q[2 * w + i].to_le_bytes();
-            }
-        }
-    }
-}
-
 // The round keys of one key: in FIPS 197 byte order for the AES instructions, or bitsliced, each
 // in every block of a group, for the portable code; only the form in use is filled. They are on
 // the heap, so that moving an Aes moves a pointer and leaves no copy of them behind, and are wiped
@@ -137,7 +95,7 @@ pub(crate) struct Aes {
 
 struct RoundKeys {
     fips: [[u8; 16]; 15],
-    bitsliced: [[Native; 8]; 15],
+    bitsliced: [[u64; 8]; 15],
 }
 
 impl Drop for RoundKeys {
@@ -217,7 +175,7 @@ impl Aes {
 
         let keys = &self.keys.bitsliced[..self.rounds + 1];
 
-        let (groups, rest) = blocks.as_chunks_mut::<{ Native::BLOCKS }>();
+        let (groups, rest) = blocks.as_chunks_mut::<{ u64::BLOCKS }>();
 
         for group in groups {
             encrypt_group(keys, group);
@@ -249,83 +207,33 @@ fn encrypt_group<P: Plane>(keys: &[[P; 8]], blocks: &mut [[u8; 16]]) {
 
     ortho(&mut q);
 
-    if cfg!(target_family = "wasm") {
-        rounds_in_one_loop(&mut q, keys);
-    } else {
-        let rounds = keys.len() - 1;
+    let rounds = keys.len() - 1;
 
-        add_round_key(&mut q, &keys[0]);
+    add_round_key(&mut q, &keys[0]);
 
-        for r in (1..rounds - 1).step_by(4) {
-            round::<P, 1>(&mut q, &keys[r]);
+    for r in (1..rounds - 1).step_by(4) {
+        round::<P, 1>(&mut q, &keys[r]);
 
-            round::<P, 2>(&mut q, &keys[r + 1]);
+        round::<P, 2>(&mut q, &keys[r + 1]);
 
-            round::<P, 3>(&mut q, &keys[r + 2]);
+        round::<P, 3>(&mut q, &keys[r + 2]);
 
-            round::<P, 0>(&mut q, &keys[r + 3]);
-        }
-
-        round::<P, 1>(&mut q, &keys[rounds - 1]);
-
-        sbox(&mut q);
-
-        shift_rows_2(&mut q);
-
-        add_round_key(&mut q, &keys[rounds]);
+        round::<P, 0>(&mut q, &keys[r + 3]);
     }
+
+    round::<P, 1>(&mut q, &keys[rounds - 1]);
+
+    sbox(&mut q);
+
+    shift_rows_2(&mut q);
+
+    add_round_key(&mut q, &keys[rounds]);
 
     ortho(&mut q);
 
     P::gather(&q, blocks);
 
     wipe(&mut q);
-}
-
-// The rounds on WebAssembly, in one loop that leaves after the S-box of the round before the last.
-// LLVM unrolls the loop of the other form into three copies of its body, about 31 KB of x86-64 code
-// under Cranelift against 12 KB here. The slice patterns give the key loads constant offsets, and
-// the planes in memory once per cycle hold no spill slot through the loop, 50 slots against 72
-// without it. Native code stays on the other form: on i686 this one took 2 to 9% more time.
-#[inline(always)]
-fn rounds_in_one_loop<P: Plane>(q: &mut [P; 8], keys: &[[P; 8]]) {
-    let [first, rest @ ..] = keys else {
-        unreachable!();
-    };
-
-    let mut rest = rest;
-
-    add_round_key(q, first);
-
-    let last = loop {
-        let [a, tail @ ..] = rest else {
-            unreachable!();
-        };
-
-        round::<P, 1>(q, a);
-
-        sbox(q);
-
-        core::hint::black_box(&mut *q);
-
-        let [b, c, d, more @ ..] = tail else {
-            break &tail[0];
-        };
-
-        mix_columns::<P, 2>(q);
-
-        add_round_key(q, b);
-
-        round::<P, 3>(q, c);
-
-        round::<P, 0>(q, d);
-
-        rest = more;
-    };
-
-    shift_rows_2(q);
-
-    add_round_key(q, last);
 }
 
 // The expanded key as bitsliced round keys, each in every block of a group. Round key r but the
@@ -408,9 +316,9 @@ fn sub_word(x: u32) -> u32 {
 
     blocks[0][..4].copy_from_slice(&x.to_le_bytes());
 
-    let mut q: [Native; 8] = [0; 8];
+    let mut q: [u64; 8] = [0; 8];
 
-    Native::spread(&blocks, &mut q);
+    u64::spread(&blocks, &mut q);
 
     ortho(&mut q);
 
@@ -418,7 +326,7 @@ fn sub_word(x: u32) -> u32 {
 
     ortho(&mut q);
 
-    Native::gather(&q, &mut blocks);
+    u64::gather(&q, &mut blocks);
 
     let out = u32::from_le_bytes(blocks[0][..4].try_into().unwrap()) ^ 0x6363_6363;
 
@@ -894,16 +802,11 @@ mod tests {
                             assert_eq!(block[..], ciphertext[..], "{path}");
                         }
 
-                        for encrypt in [
-                            encrypt_with::<u32> as fn(&[u8], &mut [u8; 16]),
-                            encrypt_with::<u64>,
-                        ] {
-                            let mut block: [u8; 16] = plaintext[..].try_into().unwrap();
+                        let mut block: [u8; 16] = plaintext[..].try_into().unwrap();
 
-                            encrypt(&key, &mut block);
+                        encrypt_with::<u64>(&key, &mut block);
 
-                            assert_eq!(block[..], ciphertext[..], "{path}");
-                        }
+                        assert_eq!(block[..], ciphertext[..], "{path}");
 
                         checked += 1;
 
@@ -957,74 +860,7 @@ mod tests {
         }
     }
 
-    // The two plane types on random keys and four different blocks.
-    #[test]
-    fn planes_agree() {
-        let mut inputs = crate::cpu::testing::Inputs::new(0xAE6);
-
-        for n in 0..500 {
-            let key: [u8; 32] = inputs.bytes();
-
-            let key = &key[..if n % 2 == 0 { 16 } else { 32 }];
-
-            let blocks: [[u8; 16]; 4] = core::array::from_fn(|_| inputs.bytes());
-
-            let (mut wide, mut narrow) = (blocks, blocks);
-
-            encrypt_group(&keys_for::<u64>(key), &mut wide);
-
-            let keys = keys_for::<u32>(key);
-
-            for pair in narrow.as_chunks_mut::<2>().0 {
-                encrypt_group(&keys, pair);
-            }
-
-            assert_eq!(wide, narrow, "case {n}");
-        }
-    }
-
-    // The rounds for WebAssembly against encrypt_group, which takes the other form on the targets
-    // that CI tests, on random keys and blocks.
-    #[test]
-    fn rounds_in_one_loop_agree() {
-        fn check<P: Plane>(key: &[u8], blocks: &[[u8; 16]; 4]) {
-            let keys = keys_for::<P>(key);
-
-            let (mut expected, mut got) = (*blocks, *blocks);
-
-            encrypt_group(&keys, &mut expected);
-
-            let mut q = [P::default(); 8];
-
-            P::spread(&got, &mut q);
-
-            ortho(&mut q);
-
-            rounds_in_one_loop(&mut q, &keys);
-
-            ortho(&mut q);
-
-            P::gather(&q, &mut got);
-
-            assert_eq!(got, expected);
-        }
-
-        let mut inputs = crate::cpu::testing::Inputs::new(0xAE7);
-
-        for n in 0..500 {
-            let key: [u8; 32] = inputs.bytes();
-
-            let key = &key[..if n % 2 == 0 { 16 } else { 32 }];
-
-            let blocks: [[u8; 16]; 4] = core::array::from_fn(|_| inputs.bytes());
-
-            check::<u64>(key, &blocks);
-
-            check::<u32>(key, &blocks);
-        }
-    }
-
-    // The bitsliced round keys of key in planes of type P, whichever type the target uses.
+    // The bitsliced round keys of key in planes of type P.
     fn keys_for<P: Plane>(key: &[u8]) -> alloc::vec::Vec<[P; 8]> {
         let rounds = if key.len() == 16 { 10 } else { 14 };
 

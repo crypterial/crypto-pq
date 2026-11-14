@@ -426,7 +426,6 @@ fn xof_update_after_read() {
 }
 
 // SPEC 12.8: at most 2^32 - 1 bytes per call, refused before anything is allocated.
-#[cfg(target_pointer_width = "64")]
 #[test]
 fn xof_output_limit() {
     let beyond = u32::MAX as usize + 1;

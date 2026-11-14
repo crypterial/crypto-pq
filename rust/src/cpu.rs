@@ -196,7 +196,6 @@ mod arch {
     }
 
     #[inline(always)]
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     #[cfg(any(
         feature = "ml-kem",
         feature = "frodokem",
@@ -211,7 +210,6 @@ mod arch {
     }
 
     #[inline(always)]
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     #[cfg(any(
         feature = "ml-kem",
         feature = "frodokem",
@@ -656,17 +654,14 @@ pub(crate) use x86_64::{
 ))]
 pub(crate) use arch::{keccak_group, permute_many};
 
-#[cfg(all(
-    any(test, not(target_family = "wasm")),
-    any(
-        feature = "ml-kem",
-        feature = "frodokem",
-        feature = "ml-dsa",
-        feature = "slh-dsa",
-        feature = "lms",
-        feature = "xmss",
-        feature = "sha3"
-    )
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
 ))]
 pub(crate) use arch::{absorb, digest};
 
@@ -1222,9 +1217,6 @@ pub(crate) fn barrier(value: u32) -> u32 {
 
 #[cfg(all(
     any(
-        target_arch = "arm",
-        target_arch = "x86",
-        target_arch = "riscv32",
         target_arch = "riscv64",
         target_arch = "loongarch64",
         target_arch = "s390x",
@@ -1247,14 +1239,11 @@ pub(crate) fn barrier(mut value: u32) -> u32 {
     value
 }
 
-// Targets without stable inline assembly in Rust, WebAssembly among them, and Miri.
+// Targets without stable inline assembly in Rust, and Miri.
 #[cfg(any(
     not(any(
         target_arch = "x86_64",
         target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "x86",
-        target_arch = "riscv32",
         target_arch = "riscv64",
         target_arch = "loongarch64",
         target_arch = "s390x",

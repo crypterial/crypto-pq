@@ -9,7 +9,7 @@ the [crypto-pq specification](spec/00-contents.md) that it implements
 
 ## [Unreleased]
 
-Implements specification 1.1 (draft).
+Implements specification 2.0 (draft).
 
 ### Added
 
@@ -55,82 +55,20 @@ Implements specification 1.1 (draft).
 - BLAKE3 on x86-64 with AVX2 or SSE4.1: the groups of an extended output on eight or four lanes
   broadcast the message and the chaining value once for all groups, with one scratch state. Outputs
   are unchanged.
-- SHA-384 and SHA-512 on WebAssembly: the compression takes the form of SHA-256's below, and streaming
-  updates copy what they buffer with no call into the runtime
-  ([decision D-85](spec/decisions.md#decision-d-85)). Outputs are unchanged.
-- SHA-224 and SHA-256 on WebAssembly: the compression runs the first group of rounds ahead of a loop
-  over the other three, and padding blocks, HMAC key blocks and one-shot inputs of under four blocks
-  share one copy of it out of line ([decision D-85](spec/decisions.md#decision-d-85)). Outputs are
-  unchanged.
 - SHA-384 and SHA-512 on ARM64 with the SHA-512 instructions: the loop over the blocks of an update
   takes the same one-loop form of the rounds as the loop over the blocks of a one-shot input, which
   took less time per block on Neoverse N2. Outputs are unchanged.
 - BLAKE2b on ARM64 cores that run it on the general registers: the compression reads the IV from
   memory, not from constants in its code. Outputs are unchanged.
-- BLAKE3 on WebAssembly: the last two inputs of `hash_many` run one after the other, and the whole
-  blocks of an extended output go straight into the output, as on 32-bit x86
-  ([decision D-84](spec/decisions.md#decision-d-84)). Outputs are unchanged.
-- BLAKE3 of at most a block on WebAssembly and 32-bit Arm, and BLAKE2 of at most a block on 32-bit
-  Arm ([decision D-86](spec/decisions.md#decision-d-86)): the message goes from its slice into
-  locals and the output from locals to the caller, with no block in memory. A hash or MAC of at most
-  a block and `derive_key` take up to 15% less time on armv7, and BLAKE3's take up to 15% less under
-  wasmtime and Node.js. The machine code of other targets is unchanged. Outputs are unchanged.
-- BLAKE2 on WebAssembly ([decision D-89](spec/decisions.md#decision-d-89)): each block takes a call
-  of one function, with the chaining value in memory, and a digest or MAC of at most a block takes the
-  message straight from its slice into the rounds. Under wasmtime, inputs of many blocks take up to 34%
-  less time on Zen cores and 5% less on Ice Lake, and one block takes 10 to 17% less. Under Node.js one
-  block takes 13 to 21% less, and inputs of many blocks take up to 3% more on Zen cores. On 32-bit Arm
-  the compression reads the message words ahead of the state, 1% less time, and BLAKE3's chains run
-  one at a time. The machine code of x86-64, ARM64, i686 and riscv64 is unchanged. Outputs are
-  unchanged.
-- Public entries on WebAssembly ([decision D-90](spec/decisions.md#decision-d-90)): digests, extended
-  outputs, MACs and key derivation are inlined into the caller, each arm a call of a function compiled
-  in this crate, and a message of SHA-3 or SHAKE shorter than a block takes no test per lane. SHA-3 and
-  SHAKE of 64 bytes take 3 to 6% less time and BLAKE3 of at most a block up to 6% less. A module that
-  uses one family leaves the code of the others out: 318 KB to 141 KB in a test module of BLAKE3. On
-  other targets the MAC entry is inlined too: keyed BLAKE3 of at most a block takes up to 3% less
-  time on x86-64 and up to 6% less on i686. Outputs are unchanged.
-- BLAKE2 on 32-bit Arm ([decision D-91](spec/decisions.md#decision-d-91)): the loops over whole
-  blocks read the message words after the state. Inputs of many blocks take 0.6 to 0.8% less time on
-  Neoverse N2 for BLAKE2s and 0.1% less for BLAKE2b. Inputs of at most a block are unchanged. The
-  machine code of other targets is unchanged. Outputs are unchanged.
-- Ascon on 32-bit Arm and WebAssembly ([decision D-92](spec/decisions.md#decision-d-92)): a hash,
-  XOF or CXOF in one call takes the padded last block through a permutation of its own.
-  Ascon-Hash256 of 1 KiB takes 1.6% less time on Neoverse N2 in 32-bit Arm code, up to 3.7% less
-  under wasmtime and up to 2.0% less under Node.js. Under wasmtime on Zen 4, inputs of 1 and 16 KiB
-  take up to 1.3% more, and under Node.js on Zen 5, Ascon-CXOF128 of 64 bytes takes 3.6% more. The
-  machine code of other targets is unchanged. Outputs are unchanged.
+- The MAC entry ([decision D-90](spec/decisions.md#decision-d-90)): `MacAlgorithm::digest_into` is
+  inlined into the caller and reaches BLAKE2 and BLAKE3 by calls of their own functions. Keyed
+  BLAKE3 of at most a block takes up to 3% less time on x86-64. Outputs are unchanged.
 - SHA-384 and SHA-512 on x86-64 with AVX-512 ([decision D-93](spec/decisions.md#decision-d-93)):
   the message schedule computes its sigma functions with AVX-512VL. SHA-384, SHA-512, HMAC and HKDF
   take 3.5% to 6.9% less time on Ice Lake, Emerald Rapids, Granite Rapids, Zen 4 and Zen 5, as a
   geometric mean, and SLH-DSA over SHA2 at the 192-bit and 256-bit levels up to 2.7% less.
   Processors without AVX-512 run the AVX2 form as before, and the machine code of other targets is
   unchanged. Outputs are unchanged.
-- BLAKE3 extended outputs on 32-bit x86 ([decision D-94](spec/decisions.md#decision-d-94)): the
-  compression of each whole block of output adds each message word after b, with less of the state
-  on the stack. Outputs of 1 and 16 KiB take 0.5% to 5.3% less time on Zen 3, Zen 4, Zen 5, Ice
-  Lake, Emerald Rapids and Granite Rapids, and an output of one block up to 4.9% more on Ice Lake.
-  The machine code of other targets is unchanged. Outputs are unchanged.
-- BLAKE2b and BLAKE2s on 32-bit x86 ([decision D-95](spec/decisions.md#decision-d-95)): the whole
-  words of a last block that is neither a whole block nor half a block are copied out of line, with
-  no call of memcpy. Inputs with such a last block take 0.4% to 19.3% less time on Zen 3, Zen 4,
-  Zen 5, Ice Lake and Emerald Rapids, other than BLAKE2s of 100 and 127 bytes and its MAC of 127
-  bytes on Zen 5, which take up to 0.9% more. The machine code of other targets is unchanged.
-  Outputs are unchanged.
-- BLAKE2s on 32-bit Arm ([decision D-96](spec/decisions.md#decision-d-96)): a digest or MAC of
-  more than a block runs its key block and last block in registers, with no call of memset or
-  memcpy. Digests of 65 to 192 bytes take 2.9% to 5.7% less time on Neoverse N2, and MACs of 65 to
-  128 bytes 5.7% to 6.6% less. The machine code of other targets is unchanged. Outputs are
-  unchanged.
-- BLAKE2b and BLAKE2s on WebAssembly ([decision D-97](spec/decisions.md#decision-d-97)): the key
-  block and a partial last block of an input of more than a block, and the data of a digest or MAC
-  of at most a block of another length than a block, half a block or none, are padded in aligned
-  groups of 8 bytes, and the rounds of a whole block read them. A digest or MAC of more than a
-  block runs its loop in the function that the dispatcher calls, and a MAC of at most a block runs a
-  function of its own. Over the rows whose code changed, the time drops by 1.5% to 3.7% as a
-  geometric mean in each class measured under wasmtime and Node.js, while some rows take up to 11%
-  more, which the decision lists. The machine code of other targets is unchanged. Outputs are
-  unchanged.
 - BLAKE2b on x86-64 with AVX2 ([decision D-98](spec/decisions.md#decision-d-98)): in a digest or
   MAC in one call, the vector that holds the last bytes of a key or of a final block whose length
   is not a multiple of 16 is written with one 32-byte store, from which the loads of the rounds
@@ -138,18 +76,6 @@ Implements specification 1.1 (draft).
   2.1% to 8.2% as a geometric mean on Ice Lake, Emerald Rapids, Granite Rapids, Zen 3 and Zen 4,
   while seven rows on Zen 3 and Zen 4 take 0.6% to 1.3% more, which the decision lists. The machine
   code of other targets is unchanged. Outputs are unchanged.
-- BLAKE2b on 32-bit Arm ([decision D-99](spec/decisions.md#decision-d-99)): a digest or MAC of
-  more than a block runs its key block, its whole blocks and its last block in one function,
-  through one copy of the rounds, with no call of memset or memcpy. On Neoverse N2, a digest of 255
-  bytes takes 2.9% less time, one of 1 KiB 0.7% less and a MAC of 1 KiB 1.1% less. The machine code
-  of other targets is unchanged. Outputs are unchanged.
-- BLAKE2s on 32-bit x86 ([decision D-100](spec/decisions.md#decision-d-100)): one or two whole
-  blocks before the last block take a call of the compression function each, out of line, so that a
-  digest or MAC of 65 to 192 bytes runs one copy of the rounds. Over these lengths the time drops by
-  3.4% on Zen 3, 7.6% on Ice Lake and 8.3% on Zen 5 as a geometric mean, and by 18% for digests of
-  129 to 192 bytes on Zen 5, and is unchanged on Emerald Rapids, while on Zen 4 digests of these
-  lengths take 0.7% to 1.4% more. The machine code of other targets is unchanged. Outputs are
-  unchanged.
 - BLAKE2b on ARM64 on Neoverse N2 ([decision D-101](spec/decisions.md#decision-d-101)): a call
   that compresses two or more blocks, as a digest of more than 128 bytes or a MAC of a message of
   at least one byte does, runs them in one loop of assembly, out of line, with the state and words
@@ -179,22 +105,19 @@ Implements specification 1.1 (draft).
   measured, 2% more, depending on where its data lies in memory. One-shot digests, the SHA-256 of
   ML-DSA, SLH-DSA, LMS and XMSS, CPUs without the SHA extensions and other targets are unchanged.
   Outputs are unchanged.
-- SHA-384, SHA-512, SHA-512/224 and SHA-512/256 on every target but WebAssembly, and SHA-224 and
-  SHA-256 on the same targets but x86-64, where D-103 did this outside SGX and the portable build
-  ([decision D-104](spec/decisions.md#decision-d-104)): the update of a `Hasher` and of an HMAC
-  `Mac` is a function of its own that buffers bytes which leave the block unfilled with no stack
-  frame, in line below 32 bytes and on ARM64 at every length but through memcpy on 32-bit Arm,
-  passes whole blocks into an empty buffer straight to the kernel, and fills a block without the
-  tests that the paths before it decide. On Neoverse N2, 1 KiB hashed in updates of 1 byte takes 38%
-  less time with SHA-256 and 31% less with SHA-512, in updates of 8 bytes 31% and 21% less, of 16
-  bytes 10% and 8% less and of 32 bytes 13% and 4% less. On Zen 3, Zen 4, Zen 5, Ice Lake and
-  Emerald Rapids, SHA-512 in updates of 1 byte takes 10% to 39% less time, of 8 bytes 5% to 17%
-  less, of 16 bytes 7% to 9% less and of 32 or 64 bytes up to 3% less. Under i686, 1 KiB in updates
-  of 1 byte takes 42% to 71% less time with SHA-256 and 35% to 68% less with SHA-512, in updates of
-  8 bytes 19% to 27% and 11% to 19% less, and under 32-bit Arm, in updates of 1 byte, 11% and 7%
+- SHA-384, SHA-512, SHA-512/224 and SHA-512/256, and SHA-224 and SHA-256 on the targets other than
+  x86-64, where D-103 did this outside SGX and the portable build ([decision
+  D-104](spec/decisions.md#decision-d-104)): the update of a `Hasher` and of an HMAC `Mac` is a
+  function of its own that buffers bytes which leave the block unfilled with no stack frame, in line
+  below 32 bytes and on ARM64 at every length, passes whole blocks into an empty buffer straight to
+  the kernel, and fills a block without the tests that the paths before it decide. On Neoverse N2, 1
+  KiB hashed in updates of 1 byte takes 38% less time with SHA-256 and 31% less with SHA-512, in
+  updates of 8 bytes 31% and 21% less, of 16 bytes 10% and 8% less and of 32 bytes 13% and 4% less.
+  On Zen 3, Zen 4, Zen 5, Ice Lake and Emerald Rapids, SHA-512 in updates of 1 byte takes 10% to 39%
+  less time, of 8 bytes 5% to 17% less, of 16 bytes 7% to 9% less and of 32 or 64 bytes up to 3%
   less. On Zen 3, a SHA-512 of 16 or 128 bytes in one update and the digest takes 0.2% to 0.3% more
-  time. One-shot digests, the SHA-2 of ML-DSA, SLH-DSA, LMS, XMSS and HKDF, and WebAssembly are
-  unchanged. Outputs are unchanged.
+  time. One-shot digests and the SHA-2 of ML-DSA, SLH-DSA, LMS, XMSS and HKDF are unchanged. Outputs
+  are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
@@ -290,7 +213,7 @@ Implements specification 1.1 (draft).
   and the keys accepted are unchanged.
 - ML-DSA verification samples the challenge of the signature it is given by plain rejection, as
   FIPS 204 Algorithm 29 is written, since that signature, c̃ with it, is public
-  ([decision D-72](spec/decisions.md#decision-d-72), revised for specification 1.1). Signing, and
+  ([decision D-72](spec/decisions.md#decision-d-72), revised for specification 2.0). Signing, and
   the verification in the pairwise test of key generation, whose signature is never output, keep
   the constant-time form. Outputs are unchanged.
 - ML-DSA: the products of the matrix and a vector are summed exactly in 64 bits for each
@@ -340,11 +263,6 @@ Implements specification 1.1 (draft).
   to two blocks before it compresses them, so that the AVX2 kernel, which schedules both blocks of
   a pair in the same vector instructions, takes the blocks of small updates in pairs too, and a
   digest compresses a held block together with the padding. Outputs are unchanged.
-- SHA-512, SHA-384 and their truncated forms on 32-bit x86 with SSE2, with HMAC and HKDF over them
-  and the SHA2 sets of SLH-DSA at security categories 3 and 5
-  ([decision D-83](spec/decisions.md#decision-d-83)): the message schedule computes its words two at
-  a time, so that each of its steps is one SSE2 operation on both words of a pair, where a word
-  alone takes two general registers. Outputs are unchanged.
 - SHA-256 on x86-64 CPUs with AVX-512F and AVX-512VL: the messages hashed side by side, eight at a
   time, in the chains and trees of LMS and XMSS and in the SHA-2 sets of SLH-DSA take a kernel,
   selected at run time, that keeps one message in each element of a 256-bit register and uses
@@ -352,61 +270,33 @@ Implements specification 1.1 (draft).
   register. AMD processors with the SHA extensions keep the SHA-NI kernel, which runs these hashes
   in less time there. The SHA-NI and AVX2 kernels and the portable code stay its twins, and outputs
   are unchanged.
-- Keccak-f[1600] on 32-bit targets other than WebAssembly: the state holds each lane
-  bit-interleaved, as XKCP's inplace32BI does, so that a lane rotation is one 32-bit rotation of
-  each word, and lanes are converted only where they are absorbed and read. On 32-bit x86 with SSE2
-  the states are instead permuted two at a time, the same lane of both in one SSE2 register, and a
-  state alone beside the zero state ([decision D-80](spec/decisions.md#decision-d-80)). Outputs are
-  unchanged.
-- Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128 on 32-bit Arm: the state holds its words
-  bit-interleaved, so that each rotation is one 32-bit rotation of each half, and words are
-  converted only where they are absorbed and read
-  ([decision D-81](spec/decisions.md#decision-d-81)). Outputs are unchanged.
-- One-shot Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128 on WebAssembly and 32-bit x86: the hash
-  and XOF dispatchers branch to the Ascon code before they set up the stack frame that the other
-  algorithms need, `XofAlgorithm::configure` and `XofAlgorithm::digest_into` are inline, and the
-  customization of Ascon-CXOF128 runs the rounds inline in place of a call of the permutation per
-  block. On 32-bit x86 the digest also stores whole output words as they are, and the linear layer
-  takes the two rotations of each word side by side, as the specification writes it, which leaves
-  one dependent step less in each round. Outputs are unchanged.
-- BLAKE2b and BLAKE3 on 32-bit x86 ([decision D-82](spec/decisions.md#decision-d-82)): with SSE2,
-  BLAKE2b's state holds the words of each row in pairs, so that each step of a round is one SSE2
-  operation on both words of a pair; BLAKE3 compresses each block of a chain in a call of its own,
-  and writes the whole blocks of an extended output from the registers of their compression
-  straight into the output. Outputs are unchanged.
 - AES in the portable code, which the AES sets of FrodoKEM use for the matrix A on CPUs without AES
   instructions: the rounds are fixsliced (Adomnicai and Peyrin, ePrint 2020/1123), with four blocks
-  in 64-bit planes on 64-bit targets and WebAssembly and two in 32-bit planes on the other 32-bit
-  targets, in the layouts of BearSSL's aes_ct64 and aes_ct. The round keys are converted to match
-  at key setup, and the S-box runs without its NOTs. The paths that use the AES instructions are
+  in 64-bit planes, in the layout of BearSSL's aes_ct64. The round keys are converted to match at
+  key setup, and the S-box runs without its NOTs. The paths that use the AES instructions are
   unchanged. Outputs are unchanged.
-- ML-KEM and ML-DSA where the NTT has no AVX2 or NEON kernel (32-bit Arm and x86, WebAssembly,
-  RISC-V, s390x and the portable builds): the NTT and its inverse take three passes on eight
-  coefficients held in registers, with the twiddle factors and their products by QINV from static
-  tables, in place of one pass through memory for each layer. The inverse reduces in its first
-  pass and folds its final scaling into its last layer. Outputs are unchanged.
+- ML-KEM and ML-DSA where the NTT has no AVX2 or NEON kernel (RISC-V, s390x and the portable
+  builds): the NTT and its inverse take three passes on eight coefficients held in registers, with
+  the twiddle factors and their products by QINV from static tables, in place of one pass through
+  memory for each layer. The inverse reduces in its first pass and folds its final scaling into its
+  last layer. Outputs are unchanged.
 - ML-KEM on the same targets: the first pass of the NTT reads the coefficients where they are, with
   no pass to widen them first, and key generation transforms e inside the sums of t, which start
   from NTT(e), with no canonical form of it and no loop to add it. The array of the sums is wiped
-  after use. Key generation takes 4 to 12 percent less time on i686, armv7, and under wasmtime and
-  Node.js, and encapsulation and decapsulation up to 6 percent less, within 1 percent of before
-  under Node.js on Zen 4. Outputs are unchanged.
-- ML-DSA signing on 32-bit Arm and x86, WebAssembly, RISC-V and s390x runs the constant-time
-  passes of SampleInBall on 64-bit words, eight lanes an operation, with the mask of each lane
-  taken from its byte of a word by arithmetic that no single bit decides
-  ([decision D-79](spec/decisions.md#decision-d-79)). Outputs are unchanged.
-- SHA-224, SHA-256, SHA-384 and SHA-512 in the portable code, which runs on 32-bit Arm and x86,
-  WebAssembly, RISC-V, s390x and the CPUs without the SHA-2 kernels: one group of 16 rounds is
-  written out and run in a loop over the groups, and the message schedule and the working
-  variables are arrays indexed with constants only, so that they stay in registers. On targets
-  without vector registers by default (32-bit Arm, RISC-V without the V extension, s390x and
-  WebAssembly without simd128), the messages that LMS, XMSS, SLH-DSA and HMAC hash side by side
-  run through the rounds one at a time, and HMAC's key blocks and the padding of a hash enter the
-  schedule word by word from the key and from the last bytes of the message, with no block built
-  in memory; SHA-512 on 32-bit Arm keeps its padding block. On WebAssembly each of the two slices
-  of an update reaches the loop over its blocks in a call of its own. On 32-bit Arm the sigma
-  functions of SHA-512 are computed on the 32-bit halves of each word. On every target HMAC hashes
-  a key longer than a block out of line, and a shorter key needs no buffer. Outputs are unchanged.
+  after use. Outputs are unchanged.
+- ML-DSA signing on the targets other than x86-64 and ARM64, RISC-V and s390x among them, runs the
+  constant-time passes of SampleInBall on 64-bit words, eight lanes an operation, with the mask of
+  each lane taken from its byte of a word by arithmetic that no single bit decides ([decision
+  D-79](spec/decisions.md#decision-d-79)). Outputs are unchanged.
+- SHA-224, SHA-256, SHA-384 and SHA-512 in the portable code, which runs on RISC-V, s390x and the
+  CPUs without the SHA-2 kernels: one group of 16 rounds is written out and run in a loop over the
+  groups, and the message schedule and the working variables are arrays indexed with constants only,
+  so that they stay in registers. On targets without vector registers by default (RISC-V without the
+  V extension and s390x), the messages that LMS, XMSS, SLH-DSA and HMAC hash side by side run
+  through the rounds one at a time, and HMAC's key blocks and the padding of a hash enter the
+  schedule word by word from the key and from the last bytes of the message, with no block built in
+  memory. On every target HMAC hashes a key longer than a block out of line, and a shorter key needs
+  no buffer. Outputs are unchanged.
 - LMS and HSS over SHA-256 and SHA-256/192 on targets without vector registers by default: each
   step of a Winternitz chain is one compression whose block is built from words, those of I and q
   fixed for a key, the chain value entering the schedule as big-endian words and the padding as
@@ -417,37 +307,25 @@ Implements specification 1.1 (draft).
 - The minimum supported Rust version is 1.89, the first in which the AVX-512 target features and
   intrinsics are stable.
 
-- FrodoKEM with AES on WebAssembly: the bitsliced rounds of AES run in one loop over the round
-  keys, with the state in memory once per cycle, where LLVM made three copies of the body of the
-  loop. FrodoKEM-976-AES takes 18% less time on AMD Zen 3 under wasmtime and 14% less under Node.js,
-  and about 14% less on Zen 4 under wasmtime; under wasmtime on Emerald Rapids it takes 1.5% more.
-  The machine code of other targets is unchanged. Outputs are unchanged.
-- FrodoKEM's matrix products on WebAssembly work on 64-bit words: a multiplication of an entry by a
-  masked word gives two products of 16-bit entries at once, and four entries load as one word.
-  FrodoKEM-976-AES takes 9 to 23% less time in key generation and up to 16% less in encapsulation and
-  decapsulation under wasmtime and Node.js; FrodoKEM-976-SHAKE takes 20 to 34% and 10 to 24% less. The
-  machine code of other targets is unchanged. Outputs are unchanged.
-- Keccak-f[1600] on WebAssembly keeps the state in locals through the rounds, from one block to the
-  next and, for a digest in one call, from the last block to the output. SHA-3 and SHAKE take up to
-  19% less time, KMAC up to 16% and ML-KEM up to 10% less under wasmtime and Node.js. The machine code
-  of other targets is unchanged. Outputs are unchanged.
-- Keccak digests of at least a block in one call on WebAssembly: the padded last block takes the loop
-  over the other blocks, with no second copy of the rounds, and the state and buffers are set up and
-  wiped with no call into the runtime ([decision D-88](spec/decisions.md#decision-d-88)). Keccak-256
-  of 136 bytes takes up to 19% less time under wasmtime. Outputs are unchanged.
+### Removed
+
+- Support for WebAssembly and 32-bit targets ([decision D-105](spec/decisions.md#decision-d-105)):
+  the crate builds for 64-bit targets only, and a build for WebAssembly or a 32-bit target stops
+  with a compile error. CI no longer builds or tests them. Every other 64-bit target keeps the
+  portable code, big-endian s390x among them. This is not compatible with 1.x, so this release
+  implements specification 2.0; 1.0.x stays the release for those targets.
 
 ### Fixed
 
-- Constant time on RISC-V and s390x: the compiler turned the masked reductions of ML-DSA and
-  ML-KEM into a choice between two values, which these targets computed with a branch on secret
-  coefficients. On RISC-V without the Zicond extension, ML-DSA signing, ML-DSA key generation from
-  a seed, the import of expanded ML-DSA keys and the check of expanded ML-KEM decapsulation keys
+- Constant time on RISC-V and s390x: the compiler turned the masked reductions of ML-DSA and ML-KEM
+  into a choice between two values, which these targets computed with a branch on secret
+  coefficients. On RISC-V without the Zicond extension, ML-DSA signing, ML-DSA key generation from a
+  seed, the import of expanded ML-DSA keys and the check of expanded ML-KEM decapsulation keys
   branched at every opt-level; on s390x, the norm checks of ML-DSA signing and the ML-KEM noise
-  sampler at opt-levels 1, 2 and 3. Every mask computed from secret data now passes an
-  optimization barrier ([decision D-79](spec/decisions.md#decision-d-79)), an empty inline
-  assembly block, or `core::hint::black_box` on WebAssembly and the other targets without stable
-  inline assembly. The machine code for x86-64 and ARM64 is unchanged. rust-v1.0.0 and
-  rust-v1.0.1 have the same flaw.
+  sampler at opt-levels 1, 2 and 3. Every mask computed from secret data now passes an optimization
+  barrier ([decision D-79](spec/decisions.md#decision-d-79)), an empty inline assembly block, or
+  `core::hint::black_box` on the targets without stable inline assembly. The machine code for x86-64
+  and ARM64 is unchanged. rust-v1.0.0 and rust-v1.0.1 have the same flaw.
 - BLAKE2s and BLAKE3 on x86-64 and BLAKE3 on ARM64: the broadcasts of message and key words are
   written out, so that no broadcast word stays in a frame of `array::map` that nothing wipes
   (D-76): BLAKE3's extended output on ARM64 copied the root block by value, BLAKE2s's AVX2 kernel
@@ -481,13 +359,6 @@ Implements specification 1.1 (draft).
   LM-OTS chain starts; SK_PRF where XMSS derives its randomizer; and with SHAKE256 SK_SEED and
   the secret chain values of XMSS. The XMSS PRF_keygen state, keyed with SK_SEED, was copied
   when it was moved into the hashes of a tree. Outputs are unchanged.
-- BLAKE3 on WebAssembly and 32-bit Arm, in builds below opt-level 3: a hash, a keyed hash or
-  `derive_key` of at most a block, with an output of at most 32 bytes that is not a whole number
-  of words, wrote its last bytes through an iterator over an array of them, which the compiler
-  kept on the stack and nothing wiped (D-76). The bytes now come from the word's register, as in
-  the other output paths. At opt-level 3 the compiler kept them in registers already; there the
-  machine code of 32-bit Arm changes in its register allocation only, and that of WebAssembly is
-  unchanged. Outputs are unchanged.
 
 ## [1.0.1] - 2026-10-26
 

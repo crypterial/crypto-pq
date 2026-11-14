@@ -234,7 +234,8 @@ operations run with DIT set. Private keys and `SecretBytes`, the type of every s
 their memory when dropped. Randomness comes only from the operating system; on a target without a
 source, operations that need it return `Error::RngFailure`. CPU-specific code for x86-64 (AVX2,
 AVX-512VL, SSE4.1, SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2, SHA-3, SHA-512) is selected at run
-time, with portable code on every target.
+time, with portable code on every 64-bit target. WebAssembly and 32-bit targets are not
+supported.
 
 Report vulnerabilities privately through
 [GitHub Security Advisories](https://github.com/crypterial/crypto-pq/security/advisories/new).

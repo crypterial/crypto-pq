@@ -10,6 +10,9 @@
 //! [`enable_data_independent_timing`]). CPU-specific code for x86-64 and ARM64 is chosen at run
 //! time, with a portable fallback on every target.
 //!
+//! The crate builds for 64-bit targets only. WebAssembly and 32-bit targets are not supported, and
+//! a build for one of them stops with a compile error.
+//!
 //! # Features
 //!
 //! Each algorithm family is a Cargo feature, and the default features enable all of them. A build
@@ -44,10 +47,9 @@
 //! # Randomness
 //!
 //! Randomness comes from the operating system: `getrandom` on Linux, Android, FreeBSD, NetBSD,
-//! DragonFly, illumos and Solaris, `getentropy` on Apple platforms and OpenBSD, `ProcessPrng` on
-//! Windows and `random_get` on WASI preview 1. On every other target, such as
-//! `wasm32-unknown-unknown` or bare metal, every operation that draws randomness fails with
-//! [`Error::RngFailure`]; hashes, XOFs, MACs, KDFs, verification, decapsulation and
+//! DragonFly, illumos and Solaris, `getentropy` on Apple platforms and OpenBSD, and `ProcessPrng`
+//! on Windows. On every other target, such as bare metal, every operation that draws randomness
+//! fails with [`Error::RngFailure`]; hashes, XOFs, MACs, KDFs, verification, decapsulation and
 //! deterministic signing need no randomness.
 //!
 //! # Examples
@@ -238,6 +240,12 @@
         clippy::unnecessary_lazy_evaluations
     )
 )]
+
+// The portable code and its tests are written and checked for 64-bit native targets (D-105).
+#[cfg(any(target_family = "wasm", not(target_pointer_width = "64")))]
+compile_error!(
+    "crypto-pq builds for 64-bit targets only; WebAssembly and 32-bit targets are not supported"
+);
 
 extern crate alloc;
 

@@ -18,9 +18,6 @@ use crate::cpu;
 use crate::sha2::IV_256;
 use crate::wipe::{registers, wipe, wipe_unless_optimized};
 
-#[cfg(any(target_family = "wasm", target_arch = "arm"))]
-use digest1_in_locals as digest1;
-
 pub(crate) const KEY: usize = 32;
 
 const BLOCK: usize = 64;
@@ -57,16 +54,11 @@ const DERIVE_KEY_MATERIAL: u32 = 64;
 // Message word i of a round is word PERMUTATION[i] of the round before.
 pub(crate) const PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
+// Each message word is added before b: a word added first is ready long before b, and that
+// shortens the chain of b.
 #[inline(always)]
-fn g(v: &mut [u32; 16], abcd: [usize; 4], x: u32, y: u32) {
-    g_order::<true>(v, abcd, x, y);
-}
-
-// g with each message word added before b (WORD_FIRST) or after it. A word added first is ready
-// long before b, and that shortens the chain of b.
-#[inline(always)]
-fn g_order<const WORD_FIRST: bool>(v: &mut [u32; 16], [a, b, c, d]: [usize; 4], x: u32, y: u32) {
-    v[a] = add3::<WORD_FIRST>(v[a], x, v[b]);
+fn g(v: &mut [u32; 16], [a, b, c, d]: [usize; 4], x: u32, y: u32) {
+    v[a] = v[a].wrapping_add(x).wrapping_add(v[b]);
 
     v[d] = (v[d] ^ v[a]).rotate_right(16);
 
@@ -74,7 +66,7 @@ fn g_order<const WORD_FIRST: bool>(v: &mut [u32; 16], [a, b, c, d]: [usize; 4], 
 
     v[b] = (v[b] ^ v[c]).rotate_right(12);
 
-    v[a] = add3::<WORD_FIRST>(v[a], y, v[b]);
+    v[a] = v[a].wrapping_add(y).wrapping_add(v[b]);
 
     v[d] = (v[d] ^ v[a]).rotate_right(8);
 
@@ -83,33 +75,23 @@ fn g_order<const WORD_FIRST: bool>(v: &mut [u32; 16], [a, b, c, d]: [usize; 4], 
     v[b] = (v[b] ^ v[c]).rotate_right(7);
 }
 
-// a + x + b, with x added first if WORD_FIRST and last otherwise.
 #[inline(always)]
-fn add3<const WORD_FIRST: bool>(a: u32, x: u32, b: u32) -> u32 {
-    if WORD_FIRST {
-        a.wrapping_add(x).wrapping_add(b)
-    } else {
-        a.wrapping_add(b).wrapping_add(x)
-    }
-}
+fn round(v: &mut [u32; 16], m: &[u32; 16]) {
+    g(v, [0, 4, 8, 12], m[0], m[1]);
 
-#[inline(always)]
-fn round<const WORD_FIRST: bool>(v: &mut [u32; 16], m: &[u32; 16]) {
-    g_order::<WORD_FIRST>(v, [0, 4, 8, 12], m[0], m[1]);
+    g(v, [1, 5, 9, 13], m[2], m[3]);
 
-    g_order::<WORD_FIRST>(v, [1, 5, 9, 13], m[2], m[3]);
+    g(v, [2, 6, 10, 14], m[4], m[5]);
 
-    g_order::<WORD_FIRST>(v, [2, 6, 10, 14], m[4], m[5]);
+    g(v, [3, 7, 11, 15], m[6], m[7]);
 
-    g_order::<WORD_FIRST>(v, [3, 7, 11, 15], m[6], m[7]);
+    g(v, [0, 5, 10, 15], m[8], m[9]);
 
-    g_order::<WORD_FIRST>(v, [0, 5, 10, 15], m[8], m[9]);
+    g(v, [1, 6, 11, 12], m[10], m[11]);
 
-    g_order::<WORD_FIRST>(v, [1, 6, 11, 12], m[10], m[11]);
+    g(v, [2, 7, 8, 13], m[12], m[13]);
 
-    g_order::<WORD_FIRST>(v, [2, 7, 8, 13], m[12], m[13]);
-
-    g_order::<WORD_FIRST>(v, [3, 4, 9, 14], m[14], m[15]);
+    g(v, [3, 4, 9, 14], m[14], m[15]);
 }
 
 // Two independent rounds, G function by G function: a compression is longer than the CPU's window
@@ -160,18 +142,6 @@ fn permute(m: &[u32; 16]) -> [u32; 16] {
 // 64-bit counter, the block's length and the domain flags.
 #[inline(always)]
 fn rounds(cv: &[u32; 8], m: &[u32; 16], counter: u64, length: u32, flags: u32) -> [u32; 16] {
-    rounds_order::<true>(cv, m, counter, length, flags)
-}
-
-// rounds with each message word added before b (WORD_FIRST) or after it.
-#[inline(always)]
-fn rounds_order<const WORD_FIRST: bool>(
-    cv: &[u32; 8],
-    m: &[u32; 16],
-    counter: u64,
-    length: u32,
-    flags: u32,
-) -> [u32; 16] {
     let mut v = [
         cv[0],
         cv[1],
@@ -192,31 +162,31 @@ fn rounds_order<const WORD_FIRST: bool>(
     ];
 
     // Written out: as a loop, the permutation became moves between registers and the stack.
-    round::<WORD_FIRST>(&mut v, m);
+    round(&mut v, m);
 
     let m = permute(m);
 
-    round::<WORD_FIRST>(&mut v, &m);
+    round(&mut v, &m);
 
     let m = permute(&m);
 
-    round::<WORD_FIRST>(&mut v, &m);
+    round(&mut v, &m);
 
     let m = permute(&m);
 
-    round::<WORD_FIRST>(&mut v, &m);
+    round(&mut v, &m);
 
     let m = permute(&m);
 
-    round::<WORD_FIRST>(&mut v, &m);
+    round(&mut v, &m);
 
     let m = permute(&m);
 
-    round::<WORD_FIRST>(&mut v, &m);
+    round(&mut v, &m);
 
     let m = permute(&m);
 
-    round::<WORD_FIRST>(&mut v, &m);
+    round(&mut v, &m);
 
     v
 }
@@ -261,39 +231,6 @@ fn compress_portable(
         } else {
             v[i] ^ cv[i - 8]
         };
-    }
-}
-
-// Whether compress_bytes adds each message word before b, as the other rounds do. Not on i686,
-// where its words come from memory in the rounds of each block of output, and with them first LLVM
-// kept more of the state on the stack: 1338 instructions against 1287, and per block of output 1353
-// executed against 1302, where purecrypto's portable code runs 1313.
-const XOF_WORD_FIRST: bool = !cfg!(target_arch = "x86");
-
-// The output of the compression of the block of words m, as bytes into out, for the whole blocks
-// of an extended output on 32-bit x86 and WebAssembly (root_whole). Its words go into out from the
-// registers that hold them: stored as words and then copied as bytes, they were loaded back with
-// wider loads than their stores, which a store cannot forward (two 8-byte loads per 16 bytes of
-// output, and memcpy's 16-byte loads after them).
-#[inline(never)]
-fn compress_bytes(
-    cv: &[u32; 8],
-    m: &[u32; 16],
-    counter: u64,
-    length: u32,
-    flags: u32,
-    out: &mut [u8; BLOCK],
-) {
-    let v = rounds_order::<XOF_WORD_FIRST>(cv, m, counter, length, flags);
-
-    for (i, bytes) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let word = if i < 8 {
-            v[i] ^ v[i + 8]
-        } else {
-            v[i] ^ cv[i - 8]
-        };
-
-        *bytes = word.to_le_bytes();
     }
 }
 
@@ -362,13 +299,6 @@ fn chain_blocks(
     chain_blocks_portable(out, cv, blocks, counter, flags, edges, last);
 }
 
-// Whether each block of a chain is compressed by a call of its own. On 32-bit x86, whose seven
-// registers hold little of the state, the rounds inlined into the loop over blocks kept words of
-// it in memory, which read-modify-write instructions changed, 60 of them in a block, each waiting
-// for the store of the last: on an AMD Zen 3 core a block took 128 ns, against 105 ns for
-// purecrypto's compression, a call per block. Compressed alone, a block has 3 of them.
-const BLOCK_CALLS: bool = cfg!(target_arch = "x86");
-
 // The chain stays in registers from block to block; a call per block stored it and loaded it
 // back, on the critical path. out comes first, where a returned array's address goes: last, it
 // changed the registers of the loop, and a 1 KiB hash took 1 percent longer on Apple M3. Out of
@@ -384,29 +314,6 @@ fn chain_blocks_portable(
     last: Last,
 ) {
     let whole = blocks.len();
-
-    // out already holds cv (chain_blocks).
-    if BLOCK_CALLS {
-        for (i, block) in blocks.iter().enumerate() {
-            let mut f = flags;
-
-            if i == 0 {
-                f |= start;
-            }
-
-            if i + 1 == whole {
-                f |= end;
-            }
-
-            chain_in_place(out, block, counter, BLOCK as u32, f);
-        }
-
-        if let Some((block, length, f)) = last {
-            chain_in_place(out, block, counter, length, f);
-        }
-
-        return;
-    }
 
     let mut h = *cv;
 
@@ -437,19 +344,8 @@ fn chain_blocks_portable(
     wipe_unless_optimized!(&mut h);
 }
 
-// The chaining value after one block, in place in h.
-#[inline(never)]
-fn chain_in_place(h: &mut [u32; 8], block: &[u8; BLOCK], counter: u64, length: u32, flags: u32) {
-    let v = rounds(h, &words(block), counter, length, flags);
-
-    for (i, word) in h.iter_mut().enumerate() {
-        *word = v[i] ^ v[i + 8];
-    }
-}
-
 // chain_blocks for two inputs of as many blocks, into out. Out of line, so that the registers of
-// its rounds do not depend on hash_many's body: inlined there, a BLAKE3 hash of 2 KiB ran 40615
-// instructions in it on 32-bit x86, against 39978 here.
+// its rounds do not depend on hash_many's body.
 #[inline(never)]
 fn chain_blocks_pair(
     key: &[u32; 8],
@@ -571,12 +467,6 @@ pub(crate) struct Many<'a> {
     pub(crate) end: u32,
 }
 
-// Whether hash_many runs the last two inputs side by side. Under the WebAssembly runtimes that was
-// the longer way for 2 KiB, by 1.29 (Zen 3), 1.33 (Zen 4), 1.10 (Zen 5) and 1.02 (Neoverse N2) under
-// wasmtime and 1.34, 1.02, 1.04 and 1.03 under Node.js; why was not established. On 32-bit Arm a pair
-// executes more instructions than the two in turn, for lack of registers.
-const PAIR_CHAINS: bool = !cfg!(any(target_family = "wasm", target_arch = "arm"));
-
 // The chaining values of the inputs into out, input i being input[i * blocks * 64..] for
 // out.len() inputs: as many as the kernels take, side by side, and the rest one by one.
 fn hash_many(input: &[u8], many: &Many, out: &mut [[u8; 32]]) {
@@ -588,7 +478,7 @@ fn hash_many(input: &[u8], many: &Many, out: &mut [[u8; 32]]) {
 
     // Two inputs left: their chains side by side, which keeps more of the scalar pipes busy than
     // one chain after the other.
-    if PAIR_CHAINS && out.len() - done == 2 {
+    if out.len() - done == 2 {
         let counter = |i: usize| {
             if many.increment {
                 many.counter + i as u64
@@ -662,27 +552,7 @@ fn hash_many(input: &[u8], many: &Many, out: &mut [[u8; 32]]) {
 fn root_whole(cv: &[u32; 8], m: &[u32; 16], index: u64, info: [u32; 2], out: &mut [u8]) -> usize {
     let (blocks, _) = out.as_chunks_mut::<BLOCK>();
 
-    let done = cpu::blake3_xof(cv, m, index, info, blocks);
-
-    // 32-bit x86, 32-bit Arm and WebAssembly, which have no kernel for them, compress the whole
-    // blocks one at a time, straight into out.
-    if cfg!(any(
-        target_arch = "x86",
-        target_arch = "arm",
-        target_family = "wasm"
-    )) {
-        let [length, flags] = info;
-
-        for (i, block) in blocks.iter_mut().enumerate().skip(done) {
-            let counter = index.wrapping_add(i as u64);
-
-            compress_bytes(cv, m, counter, length, flags, block);
-        }
-
-        return blocks.len();
-    }
-
-    done
+    cpu::blake3_xof(cv, m, index, info, blocks)
 }
 
 // What root_output's kernels leave: the blocks one at a time, from byte `skip` of block `index`.
@@ -1536,7 +1406,6 @@ impl KeyWords for [u8; KEY] {
 // slice into the registers of the state, with no copy in memory to wipe. Always inlined: with
 // keyed_hash and derive_key both calling it, it went out of line and the keyed MAC of an empty
 // message took 2 percent more time on Apple M3.
-#[cfg(not(any(target_family = "wasm", target_arch = "arm")))]
 #[inline(always)]
 fn digest1<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
@@ -1577,45 +1446,14 @@ fn digest1<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
     wipe(&mut copy);
 }
 
-// digest1 for WebAssembly and 32-bit Arm: the message goes from its slice into locals and the output
-// from locals into out, with no buffer in memory to clear and no load from a store just made.
-#[cfg(any(test, target_family = "wasm", target_arch = "arm"))]
-#[inline(always)]
-fn digest1_in_locals<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
-    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-    let mut cv: [u32; 8] = registers!(|i| key.word(i); 0 1 2 3 4 5 6 7);
-
-    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-    let mut m = match <&[u8; BLOCK]>::try_from(data) {
-        Ok(block) => words(block),
-        Err(_) => short_words(data),
-    };
-
-    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-    let mut v = rounds(&cv, &m, 0, data.len() as u32, flags);
-
-    wipe_unless_optimized!(&mut cv);
-
-    wipe_unless_optimized!(&mut m);
-
-    root_words(&v, out);
-
-    wipe_unless_optimized!(&mut v);
-}
-
 // The first out.len() bytes, at most 32, of the output words of a root compression's state v:
 // whole words straight into out, then the bytes of a last partial word from its register, as
 // write_words does, so that no copy of the output is left to wipe (D-76).
-#[cfg(any(
-    test,
-    target_family = "wasm",
-    target_arch = "arm",
-    all(
-        target_arch = "aarch64",
-        target_endian = "little",
-        target_feature = "neon",
-        not(crypto_pq_portable)
-    )
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    target_feature = "neon",
+    not(crypto_pq_portable)
 ))]
 #[inline(always)]
 pub(crate) fn root_words(v: &[u32; 16], out: &mut [u8]) {
@@ -1646,16 +1484,11 @@ pub(crate) fn root_words(v: &[u32; 16], out: &mut [u8]) {
 
 // The words of a block of less than 64 bytes, zeros after the message. Leaves at the word that
 // takes the last bytes, with no test on the zero words after it.
-#[cfg(any(
-    test,
-    target_family = "wasm",
-    target_arch = "arm",
-    all(
-        target_arch = "aarch64",
-        target_endian = "little",
-        target_feature = "neon",
-        not(crypto_pq_portable)
-    )
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    target_feature = "neon",
+    not(crypto_pq_portable)
 ))]
 #[inline(always)]
 pub(crate) fn short_words(data: &[u8]) -> [u32; 16] {
@@ -1723,14 +1556,6 @@ fn short_rest(key: &[u32; 8], root: u32, data: &[u8], out: &mut [u8]) {
     if !cpu::blake3_digest1(key, root, data, out) {
         digest1(key, root, data, out);
     }
-}
-
-// digest1 for a key in bytes on WebAssembly, for derive_key: its rounds inlined into the KDF
-// dispatch took 19 percent more time on Zen 5 under wasmtime.
-#[cfg(target_family = "wasm")]
-#[inline(never)]
-fn digest1_bytes(key: &[u8; KEY], flags: u32, data: &[u8], out: &mut [u8]) {
-    digest1(key, flags, data, out);
 }
 
 // digest1 for a key in words, out of line so that one_shot's callers hold no copy of its rounds.
@@ -1835,13 +1660,6 @@ pub(crate) fn derive_key(context: &[u8], material: &[u8], out: &mut [u8]) {
     let mut k = [0; KEY];
 
     one_shot(&IV_256, DERIVE_KEY_CONTEXT, context, &mut k);
-
-    #[cfg(target_family = "wasm")]
-    if material.len() <= BLOCK && out.len() <= 32 {
-        let root = DERIVE_KEY_MATERIAL | CHUNK_START | CHUNK_END | ROOT;
-
-        return digest1_bytes(&k, root, material, out);
-    }
 
     keyed(&k, DERIVE_KEY_MATERIAL, material, out);
 }
@@ -2800,7 +2618,7 @@ mod tests {
     }
 
     #[test]
-    fn digest1_in_locals_matches_the_rounds() {
+    fn digest1_matches_the_rounds() {
         let key: [u8; KEY] = core::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(1));
 
         let key_in_words = key_words(&key);
@@ -2829,7 +2647,7 @@ mod tests {
                 for size in 0..=32 {
                     let mut out = [0xA5; 33];
 
-                    digest1_in_locals(&key, flags, &message[..length], &mut out[..size]);
+                    digest1(&key, flags, &message[..length], &mut out[..size]);
 
                     assert_eq!(out[..size], expected[..size]);
 
@@ -2837,7 +2655,7 @@ mod tests {
 
                     out = [0xA5; 33];
 
-                    digest1_in_locals(&key_in_words, flags, &message[..length], &mut out[..size]);
+                    digest1(&key_in_words, flags, &message[..length], &mut out[..size]);
 
                     assert_eq!(out[..size], expected[..size]);
 

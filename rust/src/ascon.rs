@@ -3,33 +3,32 @@
 // (Appendix A). The start states are the states after the first permutation of each IV (A.3).
 
 use crate::cpu;
-#[cfg(not(target_arch = "x86"))]
 use crate::sha2::last_bytes;
 use crate::wipe::wipe;
 
-pub(crate) const HASH256: [u64; 5] = held([
+pub(crate) const HASH256: [u64; 5] = [
     0x9B1E5494E934D681,
     0x4BC3A01E333751D2,
     0xAE65396C6B34B81A,
     0x3C7FD4A4D56A4DB3,
     0x1A5C464906C5976D,
-]);
+];
 
-pub(crate) const XOF128: [u64; 5] = held([
+pub(crate) const XOF128: [u64; 5] = [
     0xDA82CE768D9447EB,
     0xCC7CE6C75F1EF969,
     0xE7508FD780085631,
     0x0EE0EA53416B58CC,
     0xE0547524DB6F0BDE,
-]);
+];
 
-const CXOF128: [u64; 5] = held([
+const CXOF128: [u64; 5] = [
     0x675527C2A0E8DE03,
     0x43D12D7DC0377BBC,
     0xE9901DEC426E81B5,
     0x2AB14907720780B6,
     0x8F3F1D02D432BC46,
-]);
+];
 
 // SP 800-232, 5.3: the customization string is at most 2048 bits.
 pub(crate) const MAX_CUSTOMIZATION: usize = 256;
@@ -38,107 +37,6 @@ pub(crate) const MAX_CUSTOMIZATION: usize = 256;
 const CONSTANTS: [u64; 12] = [
     0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5, 0x96, 0x87, 0x78, 0x69, 0x5A, 0x4B,
 ];
-
-// On 32-bit Arm the state holds each word bit-interleaved: its even bits in the low half and its
-// odd bits in the high half, bit j of a half being bit 2j or 2j + 1 of the word. A rotation of the
-// word is then one 32-bit rotation of each half, the halves swapped for an odd amount, which Arm
-// takes as the rotated operand of an EOR, where the 64-bit rotation took two shifts and an ORR a
-// half. Elsewhere the state holds the words whole: on 32-bit x86 the interleaved words took more
-// instructions, and the other 32-bit targets, on which they were not counted, keep the form of the
-// 64-bit ones. Words enter the state through to_lane and leave it through from_lane, so that a
-// permutation converts none; both are the identity where the state holds the words whole.
-#[cfg(not(target_arch = "arm"))]
-#[inline(always)]
-const fn to_lane(word: u64) -> u64 {
-    word
-}
-
-#[cfg(not(target_arch = "arm"))]
-#[inline(always)]
-const fn from_lane(word: u64) -> u64 {
-    word
-}
-
-#[cfg(target_arch = "arm")]
-#[inline(always)]
-const fn to_lane(word: u64) -> u64 {
-    let low = unzip(word as u32);
-
-    let high = unzip((word >> 32) as u32);
-
-    ((low & 0xffff) | (high << 16)) as u64 | (((low >> 16) | (high & 0xffff_0000)) as u64) << 32
-}
-
-#[cfg(target_arch = "arm")]
-#[inline(always)]
-const fn from_lane(word: u64) -> u64 {
-    let (even, odd) = (word as u32, (word >> 32) as u32);
-
-    let low = zip((even & 0xffff) | (odd << 16));
-
-    let high = zip((even >> 16) | (odd & 0xffff_0000));
-
-    low as u64 | (high as u64) << 32
-}
-
-// The even bits of x in its low half, in order, and its odd bits in its high half: four exchanges
-// of bit groups, each of the bits of x at the masked positions with the bits a distance above, as
-// in Keccak's interleaved lanes.
-#[cfg(target_arch = "arm")]
-#[inline(always)]
-const fn unzip(mut x: u32) -> u32 {
-    let mut t = (x ^ (x >> 1)) & 0x2222_2222;
-
-    x ^= t ^ (t << 1);
-
-    t = (x ^ (x >> 2)) & 0x0c0c_0c0c;
-
-    x ^= t ^ (t << 2);
-
-    t = (x ^ (x >> 4)) & 0x00f0_00f0;
-
-    x ^= t ^ (t << 4);
-
-    t = (x ^ (x >> 8)) & 0x0000_ff00;
-
-    x ^ t ^ (t << 8)
-}
-
-// The inverse of unzip: the same exchanges in the opposite order, as each is its own inverse.
-#[cfg(target_arch = "arm")]
-#[inline(always)]
-const fn zip(mut x: u32) -> u32 {
-    let mut t = (x ^ (x >> 8)) & 0x0000_ff00;
-
-    x ^= t ^ (t << 8);
-
-    t = (x ^ (x >> 4)) & 0x00f0_00f0;
-
-    x ^= t ^ (t << 4);
-
-    t = (x ^ (x >> 2)) & 0x0c0c_0c0c;
-
-    x ^= t ^ (t << 2);
-
-    t = (x ^ (x >> 1)) & 0x2222_2222;
-
-    x ^ t ^ (t << 1)
-}
-
-// A state given word by word, as the state holds it.
-const fn held(words: [u64; 5]) -> [u64; 5] {
-    let mut s = [0; 5];
-
-    let mut i = 0;
-
-    while i < 5 {
-        s[i] = to_lane(words[i]);
-
-        i += 1;
-    }
-
-    s
-}
 
 // The S-box layer: the circuit of Zhang and Huang, ePrint 2023/1721, checked against the S-box
 // table on all 32 inputs in every bit position by sbox_matches_table.
@@ -166,10 +64,7 @@ const fn sbox(s: &mut [u64; 5]) {
 }
 
 // The linear layer, each x ^ ror(x, a) ^ ror(x, b) as x ^ ror(x ^ ror(x, b - a), a): AArch64 then
-// folds both rotations into the EORs as rotated operands, and so does V8 on ARM64 for WebAssembly.
-// Written with both rotations of x, the compiler XORs the two rotations together first, and V8
-// computes one of them apart: one instruction more per word.
-#[cfg(not(any(target_arch = "arm", target_arch = "x86")))]
+// folds both rotations into the EORs as rotated operands.
 #[inline(always)]
 const fn linear(s: &mut [u64; 5]) {
     let [x0, x1, x2, x3, x4] = *s;
@@ -183,62 +78,9 @@ const fn linear(s: &mut [u64; 5]) {
     ];
 }
 
-// The linear layer on 32-bit x86 as the specification writes it: both rotations of x side by side,
-// one step less in each round's chain of dependent instructions.
-#[cfg(target_arch = "x86")]
-#[inline(always)]
-const fn linear(s: &mut [u64; 5]) {
-    let [x0, x1, x2, x3, x4] = *s;
-
-    *s = [
-        x0 ^ x0.rotate_right(19) ^ x0.rotate_right(28),
-        x1 ^ x1.rotate_right(61) ^ x1.rotate_right(39),
-        x2 ^ x2.rotate_right(1) ^ x2.rotate_right(6),
-        x3 ^ x3.rotate_right(10) ^ x3.rotate_right(17),
-        x4 ^ x4.rotate_right(7) ^ x4.rotate_right(41),
-    ];
-}
-
-// The linear layer on interleaved words: each x ^ ror(x, a) ^ ror(x, b) a half at a time, every
-// rotation of a half the rotated operand of an EOR on 32-bit Arm.
-#[cfg(target_arch = "arm")]
-#[inline(always)]
-const fn linear(s: &mut [u64; 5]) {
-    *s = [
-        diffuse(s[0], 19, 28),
-        diffuse(s[1], 61, 39),
-        diffuse(s[2], 1, 6),
-        diffuse(s[3], 10, 17),
-        diffuse(s[4], 7, 41),
-    ];
-}
-
-#[cfg(target_arch = "arm")]
-#[inline(always)]
-const fn diffuse(x: u64, a: u32, b: u32) -> u64 {
-    let (even, odd) = (x as u32, (x >> 32) as u32);
-
-    let (even_a, odd_a) = rotate(even, odd, a);
-
-    let (even_b, odd_b) = rotate(even, odd, b);
-
-    (even ^ even_a ^ even_b) as u64 | ((odd ^ odd_a ^ odd_b) as u64) << 32
-}
-
-// The halves of an interleaved word rotated right by r.
-#[cfg(target_arch = "arm")]
-#[inline(always)]
-const fn rotate(even: u32, odd: u32, r: u32) -> (u32, u32) {
-    if r.is_multiple_of(2) {
-        (even.rotate_right(r / 2), odd.rotate_right(r / 2))
-    } else {
-        (odd.rotate_right(r / 2), even.rotate_right(r / 2 + 1))
-    }
-}
-
 #[inline(always)]
 const fn round(s: &mut [u64; 5], constant: u64) {
-    s[2] ^= to_lane(constant);
+    s[2] ^= constant;
 
     sbox(s);
 
@@ -293,19 +135,9 @@ pub(crate) fn permute(s: &mut [u64; 5]) {
     rounds(s);
 }
 
-// Whether digest takes the padded last block through a permutation of its own after the loop over
-// the blocks, on 32-bit Arm and WebAssembly. There a hash of 1 KiB took 1.6 percent less time in
-// 32-bit Arm code on Neoverse N2, and less in 11 of the 12 classes measured under wasmtime and
-// Node.js, but on ARM64 some rows took up to 1.4 percent more; riscv64 and x86-64 without AVX2
-// were not measured (D-92).
-#[cfg(not(target_arch = "x86"))]
-const LAST_APART: bool = cfg!(any(target_arch = "arm", target_family = "wasm"));
-
 // The output for data from a start state, read once. cpu::ascon_digest declines exactly where
 // cpu::ascon does, so the portable rounds run here with the state in registers: the blocks and
-// the padded last block through one permutation, or two with LAST_APART, then the output words
-// through another.
-#[cfg(not(target_arch = "x86"))]
+// the padded last block through one permutation, then the output words through another.
 pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
     if cpu::ascon_digest(start, data, out) {
         return;
@@ -315,26 +147,14 @@ pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
 
     let (blocks, tail) = data.as_chunks::<8>();
 
-    if LAST_APART {
-        for block in blocks {
-            s[0] ^= to_lane(u64::from_le_bytes(*block));
+    let last = last_bytes(data, tail.len()) as u64 ^ 1 << (8 * tail.len());
 
-            rounds(&mut s);
-        }
+    let words = blocks.iter().map(|block| u64::from_le_bytes(*block));
 
-        s[0] ^= to_lane(last_bytes(data, tail.len()) as u64 ^ 1 << (8 * tail.len()));
+    for word in words.chain([last]) {
+        s[0] ^= word;
 
         rounds(&mut s);
-    } else {
-        let last = last_bytes(data, tail.len()) as u64 ^ 1 << (8 * tail.len());
-
-        let words = blocks.iter().map(|block| u64::from_le_bytes(*block));
-
-        for word in words.chain([last]) {
-            s[0] ^= to_lane(word);
-
-            rounds(&mut s);
-        }
     }
 
     for (i, chunk) in out.chunks_mut(8).enumerate() {
@@ -342,7 +162,7 @@ pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
             rounds(&mut s);
         }
 
-        let bytes = from_lane(s[0]).to_le_bytes();
+        let bytes = s[0].to_le_bytes();
 
         match <&mut [u8; 8]>::try_from(&mut *chunk) {
             Ok(word) => *word = bytes,
@@ -351,70 +171,6 @@ pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
     }
 
     wipe(&mut s);
-}
-
-// The same digest on 32-bit x86, where this form took fewer instructions: whole output words are
-// stored as they are and the bytes after the last whole word apart, in place of a test of the
-// length of each chunk. On WebAssembly it took fewer instructions too, but Cranelift then compiled
-// the loop over the blocks into code that took more time on AMD Zen cores.
-#[cfg(target_arch = "x86")]
-pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
-    if cpu::ascon_digest(start, data, out) {
-        return;
-    }
-
-    let mut s = *start;
-
-    let (blocks, tail) = data.as_chunks::<8>();
-
-    let last = last_word(data, tail.len()) ^ 1 << (8 * tail.len());
-
-    let words = blocks.iter().map(|block| u64::from_le_bytes(*block));
-
-    for word in words.chain([last]) {
-        s[0] ^= to_lane(word);
-
-        rounds(&mut s);
-    }
-
-    let (words, tail) = out.as_chunks_mut::<8>();
-
-    for (i, word) in words.iter_mut().enumerate() {
-        if i > 0 {
-            rounds(&mut s);
-        }
-
-        *word = from_lane(s[0]).to_le_bytes();
-    }
-
-    if !tail.is_empty() {
-        if !words.is_empty() {
-            rounds(&mut s);
-        }
-
-        tail.copy_from_slice(&from_lane(s[0]).to_le_bytes()[..tail.len()]);
-    }
-
-    wipe(&mut s);
-}
-
-// The last count bytes of data, count below 8, as a little-endian word, from the eight bytes at
-// the end where there are as many: sha2::last_bytes shifts a 128-bit value, four words here, and
-// reads a window only from 16 bytes of data.
-#[cfg(target_arch = "x86")]
-fn last_word(data: &[u8], count: usize) -> u64 {
-    if count == 0 {
-        return 0;
-    }
-
-    if let Some(window) = data.last_chunk::<8>() {
-        return u64::from_le_bytes(*window) >> (8 * (8 - count));
-    }
-
-    data[data.len() - count..]
-        .iter()
-        .rev()
-        .fold(0, |word, &byte| word << 8 | u64::from(byte))
 }
 
 // Ascon-CXOF128's state after the customization string z, at most MAX_CUSTOMIZATION bytes: its
@@ -426,7 +182,7 @@ macro_rules! customize {
 
         let mut s = CXOF128;
 
-        s[0] ^= to_lane(8 * z.len() as u64);
+        s[0] ^= 8 * z.len() as u64;
 
         $permute(&mut s);
 
@@ -435,7 +191,7 @@ macro_rules! customize {
         let mut i = 0;
 
         while i < blocks.len() {
-            s[0] ^= to_lane(u64::from_le_bytes(blocks[i]));
+            s[0] ^= u64::from_le_bytes(blocks[i]);
 
             $permute(&mut s);
 
@@ -452,7 +208,7 @@ macro_rules! customize {
             i += 1;
         }
 
-        s[0] ^= to_lane(last);
+        s[0] ^= last;
 
         $permute(&mut s);
 
@@ -460,13 +216,7 @@ macro_rules! customize {
     }};
 }
 
-// On WebAssembly and 32-bit x86, where no CPU kernel takes the permutation, with the rounds
-// inline: a call of permute per block loaded and stored the state each time.
 pub(crate) fn customize(z: &[u8]) -> [u64; 5] {
-    #[cfg(any(target_family = "wasm", target_arch = "x86"))]
-    return customize!(z, rounds);
-
-    #[cfg(not(any(target_family = "wasm", target_arch = "x86")))]
     customize!(z, permute)
 }
 
@@ -515,7 +265,7 @@ impl Sponge {
                 return;
             }
 
-            self.s[0] ^= to_lane(u64::from_le_bytes(self.pending));
+            self.s[0] ^= u64::from_le_bytes(self.pending);
 
             permute(&mut self.s);
 
@@ -525,7 +275,7 @@ impl Sponge {
         let (blocks, tail) = data.as_chunks::<8>();
 
         for block in blocks {
-            self.s[0] ^= to_lane(u64::from_le_bytes(*block));
+            self.s[0] ^= u64::from_le_bytes(*block);
 
             permute(&mut self.s);
         }
@@ -542,7 +292,7 @@ impl Sponge {
 
         last[self.filled] = 0x01;
 
-        self.s[0] ^= to_lane(u64::from_le_bytes(last));
+        self.s[0] ^= u64::from_le_bytes(last);
 
         permute(&mut self.s);
 
@@ -571,7 +321,7 @@ impl Sponge {
 
             let (chunk, rest) = core::mem::take(&mut out).split_at_mut(take);
 
-            chunk.copy_from_slice(&from_lane(self.s[0]).to_le_bytes()[start..start + take]);
+            chunk.copy_from_slice(&self.s[0].to_le_bytes()[start..start + take]);
 
             self.available -= take;
 
@@ -683,7 +433,7 @@ mod tests {
 
     // The customization of crate version 1.0.1, one byte of Z at a time.
     fn classic_customize(z: &[u8]) -> [u64; 5] {
-        let mut s = CXOF128.map(from_lane);
+        let mut s = CXOF128;
 
         s[0] ^= 8 * z.len() as u64;
 
@@ -701,7 +451,7 @@ mod tests {
 
         classic_permute(&mut s);
 
-        held(s)
+        s
     }
 
     #[test]
@@ -727,8 +477,6 @@ mod tests {
             let mut expected = state;
 
             classic_permute(&mut expected);
-
-            let (state, expected) = (held(state), held(expected));
 
             let mut actual = state;
 
@@ -777,13 +525,13 @@ mod tests {
             (0x0000_0800_00CC_0003, XOF128),
             (0x0000_0800_00CC_0004, CXOF128),
         ] {
-            let mut s = held([iv, 0, 0, 0, 0]);
+            let mut s = [iv, 0, 0, 0, 0];
 
             permute(&mut s);
 
             assert_eq!(s, start);
 
-            let mut s = held([iv, 0, 0, 0, 0]);
+            let mut s = [iv, 0, 0, 0, 0];
 
             permute_const(&mut s);
 
@@ -831,7 +579,7 @@ mod tests {
             let (blocks, tail) = data.as_chunks::<8>();
 
             for block in blocks {
-                s[0] ^= to_lane(u64::from_le_bytes(*block));
+                s[0] ^= u64::from_le_bytes(*block);
 
                 permute_const(&mut s);
             }
@@ -842,7 +590,7 @@ mod tests {
 
             last[tail.len()] = 1;
 
-            s[0] ^= to_lane(u64::from_le_bytes(last));
+            s[0] ^= u64::from_le_bytes(last);
 
             permute_const(&mut s);
 
@@ -851,7 +599,7 @@ mod tests {
                     permute_const(&mut s);
                 }
 
-                chunk.copy_from_slice(&from_lane(s[0]).to_le_bytes()[..chunk.len()]);
+                chunk.copy_from_slice(&s[0].to_le_bytes()[..chunk.len()]);
             }
 
             let mut actual = [0; 41];

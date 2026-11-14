@@ -15,8 +15,8 @@
 4. Option structs are `#[non_exhaustive]`, implement `Default`, and are built with chained setters,
    for example `SignOptions::default().with_context(b"app").with_deterministic(true)` [[D-22](../decisions.md#decision-d-22)]. The
    setters are named `with_<field>`. Rationale: a non-exhaustive struct cannot be built with a struct
-   expression outside the crate, even with `..Default::default()`; setters let 1.x add options
-   without breaking callers ([20.3](../20-versioning.md#203-compatibility-within-1x)).
+   expression outside the crate, even with `..Default::default()`; setters let a minor release add
+   options without breaking callers ([20.3](../20-versioning.md#203-compatibility-within-2x)).
 5. Algorithm values are `pub const` items of `Copy` types.
 6. `SecretBytes` [[D-23](../decisions.md#decision-d-23)] is the type of every secret output: `Encapsulation::shared_secret`, the
    result of `decapsulate`, of `KdfAlgorithm::derive`, `extract` and `expand`, and of a private key's
@@ -72,8 +72,8 @@
    threads.
 5. Entropy without `std`: `getrandom(2)` (Linux, Android, FreeBSD, NetBSD, DragonFly, illumos,
    Solaris), `getentropy` in chunks of 256 bytes (Apple, OpenBSD), `ProcessPrng` from
-   `bcryptprimitives.dll` (Windows, linked with `raw-dylib`), `random_get` (WASI preview 1). Every
-   other target, including WASI preview 2, returns RNG_FAILURE.
+   `bcryptprimitives.dll` (Windows, linked with `raw-dylib`). Every other target returns
+   RNG_FAILURE.
 6. Constant-time verification: `RUSTFLAGS="--cfg crypto_pq_ct"` and the `ct` test under valgrind
    memcheck, in the default and `crypto_pq_portable` builds, on x86-64 with the minimum and the stable
    toolchain and on ARM64 with the stable toolchain, and on x86-64 in the `crypto_pq_sse41` build with

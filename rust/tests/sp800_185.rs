@@ -333,7 +333,6 @@ fn kmac_options() {
             Ok(u32::MAX as usize)
         );
 
-        #[cfg(target_pointer_width = "64")]
         assert_eq!(
             algorithm.configure(&MacOptions::default().with_length(u32::MAX as usize + 1)),
             Err(Error::InvalidOption)

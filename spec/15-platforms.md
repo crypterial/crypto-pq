@@ -8,30 +8,20 @@ its result is kept in an atomic.
 
 ## 15.2 Supported platforms
 
-| dimension | supported in 1.1 |
+| dimension | supported in 2.0 |
 |---|---|
 | operating systems | Linux (glibc and musl), macOS, Windows; other systems with an entropy source of [14.3](14-security.md#143-entropy) |
 | processors with CPU-specific code | x86-64, ARM64 (little-endian); RISC-V 64 runs portable code |
-| portable only | every other architecture, including 32-bit and big-endian; MUST stay correct |
+| portable only | every other 64-bit architecture, including big-endian; MUST stay correct |
+| not supported | WebAssembly and 32-bit targets: a build stops with a compile error [[D-105](decisions.md#decision-d-105)] |
 | Rust | 1.89 or later, edition 2024, `no_std` with `alloc` |
 
 ## 15.3 CPU-specific code
 
 1. CPU-specific code exists only for x86-64, ARM64 and RISC-V (P9) and is always selected at run time
    by feature detection, with a portable twin. The forms of the portable code that a target's
-   architecture, pointer width or baseline features choose at compile time, such as the Keccak lanes
-   of 32-bit x86 [[D-80](decisions.md#decision-d-80)], the Ascon state of 32-bit Arm
-   [[D-81](decisions.md#decision-d-81)], the BLAKE2b state and BLAKE3 chains of 32-bit x86
-   [[D-82](decisions.md#decision-d-82)] and its SHA-512 schedule
-   [[D-83](decisions.md#decision-d-83)], and the BLAKE3 chains and output blocks of WebAssembly
-   [[D-84](decisions.md#decision-d-84)] and its SHA-2 compressions
-   [[D-85](decisions.md#decision-d-85)], the short inputs of BLAKE3 on WebAssembly and of BLAKE2
-   and BLAKE3 on 32-bit Arm [[D-86](decisions.md#decision-d-86)], the digests of Keccak on
-   WebAssembly [[D-88](decisions.md#decision-d-88)], BLAKE2 on WebAssembly and the words of BLAKE2
-   and chains of BLAKE3 on 32-bit Arm [[D-89](decisions.md#decision-d-89)], the public entries and
-   first block of Keccak on WebAssembly [[D-90](decisions.md#decision-d-90)], the words of the block
-   loops of BLAKE2 on 32-bit Arm [[D-91](decisions.md#decision-d-91)], and the last block of Ascon
-   on 32-bit Arm and WebAssembly [[D-92](decisions.md#decision-d-92)], are not CPU-specific code.
+   architecture or baseline features choose at compile time, such as the buffered updates of SHA-2
+   on ARM64 [[D-104](decisions.md#decision-d-104)], are not CPU-specific code.
 2. x86-64 tiers: AVX2 with BMI1 and BMI2 and operating-system support for the YMM state (checked with
    XGETBV); AVX-512F and AVX-512VL on top of the AVX2 tier, with operating-system support for the
    opmask and ZMM state, for Keccak-f[1600], SHA-256 on eight lanes, BLAKE2 and BLAKE3
@@ -51,7 +41,7 @@ its result is kept in an atomic.
    implementer and part numbers of MIDR_EL1 choose among the kernels of a tier, or the portable code,
    for some functions, as for BLAKE2b on Neoverse N2 [[D-101](decisions.md#decision-d-101)]; like the
    x86-64 tables, they depend on the processor only, never on the data.
-4. RISC-V runs the portable code: crypto-pq 1.1 contains no RISC-V kernel.
+4. RISC-V runs the portable code: crypto-pq 2.0 contains no RISC-V kernel.
 5. Every kernel MUST have a test that compares it with its portable twin on random inputs, and the
    official vectors MUST pass on every tier ([18.2](18-testing.md#182-cpu-tiers)).
 6. The implementation MUST offer a way to force the portable code, used by CI (Part II).

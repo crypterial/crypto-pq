@@ -324,12 +324,8 @@ impl HashAlgorithm {
 
     /// The digest of `data` written into `out`, which must be [`digest_size`](Self::digest_size)
     /// bytes, without allocating. Fails with [`Error::InvalidLength`] if `out` has another length.
-    // Inline, so that a caller's buffer of the right size needs no check at run time. On WebAssembly
-    // a hint is not enough: with the arms of digest_unchecked this went out of line, and the call of
-    // one more function, with its frame, took a hash of one block 3 to 10 percent more time under
-    // wasmtime.
-    #[cfg_attr(target_family = "wasm", inline(always))]
-    #[cfg_attr(not(target_family = "wasm"), inline)]
+    // Inline, so that a caller's buffer of the right size needs no check at run time.
+    #[inline]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         check_length(out.len(), self.digest_size)?;
 
@@ -366,34 +362,14 @@ impl HashAlgorithm {
         }
     }
 
-    // On 32-bit x86 Ascon-Hash256 leaves before the dispatcher, whose frame holds the registers and
-    // the stack arrays of the digests that it inlines.
-    #[cfg(target_arch = "x86")]
-    #[inline]
-    pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
-        #[cfg(feature = "ascon")]
-        if matches!(self.kind, Kind::Ascon) {
-            ascon::digest(&ascon::HASH256, data, out);
-
-            return;
-        }
-
-        self.digest_other(data, out);
-    }
-
-    // On WebAssembly this is inlined into the caller, where a constant algorithm leaves one arm: a
-    // dispatcher out of line took 50 instructions of each call.
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86")))]
-    #[cfg_attr(target_family = "wasm", inline(always))]
+    #[cfg(not(target_arch = "aarch64"))]
     pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
         self.digest_other(data, out);
     }
 
-    // Every kind; on aarch64 the kinds other than SHA-2, on 32-bit x86 those other than
-    // Ascon-Hash256. On WebAssembly each arm is a call of a function that is not generic, so that
-    // the code that holds the message stays compiled in this crate (D-76).
-    #[cfg_attr(any(target_arch = "aarch64", target_arch = "x86"), inline(never))]
-    #[cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86")), inline(always))]
+    // Every kind; on aarch64 the kinds other than SHA-2.
+    #[cfg_attr(target_arch = "aarch64", inline(never))]
+    #[cfg_attr(not(target_arch = "aarch64"), inline(always))]
     fn digest_other(&self, data: &[u8], out: &mut [u8]) {
         match &self.kind {
             #[cfg(any(
@@ -505,7 +481,6 @@ impl HashAlgorithm {
     }
 
     // The block size of HMAC's key blocks, and the rate of SHA-3.
-    #[cfg_attr(target_family = "wasm", inline(always))]
     pub(crate) const fn block_size(&self) -> usize {
         match self.kind {
             #[cfg(any(
@@ -778,9 +753,6 @@ impl XofAlgorithm {
     /// The algorithm with this customization in place of any set before.
     ///
     /// cSHAKE's function name N is reserved for NIST, so this sets the customization alone.
-    // Inline on WebAssembly and 32-bit x86, where short Ascon-CXOF128 digests paid for the call and
-    // for the copy of the algorithm that it returned.
-    #[cfg_attr(any(target_family = "wasm", target_arch = "x86"), inline)]
     pub fn configure(&self, options: &XofOptions) -> Result<Self, Error> {
         let customization = options.customization;
 
@@ -844,10 +816,6 @@ impl XofAlgorithm {
     /// `out.len()` bytes of output for `data`, without allocating. Fails with
     /// [`Error::InvalidLength`] if `out` is longer than 2^32 - 1 bytes or, for the Ascon XOFs,
     /// empty.
-    // Inline on WebAssembly and 32-bit x86, so that the arms of digest_unchecked are inline in the
-    // caller.
-    #[cfg_attr(target_family = "wasm", inline(always))]
-    #[cfg_attr(target_arch = "x86", inline)]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         self.check_output(out.len())?;
 
@@ -856,30 +824,7 @@ impl XofAlgorithm {
         Ok(())
     }
 
-    // On 32-bit x86 the Ascon XOFs leave before the dispatcher, as in HashAlgorithm's.
-    #[cfg(target_arch = "x86")]
-    #[inline]
     pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
-        match &self.kind {
-            #[cfg(feature = "ascon")]
-            XofKind::AsconXof => ascon::digest(&ascon::XOF128, data, out),
-            #[cfg(feature = "ascon")]
-            XofKind::AsconCxof(start) => ascon::digest(start, data, out),
-            #[allow(unreachable_patterns)]
-            _ => self.digest_other(data, out),
-        }
-    }
-
-    #[cfg(not(target_arch = "x86"))]
-    #[cfg_attr(target_family = "wasm", inline(always))]
-    pub(crate) fn digest_unchecked(&self, data: &[u8], out: &mut [u8]) {
-        self.digest_other(data, out);
-    }
-
-    // Every kind; on 32-bit x86 those other than the Ascon XOFs.
-    #[cfg_attr(target_arch = "x86", inline(never))]
-    #[cfg_attr(not(target_arch = "x86"), inline(always))]
-    fn digest_other(&self, data: &[u8], out: &mut [u8]) {
         match &self.kind {
             #[cfg(feature = "sha3")]
             XofKind::Shake | XofKind::CShake(None) => {

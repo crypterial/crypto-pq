@@ -319,8 +319,7 @@ impl MacAlgorithm {
 
     // RFC 7693, 2.1: a BLAKE2 key has 1 to 64 (BLAKE2b) or 32 (BLAKE2s) bytes, and a BLAKE3 key
     // exactly 32. HMAC and KMAC take keys of any length.
-    #[cfg_attr(target_family = "wasm", inline(always))]
-    #[cfg_attr(not(target_family = "wasm"), inline)]
+    #[inline]
     const fn key_sizes(&self) -> (usize, usize) {
         match self.kind {
             #[cfg(feature = "blake2")]
@@ -333,16 +332,14 @@ impl MacAlgorithm {
         }
     }
 
-    #[cfg_attr(target_family = "wasm", inline(always))]
-    #[cfg_attr(not(target_family = "wasm"), inline)]
+    #[inline]
     const fn key_fits(&self, key: &[u8]) -> bool {
         let (minimum, maximum) = self.key_sizes();
 
         key.len() >= minimum && key.len() <= maximum
     }
 
-    #[cfg_attr(target_family = "wasm", inline(always))]
-    #[cfg_attr(not(target_family = "wasm"), inline)]
+    #[inline]
     const fn check_key(&self, key: &[u8]) -> Result<(), Error> {
         if self.key_fits(key) {
             Ok(())
@@ -369,10 +366,9 @@ impl MacAlgorithm {
     /// [`digest_size`](Self::digest_size) bytes. Fails with [`Error::InvalidLength`] if the key
     /// length is not accepted or `out` has another length.
     // Inline, so that a constant algorithm needs no test of its kind and of a key of a constant
-    // length at run time: these took 3 to 6 percent of a MAC of a block on WebAssembly and of a keyed
-    // BLAKE3 on x86-64. What holds the key is compiled in this crate: each arm of mac is a call.
-    #[cfg_attr(target_family = "wasm", inline(always))]
-    #[cfg_attr(not(target_family = "wasm"), inline)]
+    // length at run time, which a keyed BLAKE3 paid for on x86-64. What holds the key is compiled
+    // in this crate: each arm of mac is a call.
+    #[inline]
     pub fn digest_into(&self, key: &[u8], data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         self.check_key(key)?;
 
@@ -589,11 +585,8 @@ impl MacAlgorithm {
         }
     }
 
-    // Inlined on WebAssembly and 32-bit Arm: as a call, with its arguments on the stack, this took 2
-    // percent of the instructions of a keyed BLAKE3 of an empty message.
     #[cfg(not(target_arch = "aarch64"))]
-    #[cfg_attr(any(target_family = "wasm", target_arch = "arm"), inline(always))]
-    #[cfg_attr(not(any(target_family = "wasm", target_arch = "arm")), inline)]
+    #[inline]
     fn mac(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
         match &self.kind {
             #[cfg(feature = "blake2")]
@@ -607,12 +600,10 @@ impl MacAlgorithm {
         }
     }
 
-    // HMAC and KMAC. Out of line on x86 and RISC-V: called from code inlined in another crate, hmac
-    // would be exported, and its callers in this crate would call it through the GOT and, on 32-bit
-    // x86, with its arguments on the stack.
+    // HMAC and KMAC. Out of line on x86-64 and RISC-V: called from code inlined in another crate,
+    // hmac would be exported, and its callers in this crate would call it through the GOT.
     #[cfg(not(target_arch = "aarch64"))]
-    #[cfg_attr(any(target_family = "wasm", target_arch = "arm"), inline(always))]
-    #[cfg_attr(not(any(target_family = "wasm", target_arch = "arm")), inline(never))]
+    #[inline(never)]
     fn mac_standard(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
         match &self.kind {
             #[cfg(any(
@@ -639,8 +630,7 @@ impl MacAlgorithm {
     }
 }
 
-// The first bytes of a full HMAC. Out of line on WebAssembly and 32-bit Arm, so that mac's frame is
-// paid only here.
+// The first bytes of a full HMAC.
 #[cfg(not(target_arch = "aarch64"))]
 #[cfg(any(
     feature = "hmac",
@@ -648,8 +638,7 @@ impl MacAlgorithm {
     feature = "lms",
     feature = "xmss"
 ))]
-#[cfg_attr(any(target_family = "wasm", target_arch = "arm"), inline(never))]
-#[cfg_attr(not(any(target_family = "wasm", target_arch = "arm")), inline(always))]
+#[inline(always)]
 fn hmac_truncated(hash: &HashAlgorithm, key: &[u8], data: &[u8], out: &mut [u8]) {
     let mut full = [0; 64];
 

@@ -68,7 +68,7 @@ fn zero_mask(x: u64) -> u8 {
 
 // The sign bit of !(x | -x), set when x is 0, spread by sign_mask: the compiler would read a shift
 // by 63 as a comparison with 0, and a NOT after the shift as a choice between two constants,
-// which s390x without load-on-condition, and 32-bit x86 at opt-level s, compute with a branch.
+// which s390x without load-on-condition computes with a branch.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(always)]
 fn zero_mask(x: u64) -> u8 {

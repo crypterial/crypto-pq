@@ -147,45 +147,13 @@ pub(crate) const IV_512_256: [u64; 8] = [
     0x0EB72DDC81C52CA2,
 ];
 
-#[cfg(not(target_family = "wasm"))]
 #[inline(always)]
 fn copy_bytes(to: &mut [u8], from: &[u8]) {
     to.copy_from_slice(from);
 }
 
-#[cfg(target_family = "wasm")]
-use copy_in_line as copy_bytes;
-
-// copy_from_slice for WebAssembly under a block of SHA-512, with no memory.copy: there it is a call
-// into the runtime, twice per block for updates of 64 bytes. Copies of a constant size are loads and
-// stores.
-#[cfg(any(test, target_family = "wasm"))]
-#[inline(always)]
-pub(crate) fn copy_in_line(to: &mut [u8], from: &[u8]) {
-    if from.len() >= 128 {
-        return to.copy_from_slice(from);
-    }
-
-    let to = &mut to[..from.len()];
-
-    macro_rules! copy {
-        ($($size:literal)*) => {
-            $(
-                if from.len() & $size != 0 {
-                    let at = from.len() & !(2 * $size - 1);
-
-                    to[at..at + $size].copy_from_slice(&from[at..at + $size]);
-                }
-            )*
-        };
-    }
-
-    copy!(64 32 16 8 4 2 1);
-}
-
 // The bytes of an update shorter than 64 into the buffer, with no call: the first and the last 32,
 // 16, 8, 4 or 2 of them, the largest that fits, whose two moves cover them all, or the one byte.
-#[cfg(not(target_family = "wasm"))]
 #[inline(always)]
 fn copy_short(to: &mut [u8], from: &[u8]) {
     let n = from.len();
@@ -246,7 +214,6 @@ fn copy_chunks<const N: usize>(to: &mut [u8], from: &[u8]) {
 }
 
 // The bytes of an update of 32 to N - 1 into the buffer.
-#[cfg(not(target_family = "wasm"))]
 #[inline(always)]
 fn copy_long<const N: usize>(to: &mut [u8], from: &[u8]) {
     #[cfg(target_arch = "aarch64")]
@@ -311,8 +278,7 @@ impl<const N: usize> Blocks<N> {
     // tests before it calls update_blocks: the bytes that fill the block, then the whole blocks,
     // with no test of how many there are to take or of a block left unfilled. Through update, an
     // update that fills the block ran 8 to 10 more instructions, and 1 KiB of SHA-256 in pieces of
-    // 100 bytes 2.2% more than the update of Hasher before on ARM64, 0.16% on i686 (D-104).
-    #[cfg(not(target_family = "wasm"))]
+    // 100 bytes 2.2% more than the update of Hasher before on ARM64 (D-104).
     fn update_long(&mut self, mut data: &[u8], mut process: impl FnMut(&[[u8; N]])) {
         if self.len > 0 {
             let (head, tail) = data.split_at(N - self.len);
@@ -377,10 +343,7 @@ impl<const N: usize> Blocks<N> {
     // HashAlgorithm::create stores its length there in pieces, which the load of the length waits
     // on: through bytes[len..], the SHA-512 of 63 bytes took 1.2% more time on Neoverse N2. On
     // x86-64 that path moved the code of the shorter updates, and 1 KiB of SHA-256 in pieces of 1
-    // byte took 3.3% to 10.6% more time; on 32-bit targets it kept a register on the stack, an
-    // instruction more on each short update. On 32-bit ARM memcpy moves every update: the moves in
-    // line ran 1.1% more instructions for 1 KiB of SHA-256 in pieces of 1 byte (D-104).
-    #[cfg(not(target_family = "wasm"))]
+    // byte took 3.3% to 10.6% more time (D-104).
     #[inline(always)]
     fn buffer_short(&mut self, data: &[u8]) -> bool {
         let len = self.len;
@@ -393,7 +356,7 @@ impl<const N: usize> Blocks<N> {
 
         let to = &mut self.bytes[len..end];
 
-        if data.len() >= 32 || cfg!(target_arch = "arm") {
+        if data.len() >= 32 {
             if len != 0 || N != 128 || cfg!(not(target_arch = "aarch64")) {
                 self.len = end;
 
@@ -417,7 +380,6 @@ impl<const N: usize> Blocks<N> {
     }
 
     // The data as whole blocks, where the buffer is empty and the data fills whole blocks.
-    #[cfg(not(target_family = "wasm"))]
     #[inline(always)]
     fn whole<'a>(&self, data: &'a [u8]) -> Option<&'a [[u8; N]]> {
         if self.len != 0 {
@@ -574,54 +536,12 @@ fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
     compress256_portable(state, blocks, more);
 }
 
-// Whether compress256_portable takes each slice through a call of its own to one out-of-line loop
-// over its blocks. Over the chain of both slices, LLVM computed the whole schedule of a block
-// ahead of its rounds on wasm32, which Cranelift then spilled, and the rounds ran on their latency
-// alone (llvm-mca on the x86-64 code of Cranelift, Zen 3: SHA-256 676 cycles a block against 622,
-// SHA-512 855 against 772). Natively the loop over one slice spilled more on aarch64 (Cortex-A53,
-// SHA-256: 1164 cycles a block against 1145) and ran 0.7% more instructions on i686.
-const SLICE_CALLS: bool = cfg!(target_family = "wasm");
-
 // Out of line, so that the dispatch above, which a streaming update calls for every block or two,
 // keeps no frame of its own: inlined there, the portable rounds made every call to a CPU kernel
 // save six or seven registers and reserve about 200 bytes of stack first.
 #[inline(never)]
 fn compress256_portable(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
-    if !SLICE_CALLS {
-        compress256_blocks(state, blocks.iter().chain(more));
-
-        return;
-    }
-
-    if !blocks.is_empty() {
-        compress256_slice(state, blocks);
-    }
-
-    if !more.is_empty() {
-        compress256_slice(state, more);
-    }
-}
-
-// compress256_blocks over one slice, for SLICE_CALLS.
-#[inline(never)]
-fn compress256_slice(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
-    compress256_blocks(state, blocks);
-}
-
-// The blocks of a one-shot input of under four, each through compress256_shared, as its padding.
-#[inline(never)]
-fn compress256_few(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
-    for block in blocks {
-        let mut w = [0; 16];
-
-        for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
-            *word = u32::from_be_bytes(*bytes);
-        }
-
-        compress256_shared(state, &w);
-
-        wipe(&mut w);
-    }
+    compress256_blocks(state, blocks.iter().chain(more));
 }
 
 // The portable compression of each block in turn. The schedule and the working variables are
@@ -826,11 +746,7 @@ fn finish256_words(state: &mut [u32; 8], data: &[u8], bits: u64) {
     let (blocks, tail) = data.as_chunks::<64>();
 
     if !blocks.is_empty() {
-        if PEEL_ROUNDS && blocks.len() < 4 {
-            compress256_few(state, blocks);
-        } else {
-            compress256(state, blocks, &[]);
-        }
+        compress256(state, blocks, &[]);
     }
 
     // The length takes the last 8 bytes, after the tail and the marker byte.
@@ -838,30 +754,15 @@ fn finish256_words(state: &mut [u32; 8], data: &[u8], bits: u64) {
 
     let mut v = [0; 8];
 
-    // On WebAssembly a hash of a single block in all keeps its words in registers, here, and any
-    // other padding block runs the one copy of compress256_shared. See D-85.
-    let shared = PEEL_ROUNDS && (padding > 1 || bits != tail.len() as u64 * 8);
-
     for block in 0..padding {
-        if shared {
-            let mut w: [u32; 16] = registers!(
-                |i| padding_word256(tail, bits, padding, 16 * block + i);
-                0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
-            );
+        let mut w: [u32; 16] = registers!(
+            |i| padding_word256(tail, bits, padding, 16 * block + i);
+            0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+        );
 
-            compress256_shared(state, &w);
+        compress256_words(state, &mut w, &mut v);
 
-            wipe(&mut w);
-        } else {
-            let mut w: [u32; 16] = registers!(
-                |i| padding_word256(tail, bits, padding, 16 * block + i);
-                0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
-            );
-
-            compress256_words::<PEEL_ROUNDS>(state, &mut w, &mut v);
-
-            wipe_unless_optimized!(&mut w);
-        }
+        wipe_unless_optimized!(&mut w);
     }
 
     wipe_unless_optimized!(&mut v);
@@ -912,7 +813,7 @@ pub(crate) fn finish512(state: &[u64; 8], absorbed: u128, data: &[u8], out: &mut
 // finish256_portable for SHA-512.
 #[inline(never)]
 fn finish512_portable(state: &mut [u64; 8], data: &[u8], bits: u128) {
-    if PADDING_WORDS512 {
+    if !LANE_VECTORS {
         return finish512_words(state, data, bits);
     }
 
@@ -925,49 +826,27 @@ fn finish512_portable(state: &mut [u64; 8], data: &[u8], bits: u128) {
     wipe(last.as_flattened_mut());
 }
 
-// Whether finish512_portable builds its padding blocks as finish256_portable does without vector
-// registers. Not on 32-bit Arm, where the words take two registers each: there it ran more
-// instructions than the blocks in memory (9182 against 8921 for an empty message).
-const PADDING_WORDS512: bool = !LANE_VECTORS && !cfg!(target_arch = "arm");
-
 // finish256_words for SHA-512.
 fn finish512_words(state: &mut [u64; 8], data: &[u8], bits: u128) {
     let (blocks, tail) = data.as_chunks::<128>();
 
     if !blocks.is_empty() {
-        if PEEL_ROUNDS && blocks.len() < 4 {
-            compress512_few(state, blocks);
-        } else {
-            compress512(state, blocks, &[]);
-        }
+        compress512(state, blocks, &[]);
     }
 
     let padding = if tail.len() + 17 > 128 { 2 } else { 1 };
 
     let mut v = [0; 8];
 
-    let shared = PEEL_ROUNDS && (padding > 1 || bits != tail.len() as u128 * 8);
-
     for block in 0..padding {
-        if shared {
-            let mut w: [u64; 16] = registers!(
-                |i| padding_word512(tail, bits, padding, 16 * block + i);
-                0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
-            );
+        let mut w: [u64; 16] = registers!(
+            |i| padding_word512(tail, bits, padding, 16 * block + i);
+            0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+        );
 
-            compress512_shared(state, &w);
+        compress512_words(state, &mut w, &mut v);
 
-            wipe(&mut w);
-        } else {
-            let mut w: [u64; 16] = registers!(
-                |i| padding_word512(tail, bits, padding, 16 * block + i);
-                0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
-            );
-
-            compress512_words(state, &mut w, &mut v);
-
-            wipe_unless_optimized!(&mut w);
-        }
+        wipe_unless_optimized!(&mut w);
     }
 
     wipe_unless_optimized!(&mut v);
@@ -1044,15 +923,9 @@ fn keyed256_words(iv: &[u32; 8], key: &[u8], states: &mut [[u32; 8]; 2]) {
 
         *state = *iv;
 
-        if PEEL_ROUNDS {
-            compress256_shared(state, &w);
+        compress256_words(state, &mut w, &mut v);
 
-            wipe(&mut w);
-        } else {
-            compress256_words::<false>(state, &mut w, &mut v);
-
-            wipe_unless_optimized!(&mut w);
-        }
+        wipe_unless_optimized!(&mut w);
     }
 
     wipe_unless_optimized!(&mut v);
@@ -1106,15 +979,9 @@ fn keyed512_words(iv: &[u64; 8], key: &[u8], states: &mut [[u64; 8]; 2]) {
 
         *state = *iv;
 
-        if PEEL_ROUNDS {
-            compress512_shared(state, &w);
+        compress512_words(state, &mut w, &mut v);
 
-            wipe(&mut w);
-        } else {
-            compress512_words(state, &mut w, &mut v);
-
-            wipe_unless_optimized!(&mut w);
-        }
+        wipe_unless_optimized!(&mut w);
     }
 
     wipe_unless_optimized!(&mut v);
@@ -1233,16 +1100,16 @@ pub(crate) fn hmac512(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
 
 // One group of 16 rounds written out and run in a loop, so that the code indexes the schedule w,
 // which keeps its last 16 words, and the working variables v only with constants, and at opt-level
-// 3 both stay in registers (on wasm32, locals): with a loop over the slots, every use of a word is
-// a load or a store on wasm32. Always inlined into compress256_blocks, which owns w and v, so that
-// they stay arrays of registers there.
+// 3 both stay in registers: with a loop over the slots, every use of a word would be a load or a
+// store. Always inlined into compress256_blocks, which owns w and v, so that they stay arrays of
+// registers there.
 #[inline(always)]
 fn compress256_block(state: &mut [u32; 8], block: &[u8; 64], w: &mut [u32; 16], v: &mut [u32; 8]) {
     for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
         *word = u32::from_be_bytes(*bytes);
     }
 
-    compress256_words::<PEEL_ROUNDS>(state, w, v);
+    compress256_words(state, w, v);
 }
 
 // The compression of one block whose big-endian word t is word(t), into state, for a caller that
@@ -1258,60 +1125,24 @@ pub(crate) fn compress256_built(state: &mut [u32; 8], word: impl Fn(usize) -> u3
 
     let mut v = [0; 8];
 
-    compress256_words::<PEEL_ROUNDS>(state, &mut w, &mut v);
+    compress256_words(state, &mut w, &mut v);
 
     wipe_unless_optimized!(&mut w);
 
     wipe_unless_optimized!(&mut v);
 }
 
-// Whether compress256_words and compress512_words run the rounds of the first group ahead of a loop
-// over the other groups, whose pass then holds the schedule of a group and its rounds in one block.
-// Cranelift places each pure value right before its first use, so each word of the schedule then
-// lands next to the round that reads it; under the if of a loop over all the groups, the schedule
-// ran as a block of its own ahead of the rounds.
-const PEEL_ROUNDS: bool = cfg!(target_family = "wasm");
-
-// compress256_words on a copy of the block, in one place for the padding blocks and HMAC key blocks
-// of WebAssembly and compress256_few. See D-85.
-#[inline(never)]
-fn compress256_shared(state: &mut [u32; 8], w: &[u32; 16]) {
-    let mut w = *w;
-
-    let mut v = [0; 8];
-
-    compress256_words::<true>(state, &mut w, &mut v);
-
-    wipe_unless_optimized!(&mut w);
-
-    wipe_unless_optimized!(&mut v);
-}
-
-// compress256_block for a block already in w, which the schedule overwrites. Written out in full,
-// the 64 rounds took 3616 instructions on i686 and V8 compiled them to 2116 on ARM64, against 1148
-// and 850 in the loop.
+// compress256_block for a block already in w, which the schedule overwrites.
 #[inline(always)]
-fn compress256_words<const PEEL: bool>(state: &mut [u32; 8], w: &mut [u32; 16], v: &mut [u32; 8]) {
+fn compress256_words(state: &mut [u32; 8], w: &mut [u32; 16], v: &mut [u32; 8]) {
     *v = *state;
 
-    let groups = K256.as_chunks::<16>().0;
-
-    if PEEL {
-        rounds256(v, w, &groups[0]);
-
-        for k in &groups[1..] {
+    for (group, k) in K256.as_chunks::<16>().0.iter().enumerate() {
+        if group > 0 {
             schedule256(w);
-
-            rounds256(v, w, k);
         }
-    } else {
-        for (group, k) in groups.iter().enumerate() {
-            if group > 0 {
-                schedule256(w);
-            }
 
-            rounds256(v, w, k);
-        }
+        rounds256(v, w, k);
     }
 
     for (word, value) in state.iter_mut().zip(v.iter()) {
@@ -1367,7 +1198,6 @@ fn round256_lanes<const LANES: usize>(
 pub(crate) const LANE_VECTORS: bool = cfg!(any(
     target_feature = "sse2",
     target_feature = "neon",
-    target_feature = "simd128",
     target_feature = "v"
 ));
 
@@ -1413,7 +1243,7 @@ fn compress256_lanes_each<const LANES: usize>(
             *word = words[lane];
         }
 
-        compress256_words::<PEEL_ROUNDS>(&mut state, &mut block, &mut v);
+        compress256_words(&mut state, &mut block, &mut v);
 
         for (words, word) in states.iter_mut().zip(&state) {
             words[lane] = *word;
@@ -1539,52 +1369,13 @@ fn round512(a: u64, b: u64, c: u64, d: &mut u64, e: u64, f: u64, g: u64, h: &mut
 // SHA-512's Σ: the XOR of x rotated right by a, b and c.
 #[inline(always)]
 fn big_sigma512(x: u64, [a, b, c]: [u32; 3]) -> u64 {
-    if !cfg!(target_arch = "arm") {
-        return x.rotate_right(a) ^ x.rotate_right(b) ^ x.rotate_right(c);
-    }
-
-    xor_rotated_halves(x, [a, b, c], 0, 0)
+    x.rotate_right(a) ^ x.rotate_right(b) ^ x.rotate_right(c)
 }
 
 // SHA-512's σ: the XOR of x rotated right by a and b and shifted right by s, from 1 to 31.
 #[inline(always)]
 fn small_sigma512(x: u64, [a, b]: [u32; 2], s: u32) -> u64 {
-    if !cfg!(target_arch = "arm") {
-        return x.rotate_right(a) ^ x.rotate_right(b) ^ (x >> s);
-    }
-
-    let (hi, lo) = ((x >> 32) as u32, x as u32);
-
-    xor_rotated_halves(x, [a, b], hi >> s, lo >> s ^ hi << (32 - s))
-}
-
-// The halves of x rotated right by each of the rotations, from 1 to 63 but 32, XORed into high and
-// low, as one word, for 32-bit Arm. The two shifts of a rotated half have no bits in common, so
-// that all of them join one chain of XORs, each folded into its XOR as a shifted operand. In a
-// loop: written out, the rotated halves were each built with an OR first, as for a 64-bit rotation
-// (an empty message took 9933 instructions against 8921).
-#[inline(always)]
-fn xor_rotated_halves<const N: usize>(
-    x: u64,
-    rotations: [u32; N],
-    mut high: u32,
-    mut low: u32,
-) -> u64 {
-    let (hi, lo) = ((x >> 32) as u32, x as u32);
-
-    for n in rotations {
-        let (hi, lo, n) = if n < 32 {
-            (hi, lo, n)
-        } else {
-            (lo, hi, n - 32)
-        };
-
-        high ^= hi >> n ^ lo << (32 - n);
-
-        low ^= lo >> n ^ hi << (32 - n);
-    }
-
-    u64::from(high) << 32 | u64::from(low)
+    x.rotate_right(a) ^ x.rotate_right(b) ^ (x >> s)
 }
 
 // rounds256 for SHA-512.
@@ -1647,10 +1438,6 @@ fn word512(w: &mut [u64; 16], t: usize) {
 // schedule256 for SHA-512.
 #[inline(always)]
 fn schedule512(w: &mut [u64; 16]) {
-    if cfg!(crypto_pq_pairs) {
-        return schedule512_pairs(w);
-    }
-
     word512(w, 0);
 
     word512(w, 1);
@@ -1684,62 +1471,6 @@ fn schedule512(w: &mut [u64; 16]) {
     word512(w, 15);
 }
 
-// schedule512 on 32-bit x86 with SSE2 (crypto_pq_pairs), two words at a time: words t and t + 1,
-// for t even, from the pairs at t + 1, t + 9 and t + 14, which LLVM's SLP vectorizer computes in
-// SSE2 registers, where each word alone takes two general registers (D-83).
-#[inline(always)]
-fn schedule512_pairs(w: &mut [u64; 16]) {
-    let zero = core::hint::black_box([0; 2]);
-
-    // Written out, so that every index is a constant: as a loop over the steps it stayed scalar.
-    words512_pair(w, 0, zero);
-
-    words512_pair(w, 2, zero);
-
-    words512_pair(w, 4, zero);
-
-    words512_pair(w, 6, zero);
-
-    words512_pair(w, 8, zero);
-
-    words512_pair(w, 10, zero);
-
-    words512_pair(w, 12, zero);
-
-    words512_pair(w, 14, zero);
-}
-
-// word512 for words t and t + 1.
-#[inline(always)]
-fn words512_pair(w: &mut [u64; 16], t: usize, zero: [u64; 2]) {
-    let pair = |i: usize| [w[i % 16], w[(i + 1) % 16]];
-
-    let s0 = small_sigma512_pair(pair(t + 1), zero, [1, 8], 7);
-
-    let s1 = small_sigma512_pair(pair(t + 14), zero, [19, 61], 6);
-
-    let ([x, y], [c, d]) = (pair(t), pair(t + 9));
-
-    w[t] = x.wrapping_add(s0[0]).wrapping_add(c).wrapping_add(s1[0]);
-
-    w[t + 1] = y.wrapping_add(s0[1]).wrapping_add(d).wrapping_add(s1[1]);
-}
-
-// small_sigma512 on both words of a pair, each rotation as shifts of x and of x ^ zero, for a zero
-// that LLVM cannot see: from x alone it forms a funnel shift, which SSE2 lacks (D-80).
-#[inline(always)]
-fn small_sigma512_pair(x: [u64; 2], zero: [u64; 2], [a, b]: [u32; 2], s: u32) -> [u64; 2] {
-    let sigma = |i: usize| {
-        let y = x[i] ^ zero[i];
-
-        let rotate = |n: u32| x[i] >> n | y << (64 - n);
-
-        rotate(a) ^ rotate(b) ^ x[i] >> s
-    };
-
-    [sigma(0), sigma(1)]
-}
-
 fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
     if cpu::compress512(state, blocks, more) {
         return;
@@ -1751,51 +1482,12 @@ fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
 // compress256_portable for SHA-512.
 #[inline(never)]
 fn compress512_portable(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
-    if !SLICE_CALLS {
-        compress512_blocks(state, blocks.iter().chain(more));
-
-        return;
-    }
-
-    if !blocks.is_empty() {
-        compress512_slice(state, blocks);
-    }
-
-    if !more.is_empty() {
-        compress512_slice(state, more);
-    }
-}
-
-// compress256_slice for SHA-512.
-#[inline(never)]
-fn compress512_slice(state: &mut [u64; 8], blocks: &[[u8; 128]]) {
-    compress512_blocks(state, blocks);
-}
-
-// compress256_few for SHA-512.
-#[inline(never)]
-fn compress512_few(state: &mut [u64; 8], blocks: &[[u8; 128]]) {
-    for block in blocks {
-        let mut w = [0; 16];
-
-        for (word, bytes) in w.iter_mut().zip(block.as_chunks::<8>().0) {
-            *word = u64::from_be_bytes(*bytes);
-        }
-
-        compress512_shared(state, &w);
-
-        wipe(&mut w);
-    }
+    compress512_blocks(state, blocks.iter().chain(more));
 }
 
 // compress256_blocks for SHA-512.
 fn compress512_blocks<'a>(state: &mut [u64; 8], blocks: impl IntoIterator<Item = &'a [u8; 128]>) {
     let mut w = [0; 16];
-
-    // In memory, where the wipe reaches them, the words give schedule512_pairs the loads and
-    // stores of pairs that the vectorizer starts from, as blake2::rounds_pair has its rows.
-    #[cfg(crypto_pq_pairs)]
-    core::hint::black_box(&mut w);
 
     let mut v = [0; 8];
 
@@ -1803,10 +1495,6 @@ fn compress512_blocks<'a>(state: &mut [u64; 8], blocks: impl IntoIterator<Item =
         compress512_block(state, block, &mut w, &mut v);
     }
 
-    #[cfg(crypto_pq_pairs)]
-    wipe(&mut w);
-
-    #[cfg(not(crypto_pq_pairs))]
     wipe_unless_optimized!(&mut w);
 
     wipe_unless_optimized!(&mut v);
@@ -1834,43 +1522,17 @@ fn compress512_block(state: &mut [u64; 8], block: &[u8; 128], w: &mut [u64; 16],
     compress512_words(state, w, v);
 }
 
-// compress256_shared for SHA-512.
-#[inline(never)]
-fn compress512_shared(state: &mut [u64; 8], w: &[u64; 16]) {
-    let mut w = *w;
-
-    let mut v = [0; 8];
-
-    compress512_words(state, &mut w, &mut v);
-
-    wipe_unless_optimized!(&mut w);
-
-    wipe_unless_optimized!(&mut v);
-}
-
 // compress256_words for SHA-512, with its five groups of rounds.
 #[inline(always)]
 fn compress512_words(state: &mut [u64; 8], w: &mut [u64; 16], v: &mut [u64; 8]) {
     *v = *state;
 
-    let groups = K512.as_chunks::<16>().0;
-
-    if PEEL_ROUNDS {
-        rounds512(v, w, &groups[0]);
-
-        for k in &groups[1..] {
+    for (group, k) in K512.as_chunks::<16>().0.iter().enumerate() {
+        if group > 0 {
             schedule512(w);
-
-            rounds512(v, w, k);
         }
-    } else {
-        for (group, k) in groups.iter().enumerate() {
-            if group > 0 {
-                schedule512(w);
-            }
 
-            rounds512(v, w, k);
-        }
+        rounds512(v, w, k);
     }
 
     for (word, value) in state.iter_mut().zip(v.iter()) {
@@ -1926,13 +1588,10 @@ impl Sha256 {
     // Sha256Stream (D-104): bytes that leave the block unfilled are buffered, and whole blocks
     // into an empty buffer go to the kernel, with no frame and the copy or the kernel as the last
     // call. The other callers keep update, in line in them.
-    #[cfg(not(any(
-        target_family = "wasm",
-        all(
-            target_arch = "x86_64",
-            not(target_env = "sgx"),
-            not(crypto_pq_portable)
-        )
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
     )))]
     #[inline(never)]
     pub(crate) fn update_stream(&mut self, data: &[u8]) {
@@ -1949,32 +1608,18 @@ impl Sha256 {
         }
     }
 
-    // Out of line on 64-bit targets, where update_stream then has no frame on its other paths. On
-    // the others it has one on every path, and a second one here took i686 23 more instructions
-    // per block of SHA-512 in updates of 64 bytes than update (D-104).
-    #[cfg(not(any(
-        target_family = "wasm",
-        all(
-            target_arch = "x86_64",
-            not(target_env = "sgx"),
-            not(crypto_pq_portable)
-        )
+    // Out of line, so that update_stream has no frame on its other paths (D-104).
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
     )))]
-    #[cfg_attr(target_pointer_width = "64", inline(never))]
-    #[cfg_attr(not(target_pointer_width = "64"), inline(always))]
+    #[inline(never)]
     fn update_blocks(&mut self, data: &[u8]) {
         let state = &mut self.state;
 
         self.blocks
             .update_long(data, |blocks| compress256(state, blocks, &[]));
-    }
-
-    // update on WebAssembly, which has no tail calls: there each path of update_stream took a
-    // frame, and updates that fill a block took up to 1.2 percent more time (D-104).
-    #[cfg(target_family = "wasm")]
-    #[inline(always)]
-    pub(crate) fn update_stream(&mut self, data: &[u8]) {
-        self.update(data);
     }
 
     pub(crate) fn digest(&self) -> [u8; 32] {
@@ -2151,7 +1796,6 @@ impl Sha512 {
     }
 
     // Sha256::update_stream, the update of Hasher and Mac.
-    #[cfg(not(target_family = "wasm"))]
     #[inline(never)]
     pub(crate) fn update_stream(&mut self, data: &[u8]) {
         self.length = self.length.wrapping_add(data.len() as u128);
@@ -2170,7 +1814,6 @@ impl Sha512 {
     // The whole groups of an update into an empty buffer, out of line on x86-64: there the first
     // call's detection of the CPU's features, in line, gave update_stream a frame on every path, 6
     // or 7 more instructions in an update of 16 to 64 bytes (D-104).
-    #[cfg(not(target_family = "wasm"))]
     #[cfg_attr(target_arch = "x86_64", inline(never))]
     #[cfg_attr(not(target_arch = "x86_64"), inline(always))]
     fn update_whole(&mut self, groups: &[[u8; BUFFER512]]) {
@@ -2182,22 +1825,13 @@ impl Sha512 {
     }
 
     // Sha256::update_blocks.
-    #[cfg(not(target_family = "wasm"))]
-    #[cfg_attr(target_pointer_width = "64", inline(never))]
-    #[cfg_attr(not(target_pointer_width = "64"), inline(always))]
+    #[inline(never)]
     fn update_blocks(&mut self, data: &[u8]) {
         let state = &mut self.state;
 
         self.blocks.update_long(data, |groups| {
             compress512(state, groups.as_flattened().as_chunks::<128>().0, &[])
         });
-    }
-
-    // Sha256::update_stream on WebAssembly.
-    #[cfg(target_family = "wasm")]
-    #[inline(always)]
-    pub(crate) fn update_stream(&mut self, data: &[u8]) {
-        self.update(data);
     }
 
     // The whole blocks that the buffer holds compressed now, for a state that finish_message and
@@ -2537,15 +2171,6 @@ mod tests {
 
             assert_eq!(portable, expected, "portable, case {n}");
 
-            // The other form of the portable loop, whichever the target runs.
-            let mut slices = state;
-
-            compress256_slice(&mut slices, first);
-
-            compress256_slice(&mut slices, more);
-
-            assert_eq!(slices, expected, "slices, case {n}");
-
             let mut actual = state;
 
             if cpu::compress256(&mut actual, first, more) {
@@ -2681,15 +2306,6 @@ mod tests {
             compress512_portable(&mut portable, first, more);
 
             assert_eq!(portable, expected, "portable, case {n}");
-
-            // The other form of the portable loop, whichever the target runs.
-            let mut slices = state;
-
-            compress512_slice(&mut slices, first);
-
-            compress512_slice(&mut slices, more);
-
-            assert_eq!(slices, expected, "slices, case {n}");
 
             let mut actual = state;
 
@@ -3237,20 +2853,5 @@ mod tests {
         }
 
         std::eprintln!("HMAC: {accelerated} of 1032 cases through a CPU kernel");
-    }
-
-    #[test]
-    fn copy_in_line_copies_every_length() {
-        let from: [u8; 256] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(1));
-
-        for length in 0..=from.len() {
-            let mut to = [0xA5; 257];
-
-            copy_in_line(&mut to[..length], &from[..length]);
-
-            assert_eq!(to[..length], from[..length]);
-
-            assert!(to[length..].iter().all(|&byte| byte == 0xA5));
-        }
     }
 }
