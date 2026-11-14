@@ -1317,14 +1317,15 @@ mean this draft. Every format that 1.0.x writes, 2.0 reads
 ([20.3](20-versioning.md#203-compatibility-within-2x) item 4). WebAssembly and 32-bit targets stay
 on 1.0.x.
 
-Rationale: the work on performance is for x86-64, ARM64 and RISC-V processors and is judged on
-them. A WebAssembly runtime compiles the module again for the processor that runs it, so a form
-chosen for WebAssembly is chosen for that runtime's compiler rather than for a processor, and the
-32-bit targets took forms of their own, since a 64-bit word does not fit one of their registers.
-Those forms took sixteen decisions and parts of five more, and the tests of 32-bit Arm under
-emulation took more than an hour in one CI job. On the targets that stay, the removed code was
-compiled only for the removed targets or for their tests: built with one codegen unit, the
-library's machine code is the same as before, function by function, on x86-64 and ARM64 with and
-without `crypto_pq_portable` and on riscv64. With the sixteen units of Cargo's default, x86-64 is
-the same too; on ARM64 and riscv64, rustc puts some functions in other units, as a change anywhere
-in the crate can, and LLVM gives about fifty functions on ARM64 and seven on riscv64 other code.
+Rationale: the work on performance is for x86-64 and ARM64 processors and is judged on them, and
+RISC-V runs the portable code, checked for correctness only. A WebAssembly runtime compiles the
+module again for the processor that runs it, so a form chosen for WebAssembly is chosen for that
+runtime's compiler rather than for a processor, and the 32-bit targets took forms of their own,
+since a 64-bit word does not fit one of their registers. Those forms took sixteen decisions and
+parts of five more, and the tests of 32-bit Arm under emulation took more than an hour in one CI
+job. On the targets that stay, the removed code was compiled only for the removed targets or for
+their tests: built with one codegen unit, the library's machine code is the same as before, function
+by function, on x86-64 and ARM64 with and without `crypto_pq_portable` and on riscv64. With the
+sixteen units of Cargo's default, x86-64 is the same too; on ARM64 and riscv64, rustc puts some
+functions in other units, as a change anywhere in the crate can, and LLVM gives about fifty
+functions on ARM64 and seven on riscv64 other code.
