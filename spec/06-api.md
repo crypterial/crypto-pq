@@ -182,7 +182,7 @@ SP 800-185 §3.3 reserves N for functions defined by NIST.
 2. A `Hasher`, `Xof` or `Mac` object is a sequence of calls. Two threads MUST NOT use one such object at
    the same time; doing so is a caller error.
 3. Stateful private keys follow Section [11.13](11-stateful-signatures.md#1113-concurrency).
-4. No operation waits for another thread. No operation creates threads in 1.1.
+4. No operation waits for another thread. No operation creates threads in 2.0.
 
 ## 6.7 Lifetime, equality and printing
 
