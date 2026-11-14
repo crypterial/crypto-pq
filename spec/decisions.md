@@ -669,10 +669,10 @@ values, which targets without a conditional move compute with a conditional bran
 value ([14.1](14-security.md#141-constant-time) item 1): RISC-V without the Zicond extension, and
 s390x at its baseline z10, which has no load-on-condition. The barrier is an empty inline
 assembly block that takes the value in a register and returns it, which emits no instruction, on
-the targets where Rust has stable inline assembly (32-bit ARM, 32-bit x86, RISC-V, LoongArch and
-s390x), and `core::hint::black_box` on the others, WebAssembly among them, and under Miri. On
-x86-64 and ARM64 it is the identity: there the compiler chooses with a conditional move or select
-instruction, and CI checks these builds mechanically under valgrind
+the targets where Rust has stable inline assembly (RISC-V, LoongArch and s390x), and
+`core::hint::black_box` on the others and under Miri. On x86-64 and ARM64 it is the identity: there
+the compiler chooses with a conditional move or select instruction, and CI checks these builds
+mechanically under valgrind
 ([14.1](14-security.md#141-constant-time) item 7); ML-DSA Decompose and the byte equality of
 SampleInBall keep their `black_box` forms there. The masks covered are those of the ML-DSA and
 ML-KEM reductions to [0, q), the ML-DSA reduction to the centered representative, the ML-KEM
@@ -716,131 +716,24 @@ stores the value. No timing was taken on these targets.
 
 ## Decision D-80
 
-On 32-bit x86 with SSE2, Keccak-f[1600] holds the same lane of two states as a pair of 64-bit
-words, and `keccak::permute_all` permutes the states of a group two at a time; a state alone runs
-beside the zero state, whose permutation is public. Each operation of a round on a pair is the
-same operation on both words, which LLVM's SLP vectorizer turns into one SSE2 instruction for
-both states. build.rs sets `crypto_pq_pairs` where the target architecture is x86 and the
-target features include sse2, as they do on every i686 target; the other 32-bit targets keep the
-bit-interleaved lanes, and 64-bit targets and WebAssembly the plain lanes. The pair form is
-portable code, Rust without intrinsics or assembly that is correct on any target: the target's
-features choose at compile time between two forms of the portable code, as its pointer width
-chooses between the plain and the bit-interleaved lanes. It is not CPU-specific code under
-[15.3](15-platforms.md#153-cpu-specific-code), needs no run-time detection or twin, and stays in
-the builds that force the portable code. Three details of the form keep the vectorizer at work:
-the two arrays of pairs stay in memory, behind `core::hint::black_box`, with a compiler fence
-before each plane, so that the stores of each plane give the vectorizer its starting points; each
-rotation shifts the lane and the lane XOR an opaque zero, since from one value LLVM forms a funnel
-shift, which SSE2 lacks, and its cost kept the whole round scalar; and each round computes the
-column parities from its input lanes. Every index and shift amount is a constant, so the form has
-no branch or memory access that depends on the data, and the arrays of pairs are wiped after the
-permutation.
-
-Rationale: on i686, counted under QEMU, a block of SHA3-256 executes 8841 instructions, against
-12170 with the bit-interleaved lanes. ML-KEM key generation executes 34 to 39 percent fewer
-instructions, encapsulation with a reused key 17 to 20 percent and with an imported key 29 to 40
-percent fewer, and decapsulation 13 to 15 percent fewer; ML-DSA key generation executes 42 to 47
-percent fewer, verification with a reused key 13 to 17 percent and with an imported key 41 to 46
-percent fewer, and signing 16 to 18 percent fewer. Adding each plane of a round to the parities
-of the next round as it is written, as the 64-bit form does, took 5 percent more instructions
-per block of SHA3-256. A scan of the i686 machine code at opt-levels 1, 2, 3, s and z finds no
-branch or select on secret data, and the objects of x86-64, ARM64, armv7 and wasm32 are equal to
-those before, function by function. No timing was taken on this target.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-81
 
-On 32-bit Arm, Ascon-p[12] holds each 64-bit word of the state bit-interleaved, its even bits in the
-low 32-bit half and its odd bits in the high half, so that a rotation of a word is a rotation of
-each half, the halves swapped for an odd amount, which Arm takes as the rotated operand of an EOR;
-the 64-bit rotation took two shifts and an ORR a half. Each word of input enters the state, and each
-word of output leaves it, through a fixed exchange of bit groups, so that the permutation converts
-nothing, and the start states are held interleaved at compile time. Other targets hold the words
-whole: on 32-bit x86 the interleaved words took more instructions than the whole words, and the
-other 32-bit targets, on which they were not counted, keep the form of the 64-bit ones.
-
-The form is portable code, Rust without intrinsics or assembly that is correct on any target, which
-the target's architecture chooses at compile time. It is not CPU-specific code under
-[15.3](15-platforms.md#153-cpu-specific-code), needs no run-time detection or twin, and stays in the
-builds that force the portable code. Every index, shift and rotation amount is a constant, so the
-form has no branch or memory access that depends on the data.
-
-Rationale: counted under QEMU, Ascon-Hash256 of 0, 64 and 1024 bytes, Ascon-XOF128 of 0 bytes to 32
-and of 64 bytes to 1024, and Ascon-CXOF128 of 0 and 64 bytes to 32 execute 26.5 to 28.5 percent
-fewer instructions on armv7; on i686 the interleaved words took 2.5 to 4.3 percent more instructions
-than the whole words. In bench run 41403058064, on Neoverse N2 in 32-bit mode, Ascon-Hash256 of 64
-bytes and 1 KiB and Ascon-XOF128 and Ascon-CXOF128 of 1 KiB took 0.72 times the time before with a
-one-shot digest that also absorbed the blocks a word at a time; the digest here, which keeps its
-loop over both kinds of block, executes 0.6 to 2.1 percent more instructions than that one. A scan
-of the armv7 machine code at opt-levels 1, 2, 3, s and z finds no new branch, select, table or
-division in the Ascon functions, and on x86-64, ARM64, i686 and wasm32 they are equal to those
-before, function by function.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-82
 
-On 32-bit x86 with SSE2, BLAKE2b holds the words of each row of its state in pairs, those of
-columns 0 and 2 and those of columns 1 and 3, so that each operation of the G function on a pair is
-the same operation on both words, which LLVM's SLP vectorizer turns into one SSE2 instruction. The
-diagonal step takes the same pairs, four of them with their words swapped. build.rs sets
-`crypto_pq_pairs`, the configuration of [D-80](#decision-d-80), for both forms; BLAKE2s, whose words
-are 32 bits, keeps its form there, as the other targets keep theirs. The details of D-80 keep the
-vectorizer at work here too: the pairs stay in memory, behind `core::hint::black_box`, and each
-rotation shifts the word and the word XOR an opaque zero. A compiler fence before the columns and
-before the diagonals of each round makes each half load and store its own pairs: over a whole round
-LLVM kept more values than the eight SSE2 registers hold, and spilled them.
-
-On 32-bit x86, BLAKE3 compresses each block of a chain in a call of its own, in place in the
-chaining value. With the rounds inlined into the loop over the blocks, the seven general registers
-held little of the state: its words stayed in memory, changed by 60 read-modify-write instructions
-per block, each waiting for the store of the one before. Compressed alone, a block has 3 of them.
-The whole blocks of an extended output go from the registers of their compression straight into the
-output: stored as words and then copied as bytes, they were loaded back with wider loads than their
-stores, which a store cannot forward. Other targets keep the form before.
-
-Both forms are portable code, Rust without intrinsics or assembly that is correct on any target,
-which the target's architecture and features choose at compile time. They are not CPU-specific code
-under [15.3](15-platforms.md#153-cpu-specific-code), need no run-time detection or twin, and stay in
-the builds that force the portable code. Every index and shift amount is a constant, so neither form
-has a branch or memory access that depends on the data, and the pairs are wiped after each
-compression.
-
-Rationale: on i686, counted under QEMU one instruction at a time, BLAKE2b-512 of 0 bytes to 1 KiB
-and its MAC of 64 bytes execute 53 to 57 percent fewer instructions. BLAKE3 of 1 KiB executes 1.8
-percent more, its extended output of 1 KiB from 64 bytes 1.5 percent fewer, and BLAKE2s, BLAKE3 of 0
-and 64 bytes and its MAC of 64 bytes as many as before. In bench run 41610095005, on 13 runners (Zen
-3, Zen 4, Zen 5 and Granite Rapids), with every function aligned to 64 bytes and to 128, the time
-before over the time here was 1.14 to 2.06 for BLAKE2b and its MAC, 1.05 to 1.31 for BLAKE3 and its
-MAC of 1 KiB and 16 KiB, and 1.05 to 1.41 for its extended output of 1 KiB and 16 KiB. BLAKE2s, and
-BLAKE3 of up to 64 bytes, were at 0.986 to 1.03. The lowest, on Zen 3, were BLAKE2s-256 of 0 and 64
-bytes, whose machine code, the bench harness's included, is the same as before, and BLAKE3 key
-derivation of 64 bytes, at 64 bytes of alignment: at 128 it was 1.012. A scan of the i686 machine
-code at opt-levels 1, 2, 3, s and z finds no branch, select, table or division on secret data, and
-the code of x86-64, ARM64, armv7 and wasm32 is the same as before, function by function.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-83
 
-On 32-bit x86 with SSE2, the message schedule of SHA-512, which SHA-384, SHA-512/224 and SHA-512/256
-share, computes its words two at a time: words t and t + 1, for t even, from the pairs of words at
-t, t + 1, t + 9 and t + 14 (mod 16), so that each operation of a step is the same operation on both
-words of a pair, which LLVM's SLP vectorizer turns into one SSE2 instruction. A 64-bit word alone
-takes two general registers there, and each of its rotations two double shifts. build.rs sets
-`crypto_pq_pairs`, the configuration of [D-80](#decision-d-80), for the form; the rounds keep
-theirs, as SHA-256 and the other targets keep their schedules. The details of D-80 keep the
-vectorizer at work here too: the sixteen words stay in memory, behind `core::hint::black_box`, and
-each rotation shifts the word and the word XOR an opaque zero. The eight steps of a schedule are
-written out, so that every index is a constant: as a loop over the steps, the schedule stayed
-scalar.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
-The form is portable code, Rust without intrinsics or assembly that is correct on any target, which
-the target's architecture and features choose at compile time. It is not CPU-specific code under
-[15.3](15-platforms.md#153-cpu-specific-code), needs no run-time detection or twin, and stays in the
-builds that force the portable code. Every index and shift amount is a constant, so the form has no
-branch or memory access that depends on the data, and the words are wiped after the last block.
-
-Rationale: on i686, counted under QEMU one instruction at a time, a block of SHA-512 executes 8272
-instructions, against 10007 before. SHA-512 of 0 bytes and 1 KiB, HMAC-SHA-512 of 64 bytes and
-HKDF-SHA-512 of 32 bytes execute 16.2 to 17.2 percent fewer instructions. A scan of the i686 machine
-code at opt-levels 1, 2, 3, s and z finds no branch, select, table or division on secret data, and
-the code of x86-64, ARM64, armv7 and wasm32 is the same as before, function by function.
 ## Decision D-84
 
 On x86-64, BLAKE3's `hash_many` and extended output compute two to four inputs or blocks in the row
@@ -859,12 +752,6 @@ of data-operand-independent timing instructions, or counts as on it by [D-75](#d
 each form is tested against the portable code on the native runners of
 [18.2](18-testing.md#182-cpu-tiers).
 
-On WebAssembly, `hash_many` runs the last two inputs one after the other, not side by side as on the
-other targets, and the whole blocks of an extended output go from the registers of their compression
-straight into the output, as on 32-bit x86 ([D-82](#decision-d-82)). Both are forms of the portable
-code that the target chooses at compile time, not CPU-specific code under
-[15.3](15-platforms.md#153-cpu-specific-code), and neither depends on the data.
-
 Rationale: a block in the row form takes the latency of one compression, whose chain of dependent
 instructions is as long on any register width, so that four inputs in one 512-bit register take the
 time of one input, while the eight-lane form takes its full latency with lanes empty. llvm-mca 19
@@ -879,91 +766,15 @@ block: the measurement decided, and what the model misses was not established. O
 where no runner exists, llvm-mca 19 models that plan at 466 cycles a block against 377 for four lanes
 on 128-bit registers. The cores of the Atom line were neither modelled nor measured.
 
-On WebAssembly, in bench run 42094485113, the side-by-side form took 1.29 (Zen 3), 1.33 (Zen 4), 1.10
-(Zen 5) and 1.02 (Neoverse N2) times the time here for 2 KiB under wasmtime, and 1.34, 1.02, 1.04 and
-1.03 under Node.js; what the runtimes do to it was not established. For 16 KiB of extended output, the
-words stored and then copied took 1.06, 1.09, 1.10 and 1.05 times the time here under wasmtime, and
-1.08, 1.07, 1.11 and 1.13 under Node.js.
-
 ## Decision D-85
 
-On WebAssembly, the compressions of SHA-2 run the rounds of the first group of sixteen ahead of a
-loop over the other groups, so that each pass of the loop holds a group's schedule and its rounds in
-one block. A hash of a single block runs that form inline, with its words in registers. Any other
-padding block, an HMAC key block and the blocks of a one-shot input of under four take one copy of it
-out of line, with the block's words in memory, which are wiped after each call at every optimization
-level. Longer inputs and streaming updates run it in a loop of their own. Streaming updates copy what
-they buffer as loads and stores, with no `memory.copy`, which is a call into the runtime. Other
-targets keep the form before.
-
-The form is portable code, Rust without intrinsics or assembly that is correct on any target, which
-the target chooses at compile time. It is not CPU-specific code under
-[15.3](15-platforms.md#153-cpu-specific-code), needs no run-time detection or twin, and stays in the
-builds that force the portable code. Which path runs depends only on public lengths, and every index
-and shift amount is a constant, so the form has no branch or memory access that depends on the data.
-
-Rationale: Cranelift, the compiler of wasmtime, places each pure value right before its first use.
-Under the `if` of a loop over all four groups, the schedule ran as a block of its own ahead of the
-rounds; peeled, each word of the schedule lands next to the round that reads it. In bench run
-42113245037, the time before over the time here, as a geometric mean over the 23 rows of SHA-224,
-SHA-256, HMAC and HKDF, was 1.06 (Zen 3), 1.07 (Zen 4), 1.11 (Zen 5), 1.14 (Granite Rapids) and 1.12
-(Neoverse N2) under wasmtime, and 1.10, 1.16 and 1.04 (Zen 3, Zen 4, Neoverse N2) under Node.js. The
-rows that rivals led over those rows and the LMS, HSS, XMSS and XMSS^MT rows over SHA-2 went from 31
-to 7 under wasmtime on Granite Rapids, where 7 XMSS-192 rows stay behind RustCrypto, and from 22 to 0
-on Zen 5. The lowest rows were the hashes of 0 bytes, at 0.955 under Node.js on Neoverse N2 and 0.972
-under wasmtime on Zen 3, which place decides: the same source at another place in the module was at
-1.05 and 0.995 there. Out of line, as the other padding blocks, those rows held at 0.95 to 0.96 on
-Neoverse N2 at each place measured.
-
-SHA-384 and SHA-512 took the same form in bench run 42308429929. The time before over the time here,
-as a geometric mean over the 40 rows of SHA-384, SHA-512, HMAC and HKDF, was 1.13 (Emerald Rapids),
-1.12 (Neoverse N2), 1.07 (Zen 4), 1.06 (Zen 5) and 1.01 (Zen 3) under wasmtime, and 1.09, 1.04, 1.05,
-1.06, 1.15 and 1.11 (Emerald Rapids, Ice Lake, Neoverse N2, Zen 3, Zen 4, Zen 5) under Node.js. Over
-the 22 rows of XMSS and XMSS^MT it was 1.03 to 1.18. The rows that rivals led over all of SHA-2 and its
-signatures went from 40 to 6 in the eleven classes measured, where 6 XMSS-192 rows stay behind
-RustCrypto under wasmtime on Emerald Rapids. One class loses: under wasmtime on Zen 3, for the hashes
-of a single block of SHA-384 and SHA-512, this ratio is 0.92 to 0.93, with each rival there still
-behind by 5 percent or more. A WebAssembly module has one form for every CPU, and the ten other
-classes gain 3 to 16 percent on these rows.
-
-Outside WebAssembly the code is the same as before, function by function, on x86-64, ARM64, armv7 and
-i686. A scan of the wasm32 code at opt-levels 1, 2, 3, s and z finds no select in these functions, and
-at opt-level 3 the only branch of the copy out of line is its loop counter.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-86
 
-A BLAKE3 hash of at most a block, keyed or not, on WebAssembly and on 32-bit Arm takes the message
-words straight from the input into locals and writes the output from locals, with no block in memory
-to fill, read and wipe. On both targets the dispatch of a keyed hash is inlined, and the full HMAC of
-a truncated output stays out of line, with the frame it needs. On WebAssembly the last compression
-of `derive_key` is out of line too.
-
-On 32-bit Arm, a BLAKE2 digest or MAC of at most a block of data runs one function of the same form,
-which holds both, with its one copy of the rounds, and the block counter of BLAKE2s's whole blocks
-takes 64 bits, its full range. On WebAssembly, BLAKE2 kept its form before, until
-[D-89](#decision-d-89).
-
-These are forms of the portable code that the target chooses at compile time, not CPU-specific code
-under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on public lengths.
-The words are arrays indexed by constants only, so [D-76](#decision-d-76) treats them as register
-values at opt-level 3, whose spills are copies that the compiler makes, and they are wiped at other
-levels; a partial output word, in a buffer with a run-time length, is wiped on every path.
-
-Rationale: the buffers took more than their stores, since each read of a word came right after its
-store. In bench run 42297409561, the time before over the time here for BLAKE3, as a median over the
-13 classes of CPU and runtime under wasmtime and Node.js, was 1.058 for an empty message, 1.040 for
-64 bytes, 1.081 and 1.046 keyed, 1.104 for `derive_key` and 1.112 with two contexts in turn. In bench
-run 42302165419, on armv7 on Neoverse N2, it was 1.170 and 1.162 for BLAKE3, 1.175 and 1.160 keyed,
-1.039 to 1.093 for BLAKE2 digests of one block and 1.043 to 1.161 for its MACs, and 0.994 to 1.012
-for the rows of many blocks.
-
-BLAKE2 stayed out of WebAssembly here because of one compiler. Its 16 words of state, 16 of message and 8
-of chaining value in locals took Cranelift 166 stack slots against 37 for BLAKE2b, most of them for
-one store and one reload. In that run, for BLAKE2b of one block, the time before over the time here
-was 1.01 to 1.24 under Node.js and 1.05 to 1.12 under wasmtime on Ice Lake, Emerald Rapids and
-Neoverse N2, but 0.70 to 0.86 under wasmtime on Zen 3, Zen 4 and Zen 5. Why those cores take these
-slots so badly was not established. The state in memory and a block out of line each left 142 to 163
-slots, so no form was found then that holds for both runtimes; [D-89](#decision-d-89) has one.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-87
 
@@ -985,235 +796,43 @@ and tiny-keccak 2.0.2 give the same values for each of the 284 messages.
 
 ## Decision D-88
 
-On WebAssembly, a digest of Keccak of at least a block in one call copies what follows the whole blocks
-into a block in memory, pads it there, and absorbs it in the loop over the whole blocks, so that one
-copy of the rounds runs every block of the call. That block is a stack buffer, wiped before the
-function returns, as the state is. A digest of less than a block keeps the form that takes its lanes as
-arguments, and streaming updates keep the loop over the blocks. On the same target the zero state, the
-zero block and the wipes of values of four bytes and more are stores of a word each, with no
-`memory.fill`, which is a call into the runtime. A tail of under 128 bytes goes into the block with no
-`memory.copy`. On the other targets without stable inline assembly, and under Miri, `wipe` takes the
-same stores; these targets are not measured, and CI runs this path on them.
-
-The form is portable code that the target chooses at compile time, not CPU-specific code under
-[15.3](15-platforms.md#153-cpu-specific-code). Which path runs, and how many bytes each copy takes,
-depend only on public lengths.
-
-Rationale: with a copy of the rounds of its own for the last block, a digest of a block or two took
-more time than the instructions it runs. In bench run 42329884751, the time before over the time
-here for Keccak-256 of 136 bytes was 1.24 (Ice Lake), 1.13 (Zen 3), 1.07 (Emerald Rapids), 1.07 (Zen
-4), 1.05 (Neoverse N2) and 1.00 (Zen 5) under wasmtime, and 1.01 to 1.04 under Node.js on Emerald
-Rapids, Neoverse N2, Zen 3 and Zen 5. At 1 KiB, as a median over the rows of SHA-3, SHAKE, cSHAKE,
-KMAC and Keccak-256, it was 1.07, 1.03, 1.07, 1.03, 1.01 and 1.01 under wasmtime in that order.
-Hashes of less than a block take the same code as before. At 16 KiB no class loses more than 2
-percent, except under Node.js on Zen 4, where the one job there measured long rows at 0.96; the loop
-of V8 has 621 instructions on ARM64 here and 655 before, so the bench of the release has to confirm
-that class on more jobs. Over the 33 rows of the sponge in eleven classes, rows that rivals led went
-from 7 to 3, and rows ahead by 3 percent or more from 315 to 319.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-89
 
-On WebAssembly, each block of a BLAKE2 digest or MAC of more than a block takes a call of one
-function, with the chaining value in memory and the message words read from the input ahead of the
-state. A key block and the tail of a message, padded in a block in memory that is wiped before the
-function returns, take the same function. A digest or MAC of at most a block, with an output of 4 or
-8 words, takes the message straight from its slice into the rounds: a whole block, half a block or
-nothing with the zero words folded away, and any other length through words in memory, which are
-wiped. The zero block, the zero words of BLAKE2b and the wipes of its state are stores, with no
-`memory.fill`, and the tail goes into its block with no `memory.copy`. Streaming updates call the
-compression for each block, with the words in memory, which are wiped. `HashAlgorithm::digest_into`
-and `digest_unchecked` are inlined into their callers on WebAssembly, and what they call for BLAKE2 is
-not generic: a generic function would be compiled in the crate of the caller, at the opt-level of
-that crate, while the wipes of [D-76](#decision-d-76) follow the opt-level of this one.
-
-On WebAssembly and 32-bit Arm, the compression copies the message words into locals ahead of the
-state. On 32-bit Arm, the chains of BLAKE3 run one at a time, and the whole blocks of an extended
-output go straight into the output, as on 32-bit x86 and WebAssembly.
-
-These are forms of the portable code that the target chooses at compile time, not CPU-specific code
-under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on public lengths.
-The words and the state of the rounds are arrays indexed by constants only, so
-[D-76](#decision-d-76) treats them as register values at opt-level 3, and they are wiped at other
-levels; what a call takes the address of is wiped on every path.
-
-Rationale: under Cranelift, the compiler of wasmtime, a value live through the rounds holds a spill
-slot that the values of the rounds cannot share, and regalloc2 looks at only ten slots before it
-opens a new one. In a loop with the chaining value in locals, each spill took a slot of its own: 157
-for BLAKE2b against 37 in this form. A loop with the chaining value in memory took as few slots, but
-the values of the loop took the slots that a byte of displacement reaches, with 8047 bytes of code
-for BLAKE2s against 7588 here and 7562 in p3-blake2s, and in bench run 42333112013 it took 3 percent
-more time than here on Ice Lake. That core decodes 16 bytes a cycle outside its cache of
-micro-operations, which fits the difference; the cause was not measured directly.
-
-In bench run 42337573871, the time before over the time here, as a median over the rows of 1 KiB and
-16 KiB and over the rows of at most a block, was 1.47 and 1.20 (Zen 3), 1.51 and 1.12 (Zen 4), 1.14
-and 1.18 (Zen 5), 1.06 and 1.20 (Ice Lake), 1.03 and 1.14 (Granite Rapids) and 1.00 and 1.16
-(Neoverse N2) under wasmtime, and 1.00 and 1.23 (Neoverse N2), 0.97 and 1.21 (Zen 3), 0.97 and 1.27
-(Zen 5) and 1.02 and 1.15 (Emerald Rapids) under Node.js. The rows that rivals led went from 141 to
-26 of 170 in those ten classes.
-
-Under wasmtime on Zen cores, one process can take 1.5 to 2.5 times the time of another on the same
-code with the same input, on all the rows of one function; the cause was not measured. In that run
-this took long rows before this change, of BLAKE2s in 6 of 10 processes on Zen 3 and 2 of 4 on Zen 4
-and of BLAKE2b in 2 of 4 on Zen 5, and here BLAKE2b in 1 of 4 on Zen 5 and no other row. The median
-of 1.14 holds that process: the same form without the change of `digest_into` below had none, and a
-median of 1.33.
-
-Out of line, `HashAlgorithm::digest_into` was one more call, with its frame, on every digest of a
-caller's buffer. With the arms of BLAKE2 in `digest_unchecked`, LLVM stopped inlining it, as
-`#[inline]` is a hint. In that run this took `blake3/0` and `blake3/64` 3 to 10 percent more time
-under wasmtime and 1 to 5 percent more under Node.js. With the attribute on WebAssembly they take at
-most 1.1 percent more than before the arms of BLAKE2. After that run the digests of at most a block
-were made not generic, which is 14 more instructions on ARM64 for BLAKE2s, of 1152 for an empty
-message, and 5 fewer for BLAKE2b. With this crate at opt-level 3 and the application at 1, on x86-64,
-ARM64, i686, armv7, riscv64 and WebAssembly, what the application's crate compiles of this one is drop
-glue and `Debug`.
-
-A module has one form for every CPU, and this one has costs. Long rows under Node.js take 3 percent
-more on Zen 3, Zen 4 and Zen 5, where the median of the leading rival over this code goes from 1.02
-to 1.04 down to about 1.00, while rows of at most a block there take 17 to 22 percent less. On
-Neoverse N2 under wasmtime a block takes 2 percent more than in the loop with the chaining value in
-memory. With the chaining value in locals, in bench run 42329048951, long rows took 24 to 56 percent
-more than that loop under wasmtime on Zen cores, and under Node.js 2 percent less on Neoverse N2,
-Zen 4 and Zen 5 and 3 percent more on Zen 3, so that form does not hold for both runtimes.
-
-LLVM's Reassociate adds the values of an expression by rank, and a load ranks by its place in the
-block. A word read in the rounds had the higher rank through the first rounds, and went into `a + b
-+ x` after `b`, one more step on the longest chain of dependencies, in 32 of the 160 sums of BLAKE2s.
-Read ahead of the state, it goes in first. In bench run 42329048951 that took 1 percent less time on
-armv7 on Neoverse N2. On i686 it gave nothing on long rows and took up to 1 percent more on short
-ones, and an A/B on one ARM64 core gave no gain, so these targets, x86-64 and riscv64 keep the form
-before.
-
-On armv7, BLAKE3 executes fewer instructions with its chains one at a time: 2341 against 2589 for an
-extended output of 128 bytes from 64, 16019 against 17219 for 1024 bytes, 31398 against 32117 for a
-hash of 2 KiB and 63681 against 63804 for 4 KiB. In bench run 42329048951, on armv7 on Neoverse N2,
-the median of the time before over the time here was 1.00 over the rows of 1 KiB and 16 KiB and 1.03
-over the others, and the rows that rivals led went from 12 to 1 of 36. That row is `derive_key`
-against rscrypto, which keeps the last context's key in a `thread_local`.
-
-The machine code of x86-64, ARM64, i686 and riscv64 is the same as before, function by function.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-90
 
-On WebAssembly, the public entries of digests, extended outputs, MACs and key derivation are inlined
-into their callers, where a constant algorithm leaves one arm. What is inlined checks lengths and
-routes, and each arm is a call of a function that is neither generic nor inlined: the code that holds
-a message, a key or a state stays compiled in this crate, at its opt-level, which the wipes of
-[D-76](#decision-d-76) follow. A message of Keccak shorter than a block from the zero state takes one
-function for each rate, with one call of the rounds for each number of whole lanes, so that no lane
-is tested at run time. cSHAKE and KMAC, which start from a state of their own, keep the tests.
+`MacAlgorithm::digest_into` is inlined into its callers, as a hint, and it reaches BLAKE2 and BLAKE3
+by calls of their own functions. HMAC and KMAC stay behind one function out of line on x86-64 and
+riscv64, and all of the MAC on ARM64: called from code inlined in another crate, the functions of
+this crate that they call would be exported, and the other callers in this crate would reach them
+through the GOT.
 
-On the other targets `MacAlgorithm::digest_into` is inlined too, as a hint, and it reaches BLAKE2 and
-BLAKE3 by calls of their own functions. HMAC and KMAC stay behind one function out of line on x86 and
-riscv64, and all of the MAC on ARM64: called from code inlined in another crate, the functions of this
-crate that they call would be exported, and the other callers in this crate would reach them through
-the GOT, on 32-bit x86 with their arguments on the stack.
-
-These are forms of the portable code that the target chooses at compile time, not CPU-specific code
+This is a form of the portable code that the target chooses at compile time, not CPU-specific code
 under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on public lengths.
-With this crate at opt-level 3 and the application at 1, on x86-64, ARM64, i686, armv7, riscv64 and
-WebAssembly, what the application's crate compiles of this one is drop glue, `Debug` and, on armv7,
-`MacAlgorithm::digest_into`, which checks lengths and routes.
+With this crate at opt-level 3 and the application at 1, on x86-64, ARM64 and riscv64, what the
+application's crate compiles of this one is drop glue and `Debug`. The forms that this decision gave
+WebAssembly are withdrawn by [D-105](#decision-d-105).
 
-Rationale: a dispatcher out of line took about 50 instructions of each call on WebAssembly, a test
-of the kind and of a key of a constant length 3 to 6 percent of a MAC of a block, and the tests of
-the lanes 2 percent of a digest of SHA-3. Instructions on ARM64 under wasmtime, before and here:
-SHA3-256 of 64 bytes 5354 and 5145 (libcrux 5164), keyed BLAKE3 of nothing 1116 and 1046 and of 64
-bytes 1124 and 1057 (ab-blake3 1118 and 1147), `derive_key` of 32 bytes 2228 and 2157 (ab-blake3
-2228), the BLAKE2s MAC of 64 bytes 2788 and 2736 (rscrypto 3182).
-
-In bench run 42350709458, the time before over the time here, as a median per class:
-
-- SHA-3 and SHAKE of 64 bytes: 1.06 (Zen 5), 1.06 (Zen 4), 1.05 (Zen 3), 1.04 (Neoverse N2) and 1.04
-  (Granite Rapids) under wasmtime, and 1.05 (Granite Rapids, Ice Lake, Neoverse N2, Zen 3), 1.04 (Zen
-  4) and 1.03 (Zen 5) under Node.js.
-- BLAKE3 of at most a block, keyed or not, and `derive_key`: 1.06 (Zen 4, Neoverse N2, Zen 3), 1.04
-  (Zen 5, Granite Rapids) under wasmtime, and 1.03 (Neoverse N2), 1.02 (Granite Rapids, Zen 3, Zen 5),
-  1.01 (Zen 4) and 1.00 (Ice Lake) under Node.js. Rows of these that rivals led went from 12 to 5 of
-  55, and rows ahead by 3 percent or more from 23 to 36.
-- On x86-64, keyed BLAKE3 of at most a block: 1.03 on Zen 5, 1.02 on Emerald Rapids and Ice Lake, 1.01
-  on Zen 4 and 1.00 on Zen 3; on i686, 1.01 to 1.07 by row.
-
-Over all rows of BLAKE2 and BLAKE3 in those eleven classes, rows that rivals led went from 44 to 33 of
-330, and of Keccak from 4 to 3 of 275.
-
-In one process, where the copies run in turn, no row of BLAKE2 and BLAKE3 took more than 2 percent
-more, except BLAKE2b of nothing under Node.js on Ice Lake, at 0.97, with crypto-pq ahead of the rivals
-by 19 percent. Rows measured in separate processes, as SHA-2, HMAC and HKDF are here, moved by up to 11
-percent on code that did not change: SHA-224 in updates of 64 bytes under wasmtime on Zen 3 took 0.89
-to 0.91.
-
-A module holds what it calls. In test modules with one family and its rivals, the size went from
-318157 to 141131 bytes for BLAKE3 and from 325329 to 199380 for BLAKE2. Each rate of Keccak in use
-adds about 3.5 KB of functions for its first block: from 310969 to 317376 bytes with two rates.
-
-The machine code of x86-64, ARM64, i686, armv7 and riscv64 differs, function by function, only in the
-MAC entries.
+Rationale: a test of the kind and of a key of a constant length took 3 to 6 percent of a MAC of a
+block. In bench run 42350709458, on x86-64, the time before over the time here for keyed BLAKE3 of at
+most a block was 1.03 on Zen 5, 1.02 on Emerald Rapids and Ice Lake, 1.01 on Zen 4 and 1.00 on Zen 3.
+The machine code of x86-64, ARM64 and riscv64 differed from that before, function by function, only
+in the MAC entries.
 
 ## Decision D-91
 
-On 32-bit Arm, the loops over the whole blocks of BLAKE2 read the message words of each block after
-the state, where [D-89](#decision-d-89) reads them ahead of it. They take every block of an
-incremental hash or MAC but the last, and every block of a digest or MAC of more than a block in one
-call but, for BLAKE2s, its key block and last block. Those blocks, and digests and MACs of at most a
-block, keep the order of D-89.
-
-This is a form of the portable code that the target chooses at compile time, not CPU-specific code
-under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on public lengths.
-The words and the state are arrays indexed by constants only, so [D-76](#decision-d-76) treats them
-as register values at opt-level 3, and they are wiped at other levels.
-
-Rationale: in bench run 42357880614, on armv7 on Neoverse N2, the time with the words after the
-state on every path over the time in the order of D-89, as a median over 20 processes, was 0.993 and
-0.992 for BLAKE2s of 1 KiB and 16 KiB, 0.993 and 0.982 for its MAC, and 0.999 for BLAKE2b of both
-lengths, keyed or not. In that order, rows of at most a block took 1.010 to 1.020 for BLAKE2s and
-0.995 to 0.998 for BLAKE2b; the rounds of a lone block are not changed here. The cause was not
-measured. In bench run 42362652467, over 20 processes, this form took 0.994 and 0.992 for BLAKE2s,
-0.993 and 0.992 for its MAC, 0.999 for BLAKE2b and 1.000 to 1.002 for rows of at most a block,
-while a copy of the code before took 0.999 to 1.000 of the time of the other. The time of the
-leading rival over the time here was 0.991 for BLAKE2s of 1 KiB, against 0.984 before, 0.996 for
-16 KiB, against 0.988, and 0.992 for its MAC of 16 KiB, against 0.984.
-
-The two loops, `whole_blocks` of BLAKE2s and `all_blocks` of BLAKE2b, are the machine code measured
-in the first run, and every other function of armv7 is the machine code before. The machine code of
-x86-64, ARM64, i686, riscv64 and WebAssembly is the same as before, function by function.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-92
 
-On 32-bit Arm and WebAssembly, Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128 of data given in one
-call take the padded last block through a permutation of its own after the loop over the whole
-blocks, where before it was the last step of that loop. The output words, and the wipe of the state
-at the end at every opt-level, are as before. ARM64, where the same form took more time, riscv64 and
-x86-64 without AVX2, where it was not measured, and 32-bit x86, which has a digest of its own, keep
-the code before.
-
-This is a form of the portable code that the target chooses at compile time, not CPU-specific code
-under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on public lengths.
-
-Rationale: in bench run 42362652467, in one process where the copies run in turn, the time here over
-the time before, as a median over the processes, for Ascon-Hash256 of 1 KiB, was 0.984 on armv7 on
-Neoverse N2; 0.963 (Ice Lake), 0.974 (Neoverse N2), 0.988 (Zen 3), 0.991 (Zen 5), 0.997 (Granite
-Rapids) and 1.012 (Zen 4) under wasmtime; and 0.980 (Zen 3), 0.989 (Zen 5), 0.993 (Ice Lake, Zen 4)
-and 0.998 (Emerald Rapids, Neoverse N2) under Node.js. Over the 15 rows of Ascon in these 13
-classes, rows that rivals led went from 2 to 1 of 195, and rows ahead by 3 percent or more from 90
-to 122. The two rows led before, Ascon-Hash256 and Ascon-CXOF128 of nothing under wasmtime on
-Neoverse N2, where the time of the leading rival over the time before was 0.985 and 0.989, are at
-1.006 and 0.998.
-
-Under Node.js on Zen 3, outputs of 1 KiB and 16 KiB took 1.004 to 1.007, and Ascon-XOF128 of 64
-bytes to 16 KiB, where the time of the leading rival over the time before was 0.993, is at 0.986,
-the one row led here. Under wasmtime on Zen 4, inputs of 1 KiB and 16 KiB took 1.011 to 1.013, and
-under Node.js on Zen 5, Ascon-CXOF128 of 64 bytes to 32 took 1.036, with crypto-pq still ahead of
-the rivals there by 8.6 percent. A WebAssembly module has one form for every CPU
-([D-85](#decision-d-85)). In the same processes, a copy of the code before took 0.990 to 1.004 of
-the time of the other, by row, the widest on inputs of nothing. On ARM64 on Neoverse N2, the same
-form took 0.995 to 1.014 of the time, by row. The cause was not measured.
-
-The function grows from 2372 to 3419 lines of assembly on armv7 and from 2444 to 3461 on
-WebAssembly. It is the machine code measured, and every other function of these targets is the
-machine code before. The machine code of x86-64, ARM64, i686 and riscv64 is the same as before,
-function by function.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-93
 
@@ -1241,8 +860,7 @@ of the code before took 0.972 to 1.021 of the time of the other, by row. SLH-DSA
 Rows that rivals led over those 40 rows in these five classes went from 4 of 200 to 0 in one copy
 and 2 in the other. On Ice Lake, SHA-384 and SHA-512 of nothing were at 1.055 and 1.054 against
 aws-lc-rs in the first copy and at 0.946 and 0.940 in the second, with the same machine code,
-against 0.951 and 0.953 before. As in [D-85](#decision-d-85), the place of the code decides the
-hashes of nothing. Intel's cores with AVX-512 other than Ice Lake, Emerald Rapids and Granite Rapids
+against 0.951 and 0.953 before. The place of the code decides the hashes of nothing. Intel's cores with AVX-512 other than Ice Lake, Emerald Rapids and Granite Rapids
 were not measured.
 
 The test of the tier and both forms are in one function out of line, which grows from 415 to 759
@@ -1253,227 +871,23 @@ random pairs of blocks and on lone blocks, and CI fails unless a runner with AVX
 
 ## Decision D-94
 
-On 32-bit x86, the compression of each whole block of a BLAKE3 extended output adds each message
-word to a after b, where the other compressions add it before b. The sum modulo 2^32 is the same,
-so the outputs are unchanged. The other compressions of 32-bit x86, and every other target, keep
-the order before.
-
-This is a form of the portable code that the target chooses at compile time, not CPU-specific code
-under [15.3](15-platforms.md#153-cpu-specific-code).
-
-Rationale: in this compression the message words come from memory in the rounds of each block of
-output, and added first they made LLVM keep more of the state on the stack. The function had 1338
-instructions against 1287 here, with 122 ALU operations on a stack operand against 109, and a block
-of output ran 1353 instructions against 1302, where purecrypto's portable code runs 1313. In bench
-runs 42379815803 and 42383650346, in one process where the copies run in turn, the time before over
-the time here, each the median over the processes, for outputs of 1 KiB and 16 KiB from 64 bytes,
-was 1.046 to 1.056 on Zen 3 and Zen 4, 1.025 to 1.052 on Ice Lake, 1.025 to 1.032 on Emerald
-Rapids, 1.029 to 1.039 on Granite Rapids and 1.005 to 1.018 on Zen 5. For the output of 16 KiB, the
-time of the rival that leads it, purecrypto, over the time before was 0.977 to 0.979 on Zen 4 and
-0.998 to 1.006 on Zen 3, and over the time here it is 1.030 and 1.050 to 1.053.
-
-An output of one block runs the function once. There the time before over the time here was 0.995
-to 1.015 in the other classes, while on Ice Lake the time follows the place of the code, as in
-[D-85](#decision-d-85). In each process of both runs, the two copies of the code here, the same
-machine code, took 122.2 to 122.6 ns and 133.2 to 133.9 ns. The two copies of the code before took
-116.5 to 118.5 ns in run 42383650346, and 118.3 to 118.6 ns and 135.3 to 135.5 ns in run
-42379815803. At the best place measured for each, 122.2 ns against 116.5 ns, this output takes 4.9
-percent more on Ice Lake. 32-bit x86 runs one form of the portable code on every processor, and
-this is the class that loses: the rival that leads the row there, krypteia-tessera, took 216.5 to
-219.3 ns.
-
-The machine code of x86-64, ARM64, armv7, riscv64 and WebAssembly is the same as before, function
-by function, and on i686 only this function changes.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-95
 
-On 32-bit x86, BLAKE2b and BLAKE2s copy the whole words of a last block that is neither a whole
-block nor half a block in a function of their own, out of line, which tests the length before each
-word. There the loop before, which every other target keeps, compiled to a call of memcpy. A partial
-last word, half a block and a whole block are read as before. Which words are copied depends only
-on the length of the input, which is public.
-
-This is a form of the portable code that the target chooses at compile time, not CPU-specific code
-under [15.3](15-platforms.md#153-cpu-specific-code).
-
-Rationale: under QEMU, an input runs from 20 fewer to 32 more instructions with the copy here.
-BLAKE2s of 16 bytes runs 1919 instructions against 1930 before, of 63 bytes 1990 against 1959 and
-of 127 bytes 3842 against 3811, and BLAKE2b of 16 bytes 2526 against 2546. The time drops all the
-same: the call of memcpy took more time than the instructions of the copy here. In bench run
-42392545478, in one process where the copies run in turn, the time before over the time here, each
-the median over the processes, as a geometric mean over the 23 rows of BLAKE2b, BLAKE2s and their
-MACs whose last block takes this copy, was 1.046 on Zen 3, 1.023 on Zen 4, 1.016 on Zen 5, 1.046 on
-Ice Lake and 1.105 on Emerald Rapids, and by row 1.019 to 1.072, 1.004 to 1.050, 0.991 to 1.056,
-1.015 to 1.084 and 1.032 to 1.239. Over the 72 rows that run the same instructions as before, the
-other lengths of BLAKE2, BLAKE3, and SHA-256, SHA-512, SHA3-256 and Keccak-256, which the same
-dispatcher of digests runs on 32-bit x86, it was 0.999 to 1.002 in each class and 0.927 to 1.063 by
-row, with rows on both sides of 1 in each class, as the place of the code moves them
-([D-85](#decision-d-85)). Of the 270 rows of BLAKE2 in these five classes, rivals led 41 and 44 in
-the two copies of the code before and 12 and 17 in the two copies here.
-
-Inlined into its callers on every target, in bench run 42388218855, the copy took more time under
-wasmtime, up to 22 percent for BLAKE2s of 48 and 63 bytes on Zen 3, and up to 2.5 percent at those
-lengths on Neoverse N2 in ARM64 code, so the other targets keep the loop. On 32-bit x86 it took Ice
-Lake 7 to 11 ns more, inlined, for BLAKE2s and its MAC of 0, 1, 32 and 64 bytes, which do not run
-it. Out of line, those inputs are among the 72 rows above.
-
-On Zen 5, BLAKE2s of 100 and 127 bytes and its MAC of 127 bytes took 0.0, 0.9 and 0.2 percent more
-time, and there the time follows the place of the code. In each of the three processes, one copy of
-the code here took 1.8 to 2.8 percent less time than the code before for BLAKE2s of 100 and 127
-bytes, and the other copy, the same machine code, 2.4 to 3.8 percent more, while the two copies of
-the code before were within 0.5 percent of each other. 32-bit x86 runs one form of the portable
-code on every processor, and this is the class that does not gain at these lengths: p3-blake2s,
-which leads both rows there, took 179.5 and 180.4 ns, against 184.1 to 184.7 ns before and 179.0 to
-191.5 ns here.
-
-The copy reads the input only below its length and writes only the block of message words, which
-its callers wipe as before. It keeps each word in a register and stores nothing on the stack but a
-saved register. A MAC key that is neither a whole block nor half a block is copied the same way. The
-reference answers of BLAKE2 for inputs of 0 to 255 bytes and the self-test of RFC 7693, whose keys
-are of 16 to 64 bytes, pass on i686 at opt-level 3 and z and in debug builds.
-
-The machine code of x86-64, ARM64, armv7, riscv64 and WebAssembly is the same as before, function
-by function. On i686 the copy is a new function, and the functions that call it change: the
-dispatcher of digests, the finish of the incremental forms of BLAKE2b and BLAKE2s, and their MACs.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-96
 
-On 32-bit Arm, a BLAKE2s digest or MAC of more than a block of data runs its key block and its last
-block in a function of their own, out of line, which reads the bytes into words held in registers
-and the spills of the compiler, with zeros after them, as digests and MACs of at most a block do.
-The blocks between them run in the loop over whole blocks of [D-91](#decision-d-91), as before.
-There each of the two blocks was an array in memory, which took a call of memset to fill and
-another to wipe and a call of memcpy for its words, and the output took one more call of memcpy:
-32-bit Arm has no NEON in its baseline. BLAKE2b and the incremental forms keep the code before.
-
-This is a form of the portable code that the target chooses at compile time, not CPU-specific code
-under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on the length of
-the data, which is public.
-
-Rationale: under QEMU, BLAKE2s of 65 bytes runs 2857 instructions against 3033 before, of 128 bytes
-2911 against 3028 and of 192 bytes 4263 against 4380, and its MAC of 65 bytes 4288 against 4561.
-p3-blake2s runs 2916, 2940 and 4325 instructions for these digests. In bench run 42401270582, on
-armv7 on Neoverse N2, in one process where the copies run in turn, the time before over the time
-here, each the median over the processes, was 1.030 to 1.060 for BLAKE2s of 65, 100, 127, 128, 129
-and 192 bytes, 1.060 to 1.071 for its MAC of 65, 127 and 128 bytes, 1.004 and 1.011 for both of
-1 KiB and 0.998 to 1.000 for both of 16 KiB. Over the 66 rows that run the same code as before, the
-other lengths, BLAKE2b and BLAKE3, it was 0.994 to 1.004. The time of p3-blake2s over the time
-here, for these digests, is 0.998 to 1.015, against 0.944 to 0.975 before, and that of blake2-rfc
-for these MACs is 1.032 to 1.055, against 0.967 to 0.987. Among the rivals counted on 32-bit Arm,
-these two led all nine rows before.
-
-The words and the state in the new function are arrays indexed by constants only, so
-[D-76](#decision-d-76) treats them as register values at opt-level 3, and they are wiped at other
-levels. The state that the loop over whole blocks takes stays in memory and is wiped at the end, as
-before. The function reads the data only below its length and writes only the output. A unit test
-checks this path against the compression of padded blocks, for both word sizes, data of a block and
-a byte to three blocks, keys of a byte, 7 bytes, half a block and a block, and outputs of a byte, 7
-bytes and a whole digest. The reference answers of BLAKE2 for inputs of 0 to 255 bytes and the
-self-test of RFC 7693 pass on armv7 at opt-level 3.
-
-The machine code of x86-64, ARM64, i686, riscv64 and WebAssembly is the same as before, function by
-function. On armv7 the new function has 1618 instructions. Its callers, the dispatcher of digests
-and the MAC of BLAKE2s, have 158 and 280 fewer. The compression of BLAKE2s, now called only by the
-finish of the incremental form, with the final flag, has 32 fewer, and the finish one fewer. The MAC
-of BLAKE2b has a compare in another form and the same number of instructions.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-97
 
-On WebAssembly, BLAKE2b and BLAKE2s pad a block that holds fewer bytes than a block in groups of 8
-bytes at an address aligned to 8: the key block and a partial last block of a digest or MAC of more
-than a block of data, and the data of one of at most a block whose length is neither a block, half a
-block nor zero. The whole groups of the bytes are copied 8 bytes at a time, in two copies of a power
-of two of groups that overlap, and the bytes of a last partial group are read with loads within the
-input, put together in a register and stored as one group. The other groups are zeros, stored as
-groups, and a volatile store of 8 bytes for each group wipes the block. In a digest or MAC of at
-most a block, the function of the rounds of a whole block reads this block, and the function that
-read the words of these lengths from memory, a second copy of the rounds, is gone. Before, the bytes
-of a block of a longer input went into the zero block in pieces of the bits of their length, and the
-data of at most a block went into words in memory, its whole words through `memory.copy`, a call
-into the runtime.
-
-The loop of a digest or MAC of more than a block, with its key block and its padded blocks, is
-inlined into the function that the dispatcher calls, which calls the function of the rounds for each
-block, as in [D-89](#decision-d-89). Before, the loop and the padding of a block were functions of
-their own, each call with a frame on the stack, and the padding and the function around the loop
-with one in linear memory as well. A MAC dispatches as the digests do: by the lengths, in the
-caller, to a function for at most a block of data or to one for more, each not generic and out of
-line, so that the loop inlined into the one for more adds nothing to the frame of a MAC of at most a
-block. A MAC with a key of other than half a block and at most a block of data keeps the code before
-for its key block.
-
-These are forms of the portable code that the target chooses at compile time, not CPU-specific code
-under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs and which copies run depend
-only on the lengths, which are public.
-
-Rationale: a load of a word that two stores wrote, in part each, cannot take its value from the
-stores and waits until they reach the cache. In pieces of the bits of its length, a tail of 31 bytes
-was stores of 16, 8, 4, 2 and 1 bytes, and the last word of BLAKE2s came from three stores. Here
-each word that the rounds read comes from one store. Under QEMU, in the x86-64 code that wasmtime
-compiles, BLAKE2s of 31 bytes runs 2033 instructions against 2098 before, of 65 bytes 3878 against
-4055 and of 127 bytes 3888 against 4107, and its MAC of 65 bytes 5775 against 6086. BLAKE2b of 31
-bytes runs 2411 against 2461 and of 255 bytes 4676 against 4887, and its MAC of 31 bytes 4410
-against 4509. Digests of no data, half a block and a block run the same instructions of this crate
-as before. In a module of these digests and MACs, the code that wasmtime compiles for the functions
-of BLAKE2 is 113888 bytes against 126496.
-
-In bench run 42410946244, in one process where the copies run in turn, two copies of the code here
-and two of the code before, the time before over the time here, each the geometric mean of its two
-copies of the median over the processes, as a geometric mean over the 47 rows of BLAKE2b, BLAKE2s
-and their MACs whose code changed, was 1.016 on Emerald Rapids, 1.017 on Granite Rapids, 1.023 on
-Neoverse N2, 1.038 on Zen 3, 1.025 on Zen 4 and 1.031 on Zen 5 under wasmtime, and 1.015 on Ice
-Lake, 1.036 on Neoverse N2 and 1.024 on Zen 3, Zen 4 and Zen 5 under Node.js. Over the 25 rows of
-BLAKE3, whose code is the same, it was 0.999 to 1.001 in each class, and by row 0.966 to 1.107. Of
-the 594 rows of BLAKE2 in these eleven classes, rivals led 160 by more than 1 percent in both copies
-of the code before and 59 in both copies here.
-
-A module has one form for every CPU and every runtime, and these rows take more time here against
-both copies of the code before, by more than the rows of BLAKE3 moved in their class. Under Node.js
-on Ice Lake, BLAKE2s of 1, 16, 33, 48 and 63 bytes takes 0.9 to 4.5 percent more, and digests of no
-data 2.9 to 4.9 percent more; p3-blake2s led those five rows by 0.1 to 3.2 percent before and leads
-them by 2.3 to 5.4 percent here. Under Node.js digests of no data take 3.9 to 6.2 percent more on
-Zen 3, BLAKE2b of 64 bytes and its MAC 1.2 to 3.5 percent more on Zen 4, and BLAKE2b of 64 and 128
-bytes and its MAC of 128 bytes up to 2.4 percent more on Zen 5. Under wasmtime BLAKE2s of 64 bytes
-and BLAKE2b of 100 bytes take 1.0 to 1.6 percent more on Granite Rapids, BLAKE2s of 16 KiB 1.7 to
-1.9 percent more on Zen 4, which blake2 now leads by 1.3 percent, and the BLAKE2b MAC of no data 5.9
-to 11 percent more on Zen 3, where rows of BLAKE3 moved by up to 3.5 percent. Rivals lead none of
-the other rows of this list.
-
-Under wasmtime on Zen 4 and Zen 5, the time of BLAKE2s MACs of 1 to 64 bytes follows the place of
-the code, as in [D-85](#decision-d-85). In each process, for each of these rows, one copy of the
-code here took 27 to 35 percent more time than the other, the same machine code, on Zen 5, and 6 to
-13 percent more on Zen 4. The other copy took from 4.9 percent less to 1.8 percent more than the
-copy of the code before that took less, on Zen 5, and from 9.1 percent less to 2.1 percent more on
-Zen 4. In bench run 42388218855 two copies of other code, the same machine code, differed by up to
-28 percent on these rows on Zen 5, and here the two copies of the code before differ by 17 percent
-on the BLAKE2b MAC of 1 byte there. On Zen 3 the two copies of the code here are within 2.3 percent
-of each other on these rows.
-
-Other forms ran more instructions under QEMU: with the chaining value held in the output between
-blocks, 21 to 50 more for each block, and with the loop over the blocks in `chunks_exact`, where the
-length of a block is no longer a constant, 12 more for each call. The padded block is sliced to its
-length where the rounds take it: one function of the standard library flattens the groups of both
-sizes of block, and from it LLVM knew the length of the block of BLAKE2b only as a range, so the
-function of its rounds checked the length.
-
-The block holds bytes of the key or of the data, and it is wiped after the rounds on every path, by
-the wipe module, which [23.2](profiles/rust.md#232-security-mechanics) item 1 lists for unsafe code.
-The loads of the last bytes stay within the input. The dispatchers of the MAC are inlined into the
-caller and test lengths only; what they call is not generic, so the code that reads the key and the
-data is compiled in this crate, at its opt-level, as [D-89](#decision-d-89) requires. With this
-crate at opt-level 3 and the application at 1, on x86-64, ARM64, i686, armv7, riscv64 and
-WebAssembly, what the application's crate compiles of this one is drop glue and `Debug`, as before.
-On WebAssembly the hook for a CPU kernel of a MAC returns that there is none, and the path for at
-most a block no longer calls it, as the digests do not. A unit test checks the padded block of every
-length from none to a block, for both word sizes: its length, the bytes, then zeros. The reference
-answers of BLAKE2 for inputs of 0 to 255 bytes and the self-test of RFC 7693 pass on wasm32-wasip1
-at opt-level 3 and z.
-
-The machine code of x86-64, ARM64, i686, armv7 and riscv64 is the same as before, function by
-function. On WebAssembly the functions of BLAKE2 above change, with `MacAlgorithm::digest` and
-`verify`, into which the dispatch of the MAC is inlined, and the one-call digest of Keccak, whose
-test of the rate against its block takes the other form of the same compare, with the same number of
-instructions.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-98
 
@@ -1538,140 +952,13 @@ application at 1, on all six, what the application's crate compiles of this one 
 
 ## Decision D-99
 
-On 32-bit Arm, a BLAKE2b digest or MAC of more than a block of data runs in one function, out of
-line, that reads the words of the key block and of the last block from their bytes, with zeros
-after them, as the function of [D-86](#decision-d-86) for at most a block does, and those of the
-whole blocks between them from the input, and runs every block through one copy of the rounds.
-Before, it took the portable code of the other targets, where the key block and the last block were
-arrays in memory: calls of memset filled and wiped them, a call of memcpy copied the bytes of each,
-and another the output. BLAKE2s keeps the form of [D-96](#decision-d-96), and digests and MACs of
-at most a block and the incremental form keep the code before.
-
-This is a form of the portable code that the target chooses at compile time, not CPU-specific code
-under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on the lengths,
-which are public.
-
-Rationale: under QEMU, BLAKE2b of 129 bytes runs 10531 instructions against 10846 before, of 255
-bytes 10641 against 10922, of 1 KiB 41653 against 42040 and of 16 KiB 662413 against 665200, and
-its MAC of 255 bytes 15857 against 16326. blake2-rfc runs 10905, 10890, 42301, 670861 and 16111.
-Over the instructions that BLAKE2b of 255 bytes executes, llvm-mca for Cortex-A57 counts 3552 cycles
-against 3653 before and 3631 for blake2-rfc.
-
-The form of D-96, a function for the key block and the last block and the loop over whole blocks,
-ran BLAKE2b through two copies of the rounds: 44 KB of code for a digest of 255 bytes, where one
-copy takes 21 to 24 KB on 32-bit Arm, and one of BLAKE2s 6 KB. Cortex-A15 has 32 KB of instruction
-cache, and Cortex-A7, A9 and A53 have 8 to 64 KB as built; the bench runs on Neoverse N2, which has
-64 KB, and would not show the misses. With the flag of the last block set in each branch of the
-loop, the function took a copy of the rounds for each value of the flag there, 64 KB; computed from
-the counter after the branches, it takes one, 24 KB. Each call runs one copy of the rounds, as
-before, and the code of BLAKE2b on 32-bit Arm has one copy more.
-
-In bench run 42428878012 on Neoverse N2, in one process where the copies run in turn, two copies of
-the code here and two of the code before, the time before over the time here, each the geometric
-mean of its two copies of the median over the processes, was 1.030 for BLAKE2b of 255 bytes, 1.007
-for 1 KiB and 1.000 for 16 KiB, and 1.011 and 1.000 for its MACs of 1 KiB and 16 KiB. Over the
-other 19 rows of BLAKE2b it was 1.000 to 1.002, and over the 55 rows of BLAKE2s and BLAKE3 0.991 to
-1.004, 1.000 as a geometric mean. BLAKE2b of 255 bytes, which blake2b_simd led by 1.8 percent, now
-leads it by 1.1 percent, and BLAKE2b of 1 KiB takes 0.1 percent more time than blake2b_simd, against
-0.8 before. Rivals led 5 of the 79 rows of this class before and 3 here. No row takes more time
-than before beyond the spread of the rows of BLAKE2s and BLAKE3: the digest and MAC of 16 KiB take
-0.03 and 0.01 percent more.
-
-The state and the words are held as in the function of D-86 and in the loop over whole blocks of
-[D-91](#decision-d-91): [D-76](#decision-d-76) treats them as register values at opt-level 3, and
-they are wiped at other levels. The counter is a usize, as it counts at most a block more than a
-slice holds. The unit tests check the function against the compression of padded blocks, for both
-word sizes, for data of up to three blocks, with and without a key. The reference answers of BLAKE2
-for inputs of 0 to 255 bytes and the self-test of RFC 7693 pass on armv7 at opt-level 3 and z.
-
-The machine code of x86-64, ARM64, i686, riscv64 and WebAssembly is the same as before, function by
-function. On armv7 the new function is the only one added, and the dispatcher of the digests and
-the MAC of BLAKE2b no longer hold the portable code for more than a block: 409 and 17 lines of
-assembly against 731 and 520. The compression of BLAKE2b, its loop over whole blocks and the update
-and finish of its incremental form, whose source is the same, change by at most 2 percent of their
-lines. Under QEMU, the incremental form of BLAKE2b and of its MAC runs 13 to 100 instructions fewer
-for 0 to 256 bytes, 251 and 291 fewer for 1 KiB and 4211 and 4251 fewer for 16 KiB, and the one-call
-digest and MAC of at most a block run 2 and 6 fewer. With this crate at opt-level 3 and the
-application at 1, on all six, what the application's crate compiles of this one is drop glue,
-`Debug` and, on armv7, `MacAlgorithm::digest_into`, as before.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-100
 
-On 32-bit x86, BLAKE2s takes one or two whole blocks before its last block with a call of the
-compression function for each, in a function of its own, out of line. Three or more go through the
-loop over whole blocks, which inlines a second copy of the rounds, as before. A digest or MAC of 65
-to 192 bytes of data thus runs one copy of the rounds, as one of at most 64 bytes does, and so do,
-in the incremental form, the buffered block and the whole blocks of an update when they are one or
-two. BLAKE2b and the other targets keep the code before. Which path runs depends only on the
-lengths, which are public.
-
-This is a form of the portable code that the target chooses at compile time, not CPU-specific code
-under [15.3](15-platforms.md#153-cpu-specific-code).
-
-Rationale: on 32-bit x86 the loop over whole blocks takes 5735 bytes of code and the compression
-function 5303, and a digest of 65 to 192 bytes ran both; it now runs the compression function and
-the new function, 307 bytes. It runs about as many instructions as before: under QEMU, BLAKE2s of 65
-bytes runs 3782 instructions against 3783 before, of 128 bytes 3753 against 3756, of 129 bytes 5581
-against 5568, of 192 bytes 5556 against 5539 and of 1 KiB 28721 against 28715, and its MAC of 129
-bytes 7377 against 7355. p3-blake2s runs 3749, 5563 and 5598 for 65, 129 and 192 bytes.
-
-In bench run 42458361223, in one process where the copies run in turn, two copies of the code here
-and two of the code before, the time before over the time here, each the geometric mean of its two
-copies of the median over the processes, as a geometric mean over the 12 rows of BLAKE2s of 65 to
-192 bytes (digests of 65, 100, 127, 128, 129 and 192 bytes, digests of 129, 160 and 192 bytes from
-other buffers, and MACs of 65, 127 and 128 bytes), was 1.035 on Zen 3, 1.082 on Ice Lake, 1.091 on
-Zen 5, 1.000 on Emerald Rapids and 0.992 on Zen 4. By row it was 1.021 to 1.045 on Zen 3, 1.054 to
-1.101 on Ice Lake and 0.985 to 1.016 on Emerald Rapids. On Zen 5 it was 1.213 to 1.223 for the
-digests of 129 to 192 bytes, where the loop ran two blocks, and 0.996 to 1.023 for the other rows.
-On Zen 4 the digests take 0.7 to 1.4 percent more time (0.986 to 0.993), 0.1 to 1.0 percent in one
-copy and 1.2 to 1.8 percent in the other, and the MACs the same time (0.999 to 1.000). Three more
-processes in each job, which ran only the copies of crypto-pq and the rivals without AVX2 code, gave
-the same geometric means within 0.005 and the same rows on Zen 4 within 0.001, so that the cost on
-Zen 4 does not come from the AVX2 code of other crates in the process. 32-bit x86 runs one form of
-the portable code on every processor ([D-95](#decision-d-95)), and Zen 4 is the one class of the
-five where these digests take more time.
-
-Over these 60 rows in the five classes, rivals led 22 and 23 in the two copies of the code before
-and 8 and 14 here, and by more than 1 percent 19 and 20 before and 3 and 6 here. p3-blake2s led the
-digests of 129 to 192 bytes on Zen 5 by 14.9 to 18.8 percent and now takes 0.7 to 2.0 percent more
-time than this code. On Ice Lake it led the digests of 100, 127, 160 and 192 bytes by 2.0 to 5.0
-percent; this code now leads them by 4.4 to 7.6 percent in one copy and by 0.1 to 4.0 percent in the
-other, but for 127 bytes, which p3-blake2s leads there by 0.6 percent. On Zen 3, where it led all
-nine digests by 2.3 to 6.8 percent, it still leads those of 65 and 129 bytes, by 1.8 to 4.7 percent,
-and those of 100 to 160 bytes in one copy, by 0.6 to 1.5 percent, and no longer those of 192 bytes.
-On Zen 4 it took 0.998 to 1.025 times the time of the code before for these digests and takes 0.982
-to 1.016 times the time of the code here: it led only 65 bytes, by 0.2 percent, and now leads 65,
-127 and 129 bytes, by 0.4 to 1.8 percent.
-
-Over the 70 other rows of BLAKE2b, BLAKE2s and BLAKE3 in each class, the time before over the time
-here was 0.995 to 1.009 as a geometric mean, and on Zen 4 the first copy here took the same time as
-the code before (1.000). For digests of BLAKE2s of 0 to 64 bytes, the second copy here took 7 to 10
-percent more time than the first on Zen 4, 5 to 7 percent on Zen 3 and 9 to 11 percent on Ice Lake,
-where the second copy of the code before took 0.1 percent at most, 2.5 to 3.6 and 4.4 to 8.9 percent
-more than its first: the copies run the same machine code at other places.
-
-With the test of the length inside the loop over whole blocks, LLVM allocated the registers of the
-loop anew, and in bench run 42453852559 BLAKE2s of 1 KiB and 16 KiB took 2.0 to 3.6 percent more
-time on Zen 3 and Zen 4. Out of line, the test still gave LLVM the range of the length that reaches
-the loop, and it compiled the loop anew as well. `core::hint::black_box` on the blocks before the
-loop keeps that range from it.
-
-The new function reads the input only below its length and wipes its message words, as the loop over
-whole blocks does on WebAssembly; the compression function wipes its own state, as before. The unit
-tests check it against the loop over whole blocks, for both word sizes, for one and two blocks, from
-the IV and from a compressed state, at counters that carry into the second word of the counter of
-BLAKE2s. The reference answers of BLAKE2 for inputs of 0 to 255 bytes, also fed in uneven pieces,
-and the self-test of RFC 7693 pass on i686 at opt-level 3 and in debug builds.
-
-The machine code of x86-64, ARM64, armv7, riscv64 and WebAssembly is the same as before, function by
-function. On i686 the new function is the only one added, and the loop over whole blocks and the
-compression function are the same as before; the functions that run BLAKE2s change: the dispatcher
-of digests, the MAC of BLAKE2s and the update of its incremental form. Under QEMU, the incremental
-form runs 173 instructions fewer for 1 KiB in updates of 32 or 64 bytes (33993 against 34166 and
-32443 against 32616), 9 fewer for one update of 65 or 128 bytes and 11 more for one of 129 or 192
-bytes. With this crate at opt-level 3 and the application at 1, on all six, what the application's
-crate compiles of this one is drop glue, `Debug` and, on armv7, `MacAlgorithm::digest_into`, as
-before.
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+crypto-pq no longer supports.
 
 ## Decision D-101
 
@@ -1746,7 +1033,7 @@ hash, a keyed hash or the last compression of `derive_key`, takes the message wo
 caller's slice, and a key given in bytes into the words of the state, and writes the output words
 into the caller's output: the scalar kernel keeps no copy of the block, the key or the output in
 memory. The words after a message of less than a block are zeros, and the word that takes its last
-bytes is built from them, as in [D-86](#decision-d-86); an output of less than 32 bytes takes its
+bytes is built from them; an output of less than 32 bytes takes its
 whole words, then the bytes left from the register of the next word. Other cores, longer inputs and
 other targets are unchanged.
 
@@ -1782,8 +1069,8 @@ QEMU, in the build of the constant-time check, a hash of 1 byte runs 1010 instru
 1050 before, one of 63 bytes 1055 against 1044, and keyed 1024 against 1073 and 1069 against 1067;
 the words of a short message, built in registers, take more instructions than a copy, and less time.
 
-In the same run, BLAKE2 on ARM64 with the copy of whole words that 32-bit x86 takes
-([D-95](#decision-d-95)), out of line, took more time on Neoverse N2: BLAKE2b of 16 and 31 bytes 0.5
+In the same run, BLAKE2 on ARM64 with the whole words of a short last block copied in a function of
+their own, out of line, took more time on Neoverse N2: BLAKE2b of 16 and 31 bytes 0.5
 and 0.2 percent less, but of 63, 65, 100, 127 and 255 bytes 0.7 to 1.9 percent more, and BLAKE2s and
 its MAC of 31 to 127 bytes up to 3.1 percent more. On Apple M3, in one process, BLAKE2s of 16 and 33
 bytes took 3.5 and 3.9 percent more. BLAKE2 keeps the loop on ARM64.
@@ -1884,21 +1171,17 @@ before, of 63 bytes 622.6 against 634.4, of 64 bytes 644.0 against 648.6 and of 
 
 ## Decision D-104
 
-On every target but WebAssembly, the update of `Hasher` and `Mac` for SHA-384, SHA-512, SHA-512/224
-and SHA-512/256, and for SHA-224 and SHA-256 where their engine is not that of
+The update of `Hasher` and `Mac` for SHA-384, SHA-512, SHA-512/224 and SHA-512/256, and for SHA-224 and SHA-256 where their engine is not that of
 [D-103](#decision-d-103), on x86-64 outside SGX and the portable build, is a function of its own,
 out of line as that of D-103. An update whose bytes leave the buffer unfilled is buffered there with
 no frame: fewer than 32 bytes in line, as in D-103, and 32 bytes or more through memcpy, as the last
 call, after the length is set, or on ARM64 in line, in moves of 16 bytes from the start of the bytes
-and one move of their last 16. On 32-bit Arm, every such update goes through memcpy. Into an empty
-buffer, the bytes go to its start and its length is that of the update, so that the stores do not
+and one move of their last 16. Into an empty buffer, the bytes go to its start and its length is that of the update, so that the stores do not
 wait on the load of the length: below 32 bytes, as in D-103, and from 32 for SHA-512 on ARM64. Whole
 buffers into an empty one, a block or, for SHA-512 on x86-64, two, go to the kernel as the last
 call, on x86-64 through a function of their own. Any other update fills the buffer, compresses it
 with the whole buffers after it and keeps the rest, without the tests that the paths before it
-decide: on 64-bit targets in another function, so that the update has no frame on its other paths,
-and on 32-bit targets in line, where it has one on every path. On WebAssembly, which has no tail
-calls, the update is the one before, with the same machine code. The SHA-2 of ML-DSA, SLH-DSA, LMS,
+decide, in another function, so that the update has no frame on its other paths. The SHA-2 of ML-DSA, SLH-DSA, LMS,
 XMSS and HKDF keeps the update it had, in line in it, and the one-shot digests are unchanged.
 
 The paths depend only on the length of the update and on that of the buffer, which are public, and
@@ -2012,3 +1295,36 @@ and of 1 KiB in updates of 16 bytes 26367 against 28159, and SHA-256 the same as
 SHA-256 of 1 KiB in updates of 1 byte runs 165236 against 189317, of 32 bytes 68341 against 68389
 and of 100 bytes 66123 against 66114; on 32-bit Arm 96151 against 109447, 40855 against 41255 and
 39673 against 39856.
+
+## Decision D-105
+
+crypto-pq builds for 64-bit targets only. A build for WebAssembly, or for a target whose pointers
+are not 64 bits wide, stops with a compile error ([15.2](15-platforms.md#152-supported-platforms)),
+and CI builds and tests no such target ([18.3](18-testing.md#183-platforms)). Every other 64-bit
+target keeps the portable code, big-endian s390x among them, and the CPU-specific code is that of
+x86-64 and ARM64, as before. The forms of the portable code that only the removed targets took are
+gone, with the configuration `crypto_pq_pairs` of the build script, and so are the decisions that
+chose them: D-80 to D-83, D-85, D-86, D-88, D-89, D-91, D-92, D-94 to D-97, D-99 and D-100 are
+withdrawn, and D-79, D-84, D-90, D-102 and D-104 lose their text on those targets. Of D-88, the wipe
+of the other targets without stable inline assembly and of Miri stays: each value of four bytes or
+more takes a volatile store of its own.
+
+P9 and 15.2 of SPEC 1.0 keep every platform that works working, 32-bit ones included, so the change
+cannot come in a 1.x release (Section 20.3 item 1 of SPEC 1.0). The draft begun as SPEC 1.1 is
+therefore SPEC 2.0, and the first release that implements it is 2.0.0
+([20.1](20-versioning.md#201-versions)); the decisions before this one that name specification 1.1
+mean this draft. Every format that 1.0.x writes, 2.0 reads
+([20.3](20-versioning.md#203-compatibility-within-2x) item 4). WebAssembly and 32-bit targets stay
+on 1.0.x.
+
+Rationale: the work on performance is for x86-64, ARM64 and RISC-V processors and is judged on
+them. A WebAssembly runtime compiles the module again for the processor that runs it, so a form
+chosen for WebAssembly is chosen for that runtime's compiler rather than for a processor, and the
+32-bit targets took forms of their own, since a 64-bit word does not fit one of their registers.
+Those forms took sixteen decisions and parts of five more, and the tests of 32-bit Arm under
+emulation took more than an hour in one CI job. On the targets that stay, the removed code was
+compiled only for the removed targets or for their tests: built with one codegen unit, the
+library's machine code is the same as before, function by function, on x86-64 and ARM64 with and
+without `crypto_pq_portable` and on riscv64. With the sixteen units of Cargo's default, x86-64 is
+the same too; on ARM64 and riscv64, rustc puts some functions in other units, as a change anywhere
+in the crate can, and LLVM gives about fifty functions on ARM64 and seven on riscv64 other code.

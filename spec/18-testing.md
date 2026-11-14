@@ -27,8 +27,8 @@ contains no instruction on a 512-bit register outside those two kernels
 
 ## 18.3 Platforms
 
-CI MUST build and test: Linux x86-64 and ARM64, macOS ARM64, Windows x86-64 and ARM64; 32-bit x86;
-RISC-V 64 and big-endian s390x under emulation; Linux musl; the minimum and the current toolchain of
+CI MUST build and test: Linux x86-64 and ARM64, macOS ARM64, Windows x86-64 and ARM64; RISC-V 64
+and big-endian s390x under emulation; Linux musl; the minimum and the current toolchain of
 [15.2](15-platforms.md#152-supported-platforms).
 
 ## 18.4 Vectors and robustness

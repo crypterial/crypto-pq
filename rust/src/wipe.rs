@@ -14,10 +14,7 @@ use core::sync::atomic::{Ordering, compiler_fence};
 #[cfg(all(
     any(
         target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "x86",
         target_arch = "x86_64",
-        target_arch = "riscv32",
         target_arch = "riscv64",
         target_arch = "loongarch64",
     ),
@@ -56,10 +53,7 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
 #[cfg(any(
     not(any(
         target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "x86",
         target_arch = "x86_64",
-        target_arch = "riscv32",
         target_arch = "riscv64",
         target_arch = "loongarch64",
     )),
@@ -67,8 +61,8 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
 ))]
 #[allow(unsafe_code)]
 pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
-    // A group is built in a temporary and copied, and on WebAssembly a temporary of 128 bytes takes a
-    // call of memory.fill, into the runtime. Values of a word and more get a store each.
+    // A volatile store of a group is built in a temporary and copied, so values of four bytes and
+    // more get a store each.
     #[inline(always)]
     fn stores<T: Copy + Default>(values: &mut [T]) {
         for value in values {
@@ -117,29 +111,6 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
     }
 
     compiler_fence(Ordering::SeqCst);
-}
-
-// Bytes in groups of 8 at an address aligned to 8: a block that WebAssembly pads a message in.
-// wipe clears it with one store of a u64 for each group, where a volatile store of a [u8; 8] was
-// built in a temporary and copied.
-#[cfg(any(test, target_family = "wasm"))]
-#[repr(C, align(8))]
-pub(crate) struct Groups<const N: usize>(pub(crate) [[u8; 8]; N]);
-
-#[cfg(any(test, target_family = "wasm"))]
-impl<const N: usize> Groups<N> {
-    #[allow(unsafe_code)]
-    #[inline(always)]
-    pub(crate) fn wipe(&mut self) {
-        for group in &mut self.0 {
-            // SAFETY: the group is 8 bytes of an array that starts at an address aligned to 8,
-            // at an offset that is a multiple of 8, so it is valid, aligned and exclusive for a
-            // u64, and any 8 bytes are a valid u64.
-            unsafe { core::ptr::write_volatile(core::ptr::from_mut(group).cast::<u64>(), 0) };
-        }
-
-        compiler_fence(Ordering::SeqCst);
-    }
 }
 
 // wipe for an array that holds secrets and that LLVM keeps in registers at opt-level 3: there the
@@ -303,15 +274,6 @@ mod tests {
 
             assert!(wide.iter().all(|&w| w == 0));
         }
-    }
-
-    #[test]
-    fn wipes_every_group() {
-        let mut groups = Groups([[0xA5u8; 8]; 16]);
-
-        groups.wipe();
-
-        assert!(groups.0.as_flattened().iter().all(|&b| b == 0));
     }
 
     #[test]

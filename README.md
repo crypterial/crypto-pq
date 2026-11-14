@@ -268,20 +268,21 @@ specification state them in full.
 - **Self-tests.** Key generation runs a pairwise consistency test by default, private-key import
   validates the key, and every stateful signature is verified before it is released.
 - **Randomness** comes only from the operating system: `getrandom` on Linux, Android, FreeBSD,
-  NetBSD, DragonFly, illumos and Solaris, `getentropy` on Apple platforms and OpenBSD,
-  `ProcessPrng` on Windows, and `random_get` on WASI preview 1. On a target without one, operations
-  that need randomness return `Error::RngFailure`.
+  NetBSD, DragonFly, illumos and Solaris, `getentropy` on Apple platforms and OpenBSD, and
+  `ProcessPrng` on Windows. On a target without one, operations that need randomness return
+  `Error::RngFailure`.
 - **CPU paths.** Kernels for x86-64 (AVX2, AVX-512VL on 256-bit registers for Keccak, SSE4.1,
   SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2, SHA-3, SHA-512) are selected at run time, with
-  portable code on every target and no target CPU flag needed.
+  portable code on every 64-bit target and no target CPU flag needed. WebAssembly and 32-bit targets
+  are not supported: a build for one stops with a compile error.
   `RUSTFLAGS="--cfg crypto_pq_portable"` builds the portable code only.
 - **Allocation.** Every operation is synchronous. Fixed-size operations allocate only their returned
   value, and the `_into` forms allocate nothing.
 
-CI builds and tests the crate with stable Rust on Linux x86-64, ARM64 and 32-bit x86, macOS ARM64,
-Windows x86-64 and ARM64 and Linux musl, and under emulation on 32-bit ARM, RISC-V 64 and big-endian
-s390x. On Linux x86-64 it also runs with Rust 1.89, the minimum supported version. Clippy also
-checks the library for Android, iOS, WebAssembly and bare-metal Arm and RISC-V.
+CI builds and tests the crate with stable Rust on Linux x86-64 and ARM64, macOS ARM64, Windows
+x86-64 and ARM64 and Linux musl, and under emulation on RISC-V 64 and big-endian s390x. On Linux
+x86-64 it also runs with Rust 1.89, the minimum supported version. Clippy also checks the library
+for Android, iOS and bare-metal ARM64 and RISC-V.
 
 ## Specification and test vectors
 

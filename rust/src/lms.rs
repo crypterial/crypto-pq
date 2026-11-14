@@ -184,7 +184,7 @@ fn derive(lms: &LmsType, i: &[u8], q: u32, index: u16, seed: &[u8], out: &mut No
 }
 
 // Digit i of data, of 8 / w a byte: w is a power of two, so that the byte and the place in it come
-// from shifts, where a division by the width took a call on 32-bit Arm.
+// from shifts.
 fn coefficient(t: &OtsType, data: &[u8], i: usize) -> u32 {
     let log = 3 - t.w.trailing_zeros();
 

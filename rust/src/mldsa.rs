@@ -627,7 +627,7 @@ const fn decompose(r: i32, gamma2: i32) -> (i32, i32) {
 
 // As above, with the masks from ct::sign_mask (D-79): the compiler reads the sign of 43 - r1,
 // whose range it knows, as a comparison, and an and with a sign mask as a choice between two
-// values, a select on WebAssembly and a branch where no conditional move exists.
+// values, a branch where no conditional move exists.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn decompose(r: i32, gamma2: i32) -> (i32, i32) {
     let mut r1 = (r + 127) >> 7;
@@ -1444,7 +1444,7 @@ const fn equal_byte(a: u8, b: u8, zero: u8) -> u8 {
 
 // As ct's zero mask (D-79): the top bit of !(d | -d), set when the bytes are equal, spread by
 // ct::sign_mask, since the compiler reads a shift by 7 as a comparison and the mask as a choice
-// between two constants, a select on WebAssembly and a branch where no conditional move exists.
+// between two constants, a branch where no conditional move exists.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(always)]
 fn equal_byte(a: u8, b: u8, zero: u8) -> u8 {

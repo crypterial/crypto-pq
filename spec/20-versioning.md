@@ -3,28 +3,29 @@
 ## 20.1 Versions
 
 1. The package follows Semantic Versioning 2.0.0 [[D-66](decisions.md#decision-d-66-revised-by-d-71)]. Its MAJOR.MINOR equals the version of this
-   specification it implements (1.0.x implements SPEC 1.0, 1.1.x SPEC 1.1); PATCH is independent
-   of the specification. The first release that implements this specification is 1.1.0.
+   specification it implements (1.0.x implements SPEC 1.0, 2.0.x SPEC 2.0); PATCH is independent
+   of the specification. The first release that implements this specification is 2.0.0
+   [[D-105](decisions.md#decision-d-105)].
 2. The package manifests (`Cargo.toml` and `Cargo.lock`) carry the release version; CI checks that
    they agree.
 
 ## 20.2 Format and interface versions
 
-| item | version in 1.1 |
+| item | version in 2.0 |
 |---|---|
 | state record | writes and reads 2; refuses 1 ([11.7](11-stateful-signatures.md#117-state-record-version-2), [11.8](11-stateful-signatures.md#118-state-record-version-1)) |
 | tree cache | 1 ([11.10](11-stateful-signatures.md#1110-tree-cache)) |
 | PKCS#8 export | OneAsymmetricKey version 0 ([10.3](10-key-formats.md#103-pkcs8-oneasymmetrickey)) |
 
-## 20.3 Compatibility within 1.x
+## 20.3 Compatibility within 2.x
 
-1. No public item is removed or renamed, and no behaviour specified here changes, before 2.0.0.
-2. A 1.x release MAY add algorithm values, options and operations. Options are added only in forms that do not
+1. No public item is removed or renamed, and no behaviour specified here changes, before 3.0.0.
+2. A 2.x release MAY add algorithm values, options and operations. Options are added only in forms that do not
    break existing callers ([23.1](profiles/rust.md#231-public-api-idiom) item 4).
-3. A 1.x release MAY add error codes. Callers MUST handle
+3. A 2.x release MAY add error codes. Callers MUST handle
    codes they do not know; the Rust `Error` enum is non-exhaustive ([23.1](profiles/rust.md#231-public-api-idiom) item 2).
-4. Byte formats change only by a new version number, and every 1.x release reads every format version
-   that an earlier 1.x release wrote. State record version 1 is not covered ([11.8](11-stateful-signatures.md#118-state-record-version-1)).
+4. Byte formats change only by a new version number, and every 2.x release reads every format version
+   that a 1.x or an earlier 2.x release wrote. State record version 1 is not covered ([11.8](11-stateful-signatures.md#118-state-record-version-1)).
 5. `name` strings are never reused for another algorithm.
 
 ## 20.4 Release process

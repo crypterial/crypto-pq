@@ -3,7 +3,11 @@
 | specification | status | date |
 |---|---|---|
 | SPEC 1.0 | published | 2026-10-23 |
-| SPEC 1.1 | draft | 2026-10-26 |
+| SPEC 2.0 | draft | 2026-10-26 |
+
+SPEC 2.0 was begun as SPEC 1.1. It became 2.0 on 2026-11-14, when WebAssembly and 32-bit targets
+left the supported platforms ([D-105](decisions.md#decision-d-105)), a change that SPEC 1.0 allows
+only in 2.0.0 (its Section 20.3 item 1).
 
 ## Specification versions and package versions
 
@@ -12,14 +16,15 @@ Decisions [D-66](decisions.md#decision-d-66-revised-by-d-71) and [D-71](decision
 
 1. The crypto-pq package, the Rust crate `crypto-pq`, follows Semantic Versioning 2.0.0.
 2. Its MAJOR.MINOR equals the version of this specification that it implements: every 1.0.x release
-   implements SPEC 1.0, and every 1.1.x release SPEC 1.1. PATCH is independent of the
+   implements SPEC 1.0, and every 2.0.x release SPEC 2.0. PATCH is independent of the
    specification.
-3. The first release that implements SPEC 1.0 is 1.0.0, and the first that implements SPEC 1.1 is
-   1.1.0.
+3. The first release that implements SPEC 1.0 is 1.0.0, and the first that implements SPEC 2.0 is
+   2.0.0.
 4. A release starts from a signed, annotated tag `rust-vX.Y.Z` (for example `rust-v1.0.0`) on the
    default branch of the repository `crypterial/crypto-pq`
    ([Section 20.4](20-versioning.md#204-release-process)).
-5. Compatibility within 1.x follows [Section 20.3](20-versioning.md#203-compatibility-within-1x).
+5. Compatibility within 2.x follows [Section 20.3](20-versioning.md#203-compatibility-within-2x),
+   as compatibility within 1.x follows Section 20.3 of SPEC 1.0.
 
 ## Corrections to SPEC 1.0
 
@@ -33,4 +38,4 @@ its continuous integration runs. It changes neither the behaviour of a release n
 | 2026-10-25 | [20.1](20-versioning.md#201-versions), [Appendix B](principles-review.md) | Wording. |
 | 2026-10-25 | [8.2.3](08-key-encapsulation.md#823-constant-time-and-memory), [D-50](decisions.md#decision-d-50) | 8.2.3 item 4 and D-50 name the AES-128 code that computes matrix A: the AES instructions or the bitsliced code ([14.1](14-security.md#141-constant-time) item 3). The requirement that it is constant time is unchanged. |
 | 2026-10-25 | [14.1](14-security.md#141-constant-time), [23.2](profiles/rust.md#232-security-mechanics), [23.3](profiles/rust.md#233-performance-mechanics), [23.5](profiles/rust.md#235-conformance-checklist) | The constant-time check also runs on x86-64 in a build capped at SSE4.1 (`--cfg crypto_pq_sse41`), so that it covers the SSE4.1 kernels on CI runners that have AVX2. |
-| 2026-10-27 | [23.2](profiles/rust.md#232-security-mechanics) | Item 3 names the wiping mechanism of 1.0.0 and 1.0.1: zero stores whose buffer address goes into an empty assembly block, then a compiler fence, with volatile writes for up to eight values of at most a word and on targets without stable inline assembly. The rule of the item on opt-levels is new in SPEC 1.1 ([D-76](decisions.md#decision-d-76)). |
+| 2026-10-27 | [23.2](profiles/rust.md#232-security-mechanics) | Item 3 names the wiping mechanism of 1.0.0 and 1.0.1: zero stores whose buffer address goes into an empty assembly block, then a compiler fence, with volatile writes for up to eight values of at most a word and on targets without stable inline assembly. The rule of the item on opt-levels is new in SPEC 2.0 ([D-76](decisions.md#decision-d-76)). |

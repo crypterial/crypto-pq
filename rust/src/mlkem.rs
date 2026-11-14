@@ -192,9 +192,6 @@ fn canonical(w: &Wide, f: &mut Poly) {
     }
 }
 
-// Out of line on WebAssembly: inside a large function, Cranelift reloads the addresses of this loop
-// from the stack in each pass.
-#[cfg_attr(target_family = "wasm", inline(never))]
 fn canonical_portable(w: &Wide, f: &mut Poly) {
     let (r, r_qinv) = (i32::from(R_MOD_Q), i32::from(R_MOD_Q).wrapping_mul(QINV));
 
