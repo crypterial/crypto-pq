@@ -3,7 +3,7 @@
 ## 7.1 Error codes
 
 Every failure is reported with exactly one of the following 13 codes. Section [16.4.5](16-naming.md#1645-error-codes) gives their Rust
-form. There is no other public error code in 1.1.
+form. There is no other public error code in 2.0.
 
 | code | condition |
 |---|---|
