@@ -183,10 +183,11 @@ fn copy_short(to: &mut [u8], from: &[u8]) {
     }
 }
 
-// The bytes of an update of 32 to N - 1 into the buffer on ARM64, in line: the first 32 in one pair
-// of stores, the 16-byte chunks after them, then the last 16. Through memcpy, 1 KiB of SHA-256 in
-// 32-byte pieces took 3.6% more time on Neoverse N2 (D-104). The chunks are bounded by N, so that
-// no path has a check.
+// The bytes of an update of 32 to N - 1 into the buffer on ARM64, in line, in 32-byte pairs of
+// stores: the first 32, those after them up to the last 32, then the last 32. Through memcpy, 1 KiB
+// of SHA-256 in 32-byte pieces took 3.6% more time on Neoverse N2 (D-104). In 16-byte chunks after
+// the first 32, 64 bytes took 15 instructions and five stores, the last 16 bytes twice, where two
+// pairs take 7 and four. The pairs are bounded by N, so that no path has a check.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn copy_chunks<const N: usize>(to: &mut [u8], from: &[u8]) {
@@ -198,19 +199,15 @@ fn copy_chunks<const N: usize>(to: &mut [u8], from: &[u8]) {
 
     to[..32].copy_from_slice(&from[..32]);
 
-    macro_rules! chunks {
-        ($($i:literal)*) => {
-            $(
-                if 16 * ($i + 1) < N && n >= 16 * ($i + 1) {
-                    to[16 * $i..16 * ($i + 1)].copy_from_slice(&from[16 * $i..16 * ($i + 1)]);
-                }
-            )*
-        };
+    if N > 64 && n > 64 {
+        to[32..64].copy_from_slice(&from[32..64]);
+
+        if N > 96 && n > 96 {
+            to[64..96].copy_from_slice(&from[64..96]);
+        }
     }
 
-    chunks!(2 3 4 5 6);
-
-    to[n - 16..].copy_from_slice(&from[n - 16..]);
+    to[n - 32..].copy_from_slice(&from[n - 32..]);
 }
 
 // The bytes of an update of 32 to N - 1 into the buffer.
@@ -221,6 +218,26 @@ fn copy_long<const N: usize>(to: &mut [u8], from: &[u8]) {
 
     #[cfg(not(target_arch = "aarch64"))]
     copy_bytes(to, from);
+}
+
+// 1 to N - 1 bytes into the buffer, the head that fills a block or the rest after the whole
+// blocks, in line on ARM64 as buffer_short moves them: through memcpy, an update of 64 bytes that
+// filled a SHA-512 block ran 22 instructions there, a call through the PLT among them, and gave
+// update_blocks a frame for it.
+#[inline(always)]
+fn copy_part<const N: usize>(to: &mut [u8], from: &[u8]) {
+    #[cfg(target_arch = "aarch64")]
+    if from.len() >= 32 {
+        copy_chunks::<N>(to, from);
+    } else {
+        copy_short(to, from);
+    }
+
+    // An empty copy would still call memcpy.
+    #[cfg(not(target_arch = "aarch64"))]
+    if !from.is_empty() {
+        copy_bytes(to, from);
+    }
 }
 
 #[derive(Clone)]
@@ -278,30 +295,60 @@ impl<const N: usize> Blocks<N> {
     // tests before it calls update_blocks: the bytes that fill the block, then the whole blocks,
     // with no test of how many there are to take or of a block left unfilled. Through update, an
     // update that fills the block ran 8 to 10 more instructions, and 1 KiB of SHA-256 in pieces of
-    // 100 bytes 2.2% more than the update of Hasher before on ARM64 (D-104).
-    fn update_long(&mut self, mut data: &[u8], mut process: impl FnMut(&[[u8; N]])) {
-        if self.len > 0 {
-            let (head, tail) = data.split_at(N - self.len);
+    // 100 bytes 2.2% more than the update of Hasher before on ARM64 (D-104). The filled block and
+    // the whole blocks go to process in one call, the blocks and the more blocks of the kernels,
+    // which keep the state in registers across them. Every path ends in a call, the last thing
+    // it does, so that the function keeps no frame: the bytes over go to the buffer before the
+    // call where it is not compressed, and after it, out of line, where it is.
+    fn update_long(&mut self, data: &[u8], process: impl FnOnce(&[[u8; N]], &[[u8; N]])) {
+        const { assert!(N.is_power_of_two()) };
 
-            copy_bytes(&mut self.bytes[self.len..], head);
+        // The buffer never holds a whole block, len < N, which the AND of the remainder shows the
+        // compiler: with a second bounds check, for bytes[len..], the function had a frame for the
+        // two calls of its failures.
+        let len = self.len % N;
 
-            data = tail;
+        if len == 0 {
+            let (blocks, rest) = data.as_chunks::<N>();
 
-            process(core::slice::from_ref(&self.bytes));
+            copy_part::<N>(&mut self.bytes[..rest.len()], rest);
 
-            self.wipe_second();
+            self.len = rest.len();
+
+            return process(&[], blocks);
         }
 
-        let (blocks, rest) = data.as_chunks::<N>();
+        let (head, tail) = data.split_at(N - len);
 
-        if !blocks.is_empty() {
-            process(blocks);
+        let (blocks, rest) = tail.as_chunks::<N>();
+
+        copy_part::<N>(&mut self.bytes[len..], head);
+
+        if !rest.is_empty() || N == 256 {
+            return self.update_rest(blocks, rest, process);
         }
 
-        // An empty copy would still call memcpy.
-        if !rest.is_empty() {
-            copy_bytes(&mut self.bytes[..rest.len()], rest);
-        }
+        self.len = 0;
+
+        process(core::slice::from_ref(&self.bytes), blocks)
+    }
+
+    // update_long after the block is filled, where bytes are over or the second block is wiped.
+    // In line on x86-64, where update_long keeps a frame anyway: out of line, the update of
+    // SHA-512 that fills its buffer of two blocks there ran 28 instructions more.
+    #[cfg_attr(target_arch = "aarch64", inline(never))]
+    #[cfg_attr(not(target_arch = "aarch64"), inline(always))]
+    fn update_rest(
+        &mut self,
+        blocks: &[[u8; N]],
+        rest: &[u8],
+        process: impl FnOnce(&[[u8; N]], &[[u8; N]]),
+    ) {
+        process(core::slice::from_ref(&self.bytes), blocks);
+
+        self.wipe_second();
+
+        copy_part::<N>(&mut self.bytes[..rest.len()], rest);
 
         self.len = rest.len();
     }
@@ -528,6 +575,9 @@ fn schedule256(w: &mut [u32; 16]) {
     word256(w, 15);
 }
 
+// Out of line on ARM64, so that the cold call of the first detection gives its callers no frame:
+// a streaming update ends in a call of it, and it in one of the kernel (cpu::has_ready).
+#[cfg_attr(target_arch = "aarch64", inline(never))]
 fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) {
     if cpu::compress256(state, blocks, more) {
         return;
@@ -703,10 +753,13 @@ pub(crate) fn finish256(state: &[u32; 8], absorbed: u64, data: &[u8], out: &mut 
 }
 
 // finish256 through a copy of the state, which store256 turns into the digest. Out of line on
-// x86-64, so that finish256 keeps no stack frame when digest256 stores the digest; inlined
-// elsewhere, where digest256 never does.
-#[cfg_attr(target_arch = "x86_64", inline(never))]
-#[cfg_attr(not(target_arch = "x86_64"), inline(always))]
+// x86-64 and ARM64, so that finish256 keeps no stack frame when digest256 stores the digest;
+// inlined elsewhere, where digest256 never does.
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), inline(never))]
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    inline(always)
+)]
 fn finish256_state(state: &[u32; 8], data: &[u8], bits: u64, out: &mut [u8]) {
     let mut state = *state;
 
@@ -720,10 +773,10 @@ fn finish256_state(state: &[u32; 8], data: &[u8], bits: u64, out: &mut [u8]) {
 }
 
 // Out of line, as compress256_portable, so that finish256 keeps no frame for the padded blocks
-// when a CPU kernel runs. Not on aarch64, where this body is inlined into finish256: there the
-// out-of-line form ran two instructions fewer for an empty message but took 0.5% more time on
+// when a CPU kernel runs. Not on aarch64, where this body is inlined into finish256_state: there
+// the out-of-line form ran two instructions fewer for an empty message but took 0.5% more time on
 // Neoverse N2, with its return and output-store branch targets at the last word of a 32-byte fetch
-// block.
+// block, when finish256_state was the path of every digest.
 #[cfg_attr(not(target_arch = "aarch64"), inline(never))]
 fn finish256_portable(state: &mut [u32; 8], data: &[u8], bits: u64) {
     if !LANE_VECTORS {
@@ -799,6 +852,15 @@ fn padding_word256(tail: &[u8], bits: u64, padding: usize, j: usize) -> u32 {
 pub(crate) fn finish512(state: &[u64; 8], absorbed: u128, data: &[u8], out: &mut [u8]) {
     let bits = absorbed.wrapping_add(data.len() as u128).wrapping_mul(8);
 
+    if !cpu::digest512(state, data, bits, out) {
+        finish512_state(state, data, bits, out);
+    }
+}
+
+// finish256_state for SHA-512, out of line on ARM64 only, where digest512 stores the digest.
+#[cfg_attr(target_arch = "aarch64", inline(never))]
+#[cfg_attr(not(target_arch = "aarch64"), inline(always))]
+fn finish512_state(state: &[u64; 8], data: &[u8], bits: u128, out: &mut [u8]) {
     let mut state = *state;
 
     if !cpu::finish512(&mut state, data, bits) {
@@ -1471,6 +1533,8 @@ fn schedule512(w: &mut [u64; 16]) {
     word512(w, 15);
 }
 
+// compress256's dispatch for SHA-512.
+#[cfg_attr(target_arch = "aarch64", inline(never))]
 fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) {
     if cpu::compress512(state, blocks, more) {
         return;
@@ -1619,7 +1683,7 @@ impl Sha256 {
         let state = &mut self.state;
 
         self.blocks
-            .update_long(data, |blocks| compress256(state, blocks, &[]));
+            .update_long(data, |first, blocks| compress256(state, first, blocks));
     }
 
     pub(crate) fn digest(&self) -> [u8; 32] {
@@ -1641,6 +1705,22 @@ impl Sha256 {
             data,
             out,
         );
+    }
+
+    // The leading out.len() bytes of an HMAC tag with this state as the inner hash, whose digest
+    // has `size` bytes, and `outer`, the state after the outer key block, in one kernel call that
+    // keeps the inner digest in registers; false where no kernel does, and the caller takes the
+    // two digests. ARM64 only, as Mac::finish.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn hmac_into(&self, outer: &[u32; 8], size: usize, out: &mut [u8]) -> bool {
+        cpu::hmac256_finish(
+            &self.state,
+            self.blocks.buffered(),
+            self.length.wrapping_mul(8),
+            outer,
+            size,
+            out,
+        )
     }
 
     // finish_lanes for messages whose padded last block the caller has already built as words,
@@ -1829,8 +1909,12 @@ impl Sha512 {
     fn update_blocks(&mut self, data: &[u8]) {
         let state = &mut self.state;
 
-        self.blocks.update_long(data, |groups| {
-            compress512(state, groups.as_flattened().as_chunks::<128>().0, &[])
+        self.blocks.update_long(data, |first, groups| {
+            compress512(
+                state,
+                first.as_flattened().as_chunks::<128>().0,
+                groups.as_flattened().as_chunks::<128>().0,
+            )
         });
     }
 
@@ -1865,6 +1949,19 @@ impl Sha512 {
             data,
             out,
         );
+    }
+
+    // Sha256::hmac_into.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn hmac_into(&self, outer: &[u64; 8], size: usize, out: &mut [u8]) -> bool {
+        cpu::hmac512_finish(
+            &self.state,
+            self.blocks.buffered(),
+            self.length.wrapping_mul(8),
+            outer,
+            size,
+            out,
+        )
     }
 
     // Sha256::finish_lanes for one message.
@@ -2068,6 +2165,21 @@ impl Sha256Stream {
         } else if !cpu::digest256_kept(&engine.state, data, engine.length.wrapping_mul(8), out) {
             digest_of_kept(engine, data, out);
         }
+    }
+
+    // Sha256::hmac_into, from a kept state or one in the order of the words.
+    pub(crate) fn hmac_into(&self, outer: &[u32; 8], size: usize, out: &mut [u8]) -> bool {
+        let engine = &self.engine;
+
+        cpu::hmac256_finish_kept(
+            &engine.state,
+            self.kept,
+            engine.blocks.buffered(),
+            engine.length.wrapping_mul(8),
+            outer,
+            size,
+            out,
+        )
     }
 }
 
@@ -2747,6 +2859,12 @@ mod tests {
 
                 store256(&state, &mut expected);
 
+                let mut kernel = *iv;
+
+                if cpu::finish256(&mut kernel, message, bits) {
+                    assert_eq!(kernel, state, "state, length {length}");
+                }
+
                 for taken in 0..=32 {
                     let mut out = [0; 32];
 
@@ -2779,9 +2897,76 @@ mod tests {
         );
     }
 
+    // digest_kernel_matches_portable for SHA-512 and the hashes truncated from it, the state and
+    // finish512 of every size of out against the portable finish; through digest512 and finish512,
+    // a kernel where the CPU has one.
+    #[test]
+    fn digest512_kernel_matches_portable() {
+        let data: [u8; 3 * 128 + 1] = Inputs::new(9).bytes();
+
+        let mut accelerated = 0;
+
+        for length in 0..data.len() {
+            let message = &data[..length];
+
+            let bits = 8 * (128 + length as u128);
+
+            for (iv, size) in [
+                (&IV_512, 64),
+                (&IV_384, 48),
+                (&IV_512_256, 32),
+                (&IV_512_224, 28),
+            ] {
+                let mut expected_state = *iv;
+
+                finish512_portable(&mut expected_state, message, bits);
+
+                let mut expected = [0; 64];
+
+                store512(&expected_state, &mut expected);
+
+                let mut state = *iv;
+
+                if cpu::finish512(&mut state, message, bits) {
+                    assert_eq!(state, expected_state, "state, length {length}");
+                }
+
+                for taken in 0..=64 {
+                    let mut out = [0; 64];
+
+                    finish512(iv, 128, message, &mut out[..taken]);
+
+                    let (digest, after) = out.split_at(taken);
+
+                    assert_eq!(digest, &expected[..taken], "out {taken}, length {length}");
+
+                    assert!(after.iter().all(|&byte| byte == 0), "out {taken}");
+                }
+
+                let mut out = [0; 64];
+
+                if cpu::digest512(iv, message, bits, &mut out[..size]) {
+                    let (digest, after) = out.split_at(size);
+
+                    assert_eq!(digest, &expected[..size], "size {size}, length {length}");
+
+                    assert!(after.iter().all(|&byte| byte == 0), "size {size}");
+
+                    accelerated += 1;
+                }
+            }
+        }
+
+        std::eprintln!(
+            "SHA-512 digests: {accelerated} of {} cases through a CPU kernel",
+            4 * data.len()
+        );
+    }
+
     // The one-call HMAC kernels against the key states and the finish of the generic path, for
     // every key length up to a block, data lengths around the padding boundaries and every tag
-    // size. Where there is no kernel, the cpu functions return false.
+    // size, and on ARM64 the finish of a MAC from a MacKey for truncated tags too. Where there is
+    // no kernel, the cpu functions return false.
     #[test]
     fn hmac_kernels_match_generic() {
         let bytes: [u8; 400] = Inputs::new(5).bytes();
@@ -2819,6 +3004,101 @@ mod tests {
 
                     accelerated += 1;
                 }
+
+                // The tag of a MAC from a MacKey, after a block of data or none and of every
+                // truncated size.
+                #[cfg(target_arch = "aarch64")]
+                for (before, taken) in [(0, size), (1, size), (0, 4), (1, size - 1)] {
+                    let mut inner = keyed[0];
+
+                    compress256(&mut inner, bytes[..64 * before].as_chunks::<64>().0, &[]);
+
+                    let bits = 8 * (64 * (1 + before as u64) + data.len() as u64);
+
+                    let mut tag = [0; 32];
+
+                    if cpu::hmac256_finish(&inner, data, bits, &keyed[1], size, &mut tag[..taken]) {
+                        let (mut digest, mut expected) = ([0; 32], [0; 32]);
+
+                        let mut message = [0; 64 + 260];
+
+                        message[..64].copy_from_slice(&bytes[..64]);
+
+                        message[64..64 + data.len()].copy_from_slice(data);
+
+                        let message = &message[64 - 64 * before..64 + data.len()];
+
+                        finish256(&keyed[0], 64, message, &mut digest[..size]);
+
+                        finish256(&keyed[1], 64, &digest[..size], &mut expected[..taken]);
+
+                        assert_eq!(tag, expected, "finish, key {key_length}, {before} {taken}");
+
+                        accelerated += 1;
+                    }
+                }
+
+                // The same from Sha256Stream's state on x86-64: in the order of the words, and
+                // kept after a block of data. Whole tags only.
+                #[cfg(all(
+                    any(
+                        feature = "sha2",
+                        feature = "ml-dsa",
+                        feature = "slh-dsa",
+                        feature = "lms",
+                        feature = "xmss"
+                    ),
+                    target_arch = "x86_64",
+                    not(target_env = "sgx"),
+                    not(crypto_pq_portable)
+                ))]
+                for before in [0, 1] {
+                    let (mut inner, mut kept) = (keyed[0], false);
+
+                    let first = bytes[..64 * before].as_chunks::<64>().0;
+
+                    if !first.is_empty() && !cpu::compress256_kept(&mut inner, &mut kept, first) {
+                        continue;
+                    }
+
+                    let bits = 8 * (64 * (1 + before as u64) + data.len() as u64);
+
+                    let mut tag = [0; 32];
+
+                    let (outer, tag) = (&keyed[1], &mut tag[..size]);
+
+                    if cpu::hmac256_finish_kept(&inner, kept, data, bits, outer, size, tag) {
+                        let (mut digest, mut expected) = ([0; 32], [0; 32]);
+
+                        let mut message = [0; 64 + 260];
+
+                        message[..64].copy_from_slice(&bytes[..64]);
+
+                        message[64..64 + data.len()].copy_from_slice(data);
+
+                        let message = &message[64 - 64 * before..64 + data.len()];
+
+                        finish256(&keyed[0], 64, message, &mut digest[..size]);
+
+                        finish256(&keyed[1], 64, &digest[..size], &mut expected[..size]);
+
+                        assert_eq!(tag, &expected[..size], "kept, key {key_length}, {before}");
+
+                        accelerated += 1;
+                    }
+
+                    let mut short = [0; 31];
+
+                    assert!(!cpu::hmac256_finish_kept(
+                        &inner,
+                        kept,
+                        data,
+                        bits,
+                        outer,
+                        size,
+                        &mut short[..size - 1]
+                    ));
+                }
             }
 
             for (iv, size) in [(&IV_512, 64), (&IV_384, 48)] {
@@ -2849,9 +3129,40 @@ mod tests {
 
                     accelerated += 1;
                 }
+
+                #[cfg(target_arch = "aarch64")]
+                for (before, taken) in [(0, size), (1, size), (0, 4), (1, size - 1)] {
+                    let mut inner = keyed[0];
+
+                    compress512(&mut inner, bytes[..128 * before].as_chunks::<128>().0, &[]);
+
+                    let bits = 8 * (128 * (1 + before as u128) + data.len() as u128);
+
+                    let mut tag = [0; 64];
+
+                    if cpu::hmac512_finish(&inner, data, bits, &keyed[1], size, &mut tag[..taken]) {
+                        let (mut digest, mut expected) = ([0; 64], [0; 64]);
+
+                        let mut message = [0; 128 + 260];
+
+                        message[..128].copy_from_slice(&bytes[..128]);
+
+                        message[128..128 + data.len()].copy_from_slice(data);
+
+                        let message = &message[128 - 128 * before..128 + data.len()];
+
+                        finish512(&keyed[0], 128, message, &mut digest[..size]);
+
+                        finish512(&keyed[1], 128, &digest[..size], &mut expected[..taken]);
+
+                        assert_eq!(tag, expected, "finish, key {key_length}, {before} {taken}");
+
+                        accelerated += 1;
+                    }
+                }
             }
         }
 
-        std::eprintln!("HMAC: {accelerated} of 1032 cases through a CPU kernel");
+        std::eprintln!("HMAC: {accelerated} cases through a CPU kernel");
     }
 }

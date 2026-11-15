@@ -649,6 +649,38 @@ fn hmac_truncated(hash: &HashAlgorithm, key: &[u8], data: &[u8], out: &mut [u8])
     wipe(&mut full);
 }
 
+// The tag of a MAC from its inner engine through two digests: the inner one of `size` bytes, then
+// the outer one (finish, from the inner digest into the tag), both in buffers that are wiped.
+#[cfg(any(
+    feature = "hmac",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[inline(always)]
+fn hmac_digests(
+    inner: &Engine,
+    size: usize,
+    out: &mut [u8],
+    finish: impl FnOnce(&[u8], &mut [u8]),
+) {
+    let mut digest = [0; 64];
+
+    let mut full = [0; 64];
+
+    let (inner_digest, tag) = (&mut digest[..size], &mut full[..size]);
+
+    inner.digest_into(inner_digest);
+
+    finish(inner_digest, tag);
+
+    out.copy_from_slice(&tag[..out.len()]);
+
+    wipe(&mut digest);
+
+    wipe(&mut full);
+}
+
 // HMAC's engines before the key: the inner one at the hash's initial state.
 #[cfg(any(
     feature = "hmac",
@@ -830,7 +862,8 @@ impl Mac {
     }
 
     // HMAC's inner digest is wiped: with the outer key it gives the output, which may be a key
-    // itself. The engines that finish here are copies, which their drops wipe.
+    // itself. The engines that finish here are copies, which their drops wipe. A kernel that ends
+    // both hashes in one call (hmac_into) keeps the inner digest in its registers instead.
     fn finish(&self, out: &mut [u8]) {
         match &self.engine {
             #[cfg(any(
@@ -844,24 +877,43 @@ impl Mac {
                 outer,
                 digest_size,
             } => {
-                let mut digest = [0; 64];
-
-                let mut full = [0; 64];
-
-                let (inner_digest, tag) = (&mut digest[..*digest_size], &mut full[..*digest_size]);
-
-                inner.digest_into(inner_digest);
-
+                // The outer state picks the path once. The kernels that end both hashes are on
+                // ARM64 and, for SHA-256 alone, on x86-64; tested through the engine first, or
+                // apart from the finish below, an HMAC-SHA-512 on x86-64 ran 8 to 13 more
+                // instructions here.
                 match outer {
-                    Outer::Sha256(state) => finish256(state, 64, inner_digest, tag),
-                    Outer::Sha512(state) => finish512(state, 128, inner_digest, tag),
+                    Outer::Sha256(state) => {
+                        #[cfg(any(
+                            target_arch = "aarch64",
+                            all(
+                                target_arch = "x86_64",
+                                not(target_env = "sgx"),
+                                not(crypto_pq_portable)
+                            )
+                        ))]
+                        if let Engine::Sha256(engine) = inner
+                            && engine.hmac_into(state, *digest_size, out)
+                        {
+                            return;
+                        }
+
+                        hmac_digests(inner, *digest_size, out, |digest, tag| {
+                            finish256(state, 64, digest, tag);
+                        });
+                    }
+                    Outer::Sha512(state) => {
+                        #[cfg(target_arch = "aarch64")]
+                        if let Engine::Sha512(engine) = inner
+                            && engine.hmac_into(state, *digest_size, out)
+                        {
+                            return;
+                        }
+
+                        hmac_digests(inner, *digest_size, out, |digest, tag| {
+                            finish512(state, 128, digest, tag);
+                        });
+                    }
                 }
-
-                out.copy_from_slice(&tag[..out.len()]);
-
-                wipe(&mut digest);
-
-                wipe(&mut full);
             }
             #[cfg(feature = "sha3")]
             MacEngine::Kmac { engine, xof } => {
