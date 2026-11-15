@@ -324,38 +324,41 @@ impl HashAlgorithm {
 
     /// The digest of `data` written into `out`, which must be [`digest_size`](Self::digest_size)
     /// bytes, without allocating. Fails with [`Error::InvalidLength`] if `out` has another length.
-    // Inline always, so that a caller's buffer of the right size needs no check at run time, and
-    // BLAKE3, SHA-3, Keccak-256 and Ascon of a constant algorithm call their own code with no test
-    // of the kind: through the dispatcher, the frame of the kinds that it inlines cost them six
-    // saved registers on x86-64 (D-108, D-109, D-110). Inline alone left those tests out of line
-    // at some call sites, where a digest of another kind ran a call and a jump table more, 23
-    // instructions on x86-64.
-    #[inline(always)]
+    // Inline, so that a caller's buffer of the right size needs no check at run time. Off x86-64,
+    // BLAKE3, SHA-3, Keccak-256 and Ascon call their own code here with no dispatcher frame, and
+    // always inline, so that a constant algorithm runs no test of the kind (D-108, D-109, D-110).
+    // On x86-64 an algorithm chosen at run time paid for those tests in a digest of another kind,
+    // SHA-256 of 64 bytes 3.0% more time on Zen 3, so the dispatcher takes every kind there.
+    #[cfg_attr(target_arch = "x86_64", inline)]
+    #[cfg_attr(not(target_arch = "x86_64"), inline(always))]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         check_length(out.len(), self.digest_size)?;
 
-        #[cfg(feature = "blake3")]
+        #[cfg(all(feature = "blake3", not(target_arch = "x86_64")))]
         if matches!(self.kind, Kind::Blake3) {
             blake3::digest(data, out);
 
             return Ok(());
         }
 
-        #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
+        #[cfg(all(
+            any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"),
+            not(target_arch = "x86_64")
+        ))]
         if matches!(self.kind, Kind::Sha3) {
             Keccak::digest_once(self.block_size(), SHA3_SUFFIX, data, out);
 
             return Ok(());
         }
 
-        #[cfg(feature = "sha3")]
+        #[cfg(all(feature = "sha3", not(target_arch = "x86_64")))]
         if matches!(self.kind, Kind::Keccak) {
             Keccak::digest_once(self.block_size(), KECCAK_SUFFIX, data, out);
 
             return Ok(());
         }
 
-        #[cfg(feature = "ascon")]
+        #[cfg(all(feature = "ascon", not(target_arch = "x86_64")))]
         if matches!(self.kind, Kind::Ascon) {
             ascon::digest(&ascon::HASH256, data, out);
 
@@ -422,9 +425,9 @@ impl HashAlgorithm {
             ))]
             Kind::Sha512(iv) => finish512(iv, 0, data, out),
             #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
-            Kind::Sha3 => Keccak::digest_into(self.block_size(), SHA3_SUFFIX, data, out),
+            Kind::Sha3 => Keccak::digest_once(self.block_size(), SHA3_SUFFIX, data, out),
             #[cfg(feature = "sha3")]
-            Kind::Keccak => Keccak::digest_into(self.block_size(), KECCAK_SUFFIX, data, out),
+            Kind::Keccak => Keccak::digest_once(self.block_size(), KECCAK_SUFFIX, data, out),
             #[cfg(feature = "blake2")]
             Kind::Blake2b(h) => blake2::digest_b(h, data, out),
             #[cfg(feature = "blake2")]
@@ -786,9 +789,9 @@ impl XofAlgorithm {
     /// The algorithm with this customization in place of any set before.
     ///
     /// cSHAKE's function name N is reserved for NIST, so this sets the customization alone.
-    // Inline, so that the start state of a constant algorithm's customization goes to a call of
-    // digest_into right after without a copy of the whole algorithm (D-109).
-    #[inline]
+    // Inline off x86-64, so that the start state of a constant algorithm's customization goes to
+    // a call of digest_into right after without a copy of the whole algorithm (D-109).
+    #[cfg_attr(not(target_arch = "x86_64"), inline)]
     pub fn configure(&self, options: &XofOptions) -> Result<Self, Error> {
         let customization = options.customization;
 
@@ -852,20 +855,20 @@ impl XofAlgorithm {
     /// `out.len()` bytes of output for `data`, without allocating. Fails with
     /// [`Error::InvalidLength`] if `out` is longer than 2^32 - 1 bytes or, for the Ascon XOFs,
     /// empty.
-    // Inline always, as HashAlgorithm::digest_into, for BLAKE3 and Ascon of a constant algorithm
-    // (D-108, D-109).
-    #[inline(always)]
+    // As HashAlgorithm::digest_into: off x86-64, BLAKE3 and Ascon call their own code here, always
+    // inline (D-108, D-109); on x86-64 the dispatcher takes every kind.
+    #[cfg_attr(not(target_arch = "x86_64"), inline(always))]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         self.check_output(out.len())?;
 
-        #[cfg(feature = "blake3")]
+        #[cfg(all(feature = "blake3", not(target_arch = "x86_64")))]
         if matches!(self.kind, XofKind::Blake3) {
             blake3::digest(data, out);
 
             return Ok(());
         }
 
-        #[cfg(feature = "ascon")]
+        #[cfg(all(feature = "ascon", not(target_arch = "x86_64")))]
         match &self.kind {
             XofKind::AsconXof => {
                 ascon::digest(&ascon::XOF128, data, out);

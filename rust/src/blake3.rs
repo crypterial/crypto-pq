@@ -1607,7 +1607,7 @@ fn one_shot_read(
         return;
     }
 
-    one_shot_long(data, out, key, flags);
+    one_shot_long(key, flags, data, out);
 }
 
 // one_shot's short path on a word of features not yet probed, or on another kernel. This and the
@@ -1640,10 +1640,9 @@ fn one_block_long(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
     wipe(&mut last);
 }
 
-// one_shot for more than a block of input or more than 32 bytes of output. The input and the
-// output come first, as digest receives them and as the digest kernels take them.
+// one_shot for more than a block of input or more than 32 bytes of output.
 #[inline(never)]
-fn one_shot_long(data: &[u8], out: &mut [u8], key: &[u32; 8], flags: u32) {
+fn one_shot_long(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
     if data.len() <= CHUNK && out.len() <= 32 {
         let mut v = [0; 8];
 
@@ -1857,7 +1856,7 @@ fn keyed_long(key: &[u8; KEY], flags: u32, data: &[u8], out: &mut [u8]) {
 
     key_words(key, &mut k);
 
-    one_shot_long(data, out, &k, flags);
+    one_shot_long(&k, flags, data, out);
 
     wipe(&mut k);
 }
