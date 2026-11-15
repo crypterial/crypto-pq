@@ -387,8 +387,10 @@ impl fmt::Debug for KemAlgorithm {
 }
 
 // An ML-KEM public key and the form of it that encapsulation uses, computed on first use so that
-// no encapsulation samples the matrix or hashes the key again.
+// no encapsulation samples the matrix or hashes the key again. Clone is for a target without
+// compare-and-swap, whose Shared is a Box that copies (once.rs).
 #[cfg(feature = "ml-kem")]
+#[derive(Clone)]
 struct MlKemPublic {
     key: Vec<u8>,
     params: Parameters,
@@ -409,8 +411,10 @@ impl MlKemPublic {
     }
 }
 
-// A FrodoKEM public key and its pkh, computed on first use; the matrix is never kept.
+// A FrodoKEM public key and its pkh, computed on first use; the matrix is never kept. Clone as
+// for MlKemPublic.
 #[cfg(feature = "frodokem")]
+#[derive(Clone)]
 struct FrodoPublic {
     key: Vec<u8>,
     params: frodokem::Parameters,
