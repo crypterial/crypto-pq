@@ -14,7 +14,8 @@
 // one-shot digests and MACs keep the state in registers from the first block to the output.
 // (Message words moved by scalar stores into a ring that the rounds read with vector loads took
 // 35 to 60% more time than these gathers: the loads waited on the stores.) With AVX-512VL the
-// AVX2 row forms take some of its rotations (module vl).
+// AVX2 row forms take some of its rotations (module vl), or on AMD's cores split them (module
+// split).
 
 use core::arch::x86_64::*;
 
@@ -142,6 +143,13 @@ fn rotate64<const R: u32>(x: __m256i) -> __m256i {
     }
 }
 
+// x ^ y rotated right by R, the update of a row in a half step, with AVX2's rotations.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn rotate_xor64<const R: u32>(x: __m256i, y: __m256i) -> __m256i {
+    rotate64::<R>(_mm256_xor_si256(x, y))
+}
+
 // The sixteen words of a block as eight pairs, each pair in both halves of a vector, which a
 // broadcast load gives.
 #[target_feature(enable = "avx2")]
@@ -207,7 +215,8 @@ fn gather64(m: &[__m256i; 8], w: [usize; 4]) -> __m256i {
     halves(pair64(m, w[0], w[1]), pair64(m, w[2], w[3]))
 }
 
-// The AVX2 row form of BLAKE2b, generated for AVX2 and for AVX-512VL with the module's rotation.
+// The AVX2 row form of BLAKE2b, generated for AVX2, for AVX-512VL and for the split rotations with
+// the module's rotation of x ^ y.
 // The twelve rounds of BLAKE2b on the rows, in the code of the caller: the out-of-line
 // compression of a single block and the loop over several.
 macro_rules! rounds64 {
@@ -240,7 +249,7 @@ macro_rules! rounds64 {
 
 // With `unsafe` and a safety section, the entry points are unsafe functions documented with it.
 macro_rules! rows64 {
-    ($feature:literal, $rotate:ident $(, $unsafe:tt $safety:literal)?) => {
+    ($feature:literal, $rotate_xor:ident $(, $unsafe:tt $safety:literal)?) => {
         // Half of the four G functions of a step: a += m, a += b, d = ror(d ^ a), c += d, b = ror(b
         // ^ c).
         #[target_feature(enable = $feature)]
@@ -250,11 +259,11 @@ macro_rules! rows64 {
 
             *a = _mm256_add_epi64(_mm256_add_epi64(*a, m), *b);
 
-            *d = $rotate::<R1>(_mm256_xor_si256(*d, *a));
+            *d = $rotate_xor::<R1>(*d, *a);
 
             *c = _mm256_add_epi64(*c, *d);
 
-            *b = $rotate::<R2>(_mm256_xor_si256(*b, *c));
+            *b = $rotate_xor::<R2>(*b, *c);
         }
 
         // Round R, with the row of SIGMA a constant: an instance per round, each called once and
@@ -1075,10 +1084,17 @@ fn rotate32_avx2<const R: u32>(x: __m128i) -> __m128i {
     }
 }
 
-// The AVX2 row form of BLAKE2s, generated for AVX2 and for AVX-512VL with the module's rotation.
-// The entry point's `unsafe` and safety section as in rows64.
+// x ^ y rotated right by R, as rotate_xor64.
+#[target_feature(enable = "avx2")]
+#[inline]
+fn rotate_xor32<const R: u32>(x: __m128i, y: __m128i) -> __m128i {
+    rotate32_avx2::<R>(_mm_xor_si128(x, y))
+}
+
+// The AVX2 row form of BLAKE2s, generated as rows64 with the module's rotation of x ^ y. The entry
+// point's `unsafe` and safety section as in rows64.
 macro_rules! rows32 {
-    ($feature:literal, $rotate:ident $(, $unsafe:tt $safety:literal)?) => {
+    ($feature:literal, $rotate_xor:ident $(, $unsafe:tt $safety:literal)?) => {
         #[target_feature(enable = $feature)]
         #[inline]
         fn half32_avx2<const R1: u32, const R2: u32>(row: &mut [__m128i; 4], m: __m128i) {
@@ -1086,11 +1102,11 @@ macro_rules! rows32 {
 
             *a = _mm_add_epi32(_mm_add_epi32(*a, m), *b);
 
-            *d = $rotate::<R1>(_mm_xor_si128(*d, *a));
+            *d = $rotate_xor::<R1>(*d, *a);
 
             *c = _mm_add_epi32(*c, *d);
 
-            *b = $rotate::<R2>(_mm_xor_si128(*b, *c));
+            *b = $rotate_xor::<R2>(*b, *c);
         }
 
         // Round R. For the diagonal step, a moves down a lane and c and d up one and two.
@@ -1271,9 +1287,9 @@ macro_rules! rows32 {
 mod avx2 {
     use super::*;
 
-    rows64!("avx2", rotate64);
+    rows64!("avx2", rotate_xor64);
 
-    rows32!("avx2", rotate32_avx2);
+    rows32!("avx2", rotate_xor32);
 }
 
 // The AVX2 row forms with the rotations by 63 (BLAKE2b), 12 and 7 (BLAKE2s) each one EVEX
@@ -1288,42 +1304,96 @@ mod vl {
     #[target_feature(enable = "avx2")]
     #[inline]
     #[allow(unsafe_code)]
-    fn rotate64_vl<const R: u32>(x: __m256i) -> __m256i {
+    fn rotate_xor64_vl<const R: u32>(x: __m256i, y: __m256i) -> __m256i {
+        let z = _mm256_xor_si256(x, y);
+
         match R {
             // SAFETY: the CPU has AVX-512F and AVX-512VL, as the entry points require.
-            63 => unsafe { ror64::<63>(x) },
-            _ => rotate64::<R>(x),
+            63 => unsafe { ror64::<63>(z) },
+            _ => rotate64::<R>(z),
         }
     }
 
     #[target_feature(enable = "avx2")]
     #[inline]
     #[allow(unsafe_code)]
-    fn rotate32_vl<const R: u32>(x: __m128i) -> __m128i {
+    fn rotate_xor32_vl<const R: u32>(x: __m128i, y: __m128i) -> __m128i {
+        let z = _mm_xor_si128(x, y);
+
         match R {
-            // SAFETY: as in rotate64_vl, here and in the next.
-            12 => unsafe { ror32::<12>(x) },
-            7 => unsafe { ror32::<7>(x) },
-            _ => rotate32_avx2::<R>(x),
+            // SAFETY: as in rotate_xor64_vl, here and in the next.
+            12 => unsafe { ror32::<12>(z) },
+            7 => unsafe { ror32::<7>(z) },
+            _ => rotate32_avx2::<R>(z),
         }
     }
 
     rows64!(
         "avx2",
-        rotate64_vl,
+        rotate_xor64_vl,
         unsafe "# Safety\n\nThe CPU has AVX-512F and AVX-512VL, and the operating system saves \
             their registers."
     );
 
     rows32!(
         "avx2",
-        rotate32_vl,
+        rotate_xor32_vl,
+        unsafe "# Safety\n\nThe CPU has AVX-512F and AVX-512VL, and the operating system saves \
+            their registers."
+    );
+}
+
+// The AVX2 row forms on AMD's cores with AVX-512 (D-107), where a VPSHUFB, VPRORD or VPRORQ takes
+// two cycles and a shift, an addition or a VPTERNLOGD one (Zen 4). Each rotation of x ^ y but
+// BLAKE2b's by 32 is that of x, which the half step before wrote, xored with y's two shifted
+// halves: two instructions on the chain from y, against three for the XOR and a VPSHUFB, or the
+// XOR, two shifts and an OR, so that the chain of a step is 12 cycles in place of 15 (BLAKE2b) and
+// 16 (BLAKE2s). The rotation by 32 stays the XOR and a VPSHUFD of one cycle.
+mod split {
+    use super::super::evex::{ror_xor32, ror_xor64};
+    use super::*;
+
+    // Private to this module, whose entry points are unsafe and require AVX-512F and AVX-512VL:
+    // every call of the rotations below comes from one of them.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    #[allow(unsafe_code)]
+    fn rotate_xor64_split<const R: u32>(x: __m256i, y: __m256i) -> __m256i {
+        match R {
+            32 => swap32(_mm256_xor_si256(x, y)),
+            // SAFETY: the CPU has AVX-512F and AVX-512VL, as the entry points require.
+            _ => unsafe { ror_xor64::<R>(x, y) },
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    #[allow(unsafe_code)]
+    fn rotate_xor32_split<const R: u32>(x: __m128i, y: __m128i) -> __m128i {
+        // SAFETY: as in rotate_xor64_split.
+        unsafe { ror_xor32::<R>(x, y) }
+    }
+
+    rows64!(
+        "avx2",
+        rotate_xor64_split,
+        unsafe "# Safety\n\nThe CPU has AVX-512F and AVX-512VL, and the operating system saves \
+            their registers."
+    );
+
+    rows32!(
+        "avx2",
+        rotate_xor32_split,
         unsafe "# Safety\n\nThe CPU has AVX-512F and AVX-512VL, and the operating system saves \
             their registers."
     );
 }
 
 pub(super) use avx2::{blake2b_avx2, blake2b_digest_avx2, blake2s_avx2};
+pub(super) use split::{
+    blake2b_avx2 as blake2b_split, blake2b_digest_avx2 as blake2b_digest_split,
+    blake2s_avx2 as blake2s_split,
+};
 pub(super) use vl::{
     blake2b_avx2 as blake2b_vl, blake2b_digest_avx2 as blake2b_digest_vl,
     blake2s_avx2 as blake2s_vl,
