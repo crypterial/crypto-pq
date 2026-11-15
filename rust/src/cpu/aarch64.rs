@@ -188,6 +188,48 @@ fn has(feature: u32) -> bool {
     found & feature != 0
 }
 
+// has() for the SHA-2 compressions of a streaming update, whose dispatch in sha2.rs is a tail call
+// of the kernel: the first call's probe runs out of line, so that the ready path keeps no frame.
+// With the probe in line, every call saved and restored six registers, 11 of the 17 instructions
+// that the dispatch ran per block.
+#[inline]
+fn has_ready(feature: u32) -> bool {
+    if !usable(feature) {
+        return false;
+    }
+
+    if guaranteed(feature) {
+        return true;
+    }
+
+    match FEATURES.load(Ordering::Relaxed) {
+        0 => has_first(feature),
+        found => found & feature != 0,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn has_first(feature: u32) -> bool {
+    has(feature)
+}
+
+// has() without the first detection, false until a call of has() has probed, for a kernel whose
+// caller then takes a path that detects (the SHA-2 digests): with no call of the probe, the caller
+// that takes the kernel needs no frame.
+#[inline]
+fn detected(feature: u32) -> bool {
+    if !usable(feature) {
+        return false;
+    }
+
+    if guaranteed(feature) {
+        return true;
+    }
+
+    FEATURES.load(Ordering::Relaxed) & feature != 0
+}
+
 // BLAKE's detection has its own word and probe, so that no other caller of has() carries BLAKE's
 // probe: an out-of-line probe in has() moved the register allocation of the SHA-2 and Keccak
 // callers, and Apple M3 measured SHA-256 of an empty input 1.4% and SHAKE128 of 64 bytes 0.6%
@@ -586,7 +628,7 @@ pub(crate) fn frodo_aes_rows(
 // padding without copying the input.
 #[allow(unsafe_code)]
 pub(crate) fn compress256(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]]) -> bool {
-    if !has(SHA2) {
+    if !has_ready(SHA2) {
         return false;
     }
 
@@ -623,32 +665,74 @@ pub(crate) fn compress256_pair(states: &mut [[u32; 8]; 2], blocks: &[[u8; 64]; 2
     true
 }
 
+// The state after data and its padding: for the first digest of a process, as digest256 returns
+// false before the detection, and for the kernel tests. final256_sha2 stores the digest, whose
+// big-endian words are the state, and the bytes are wiped.
 #[allow(unsafe_code)]
 pub(crate) fn finish256(state: &mut [u32; 8], data: &[u8], bits: u64) -> bool {
     if !has(SHA2) {
         return false;
     }
 
+    let mut bytes = [0; 32];
+
     // SAFETY: as in compress256.
-    unsafe { finish256_sha2(state, data, bits) };
+    unsafe { final256_sha2(state, data, bits, None, &mut bytes) };
+
+    for (word, bytes) in state.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        *word = u32::from_be_bytes(*bytes);
+    }
+
+    wipe(&mut bytes);
 
     true
 }
 
-// The digest is stored from the state that finish256 leaves.
-#[inline(always)]
-pub(crate) fn digest256(_: &[u32; 8], _: &[u8], _: u64, _: &mut [u8]) -> bool {
-    false
+// finish256 with the first out.len() bytes of the digest stored from the registers, so that the
+// state has no copy on the stack to wipe (sha2::finish256_state). Before the first detection this
+// returns false, and finish256_state, which the caller runs then, detects.
+#[allow(unsafe_code)]
+pub(crate) fn digest256(state: &[u32; 8], data: &[u8], bits: u64, out: &mut [u8]) -> bool {
+    if !detected(SHA2) {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { final256_sha2(state, data, bits, None, out) };
+
+    true
 }
 
+// digest256 for SHA-512 and the hashes truncated from it.
+#[allow(unsafe_code)]
+pub(crate) fn digest512(state: &[u64; 8], data: &[u8], bits: u128, out: &mut [u8]) -> bool {
+    if !detected(SHA3) {
+        return false;
+    }
+
+    // SAFETY: as in compress512.
+    unsafe { final512_sha3(state, data, bits, None, out) };
+
+    true
+}
+
+// finish256 for SHA-512.
 #[allow(unsafe_code)]
 pub(crate) fn finish512(state: &mut [u64; 8], data: &[u8], bits: u128) -> bool {
     if !has(SHA3) {
         return false;
     }
 
+    let mut bytes = [0; 64];
+
     // SAFETY: as in compress512.
-    unsafe { finish512_sha3(state, data, bits) };
+    unsafe { final512_sha3(state, data, bits, None, &mut bytes) };
+
+    for (word, bytes) in state.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        *word = u64::from_be_bytes(*bytes);
+    }
+
+    wipe(&mut bytes);
 
     true
 }
@@ -703,9 +787,52 @@ pub(crate) fn hmac512_keyed(keyed: &[[u64; 8]; 2], data: &[u8], tag: &mut [u8]) 
     true
 }
 
+// The first out.len() bytes of an HMAC-SHA-256 or HMAC-SHA-224 tag, whose inner digest has `size`
+// bytes, from the inner state after the whole blocks before data, data, and the state after the
+// outer key block: a MAC from a MacKey (mac.rs, Mac::finish), whose inner digest stays in
+// registers. As digest256, false before the first detection, and the caller's two digests detect.
+#[allow(unsafe_code)]
+pub(crate) fn hmac256_finish(
+    inner: &[u32; 8],
+    data: &[u8],
+    bits: u64,
+    outer: &[u32; 8],
+    size: usize,
+    out: &mut [u8],
+) -> bool {
+    if !detected(SHA2) || !matches!(size, 28 | 32) || out.len() > size {
+        return false;
+    }
+
+    // SAFETY: as in compress256.
+    unsafe { final256_sha2(inner, data, bits, Some((outer, size)), out) };
+
+    true
+}
+
+// hmac256_finish for HMAC-SHA-512 and HMAC-SHA-384.
+#[allow(unsafe_code)]
+pub(crate) fn hmac512_finish(
+    inner: &[u64; 8],
+    data: &[u8],
+    bits: u128,
+    outer: &[u64; 8],
+    size: usize,
+    out: &mut [u8],
+) -> bool {
+    if !detected(SHA3) || !matches!(size, 48 | 64) || out.len() > size {
+        return false;
+    }
+
+    // SAFETY: as in compress512.
+    unsafe { final512_sha3(inner, data, bits, Some((outer, size)), out) };
+
+    true
+}
+
 #[allow(unsafe_code)]
 pub(crate) fn compress512(state: &mut [u64; 8], blocks: &[[u8; 128]], more: &[[u8; 128]]) -> bool {
-    if !has(SHA3) {
+    if !has_ready(SHA3) {
         return false;
     }
 
@@ -1553,12 +1680,33 @@ fn block_chunks<const N: usize>(block: &[[u8; 16]]) -> [uint8x16_t; N] {
     chunks
 }
 
+// The round constants, loaded from one base address. The address passes through an empty asm
+// block, which LLVM cannot see through: with the values known, it gave each vector a constant
+// pool entry of its own, an ADRP and a load apiece, 32 instructions where 10 do, before every
+// block of a streaming update.
 #[target_feature(enable = "neon")]
 #[inline]
+#[allow(unsafe_code)]
 fn constants256() -> [uint32x4_t; 16] {
+    let mut address: *const [u32; 64] = &K256;
+
+    // SAFETY: the template is a comment, so address keeps its value; it reads and writes no
+    // memory, stack or flags. Declared readonly rather than nomem, which a block given a pointer
+    // may not claim (clippy::pointers_in_nomem_asm_block); either lets LLVM merge or drop it.
+    unsafe {
+        core::arch::asm!(
+            "// {address}",
+            address = inout(reg) address,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+    }
+
+    // SAFETY: address is that of K256, a constant of the program, unchanged by the block above.
+    let constants = unsafe { &*address };
+
     let mut k = [vdupq_n_u32(0); 16];
 
-    for (k, words) in k.iter_mut().zip(K256.as_chunks::<4>().0) {
+    for (k, words) in k.iter_mut().zip(constants.as_chunks::<4>().0) {
         *k = load_u32(words);
     }
 
@@ -1671,13 +1819,122 @@ fn tail256(
     wipe_unless_optimized!(vector_lanes(&mut last));
 }
 
+// The end of a SHA-256 or SHA-224 computation from the state after its whole blocks: data and its
+// padding, then for HMAC the outer hash of that inner digest of `size` bytes from the state after
+// the outer key block, and the first out.len() bytes of the digest or tag stored from the
+// registers. The state is read, never written, so that no copy of it is kept to wipe. One kernel
+// for both ends, so that its padded blocks are compiled once, in line: in two kernels they were
+// not, and the state and the round constants went through the stack (D-106).
 #[target_feature(enable = "sha2")]
-fn finish256_sha2(state: &mut [u32; 8], data: &[u8], bits: u64) {
+fn final256_sha2(
+    state: &[u32; 8],
+    data: &[u8],
+    bits: u64,
+    outer: Option<(&[u32; 8], usize)>,
+    out: &mut [u8],
+) {
+    let k = constants256();
+
     let (mut abcd, mut efgh) = load256(state);
 
-    tail256(&mut abcd, &mut efgh, data, bits, &constants256());
+    tail256(&mut abcd, &mut efgh, data, bits, &k);
 
-    store256(abcd, efgh, state);
+    if let Some((outer, size)) = outer {
+        // The outer block is the inner digest's words, the marker word and the length.
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut block = [abcd, efgh, vdupq_n_u32(0), vdupq_n_u32(0)];
+
+        if size == 32 {
+            block[2] = vsetq_lane_u32::<0>(0x8000_0000, block[2]);
+        } else {
+            block[1] = vsetq_lane_u32::<3>(0x8000_0000, block[1]);
+        }
+
+        block[3] = vsetq_lane_u32::<3>((64 + size as u32) * 8, block[3]);
+
+        (abcd, efgh) = load256(outer);
+
+        block256(&mut abcd, &mut efgh, block, &k);
+
+        wipe_unless_optimized!(vector_lanes(&mut block));
+    }
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut bytes = [
+        vrev32q_u8(vreinterpretq_u8_u32(abcd)),
+        vrev32q_u8(vreinterpretq_u8_u32(efgh)),
+    ];
+
+    store_digest(bytes, out);
+
+    wipe_unless_optimized!(vector_lanes(&mut bytes));
+}
+
+// The first out.len() bytes of a digest, at most 16 * N, from the byte vectors of its final state:
+// the whole vectors, then the bytes of the next in pieces of 8, 4, 2 and 1, without a copy in
+// memory. Each vector is named by a constant index: picked at run time, the vectors went to the
+// stack, where nothing wiped them.
+#[target_feature(enable = "neon")]
+#[inline]
+fn store_digest<const N: usize>(vectors: [uint8x16_t; N], out: &mut [u8]) {
+    let (chunks, rest) = out.as_chunks_mut::<16>();
+
+    let whole = chunks.len();
+
+    for (chunk, vector) in chunks.iter_mut().zip(vectors) {
+        store_u8(vector, chunk);
+    }
+
+    for (i, vector) in vectors.into_iter().enumerate() {
+        if i == whole && !rest.is_empty() {
+            store_part(vector, rest);
+        }
+    }
+}
+
+// The first out.len() bytes of a vector, fewer than sixteen.
+#[target_feature(enable = "neon")]
+#[inline]
+fn store_part(vector: uint8x16_t, out: &mut [u8]) {
+    let halves = vreinterpretq_u64_u8(vector);
+
+    let mut value = vgetq_lane_u64::<0>(halves);
+
+    let mut out = out;
+
+    if out.len() >= 8 {
+        let (eight, after) = core::mem::take(&mut out).split_at_mut(8);
+
+        eight.copy_from_slice(&value.to_le_bytes());
+
+        value = vgetq_lane_u64::<1>(halves);
+
+        out = after;
+    }
+
+    if out.len() >= 4 {
+        let (four, after) = core::mem::take(&mut out).split_at_mut(4);
+
+        four.copy_from_slice(&(value as u32).to_le_bytes());
+
+        value >>= 32;
+
+        out = after;
+    }
+
+    if out.len() >= 2 {
+        let (two, after) = core::mem::take(&mut out).split_at_mut(2);
+
+        two.copy_from_slice(&(value as u16).to_le_bytes());
+
+        value >>= 16;
+
+        out = after;
+    }
+
+    if let Some(byte) = out.first_mut() {
+        *byte = value as u8;
+    }
 }
 
 // The key block of HMAC (a key of at most `N` chunks, zero-padded) XORed with pad in every byte.
@@ -1701,38 +1958,11 @@ fn key_block<const N: usize>(key: &[u8], pad: u8) -> [uint8x16_t; N] {
     block
 }
 
-// A tag from the byte vectors of a final state: whole vectors, and for HMAC-SHA-224 twelve bytes
-// of the last one, written without a copy in memory. The last vector is named by a constant
-// index: picked at run time, the vectors went to the stack, where nothing wiped them.
-#[target_feature(enable = "neon")]
-#[inline]
-fn store_tag<const N: usize>(vectors: [uint8x16_t; N], tag: &mut [u8]) {
-    let (chunks, rest) = tag.as_chunks_mut::<16>();
-
-    for (chunk, vector) in chunks.iter_mut().zip(vectors) {
-        store_u8(vector, chunk);
-    }
-
-    if !rest.is_empty() {
-        assert!(chunks.len() == N - 1, "only the last vector is partial");
-
-        let halves = vreinterpretq_u64_u8(vectors[N - 1]);
-
-        let (low, high) = (vgetq_lane_u64::<0>(halves), vgetq_lane_u64::<1>(halves));
-
-        for (i, byte) in rest.iter_mut().enumerate() {
-            let half = if i < 8 { low } else { high };
-
-            *byte = (half >> (8 * (i % 8))) as u8;
-        }
-    }
-}
-
 // HMAC-SHA-256, or HMAC-SHA-224 for a 28-byte tag, of data under a key of at most a block: the two
-// key blocks in registers, which the core overlaps, the inner hash through data and its padding,
-// and the outer hash of the inner digest. The inner hash is a call to finish256_sha2, and the
-// keyed states wait for it in `states`, which is wiped: held in registers across a call, they
-// would have been saved on the stack, where nothing wipes them.
+// key blocks in registers, which the core overlaps, then the inner hash through data and its
+// padding and the outer hash of the inner digest, a call to final256_sha2. The keyed states wait
+// for it in `states`, which is wiped: held in registers across a call, they would have been saved
+// on the stack, where nothing wipes them.
 #[target_feature(enable = "sha2")]
 fn hmac256_sha2(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
     let k = constants256();
@@ -1761,58 +1991,22 @@ fn hmac256_sha2(iv: &[u32; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
 
     store256(outer_abcd, outer_efgh, &mut states[1]);
 
-    after_keys256(&mut states, data, tag, &k);
+    hmac256_keyed_sha2(&states, data, tag);
 
     wipe(states.as_flattened_mut());
-}
-
-// HMAC-SHA-256 or HMAC-SHA-224 from the states after the inner and the outer key block, which
-// `states` holds; the inner hash overwrites the first.
-#[target_feature(enable = "sha2")]
-#[inline]
-fn after_keys256(states: &mut [[u32; 8]; 2], data: &[u8], tag: &mut [u8], k: &[uint32x4_t; 16]) {
-    finish256_sha2(
-        &mut states[0],
-        data,
-        (data.len() as u64).wrapping_add(64).wrapping_mul(8),
-    );
-
-    let (inner_abcd, inner_efgh) = load256(&states[0]);
-
-    let (mut outer_abcd, mut outer_efgh) = load256(&states[1]);
-
-    // The outer block is the inner digest's words, the marker word and the length.
-    let bits = (64 + tag.len() as u32) * 8;
-
-    let mut outer = [inner_abcd, inner_efgh, vdupq_n_u32(0), vdupq_n_u32(0)];
-
-    if tag.len() == 32 {
-        outer[2] = vsetq_lane_u32::<0>(0x8000_0000, outer[2]);
-    } else {
-        outer[1] = vsetq_lane_u32::<3>(0x8000_0000, outer[1]);
-    }
-
-    outer[3] = vsetq_lane_u32::<3>(bits, outer[3]);
-
-    block256(&mut outer_abcd, &mut outer_efgh, outer, k);
-
-    store_tag(
-        [
-            vrev32q_u8(vreinterpretq_u8_u32(outer_abcd)),
-            vrev32q_u8(vreinterpretq_u8_u32(outer_efgh)),
-        ],
-        tag,
-    );
 }
 
 // hmac256_sha2 from the keyed states, for many messages under one key: HKDF's expansion.
 #[target_feature(enable = "sha2")]
+#[inline]
 fn hmac256_keyed_sha2(keyed: &[[u32; 8]; 2], data: &[u8], tag: &mut [u8]) {
-    let mut states = *keyed;
-
-    after_keys256(&mut states, data, tag, &constants256());
-
-    wipe(states.as_flattened_mut());
+    final256_sha2(
+        &keyed[0],
+        data,
+        (data.len() as u64).wrapping_add(64).wrapping_mul(8),
+        Some((&keyed[1], tag.len())),
+        tag,
+    );
 }
 
 // A state and a block of bytes as a stream.
@@ -2263,15 +2457,51 @@ fn tail512(s: &mut [[uint64x2_t; 4]; 1], data: &[u8], bits: u128) {
     wipe_unless_optimized!(vector_lanes(&mut second));
 }
 
+// final256_sha2 for SHA-512, SHA-384 and the hashes truncated from SHA-512.
 #[target_feature(enable = "sha3")]
-fn finish512_sha3(state: &mut [u64; 8], data: &[u8], bits: u128) {
+fn final512_sha3(
+    state: &[u64; 8],
+    data: &[u8],
+    bits: u128,
+    outer: Option<(&[u64; 8], usize)>,
+    out: &mut [u8],
+) {
     let mut s = [load512(state)];
 
     tail512(&mut s, data, bits);
 
-    store512(&s[0], state);
+    if let Some((outer, size)) = outer {
+        // The outer block is the inner digest's words, the marker word and the length.
+        let [ab, cd, ef, gh] = s[0];
+
+        let (marker, zero) = (vector64(0x8000_0000_0000_0000, 0), vdupq_n_u64(0));
+
+        let length = vector64(0, (128 + size as u64) * 8);
+
+        let mut block = [if size == 64 {
+            [ab, cd, ef, gh, marker, zero, zero, length]
+        } else {
+            [ab, cd, ef, marker, zero, zero, zero, length]
+        }];
+
+        s = [load512(outer)];
+
+        rounds512(&mut s, &mut block);
+
+        wipe_unless_optimized!(vector_lanes(&mut block));
+    }
+
+    let mut bytes = [vdupq_n_u8(0); 4];
+
+    for (bytes, pair) in bytes.iter_mut().zip(s[0]) {
+        *bytes = vrev64q_u8(vreinterpretq_u8_u64(pair));
+    }
+
+    store_digest(bytes, out);
 
     wipe_unless_optimized!(vector_lanes(&mut s));
+
+    wipe_unless_optimized!(vector_lanes(&mut bytes));
 }
 
 // hmac256_sha2 for HMAC-SHA-512, or HMAC-SHA-384 for a 48-byte tag.
@@ -2297,7 +2527,7 @@ fn hmac512_sha3(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
 
     store512(&outer[0], &mut states[1]);
 
-    after_keys512(&mut states, data, tag);
+    hmac512_keyed_sha3(&states, data, tag);
 
     wipe(states.as_flattened_mut());
 
@@ -2308,55 +2538,17 @@ fn hmac512_sha3(iv: &[u64; 8], key: &[u8], data: &[u8], tag: &mut [u8]) {
     wipe_unless_optimized!(vector_lanes(&mut m));
 }
 
-// after_keys256 for SHA-512 and SHA-384.
+// hmac256_keyed_sha2 for SHA-512 and SHA-384.
 #[target_feature(enable = "sha3")]
 #[inline]
-fn after_keys512(states: &mut [[u64; 8]; 2], data: &[u8], tag: &mut [u8]) {
-    finish512_sha3(
-        &mut states[0],
+fn hmac512_keyed_sha3(keyed: &[[u64; 8]; 2], data: &[u8], tag: &mut [u8]) {
+    final512_sha3(
+        &keyed[0],
         data,
         (data.len() as u128).wrapping_add(128).wrapping_mul(8),
+        Some((&keyed[1], tag.len())),
+        tag,
     );
-
-    let mut outer = [load512(&states[1])];
-
-    // The outer block is the inner digest's words, the marker word and the length.
-    let [ab, cd, ef, gh] = load512(&states[0]);
-
-    let (marker, zero) = (vector64(0x8000_0000_0000_0000, 0), vdupq_n_u64(0));
-
-    let length = vector64(0, (128 + tag.len() as u64) * 8);
-
-    let mut block = [if tag.len() == 64 {
-        [ab, cd, ef, gh, marker, zero, zero, length]
-    } else {
-        [ab, cd, ef, marker, zero, zero, zero, length]
-    }];
-
-    rounds512(&mut outer, &mut block);
-
-    let mut bytes = [vdupq_n_u8(0); 4];
-
-    for (bytes, pair) in bytes.iter_mut().zip(outer[0]) {
-        *bytes = vrev64q_u8(vreinterpretq_u8_u64(pair));
-    }
-
-    store_tag(bytes, tag);
-
-    wipe_unless_optimized!(vector_lanes(&mut outer));
-
-    wipe_unless_optimized!(vector_lanes(&mut block));
-
-    wipe_unless_optimized!(vector_lanes(&mut bytes));
-}
-
-#[target_feature(enable = "sha3")]
-fn hmac512_keyed_sha3(keyed: &[[u64; 8]; 2], data: &[u8], tag: &mut [u8]) {
-    let mut states = *keyed;
-
-    after_keys512(&mut states, data, tag);
-
-    wipe(states.as_flattened_mut());
 }
 
 #[target_feature(enable = "neon")]

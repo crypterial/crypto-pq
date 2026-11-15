@@ -145,6 +145,11 @@ mod arch {
     }
 
     #[inline(always)]
+    pub(crate) fn digest512(_: &[u64; 8], _: &[u8], _: u128, _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
     pub(crate) fn hmac256(_: &[u32; 8], _: &[u8], _: &[u8], _: &mut [u8]) -> bool {
         false
     }
@@ -161,6 +166,32 @@ mod arch {
 
     #[inline(always)]
     pub(crate) fn hmac512_keyed(_: &[[u64; 8]; 2], _: &[u8], _: &mut [u8]) -> bool {
+        false
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    pub(crate) fn hmac256_finish(
+        _: &[u32; 8],
+        _: &[u8],
+        _: u64,
+        _: &[u32; 8],
+        _: usize,
+        _: &mut [u8],
+    ) -> bool {
+        false
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    pub(crate) fn hmac512_finish(
+        _: &[u64; 8],
+        _: &[u8],
+        _: u128,
+        _: &[u64; 8],
+        _: usize,
+        _: &mut [u8],
+    ) -> bool {
         false
     }
 
@@ -596,8 +627,12 @@ mod arch {
 
 pub(crate) use arch::{
     compress256, compress256_lanes, compress256_pair, compress512, compress512_pair, digest256,
-    finish256, finish512, hmac256, hmac256_keyed, hmac512, hmac512_keyed,
+    digest512, finish256, finish512, hmac256, hmac256_keyed, hmac512, hmac512_keyed,
 };
+
+// The tag of a MAC from a MacKey in one call (mac.rs, Mac::finish), ARM64 only.
+#[cfg(target_arch = "aarch64")]
+pub(crate) use arch::{hmac256_finish, hmac512_finish};
 
 // The kernels of sha2.rs's Sha256Stream, x86-64 only.
 #[cfg(all(
@@ -612,7 +647,7 @@ pub(crate) use arch::{
     not(target_env = "sgx"),
     not(crypto_pq_portable)
 ))]
-pub(crate) use x86_64::{compress256_kept, digest256_kept};
+pub(crate) use x86_64::{compress256_kept, digest256_kept, hmac256_finish_kept};
 
 #[cfg(feature = "frodokem")]
 pub(crate) use arch::{

@@ -1205,6 +1205,49 @@ pub(crate) fn digest256_kept(state: &[u32; 8], data: &[u8], bits: u64, out: &mut
     true
 }
 
+// The HMAC-SHA-256 or HMAC-SHA-224 tag of a MAC from a MacKey (mac.rs, Mac::finish) in one call,
+// from the inner state of Sha256Stream, kept or in the order of the words, after the whole blocks
+// before data, data, and the state after the outer key block: the inner digest stays in registers.
+// The inner digest has `size` bytes; false for a tag truncated below it, as digest_of stores
+// whole digests, and before the first detection.
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[allow(unsafe_code)]
+pub(crate) fn hmac256_finish_kept(
+    inner: &[u32; 8],
+    kept: bool,
+    data: &[u8],
+    bits: u64,
+    outer: &[u32; 8],
+    size: usize,
+    tag: &mut [u8],
+) -> bool {
+    if !detected(SHA) || !matches!(size, 28 | 32) || tag.len() != size {
+        return false;
+    }
+
+    if kept {
+        // SAFETY: as in compress256.
+        unsafe { final256_sha::<true>(inner, data, bits, outer, tag) };
+    } else {
+        // SAFETY: as in compress256.
+        unsafe { final256_sha::<false>(inner, data, bits, outer, tag) };
+    }
+
+    true
+}
+
+// The digest is stored from the state that finish512 leaves.
+#[inline(always)]
+pub(crate) fn digest512(_: &[u64; 8], _: &[u8], _: u128, _: &mut [u8]) -> bool {
+    false
+}
+
 #[allow(unsafe_code)]
 pub(crate) fn finish512(state: &mut [u64; 8], data: &[u8], bits: u128) -> bool {
     if !has(AVX2) {
@@ -2872,14 +2915,26 @@ fn state_of(stream: &Stream, state: &mut [u32; 8]) {
         unreachable!("eight words are two groups of four")
     };
 
+    let words = state_words(stream);
+
+    memory::store128(words[0], abcd);
+
+    memory::store128(words[1], efgh);
+}
+
+// The state's words a, b, c, d and e, f, g, h, the first in the lowest lane.
+#[target_feature(enable = "sse4.1")]
+#[inline]
+fn state_words(stream: &Stream) -> [__m128i; 2] {
     // Lanes a, b, e, f and g, h, c, d.
     let abef = _mm_shuffle_epi32::<0x1B>(stream.abef);
 
     let ghcd = _mm_shuffle_epi32::<0xB1>(stream.cdgh);
 
-    memory::store128(_mm_blend_epi16::<0xF0>(abef, ghcd), abcd);
-
-    memory::store128(_mm_alignr_epi8::<8>(ghcd, abef), efgh);
+    [
+        _mm_blend_epi16::<0xF0>(abef, ghcd),
+        _mm_alignr_epi8::<8>(ghcd, abef),
+    ]
 }
 
 // The words of state_of as big-endian bytes, the 32 of a digest or the 28 of SHA-224's, stored
@@ -2996,11 +3051,15 @@ macro_rules! finish_stream256 {
         // The length field: words 14 and 15 of the last block.
         let length = _mm_set_epi32(bits as i32, (bits >> 32) as i32, 0, 0);
 
+        #[cfg(target_feature = "avx")]
         for block in blocks {
             block_words(block, &mut $streams[0].m);
 
             rounds256!($streams, 1);
         }
+
+        #[cfg(not(target_feature = "avx"))]
+        blocks256_sha(&mut $streams[0], blocks);
 
         $streams[0].m = [
             last_chunk(whole, 0, marker),
@@ -3104,29 +3163,13 @@ fn kept_of(stream: &Stream, state: &mut [u32; 8]) {
     memory::store128(stream.cdgh, cdgh);
 }
 
-// K256 for the memory operands of PADDD in compress256_sha_kept, which need 16-byte alignment.
-#[cfg(all(
-    any(
-        feature = "sha2",
-        feature = "ml-dsa",
-        feature = "slh-dsa",
-        feature = "lms",
-        feature = "xmss"
-    ),
-    not(target_feature = "avx")
-))]
+// K256 for the memory operands of PADDD in blocks256_sha, which need 16-byte alignment.
+#[cfg(not(target_feature = "avx"))]
 static K256_TABLE: Aligned<[u32; 64]> = Aligned(K256);
 
 // compress256_sha for Sha256Stream: the state in the order of stream_kept after the call, and
-// before it when KEPT, else in the order of the words. Without AVX, the loop is that of
-// compress256_sha over its first slice, in the order LLVM gives it there, in assembly, from a
-// 64-byte boundary, where that loop is in a build that aligns functions to 64 bytes. On Ice Lake,
-// where SHA256MSG1 and SHA256MSG2 are 6 and 12 uops, HMAC-SHA-256 of 16 KiB took 2.5% more time
-// than with compress256_sha in the order LLVM gave this function, with each SHA256MSG2 between the
-// two SHA256RNDS2 of the next quarter, and 2.0% in this order, both with the loop 16 bytes past a
-// 64-byte boundary, and the same time from a boundary; with the loop 32 bytes past one, a stream
-// of 64-byte updates took 0.9% more time than from a boundary. With AVX, LLVM gives both loops one
-// order (D-103).
+// before it when KEPT, else in the order of the words. With AVX, LLVM gives the loop the order of
+// compress256_sha's (D-103); without, it is blocks256_sha.
 #[cfg(any(
     feature = "sha2",
     feature = "ml-dsa",
@@ -3135,7 +3178,6 @@ static K256_TABLE: Aligned<[u32; 64]> = Aligned(K256);
     feature = "xmss"
 ))]
 #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
-#[allow(unsafe_code)]
 fn compress256_sha_kept<const KEPT: bool>(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
     let mut streams = [if KEPT {
         stream_kept(state)
@@ -3151,12 +3193,35 @@ fn compress256_sha_kept<const KEPT: bool>(state: &mut [u32; 8], blocks: &[[u8; 6
     }
 
     #[cfg(not(target_feature = "avx"))]
+    blocks256_sha(&mut streams[0], blocks);
+
+    kept_of(&streams[0], state);
+
+    wipe_unless_optimized!(memory::words_of(&mut streams));
+}
+
+// The blocks on one stream without AVX: the loop of compress256_sha over its first slice, in the
+// order LLVM gives it there, in assembly, from a 64-byte boundary, where that loop is in a build
+// that aligns functions to 64 bytes. On Ice Lake, where SHA256MSG1 and SHA256MSG2 are 6 and 12
+// uops, HMAC-SHA-256 of 16 KiB took 2.5% more time than with compress256_sha in the order LLVM gave
+// compress256_sha_kept, with each SHA256MSG2 between the two SHA256RNDS2 of the next quarter, and
+// 2.0% in this order, both with the loop 16 bytes past a 64-byte boundary, and the same time from
+// a boundary; with the loop 32 bytes past one, a stream of 64-byte updates took 0.9% more time than
+// from a boundary (D-103). The first SHA256RNDS2 of a block reads abef from xmm6, the register of
+// the rounds, where LLVM read it from xmm8, its copy for the sum after the block: through the
+// copy, a MOVDQA joined the chain from one block to the next, one cycle a block in the llvm-mca
+// models of Ice Lake and Sapphire Rapids. An empty REX prefix keeps that instruction's five bytes
+// and the offsets of the rest of the loop. The whole blocks of a one-shot digest take this loop
+// too, which LLVM put 32 bytes past a boundary in finish_stream256 (D-106).
+#[cfg(not(target_feature = "avx"))]
+#[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+#[inline]
+#[allow(unsafe_code)]
+fn blocks256_sha(stream: &mut Stream, blocks: &[[u8; 64]]) {
     if !blocks.is_empty() {
         let k = K256.as_chunks::<4>().0;
 
         let swap = _mm_set_epi64x(0x0C0D_0E0F_0809_0A0B, 0x0405_0607_0001_0203);
-
-        let stream = &mut streams[0];
 
         // SAFETY: the assembly reads the blocks, up to end, and the first 176 bytes of K256_TABLE,
         // whose alignment the memory operands of PADDD need; it writes the registers it names
@@ -3178,7 +3243,8 @@ fn compress256_sha_kept<const KEPT: bool>(state: &mut [u32; 8], blocks: &[[u8; 6
                 "movdqa %xmm3, %xmm0",
                 "paddd {k}(%rip), %xmm0",
                 "pshufb %xmm9, %xmm1",
-                "sha256rnds2 %xmm0, %xmm8, %xmm5",
+                ".byte 0x40",
+                "sha256rnds2 %xmm0, %xmm6, %xmm5",
                 "pshufd $14, %xmm0, %xmm0",
                 "sha256rnds2 %xmm0, %xmm5, %xmm6",
                 "movdqa %xmm1, %xmm0",
@@ -3346,10 +3412,6 @@ fn compress256_sha_kept<const KEPT: bool>(state: &mut [u32; 8], blocks: &[[u8; 6
             );
         }
     }
-
-    kept_of(&streams[0], state);
-
-    wipe_unless_optimized!(memory::words_of(&mut streams));
 }
 
 // digest256_sha for a state in the order of stream_kept.
@@ -3440,32 +3502,82 @@ fn after_keys256_sha(states: &mut [[u32; 8]; 2], data: &[u8], tag: &mut [u8]) {
 
     let mut outer = [stream_of(&states[1])];
 
-    // The outer block is the inner digest's words, the marker word and the length.
-    let bits = ((64 + tag.len() as u32) * 8) as i32;
-
-    let marker = 0x8000_0000_u32 as i32;
-
-    outer[0].m = if tag.len() == 32 {
-        [
-            memory::load128(first),
-            memory::load128(second),
-            _mm_set_epi32(0, 0, 0, marker),
-            _mm_set_epi32(bits, 0, 0, 0),
-        ]
-    } else {
-        [
-            memory::load128(first),
-            _mm_insert_epi32::<3>(memory::load128(second), marker),
-            _mm_setzero_si128(),
-            _mm_set_epi32(bits, 0, 0, 0),
-        ]
-    };
+    outer[0].m = outer_block256(memory::load128(first), memory::load128(second), tag.len());
 
     rounds256!(outer, 1);
 
     digest_of(&outer[0], tag);
 
     wipe_unless_optimized!(memory::words_of(&mut outer));
+}
+
+// The outer block of HMAC-SHA-256 or HMAC-SHA-224 as schedule words: the inner digest's words,
+// abcd and efgh with a in the lowest lane, of `size` bytes, the marker word and the length.
+#[target_feature(enable = "sse4.1")]
+#[inline]
+fn outer_block256(abcd: __m128i, efgh: __m128i, size: usize) -> [__m128i; 4] {
+    let bits = ((64 + size as u32) * 8) as i32;
+
+    let marker = 0x8000_0000_u32 as i32;
+
+    if size == 32 {
+        [
+            abcd,
+            efgh,
+            _mm_set_epi32(0, 0, 0, marker),
+            _mm_set_epi32(bits, 0, 0, 0),
+        ]
+    } else {
+        [
+            abcd,
+            _mm_insert_epi32::<3>(efgh, marker),
+            _mm_setzero_si128(),
+            _mm_set_epi32(bits, 0, 0, 0),
+        ]
+    }
+}
+
+// The end of an HMAC tag from a MacKey (hmac256_finish_kept): the inner hash through data and its
+// padding from a state in the order of stream_kept when KEPT, else of the words, then the outer
+// hash of its digest from the outer state, whose words go from the inner rounds' registers to the
+// outer block without memory, and the tag stored from the registers (D-106).
+#[cfg(any(
+    feature = "sha2",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss"
+))]
+#[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+fn final256_sha<const KEPT: bool>(
+    inner: &[u32; 8],
+    data: &[u8],
+    bits: u64,
+    outer: &[u32; 8],
+    tag: &mut [u8],
+) {
+    let mut streams = [if KEPT {
+        stream_kept(inner)
+    } else {
+        stream_of(inner)
+    }];
+
+    finish_stream256!(streams, data, bits);
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut words = state_words(&streams[0]);
+
+    streams[0] = stream_of(outer);
+
+    streams[0].m = outer_block256(words[0], words[1], tag.len());
+
+    rounds256!(streams, 1);
+
+    digest_of(&streams[0], tag);
+
+    wipe_unless_optimized!(memory::words_of(&mut streams));
+
+    wipe_unless_optimized!(memory::words_of(&mut words));
 }
 
 // hmac256_sha from the keyed states, for many messages under one key: HKDF's expansion.
