@@ -118,6 +118,55 @@ Implements specification 2.0 (draft).
   less. On Zen 3, a SHA-512 of 16 or 128 bytes in one update and the digest takes 0.2% to 0.3% more
   time. One-shot digests and the SHA-2 of ML-DSA, SLH-DSA, LMS, XMSS and HKDF are unchanged. Outputs
   are unchanged.
+- SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224 and SHA-512/256 on ARM64, and HMAC-SHA-224 and
+  HMAC-SHA-256 under a key from `MacAlgorithm::key` on x86-64 with the SHA extensions
+  ([decision D-106](spec/decisions.md#decision-d-106)): the digest, and the tag of a MAC from a
+  `MacKey`, are stored from the registers of the kernel that runs the padding blocks, with no copy
+  of the state on the stack, and on ARM64 the compressions of a stream reach their kernel with no
+  stack frame. On x86-64 without AVX at compile time, the whole blocks of a kept state and of such a
+  MAC run the loop of D-103 with the first round of a block reading the state from the register of
+  the rounds; the one-shot digests are unchanged. On Neoverse N2, a SHA-256 of 64 bytes takes 21%
+  less time, one of no data 12% less, SHA-224 up to 22% less, the other digests of at most 64 bytes
+  3% to 4% less, updates up to 9% less and an HMAC of 64 bytes under a key set up once 7% to 14%
+  less. On x86-64, HMAC-SHA-256 of 64 bytes under a key set up once takes 3% to 9% less time, and
+  23% less on Ice Lake. Outputs are unchanged.
+- BLAKE2s on AMD processors with AVX-512 that run the vector kernels for one message (Zen 4)
+  ([decision D-107](spec/decisions.md#decision-d-107)): each rotation that follows an XOR is split
+  into a VPRORD of the earlier value, two shifts and one three-input XOR, which takes one cycle off
+  each half step of the rounds. On Zen 4, BLAKE2s digests take 2% to 9% less time and its MACs 2% to
+  5% less. BLAKE2b and other processors run the code before. Outputs are unchanged.
+- BLAKE3 on x86-64 ([decision D-108](spec/decisions.md#decision-d-108)): a hash, keyed hash or
+  `derive_key` of at most 64 bytes with at most 32 bytes of output reads the message and the key
+  straight into the registers of its kernel and stores the output from them, with no buffer on the
+  stack and one read of the feature word. On Zen 4 the chain over a chunk takes the split rotations
+  of D-107, and on Zen 5 and processors without AVX2 and SSE4.1 the portable code of a keyed hash
+  takes the form of D-102. Off x86-64, `HashAlgorithm::digest_into` and `XofAlgorithm::digest_into`
+  reach BLAKE3 with no dispatcher frame. A hash or keyed hash of at most 64 bytes takes up to 3.6%
+  less time on Zen 3, Zen 4, Emerald Rapids and Granite Rapids and up to 9% less on Ice Lake, on Zen
+  5 a keyed hash of at most 63 bytes 3.1% to 7.1% less and a `derive_key` of 32 bytes 2.9% to 3.2%
+  less, a hash of 1 KiB 2% less on Zen 4, and on Neoverse N2 a hash of at most 64 bytes 1.6% to 3.1%
+  less. Outputs are unchanged.
+- Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128
+  ([decision D-109](spec/decisions.md#decision-d-109)): off x86-64, `HashAlgorithm::digest_into` and
+  `XofAlgorithm::digest_into` reach Ascon with no dispatcher frame and `XofAlgorithm::configure` is
+  inline; on x86-64 with AVX2 the customization string of Ascon-CXOF128 is absorbed with the state
+  in registers. On Neoverse N2, Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128 take up to 3.4% less
+  time, and on x86-64 Ascon-CXOF128 up to 2.3% less. Outputs are unchanged.
+- One-shot SHA3-224, SHA3-256, SHA3-384, SHA3-512 and Keccak-256 digests
+  ([decision D-110](spec/decisions.md#decision-d-110)): on x86-64, the dispatcher of
+  `HashAlgorithm::digest_into` reaches the kernel of the rate, the scalar one or the one-state
+  AVX-512VL one, through a one-shot digest with one read of the feature word and no frame of its
+  own, and an output of at most the rate is copied from the state without the loop of the squeeze.
+  Off x86-64, `HashAlgorithm::digest_into` and `XofAlgorithm::digest_into` are always inline and
+  reach SHA-3, Keccak-256, BLAKE3 and Ascon with no dispatcher frame. SHA-3 digests of 64 bytes take
+  up to 1.7% less time on Zen 4 and Emerald Rapids, and on Neoverse N2 the digests take up to 2.2%
+  less and Keccak-256 up to 1.6% less. Outputs are unchanged.
+- BLAKE2s on x86-64, and BLAKE2b and BLAKE2s in the portable code
+  ([decision D-111](spec/decisions.md#decision-d-111)): the last block of a digest in one call that
+  has no block before it, the last block of a MAC and the key are built from moves of whole words,
+  so that each word the kernels load comes from one store. BLAKE2s digests of at most 64 bytes take
+  up to 14% less time on Emerald Rapids and Granite Rapids and up to 3% less on Zen 3, and one of 63
+  bytes 23% less on Ice Lake. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
@@ -359,6 +408,13 @@ Implements specification 2.0 (draft).
   LM-OTS chain starts; SK_PRF where XMSS derives its randomizer; and with SHAKE256 SK_SEED and
   the secret chain values of XMSS. The XMSS PRF_keygen state, keyed with SK_SEED, was copied
   when it was moved into the hashes of a tree. Outputs are unchanged.
+- Builds for a 64-bit target without compare-and-swap of pointer width, such as RV64IM
+  (`riscv64im-unknown-none-elf`), the instruction set of zkVMs
+  ([decision D-112](spec/decisions.md#decision-d-112)): the form of the key caches for such a
+  target, which fills them when a key is made, did not compile with ML-KEM, FrodoKEM or ML-DSA. It
+  builds now, `--cfg crypto_pq_eager` takes it on any target, and CI builds the library for RV64IM
+  and runs the tests in that form. The machine code of other targets is unchanged. rust-v1.0.0 and
+  rust-v1.0.1 have the same flaw.
 
 ## [1.0.1] - 2026-10-26
 

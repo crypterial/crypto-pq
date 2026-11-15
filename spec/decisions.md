@@ -1329,3 +1329,380 @@ by function, on x86-64 and ARM64 with and without `crypto_pq_portable` and on ri
 sixteen units of Cargo's default, x86-64 is the same too; on ARM64 and riscv64, rustc puts some
 functions in other units, as a change anywhere in the crate can, and LLVM gives about fifty
 functions on ARM64 and seven on riscv64 other code.
+
+## Decision D-106
+
+On ARM64, the digests of SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224 and SHA-512/256 are
+stored from the registers of the kernel that runs the padding blocks, `final256_sha2` or
+`final512_sha3`, which reads the state and does not write it, so that no copy of the state is made
+on the stack. The first digest of a process, before the detection of the CPU's features, and the
+kernel tests take the path before, whose state the kernel returns through its byte output, wiped.
+The same kernel ends a MAC from a `MacKey` for HMAC-SHA-224, HMAC-SHA-256, HMAC-SHA-384 and
+HMAC-SHA-512: the inner digest goes from the registers of the inner rounds into the outer block, and
+the tag, of any length from 4 bytes to the digest, is stored from the registers of the outer rounds.
+The compressions of a streaming update are reached through a dispatch whose first detection is out
+of line, so that the dispatch has no stack frame, and the buffered update of
+[D-104](#decision-d-104) copies 32-byte pairs in line and calls the kernel once for the filled block
+and the whole blocks after it.
+
+On x86-64 with the SHA extensions, outside SGX and the portable build, a MAC from a `MacKey` for
+HMAC-SHA-224 and HMAC-SHA-256 with a tag of the digest's length ends the same way, from the kept
+state of [D-103](#decision-d-103) or from a state in the order of the words; a truncated tag takes
+the path before. In builds without AVX, the whole blocks of such a MAC and of a kept state's digest
+take the assembly loop of D-103, now in a function of its own, whose first SHA256RNDS2 reads abef
+from the register of the rounds instead of from the copy kept for the sum after the block. An empty
+REX prefix keeps that instruction at five bytes and every later offset of the loop. The one-shot
+digests keep the loop of the rounds.
+
+This is CPU-specific code under [15.3](15-platforms.md#153-cpu-specific-code). The branches are on
+lengths, on the size of the output and on whether the state is kept, which are public. The vectors
+of a digest or a tag are named by constant indexes, so that none goes to the stack, and the
+kernels' vector arrays are register values under [D-76](#decision-d-76), wiped below opt-level 3.
+The inner digest of an HMAC, which with the outer key gives the tag, no longer goes to a buffer on
+the stack. The assembly reads only the blocks and the round constants and writes only the registers
+it names and the flags, with no branch but the loop's, on the number of blocks. The tests compare
+each kernel with the portable finish for every length up to three blocks after one absorbed block
+and every output size, and with the generic HMAC for every key length up to a block, ten lengths of
+data and truncated tags, from the kept state and from one in the order of the words. They pass
+natively on ARM64 at opt-levels 3 and z, in the portable build and under valgrind with
+`crypto_pq_ct`, and under qemu-x86_64 with the SHA extensions and AVX2, with the SHA extensions and
+no AVX, with AVX2 alone and with neither.
+
+Rationale: the digest and the tag went through copies of the state on the stack, which the code
+then wiped, and on ARM64 the dispatch of each compression of a stream kept a stack frame for its
+first detection. On x86-64, the loop over the whole blocks of the kept state read abef for the
+first SHA256RNDS2 of a block from the copy that a MOVDQA writes after the PADDD, which put the
+MOVDQA on the chain from one block to the next. llvm-mca puts that loop at 162 cycles a block on
+Ice Lake and at 195 on Sapphire Rapids, Emerald Rapids and Granite Rapids, and the loop here at 161
+and 194, as the loop of CRYPTOGAMS in aws-lc-rs and ring; Zen 3, Zen 4 and Zen 5 take 129 in both.
+The bound of the 32 dependent SHA256RNDS2 of a block and the PADDD is 129 cycles on Zen, 161 on Ice
+Lake and 193 on Sapphire Rapids. Under QEMU, counting the instructions run in crypto-pq, with the
+Neoverse N2 model a SHA-512 of 16 KiB in updates of 64 bytes runs 81282 instructions here against
+86440 before, a SHA-256 41528 against 50047, a one-shot SHA-256 of 1 KiB 1773 against 1869, one of
+no data 168 against 248 and HMAC-SHA-256 of 16 KiB under a key set up once 26885 against 27175.
+With the EPYC-Milan model, HMAC-SHA-256 of 16 KiB under a key set up once runs 40361 against 40511
+and HMAC-SHA-224 40372 against 40550. The one-shot digests on x86-64 took the loop of the kept state
+too at first: in bench run 43696970946, with that call, a SHA-256 of 64 bytes took up to 3.6% more
+time on Zen 3 and one of no data 2.5% on Ice Lake, so they keep the loop of the rounds, with which
+they run the instructions of main.
+
+In bench run 43715242317, in one process where four copies of crypto-pq run in turn (two copies of
+this code and two of the code before), the time before over the time here, the time before the
+geometric mean of its two copies, each ratio taken within one process and the median over the
+processes of a class, on Neoverse N2 (30 processes), was 1.131 for a SHA-256 of no data, 1.274 of 64
+bytes, 1.030 of 1 KiB and 1.002 of 16 KiB, and 1.002 to 1.284 for SHA-224; 1.032 to 1.045 for
+SHA-384, SHA-512, SHA-512/224 and SHA-512/256 of no data and of 64 bytes and 0.998 to 1.004 of 1 KiB
+and 16 KiB; 1.001 to 1.104 in updates for SHA-224 and SHA-256 and 1.019 to 1.073 for the others;
+1.078 to 1.163 for an HMAC of 64 bytes under a key set up once, 1.001 to 1.042 of 1 KiB and 16 KiB,
+and 0.999 to 1.044 under a new key. On Zen 3, Zen 4, Emerald Rapids and Granite Rapids (50, 40, 5
+and 45 processes), HMAC-SHA-256 of 64 bytes under a key set up once gave 1.089, 1.097, 1.032 and
+1.032, HMAC-SHA-224 and HMAC-SHA-256 of 1 KiB 1.006 to 1.026 and of 16 KiB 1.000 to 1.002, the
+streams of SHA-2 0.996 to 1.010 but in updates of 1 byte, and the one-shot digests 0.996 to 1.004
+but a SHA-256 of 64 bytes on Zen 4; on Ice Lake (10 processes), 1.298, 1.113 and 1.074 for
+HMAC-SHA-256 under a key set up once. The run drew no Zen 5 runner; in bench run 43710860782, with
+the same code for SHA-2, Zen 5 (20 processes) gave 1.037 for HMAC-SHA-256 of 64 bytes under a key
+set up once and 0.997 to 1.009 for the digests and streams. On Zen 4 a SHA-256 of 64 bytes gave
+0.987 and 0.988 in the two copies of this code, as 0.989 in bench runs 43706703529 and 43710860782,
+with the instructions of main: under QEMU with the EPYC-Genoa model it runs 442 in both, through the
+kernel's machine code unchanged and the dispatcher's path the same but for one register and its
+frame, at other offsets in the dispatcher, whose code for other kinds changed. A SHA-256 of 1 KiB in
+updates of 1 byte gave 0.977 there and 1.030 in the second copy of this code, where the two copies
+of the code before differed by 5.3 percent. They differed by up to 2.5 percent on the other rows of
+x86-64 and 0.9 percent on Neoverse N2; on Ice Lake, with two runners, by up to 17 percent, and its
+rows below 0.99, 0.891 to 0.989, came in one copy of this code, the other giving 0.994 to 1.013 on
+them.
+
+## Decision D-107
+
+On x86-64 processors of AMD with the AVX-512 tier of [15.3](15-platforms.md#153-cpu-specific-code)
+item 2 whose kernels for one message are the vector ones (Zen 4), where
+[D-44](#decision-d-44) kept the AVX2 forms, the kernel for one message of BLAKE2s takes the AVX2 row
+form with each rotation of a value that the half step before wrote, XORed with the row the step
+writes, in the split form: ror(x ^ y, r) as ror(x, r) ^ (y >> r) ^ (y << (32 - r)), one VPRORD of
+x, two shifts of y and one VPTERNLOGD. The rotation of x is off the chain from the new row to the
+rotated one, which takes a shift and the three-input XOR in place of an XOR and a rotation.
+BLAKE2b keeps its AVX2 form there, Intel's processors the forms of D-44, with VPRORD and VPRORQ, and
+Zen 5 the portable code. The one-shot dispatch tests the tiers under one mask of the feature word.
+
+The instructions work on registers only, with no branch or memory access that depends on the data,
+as in the other AVX-512 kernels of [D-44](#decision-d-44), and the form computes the same values as
+the rotation of the XOR. The build for the constant-time check under valgrind leaves the tier out,
+as it does for those kernels. A unit test checks the dispatch's tests against the choice of
+`blake2()` on every combination of seven groups of feature bits, and the tests of the vector
+kernels run the split kernel against the portable code on CI's runners with AVX-512.
+
+Rationale: on Zen 4 a VPRORD takes two cycles and a shift and a VPTERNLOGD one each (uops.info), so
+that a half step on the chain takes three cycles in place of four. Along the chain of the compiled
+rounds, with those latencies, ten rounds of BLAKE2s take 242 cycles against 323 in the AVX2 form,
+and the shifts and shuffles of the rounds keep their ports below that bound. BLAKE2b's rounds took
+the same form at first, 295 cycles against 366 along their chain with four for VPERMQ, but in bench
+run 43696970946 on Zen 4 its digests of 63 to 255 bytes took 1.2% to 1.7% more time than in the
+AVX2 form and its MAC of no data 6.3% more, so BLAKE2b keeps the AVX2 form.
+
+In bench run 43715242317, measured as in [D-106](#decision-d-106), on Zen 4 (40 processes) the time
+before over the time here was 1.022 to 1.095 for BLAKE2s digests of up to 64 bytes, 1.036 to 1.054
+of 65 bytes to 1 KiB and 1.040 of 16 KiB, 1.023 to 1.050 for its MACs and 1.039 to 1.044 for a
+BLAKE2s chosen at run time; BLAKE2b, in the AVX2 form as before, gave 0.994 to 1.007. The two copies
+of the code before differed by up to 0.3 percent there.
+
+## Decision D-108
+
+On x86-64, the kernels of BLAKE3 for one block, a hash, keyed hash or `derive_key` of at most 64
+bytes with an output of at most 32 bytes, read the message and the key straight into their registers
+and store the output from them in pieces of 16, 8, 4 and 1 bytes, with no buffer, copy or wipe on
+the stack, and the bytes of a message of fewer than four take constant places, with no shift by a
+count. Built with one codegen unit, as the benchmarks build the crate, they have no stack frame: one
+read of the feature word serves the test of the gather tier and the choice of the kernel, and the
+keyed path tests the tiers before it sets up a frame. Off x86-64, `HashAlgorithm::digest_into` and
+`XofAlgorithm::digest_into` call BLAKE3's digest directly for its kinds; on x86-64 the dispatcher
+takes them, as before ([D-110](#decision-d-110)). On AMD's processors with the AVX-512VL row form
+(Zen 4), the rounds of the chain over a chunk take the split rotations of [D-107](#decision-d-107);
+the single compressions and the kernels for one block keep VPRORD there, and Intel's rounds are
+unchanged. On the cores whose kernel for one message is the portable code, Zen 5 by its feature word
+and the cores without AVX2 and SSE4.1, that code takes the form of [D-102](#decision-d-102) for a
+key in bytes, as in a keyed hash and the key material of `derive_key`: the message words come from
+the caller's slice and the output words go straight into the output, in one copy for each mode,
+which holds its flags as a constant. A hash, an extended output and the context of `derive_key`,
+whose key is in words, keep the form before, through a block on the stack for a message of fewer
+than 64 bytes.
+
+On x86-64 both forms of the portable code are also built in the portable build, so that the
+constant-time check under valgrind, which runs that build, covers the code that those cores run on
+secret keys. The paths depend on lengths and on the feature word only, which are public, and the
+kernels' registers are register values under [D-76](#decision-d-76). A unit test checks the tests of
+the feature word in the dispatch for one message, and those of the chain, against the choice of
+`blake()` on every combination of seven groups of bits, where the two tests of the portable code
+together take the words for which it chooses that code, and the kernel tests compare every kernel
+with the portable code under qemu-x86_64 with AVX2, with SSE4.1 alone, with neither, with the gather
+tier and as Zen 5, natively on ARM64, and on CI's runners with AVX-512. Without such a runner, the
+rounds of the split kernels, taken from their machine code, gave BLAKE3's rounds on 2000 random
+states and blocks.
+
+Rationale: the path to a kernel for one block saved six registers and set up a frame, filled a block
+and an output buffer on the stack and wiped them, and read the feature word twice. llvm-mca's model
+of Zen 4 puts a round of the row form at 32 cycles with VPRORD and 27 with the split rotations. From
+BLAKE3's digest, it puts the path of a hash of 64 bytes at 148.3 and 115.3 cycles on Ice Lake and
+Granite Rapids with VPRORD and at 163.7 and 154.4 with the split rotations, and on Zen 4 at 181.6
+and 176.3; but in bench run 43696970946 on Zen 4, with the split rotations, a hash of at most 64
+bytes took 4% to 6% more time than before, where one of 1 KiB, whose chunk is a chain of 16 blocks,
+took 2.5% less, so only the chain takes them. Under QEMU, counting the instructions run in
+crypto-pq, with the EPYC-Milan model a hash of 64 bytes runs 445 against 461 on the AVX2 path, one
+of 0 bytes 448 against 464, a keyed hash of 64 bytes 418 against 444 and an extended output of 20
+bytes from 3, 505 against 545. On Zen 5's path, in the form of D-102, a hash of 64 bytes ran 1025
+instructions against 1024, and in bench run 43710860782 one for an algorithm chosen at run time took
+1.4% more time there, in both copies of that code, where a call of the constant took 0.4% more; so a
+key in words keeps the form before. LLVM then drops the key's argument, the same in every caller of
+that path, and a hash of 0, 1, 32, 63 or 64 bytes runs 29 instructions fewer than before (995
+against 1024 for 64 bytes). A keyed hash, in the form of D-102, ran 970 against 989 for 0 bytes and
+975 against 965 for 64 with its flags in a register, one copy serving both modes; in the same run it
+took 6.4% less time for 1 byte, 4.1% less for 63 and the same for 64, and in bench run 43718708208 a
+MAC of 64 bytes for an algorithm chosen at run time took 1.3% more time on Zen 5, in both copies of
+that code. With a copy for each mode it runs 965 against 989 for 0 bytes, 971 against 992 for 1, 992
+against 988 for 32, 1032 against 988 for 63 and 970 against 965 for 64. Under the qemu64 model,
+without AVX2 and SSE4.1, the keyed path went through the dispatch of the kernels, which reads the
+feature word again, and ran 18 to 81 more instructions than before; through Zen 5's path it runs 968
+against 987 for 0 bytes, 974 against 990 for 1, 995 against 987 for 32, 1035 against 995 for 63 and
+973 against 965 for 64. With the Neoverse N2 model, where the call is direct, a hash of 64 bytes
+runs 938 against 967 and an extended output of 20 bytes from 3, 966 against 1000. The blake3 crate,
+ab-blake3 and rscrypto run 647, 556 and 636 instructions for a hash of 0 bytes on the AVX2 path,
+where this code runs 448.
+
+In bench run 43715242317, measured as in [D-106](#decision-d-106), on Zen 3, Zen 4, Emerald Rapids
+and Granite Rapids (50, 40, 5 and 45 processes) the time before over the time here was 0.993 to
+1.027 for a hash of at most 64 bytes, 0.997 to 1.037 for a keyed hash, 0.993 to 1.003 for a
+`derive_key` of 32 bytes, 0.996 to 1.020 for 1 KiB and 16 KiB, with 1.020 for a hash of 1 KiB on Zen
+4, whose chain takes the split rotations, and 0.990 to 1.021 for an algorithm chosen at run time; on
+Ice Lake (10 processes) 1.012 to 1.102 for a hash or keyed hash of at most 64 bytes; on Neoverse N2
+(30 processes) 1.016 to 1.032 for a hash of at most 64 bytes, 1.000 to 1.028 for an extended output
+and 0.996 to 1.023 on the other rows. On Zen 3 an extended output of 1 KiB from 64 bytes gave 0.953
+and 0.976 in the two copies of this code, where the kernel of the output, which runs 2627 of the
+2848 instructions of that call under QEMU with the EPYC-Milan model against 2849 before, is main's
+machine code; the two copies of the code before differed by up to 4.6 percent on that row over the
+classes of x86-64, and over the copies of the four bench runs before it moved between 0.936 and
+1.014 on Zen 3. They differed by up to 1.0 percent on the other rows of x86-64 and 0.7 percent on
+Neoverse N2. In bench run 43721808501, with this code and measured as in [D-106](#decision-d-106),
+on Zen 5 (55 processes) the time before over the time here was 1.003 to 1.021 for a hash of at most
+64 bytes, 1.032 to 1.077 for a keyed hash of at most 63 bytes and 0.999 for 64, 1.030 and 1.033 for
+a `derive_key` of 32 bytes, 0.997 to 1.002 for 1 KiB and 16 KiB and 0.994 to 1.018 for an extended
+output; for an algorithm chosen at run time, 1.008 to 1.106 for a MAC of at most 63 bytes and 0.997
+for 64, in both copies of this code, and 0.977 to 1.018 for a hash or an extended output, whose two
+rows below 0.99 came in one copy of this code, the other giving 1.011 and 1.010. The two copies of
+the code before differed by up to 3.8 percent on those rows. Bench run 43715242317 measured this
+code before the copy for each mode and the path of the cores without AVX2 and SSE4.1, whose kernels'
+paths run the same instructions under QEMU with the EPYC-Milan and EPYC-Genoa models.
+
+## Decision D-109
+
+Off x86-64, `HashAlgorithm::digest_into` sends Ascon-Hash256, and `XofAlgorithm::digest_into`
+Ascon-XOF128 and Ascon-CXOF128, to Ascon's digest directly, and `XofAlgorithm::configure` is inline,
+so that a constant algorithm reaches its kernel through no dispatcher frame and a configured
+Ascon-CXOF128 is not copied; on x86-64 the dispatcher takes them, as before
+([D-110](#decision-d-110)). On x86-64 with AVX2, a kernel absorbs the customization string of
+Ascon-CXOF128 with the state in registers across its blocks, where the portable loop, its twin,
+loads and stores the state once a block. The bytes of a partial output word are written from its
+register, not from an array of its bytes copied with a length known at run time, in the reader of
+an extended output and, off x86-64, in the one-shot digest, whose portable code on x86-64 is the
+code before.
+
+The kernel uses the scalar instructions of the permutation's kernel on the same state, with no
+branch or index that depends on the data; the lengths are public. Its state is an array indexed
+with constants only, register values under [D-76](#decision-d-76), wiped below opt-level 3. The
+tests compare the kernel with the portable loop on every customization length from 0 to 256 bytes
+and on 10,000 edge and random cases, which run through the kernel under qemu-x86_64 with AVX2 and as
+Zen 3, and through the portable code with SSE4.1 alone and with neither; on ARM64, natively and in
+the portable build, the customization keeps the loop over the permutation's kernel.
+
+Rationale: through the dispatcher, the frame of the kinds that it inlines cost Ascon its saved
+registers, and the customization's loop loaded and stored the state at each permutation. Under
+QEMU, counting the instructions run in crypto-pq, with the EPYC-Milan model an Ascon-CXOF128 of 0
+bytes with 32 bytes of output runs 4033 instructions here against 4105 before and one of 64 bytes
+with 1 KiB of output 65383 against 65455, and Ascon-Hash256 and Ascon-XOF128 run the instructions
+of main. With the Neoverse N1 and N2 models, where the call is direct, an Ascon-Hash256 of 0 bytes
+runs 1383 against 1448, an Ascon-CXOF128 of 0 bytes with 32 bytes of output 2817 against 2931, an
+Ascon-XOF128 of 64 bytes with 1 KiB of output 44219 against 45304 and an Ascon-CXOF128 45653
+against 46783. The permutation is unchanged: its twelve rounds take 36 operations each, the fewest
+for scalar code without a three-input XOR, and LLVM's code adds 25 or 26 copies a permutation,
+where two-operand instructions need 24. On x86-64 the portable digest was out of line at first, so
+that the dispatch of the kernel set up no frame for it, but in bench run 43706703529 on Granite
+Rapids, with the kernel's machine code unchanged, an Ascon-XOF128 of 64 bytes with 32 bytes of
+output then took 1.9% more time, so the digest there is main's machine code.
+
+In bench run 43715242317, measured as in [D-106](#decision-d-106), on Zen 3, Zen 4, Emerald Rapids
+and Granite Rapids (50, 40, 5 and 45 processes) the time before over the time here was 0.996 to
+1.014 for Ascon-Hash256, 0.998 to 1.003 for Ascon-XOF128, with 1.000 for 64 bytes with 32 bytes of
+output on Granite Rapids, 0.998 to 1.024 for Ascon-CXOF128 and 0.999 to 1.008 for an algorithm
+chosen at run time, and on Ice Lake (10 processes) 0.998 to 1.007; on Neoverse N2 (30 processes)
+1.002 to 1.021 for Ascon-Hash256, 1.002 to 1.030 for Ascon-XOF128, 1.002 to 1.035 for Ascon-CXOF128
+and 1.009 to 1.027 for an algorithm chosen at run time. In bench run 43710860782, with the same code
+for Ascon, Zen 5 (20 processes) gave 0.992 to 1.010. The two copies of the code before differed by
+up to 1.4 percent on x86-64 and 0.2 percent on Neoverse N2.
+
+## Decision D-110
+
+`HashAlgorithm::digest_into` sends SHA3-224, SHA3-256, SHA3-384, SHA3-512 and Keccak-256 to a
+one-shot digest of the sponge, which on x86-64, outside SGX and the portable build, reads the
+feature word once, without the detection, and jumps to the kernel of the rate, the scalar one or
+the one-state AVX-512VL one, as its last call, with no saved register or frame. A feature word not
+yet detected, or a rate without a kernel, goes to the digest of the sponge as before, which detects
+and holds the portable sponge; on other targets the one-shot digest is that digest. The kernels of
+one state copy an output of at most the rate from the lanes of the state, without the loop over the
+blocks of the squeeze. Off x86-64, `HashAlgorithm::digest_into` and `XofAlgorithm::digest_into` are
+always inline and call SHA-3, Keccak-256, BLAKE3 and Ascon directly, so that a constant algorithm
+reaches its own code, or the dispatcher, with no test of the kind; on x86-64 they keep the form
+before, in which the dispatcher takes every kind.
+
+The new tests are of the feature word, the rate and the length of the output, which are public;
+the permutation and the wipe of the state ([D-76](#decision-d-76)) are as before, and the one-shot
+digest holds no secret. The test of the kernels compares the one-shot digest with the reference
+sponge for every rate, suffix, input length and output size of the test, 6000 cases, half of them
+from the zero state, under qemu-x86_64 with AVX2, as Zen 3, with SSE4.1 alone and with neither,
+natively on ARM64, and with the one-state AVX-512VL kernels on CI's runners that take them.
+
+Rationale: through the dispatchers, a one-shot SHA-3 saved six registers and set up a frame of 0x168
+bytes, then saved seven more for the probe call of the kernel's dispatch, which read the feature
+word twice: 82 instructions before the kernel. Under QEMU, counting the instructions run in
+crypto-pq, with the EPYC-Milan model a SHA3-512 of 64 bytes runs 4637 instructions here against 4683
+before, 55 of them before the kernel, a SHA3-384 4632 against 4698, a Keccak-256 4621 against 4678
+and a SHA3-512 of 1 KiB 66792 against 66838, and the Haswell model runs the same; with the Neoverse
+N2 model, where the call is direct, a SHA3-512 of 64 bytes runs 3679 against 3693, a SHA3-384 3694
+against 3708, a Keccak-256 3656 against 3670 and a SHA3-512 of 1 KiB 52352 against 52366. The
+permutation, which runs 4422 of the instructions of a SHA3-512 of 64 bytes on the Zen 3 path against
+4737 in that of keccak-asm, is unchanged, so that the code around it runs 215 instructions against
+261. The stack bytes of the path, frames and saved registers, go from 936 to 760. The one-state
+AVX-512VL kernels, which QEMU does not run, are reached from the one-shot digest in 23 instructions,
+the last a jump; through the kernel's dispatch, as at first, the path took 85, with twelve registers
+saved in two frames and a second read of the feature word. In the dispatcher, the one-shot digest
+runs 27 or 28 instructions fewer than the digest of the sponge. With their tests of the kind and
+inline alone, the two digest_into functions stayed out of line in a driver that calls them at
+several places, where a BLAKE2s or BLAKE2b digest ran 23 instructions more, a call and a jump table,
+so they are always inline where they test the kind. On x86-64 those tests, with the calls in line,
+ran 12 instructions more on every other kind, and in bench run 43703649341 a SHA-256 of 64 bytes
+took 3.0% more time on Zen 3, and 1.4% more on Zen 5 for a kind chosen at run time; on Neoverse N2,
+for an algorithm chosen at run time, they run 7 instructions more in the caller, and the dispatcher
+10 fewer for BLAKE2s.
+
+In bench run 43715242317, measured as in [D-106](#decision-d-106), the time before over the time
+here for SHA-3 digests of 64 bytes was 1.008 to 1.017 on Zen 4 (40 processes) and 1.009 to 1.015 on
+Emerald Rapids (5), and for Keccak-256 of 32 and 64 bytes 1.005 to 1.007 and 1.007 to 1.012; over
+those classes and Granite Rapids (45), 0.998 to 1.007 for 1 KiB, 1.000 to 1.013 for 16 KiB, 0.999 to
+1.006 for SHAKE and 0.999 to 1.016 for an algorithm chosen at run time, where the two copies of the
+code before differed by up to 1.2 percent. On Granite Rapids the digests of 64 bytes gave 0.990 to
+1.003 in one copy of this code and 1.008 to 1.016 in the other, and Keccak-256 of 136 bytes 0.983
+and 0.998. On Zen 3 (50 processes), where the two copies of the code before differed by up to 4.7
+percent on the rows of at most 136 bytes, Keccak-256 of 32 to 136 bytes gave 1.019 to 1.033, SHAKE
+1.001 to 1.033, an algorithm chosen at run time 1.015 to 1.039 and 1 KiB and 16 KiB 0.997 to 1.004,
+and the digests of 64 bytes 0.971 to 0.987 but SHA3-256 in one copy of this code and 1.016 to 1.033
+in the other. In bench run 43710860782, with the same code for SHA-3, the digests of 64 bytes gave
+1.015 to 1.034 on Zen 3 and 1.008 to 1.023 on Granite Rapids, and Zen 5 (20 processes) gave 0.999 to
+1.011 on every row. On Ice Lake (10 processes), Keccak-256 of 32 and 64 bytes and SHA3-224 and
+SHA3-512 of 1 KiB gave 0.914 to 0.946 in one copy of this code and 1.005 to 1.031 in the other. On
+Neoverse N2 (30 processes) the digests gave 1.001 to 1.022, Keccak-256 1.002 to 1.016, SHAKE 1.003
+to 1.011 and an algorithm chosen at run time 0.997 to 1.015, where the two copies of the code before
+differed by up to 1.0 percent.
+
+## Decision D-111
+
+On x86-64, the last block of a BLAKE2s digest in one call is built from moves of whole 32-bit words
+and one store of the last partial word when it is the only block, and from one copy, as before,
+when other blocks come before it; the last block of a BLAKE2s MAC, which follows the key block, is
+built from the moves of whole words, the function that finishes them stays in line, and a MAC key
+of 32 bytes is copied in moves of a size known at compile time. The portable code of BLAKE2b and
+BLAKE2s reads the last block and the key in fixed-size copies of 16 and 8 words, then the whole
+words, then the last bytes in one word.
+
+The moves depend on the lengths only, which are public, and the bytes go as before into the same
+buffers, which are wiped ([D-76](#decision-d-76)). A unit test compares the words with the bytes
+they come from for every length of a block at six offsets, for both word sizes; the tests compare
+the kernels with the portable code, and the one-shot digests and MACs with the engine for every
+length up to 389 bytes.
+
+Rationale: the kernels load a block a word at a time, and a last block or key that memcpy copied
+ends in moves that end on its last byte, so that a load of a word that spans two of the stores
+waits until both reach the cache, as [D-98](#decision-d-98) found for BLAKE2b. In bench run
+42691782767, a BLAKE2s digest of 63 bytes took 6 ns more than one of 64 on Zen 3, 17 ns more on
+Zen 4, 13 ns more on Emerald Rapids and 22 ns more on Ice Lake, and the same on Zen 5, which runs
+the portable code, and on Neoverse N2. After other blocks, which the kernel compresses before it
+loads the last one, the stores of the copy have reached the cache: in bench run 43696970946 the
+moves of whole words took digests of 65 to 129 bytes no less time, so those keep the copy. Under
+QEMU, the paths of Zen 5 and Nehalem run 1 to 10 instructions fewer, and with the EPYC-Milan model
+the AVX2 path runs 9 to 18 more on digests of 1, 31, 33 and 63 bytes, 2 to 4 more on 0, 32 and 64
+bytes, 3 more on 65, 127 and 129 bytes, and on MACs 8 and 7 fewer on 0 and 32
+bytes and 10 more on 63, against the moves of glibc's memcpy.
+
+In bench run 43715242317, measured as in [D-106](#decision-d-106), on Emerald Rapids and Granite
+Rapids (5 and 45 processes) the time before over the time here for BLAKE2s digests of at most 64
+bytes was 0.996 to 1.169, with 1.160 and 1.161 for 1 byte and 1.131 and 1.128 for 63, 0.994 to 1.001
+for its MACs and 0.996 to 1.006 for longer digests; on Zen 3 (50 processes), 0.994 to 1.030 for
+digests of at most 64 bytes, with 1.013 for 63, 0.998 to 1.015 for MACs and 0.998 to 1.001 for
+longer digests; on Ice Lake (10 processes), 0.997 to 1.299 for digests of at most 64 bytes, with
+1.299 for 63, and 1.054 to 1.717 for MACs. BLAKE2b gave 0.997 to 1.004 on Zen 3, Emerald Rapids and
+Granite Rapids, and on Neoverse N2 (30 processes) BLAKE2s and BLAKE2b gave 0.996 to 1.009. In bench
+run 43710860782, with the same code for BLAKE2, Zen 5 (20 processes) gave 0.994 to 1.024. The two
+copies of the code before differed by up to 0.7 percent on Zen 3, Emerald Rapids and Granite Rapids
+and 0.4 percent on Neoverse N2, and on Ice Lake, with two runners, by up to 47 percent, where its
+two rows below 0.99, digests of 100 and 127 bytes at 0.989, gave 1.000 and 0.999 in the other copy
+of this code.
+
+## Decision D-112
+
+On a 64-bit target without compare-and-swap of pointer width, such as RV64IM
+(`riscv64im-unknown-none-elf`), the instruction set that zkVMs run, the caches of the ML-KEM,
+FrodoKEM and ML-DSA keys are filled when a key is made, in place of on first use, and a private key
+and the public key taken from it each hold their own copy of the public part, where other targets
+share one. That form now builds: ML-DSA's verification reads whether its caches are filled, which
+the form allowed only in the tests, and the public parts of ML-KEM and FrodoKEM can be copied. The
+configuration `--cfg crypto_pq_eager` takes the same form on any target. CI checks the library for
+RV64IM with Clippy for the default features, every feature and each feature on its own, and builds
+it in release with the default and every feature, on a pinned nightly that builds `core` and
+`alloc` from source; it runs the tests with `crypto_pq_eager` on x86-64.
+
+The values are the same, computed when a key is made, so the outputs are unchanged. The parts that
+a key and its pair copy are public; the caches of a private key are not copied, and they are wiped
+when the key is dropped, as before. The tests of the caches of ML-KEM, ML-DSA and SLH-DSA check each
+form: in the eager one, a key and its pair hold separate public parts and a new key holds its caches
+filled. The machine code of the targets with compare-and-swap is unchanged, function by function, on
+x86-64 and ARM64.
+
+Rationale: no target that CI built lacked compare-and-swap, so the form for such targets was not
+compiled after the caches became lazy, and a build for RV64IM stopped with six errors. The build for
+that target and the tests of the form on a runner keep it working.
