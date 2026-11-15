@@ -13,6 +13,7 @@ its result is kept in an atomic.
 | operating systems | Linux (glibc and musl), macOS, Windows; other systems with an entropy source of [14.3](14-security.md#143-entropy) |
 | processors with CPU-specific code | x86-64, ARM64 (little-endian); RISC-V 64 runs portable code |
 | portable only | every other 64-bit architecture, including big-endian; MUST stay correct |
+| without compare-and-swap | portable code, the key caches filled when a key is made; for example RV64IM (`riscv64im-unknown-none-elf`), the instruction set of zkVMs, built with `build-std` on nightly [[D-112](decisions.md#decision-d-112)] |
 | not supported | WebAssembly and 32-bit targets: a build stops with a compile error [[D-105](decisions.md#decision-d-105)] |
 | Rust | 1.89 or later, edition 2024, `no_std` with `alloc` |
 

@@ -29,7 +29,9 @@ contains no instruction on a 512-bit register outside those two kernels
 
 CI MUST build and test: Linux x86-64 and ARM64, macOS ARM64, Windows x86-64 and ARM64; RISC-V 64
 and big-endian s390x under emulation; Linux musl; the minimum and the current toolchain of
-[15.2](15-platforms.md#152-supported-platforms).
+[15.2](15-platforms.md#152-supported-platforms). CI MUST build RV64IM, a target without
+compare-and-swap, and test the form of the key caches that it takes
+[[D-112](decisions.md#decision-d-112)].
 
 ## 18.4 Vectors and robustness
 
