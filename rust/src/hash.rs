@@ -324,9 +324,10 @@ impl HashAlgorithm {
 
     /// The digest of `data` written into `out`, which must be [`digest_size`](Self::digest_size)
     /// bytes, without allocating. Fails with [`Error::InvalidLength`] if `out` has another length.
-    // Inline, so that a caller's buffer of the right size needs no check at run time, and BLAKE3 of
-    // a constant algorithm calls its own code with no test of the kind: through the dispatcher, the
-    // frame of the kinds that it inlines cost BLAKE3 six saved registers on x86-64.
+    // Inline, so that a caller's buffer of the right size needs no check at run time, and BLAKE3,
+    // SHA-3 and Keccak-256 of a constant algorithm call their own code with no test of the kind:
+    // through the dispatcher, the frame of the kinds that it inlines cost them six saved registers
+    // on x86-64 (D-108, D-110).
     #[inline]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         check_length(out.len(), self.digest_size)?;
@@ -334,6 +335,20 @@ impl HashAlgorithm {
         #[cfg(feature = "blake3")]
         if matches!(self.kind, Kind::Blake3) {
             blake3::digest(data, out);
+
+            return Ok(());
+        }
+
+        #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
+        if matches!(self.kind, Kind::Sha3) {
+            Keccak::digest_once(self.block_size(), SHA3_SUFFIX, data, out);
+
+            return Ok(());
+        }
+
+        #[cfg(feature = "sha3")]
+        if matches!(self.kind, Kind::Keccak) {
+            Keccak::digest_once(self.block_size(), KECCAK_SUFFIX, data, out);
 
             return Ok(());
         }

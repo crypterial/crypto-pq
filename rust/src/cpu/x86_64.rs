@@ -2300,6 +2300,40 @@ fn digest_avx512(
     true
 }
 
+// digest from the zero state where one read of the features, with no detection, finds digest's
+// kernel for rate: false where digest would detect the features first or where no kernel takes
+// rate. Inlined into Keccak::digest_once, the kernel's call is its last, so the caller saves no
+// registers and keeps no frame (D-110).
+#[inline]
+#[allow(unsafe_code)]
+#[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
+pub(crate) fn digest_known(rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) -> bool {
+    let found = FEATURES.load(Ordering::Relaxed);
+
+    // READY too: a build that guarantees AVX2 would otherwise never detect AVX512_ONE here.
+    if found & READY == 0 || !among(found, AVX2) {
+        return false;
+    }
+
+    if among(found, AVX512_ONE) {
+        return digest_avx512(None, rate, suffix, data, out);
+    }
+
+    // SAFETY: as in absorb.
+    unsafe {
+        match rate {
+            72 => keccak::digest_bmi::<72>(None, data, suffix, out),
+            104 => keccak::digest_bmi::<104>(None, data, suffix, out),
+            136 => keccak::digest_bmi::<136>(None, data, suffix, out),
+            144 => keccak::digest_bmi::<144>(None, data, suffix, out),
+            168 => keccak::digest_bmi::<168>(None, data, suffix, out),
+            _ => return false,
+        }
+    }
+
+    true
+}
+
 // Whether the word of FEATURES as read takes BLAKE2's portable code for one message
 // (ONE_MESSAGE).
 #[inline(always)]

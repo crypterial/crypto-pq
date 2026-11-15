@@ -1007,25 +1007,42 @@ macro_rules! digest {
 
             $permute;
 
+            // An output within the rate, as every SHA-3 digest is, takes its lanes with no loop over
+            // blocks: the loop's tests cost SHA3-512 about 40 instructions (D-110).
+            let within = out.len() <= RATE;
+
             let (whole, partial) = out.as_chunks_mut::<8>();
 
-            let mut chunks = whole.chunks_mut(RATE / 8).peekable();
+            let mut squeezed = whole.len();
 
-            let mut squeezed = 0;
-
-            while let Some(chunk) = chunks.next() {
-                for (bytes, lane) in chunk.iter_mut().zip(&state) {
-                    *bytes = lane.to_le_bytes();
+            if within {
+                // Lane by lane up to the rate, which LLVM unrolls: a loop over whole became a call
+                // of memcpy.
+                for (i, lane) in state[..RATE / 8].iter().enumerate() {
+                    if let Some(bytes) = whole.get_mut(i) {
+                        *bytes = lane.to_le_bytes();
+                    }
                 }
+            } else {
+                let mut chunks = whole.chunks_mut(RATE / 8).peekable();
 
-                squeezed += chunk.len();
+                squeezed = 0;
 
-                if chunk.len() == RATE / 8 && (chunks.peek().is_some() || !partial.is_empty()) {
-                    let $state = &mut state;
+                while let Some(chunk) = chunks.next() {
+                    for (bytes, lane) in chunk.iter_mut().zip(&state) {
+                        *bytes = lane.to_le_bytes();
+                    }
 
-                    $permute;
+                    squeezed += chunk.len();
 
-                    squeezed = 0;
+                    if chunk.len() == RATE / 8 && (chunks.peek().is_some() || !partial.is_empty())
+                    {
+                        let $state = &mut state;
+
+                        $permute;
+
+                        squeezed = 0;
+                    }
                 }
             }
 
