@@ -23,7 +23,7 @@ use core::arch::x86_64::*;
 use super::memory::words_of;
 use super::memory::{clear, load128, load256, store128, store256};
 use crate::blake2::SIGMA;
-use crate::sha2::{IV_256, IV_512, last_bytes};
+use crate::sha2::{IV_256, IV_512, copy_short, last_bytes};
 use crate::wipe::{wipe, wipe_unless_optimized};
 
 instruction!(swap32, __m256i, ymm_reg, "vpshufd {out}, {x}, 0xB1", x);
@@ -1419,18 +1419,41 @@ pub(super) fn split32(data: &[u8]) -> (&[[u8; 64]], &[u8]) {
 }
 
 // f with the final block of the bytes of tail: straight from tail when they are a whole block,
-// else zero-padded in a copy, which is then wiped.
+// else zero-padded in a copy, which is then wiped. In line, as it was before words32, which made
+// it large enough for the compiler to call it.
+#[inline(always)]
 pub(super) fn final32(tail: &[u8], f: impl FnOnce(&[u8; 64])) {
     match <&[u8; 64]>::try_from(tail) {
         Ok(block) => f(block),
         Err(_) => {
             let mut copy = [0; 64];
 
-            copy[..tail.len()].copy_from_slice(tail);
+            words32(tail, &mut copy);
 
             f(&copy);
 
             wipe(&mut copy);
         }
+    }
+}
+
+// The bytes of from, fewer than 64, at the start of block, whose other bytes are zero, with each
+// 4-byte word of block in one store that holds all of it: the whole words in moves that start and
+// end on a word, the bytes after them in one word. The kernels load the block a word at a time,
+// and a load of bytes from two stores waits until both reach the cache (D-98): through memcpy,
+// whose moves end on the last byte, a digest of 63 bytes took 6 to 22 ns more than one of 64 on
+// Zen 3, Zen 4 and Intel's cores (D-111).
+#[inline(always)]
+pub(super) fn words32(from: &[u8], block: &mut [u8; 64]) {
+    let whole = from.len() / 4 * 4;
+
+    copy_short(block, &from[..whole]);
+
+    let rest = from.len() % 4;
+
+    if rest > 0 {
+        let value = last_bytes(from, rest) as u32;
+
+        block[whole..whole + 4].copy_from_slice(&value.to_le_bytes());
     }
 }

@@ -678,24 +678,23 @@ fn words<W: Word>(data: &[u8], start: usize, out: &mut [W; 16]) {
     let tail = &data[start..];
 
     // A whole block, and a key of half a block (the digest length of BLAKE2s-256 and BLAKE2b-512),
-    // at a size the compiler knows, as loads and stores: at the size of the input, each took a
-    // call of memcpy.
+    // at a size the compiler knows, as loads and stores.
     if tail.len() == 16 * W::BYTES {
-        fixed::<W, 16>(tail, out);
+        fixed::<W, 16>(tail, 0, out);
 
         return;
     }
 
     if tail.len() == 8 * W::BYTES {
-        fixed::<W, 8>(tail, out);
+        fixed::<W, 8>(tail, 0, out);
 
         return;
     }
 
     let whole = tail.len() / W::BYTES;
 
-    for (word, bytes) in out.iter_mut().zip(tail.chunks_exact(W::BYTES)) {
-        *word = W::from_le(bytes);
+    if whole != 0 {
+        whole_words(tail, whole.min(15), out);
     }
 
     let rest = tail.len() % W::BYTES;
@@ -705,11 +704,49 @@ fn words<W: Word>(data: &[u8], start: usize, out: &mut [W; 16]) {
     }
 }
 
-// The first N words of out from tail, which holds N words.
+// The key block's words. A key of half a block, the longest (RFC 7693, 2.1), is tested first:
+// words tests a whole block first, which no key is.
 #[inline(always)]
-fn fixed<W: Word, const N: usize>(tail: &[u8], out: &mut [W; 16]) {
-    for (i, word) in out.iter_mut().enumerate().take(N) {
-        *word = W::from_le(&tail[i * W::BYTES..]);
+fn key_words<W: Word>(key: &[u8], out: &mut [W; 16]) {
+    if key.len() == 8 * W::BYTES {
+        fixed::<W, 8>(key, 0, out);
+    } else {
+        words(key, 0, out);
+    }
+}
+
+// The first `whole` words of out, 1 to 15, from those of tail, in two moves of a size the compiler
+// knows, the first and the last 8, 4 or 2 of them, the largest that fits, or the one word: at the
+// size of the input, they took a call of memcpy, and the values that the call kept went through
+// the stack (D-111).
+#[inline(always)]
+fn whole_words<W: Word>(tail: &[u8], whole: usize, out: &mut [W; 16]) {
+    macro_rules! ends {
+        ($size:literal) => {{
+            fixed::<W, $size>(tail, 0, out);
+
+            fixed::<W, $size>(tail, whole - $size, out);
+        }};
+    }
+
+    if whole >= 8 {
+        ends!(8)
+    } else if whole >= 4 {
+        ends!(4)
+    } else if whole >= 2 {
+        ends!(2)
+    } else {
+        fixed::<W, 1>(tail, 0, out);
+    }
+}
+
+// N words of out from those of tail, from word `at` on.
+#[inline(always)]
+fn fixed<W: Word, const N: usize>(tail: &[u8], at: usize, out: &mut [W; 16]) {
+    let bytes = &tail[at * W::BYTES..(at + N) * W::BYTES];
+
+    for (word, chunk) in out[at..at + N].iter_mut().zip(bytes.chunks_exact(W::BYTES)) {
+        *word = W::from_le(chunk);
     }
 }
 
@@ -808,7 +845,7 @@ pub(crate) fn mac<W: Word>(h: &[W; 8], key: &[u8], data: &[u8], out: &mut [u8]) 
 
     let mut key_block = [W::default(); 16];
 
-    words(key, 0, &mut key_block);
+    key_words(key, &mut key_block);
 
     let block = 16 * W::BYTES as u128;
 
@@ -1246,5 +1283,47 @@ mod tests {
         one_shot_matches_engine::<u64>();
 
         one_shot_matches_engine::<u32>();
+    }
+
+    // words and key_words against the bytes copied into a zeroed block, for every length of a
+    // final block and several starts, the words past the bytes left at zero.
+    fn words_match_bytes<W: Word>() {
+        let data: [u8; 2 * 128 + 3] = Inputs::new(12).bytes();
+
+        let block = 16 * W::BYTES;
+
+        for start in [0, 1, 7, block - 1, block, block + 3] {
+            for length in 0..=block {
+                let tail = &data[start..start + length];
+
+                let mut bytes = [0; 128];
+
+                bytes[..length].copy_from_slice(tail);
+
+                let expected: [W; 16] =
+                    core::array::from_fn(|i| W::from_le(&bytes[i * W::BYTES..(i + 1) * W::BYTES]));
+
+                let mut actual = [W::default(); 16];
+
+                words(&data[..start + length], start, &mut actual);
+
+                assert!(actual == expected, "start {start}, length {length}");
+
+                if start == 0 && length > 0 {
+                    let mut key = [W::default(); 16];
+
+                    key_words(tail, &mut key);
+
+                    assert!(key == expected, "key of {length} bytes");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn words_match_bytes_for_both() {
+        words_match_bytes::<u64>();
+
+        words_match_bytes::<u32>();
     }
 }

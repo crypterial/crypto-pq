@@ -2668,7 +2668,11 @@ fn blake2s_mac_with(
 
     let mut key_block = [0; 64];
 
-    key_block[..key.len()].copy_from_slice(key);
+    // A key of the digest length, the usual one, in moves of a size the compiler knows.
+    match <&[u8; 32]>::try_from(key) {
+        Ok(key) => key_block[..32].copy_from_slice(key),
+        Err(_) => blake2::words32(key, &mut key_block),
+    }
 
     let total = 64 + data.len() as u64;
 
