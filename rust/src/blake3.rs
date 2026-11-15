@@ -1411,67 +1411,69 @@ fn digest1<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
     let mut cv: [u32; 8] = registers!(|i| key.word(i); 0 1 2 3 4 5 6 7);
 
-    // On x86-64, where the cores of ONE_MESSAGE run this code (D-108), in the form of ARM64 with
-    // LAZY (D-102): the message words from the caller's slice and the output words into out, with
-    // no block or output in memory to fill, read back and wipe. The crypto_pq_portable build
-    // compiles it too, so that its valgrind run checks the code that Zen 5 runs on secret keys.
-    #[cfg(all(target_arch = "x86_64", not(target_env = "sgx")))]
-    {
-        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-        let mut m = match <&[u8; BLOCK]>::try_from(data) {
-            Ok(block) => words(block),
-            Err(_) => short_words(data),
-        };
+    let mut copy = [0; BLOCK];
 
-        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-        let mut v = rounds(&cv, &m, 0, data.len() as u32, flags);
+    let block = match <&[u8; BLOCK]>::try_from(data) {
+        Ok(block) => block,
+        Err(_) => {
+            copy[..data.len()].copy_from_slice(data);
 
-        wipe_unless_optimized!(&mut cv);
+            &copy
+        }
+    };
 
-        root_words(&v, out);
+    let v = rounds(&cv, &words(block), 0, data.len() as u32, flags);
 
-        wipe_unless_optimized!(&mut v);
+    wipe_unless_optimized!(&mut cv);
 
-        wipe_unless_optimized!(&mut m);
+    let mut bytes = [0; 32];
+
+    let target = match <&mut [u8; 32]>::try_from(&mut *out) {
+        Ok(whole) => whole,
+        Err(_) => &mut bytes,
+    };
+
+    for (i, chunk) in target.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        *chunk = (v[i] ^ v[i + 8]).to_le_bytes();
     }
 
-    // Elsewhere through a zeroed copy of a short block and a buffer of a short output.
-    #[cfg(not(all(target_arch = "x86_64", not(target_env = "sgx"))))]
-    {
-        let mut copy = [0; BLOCK];
+    if out.len() < 32 {
+        out.copy_from_slice(&bytes[..out.len()]);
 
-        let block = match <&[u8; BLOCK]>::try_from(data) {
-            Ok(block) => block,
-            Err(_) => {
-                copy[..data.len()].copy_from_slice(data);
-
-                &copy
-            }
-        };
-
-        let v = rounds(&cv, &words(block), 0, data.len() as u32, flags);
-
-        wipe_unless_optimized!(&mut cv);
-
-        let mut bytes = [0; 32];
-
-        let target = match <&mut [u8; 32]>::try_from(&mut *out) {
-            Ok(whole) => whole,
-            Err(_) => &mut bytes,
-        };
-
-        for (i, chunk) in target.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            *chunk = (v[i] ^ v[i + 8]).to_le_bytes();
-        }
-
-        if out.len() < 32 {
-            out.copy_from_slice(&bytes[..out.len()]);
-
-            wipe(&mut bytes);
-        }
-
-        wipe(&mut copy);
+        wipe(&mut bytes);
     }
+
+    wipe(&mut copy);
+}
+
+// digest1 for a key in bytes on x86-64, where the cores of ONE_MESSAGE run it (D-108), in the form
+// of ARM64 with LAZY (D-102): the message words from the caller's slice and the output words into
+// out, with no block or output in memory to fill, read back and wipe. The crypto_pq_portable build
+// compiles it too, so that its valgrind run checks the code that Zen 5 runs on secret keys. A key
+// in words keeps digest1: in this form a hash of 64 bytes, for an algorithm chosen at run time,
+// took 1.4% more time on Zen 5.
+#[cfg(all(target_arch = "x86_64", not(target_env = "sgx")))]
+#[inline(always)]
+fn digest1_lazy(key: &[u8; KEY], flags: u32, data: &[u8], out: &mut [u8]) {
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut cv: [u32; 8] = registers!(|i| key.word(i); 0 1 2 3 4 5 6 7);
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut m = match <&[u8; BLOCK]>::try_from(data) {
+        Ok(block) => words(block),
+        Err(_) => short_words(data),
+    };
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut v = rounds(&cv, &m, 0, data.len() as u32, flags);
+
+    wipe_unless_optimized!(&mut cv);
+
+    root_words(&v, out);
+
+    wipe_unless_optimized!(&mut v);
+
+    wipe_unless_optimized!(&mut m);
 }
 
 // The first out.len() bytes, at most 32, of the output words of a root compression's state v:
@@ -1808,7 +1810,7 @@ fn keyed(word: impl FnOnce() -> u32, key: &[u8; KEY], flags: u32, data: &[u8], o
 ))]
 #[inline(never)]
 fn digest1_bytes(data: &[u8], out: &mut [u8], key: &[u8; KEY], flags: u32) {
-    digest1(key, flags, data, out);
+    digest1_lazy(key, flags, data, out);
 }
 
 // keyed's short path on a word of features not yet probed, or on another kernel.
@@ -1830,6 +1832,10 @@ fn digest1_bytes(data: &[u8], out: &mut [u8], key: &[u8; KEY], flags: u32) {
 )]
 fn keyed_short(key: &[u8; KEY], root: u32, data: &[u8], out: &mut [u8]) {
     if !cpu::blake3_digest1_bytes(key, root, data, out) {
+        #[cfg(all(target_arch = "x86_64", not(target_env = "sgx")))]
+        digest1_lazy(key, root, data, out);
+
+        #[cfg(not(all(target_arch = "x86_64", not(target_env = "sgx"))))]
         digest1(key, root, data, out);
     }
 }
@@ -2836,6 +2842,17 @@ mod tests {
                     assert_eq!(out[..size], expected[..size]);
 
                     assert!(out[size..].iter().all(|&byte| byte == 0xA5));
+
+                    #[cfg(all(target_arch = "x86_64", not(target_env = "sgx")))]
+                    {
+                        out = [0xA5; 33];
+
+                        digest1_lazy(&key, flags, &message[..length], &mut out[..size]);
+
+                        assert_eq!(out[..size], expected[..size]);
+
+                        assert!(out[size..].iter().all(|&byte| byte == 0xA5));
+                    }
                 }
             }
         }
