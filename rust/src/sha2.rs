@@ -155,7 +155,7 @@ fn copy_bytes(to: &mut [u8], from: &[u8]) {
 // The bytes of an update shorter than 64 into the buffer, with no call: the first and the last 32,
 // 16, 8, 4 or 2 of them, the largest that fits, whose two moves cover them all, or the one byte.
 #[inline(always)]
-fn copy_short(to: &mut [u8], from: &[u8]) {
+pub(crate) fn copy_short(to: &mut [u8], from: &[u8]) {
     let n = from.len();
 
     let to = &mut to[..n];
