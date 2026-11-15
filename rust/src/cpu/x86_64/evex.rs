@@ -55,6 +55,87 @@ pub(super) unsafe fn ror64<const R: u32>(x: __m256i) -> __m256i {
     out
 }
 
+/// x ^ y rotated right by R in each 32-bit lane, as x rotated xored with y's two shifted halves:
+/// a VPRORD of x, two shifts of y and a VPTERNLOGD, two instructions from y to the result (D-107).
+///
+/// # Safety
+///
+/// As for ror32.
+#[cfg(feature = "blake2")]
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(unsafe_code)]
+pub(super) unsafe fn ror_xor32<const R: u32>(x: __m128i, y: __m128i) -> __m128i {
+    let out;
+
+    // SAFETY: as in ror32: two shifts, a VPRORD and a VPTERNLOGD, on registers. The shifts read y
+    // before the VPRORD writes x's register.
+    unsafe {
+        asm!(
+            "vpsrld {a}, {y}, {r}",
+            "vpslld {b}, {y}, {l}",
+            "vprord {x}, {x}, {r}",
+            "vpternlogd {x}, {a}, {b}, 0x96",
+            x = inout(xmm_reg) x => out,
+            y = in(xmm_reg) y,
+            a = out(xmm_reg) _,
+            b = out(xmm_reg) _,
+            r = const R,
+            l = const 32 - R,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+
+    out
+}
+
+/// x ^ y rotated right by R in each 64-bit lane, as ror_xor32: a VPRORQ, two shifts of y (a shift
+/// and a doubling for R = 63) and a VPTERNLOGQ.
+///
+/// # Safety
+///
+/// As for ror32.
+#[cfg(feature = "blake2")]
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(unsafe_code)]
+pub(super) unsafe fn ror_xor64<const R: u32>(x: __m256i, y: __m256i) -> __m256i {
+    let out;
+
+    // SAFETY: as in ror_xor32, with a VPRORQ and a VPTERNLOGQ.
+    unsafe {
+        if R == 63 {
+            asm!(
+                "vpsrlq {a}, {y}, 63",
+                "vpaddq {b}, {y}, {y}",
+                "vprorq {x}, {x}, 63",
+                "vpternlogq {x}, {a}, {b}, 0x96",
+                x = inout(ymm_reg) x => out,
+                y = in(ymm_reg) y,
+                a = out(ymm_reg) _,
+                b = out(ymm_reg) _,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        } else {
+            asm!(
+                "vpsrlq {a}, {y}, {r}",
+                "vpsllq {b}, {y}, {l}",
+                "vprorq {x}, {x}, {r}",
+                "vpternlogq {x}, {a}, {b}, 0x96",
+                x = inout(ymm_reg) x => out,
+                y = in(ymm_reg) y,
+                a = out(ymm_reg) _,
+                b = out(ymm_reg) _,
+                r = const R,
+                l = const 64 - R,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+    }
+
+    out
+}
+
 /// A sigma function of SHA-512 in each 64-bit lane: x rotated right by R0 and by R1, xored with x
 /// shifted right by S.
 ///

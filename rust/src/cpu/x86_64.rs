@@ -294,16 +294,31 @@ enum Blake {
     Portable,
 }
 
-// BLAKE2 takes the AVX-512VL row forms on Intel's cores only. On AMD Zen 4 (family 19h) VPRORD
-// takes two cycles, where each of the two shifts and the OR it replaces takes one, and BLAKE2s-256
-// of 64 bytes took 98.5 ns with VPRORD against 92.2 ns with the AVX2 form (EPYC 9V74, five
-// runners); Zen 5 runs the portable code (ONE_MESSAGE).
+// BLAKE2's kernels for one message: those of blake(), with the split rotations in place of the
+// AVX-512VL row forms on AMD's cores.
+#[cfg(feature = "blake2")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Blake2 {
+    Vl,
+    Split,
+    Avx2,
+    Sse41,
+    Portable,
+}
+
+// BLAKE2 takes the AVX-512VL row forms on Intel's cores and the split rotations on AMD's (D-107).
+// On AMD Zen 4 (family 19h) VPRORD takes two cycles, where each of the two shifts and the OR it
+// replaces takes one, and BLAKE2s-256 of 64 bytes took 98.5 ns with VPRORD against 92.2 ns with
+// the AVX2 form (EPYC 9V74, five runners); Zen 5 runs the portable code (ONE_MESSAGE).
 #[inline]
 #[cfg(feature = "blake2")]
-fn blake2(found: u32) -> Blake {
+fn blake2(found: u32) -> Blake2 {
     match blake(found) {
-        Blake::Vl if among(found, AVX512_AMD) => Blake::Avx2,
-        one => one,
+        Blake::Vl if among(found, AVX512_AMD) => Blake2::Split,
+        Blake::Vl => Blake2::Vl,
+        Blake::Avx2 => Blake2::Avx2,
+        Blake::Sse41 => Blake2::Sse41,
+        Blake::Portable => Blake2::Portable,
     }
 }
 
@@ -314,8 +329,19 @@ fn blake2(found: u32) -> Blake {
 #[inline(always)]
 #[cfg(any(feature = "blake2", feature = "blake3"))]
 fn tier(word: u32, vl: bool) -> bool {
+    match tier_bits(vl) {
+        Some((mask, want)) => word & mask == want,
+        None => false,
+    }
+}
+
+// The mask of the word that tier tests and the value it wants, or None where the build has no
+// such tier.
+#[inline(always)]
+#[cfg(any(feature = "blake2", feature = "blake3"))]
+const fn tier_bits(vl: bool) -> Option<(u32, u32)> {
     if !usable(AVX2) || vl && !usable(AVX512) {
-        return false;
+        return None;
     }
 
     let mut mask = READY;
@@ -334,13 +360,43 @@ fn tier(word: u32, vl: bool) -> bool {
 
     if guaranteed(AVX512) {
         if !vl {
-            return false;
+            return None;
         }
     } else if usable(AVX512) {
         mask |= AVX512;
 
         if vl {
             want |= AVX512;
+        }
+    }
+
+    Some((mask, want))
+}
+
+// tier for BLAKE2, whose AVX-512VL tier blake2() splits by AVX512_AMD: whether the word as read
+// takes the AVX2 row forms (Avx2), the AVX-512VL ones (Vl) or the split rotations (Split). Each is
+// a test of the word under one mask, tier's with AVX512_AMD, so that the tests of a dispatch share
+// one AND: a test of AVX512_AMD after tier's took a second one, and two instructions on Zen 5.
+// A dispatch writes its AVX2 test second: LLVM compares the values of one masked word in order,
+// but moves to the end the one whose code comes next, and the AVX2 test written first came second.
+#[inline(always)]
+#[cfg(feature = "blake2")]
+fn blake2_tier(word: u32, one: Blake2) -> bool {
+    let vl = match one {
+        Blake2::Avx2 => false,
+        Blake2::Vl | Blake2::Split => true,
+        Blake2::Sse41 | Blake2::Portable => return false,
+    };
+
+    let Some((mut mask, mut want)) = tier_bits(vl) else {
+        return false;
+    };
+
+    if usable(AVX512_AMD) {
+        mask |= AVX512_AMD;
+
+        if one == Blake2::Split {
+            want |= AVX512_AMD;
         }
     }
 
@@ -367,9 +423,9 @@ fn blake_now() -> Blake {
 // blake2(features()), as blake_now.
 #[inline]
 #[cfg(feature = "blake2")]
-fn blake2_now() -> Blake {
+fn blake2_now() -> Blake2 {
     if tier(FEATURES.load(Ordering::Relaxed), false) {
-        return Blake::Avx2;
+        return Blake2::Avx2;
     }
 
     blake2(features())
@@ -2143,12 +2199,12 @@ fn blake2_portable(word: u32) -> bool {
     word & READY != 0 && among(word, AVX2) && among(word, ONE_MESSAGE)
 }
 
-// Whether the word of FEATURES as read takes BLAKE2's AVX2 kernels, as blake2(features()) would:
-// the AVX2 tier, or the AVX-512VL one on the AMD cores that blake2() moves to AVX2 (AVX512_AMD).
+// Whether the word of FEATURES as read takes BLAKE2's SSE4.1 blocks, as blake2() would: probed,
+// with SSE4.1 and without AVX2.
 #[inline(always)]
 #[cfg(feature = "blake2")]
-fn blake2_avx2(word: u32) -> bool {
-    tier(word, false) || tier(word, true) && among(word, AVX512_AMD)
+fn blake2_blocks(word: u32) -> bool {
+    word & READY != 0 && !among(word, AVX2) && among(word, SSE41)
 }
 
 // The BLAKE2 functions below read FEATURES out of line: a read inlined into the generic engine
@@ -2165,12 +2221,14 @@ pub(crate) fn blake2b(
     match blake2_now() {
         // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2, and the operating system saves
         // their registers.
-        Blake::Vl => unsafe { blake2::blake2b_vl(h, first, blocks, counter, last) },
+        Blake2::Vl => unsafe { blake2::blake2b_vl(h, first, blocks, counter, last) },
+        // SAFETY: as for Vl.
+        Blake2::Split => unsafe { blake2::blake2b_split(h, first, blocks, counter, last) },
         // SAFETY: the CPU has AVX2 and the operating system saves its registers.
-        Blake::Avx2 => unsafe { blake2::blake2b_avx2(h, first, blocks, counter, last) },
+        Blake2::Avx2 => unsafe { blake2::blake2b_avx2(h, first, blocks, counter, last) },
         // SAFETY: the CPU has SSSE3 and SSE4.1, all that the kernel needs.
-        Blake::Sse41 => unsafe { blake2::blake2b_sse41(h, first, blocks, counter, last) },
-        Blake::Portable => return false,
+        Blake2::Sse41 => unsafe { blake2::blake2b_sse41(h, first, blocks, counter, last) },
+        Blake2::Portable => return false,
     }
 
     true
@@ -2193,7 +2251,7 @@ pub(crate) fn blake2s(
         let mut last = last.map(|(m, total)| (blake2::bytes32(m), total as u64));
 
         // SAFETY: the CPU has AVX2, and AVX-512F and AVX-512VL if blake2s_kernel chose
-        // their kernel; the operating system saves the registers of both.
+        // one of their kernels; the operating system saves the registers of both.
         unsafe {
             kernel(
                 h,
@@ -2216,7 +2274,7 @@ pub(crate) fn blake2s(
         return true;
     }
 
-    if one != Blake::Sse41 {
+    if one != Blake2::Sse41 {
         return false;
     }
 
@@ -2244,25 +2302,26 @@ pub(crate) fn blake2b_mac(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8])
 // call, Zen 5 (ONE_MESSAGE) took up to 2.8% more time for a message of 0 or 64 bytes (EPYC 9V45).
 // The rest out of line, so that the digest stays small enough to be inlined into its caller: out
 // of line, it took 1.3 to 3.7% more time for a message of 0 or 64 bytes (EPYC 7763 and 9V74, Xeon
-// 8370C).
+// 8370C), and with a call of the split rotations here, the compiler kept it out of line. A test of
+// the SSE4.1 tier here moved the test of the portable one and three registers, on Zen 5's path.
 #[inline(always)]
 #[allow(unsafe_code)]
 #[cfg(feature = "blake2")]
 fn blake2b_keyed(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
     let word = FEATURES.load(Ordering::Relaxed);
 
-    if blake2_avx2(word) {
-        // SAFETY: the CPU has AVX2 (blake2_avx2 tests it) and the operating system saves its
-        // registers.
-        unsafe { blake2::blake2b_digest_avx2(h, key, data, out) };
+    if blake2_tier(word, Blake2::Vl) {
+        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2 (blake2_tier tests them), and
+        // the operating system saves their registers.
+        unsafe { blake2::blake2b_digest_vl(h, key, data, out) };
 
         return Kernel::Done;
     }
 
-    if tier(word, true) {
-        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2 (tier tests them), and the
-        // operating system saves their registers.
-        unsafe { blake2::blake2b_digest_vl(h, key, data, out) };
+    if blake2_tier(word, Blake2::Avx2) {
+        // SAFETY: the CPU has AVX2 (blake2_tier tests it) and the operating system saves its
+        // registers.
+        unsafe { blake2::blake2b_digest_avx2(h, key, data, out) };
 
         return Kernel::Done;
     }
@@ -2274,25 +2333,66 @@ fn blake2b_keyed(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kerne
     blake2b_tiers(h, key, data, out)
 }
 
-// blake2b_keyed by blake2(features()), which probes the CPU on the first call.
+// The rest of blake2b_keyed, on the word as read: the SSE4.1 tier first, before any call, so that
+// its path takes no frame, then the split rotations, then the first call, out of line, then the
+// other tiers. No value here lives across a call, so that no path saves registers: with the
+// probe here, each took six. The word is read again here: passed as an argument, it moved the
+// others, and their moves added 11 instructions to every caller.
 #[inline(never)]
 #[allow(unsafe_code)]
 #[cfg(feature = "blake2")]
 fn blake2b_tiers(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
-    match blake2(features()) {
-        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2, and the operating system saves
-        // their registers.
-        Blake::Vl => unsafe { blake2::blake2b_digest_vl(h, key, data, out) },
+    let word = FEATURES.load(Ordering::Relaxed);
+
+    if blake2_blocks(word) {
+        return Kernel::Blocks;
+    }
+
+    if blake2_tier(word, Blake2::Split) {
+        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2 (blake2_tier tests them), and
+        // the operating system saves their registers.
+        unsafe { blake2::blake2b_digest_split(h, key, data, out) };
+
+        return Kernel::Done;
+    }
+
+    if word == 0 {
+        return blake2b_first(h, key, data, out);
+    }
+
+    blake2b_kernel(blake2(word), h, key, data, out)
+}
+
+// blake2b_tiers on the first call, which probes the CPU.
+#[cold]
+#[inline(never)]
+#[cfg(feature = "blake2")]
+fn blake2b_first(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
+    blake2b_kernel(blake2(features()), h, key, data, out)
+}
+
+// The digest by the kernel of one, or what the generic code takes instead.
+#[inline(always)]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake2")]
+fn blake2b_kernel(one: Blake2, h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
+    match one {
+        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2 (blake2 tests them), and the
+        // operating system saves their registers.
+        Blake2::Vl => unsafe { blake2::blake2b_digest_vl(h, key, data, out) },
+        // SAFETY: as for Vl.
+        Blake2::Split => unsafe { blake2::blake2b_digest_split(h, key, data, out) },
         // SAFETY: the CPU has AVX2 and the operating system saves its registers.
-        Blake::Avx2 => unsafe { blake2::blake2b_digest_avx2(h, key, data, out) },
-        Blake::Sse41 => return Kernel::Blocks,
-        Blake::Portable => return Kernel::Portable,
+        Blake2::Avx2 => unsafe { blake2::blake2b_digest_avx2(h, key, data, out) },
+        Blake2::Sse41 => return Kernel::Blocks,
+        Blake2::Portable => return Kernel::Portable,
     }
 
     Kernel::Done
 }
 
-// The BLAKE2s kernel for one message of the AVX2 code, with AVX-512VL or without.
+// The BLAKE2s kernel for one message of the AVX2 code, with AVX-512VL's rotations, its split ones
+// or neither.
 #[cfg(feature = "blake2")]
 type Blake2sKernel = unsafe fn(
     &mut [u32; 8],
@@ -2305,17 +2405,19 @@ type Blake2sKernel = unsafe fn(
 
 #[inline]
 #[cfg(feature = "blake2")]
-fn blake2s_kernel(one: Blake) -> Option<Blake2sKernel> {
+fn blake2s_kernel(one: Blake2) -> Option<Blake2sKernel> {
     match one {
-        Blake::Vl => Some(blake2::blake2s_vl),
-        Blake::Avx2 => Some(blake2::blake2s_avx2),
-        Blake::Sse41 | Blake::Portable => None,
+        Blake2::Vl => Some(blake2::blake2s_vl),
+        Blake2::Split => Some(blake2::blake2s_split),
+        Blake2::Avx2 => Some(blake2::blake2s_avx2),
+        Blake2::Sse41 | Blake2::Portable => None,
     }
 }
 
 // BLAKE2s's digest and MAC in one call of the AVX2 code each, with the blocks found here. One read
-// of FEATURES picks the AVX2 kernel, else the portable code for one message (ONE_MESSAGE), else
-// the other tiers, and one call reaches the function that calls the kernel, as before these tiers.
+// of FEATURES picks the AVX2 kernel or the split rotations, else the portable code for one message
+// (ONE_MESSAGE), else the other tiers, and one call reaches the function that calls the kernel, as
+// before these tiers.
 // Each tier calls its kernel directly, as the functions below are inlined with the kernel known.
 // The digest reads FEATURES in that function, as before these tiers: on Zen 4 a read in its
 // caller, then a call of the AVX2 code, took up to 1.4 ns more on a message of 0 or 64 bytes.
@@ -2324,7 +2426,11 @@ fn blake2s_kernel(one: Blake) -> Option<Blake2sKernel> {
 pub(crate) fn blake2s_digest(h: &[u32; 8], data: &[u8], out: &mut [u8]) -> Kernel {
     let word = FEATURES.load(Ordering::Relaxed);
 
-    if blake2_avx2(word) {
+    if blake2_tier(word, Blake2::Split) {
+        return blake2s_digest_with(blake2::blake2s_split, h, data, out);
+    }
+
+    if blake2_tier(word, Blake2::Avx2) {
         return blake2s_digest_with(blake2::blake2s_avx2, h, data, out);
     }
 
@@ -2338,10 +2444,11 @@ pub(crate) fn blake2s_digest(h: &[u32; 8], data: &[u8], out: &mut [u8]) -> Kerne
 #[cfg(feature = "blake2")]
 fn blake2s_digest_kernels(h: &[u32; 8], data: &[u8], out: &mut [u8]) -> Kernel {
     match blake2(features()) {
-        Blake::Vl => blake2s_digest_with(blake2::blake2s_vl, h, data, out),
-        Blake::Avx2 => blake2s_digest_with(blake2::blake2s_avx2, h, data, out),
-        Blake::Sse41 => Kernel::Blocks,
-        Blake::Portable => Kernel::Portable,
+        Blake2::Vl => blake2s_digest_with(blake2::blake2s_vl, h, data, out),
+        Blake2::Split => blake2s_digest_with(blake2::blake2s_split, h, data, out),
+        Blake2::Avx2 => blake2s_digest_with(blake2::blake2s_avx2, h, data, out),
+        Blake2::Sse41 => Kernel::Blocks,
+        Blake2::Portable => Kernel::Portable,
     }
 }
 
@@ -2357,8 +2464,9 @@ fn blake2s_digest_with(kernel: Blake2sKernel, h: &[u32; 8], data: &[u8], out: &m
     blake2::final32(tail, |last| {
         let total = data.len() as u64;
 
-        // SAFETY: the CPU has AVX2, and AVX-512F and AVX-512VL if blake2s_digest_kernels chose
-        // their kernel (blake2_avx2 and blake2 test them); the operating system saves them.
+        // SAFETY: the CPU has AVX2, and AVX-512F and AVX-512VL if blake2s_digest or
+        // blake2s_digest_kernels chose one of their kernels (blake2_tier and blake2 test them);
+        // the operating system saves them.
         unsafe { kernel(&mut state, None, blocks, Some((last, total)), 0, Some(out)) };
     });
 
@@ -2373,7 +2481,11 @@ fn blake2s_digest_with(kernel: Blake2sKernel, h: &[u32; 8], data: &[u8], out: &m
 pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
     let word = FEATURES.load(Ordering::Relaxed);
 
-    if blake2_avx2(word) {
+    if blake2_tier(word, Blake2::Split) {
+        return blake2s_mac_with(blake2::blake2s_split, h, key, data, out);
+    }
+
+    if blake2_tier(word, Blake2::Avx2) {
         return blake2s_mac_with(blake2::blake2s_avx2, h, key, data, out);
     }
 
@@ -2387,10 +2499,11 @@ pub(crate) fn blake2s_mac(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8])
 #[cfg(feature = "blake2")]
 fn blake2s_mac_kernels(h: &[u32; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
     match blake2(features()) {
-        Blake::Vl => blake2s_mac_with(blake2::blake2s_vl, h, key, data, out),
-        Blake::Avx2 => blake2s_mac_with(blake2::blake2s_avx2, h, key, data, out),
-        Blake::Sse41 => Kernel::Blocks,
-        Blake::Portable => Kernel::Portable,
+        Blake2::Vl => blake2s_mac_with(blake2::blake2s_vl, h, key, data, out),
+        Blake2::Split => blake2s_mac_with(blake2::blake2s_split, h, key, data, out),
+        Blake2::Avx2 => blake2s_mac_with(blake2::blake2s_avx2, h, key, data, out),
+        Blake2::Sse41 => Kernel::Blocks,
+        Blake2::Portable => Kernel::Portable,
     }
 }
 
@@ -2417,8 +2530,9 @@ fn blake2s_mac_with(
     let total = 64 + data.len() as u64;
 
     if data.is_empty() {
-        // SAFETY: the CPU has AVX2, and AVX-512F and AVX-512VL if blake2s_mac_kernels chose
-        // their kernel (blake2_avx2 and blake2 test them); the operating system saves them.
+        // SAFETY: the CPU has AVX2, and AVX-512F and AVX-512VL if blake2s_mac or
+        // blake2s_mac_kernels chose one of their kernels (blake2_tier and blake2 test them); the
+        // operating system saves them.
         unsafe {
             kernel(
                 &mut state,
@@ -3829,6 +3943,70 @@ mod tests {
                 "{vendor:?} {eax:#010x}"
             );
         }
+    }
+
+    // The tests of the word as read that BLAKE2's dispatch takes before blake2() choose what
+    // blake2() would on every word, and on every word that probe can store they leave none of its
+    // AVX2, AVX-512VL, split or SSE4.1 tiers to it (D-107). AVX512_AMD comes with AVX512 only.
+    #[test]
+    #[cfg(feature = "blake2")]
+    fn blake2_word_tests_match_blake2() {
+        use super::{Blake2, blake2, blake2_blocks, blake2_portable, blake2_tier};
+
+        let bits = [
+            super::AVX2,
+            super::SSE41,
+            super::ONE_MESSAGE,
+            super::AVX512,
+            super::AVX512_AMD,
+            super::SHA | super::AES | super::AVX512_ONE | super::GATHER | super::ZMM_LANES,
+            super::XMM_FOUR,
+        ];
+
+        for set in 0..1_u32 << bits.len() {
+            let word = bits
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| set >> i & 1 == 1)
+                .fold(super::READY, |word, (_, bit)| word | bit);
+
+            let one = blake2(word);
+
+            let stored = word & super::AVX512_AMD == 0 || word & super::AVX512 != 0;
+
+            for tier in [Blake2::Avx2, Blake2::Vl, Blake2::Split] {
+                let taken = blake2_tier(word, tier);
+
+                assert!(!taken || one == tier, "{word:#x}: tier {:?}", tier as u8);
+
+                assert!(
+                    !stored || taken || one != tier,
+                    "{word:#x}: tier {:?} left",
+                    tier as u8
+                );
+            }
+
+            assert!(
+                !blake2_blocks(word) || one == Blake2::Sse41,
+                "{word:#x}: blocks"
+            );
+
+            assert!(
+                !stored || blake2_blocks(word) || one != Blake2::Sse41,
+                "{word:#x}: SSE4.1"
+            );
+
+            assert!(
+                !blake2_portable(word) || one == Blake2::Portable,
+                "{word:#x}: portable"
+            );
+        }
+
+        for tier in [Blake2::Avx2, Blake2::Vl, Blake2::Split] {
+            assert!(!blake2_tier(0, tier), "unprobed: tier {:?}", tier as u8);
+        }
+
+        assert!(!blake2_blocks(0) && !blake2_portable(0), "unprobed");
     }
 
     #[test]
