@@ -146,10 +146,10 @@ pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
     digest_portable(start, data, out);
 }
 
-// Out of line on x86-64, where every core with AVX2 takes the kernel: inline, its saved registers
-// and stack frame came before the test, and the kernel's callers paid for them (D-109). The bytes
-// of a partial word come from its register, not from an array of them.
-#[cfg_attr(target_arch = "x86_64", inline(never))]
+// The bytes of a partial word come from its register, not from an array of them (D-109). On
+// x86-64 the code before stays, in line and with the array: out of line, with the kernel's code
+// unchanged, an Ascon-XOF128 of 64 bytes took 1.9% more time on Granite Rapids.
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn digest_portable(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
     let mut s = *start;
 
@@ -170,6 +170,17 @@ fn digest_portable(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
             rounds(&mut s);
         }
 
+        #[cfg(target_arch = "x86_64")]
+        {
+            let bytes = s[0].to_le_bytes();
+
+            match <&mut [u8; 8]>::try_from(&mut *chunk) {
+                Ok(word) => *word = bytes,
+                Err(_) => chunk.copy_from_slice(&bytes[..chunk.len()]),
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
         match <&mut [u8; 8]>::try_from(&mut *chunk) {
             Ok(word) => *word = s[0].to_le_bytes(),
             Err(_) => {
