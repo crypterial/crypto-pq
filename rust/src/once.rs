@@ -10,21 +10,22 @@
 // A target without pointer-width compare_exchange has no lock-free way to fill a value through a
 // shared reference, and a lock would need the same instruction. There the value is computed when
 // the OnceBox is made, as before the caches were lazy, and Shared copies instead of sharing,
-// because Arc does not exist either.
+// because Arc does not exist either. RV64IM, the ISA of zkVMs, is such a target, and
+// `--cfg crypto_pq_eager` builds this form on any target, so that the tests run it (D-112).
 
-#[cfg(target_has_atomic = "ptr")]
+#[cfg(all(target_has_atomic = "ptr", not(crypto_pq_eager)))]
 pub(crate) type Shared<T> = alloc::sync::Arc<T>;
 
-#[cfg(not(target_has_atomic = "ptr"))]
+#[cfg(any(not(target_has_atomic = "ptr"), crypto_pq_eager))]
 pub(crate) type Shared<T> = alloc::boxed::Box<T>;
 
-#[cfg(target_has_atomic = "ptr")]
+#[cfg(all(target_has_atomic = "ptr", not(crypto_pq_eager)))]
 pub(crate) use lazy::OnceBox;
 
-#[cfg(not(target_has_atomic = "ptr"))]
+#[cfg(any(not(target_has_atomic = "ptr"), crypto_pq_eager))]
 pub(crate) use eager::OnceBox;
 
-#[cfg(target_has_atomic = "ptr")]
+#[cfg(all(target_has_atomic = "ptr", any(test, not(crypto_pq_eager))))]
 #[allow(unsafe_code)]
 mod lazy {
     use alloc::boxed::Box;
@@ -121,7 +122,7 @@ mod lazy {
     }
 }
 
-#[cfg(any(test, not(target_has_atomic = "ptr")))]
+#[cfg(any(test, not(target_has_atomic = "ptr"), crypto_pq_eager))]
 mod eager {
     use alloc::boxed::Box;
 
@@ -133,7 +134,9 @@ mod eager {
             Self(Box::new(init()))
         }
 
-        #[cfg(test)]
+        // For the tests and ML-DSA's verification, which fills both caches together when
+        // neither is filled.
+        #[cfg(any(test, feature = "ml-dsa"))]
         pub(crate) fn get(&self) -> Option<&T> {
             Some(&self.0)
         }
