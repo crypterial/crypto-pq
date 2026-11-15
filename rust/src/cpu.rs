@@ -700,6 +700,14 @@ pub(crate) use arch::{keccak_group, permute_many};
 ))]
 pub(crate) use arch::{absorb, digest};
 
+#[cfg(all(
+    any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"),
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+pub(crate) use x86_64::digest_known;
+
 #[cfg(feature = "slh-dsa")]
 pub(crate) use arch::{ONE_BLOCK4, one_block4};
 

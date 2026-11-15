@@ -627,6 +627,44 @@ impl Keccak {
         engine.read(out);
     }
 
+    // digest_into for HashAlgorithm::digest_into. On x86-64 the kernel that cpu::digest_known finds
+    // is the last call here, with no frame: digest_into keeps the frame of its portable sponge and
+    // the registers saved for it on every path (D-110). Otherwise digest_into, out of line.
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))]
+    #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
+    pub(crate) fn digest_once(rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) {
+        if cpu::digest_known(rate, suffix, data, out) {
+            return;
+        }
+
+        Self::digest_late(rate, suffix, data, out);
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ))]
+    #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
+    #[inline(never)]
+    fn digest_late(rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) {
+        Self::digest_into(rate, suffix, data, out);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    )))]
+    #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
+    pub(crate) fn digest_once(rate: usize, suffix: u8, data: &[u8], out: &mut [u8]) {
+        Self::digest_into(rate, suffix, data, out);
+    }
+
     // digest_into from a state at a block boundary, such as cSHAKE's after its prefix.
     pub(crate) fn digest_from(
         start: &[u64; 25],
@@ -856,6 +894,18 @@ mod tests {
                 );
 
                 accelerated += 1;
+            }
+
+            #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
+            if initial.is_none() {
+                let mut once = vec![0; size];
+
+                Keccak::digest_once(rate, suffix, &data[..length], &mut once);
+
+                assert_eq!(
+                    once, expected,
+                    "digest_once: rate {rate}, length {length}, size {size}"
+                );
             }
         }
 
