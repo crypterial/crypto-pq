@@ -324,11 +324,13 @@ impl HashAlgorithm {
 
     /// The digest of `data` written into `out`, which must be [`digest_size`](Self::digest_size)
     /// bytes, without allocating. Fails with [`Error::InvalidLength`] if `out` has another length.
-    // Inline, so that a caller's buffer of the right size needs no check at run time, and BLAKE3,
-    // SHA-3, Keccak-256 and Ascon of a constant algorithm call their own code with no test of the
-    // kind: through the dispatcher, the frame of the kinds that it inlines cost them six saved
-    // registers on x86-64 (D-108, D-109, D-110).
-    #[inline]
+    // Inline always, so that a caller's buffer of the right size needs no check at run time, and
+    // BLAKE3, SHA-3, Keccak-256 and Ascon of a constant algorithm call their own code with no test
+    // of the kind: through the dispatcher, the frame of the kinds that it inlines cost them six
+    // saved registers on x86-64 (D-108, D-109, D-110). Inline alone left those tests out of line
+    // at some call sites, where a digest of another kind ran a call and a jump table more, 23
+    // instructions on x86-64.
+    #[inline(always)]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         check_length(out.len(), self.digest_size)?;
 
@@ -850,9 +852,9 @@ impl XofAlgorithm {
     /// `out.len()` bytes of output for `data`, without allocating. Fails with
     /// [`Error::InvalidLength`] if `out` is longer than 2^32 - 1 bytes or, for the Ascon XOFs,
     /// empty.
-    // Inline, as HashAlgorithm::digest_into, for BLAKE3 and Ascon of a constant algorithm (D-108,
-    // D-109).
-    #[inline]
+    // Inline always, as HashAlgorithm::digest_into, for BLAKE3 and Ascon of a constant algorithm
+    // (D-108, D-109).
+    #[inline(always)]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         self.check_output(out.len())?;
 
