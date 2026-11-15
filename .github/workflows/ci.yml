@@ -319,7 +319,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { cpu: Haswell-v4, kernels: 62 }
+          - { cpu: Haswell-v4, kernels: 63 }
           - { cpu: Denverton, kernels: 16 }
           - { cpu: qemu64, kernels: 0 }
     defaults:

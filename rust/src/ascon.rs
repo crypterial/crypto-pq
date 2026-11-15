@@ -136,13 +136,21 @@ pub(crate) fn permute(s: &mut [u64; 5]) {
 }
 
 // The output for data from a start state, read once. cpu::ascon_digest declines exactly where
-// cpu::ascon does, so the portable rounds run here with the state in registers: the blocks and
-// the padded last block through one permutation, then the output words through another.
+// cpu::ascon does, so the portable rounds run in digest_portable with the state in registers: the
+// blocks and the padded last block through one permutation, then the output words through another.
 pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
     if cpu::ascon_digest(start, data, out) {
         return;
     }
 
+    digest_portable(start, data, out);
+}
+
+// Out of line on x86-64, where every core with AVX2 takes the kernel: inline, its saved registers
+// and stack frame came before the test, and the kernel's callers paid for them (D-109). The bytes
+// of a partial word come from its register, not from an array of them.
+#[cfg_attr(target_arch = "x86_64", inline(never))]
+fn digest_portable(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
     let mut s = *start;
 
     let (blocks, tail) = data.as_chunks::<8>();
@@ -162,11 +170,17 @@ pub(crate) fn digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) {
             rounds(&mut s);
         }
 
-        let bytes = s[0].to_le_bytes();
-
         match <&mut [u8; 8]>::try_from(&mut *chunk) {
-            Ok(word) => *word = bytes,
-            Err(_) => chunk.copy_from_slice(&bytes[..chunk.len()]),
+            Ok(word) => *word = s[0].to_le_bytes(),
+            Err(_) => {
+                let mut word = s[0];
+
+                for byte in chunk {
+                    *byte = word as u8;
+
+                    word >>= 8;
+                }
+            }
         }
     }
 
@@ -216,7 +230,15 @@ macro_rules! customize {
     }};
 }
 
+// cpu::ascon_absorb keeps the state in registers across the blocks, where permute loads and
+// stores it once per block (D-109).
 pub(crate) fn customize(z: &[u8]) -> [u64; 5] {
+    let mut s = CXOF128;
+
+    if cpu::ascon_absorb(&mut s, 8 * z.len() as u64, z) {
+        return s;
+    }
+
     customize!(z, permute)
 }
 
@@ -321,7 +343,20 @@ impl Sponge {
 
             let (chunk, rest) = core::mem::take(&mut out).split_at_mut(take);
 
-            chunk.copy_from_slice(&self.s[0].to_le_bytes()[start..start + take]);
+            // The bytes from the register of the word, not from an array of them, which a run-time
+            // range would put on the stack (D-76).
+            match <&mut [u8; 8]>::try_from(&mut *chunk) {
+                Ok(word) => *word = self.s[0].to_le_bytes(),
+                Err(_) => {
+                    let mut word = self.s[0] >> (8 * start);
+
+                    for byte in chunk {
+                        *byte = word as u8;
+
+                        word >>= 8;
+                    }
+                }
+            }
 
             self.available -= take;
 
@@ -572,27 +607,47 @@ mod tests {
 
             let data = &data[..n % 41];
 
-            let mut expected = [0; 41];
+            let absorbed = |mut s: [u64; 5]| {
+                let (blocks, tail) = data.as_chunks::<8>();
+
+                for block in blocks {
+                    s[0] ^= u64::from_le_bytes(*block);
+
+                    permute_const(&mut s);
+                }
+
+                let mut last = [0; 8];
+
+                last[..tail.len()].copy_from_slice(tail);
+
+                last[tail.len()] = 1;
+
+                s[0] ^= u64::from_le_bytes(last);
+
+                permute_const(&mut s);
+
+                s
+            };
+
+            let [first] = inputs.words();
 
             let mut s = state;
 
-            let (blocks, tail) = data.as_chunks::<8>();
-
-            for block in blocks {
-                s[0] ^= u64::from_le_bytes(*block);
-
-                permute_const(&mut s);
-            }
-
-            let mut last = [0; 8];
-
-            last[..tail.len()].copy_from_slice(tail);
-
-            last[tail.len()] = 1;
-
-            s[0] ^= u64::from_le_bytes(last);
+            s[0] ^= first;
 
             permute_const(&mut s);
+
+            let expected = absorbed(s);
+
+            let mut actual = state;
+
+            if cpu::ascon_absorb(&mut actual, first, data) {
+                assert_eq!(actual, expected, "absorb, case {n}");
+            }
+
+            let mut expected = [0; 41];
+
+            let mut s = absorbed(state);
 
             for (i, chunk) in expected[..n % 42].chunks_mut(8).enumerate() {
                 if i > 0 {

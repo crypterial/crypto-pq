@@ -74,7 +74,7 @@ mod sample;
 use memory::{load_u8, load_u32, load_u64, store_u8, store_u32, store_u64};
 
 #[cfg(feature = "ascon")]
-pub(crate) use ascon::{ascon, ascon_digest};
+pub(crate) use ascon::{ascon, ascon_absorb, ascon_digest};
 
 #[cfg(feature = "ml-kem")]
 pub(crate) use binomial::binomial;

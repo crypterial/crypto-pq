@@ -2002,6 +2002,19 @@ pub(crate) fn ascon_digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) -> boo
 }
 
 #[allow(unsafe_code)]
+#[cfg(feature = "ascon")]
+pub(crate) fn ascon_absorb(s: &mut [u64; 5], first: u64, data: &[u8]) -> bool {
+    if !has(AVX2) {
+        return false;
+    }
+
+    // SAFETY: as in ascon.
+    unsafe { ascon::absorb_bmi(s, first, data) };
+
+    true
+}
+
+#[allow(unsafe_code)]
 #[cfg(feature = "frodokem")]
 pub(crate) fn aes_expand(key: &[u8], round_keys: &mut [[u8; 16]; 15]) -> bool {
     if !has(AES) {
