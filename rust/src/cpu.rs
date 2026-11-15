@@ -680,8 +680,8 @@ pub(crate) use arch::{
     not(crypto_pq_portable)
 ))]
 pub(crate) use x86_64::{
-    blake3_gathered, blake3_gathered_blocks, blake3_gathered_compress, blake3_gathered_digest1,
-    blake3_gathered_digest1_bytes, blake3_gathered_in,
+    blake3_baseline_now, blake3_gathered, blake3_gathered_blocks, blake3_gathered_compress,
+    blake3_gathered_digest1, blake3_gathered_digest1_bytes, blake3_gathered_in,
 };
 
 #[cfg(any(

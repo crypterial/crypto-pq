@@ -984,8 +984,8 @@ pub(crate) fn blake3_blocks(
     true
 }
 
-// The word of FEATURES as it is, read once for the tests of blake3_digest1_now and
-// blake3_portable_now.
+// The word of FEATURES as it is, read once for the tests of blake3_digest1_now,
+// blake3_portable_now and blake3_baseline_now.
 #[inline(always)]
 #[cfg(feature = "blake3")]
 pub(crate) fn word() -> u32 {
@@ -1027,6 +1027,14 @@ pub(crate) fn blake3_digest1_now<K: memory::Plain, const N: usize>(
 #[cfg(feature = "blake3")]
 pub(crate) fn blake3_portable_now(word: u32) -> bool {
     word & READY != 0 && among(word, AVX2) && among(word, ONE_MESSAGE)
+}
+
+// Whether the word of FEATURES as read shows neither AVX2 nor SSE4.1, where blake() chooses the
+// portable code by the features found: keyed takes digest1_bytes there too (D-108).
+#[inline(always)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_baseline_now(word: u32) -> bool {
+    word & READY != 0 && !among(word, AVX2) && !among(word, SSE41)
 }
 
 // A one-block digest of at most 32 bytes in one call.
@@ -4163,11 +4171,11 @@ mod tests {
     // The tests of the word as read that BLAKE3's chain takes before blake() (blake3_chain_now)
     // choose what blake() and blake3_vl would on every word, and on every word that probe can store
     // they leave none of the AVX2, AVX-512VL and split tiers to them, and the portable tier of one
-    // message is blake()'s (D-108).
+    // message is blake()'s and with blake3_baseline_now all of it (D-108).
     #[test]
     #[cfg(feature = "blake3")]
     fn blake3_word_tests_match_blake() {
-        use super::{Blake, among, blake, blake3_portable_now, blake3_tier};
+        use super::{Blake, among, blake, blake3_baseline_now, blake3_portable_now, blake3_tier};
 
         let bits = [
             super::AVX2,
@@ -4213,6 +4221,12 @@ mod tests {
                 !blake3_portable_now(word) || one == Blake::Portable,
                 "{word:#x}: portable"
             );
+
+            assert_eq!(
+                blake3_portable_now(word) || blake3_baseline_now(word),
+                one == Blake::Portable,
+                "{word:#x}: portable or baseline"
+            );
         }
 
         for (vl, split) in [(false, false), (true, false), (true, true)] {
@@ -4220,6 +4234,8 @@ mod tests {
         }
 
         assert!(!blake3_portable_now(0), "unprobed");
+
+        assert!(!blake3_baseline_now(0), "unprobed: baseline");
     }
 
     #[test]
