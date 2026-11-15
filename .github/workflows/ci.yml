@@ -306,6 +306,57 @@ jobs:
       - run: cargo test --locked --all-features
       - run: cargo test --locked --release --all-features
 
+  # RV64IM, the ISA of zkVMs, has no compare-and-swap, so the key caches take the form that fills
+  # them when a key is made (D-112). It is a tier 3 target, with no prebuilt core and alloc, which
+  # the pinned nightly builds from source. Clippy checks the library for the default features,
+  # every feature and each feature on its own, and the default and every feature build in release.
+  rust-rv64im:
+    name: rust riscv64im-unknown-none-elf
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    env:
+      NIGHTLY: nightly-2026-10-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install "$NIGHTLY" --profile minimal --component clippy,rust-src
+      - run: |
+          lint() {
+            echo "::group::[$*]"
+            cargo "+$NIGHTLY" clippy --lib --locked -Z build-std=core,alloc --target riscv64im-unknown-none-elf "$@" -- -D warnings
+            echo "::endgroup::"
+          }
+          lint
+          lint --all-features
+          for features in "" ml-kem frodokem ml-dsa slh-dsa lms xmss sha2 sha3 blake2 blake3 ascon hmac hkdf hazmat; do
+            lint --no-default-features --features "$features"
+          done
+      - run: |
+          for features in "" --all-features; do
+            echo "::group::build [$features]"
+            cargo "+$NIGHTLY" build --lib --release --locked -Z build-std=core,alloc --target riscv64im-unknown-none-elf $features
+            echo "::endgroup::"
+          done
+
+  # The same form on a runner, which runs the tests (D-112).
+  rust-eager:
+    name: rust key caches without compare-and-swap
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    env:
+      RUSTFLAGS: --cfg crypto_pq_eager
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - run: rustup override set stable
+      - run: cargo clippy --all-targets --locked --all-features -- -D warnings
+      - run: cargo test --locked --release --all-features
+
   # Each x86-64 path whatever the runner's CPU: QEMU user mode runs the suite on a CPU with AVX2
   # and no SHA-NI, one with SHA-NI and SSE4.1 (BLAKE2 and BLAKE3) but no AVX, and one with none of
   # them, and the kernel count test fails unless each selects its expected number of kernels
