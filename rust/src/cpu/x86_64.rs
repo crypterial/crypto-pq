@@ -295,7 +295,7 @@ enum Blake {
 }
 
 // BLAKE2's kernels for one message: those of blake(), with the split rotations in place of the
-// AVX-512VL row forms on AMD's cores.
+// AVX-512VL row forms on AMD's cores, which BLAKE2s runs and BLAKE2b takes in its AVX2 form.
 #[cfg(feature = "blake2")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Blake2 {
@@ -309,7 +309,9 @@ enum Blake2 {
 // BLAKE2 takes the AVX-512VL row forms on Intel's cores and the split rotations on AMD's (D-107).
 // On AMD Zen 4 (family 19h) VPRORD takes two cycles, where each of the two shifts and the OR it
 // replaces takes one, and BLAKE2s-256 of 64 bytes took 98.5 ns with VPRORD against 92.2 ns with
-// the AVX2 form (EPYC 9V74, five runners); Zen 5 runs the portable code (ONE_MESSAGE).
+// the AVX2 form (EPYC 9V74, five runners); Zen 5 runs the portable code (ONE_MESSAGE). BLAKE2b
+// runs its AVX2 form for Split, as before D-107: with the split rotations, its digests of 63 to
+// 255 bytes took 1.2 to 1.7% more time on Zen 4 and its MAC of no data 6.3% (EPYC 9V74, run 114).
 #[inline]
 #[cfg(feature = "blake2")]
 fn blake2(found: u32) -> Blake2 {
@@ -413,9 +415,10 @@ fn blake2_tier(word: u32, one: Blake2) -> bool {
     word & mask == want
 }
 
-// BLAKE3's kernels for one message: those of blake(), with the AVX-512VL row form in the split
-// rotations on AMD's cores (D-107), where a VPRORD on the chain of a half step takes two cycles.
-// Blake's kinds come first, in its order, so that blake_now takes each to its own with no code.
+// The kernels of BLAKE3's chain over a chunk: those of blake(), with the AVX-512VL row form in the
+// split rotations on AMD's cores (D-108), where a VPRORD on the chain of a half step takes two
+// cycles. Blake's kinds come first, in its order, so that blake3_chain_now takes each to its own
+// with no code.
 #[cfg(feature = "blake3")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Blake3 {
@@ -440,11 +443,30 @@ fn blake3_tier(word: u32, vl: bool, amd: bool) -> bool {
     tier_with(word, vl, AVX512_AMD, if amd { AVX512_AMD } else { 0 })
 }
 
-// blake(features()) for BLAKE3, with the AVX2 and AVX-512VL tiers tested first on the word as
-// read.
+// blake(features()), with the AVX2 and AVX-512VL tiers tested first on the word as read.
 #[inline]
 #[cfg(feature = "blake3")]
-fn blake_now() -> Blake3 {
+fn blake_now() -> Blake {
+    let word = FEATURES.load(Ordering::Relaxed);
+
+    if tier(word, false) {
+        return Blake::Avx2;
+    }
+
+    if tier(word, true) {
+        return Blake::Vl;
+    }
+
+    blake(features())
+}
+
+// blake_now for BLAKE3's chain, with the split rotations on AMD's cores. The single compressions
+// and the digest of one block keep blake_now's VPRORD form there: with the split rotations, a hash
+// of at most 64 bytes took 4 to 6% more time on Zen 4 (EPYC 9V74, run 114), where one of 1 KiB,
+// whose chunk is a chain of 16 blocks, took 2.5% less.
+#[inline]
+#[cfg(feature = "blake3")]
+fn blake3_chain_now() -> Blake3 {
     let word = FEATURES.load(Ordering::Relaxed);
 
     if blake3_tier(word, false, false) {
@@ -469,8 +491,8 @@ fn blake_now() -> Blake3 {
     }
 }
 
-// blake_now's choice on the word of the first call that chooses the AVX-512VL row forms, out of
-// line: inline, it took blake3_blocks out of line from its callers, a call and six saved
+// blake3_chain_now's choice on the word of the first call that chooses the AVX-512VL row forms,
+// out of line: inline, it took blake3_blocks out of line from its callers, a call and six saved
 // registers more for each chunk.
 #[cold]
 #[inline(never)]
@@ -932,8 +954,8 @@ pub(crate) fn blake3_xof(
 }
 
 // BLAKE3's chain over a chunk's blocks and its single compression, a row of the state per vector.
-// Inline always, as this and blake3_compress were inline before the split arms (D-107): out of
-// line they cost each chunk a call and six saved registers.
+// Inline always, as this was inline before the split arm (D-108): out of line it cost each chunk
+// a call and six saved registers.
 #[inline(always)]
 #[allow(unsafe_code)]
 #[cfg(feature = "blake3")]
@@ -945,7 +967,7 @@ pub(crate) fn blake3_blocks(
     edges: [u32; 2],
     last: crate::blake3::Last,
 ) -> bool {
-    match blake_now() {
+    match blake3_chain_now() {
         // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2, and the operating system saves
         // their registers.
         Blake3::Vl => unsafe { blake3::chain_vl::<false>(cv, blocks, counter, flags, edges, last) },
@@ -983,41 +1005,16 @@ pub(crate) fn blake3_digest1_now<K: memory::Plain, const N: usize>(
     data: &[u8],
     out: &mut [u8],
 ) -> bool {
-    if blake3_tier(word, false, false) {
+    if tier(word, false) {
         // SAFETY: as in blake3_many.
         unsafe { blake3::digest1_avx2(data, out, key, flags) };
 
         return true;
     }
 
-    if blake3_tier(word, true, false) {
+    if tier(word, true) {
         // SAFETY: as in blake3_blocks.
-        unsafe { blake3::digest1_vl::<false, K, N>(data, out, key, flags) };
-
-        return true;
-    }
-
-    false
-}
-
-// blake3_digest1_now for the split row form on AMD's cores (D-107, D-108), which one_shot and keyed
-// test after blake3_portable_now: in blake3_digest1_now, LLVM compared the masked word with the AMD
-// tier's value first, or with a cold call there the AVX2 tier's first, a comparison more on the
-// paths of Intel's cores or of Zen 5's. The tests of the AMD tier and of the portable one take
-// Zen 4's path five instructions more.
-#[inline(always)]
-#[allow(unsafe_code)]
-#[cfg(feature = "blake3")]
-pub(crate) fn blake3_split_now<K: memory::Plain, const N: usize>(
-    word: u32,
-    key: &[K; N],
-    flags: u32,
-    data: &[u8],
-    out: &mut [u8],
-) -> bool {
-    if blake3_tier(word, true, true) {
-        // SAFETY: as in blake3_blocks.
-        unsafe { blake3::digest1_vl::<true, K, N>(data, out, key, flags) };
+        unsafe { blake3::digest1_vl(data, out, key, flags) };
 
         return true;
     }
@@ -1062,19 +1059,18 @@ fn digest1<K: memory::Plain, const N: usize>(
     out: &mut [u8],
 ) -> bool {
     match blake_now() {
-        // SAFETY: as in blake3_blocks, here and in the next.
-        Blake3::Vl => unsafe { blake3::digest1_vl::<false, K, N>(data, out, key, flags) },
-        Blake3::Split => unsafe { blake3::digest1_vl::<true, K, N>(data, out, key, flags) },
+        // SAFETY: as in blake3_blocks.
+        Blake::Vl => unsafe { blake3::digest1_vl(data, out, key, flags) },
         // SAFETY: as in blake3_many, here and in the next.
-        Blake3::Avx2 => unsafe { blake3::digest1_avx2(data, out, key, flags) },
-        Blake3::Sse41 => unsafe { blake3::digest1_sse41(data, out, key, flags) },
-        Blake3::Portable => return false,
+        Blake::Avx2 => unsafe { blake3::digest1_avx2(data, out, key, flags) },
+        Blake::Sse41 => unsafe { blake3::digest1_sse41(data, out, key, flags) },
+        Blake::Portable => return false,
     }
 
     true
 }
 
-#[inline(always)]
+#[inline]
 #[allow(unsafe_code)]
 #[cfg(feature = "blake3")]
 pub(crate) fn blake3_compress(
@@ -1085,17 +1081,12 @@ pub(crate) fn blake3_compress(
     out: &mut [u32; 16],
 ) -> bool {
     match blake_now() {
-        // SAFETY: as in blake3_blocks, here and in the next.
-        Blake3::Vl => unsafe {
-            blake3::compress_vl::<false>(cv, block, counter, length, flags, out)
-        },
-        Blake3::Split => unsafe {
-            blake3::compress_vl::<true>(cv, block, counter, length, flags, out)
-        },
+        // SAFETY: as in blake3_blocks.
+        Blake::Vl => unsafe { blake3::compress_vl(cv, block, counter, length, flags, out) },
         // SAFETY: as in blake3_many, here and in the next.
-        Blake3::Avx2 => unsafe { blake3::compress_avx2(cv, block, counter, length, flags, out) },
-        Blake3::Sse41 => unsafe { blake3::compress_sse41(cv, block, counter, length, flags, out) },
-        Blake3::Portable => return false,
+        Blake::Avx2 => unsafe { blake3::compress_avx2(cv, block, counter, length, flags, out) },
+        Blake::Sse41 => unsafe { blake3::compress_sse41(cv, block, counter, length, flags, out) },
+        Blake::Portable => return false,
     }
 
     true
@@ -2355,12 +2346,12 @@ fn blake2_portable(word: u32) -> bool {
     word & READY != 0 && among(word, AVX2) && among(word, ONE_MESSAGE)
 }
 
-// Whether the word of FEATURES as read takes BLAKE2's SSE4.1 blocks, as blake2() would: probed,
-// with SSE4.1 and without AVX2.
+// Whether the word of FEATURES as read takes BLAKE2b's AVX2 kernels, as blake2(features()) would:
+// the AVX2 tier, or the AVX-512VL one on the AMD cores that blake2() moves to Split (AVX512_AMD).
 #[inline(always)]
 #[cfg(feature = "blake2")]
-fn blake2_blocks(word: u32) -> bool {
-    word & READY != 0 && !among(word, AVX2) && among(word, SSE41)
+fn blake2_avx2(word: u32) -> bool {
+    tier(word, false) || tier(word, true) && among(word, AVX512_AMD)
 }
 
 // The BLAKE2 functions below read FEATURES out of line: a read inlined into the generic engine
@@ -2378,10 +2369,10 @@ pub(crate) fn blake2b(
         // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2, and the operating system saves
         // their registers.
         Blake2::Vl => unsafe { blake2::blake2b_vl(h, first, blocks, counter, last) },
-        // SAFETY: as for Vl.
-        Blake2::Split => unsafe { blake2::blake2b_split(h, first, blocks, counter, last) },
         // SAFETY: the CPU has AVX2 and the operating system saves its registers.
-        Blake2::Avx2 => unsafe { blake2::blake2b_avx2(h, first, blocks, counter, last) },
+        Blake2::Avx2 | Blake2::Split => unsafe {
+            blake2::blake2b_avx2(h, first, blocks, counter, last)
+        },
         // SAFETY: the CPU has SSSE3 and SSE4.1, all that the kernel needs.
         Blake2::Sse41 => unsafe { blake2::blake2b_sse41(h, first, blocks, counter, last) },
         Blake2::Portable => return false,
@@ -2458,26 +2449,25 @@ pub(crate) fn blake2b_mac(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8])
 // call, Zen 5 (ONE_MESSAGE) took up to 2.8% more time for a message of 0 or 64 bytes (EPYC 9V45).
 // The rest out of line, so that the digest stays small enough to be inlined into its caller: out
 // of line, it took 1.3 to 3.7% more time for a message of 0 or 64 bytes (EPYC 7763 and 9V74, Xeon
-// 8370C), and with a call of the split rotations here, the compiler kept it out of line. A test of
-// the SSE4.1 tier here moved the test of the portable one and three registers, on Zen 5's path.
+// 8370C).
 #[inline(always)]
 #[allow(unsafe_code)]
 #[cfg(feature = "blake2")]
 fn blake2b_keyed(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
     let word = FEATURES.load(Ordering::Relaxed);
 
-    if blake2_tier(word, Blake2::Vl) {
-        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2 (blake2_tier tests them), and
-        // the operating system saves their registers.
-        unsafe { blake2::blake2b_digest_vl(h, key, data, out) };
+    if blake2_avx2(word) {
+        // SAFETY: the CPU has AVX2 (blake2_avx2 tests it) and the operating system saves its
+        // registers.
+        unsafe { blake2::blake2b_digest_avx2(h, key, data, out) };
 
         return Kernel::Done;
     }
 
-    if blake2_tier(word, Blake2::Avx2) {
-        // SAFETY: the CPU has AVX2 (blake2_tier tests it) and the operating system saves its
-        // registers.
-        unsafe { blake2::blake2b_digest_avx2(h, key, data, out) };
+    if tier(word, true) {
+        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2 (tier tests them), and the
+        // operating system saves their registers.
+        unsafe { blake2::blake2b_digest_vl(h, key, data, out) };
 
         return Kernel::Done;
     }
@@ -2489,57 +2479,17 @@ fn blake2b_keyed(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kerne
     blake2b_tiers(h, key, data, out)
 }
 
-// The rest of blake2b_keyed, on the word as read: the SSE4.1 tier first, before any call, so that
-// its path takes no frame, then the split rotations, then the first call, out of line, then the
-// other tiers. No value here lives across a call, so that no path saves registers: with the
-// probe here, each took six. The word is read again here: passed as an argument, it moved the
-// others, and their moves added 11 instructions to every caller.
+// blake2b_keyed by blake2(features()), which probes the CPU on the first call.
 #[inline(never)]
 #[allow(unsafe_code)]
 #[cfg(feature = "blake2")]
 fn blake2b_tiers(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
-    let word = FEATURES.load(Ordering::Relaxed);
-
-    if blake2_blocks(word) {
-        return Kernel::Blocks;
-    }
-
-    if blake2_tier(word, Blake2::Split) {
-        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2 (blake2_tier tests them), and
-        // the operating system saves their registers.
-        unsafe { blake2::blake2b_digest_split(h, key, data, out) };
-
-        return Kernel::Done;
-    }
-
-    if word == 0 {
-        return blake2b_first(h, key, data, out);
-    }
-
-    blake2b_kernel(blake2(word), h, key, data, out)
-}
-
-// blake2b_tiers on the first call, which probes the CPU.
-#[cold]
-#[inline(never)]
-#[cfg(feature = "blake2")]
-fn blake2b_first(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
-    blake2b_kernel(blake2(features()), h, key, data, out)
-}
-
-// The digest by the kernel of one, or what the generic code takes instead.
-#[inline(always)]
-#[allow(unsafe_code)]
-#[cfg(feature = "blake2")]
-fn blake2b_kernel(one: Blake2, h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
-    match one {
-        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2 (blake2 tests them), and the
-        // operating system saves their registers.
+    match blake2(features()) {
+        // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2, and the operating system saves
+        // their registers.
         Blake2::Vl => unsafe { blake2::blake2b_digest_vl(h, key, data, out) },
-        // SAFETY: as for Vl.
-        Blake2::Split => unsafe { blake2::blake2b_digest_split(h, key, data, out) },
         // SAFETY: the CPU has AVX2 and the operating system saves its registers.
-        Blake2::Avx2 => unsafe { blake2::blake2b_digest_avx2(h, key, data, out) },
+        Blake2::Avx2 | Blake2::Split => unsafe { blake2::blake2b_digest_avx2(h, key, data, out) },
         Blake2::Sse41 => return Kernel::Blocks,
         Blake2::Portable => return Kernel::Portable,
     }
@@ -2617,14 +2567,21 @@ fn blake2s_digest_with(kernel: Blake2sKernel, h: &[u32; 8], data: &[u8], out: &m
     // The kernel's working copy of the chaining value, wiped after it.
     let mut state = *h;
 
-    blake2::final32(tail, |last| {
+    let digest = |last: &[u8; 64]| {
         let total = data.len() as u64;
 
         // SAFETY: the CPU has AVX2, and AVX-512F and AVX-512VL if blake2s_digest or
         // blake2s_digest_kernels chose one of their kernels (blake2_tier and blake2 test them);
         // the operating system saves them.
         unsafe { kernel(&mut state, None, blocks, Some((last, total)), 0, Some(out)) };
-    });
+    };
+
+    // The whole-word stores of final32 for a final block that the kernel loads first (D-111).
+    if blocks.is_empty() {
+        blake2::final32(tail, digest);
+    } else {
+        blake2::final32_after(tail, digest);
+    }
 
     wipe(&mut state);
 
@@ -3309,9 +3266,27 @@ fn compress256_sha(state: &mut [u32; 8], blocks: &[[u8; 64]], more: &[[u8; 64]])
 // The whole blocks of data and then its padded last block or two, on one stream, for a message of
 // `bits` bits that ends with data, the padding built in registers as in the aarch64 tail256. The
 // stream's schedule words keep message words, which are wiped with the stream. A macro, as
-// rounds256 is, for the two functions that differ in how they store the state.
+// rounds256 is, for the functions that differ in how they store the state. With blocks256_sha,
+// the whole blocks take that loop in builds without AVX: the kept states of a stream and the
+// HMAC tags of a MacKey do (D-106), and the one-shot digests do not, for which it took a message
+// of 64 bytes up to 3.6% more time on Zen 3 and an empty one 2.5% on Ice Lake (EPYC 7763, Xeon
+// 8370C, run 114).
 macro_rules! finish_stream256 {
-    ($streams:ident, $data:expr, $bits:expr) => {{
+    (@blocks $streams:ident, $blocks:ident) => {
+        for block in $blocks {
+            block_words(block, &mut $streams[0].m);
+
+            rounds256!($streams, 1);
+        }
+    };
+    (@blocks $streams:ident, $blocks:ident, blocks256_sha) => {
+        #[cfg(target_feature = "avx")]
+        finish_stream256!(@blocks $streams, $blocks);
+
+        #[cfg(not(target_feature = "avx"))]
+        blocks256_sha(&mut $streams[0], $blocks);
+    };
+    ($streams:ident, $data:expr, $bits:expr $(, $kernel:ident)?) => {{
         let data: &[u8] = $data;
 
         let bits: u64 = $bits;
@@ -3325,15 +3300,7 @@ macro_rules! finish_stream256 {
         // The length field: words 14 and 15 of the last block.
         let length = _mm_set_epi32(bits as i32, (bits >> 32) as i32, 0, 0);
 
-        #[cfg(target_feature = "avx")]
-        for block in blocks {
-            block_words(block, &mut $streams[0].m);
-
-            rounds256!($streams, 1);
-        }
-
-        #[cfg(not(target_feature = "avx"))]
-        blocks256_sha(&mut $streams[0], blocks);
+        finish_stream256!(@blocks $streams, blocks $(, $kernel)?);
 
         $streams[0].m = [
             last_chunk(whole, 0, marker),
@@ -3485,8 +3452,9 @@ fn compress256_sha_kept<const KEPT: bool>(state: &mut [u32; 8], blocks: &[[u8; 6
 // the rounds, where LLVM read it from xmm8, its copy for the sum after the block: through the
 // copy, a MOVDQA joined the chain from one block to the next, one cycle a block in the llvm-mca
 // models of Ice Lake and Sapphire Rapids. An empty REX prefix keeps that instruction's five bytes
-// and the offsets of the rest of the loop. The whole blocks of a one-shot digest take this loop
-// too, which LLVM put 32 bytes past a boundary in finish_stream256 (D-106).
+// and the offsets of the rest of the loop. The whole blocks of a kept state's digest and of an
+// HMAC tag from a MacKey take this loop too, which LLVM put 32 bytes past a boundary in
+// finish_stream256 (D-106).
 #[cfg(not(target_feature = "avx"))]
 #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
 #[inline]
@@ -3700,7 +3668,7 @@ fn blocks256_sha(stream: &mut Stream, blocks: &[[u8; 64]]) {
 fn digest256_sha_kept(state: &[u32; 8], data: &[u8], bits: u64, out: &mut [u8]) {
     let mut streams = [stream_kept(state)];
 
-    finish_stream256!(streams, data, bits);
+    finish_stream256!(streams, data, bits, blocks256_sha);
 
     digest_of(&streams[0], out);
 
@@ -3836,7 +3804,7 @@ fn final256_sha<const KEPT: bool>(
         stream_of(inner)
     }];
 
-    finish_stream256!(streams, data, bits);
+    finish_stream256!(streams, data, bits, blocks256_sha);
 
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
     let mut words = state_words(&streams[0]);
@@ -4107,11 +4075,12 @@ mod tests {
 
     // The tests of the word as read that BLAKE2's dispatch takes before blake2() choose what
     // blake2() would on every word, and on every word that probe can store they leave none of its
-    // AVX2, AVX-512VL, split or SSE4.1 tiers to it (D-107). AVX512_AMD comes with AVX512 only.
+    // AVX2, AVX-512VL or split tiers to it, nor BLAKE2b's AVX2 kernels (D-107). AVX512_AMD comes
+    // with AVX512 only.
     #[test]
     #[cfg(feature = "blake2")]
     fn blake2_word_tests_match_blake2() {
-        use super::{Blake2, blake2, blake2_blocks, blake2_portable, blake2_tier};
+        use super::{Blake2, blake2, blake2_avx2, blake2_portable, blake2_tier};
 
         let bits = [
             super::AVX2,
@@ -4146,14 +4115,13 @@ mod tests {
                 );
             }
 
-            assert!(
-                !blake2_blocks(word) || one == Blake2::Sse41,
-                "{word:#x}: blocks"
-            );
+            let avx2 = matches!(one, Blake2::Avx2 | Blake2::Split);
+
+            assert!(!blake2_avx2(word) || avx2, "{word:#x}: BLAKE2b AVX2");
 
             assert!(
-                !stored || blake2_blocks(word) || one != Blake2::Sse41,
-                "{word:#x}: SSE4.1"
+                !stored || blake2_avx2(word) || !avx2,
+                "{word:#x}: BLAKE2b AVX2 left"
             );
 
             assert!(
@@ -4166,12 +4134,13 @@ mod tests {
             assert!(!blake2_tier(0, tier), "unprobed: tier {:?}", tier as u8);
         }
 
-        assert!(!blake2_blocks(0) && !blake2_portable(0), "unprobed");
+        assert!(!blake2_avx2(0) && !blake2_portable(0), "unprobed");
     }
 
-    // The tests of the word as read that BLAKE3's one-message dispatch takes before blake() choose
-    // what blake() and blake3_vl would on every word, and on every word that probe can store they
-    // leave none of the AVX2, AVX-512VL and split tiers to them (D-107, D-108).
+    // The tests of the word as read that BLAKE3's chain takes before blake() (blake3_chain_now)
+    // choose what blake() and blake3_vl would on every word, and on every word that probe can store
+    // they leave none of the AVX2, AVX-512VL and split tiers to them, and the portable tier of one
+    // message is blake()'s (D-108).
     #[test]
     #[cfg(feature = "blake3")]
     fn blake3_word_tests_match_blake() {

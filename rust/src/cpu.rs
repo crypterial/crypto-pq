@@ -672,7 +672,7 @@ pub(crate) use arch::{
     blake3_many, blake3_portable_now, blake3_xof, word,
 };
 
-// The dispatch of blake3.rs's gathered module and of the split row form, x86-64 only.
+// The dispatch of blake3.rs's gathered module, x86-64 only.
 #[cfg(all(
     feature = "blake3",
     target_arch = "x86_64",
@@ -681,7 +681,7 @@ pub(crate) use arch::{
 ))]
 pub(crate) use x86_64::{
     blake3_gathered, blake3_gathered_blocks, blake3_gathered_compress, blake3_gathered_digest1,
-    blake3_gathered_digest1_bytes, blake3_gathered_in, blake3_split_now,
+    blake3_gathered_digest1_bytes, blake3_gathered_in,
 };
 
 #[cfg(any(

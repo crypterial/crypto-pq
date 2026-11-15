@@ -1,9 +1,9 @@
 // The one-message kernels of BLAKE2 and BLAKE3, called directly against the portable code on the
 // same inputs, whatever the core tables choose for the dispatch: the AVX-512VL ones and the split
-// rotations on every CPU with AVX512 (the dispatch runs the portable code on AMD Zen 5 and the
-// split rotations on AMD's other cores), the AVX2 ones, which take the same arguments, on every CPU
-// with AVX2. Messages of 0 to 65, 128 and 1025 bytes where a kernel takes them, keyed and unkeyed,
-// and several output lengths. CI's AVX-512 runners look for the line that the test prints. The
+// rotations of BLAKE2s and of BLAKE3's chain on every CPU with AVX512 (the dispatch runs the
+// portable code on AMD Zen 5, and on AMD's other cores those split rotations and BLAKE2b's AVX2
+// forms), the AVX2 ones, which take the same arguments, on every CPU with AVX2. Messages of 0 to
+// 65, 128 and 1025 bytes where a kernel takes them, keyed and unkeyed, and several output lengths. CI's AVX-512 runners look for the line that the test prints. The
 // references are the portable compressions with RFC 7693's and the BLAKE3 specification's
 // framing, checked against the library's own functions first. BLAKE3's 512-bit kernels for
 // sixteen inputs, and hash_many with them and the eight-lane AVX-512VL kernel, are called the same
@@ -48,8 +48,8 @@ struct Kernels {
 // The kernels of a tier: BLAKE2b's two, BLAKE2s's one and BLAKE3's four.
 const TIER: usize = 7;
 
-// Those of the AVX-512VL tier and of the split rotations.
-const COUNT: usize = 2 * TIER;
+// Those of the AVX-512VL tier and the two of the split rotations, BLAKE2s's and BLAKE3's chain.
+const COUNT: usize = TIER + 2;
 
 fn lengths() -> impl Iterator<Item = usize> {
     (0..=65).chain([128, 1025])
@@ -630,21 +630,18 @@ fn blake_vl_kernels_match_portable() {
             blake2b_digest: blake2::blake2b_digest_vl,
             blake2s: blake2::blake2s_vl,
             chain: blake3::chain_vl::<false>,
-            compress: blake3::compress_vl::<false>,
-            digest1_words: blake3::digest1_vl::<false, u32, 8>,
-            digest1_bytes: blake3::digest1_vl::<false, u8, 32>,
+            compress: blake3::compress_vl,
+            digest1_words: blake3::digest1_vl::<u32, 8>,
+            digest1_bytes: blake3::digest1_vl::<u8, 32>,
         };
 
-        // The split rotations (D-107), which the dispatch runs on AMD's cores, on every CPU with
-        // AVX512.
+        // The split rotations (D-107, D-108), which the dispatch runs on AMD's cores, on every CPU
+        // with AVX512: BLAKE2s's kernel and BLAKE3's chain, with the AVX-512VL tier's others, which
+        // have no split form.
         let split = Kernels {
-            blake2b: blake2::blake2b_split,
-            blake2b_digest: blake2::blake2b_digest_split,
             blake2s: blake2::blake2s_split,
             chain: blake3::chain_vl::<true>,
-            compress: blake3::compress_vl::<true>,
-            digest1_words: blake3::digest1_vl::<true, u32, 8>,
-            digest1_bytes: blake3::digest1_vl::<true, u8, 32>,
+            ..vl
         };
 
         // SAFETY (both): the CPU has AVX-512F and AVX-512VL with AVX2, and the operating system

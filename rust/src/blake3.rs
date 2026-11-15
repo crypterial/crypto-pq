@@ -1602,15 +1602,6 @@ fn one_shot_read(
             return;
         }
 
-        #[cfg(all(
-            target_arch = "x86_64",
-            not(target_env = "sgx"),
-            not(crypto_pq_portable)
-        ))]
-        if cpu::blake3_split_now(word, key, root, data, out) {
-            return;
-        }
-
         short_rest(data, out, key, root);
 
         return;
@@ -1798,10 +1789,6 @@ fn keyed(word: impl FnOnce() -> u32, key: &[u8; KEY], flags: u32, data: &[u8], o
             if cpu::blake3_portable_now(word) {
                 digest1_bytes(data, out, key, root);
 
-                return;
-            }
-
-            if cpu::blake3_split_now(word, key, root, data, out) {
                 return;
             }
         }

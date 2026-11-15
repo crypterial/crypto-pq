@@ -1568,8 +1568,8 @@ mod rows_pair {
 // intrinsics form, its message in two ymm registers and two VPERMT2D a round, took 50.7 ns a block
 // of a 1 KiB hash on Granite Rapids and 61.2 on Emerald Rapids, against 46.2 and 55.7 for rscrypto,
 // which runs this assembly there, and 63.4 against 62.2 on AMD Zen 4. The EVEX instructions are
-// inline assembly in AVX2 code. Each entry point takes SPLIT, the rotations of split_half, which
-// the dispatch chooses on AMD's cores (D-107).
+// inline assembly in AVX2 code. The chain takes SPLIT, the rotations of split_half, which the
+// dispatch chooses on AMD's cores (D-108).
 mod rows_vl {
     use super::*;
 
@@ -1655,44 +1655,16 @@ mod rows_vl {
         };
     }
 
-    // The seven rounds of a block on row, whose words are the rows of m in order, with the split
-    // rotations if SPLIT. Private to this module, whose entry points are unsafe and require
-    // AVX-512F and AVX-512VL.
+    // The seven rounds of a block on row, whose words are the rows of m in order. Private to this
+    // module, whose entry points are unsafe and require AVX-512F and AVX-512VL.
     #[target_feature(enable = "avx2")]
     #[inline]
     #[allow(unsafe_code)]
-    fn rounds<const SPLIT: bool>(row: &mut [__m128i; 4], m: &[__m128i; 4]) {
+    fn rounds(row: &mut [__m128i; 4], m: &[__m128i; 4]) {
         let [r0, r1, r2, r3] = row;
 
-        // SAFETY (both): AVX-512VL instructions, which the CPU has, as the entry points require, on
-        // xmm0 to xmm11, all declared; no memory, no stack.
-        if SPLIT {
-            unsafe {
-                core::arch::asm!(
-                    "vshufps xmm4, xmm8, xmm9, 136",
-                    "vshufps xmm5, xmm8, xmm9, 221",
-                    "vshufps xmm6, xmm10, xmm11, 136",
-                    "vshufps xmm7, xmm10, xmm11, 221",
-                    "vpshufd xmm6, xmm6, 0x93",
-                    "vpshufd xmm7, xmm7, 0x93",
-                    seven_rounds!(split_half),
-                    rounds = out(reg) _,
-                    inout("xmm0") *r0,
-                    inout("xmm1") *r1,
-                    inout("xmm2") *r2,
-                    inout("xmm3") *r3,
-                    inout("xmm8") m[0] => _,
-                    inout("xmm9") m[1] => _,
-                    inout("xmm10") m[2] => _,
-                    inout("xmm11") m[3] => _,
-                    out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
-                    options(nostack, nomem),
-                )
-            };
-
-            return;
-        }
-
+        // SAFETY: AVX-512VL instructions, which the CPU has, as the entry points require, on xmm0
+        // to xmm11, all declared; no memory, no stack.
         unsafe {
             core::arch::asm!(
                 "vshufps xmm4, xmm8, xmm9, 136",
@@ -1856,14 +1828,14 @@ mod rows_vl {
         }
     }
 
-    /// As rows!'s digest1, as chain.
+    /// As rows!'s digest1.
     ///
     /// # Safety
     ///
     /// As for chain.
     #[target_feature(enable = "avx2")]
     #[allow(unsafe_code)]
-    pub(in crate::cpu::x86_64) unsafe fn digest1<const SPLIT: bool, K: Plain, const N: usize>(
+    pub(in crate::cpu::x86_64) unsafe fn digest1<K: Plain, const N: usize>(
         data: &[u8],
         out: &mut [u8],
         key: &[K; N],
@@ -1881,7 +1853,7 @@ mod rows_vl {
 
         let mut row = start(cv, 0, data.len() as u32, flags);
 
-        rounds::<SPLIT>(&mut row, &m);
+        rounds(&mut row, &m);
 
         #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
         let mut h = [_mm_xor_si128(row[0], row[2]), _mm_xor_si128(row[1], row[3])];
@@ -1895,14 +1867,14 @@ mod rows_vl {
         wipe_unless_optimized!(words_of(&mut m));
     }
 
-    /// As rows!'s compress, as chain.
+    /// As rows!'s compress.
     ///
     /// # Safety
     ///
     /// As for chain.
     #[target_feature(enable = "avx2")]
     #[allow(unsafe_code)]
-    pub(in crate::cpu) unsafe fn compress<const SPLIT: bool>(
+    pub(in crate::cpu) unsafe fn compress(
         cv: &[u32; 8],
         block: &[u8; 64],
         counter: u64,
@@ -1922,7 +1894,7 @@ mod rows_vl {
         #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
         let mut m = message(block);
 
-        rounds::<SPLIT>(&mut row, &m);
+        rounds(&mut row, &m);
 
         let [o0, o1, o2, o3] = out.as_chunks_mut::<4>().0 else {
             unreachable!("sixteen words are four groups of four")
