@@ -324,10 +324,19 @@ impl HashAlgorithm {
 
     /// The digest of `data` written into `out`, which must be [`digest_size`](Self::digest_size)
     /// bytes, without allocating. Fails with [`Error::InvalidLength`] if `out` has another length.
-    // Inline, so that a caller's buffer of the right size needs no check at run time.
+    // Inline, so that a caller's buffer of the right size needs no check at run time, and BLAKE3 of
+    // a constant algorithm calls its own code with no test of the kind: through the dispatcher, the
+    // frame of the kinds that it inlines cost BLAKE3 six saved registers on x86-64.
     #[inline]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         check_length(out.len(), self.digest_size)?;
+
+        #[cfg(feature = "blake3")]
+        if matches!(self.kind, Kind::Blake3) {
+            blake3::digest(data, out);
+
+            return Ok(());
+        }
 
         self.digest_unchecked(data, out);
 
@@ -816,8 +825,17 @@ impl XofAlgorithm {
     /// `out.len()` bytes of output for `data`, without allocating. Fails with
     /// [`Error::InvalidLength`] if `out` is longer than 2^32 - 1 bytes or, for the Ascon XOFs,
     /// empty.
+    // Inline, as HashAlgorithm::digest_into, for BLAKE3 of a constant algorithm (D-108).
+    #[inline]
     pub fn digest_into(&self, data: &[u8], out: &mut [u8]) -> Result<(), Error> {
         self.check_output(out.len())?;
+
+        #[cfg(feature = "blake3")]
+        if matches!(self.kind, XofKind::Blake3) {
+            blake3::digest(data, out);
+
+            return Ok(());
+        }
 
         self.digest_unchecked(data, out);
 

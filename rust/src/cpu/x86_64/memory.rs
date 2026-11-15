@@ -8,7 +8,7 @@ use core::arch::x86_64::*;
 use core::mem::MaybeUninit;
 
 // The element types of the arrays: integers, of which every bit pattern is a value.
-pub(super) trait Plain: Copy {}
+pub(crate) trait Plain: Copy {}
 
 impl Plain for u8 {}
 

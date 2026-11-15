@@ -1,13 +1,13 @@
 // The one-message kernels of BLAKE2 and BLAKE3, called directly against the portable code on the
-// same inputs, whatever the core tables choose for the dispatch: the AVX-512VL ones and BLAKE2's
-// split rotations on every CPU with AVX512 (the dispatch runs the portable code on AMD Zen 5 and
-// the split rotations on AMD's other cores), the AVX2 ones, which take the same arguments, on
-// every CPU with AVX2. Messages of 0 to 65, 128 and 1025 bytes where a kernel takes them, keyed and
-// unkeyed, and several output lengths. CI's AVX-512 runners look for the line that the test
-// prints. The references are the portable compressions with RFC 7693's and the BLAKE3
-// specification's framing, checked against the library's own functions first. BLAKE3's 512-bit
-// kernels for sixteen inputs, and hash_many with them and the eight-lane AVX-512VL kernel, are
-// called the same way, on every CPU with AVX512.
+// same inputs, whatever the core tables choose for the dispatch: the AVX-512VL ones and the split
+// rotations on every CPU with AVX512 (the dispatch runs the portable code on AMD Zen 5 and the
+// split rotations on AMD's other cores), the AVX2 ones, which take the same arguments, on every CPU
+// with AVX2. Messages of 0 to 65, 128 and 1025 bytes where a kernel takes them, keyed and unkeyed,
+// and several output lengths. CI's AVX-512 runners look for the line that the test prints. The
+// references are the portable compressions with RFC 7693's and the BLAKE3 specification's
+// framing, checked against the library's own functions first. BLAKE3's 512-bit kernels for
+// sixteen inputs, and hash_many with them and the eight-lane AVX-512VL kernel, are called the same
+// way, on every CPU with AVX512.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -30,34 +30,26 @@ type Chain = unsafe fn(&mut [u32; 8], &[[u8; 64]], u64, u32, [u32; 2], Last<'_>)
 
 type Compress = unsafe fn(&[u32; 8], &[u8; 64], u64, u32, u32, &mut [u32; 16]);
 
-type Digest1Words = unsafe fn(&[u32; 8], u32, &[u8], &mut [u8]);
+type Digest1Words = unsafe fn(&[u8], &mut [u8], &[u32; 8], u32);
 
-type Digest1Bytes = unsafe fn(&[u8; 32], u32, &[u8], &mut [u8]);
+type Digest1Bytes = unsafe fn(&[u8], &mut [u8], &[u8; 32], u32);
 
-// One tier's kernels for one message: BLAKE2's, and BLAKE3's but in the tier of the split
-// rotations, which has none.
+// One tier's kernels for one message.
 struct Kernels {
     blake2b: Blake2bKernel,
     blake2b_digest: Blake2bDigest,
     blake2s: Blake2sKernel,
-    blake3: Option<Blake3Kernels>,
-}
-
-struct Blake3Kernels {
     chain: Chain,
     compress: Compress,
     digest1_words: Digest1Words,
     digest1_bytes: Digest1Bytes,
 }
 
-impl Kernels {
-    fn count(&self) -> usize {
-        if self.blake3.is_some() { 7 } else { 3 }
-    }
-}
+// The kernels of a tier: BLAKE2b's two, BLAKE2s's one and BLAKE3's four.
+const TIER: usize = 7;
 
-// The kernels of the AVX-512VL tier and of the split rotations.
-const COUNT: usize = 10;
+// Those of the AVX-512VL tier and of the split rotations.
+const COUNT: usize = 2 * TIER;
 
 fn lengths() -> impl Iterator<Item = usize> {
     (0..=65).chain([128, 1025])
@@ -513,10 +505,6 @@ unsafe fn kernels_match(kernels: &Kernels, inputs: &mut Inputs, tier: &str) {
                 }
             }
 
-            let Some(blake3) = &kernels.blake3 else {
-                continue;
-            };
-
             // BLAKE3: the chain of the message's blocks, a partial one last.
             let (cv, flags) = if keyed {
                 (words, KEYED_HASH)
@@ -562,7 +550,7 @@ unsafe fn kernels_match(kernels: &Kernels, inputs: &mut Inputs, tier: &str) {
 
             let mut h = cv;
 
-            unsafe { (blake3.chain)(&mut h, blocks, counter, flags, edges, last) };
+            unsafe { (kernels.chain)(&mut h, blocks, counter, flags, edges, last) };
 
             assert_eq!(h, expected, "{tier} blake3 chain {length} keyed {keyed}");
 
@@ -575,7 +563,7 @@ unsafe fn kernels_match(kernels: &Kernels, inputs: &mut Inputs, tier: &str) {
 
             let mut out = [0; 16];
 
-            unsafe { (blake3.compress)(&cv, &block, counter, length as u32, flags, &mut out) };
+            unsafe { (kernels.compress)(&cv, &block, counter, length as u32, flags, &mut out) };
 
             assert_eq!(
                 out,
@@ -590,14 +578,14 @@ unsafe fn kernels_match(kernels: &Kernels, inputs: &mut Inputs, tier: &str) {
 
                 let mut out = vec![0; size];
 
-                unsafe { (blake3.digest1_words)(&cv, root, &data, &mut out) };
+                unsafe { (kernels.digest1_words)(&data, &mut out, &cv, root) };
 
                 assert_eq!(
                     out, expected,
                     "{tier} blake3 digest1 {length} keyed {keyed}"
                 );
 
-                unsafe { (blake3.digest1_bytes)(&key_bytes(&cv), root, &data, &mut out) };
+                unsafe { (kernels.digest1_bytes)(&data, &mut out, &key_bytes(&cv), root) };
 
                 assert_eq!(
                     out, expected,
@@ -622,18 +610,16 @@ fn blake_vl_kernels_match_portable() {
             blake2b: blake2::blake2b_avx2,
             blake2b_digest: blake2::blake2b_digest_avx2,
             blake2s: blake2::blake2s_avx2,
-            blake3: Some(Blake3Kernels {
-                chain: blake3::chain_avx2,
-                compress: blake3::compress_avx2,
-                digest1_words: blake3::digest1_avx2::<u32, 8>,
-                digest1_bytes: blake3::digest1_avx2::<u8, 32>,
-            }),
+            chain: blake3::chain_avx2,
+            compress: blake3::compress_avx2,
+            digest1_words: blake3::digest1_avx2::<u32, 8>,
+            digest1_bytes: blake3::digest1_avx2::<u8, 32>,
         };
 
         // SAFETY: the CPU has AVX2, and the operating system saves its registers.
         unsafe { kernels_match(&avx2, &mut inputs, "AVX2") };
 
-        avx2_run = avx2.count();
+        avx2_run = TIER;
     }
 
     let mut run = 0;
@@ -643,29 +629,31 @@ fn blake_vl_kernels_match_portable() {
             blake2b: blake2::blake2b_vl,
             blake2b_digest: blake2::blake2b_digest_vl,
             blake2s: blake2::blake2s_vl,
-            blake3: Some(Blake3Kernels {
-                chain: blake3::chain_vl,
-                compress: blake3::compress_vl,
-                digest1_words: blake3::digest1_vl::<u32, 8>,
-                digest1_bytes: blake3::digest1_vl::<u8, 32>,
-            }),
+            chain: blake3::chain_vl::<false>,
+            compress: blake3::compress_vl::<false>,
+            digest1_words: blake3::digest1_vl::<false, u32, 8>,
+            digest1_bytes: blake3::digest1_vl::<false, u8, 32>,
         };
 
+        // The split rotations (D-107), which the dispatch runs on AMD's cores, on every CPU with
+        // AVX512.
         let split = Kernels {
             blake2b: blake2::blake2b_split,
             blake2b_digest: blake2::blake2b_digest_split,
             blake2s: blake2::blake2s_split,
-            blake3: None,
+            chain: blake3::chain_vl::<true>,
+            compress: blake3::compress_vl::<true>,
+            digest1_words: blake3::digest1_vl::<true, u32, 8>,
+            digest1_bytes: blake3::digest1_vl::<true, u8, 32>,
         };
 
-        // SAFETY: the CPU has AVX-512F and AVX-512VL with AVX2, and the operating system saves
-        // their registers.
+        // SAFETY (both): the CPU has AVX-512F and AVX-512VL with AVX2, and the operating system
+        // saves their registers.
         unsafe { kernels_match(&vl, &mut inputs, "AVX-512VL") };
 
-        // SAFETY: as for the AVX-512VL tier.
         unsafe { kernels_match(&split, &mut inputs, "split") };
 
-        run = vl.count() + split.count();
+        run = COUNT;
     }
 
     std::eprintln!("BLAKE VL kernels: {run} of {COUNT} run (AVX2 kernels: {avx2_run})");

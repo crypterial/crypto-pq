@@ -131,12 +131,95 @@ fn short_words(data: &[u8]) -> [u64; 2] {
         return [u64::from(u32::from_le_bytes(*first)) | high << 32, 0];
     }
 
-    let low = data
-        .iter()
-        .enumerate()
-        .fold(0, |word, (i, &byte)| word | u64::from(byte) << (8 * i));
+    // At most three bytes, each at its constant place, with no shift by a variable count, which
+    // x86 takes in cl, the low byte of the register that the kernels' callers pass out.len()
+    // in. The paths of 4 to 15 bytes shift by cl: built with one codegen unit, as the bench
+    // builds the crate, the kernels save no register and adjust the stack only before the
+    // panic of an input over 64 bytes; with the default sixteen, each saves rbx at its entry
+    // (D-108).
+    let mut low = 0;
+
+    if let Some(&byte) = data.first() {
+        low = u64::from(byte);
+    }
+
+    if let Some(&byte) = data.get(1) {
+        low |= u64::from(byte) << 8;
+    }
+
+    if let Some(&byte) = data.get(2) {
+        low |= u64::from(byte) << 16;
+    }
 
     [low, 0]
+}
+
+// The first out.len() bytes of the 32 of the digest in h, 16 of them from h[0] and 16 from h[1]:
+// whole straight into out, and a shorter output from the registers in pieces of 16, 8, 4 and 1
+// bytes, so that no copy of the digest is left in memory to wipe (D-76), and, built with one
+// codegen unit, the digest kernels need no frame (short_words).
+#[target_feature(enable = "sse2")]
+#[inline]
+fn store_digest(h: [__m128i; 2], out: &mut [u8]) {
+    if let Ok(whole) = <&mut [u8; 32]>::try_from(&mut *out) {
+        let [first, second] = whole.as_chunks_mut::<16>().0 else {
+            unreachable!("32 bytes are two groups of 16")
+        };
+
+        store128(h[0], first);
+
+        store128(h[1], second);
+
+        return;
+    }
+
+    let mut vector = h[0];
+
+    let mut rest = out;
+
+    if rest.len() >= 16 {
+        let Some((first, tail)) = core::mem::take(&mut rest).split_first_chunk_mut::<16>() else {
+            unreachable!("at least 16 bytes")
+        };
+
+        store128(h[0], first);
+
+        vector = h[1];
+
+        rest = tail;
+    }
+
+    if rest.len() >= 8 {
+        let Some((first, tail)) = core::mem::take(&mut rest).split_first_chunk_mut::<8>() else {
+            unreachable!("at least 8 bytes")
+        };
+
+        *first = _mm_cvtsi128_si64(vector).to_le_bytes();
+
+        vector = _mm_srli_si128::<8>(vector);
+
+        rest = tail;
+    }
+
+    let mut word = _mm_cvtsi128_si64(vector) as u64;
+
+    if rest.len() >= 4 {
+        let Some((first, tail)) = core::mem::take(&mut rest).split_first_chunk_mut::<4>() else {
+            unreachable!("at least 4 bytes")
+        };
+
+        *first = (word as u32).to_le_bytes();
+
+        word >>= 32;
+
+        rest = tail;
+    }
+
+    for byte in rest.iter_mut().take(3) {
+        *byte = word as u8;
+
+        word >>= 8;
+    }
 }
 
 // The words of at most a block of input with zeros after it, in four vectors of four words in
@@ -173,10 +256,16 @@ fn tail(data: &[u8], count: usize) -> __m128i {
         return _mm_setzero_si128();
     }
 
-    let Some(end) = data.last_chunk::<16>() else {
+    // A test of the length first: with last_chunk's option tested instead, its pointer and the
+    // length took a register each, and the digest kernels saved two.
+    if data.len() < 16 {
         let [low, high] = short_words(data);
 
         return _mm_set_epi64x(high as i64, low as i64);
+    }
+
+    let Some(end) = data.last_chunk::<16>() else {
+        unreachable!("at least sixteen bytes")
     };
 
     let Some(control) = TAIL[16 - count..].first_chunk::<16>() else {
@@ -371,12 +460,13 @@ macro_rules! rows {
         // At most 32 bytes of the root's output for at most a block of input, whose flags the
         // caller gives: one compression, from the key to the output in registers. The key is
         // eight words or their 32 bytes in little-endian order, which in memory are the same.
+        // The input and the output come first, in the registers in which digest receives them.
         #[target_feature(enable = $feature)]
         pub(in crate::cpu::x86_64) fn digest1<K: Plain, const N: usize>(
-            key: &[K; N],
-            flags: u32,
             data: &[u8],
             out: &mut [u8],
+            key: &[K; N],
+            flags: u32,
         ) {
             const { assert!(size_of::<[K; N]>() == 32) };
 
@@ -403,26 +493,7 @@ macro_rules! rows {
             #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
             let mut h = [_mm_xor_si128(row[0], row[2]), _mm_xor_si128(row[1], row[3])];
 
-            let mut bytes = [0; 32];
-
-            let target = match <&mut [u8; 32]>::try_from(&mut *out) {
-                Ok(whole) => whole,
-                Err(_) => &mut bytes,
-            };
-
-            let [first, second] = target.as_chunks_mut::<16>().0 else {
-                unreachable!("32 bytes are two groups of 16")
-            };
-
-            store128(h[0], first);
-
-            store128(h[1], second);
-
-            if out.len() < 32 {
-                out.copy_from_slice(&bytes[..out.len()]);
-
-                wipe(&mut bytes);
-            }
+            store_digest(h, out);
 
             wipe_unless_optimized!(words_of(&mut row));
 
@@ -1497,49 +1568,69 @@ mod rows_pair {
 // intrinsics form, its message in two ymm registers and two VPERMT2D a round, took 50.7 ns a block
 // of a 1 KiB hash on Granite Rapids and 61.2 on Emerald Rapids, against 46.2 and 55.7 for rscrypto,
 // which runs this assembly there, and 63.4 against 62.2 on AMD Zen 4. The EVEX instructions are
-// inline assembly in AVX2 code.
+// inline assembly in AVX2 code. Each entry point takes SPLIT, the rotations of split_half, which
+// the dispatch chooses on AMD's cores (D-107).
 mod rows_vl {
     use super::*;
 
+    // A half step of G on the rows in xmm0 to xmm3 with the message's vector m: a += m + b,
+    // d = ror(d ^ a, r1), c += d, b = ror(b ^ c, r2), each rotation an XOR and a VPRORD.
+    #[rustfmt::skip]
+    macro_rules! xor_half {
+        ($m:literal, $r1:literal, $l1:literal, $r2:literal, $l2:literal) => {
+            concat!(
+                "vpaddd xmm0, xmm0, ", $m, "\n",
+                "vpaddd xmm0, xmm0, xmm1\n",
+                "vpxord xmm3, xmm3, xmm0\n",
+                "vprord xmm3, xmm3, ", $r1, "\n",
+                "vpaddd xmm2, xmm2, xmm3\n",
+                "vpxord xmm1, xmm1, xmm2\n",
+                "vprord xmm1, xmm1, ", $r2, "\n",
+            )
+        };
+    }
+
+    // xor_half with each rotation in the split form of D-107, ror(d ^ a, r) as ror(d, r) ^ (a >> r)
+    // ^ (a << (32 - r)) in one VPTERNLOGD, with xmm10 and xmm11 for the shifts: the VPRORD of d,
+    // which the half step before wrote, is off the chain, which takes a shift and a VPTERNLOGD from
+    // a to d in place of an XOR and a VPRORD. On AMD Zen 4 a VPRORD takes two cycles and a shift
+    // and a VPTERNLOGD one each (uops.info), so that a half step takes six cycles on the chain in
+    // place of eight, a round 24 in place of 32 (llvm-mca znver4: 27 against 32, with its ports).
+    #[rustfmt::skip]
+    macro_rules! split_half {
+        ($m:literal, $r1:literal, $l1:literal, $r2:literal, $l2:literal) => {
+            concat!(
+                "vpaddd xmm0, xmm0, ", $m, "\n",
+                "vpaddd xmm0, xmm0, xmm1\n",
+                "vpsrld xmm10, xmm0, ", $r1, "\n",
+                "vpslld xmm11, xmm0, ", $l1, "\n",
+                "vprord xmm3, xmm3, ", $r1, "\n",
+                "vpternlogd xmm3, xmm10, xmm11, 0x96\n",
+                "vpaddd xmm2, xmm2, xmm3\n",
+                "vpsrld xmm10, xmm2, ", $r2, "\n",
+                "vpslld xmm11, xmm2, ", $l2, "\n",
+                "vprord xmm1, xmm1, ", $r2, "\n",
+                "vpternlogd xmm1, xmm10, xmm11, 0x96\n",
+            )
+        };
+    }
+
     // The rounds on the state in xmm0 to xmm3 and the message's vectors of the first round in xmm4
-    // to xmm7, with xmm8 and xmm9 for the permutation. No memory.
+    // to xmm7, with xmm8 and xmm9 for the permutation, the half steps in the form of half (and
+    // split_half's xmm10 and xmm11). No memory.
     #[rustfmt::skip]
     macro_rules! seven_rounds {
-        () => {
+        ($half:ident) => {
             concat!(
                 "mov {rounds:e}, 7\n",
                 "3:\n",
-                "vpaddd xmm0, xmm0, xmm4\n",
-                "vpaddd xmm0, xmm0, xmm1\n",
-                "vpxord xmm3, xmm3, xmm0\n",
-                "vprord xmm3, xmm3, 16\n",
-                "vpaddd xmm2, xmm2, xmm3\n",
-                "vpxord xmm1, xmm1, xmm2\n",
-                "vprord xmm1, xmm1, 12\n",
-                "vpaddd xmm0, xmm0, xmm5\n",
-                "vpaddd xmm0, xmm0, xmm1\n",
-                "vpxord xmm3, xmm3, xmm0\n",
-                "vprord xmm3, xmm3, 8\n",
-                "vpaddd xmm2, xmm2, xmm3\n",
-                "vpxord xmm1, xmm1, xmm2\n",
-                "vprord xmm1, xmm1, 7\n",
+                $half!("xmm4", 16, 16, 12, 20),
+                $half!("xmm5", 8, 24, 7, 25),
                 "vpshufd xmm0, xmm0, 0x93\n",
                 "vpshufd xmm3, xmm3, 0x4E\n",
                 "vpshufd xmm2, xmm2, 0x39\n",
-                "vpaddd xmm0, xmm0, xmm6\n",
-                "vpaddd xmm0, xmm0, xmm1\n",
-                "vpxord xmm3, xmm3, xmm0\n",
-                "vprord xmm3, xmm3, 16\n",
-                "vpaddd xmm2, xmm2, xmm3\n",
-                "vpxord xmm1, xmm1, xmm2\n",
-                "vprord xmm1, xmm1, 12\n",
-                "vpaddd xmm0, xmm0, xmm7\n",
-                "vpaddd xmm0, xmm0, xmm1\n",
-                "vpxord xmm3, xmm3, xmm0\n",
-                "vprord xmm3, xmm3, 8\n",
-                "vpaddd xmm2, xmm2, xmm3\n",
-                "vpxord xmm1, xmm1, xmm2\n",
-                "vprord xmm1, xmm1, 7\n",
+                $half!("xmm6", 16, 16, 12, 20),
+                $half!("xmm7", 8, 24, 7, 25),
                 "vpshufd xmm0, xmm0, 0x39\n",
                 "vpshufd xmm3, xmm3, 0x4E\n",
                 "vpshufd xmm2, xmm2, 0x93\n",
@@ -1564,16 +1655,44 @@ mod rows_vl {
         };
     }
 
-    // The seven rounds of a block on row, whose words are the rows of m in order. Private to this
-    // module, whose entry points are unsafe and require AVX-512F and AVX-512VL.
+    // The seven rounds of a block on row, whose words are the rows of m in order, with the split
+    // rotations if SPLIT. Private to this module, whose entry points are unsafe and require
+    // AVX-512F and AVX-512VL.
     #[target_feature(enable = "avx2")]
     #[inline]
     #[allow(unsafe_code)]
-    fn rounds(row: &mut [__m128i; 4], m: &[__m128i; 4]) {
+    fn rounds<const SPLIT: bool>(row: &mut [__m128i; 4], m: &[__m128i; 4]) {
         let [r0, r1, r2, r3] = row;
 
-        // SAFETY: AVX-512VL instructions, which the CPU has, as the entry points require, on xmm0
-        // to xmm11, all declared; no memory, no stack.
+        // SAFETY (both): AVX-512VL instructions, which the CPU has, as the entry points require, on
+        // xmm0 to xmm11, all declared; no memory, no stack.
+        if SPLIT {
+            unsafe {
+                core::arch::asm!(
+                    "vshufps xmm4, xmm8, xmm9, 136",
+                    "vshufps xmm5, xmm8, xmm9, 221",
+                    "vshufps xmm6, xmm10, xmm11, 136",
+                    "vshufps xmm7, xmm10, xmm11, 221",
+                    "vpshufd xmm6, xmm6, 0x93",
+                    "vpshufd xmm7, xmm7, 0x93",
+                    seven_rounds!(split_half),
+                    rounds = out(reg) _,
+                    inout("xmm0") *r0,
+                    inout("xmm1") *r1,
+                    inout("xmm2") *r2,
+                    inout("xmm3") *r3,
+                    inout("xmm8") m[0] => _,
+                    inout("xmm9") m[1] => _,
+                    inout("xmm10") m[2] => _,
+                    inout("xmm11") m[3] => _,
+                    out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
+                    options(nostack, nomem),
+                )
+            };
+
+            return;
+        }
+
         unsafe {
             core::arch::asm!(
                 "vshufps xmm4, xmm8, xmm9, 136",
@@ -1582,7 +1701,7 @@ mod rows_vl {
                 "vshufps xmm7, xmm10, xmm11, 221",
                 "vpshufd xmm6, xmm6, 0x93",
                 "vpshufd xmm7, xmm7, 0x93",
-                seven_rounds!(),
+                seven_rounds!(xor_half),
                 rounds = out(reg) _,
                 inout("xmm0") *r0,
                 inout("xmm1") *r1,
@@ -1637,7 +1756,7 @@ mod rows_vl {
     #[target_feature(enable = "avx2")]
     #[inline]
     #[allow(unsafe_code)]
-    unsafe fn chain_rows(
+    unsafe fn chain_rows<const SPLIT: bool>(
         cv: &mut [u32; 8],
         blocks: &[[u8; 64]],
         counter: u64,
@@ -1648,66 +1767,76 @@ mod rows_vl {
             unreachable!("eight words are two groups of four")
         };
 
-        // SAFETY: AVX-512VL instructions, which the CPU has, on xmm0 to xmm9, declared clobbered,
-        // and on xmm14 and xmm15, read only. They read the 32 bytes of cv and the 64 bytes of each
-        // of the blocks, at least one, and write cv; no stack.
-        unsafe {
-            core::arch::asm!(
-                "vmovdqu xmm0, xmmword ptr [{cv}]",
-                "vmovdqu xmm1, xmmword ptr [{cv} + 16]",
-                ".p2align 5",
-                "2:",
-                "mov {t:e}, {flags:e}",
-                "or {t:e}, {end:e}",
-                "add {offset}, 64",
-                "cmp {offset}, {total}",
-                "cmovne {t:e}, {flags:e}",
-                "vpinsrd xmm3, xmm14, {t:e}, 3",
-                "vmovdqa xmm2, xmm15",
-                "vmovups xmm8, xmmword ptr [{blocks} + {offset} - 64]",
-                "vmovups xmm9, xmmword ptr [{blocks} + {offset} - 48]",
-                "vshufps xmm4, xmm8, xmm9, 136",
-                "vshufps xmm5, xmm8, xmm9, 221",
-                "vmovups xmm8, xmmword ptr [{blocks} + {offset} - 32]",
-                "vmovups xmm9, xmmword ptr [{blocks} + {offset} - 16]",
-                "vshufps xmm6, xmm8, xmm9, 136",
-                "vshufps xmm7, xmm8, xmm9, 221",
-                "vpshufd xmm6, xmm6, 0x93",
-                "vpshufd xmm7, xmm7, 0x93",
-                seven_rounds!(),
-                "vpxor xmm0, xmm0, xmm2",
-                "vpxor xmm1, xmm1, xmm3",
-                "mov {flags:e}, {rest:e}",
-                "cmp {offset}, {total}",
-                "jne 2b",
-                "vmovdqu xmmword ptr [{cv}], xmm0",
-                "vmovdqu xmmword ptr [{cv} + 16], xmm1",
-                cv = in(reg) cv.as_mut_ptr(),
-                blocks = in(reg) blocks.as_ptr(),
-                total = in(reg) 64 * blocks.len(),
-                offset = inout(reg) 0usize => _,
-                flags = inout(reg) first => _,
-                rest = in(reg) rest,
-                end = in(reg) end,
-                t = out(reg) _,
-                rounds = out(reg) _,
-                in("xmm14") _mm_set_epi64x(i64::from(length), counter as i64),
-                in("xmm15") load128(iv),
-                out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _, out("xmm4") _,
-                out("xmm5") _, out("xmm6") _, out("xmm7") _, out("xmm8") _, out("xmm9") _,
-                options(nostack),
-            )
-        };
+        // The loop with the half steps of half, and the registers it clobbers besides xmm0 to xmm9.
+        macro_rules! blocks {
+            ($half:ident; $($more:tt)*) => {
+                core::arch::asm!(
+                    "vmovdqu xmm0, xmmword ptr [{cv}]",
+                    "vmovdqu xmm1, xmmword ptr [{cv} + 16]",
+                    ".p2align 5",
+                    "2:",
+                    "mov {t:e}, {flags:e}",
+                    "or {t:e}, {end:e}",
+                    "add {offset}, 64",
+                    "cmp {offset}, {total}",
+                    "cmovne {t:e}, {flags:e}",
+                    "vpinsrd xmm3, xmm14, {t:e}, 3",
+                    "vmovdqa xmm2, xmm15",
+                    "vmovups xmm8, xmmword ptr [{blocks} + {offset} - 64]",
+                    "vmovups xmm9, xmmword ptr [{blocks} + {offset} - 48]",
+                    "vshufps xmm4, xmm8, xmm9, 136",
+                    "vshufps xmm5, xmm8, xmm9, 221",
+                    "vmovups xmm8, xmmword ptr [{blocks} + {offset} - 32]",
+                    "vmovups xmm9, xmmword ptr [{blocks} + {offset} - 16]",
+                    "vshufps xmm6, xmm8, xmm9, 136",
+                    "vshufps xmm7, xmm8, xmm9, 221",
+                    "vpshufd xmm6, xmm6, 0x93",
+                    "vpshufd xmm7, xmm7, 0x93",
+                    seven_rounds!($half),
+                    "vpxor xmm0, xmm0, xmm2",
+                    "vpxor xmm1, xmm1, xmm3",
+                    "mov {flags:e}, {rest:e}",
+                    "cmp {offset}, {total}",
+                    "jne 2b",
+                    "vmovdqu xmmword ptr [{cv}], xmm0",
+                    "vmovdqu xmmword ptr [{cv} + 16], xmm1",
+                    cv = in(reg) cv.as_mut_ptr(),
+                    blocks = in(reg) blocks.as_ptr(),
+                    total = in(reg) 64 * blocks.len(),
+                    offset = inout(reg) 0usize => _,
+                    flags = inout(reg) first => _,
+                    rest = in(reg) rest,
+                    end = in(reg) end,
+                    t = out(reg) _,
+                    rounds = out(reg) _,
+                    in("xmm14") _mm_set_epi64x(i64::from(length), counter as i64),
+                    in("xmm15") load128(iv),
+                    out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _, out("xmm4") _,
+                    out("xmm5") _, out("xmm6") _, out("xmm7") _, out("xmm8") _, out("xmm9") _,
+                    $($more)*
+                    options(nostack),
+                )
+            };
+        }
+
+        // SAFETY (both): AVX-512VL instructions, which the CPU has, on xmm0 to xmm9 (and xmm10 and
+        // xmm11 if SPLIT), declared clobbered, and on xmm14 and xmm15, read only. They read the 32
+        // bytes of cv and the 64 bytes of each of the blocks, at least one, and write cv; no stack.
+        if SPLIT {
+            unsafe { blocks!(split_half; out("xmm10") _, out("xmm11") _,) };
+        } else {
+            unsafe { blocks!(xor_half;) };
+        }
     }
 
-    /// As rows!'s chain.
+    /// As rows!'s chain, with the split rotations if SPLIT.
     ///
     /// # Safety
     ///
     /// The CPU has AVX-512F and AVX-512VL, and the operating system saves their registers.
     #[target_feature(enable = "avx2")]
     #[allow(unsafe_code)]
-    pub(in crate::cpu) unsafe fn chain(
+    pub(in crate::cpu) unsafe fn chain<const SPLIT: bool>(
         cv: &mut [u32; 8],
         blocks: &[[u8; 64]],
         counter: u64,
@@ -1717,26 +1846,28 @@ mod rows_vl {
     ) {
         // SAFETY (both calls): as for this function, with at least one block.
         if !blocks.is_empty() {
-            unsafe { chain_rows(cv, blocks, counter, 64, [flags | first, flags, end]) };
+            unsafe { chain_rows::<SPLIT>(cv, blocks, counter, 64, [flags | first, flags, end]) };
         }
 
         if let Some((block, length, f)) = last {
-            unsafe { chain_rows(cv, core::slice::from_ref(block), counter, length, [f, f, 0]) };
+            unsafe {
+                chain_rows::<SPLIT>(cv, core::slice::from_ref(block), counter, length, [f, f, 0])
+            };
         }
     }
 
-    /// As rows!'s digest1.
+    /// As rows!'s digest1, as chain.
     ///
     /// # Safety
     ///
     /// As for chain.
     #[target_feature(enable = "avx2")]
     #[allow(unsafe_code)]
-    pub(in crate::cpu::x86_64) unsafe fn digest1<K: Plain, const N: usize>(
-        key: &[K; N],
-        flags: u32,
+    pub(in crate::cpu::x86_64) unsafe fn digest1<const SPLIT: bool, K: Plain, const N: usize>(
         data: &[u8],
         out: &mut [u8],
+        key: &[K; N],
+        flags: u32,
     ) {
         const { assert!(size_of::<[K; N]>() == 32) };
 
@@ -1750,31 +1881,12 @@ mod rows_vl {
 
         let mut row = start(cv, 0, data.len() as u32, flags);
 
-        rounds(&mut row, &m);
+        rounds::<SPLIT>(&mut row, &m);
 
         #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
         let mut h = [_mm_xor_si128(row[0], row[2]), _mm_xor_si128(row[1], row[3])];
 
-        let mut bytes = [0; 32];
-
-        let target = match <&mut [u8; 32]>::try_from(&mut *out) {
-            Ok(whole) => whole,
-            Err(_) => &mut bytes,
-        };
-
-        let [first, second] = target.as_chunks_mut::<16>().0 else {
-            unreachable!("32 bytes are two groups of 16")
-        };
-
-        store128(h[0], first);
-
-        store128(h[1], second);
-
-        if out.len() < 32 {
-            out.copy_from_slice(&bytes[..out.len()]);
-
-            wipe(&mut bytes);
-        }
+        store_digest(h, out);
 
         wipe_unless_optimized!(words_of(&mut row));
 
@@ -1783,14 +1895,14 @@ mod rows_vl {
         wipe_unless_optimized!(words_of(&mut m));
     }
 
-    /// As rows!'s compress.
+    /// As rows!'s compress, as chain.
     ///
     /// # Safety
     ///
     /// As for chain.
     #[target_feature(enable = "avx2")]
     #[allow(unsafe_code)]
-    pub(in crate::cpu) unsafe fn compress(
+    pub(in crate::cpu) unsafe fn compress<const SPLIT: bool>(
         cv: &[u32; 8],
         block: &[u8; 64],
         counter: u64,
@@ -1810,7 +1922,7 @@ mod rows_vl {
         #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
         let mut m = message(block);
 
-        rounds(&mut row, &m);
+        rounds::<SPLIT>(&mut row, &m);
 
         let [o0, o1, o2, o3] = out.as_chunks_mut::<4>().0 else {
             unreachable!("sixteen words are four groups of four")
