@@ -2264,7 +2264,6 @@ pub(crate) fn digest(
 
 // digest with the one-state AVX-512VL kernel, out of line, as permute1 is.
 #[inline(never)]
-#[allow(unsafe_code)]
 #[cfg(any(
     feature = "ml-kem",
     feature = "frodokem",
@@ -2281,10 +2280,32 @@ fn digest_avx512(
     data: &[u8],
     out: &mut [u8],
 ) -> bool {
-    let amd = has(AVX512_AMD);
+    one_state_digest(initial, rate, has(AVX512_AMD), suffix, data, out)
+}
 
-    // SAFETY: digest found AVX512_ONE: the CPU has AVX2, AVX-512F and AVX-512VL, and the operating
-    // system saves the registers.
+// The one-state AVX-512VL kernel of rate, in AMD's form where amd: false where no kernel takes
+// rate. Its callers have found AVX512_ONE.
+#[inline(always)]
+#[allow(unsafe_code)]
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    feature = "slh-dsa",
+    feature = "lms",
+    feature = "xmss",
+    feature = "sha3"
+))]
+fn one_state_digest(
+    initial: Option<&[u64; 25]>,
+    rate: usize,
+    amd: bool,
+    suffix: u8,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
+    // SAFETY: the caller found AVX512_ONE: the CPU has AVX2, AVX-512F and AVX-512VL, and the
+    // operating system saves the registers.
     unsafe {
         match rate {
             72 if amd => keccak::digest_avx512::<72, false>(initial, data, suffix, out),
@@ -2307,7 +2328,9 @@ fn digest_avx512(
 // digest from the zero state where one read of the features, with no detection, finds digest's
 // kernel for rate: false where digest would detect the features first or where no kernel takes
 // rate. Inlined into Keccak::digest_once, the kernel's call is its last, so the caller saves no
-// registers and keeps no frame (D-110).
+// registers and keeps no frame (D-110). The AVX-512VL kernels are chosen here too, by the same
+// read: through digest_avx512, whose result the caller tests, the cores of AVX512_ONE saved seven
+// registers.
 #[inline]
 #[allow(unsafe_code)]
 #[cfg(any(feature = "sha3", feature = "ml-dsa", feature = "slh-dsa"))]
@@ -2320,7 +2343,7 @@ pub(crate) fn digest_known(rate: usize, suffix: u8, data: &[u8], out: &mut [u8])
     }
 
     if among(found, AVX512_ONE) {
-        return digest_avx512(None, rate, suffix, data, out);
+        return one_state_digest(None, rate, among(found, AVX512_AMD), suffix, data, out);
     }
 
     // SAFETY: as in absorb.
