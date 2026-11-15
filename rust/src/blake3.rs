@@ -1446,12 +1446,12 @@ fn digest1<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
     wipe(&mut copy);
 }
 
-// digest1 for a key in bytes on x86-64, where the cores of ONE_MESSAGE run it (D-108), in the form
-// of ARM64 with LAZY (D-102): the message words from the caller's slice and the output words into
-// out, with no block or output in memory to fill, read back and wipe. The crypto_pq_portable build
-// compiles it too, so that its valgrind run checks the code that Zen 5 runs on secret keys. A key
-// in words keeps digest1: in this form a hash of 64 bytes, for an algorithm chosen at run time,
-// took 1.4% more time on Zen 5.
+// digest1 for a key in bytes on x86-64, where the cores with no kernel for one message run it
+// (D-108), in the form of ARM64 with LAZY (D-102): the message words from the caller's slice and
+// the output words into out, with no block or output in memory to fill, read back and wipe. The
+// crypto_pq_portable build compiles it too, so that its valgrind run checks the code that Zen 5
+// runs on secret keys. A key in words keeps digest1: in this form a hash of 64 bytes, for an
+// algorithm chosen at run time, took 1.4% more time on Zen 5.
 #[cfg(all(target_arch = "x86_64", not(target_env = "sgx")))]
 #[inline(always)]
 fn digest1_lazy(key: &[u8; KEY], flags: u32, data: &[u8], out: &mut [u8]) {
@@ -1712,13 +1712,7 @@ pub(crate) fn keyed_hash(key: &[u8], data: &[u8], out: &mut [u8]) {
             return gathered::keyed_hash(key, data, out);
         }
 
-        keyed(
-            || word,
-            key.try_into().expect("a 32-byte key"),
-            KEYED_HASH,
-            data,
-            out,
-        );
+        keyed::<KEYED_HASH>(|| word, key.try_into().expect("a 32-byte key"), data, out);
     }
 
     #[cfg(not(all(
@@ -1726,13 +1720,7 @@ pub(crate) fn keyed_hash(key: &[u8], data: &[u8], out: &mut [u8]) {
         not(target_env = "sgx"),
         not(crypto_pq_portable)
     )))]
-    keyed(
-        cpu::word,
-        key.try_into().expect("a 32-byte key"),
-        KEYED_HASH,
-        data,
-        out,
-    );
+    keyed::<KEYED_HASH>(cpu::word, key.try_into().expect("a 32-byte key"), data, out);
 }
 
 // derive_key(context, key material) into out. The context key is the context string hashed in its
@@ -1755,16 +1743,26 @@ pub(crate) fn derive_key(context: &[u8], material: &[u8], out: &mut [u8]) {
 
     one_shot(&IV_256, DERIVE_KEY_CONTEXT, context, &mut k);
 
-    keyed(cpu::word, &k, DERIVE_KEY_MATERIAL, material, out);
+    keyed::<DERIVE_KEY_MATERIAL>(cpu::word, &k, material, out);
 }
 
-// The mode of flags with key's bytes as the key. A short input goes from the caller's key straight
+// The mode of FLAGS with key's bytes as the key. A short input goes from the caller's key straight
 // into the registers of one compression. On x86-64 the test of the word of features and the
 // kernel's tail call come before any frame, as in one_shot: with the other paths inlined,
 // keyed_hash saved six registers and set up a frame before it tail-called the kernel (D-108).
-// The word of features comes from word, as in one_shot_read; the other targets do not read it.
+// The cores with no kernel for one message, Zen 5 (ONE_MESSAGE) and those without AVX2 and
+// SSE4.1, take digest1_bytes: through keyed_short, whose dispatch reads the word again, the second
+// ran 18 to 81 more instructions than the code before under QEMU with the qemu64 model. FLAGS is a
+// parameter of the type, so that digest1_bytes holds each mode's flags as a constant: with them
+// in a register, a keyed hash of 64 bytes on Zen 5 ran 5 more instructions. The word of features
+// comes from word, as in one_shot_read; the other targets do not read it.
 #[inline(always)]
-fn keyed(word: impl FnOnce() -> u32, key: &[u8; KEY], flags: u32, data: &[u8], out: &mut [u8]) {
+fn keyed<const FLAGS: u32>(
+    word: impl FnOnce() -> u32,
+    key: &[u8; KEY],
+    data: &[u8],
+    out: &mut [u8],
+) {
     #[cfg(not(all(
         target_arch = "x86_64",
         not(target_env = "sgx"),
@@ -1773,7 +1771,7 @@ fn keyed(word: impl FnOnce() -> u32, key: &[u8; KEY], flags: u32, data: &[u8], o
     let _ = word;
 
     if short(data, out) {
-        let root = flags | CHUNK_START | CHUNK_END | ROOT;
+        let root = FLAGS | CHUNK_START | CHUNK_END | ROOT;
 
         #[cfg(all(
             target_arch = "x86_64",
@@ -1787,8 +1785,8 @@ fn keyed(word: impl FnOnce() -> u32, key: &[u8; KEY], flags: u32, data: &[u8], o
                 return;
             }
 
-            if cpu::blake3_portable_now(word) {
-                digest1_bytes(data, out, key, root);
+            if cpu::blake3_portable_now(word) || cpu::blake3_baseline_now(word) {
+                digest1_bytes::<FLAGS>(data, out, key);
 
                 return;
             }
@@ -1799,18 +1797,19 @@ fn keyed(word: impl FnOnce() -> u32, key: &[u8; KEY], flags: u32, data: &[u8], o
         return;
     }
 
-    keyed_long(key, flags, data, out);
+    keyed_long(key, FLAGS, data, out);
 }
 
-// digest1 for a key in bytes, out of line as digest1_words, for keyed on x86-64.
+// digest1 for a key in bytes, out of line as digest1_words, for keyed on x86-64: one copy for
+// each mode.
 #[cfg(all(
     target_arch = "x86_64",
     not(target_env = "sgx"),
     not(crypto_pq_portable)
 ))]
 #[inline(never)]
-fn digest1_bytes(data: &[u8], out: &mut [u8], key: &[u8; KEY], flags: u32) {
-    digest1_lazy(key, flags, data, out);
+fn digest1_bytes<const FLAGS: u32>(data: &[u8], out: &mut [u8], key: &[u8; KEY]) {
+    digest1_lazy(key, FLAGS | CHUNK_START | CHUNK_END | ROOT, data, out);
 }
 
 // keyed's short path on a word of features not yet probed, or on another kernel.
