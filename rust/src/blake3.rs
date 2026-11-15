@@ -1411,49 +1411,80 @@ fn digest1<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
     #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
     let mut cv: [u32; 8] = registers!(|i| key.word(i); 0 1 2 3 4 5 6 7);
 
-    let mut copy = [0; BLOCK];
+    // On x86-64, where the cores of ONE_MESSAGE run this code (D-108), in the form of ARM64 with
+    // LAZY (D-102): the message words from the caller's slice and the output words into out, with
+    // no block or output in memory to fill, read back and wipe. The crypto_pq_portable build
+    // compiles it too, so that its valgrind run checks the code that Zen 5 runs on secret keys.
+    #[cfg(all(target_arch = "x86_64", not(target_env = "sgx")))]
+    {
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut m = match <&[u8; BLOCK]>::try_from(data) {
+            Ok(block) => words(block),
+            Err(_) => short_words(data),
+        };
 
-    let block = match <&[u8; BLOCK]>::try_from(data) {
-        Ok(block) => block,
-        Err(_) => {
-            copy[..data.len()].copy_from_slice(data);
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut v = rounds(&cv, &m, 0, data.len() as u32, flags);
 
-            &copy
+        wipe_unless_optimized!(&mut cv);
+
+        root_words(&v, out);
+
+        wipe_unless_optimized!(&mut v);
+
+        wipe_unless_optimized!(&mut m);
+    }
+
+    // Elsewhere through a zeroed copy of a short block and a buffer of a short output.
+    #[cfg(not(all(target_arch = "x86_64", not(target_env = "sgx"))))]
+    {
+        let mut copy = [0; BLOCK];
+
+        let block = match <&[u8; BLOCK]>::try_from(data) {
+            Ok(block) => block,
+            Err(_) => {
+                copy[..data.len()].copy_from_slice(data);
+
+                &copy
+            }
+        };
+
+        let v = rounds(&cv, &words(block), 0, data.len() as u32, flags);
+
+        wipe_unless_optimized!(&mut cv);
+
+        let mut bytes = [0; 32];
+
+        let target = match <&mut [u8; 32]>::try_from(&mut *out) {
+            Ok(whole) => whole,
+            Err(_) => &mut bytes,
+        };
+
+        for (i, chunk) in target.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *chunk = (v[i] ^ v[i + 8]).to_le_bytes();
         }
-    };
 
-    let v = rounds(&cv, &words(block), 0, data.len() as u32, flags);
+        if out.len() < 32 {
+            out.copy_from_slice(&bytes[..out.len()]);
 
-    wipe_unless_optimized!(&mut cv);
+            wipe(&mut bytes);
+        }
 
-    let mut bytes = [0; 32];
-
-    let target = match <&mut [u8; 32]>::try_from(&mut *out) {
-        Ok(whole) => whole,
-        Err(_) => &mut bytes,
-    };
-
-    for (i, chunk) in target.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        *chunk = (v[i] ^ v[i + 8]).to_le_bytes();
+        wipe(&mut copy);
     }
-
-    if out.len() < 32 {
-        out.copy_from_slice(&bytes[..out.len()]);
-
-        wipe(&mut bytes);
-    }
-
-    wipe(&mut copy);
 }
 
 // The first out.len() bytes, at most 32, of the output words of a root compression's state v:
 // whole words straight into out, then the bytes of a last partial word from its register, as
 // write_words does, so that no copy of the output is left to wipe (D-76).
-#[cfg(all(
-    target_arch = "aarch64",
-    target_endian = "little",
-    target_feature = "neon",
-    not(crypto_pq_portable)
+#[cfg(any(
+    all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        target_feature = "neon",
+        not(crypto_pq_portable)
+    ),
+    all(target_arch = "x86_64", not(target_env = "sgx"))
 ))]
 #[inline(always)]
 pub(crate) fn root_words(v: &[u32; 16], out: &mut [u8]) {
@@ -1484,11 +1515,14 @@ pub(crate) fn root_words(v: &[u32; 16], out: &mut [u8]) {
 
 // The words of a block of less than 64 bytes, zeros after the message. Leaves at the word that
 // takes the last bytes, with no test on the zero words after it.
-#[cfg(all(
-    target_arch = "aarch64",
-    target_endian = "little",
-    target_feature = "neon",
-    not(crypto_pq_portable)
+#[cfg(any(
+    all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        target_feature = "neon",
+        not(crypto_pq_portable)
+    ),
+    all(target_arch = "x86_64", not(target_env = "sgx"))
 ))]
 #[inline(always)]
 pub(crate) fn short_words(data: &[u8]) -> [u32; 16] {
@@ -1521,38 +1555,74 @@ pub(crate) fn short_words(data: &[u8]) -> [u32; 16] {
     m
 }
 
+// Whether one compression gives the output: at most a block of input and at most 32 bytes of
+// output. On x86-64 as one comparison of the larger of the input's length and twice the output's
+// (a slice's length is at most isize::MAX, so the product does not wrap): the two comparisons
+// combined took a byte register that held an argument, which then moved twice.
+#[inline(always)]
+fn short(data: &[u8], out: &[u8]) -> bool {
+    if cfg!(target_arch = "x86_64") {
+        data.len().max(2 * out.len()) <= BLOCK
+    } else {
+        data.len() <= BLOCK && out.len() <= 32
+    }
+}
+
 // out.len() bytes of output for data in one call.
 // Inlined into its callers with the tests of a short input and of the word of features, so that
 // the kernel's call comes before any frame: out of line, one_shot saved six registers and set up a
 // frame for its other paths before it tail-called the kernel.
 #[inline(always)]
 fn one_shot(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
-    if data.len() <= BLOCK && out.len() <= 32 {
+    one_shot_read(cpu::word, key, flags, data, out);
+}
+
+// one_shot with the word of features from word, read where the short path needs it, or read
+// before by a caller that tested it.
+#[inline(always)]
+fn one_shot_read(
+    word: impl FnOnce() -> u32,
+    key: &[u32; 8],
+    flags: u32,
+    data: &[u8],
+    out: &mut [u8],
+) {
+    if short(data, out) {
         let root = flags | CHUNK_START | CHUNK_END | ROOT;
 
-        let word = cpu::word();
+        let word = word();
 
         if cpu::blake3_digest1_now(word, key, root, data, out) {
             return;
         }
 
         if cpu::blake3_portable_now(word) {
-            digest1_words(key, root, data, out);
+            digest1_words(data, out, key, root);
 
             return;
         }
 
-        short_rest(key, root, data, out);
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(target_env = "sgx"),
+            not(crypto_pq_portable)
+        ))]
+        if cpu::blake3_split_now(word, key, root, data, out) {
+            return;
+        }
+
+        short_rest(data, out, key, root);
 
         return;
     }
 
-    one_shot_long(key, flags, data, out);
+    one_shot_long(data, out, key, flags);
 }
 
-// one_shot's short path on a word of features not yet probed, or on another kernel.
+// one_shot's short path on a word of features not yet probed, or on another kernel. This and the
+// next take the input and the output first, as one_shot_long.
 #[inline(never)]
-fn short_rest(key: &[u32; 8], root: u32, data: &[u8], out: &mut [u8]) {
+fn short_rest(data: &[u8], out: &mut [u8], key: &[u32; 8], root: u32) {
     if !cpu::blake3_digest1(key, root, data, out) {
         digest1(key, root, data, out);
     }
@@ -1560,7 +1630,7 @@ fn short_rest(key: &[u32; 8], root: u32, data: &[u8], out: &mut [u8]) {
 
 // digest1 for a key in words, out of line so that one_shot's callers hold no copy of its rounds.
 #[inline(never)]
-fn digest1_words(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
+fn digest1_words(data: &[u8], out: &mut [u8], key: &[u32; 8], flags: u32) {
     digest1(key, flags, data, out);
 }
 
@@ -1579,9 +1649,10 @@ fn one_block_long(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
     wipe(&mut last);
 }
 
-// one_shot for more than a block of input or more than 32 bytes of output.
+// one_shot for more than a block of input or more than 32 bytes of output. The input and the
+// output come first, as digest receives them and as the digest kernels take them.
 #[inline(never)]
-fn one_shot_long(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
+fn one_shot_long(data: &[u8], out: &mut [u8], key: &[u32; 8], flags: u32) {
     if data.len() <= CHUNK && out.len() <= 32 {
         let mut v = [0; 8];
 
@@ -1610,16 +1681,29 @@ fn one_shot_long(key: &[u32; 8], flags: u32, data: &[u8], out: &mut [u8]) {
 }
 
 // hash: out.len() bytes of output.
+// On x86-64 one read of the word of features serves the test of GATHER and the kernel's dispatch
+// (D-108).
 pub(crate) fn digest(data: &[u8], out: &mut [u8]) {
     #[cfg(all(
         target_arch = "x86_64",
         not(target_env = "sgx"),
         not(crypto_pq_portable)
     ))]
-    if cpu::blake3_gathered() {
-        return gathered::one_shot(&IV_256, 0, data, out);
+    {
+        let word = cpu::word();
+
+        if cpu::blake3_gathered_in(word) {
+            return gathered::one_shot(&IV_256, 0, data, out);
+        }
+
+        one_shot_read(|| word, &IV_256, 0, data, out);
     }
 
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    )))]
     one_shot(&IV_256, 0, data, out);
 }
 
@@ -1629,11 +1713,29 @@ pub(crate) fn keyed_hash(key: &[u8], data: &[u8], out: &mut [u8]) {
         not(target_env = "sgx"),
         not(crypto_pq_portable)
     ))]
-    if cpu::blake3_gathered() {
-        return gathered::keyed_hash(key, data, out);
+    {
+        let word = cpu::word();
+
+        if cpu::blake3_gathered_in(word) {
+            return gathered::keyed_hash(key, data, out);
+        }
+
+        keyed(
+            || word,
+            key.try_into().expect("a 32-byte key"),
+            KEYED_HASH,
+            data,
+            out,
+        );
     }
 
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    )))]
     keyed(
+        cpu::word,
         key.try_into().expect("a 32-byte key"),
         KEYED_HASH,
         data,
@@ -1661,28 +1763,114 @@ pub(crate) fn derive_key(context: &[u8], material: &[u8], out: &mut [u8]) {
 
     one_shot(&IV_256, DERIVE_KEY_CONTEXT, context, &mut k);
 
-    keyed(&k, DERIVE_KEY_MATERIAL, material, out);
+    keyed(cpu::word, &k, DERIVE_KEY_MATERIAL, material, out);
 }
 
 // The mode of flags with key's bytes as the key. A short input goes from the caller's key straight
-// into the registers of one compression.
+// into the registers of one compression. On x86-64 the test of the word of features and the
+// kernel's tail call come before any frame, as in one_shot: with the other paths inlined,
+// keyed_hash saved six registers and set up a frame before it tail-called the kernel (D-108).
+// The word of features comes from word, as in one_shot_read; the other targets do not read it.
 #[inline(always)]
-fn keyed(key: &[u8; KEY], flags: u32, data: &[u8], out: &mut [u8]) {
-    let root = flags | CHUNK_START | CHUNK_END | ROOT;
+fn keyed(word: impl FnOnce() -> u32, key: &[u8; KEY], flags: u32, data: &[u8], out: &mut [u8]) {
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    )))]
+    let _ = word;
 
-    if data.len() <= BLOCK && out.len() <= 32 {
-        if !cpu::blake3_digest1_bytes(key, root, data, out) {
-            digest1(key, root, data, out);
+    if short(data, out) {
+        let root = flags | CHUNK_START | CHUNK_END | ROOT;
+
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(target_env = "sgx"),
+            not(crypto_pq_portable)
+        ))]
+        {
+            let word = word();
+
+            if cpu::blake3_digest1_now(word, key, root, data, out) {
+                return;
+            }
+
+            if cpu::blake3_portable_now(word) {
+                digest1_bytes(data, out, key, root);
+
+                return;
+            }
+
+            if cpu::blake3_split_now(word, key, root, data, out) {
+                return;
+            }
         }
+
+        keyed_short(key, root, data, out);
 
         return;
     }
 
+    keyed_long(key, flags, data, out);
+}
+
+// digest1 for a key in bytes, out of line as digest1_words, for keyed on x86-64.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+#[inline(never)]
+fn digest1_bytes(data: &[u8], out: &mut [u8], key: &[u8; KEY], flags: u32) {
+    digest1(key, flags, data, out);
+}
+
+// keyed's short path on a word of features not yet probed, or on another kernel.
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ),
+    inline(never)
+)]
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    )),
+    inline(always)
+)]
+fn keyed_short(key: &[u8; KEY], root: u32, data: &[u8], out: &mut [u8]) {
+    if !cpu::blake3_digest1_bytes(key, root, data, out) {
+        digest1(key, root, data, out);
+    }
+}
+
+// keyed for more than a block of input or more than 32 bytes of output.
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    ),
+    inline(never)
+)]
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    )),
+    inline(always)
+)]
+fn keyed_long(key: &[u8; KEY], flags: u32, data: &[u8], out: &mut [u8]) {
     let mut k = [0; 8];
 
     key_words(key, &mut k);
 
-    one_shot(&k, flags, data, out);
+    one_shot_long(data, out, &k, flags);
 
     wipe(&mut k);
 }
@@ -1955,6 +2143,8 @@ mod gathered {
         }
     }
 
+    // Out of line, as one_shot, so that keyed_hash's frameless path on the other cores stays so.
+    #[inline(never)]
     pub(super) fn keyed_hash(key: &[u8], data: &[u8], out: &mut [u8]) {
         let key = key.try_into().expect("a 32-byte key");
 

@@ -335,6 +335,16 @@ fn tier(word: u32, vl: bool) -> bool {
     }
 }
 
+// tier with more bits of the word tested: those of more, against those of extra.
+#[inline(always)]
+#[cfg(feature = "blake3")]
+fn tier_with(word: u32, vl: bool, more: u32, extra: u32) -> bool {
+    match tier_bits(vl) {
+        Some((mask, want)) => word & (mask | more) == want | extra,
+        None => false,
+    }
+}
+
 // The mask of the word that tier tests and the value it wants, or None where the build has no
 // such tier.
 #[inline(always)]
@@ -403,21 +413,74 @@ fn blake2_tier(word: u32, one: Blake2) -> bool {
     word & mask == want
 }
 
-// blake(features()), with the AVX2 and AVX-512VL tiers tested first on the word as read.
+// BLAKE3's kernels for one message: those of blake(), with the AVX-512VL row form in the split
+// rotations on AMD's cores (D-107), where a VPRORD on the chain of a half step takes two cycles.
+// Blake's kinds come first, in its order, so that blake_now takes each to its own with no code.
+#[cfg(feature = "blake3")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Blake3 {
+    Vl,
+    Avx2,
+    Sse41,
+    Portable,
+    Split,
+}
+
+// The tier of tier(word, vl), on an AMD core with AVX512 or not. The three tiers test AVX512_AMD
+// with the bits of tier, so that they compare one masked word, and Intel's paths take no more
+// instructions than with tier: AVX512_AMD is never found without AVX512, so that the AVX2 tier
+// holds as tier's.
+#[inline(always)]
+#[cfg(feature = "blake3")]
+fn blake3_tier(word: u32, vl: bool, amd: bool) -> bool {
+    if !usable(AVX512_AMD) {
+        return !amd && tier(word, vl);
+    }
+
+    tier_with(word, vl, AVX512_AMD, if amd { AVX512_AMD } else { 0 })
+}
+
+// blake(features()) for BLAKE3, with the AVX2 and AVX-512VL tiers tested first on the word as
+// read.
 #[inline]
 #[cfg(feature = "blake3")]
-fn blake_now() -> Blake {
+fn blake_now() -> Blake3 {
     let word = FEATURES.load(Ordering::Relaxed);
 
-    if tier(word, false) {
-        return Blake::Avx2;
+    if blake3_tier(word, false, false) {
+        return Blake3::Avx2;
     }
 
-    if tier(word, true) {
-        return Blake::Vl;
+    if blake3_tier(word, true, false) {
+        return Blake3::Vl;
     }
 
-    blake(features())
+    if blake3_tier(word, true, true) {
+        return Blake3::Split;
+    }
+
+    let found = features();
+
+    match blake(found) {
+        Blake::Vl => blake3_vl(found),
+        Blake::Avx2 => Blake3::Avx2,
+        Blake::Sse41 => Blake3::Sse41,
+        Blake::Portable => Blake3::Portable,
+    }
+}
+
+// blake_now's choice on the word of the first call that chooses the AVX-512VL row forms, out of
+// line: inline, it took blake3_blocks out of line from its callers, a call and six saved
+// registers more for each chunk.
+#[cold]
+#[inline(never)]
+#[cfg(feature = "blake3")]
+fn blake3_vl(found: u32) -> Blake3 {
+    if among(found, AVX512_AMD) {
+        return Blake3::Split;
+    }
+
+    Blake3::Vl
 }
 
 // blake2(features()), as blake_now.
@@ -869,7 +932,9 @@ pub(crate) fn blake3_xof(
 }
 
 // BLAKE3's chain over a chunk's blocks and its single compression, a row of the state per vector.
-#[inline]
+// Inline always, as this and blake3_compress were inline before the split arms (D-107): out of
+// line they cost each chunk a call and six saved registers.
+#[inline(always)]
 #[allow(unsafe_code)]
 #[cfg(feature = "blake3")]
 pub(crate) fn blake3_blocks(
@@ -883,11 +948,15 @@ pub(crate) fn blake3_blocks(
     match blake_now() {
         // SAFETY: the CPU has AVX-512F and AVX-512VL besides AVX2, and the operating system saves
         // their registers.
-        Blake::Vl => unsafe { blake3::chain_vl(cv, blocks, counter, flags, edges, last) },
+        Blake3::Vl => unsafe { blake3::chain_vl::<false>(cv, blocks, counter, flags, edges, last) },
+        // SAFETY: as in the Vl arm.
+        Blake3::Split => unsafe {
+            blake3::chain_vl::<true>(cv, blocks, counter, flags, edges, last)
+        },
         // SAFETY: as in blake3_many, here and in the next.
-        Blake::Avx2 => unsafe { blake3::chain_avx2(cv, blocks, counter, flags, edges, last) },
-        Blake::Sse41 => unsafe { blake3::chain_sse41(cv, blocks, counter, flags, edges, last) },
-        Blake::Portable => return false,
+        Blake3::Avx2 => unsafe { blake3::chain_avx2(cv, blocks, counter, flags, edges, last) },
+        Blake3::Sse41 => unsafe { blake3::chain_sse41(cv, blocks, counter, flags, edges, last) },
+        Blake3::Portable => return false,
     }
 
     true
@@ -901,28 +970,54 @@ pub(crate) fn word() -> u32 {
     FEATURES.load(Ordering::Relaxed)
 }
 
-// blake3_digest1 when the word of FEATURES as read chooses a vector kernel, with no probe: a test
-// and a tail call, which one_shot's callers make before any frame of their own.
+// blake3_digest1 or blake3_digest1_bytes when the word of FEATURES as read chooses a vector kernel,
+// with no probe: a test and a tail call, which one_shot's and keyed's callers make before any frame
+// of their own (D-108).
 #[inline(always)]
 #[allow(unsafe_code)]
 #[cfg(feature = "blake3")]
-pub(crate) fn blake3_digest1_now(
+pub(crate) fn blake3_digest1_now<K: memory::Plain, const N: usize>(
     word: u32,
-    key: &[u32; 8],
+    key: &[K; N],
     flags: u32,
     data: &[u8],
     out: &mut [u8],
 ) -> bool {
-    if tier(word, false) {
+    if blake3_tier(word, false, false) {
         // SAFETY: as in blake3_many.
-        unsafe { blake3::digest1_avx2(key, flags, data, out) };
+        unsafe { blake3::digest1_avx2(data, out, key, flags) };
 
         return true;
     }
 
-    if tier(word, true) {
+    if blake3_tier(word, true, false) {
         // SAFETY: as in blake3_blocks.
-        unsafe { blake3::digest1_vl(key, flags, data, out) };
+        unsafe { blake3::digest1_vl::<false, K, N>(data, out, key, flags) };
+
+        return true;
+    }
+
+    false
+}
+
+// blake3_digest1_now for the split row form on AMD's cores (D-107, D-108), which one_shot and keyed
+// test after blake3_portable_now: in blake3_digest1_now, LLVM compared the masked word with the AMD
+// tier's value first, or with a cold call there the AVX2 tier's first, a comparison more on the
+// paths of Intel's cores or of Zen 5's. The tests of the AMD tier and of the portable one take
+// Zen 4's path five instructions more.
+#[inline(always)]
+#[allow(unsafe_code)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_split_now<K: memory::Plain, const N: usize>(
+    word: u32,
+    key: &[K; N],
+    flags: u32,
+    data: &[u8],
+    out: &mut [u8],
+) -> bool {
+    if blake3_tier(word, true, true) {
+        // SAFETY: as in blake3_blocks.
+        unsafe { blake3::digest1_vl::<true, K, N>(data, out, key, flags) };
 
         return true;
     }
@@ -967,18 +1062,19 @@ fn digest1<K: memory::Plain, const N: usize>(
     out: &mut [u8],
 ) -> bool {
     match blake_now() {
-        // SAFETY: as in blake3_blocks.
-        Blake::Vl => unsafe { blake3::digest1_vl(key, flags, data, out) },
+        // SAFETY: as in blake3_blocks, here and in the next.
+        Blake3::Vl => unsafe { blake3::digest1_vl::<false, K, N>(data, out, key, flags) },
+        Blake3::Split => unsafe { blake3::digest1_vl::<true, K, N>(data, out, key, flags) },
         // SAFETY: as in blake3_many, here and in the next.
-        Blake::Avx2 => unsafe { blake3::digest1_avx2(key, flags, data, out) },
-        Blake::Sse41 => unsafe { blake3::digest1_sse41(key, flags, data, out) },
-        Blake::Portable => return false,
+        Blake3::Avx2 => unsafe { blake3::digest1_avx2(data, out, key, flags) },
+        Blake3::Sse41 => unsafe { blake3::digest1_sse41(data, out, key, flags) },
+        Blake3::Portable => return false,
     }
 
     true
 }
 
-#[inline]
+#[inline(always)]
 #[allow(unsafe_code)]
 #[cfg(feature = "blake3")]
 pub(crate) fn blake3_compress(
@@ -989,12 +1085,17 @@ pub(crate) fn blake3_compress(
     out: &mut [u32; 16],
 ) -> bool {
     match blake_now() {
-        // SAFETY: as in blake3_blocks.
-        Blake::Vl => unsafe { blake3::compress_vl(cv, block, counter, length, flags, out) },
+        // SAFETY: as in blake3_blocks, here and in the next.
+        Blake3::Vl => unsafe {
+            blake3::compress_vl::<false>(cv, block, counter, length, flags, out)
+        },
+        Blake3::Split => unsafe {
+            blake3::compress_vl::<true>(cv, block, counter, length, flags, out)
+        },
         // SAFETY: as in blake3_many, here and in the next.
-        Blake::Avx2 => unsafe { blake3::compress_avx2(cv, block, counter, length, flags, out) },
-        Blake::Sse41 => unsafe { blake3::compress_sse41(cv, block, counter, length, flags, out) },
-        Blake::Portable => return false,
+        Blake3::Avx2 => unsafe { blake3::compress_avx2(cv, block, counter, length, flags, out) },
+        Blake3::Sse41 => unsafe { blake3::compress_sse41(cv, block, counter, length, flags, out) },
+        Blake3::Portable => return false,
     }
 
     true
@@ -1005,7 +1106,15 @@ pub(crate) fn blake3_compress(
 #[inline(always)]
 #[cfg(feature = "blake3")]
 pub(crate) fn blake3_gathered() -> bool {
-    usable(GATHER) && usable(AVX2) && FEATURES.load(Ordering::Relaxed) & GATHER != 0
+    blake3_gathered_in(FEATURES.load(Ordering::Relaxed))
+}
+
+// blake3_gathered on a word of FEATURES that the caller has read (word()), which its kernel's
+// dispatch then tests too, with no second read.
+#[inline(always)]
+#[cfg(feature = "blake3")]
+pub(crate) fn blake3_gathered_in(word: u32) -> bool {
+    usable(GATHER) && usable(AVX2) && word & GATHER != 0
 }
 
 // The dispatch of blake3.rs's gathered module: blake3_digest1, blake3_digest1_bytes,
@@ -1054,7 +1163,7 @@ fn gathered_digest1<K: memory::Plain, const N: usize>(
 
     if has(SSE41) {
         // SAFETY: as in blake3_many.
-        unsafe { blake3::digest1_sse41(key, flags, data, out) };
+        unsafe { blake3::digest1_sse41(data, out, key, flags) };
 
         return true;
     }
@@ -4009,6 +4118,67 @@ mod tests {
         assert!(!blake2_blocks(0) && !blake2_portable(0), "unprobed");
     }
 
+    // The tests of the word as read that BLAKE3's one-message dispatch takes before blake() choose
+    // what blake() and blake3_vl would on every word, and on every word that probe can store they
+    // leave none of the AVX2, AVX-512VL and split tiers to them (D-107, D-108).
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn blake3_word_tests_match_blake() {
+        use super::{Blake, among, blake, blake3_portable_now, blake3_tier};
+
+        let bits = [
+            super::AVX2,
+            super::SSE41,
+            super::ONE_MESSAGE,
+            super::AVX512,
+            super::AVX512_AMD,
+            super::SHA | super::AES | super::AVX512_ONE | super::GATHER | super::ZMM_LANES,
+            super::XMM_FOUR,
+        ];
+
+        for set in 0..1_u32 << bits.len() {
+            let word = bits
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| set >> i & 1 == 1)
+                .fold(super::READY, |word, (_, bit)| word | bit);
+
+            let one = blake(word);
+
+            let amd = among(word, super::AVX512_AMD);
+
+            let stored = word & super::AVX512_AMD == 0 || word & super::AVX512 != 0;
+
+            for (vl, split, kind) in [
+                (false, false, Blake::Avx2),
+                (true, false, Blake::Vl),
+                (true, true, Blake::Vl),
+            ] {
+                let chosen = one == kind && (!vl || amd == split);
+
+                let taken = blake3_tier(word, vl, split);
+
+                assert!(!taken || chosen, "{word:#x}: tier {vl} {split}");
+
+                assert!(
+                    !stored || taken || !chosen,
+                    "{word:#x}: tier {vl} {split} left"
+                );
+            }
+
+            assert!(
+                !blake3_portable_now(word) || one == Blake::Portable,
+                "{word:#x}: portable"
+            );
+        }
+
+        for (vl, split) in [(false, false), (true, false), (true, true)] {
+            assert!(!blake3_tier(0, vl, split), "unprobed: tier {vl} {split}");
+        }
+
+        assert!(!blake3_portable_now(0), "unprobed");
+    }
+
     #[test]
     fn xmm_four_table() {
         let cases = [
@@ -4101,7 +4271,7 @@ mod tests {
 
                 // SAFETY: the CPU has AVX2 and the operating system saves its registers.
                 unsafe {
-                    digest1_avx2(&key, 11, &data[..n], &mut a[..size]);
+                    digest1_avx2(&data[..n], &mut a[..size], &key, 11);
 
                     digest1_gather(&key, 11, &data[..n], &mut b[..size]);
                 }
