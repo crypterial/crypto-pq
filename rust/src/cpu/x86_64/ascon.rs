@@ -4,6 +4,7 @@
 // from one block to the next, without a call per permutation.
 
 use crate::sha2::last_bytes;
+use crate::wipe::wipe_unless_optimized;
 
 const CONSTANTS: [u64; 12] = [
     0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5, 0x96, 0x87, 0x78, 0x69, 0x5A, 0x4B,
@@ -89,6 +90,38 @@ pub(super) fn ascon_bmi(s: &mut [u64; 5]) {
     permute_complemented(s);
 
     s[2] = !s[2];
+}
+
+// crate::ascon's absorb with the state in registers from the first block to the last: the block
+// `first`, then the whole eight-byte blocks of data and its padded last block (D-109). The state
+// is an array indexed with constants only, register values under D-76.
+#[target_feature(enable = "bmi1,bmi2")]
+pub(super) fn absorb_bmi(s: &mut [u64; 5], first: u64, data: &[u8]) {
+    let mut x = *s;
+
+    x[0] ^= first;
+
+    x[2] = !x[2];
+
+    permute_complemented(&mut x);
+
+    let (blocks, tail) = data.as_chunks::<8>();
+
+    for block in blocks {
+        x[0] ^= u64::from_le_bytes(*block);
+
+        permute_complemented(&mut x);
+    }
+
+    x[0] ^= last_bytes(data, tail.len()) as u64 ^ 1 << (8 * tail.len());
+
+    permute_complemented(&mut x);
+
+    x[2] = !x[2];
+
+    *s = x;
+
+    wipe_unless_optimized!(&mut x);
 }
 
 // crate::ascon's digest with the state in registers throughout and x2 complemented from the start

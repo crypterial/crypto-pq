@@ -125,6 +125,13 @@ pub(crate) fn ascon(s: &mut [u64; 5]) -> bool {
     true
 }
 
+// The customization string's blocks go through crate::ascon's loop over permute, and so through
+// this kernel on the cores where it is selected, as before D-109.
+#[inline(always)]
+pub(crate) fn ascon_absorb(_: &mut [u64; 5], _: u64, _: &[u8]) -> bool {
+    false
+}
+
 // crate::ascon's digest with the state in registers throughout: the whole eight-byte blocks of
 // data, its padded last block, then out.len() bytes.
 pub(crate) fn ascon_digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) -> bool {
@@ -161,7 +168,14 @@ pub(crate) fn ascon_digest(start: &[u64; 5], data: &[u8], out: &mut [u8]) -> boo
             permute(&mut s);
         }
 
-        rest.copy_from_slice(&s[0].to_le_bytes()[..rest.len()]);
+        // The bytes from the register of the word, not from an array of them (D-76).
+        let mut word = s[0];
+
+        for byte in rest {
+            *byte = word as u8;
+
+            word >>= 8;
+        }
     }
 
     crate::wipe::wipe(&mut s);

@@ -213,6 +213,12 @@ mod arch {
     }
 
     #[inline(always)]
+    #[cfg(feature = "ascon")]
+    pub(crate) fn ascon_absorb(_: &mut [u64; 5], _: u64, _: &[u8]) -> bool {
+        false
+    }
+
+    #[inline(always)]
     #[cfg(any(
         feature = "ml-kem",
         feature = "frodokem",
@@ -655,7 +661,7 @@ pub(crate) use arch::{
 };
 
 #[cfg(feature = "ascon")]
-pub(crate) use arch::{ascon, ascon_digest};
+pub(crate) use arch::{ascon, ascon_absorb, ascon_digest};
 
 #[cfg(feature = "blake2")]
 pub(crate) use arch::{blake2b, blake2b_digest, blake2b_mac, blake2s, blake2s_digest, blake2s_mac};
@@ -1588,6 +1594,10 @@ mod kernel_count {
         let mut out = [0; 32];
 
         tally.note("ascon_digest", super::ascon_digest(&start, &data, &mut out));
+
+        let mut s = start;
+
+        tally.note("ascon_absorb", super::ascon_absorb(&mut s, 64, &data));
     }
 
     #[cfg(feature = "blake2")]
