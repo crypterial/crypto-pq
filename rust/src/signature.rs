@@ -1162,10 +1162,13 @@ mod tests {
     const MESSAGE: &[u8] = b"lazy caches";
 
     // The caches fill on first use, which for a generated key is its self-test, and a key pair
-    // shares one public part. Signing needs Â but not t̂1.
+    // shares one public part. Signing needs Â but not t̂1. In the eager form of once.rs a key fills
+    // them when it is made, and each key has its own copy.
     #[cfg(feature = "ml-dsa")]
     #[test]
     fn caches_fill_on_first_use_and_are_shared() {
+        let eager = crate::once::EAGER;
+
         let options = SignOptions::default().with_deterministic(true);
 
         for algorithm in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
@@ -1173,13 +1176,16 @@ mod tests {
 
             let (public_key, private_key) = (&pair.public_key, &pair.private_key);
 
-            assert!(core::ptr::eq(&*public_key.public, &*private_key.public));
+            assert_eq!(
+                core::ptr::eq(&*public_key.public, &*private_key.public),
+                !eager
+            );
 
-            assert_eq!(filled(private_key), (false, false, false));
+            assert_eq!(filled(private_key), (eager, eager, eager));
 
             let signed = private_key.sign(MESSAGE, &options).expect("signature");
 
-            assert_eq!(filled(private_key), (true, false, true));
+            assert_eq!(filled(private_key), (true, eager, true));
 
             assert!(public_key.verify(&signed, MESSAGE, &VerifyOptions::default()));
 
@@ -1193,7 +1199,13 @@ mod tests {
 
             let derived = imported.public.derived.as_ref().expect("an ML-DSA key");
 
-            assert!(derived.matrix.get().is_none() && derived.verifying.get().is_none());
+            assert_eq!(
+                (
+                    derived.matrix.get().is_some(),
+                    derived.verifying.get().is_some()
+                ),
+                (eager, eager)
+            );
 
             assert!(imported.verify(&signed, MESSAGE, &VerifyOptions::default()));
 
@@ -1206,7 +1218,7 @@ mod tests {
                     .import_private_key(&exported, format)
                     .expect("import");
 
-                assert_eq!(filled(&reimported), (false, false, false));
+                assert_eq!(filled(&reimported), (eager, eager, eager));
 
                 assert_eq!(reimported.sign(MESSAGE, &options), Ok(signed.clone()));
             }
@@ -1221,7 +1233,7 @@ mod tests {
                 .generate_key_pair(&KeyGenOptions::default().with_self_test(false))
                 .expect("key pair");
 
-            assert_eq!(filled(&untested.private_key), (false, false, false));
+            assert_eq!(filled(&untested.private_key), (eager, eager, eager));
         }
     }
 
@@ -1277,9 +1289,10 @@ mod tests {
 
         assert!(pair.private_key.public.derived.is_none() && pair.private_key.signing.is_none());
 
-        assert!(core::ptr::eq(
-            &*pair.public_key.public,
-            &*pair.private_key.public
-        ));
+        // One public part for the pair, or a copy for each key in the eager form of once.rs.
+        assert_eq!(
+            core::ptr::eq(&*pair.public_key.public, &*pair.private_key.public),
+            !crate::once::EAGER
+        );
     }
 }

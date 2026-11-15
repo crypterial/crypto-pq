@@ -25,6 +25,10 @@ pub(crate) use lazy::OnceBox;
 #[cfg(any(not(target_has_atomic = "ptr"), crypto_pq_eager))]
 pub(crate) use eager::OnceBox;
 
+// Whether the keys take the eager form, for the tests of their caches.
+#[cfg(test)]
+pub(crate) const EAGER: bool = cfg!(any(not(target_has_atomic = "ptr"), crypto_pq_eager));
+
 #[cfg(all(target_has_atomic = "ptr", any(test, not(crypto_pq_eager))))]
 #[allow(unsafe_code)]
 mod lazy {

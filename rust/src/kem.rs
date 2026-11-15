@@ -731,9 +731,12 @@ mod tests {
     }
 
     // The caches fill on first use, which for a generated key is its self-test, and a key pair
-    // shares one public part.
+    // shares one public part. In the eager form of once.rs a key fills them when it is made, and
+    // each key has its own copy.
     #[test]
     fn caches_fill_on_first_use_and_are_shared() {
+        let eager = crate::once::EAGER;
+
         for algorithm in [ML_KEM_512, ML_KEM_768, ML_KEM_1024] {
             let seed = [7; 64];
 
@@ -742,9 +745,12 @@ mod tests {
 
             let (public_key, private_key) = (&pair.public_key, &pair.private_key);
 
-            assert!(core::ptr::eq(public_part(public_key), part(private_key)));
+            assert_eq!(
+                core::ptr::eq(public_part(public_key), part(private_key)),
+                !eager
+            );
 
-            assert_eq!(filled(private_key), (false, false));
+            assert_eq!(filled(private_key), (eager, eager));
 
             let randomness = [9; 64];
 
@@ -752,7 +758,7 @@ mod tests {
                 hazmat::encapsulate(public_key, &randomness[..algorithm.randomness_size()])
                     .expect("encapsulation");
 
-            assert_eq!(filled(private_key), (true, false));
+            assert_eq!(filled(private_key), (true, eager));
 
             let shared_secret = private_key
                 .decapsulate(&encapsulation.ciphertext)
@@ -768,11 +774,14 @@ mod tests {
                 .import_public_key(&raw, KeyFormat::Raw)
                 .expect("import");
 
-            assert!(public_part(&imported).form.get().is_none());
+            assert_eq!(public_part(&imported).form.get().is_some(), eager);
 
             let clone = imported.clone();
 
-            assert!(core::ptr::eq(public_part(&clone), public_part(&imported)));
+            assert_eq!(
+                core::ptr::eq(public_part(&clone), public_part(&imported)),
+                !eager
+            );
 
             hazmat::encapsulate(&clone, &randomness[..algorithm.randomness_size()])
                 .expect("encapsulation");
@@ -785,7 +794,7 @@ mod tests {
                 .import_private_key(&seed, KeyFormat::Raw)
                 .expect("import");
 
-            assert_eq!(filled(&reimported), (false, false));
+            assert_eq!(filled(&reimported), (eager, eager));
 
             let generated = algorithm
                 .generate_key_pair(&KeyGenOptions::default())
@@ -797,7 +806,7 @@ mod tests {
                 .generate_key_pair(&KeyGenOptions::default().with_self_test(false))
                 .expect("key pair");
 
-            assert_eq!(filled(&untested.private_key), (false, false));
+            assert_eq!(filled(&untested.private_key), (eager, eager));
         }
     }
 
