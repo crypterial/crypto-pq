@@ -1756,3 +1756,72 @@ bytes of output, 1.072 to 1.079 for 64 bytes with 1 KiB or 16 KiB of output, and
 1.002 to 1.014 for data of 1 KiB and 16 KiB. On Neoverse N2 (18 processes), whose code is
 unchanged, it was 0.998 to 1.001. The two copies of this code differed by up to 0.2 percent, but by
 2.4 percent on Zen 3 for an Ascon-CXOF128 of 16 KiB, and by 0.6 percent on Neoverse N2.
+
+## Decision D-114
+
+In the kernels of BLAKE2b for one message on x86-64 with AVX2 and with AVX-512VL, the padding of a
+final block or of a key writes each of the eight vectors of message words once, the vector of the
+bytes that end the input computed before any of them, where it zeroed the eight and then wrote the
+16-byte pieces over the zeros. The digest in one call runs a single block, the key alone or data of
+at most a block, and two blocks or more, which a MAC of at least one byte or a digest of more than
+128 bytes makes, in two functions of their own, out of line, between which its entry point chooses
+by the lengths. The function of two blocks or more pads the key block into the message words before
+the loop of compressions, where the loop's first step padded it, and reads the length of a partial
+final block through an empty block of inline assembly that is not pure.
+
+This is CPU-specific code under [15.3](15-platforms.md#153-cpu-specific-code). Which function and
+which path run depends only on the lengths, which are public. The key and the final block are padded
+into the array of message words, as before, which each function clears at the end; the copies that
+the compiler makes in registers or spill slots are those of [14.5](14-security.md#145-wiping) item
+3. Under qemu-x86_64 with the EPYC-Milan model, after a MAC with a key of 64 or 33 bytes, the stack
+below the caller holds no 8-byte word of the key when the message has at least one byte and every
+word of it, 48 or 24 copies in all, when the message is empty, as before; it holds 38 to 96 copies
+of the words of the last block of data, against 34 to 88 before. The block of assembly has an empty
+template, takes the length in a register and touches no memory, stack or flags; the length's minimum
+with the length of the data keeps the slice of the padding within the data without a bounds check.
+In the function of two blocks or more, the reading of the last bytes of data shorter than 16 bytes
+keeps one bounds check, which cannot fail, since their count is at most that length. The two
+functions are private to their kernel's module and called only from its entry point, as are the
+other functions that run the rounds. The tests that compare the kernels with the portable code (for
+BLAKE2b and BLAKE2s, 4000 digest and 4000 MAC cases: random chaining values, every key length, every
+length up to three blocks and nine bytes and every digest size) pass under qemu-x86_64 at
+opt-levels 0, 1, 2, 3, s and z as Haswell, at 3 as EPYC-Milan and EPYC-Genoa, which run the AVX2
+kernel, and as Nehalem and Conroe, which do not, and in the release build as EPYC-Milan, with the
+blake2 and symmetric suites, and the hash suite at 3 and in the release build. The library's tests
+passed natively on the 29 runners of the bench run, the AVX-512VL kernel on the Intel ones.
+
+Rationale: LLVM computed the values of both paddings before the loop and kept most of them on the
+stack across it. Under QEMU with the EPYC-Milan model, counting the instructions run in crypto-pq, a
+MAC of 64 bytes with a key of 64 bytes ran 316 instructions outside the rounds of its two
+compressions, 103 of them stores, and runs 256 here, 77 of them stores; a MAC of an empty message,
+one compression, ran 203 with 62 and runs 176 with 45. A value that the block of assembly gives
+cannot be computed before the loop, so the padding of the final block is computed in the step that
+reads it; without the block, the function of two blocks or more runs 10 to 38 instructions more. In
+all, a MAC of 64 bytes runs 1582 instructions against 1606 before, one of 128 bytes 1545 against
+1586, a digest of at most a block 2 to 51 fewer (845 against 853 for one byte) and a digest of 1 KiB
+5517 against 5515. In one function with the loop, the code of a single block ran 6 to 16 more
+instructions than here.
+
+On Zen 4, a digest of a single block that ends in a partial 16-byte piece took about 20 ns more
+than one of whole pieces in main, which zeroed m and wrote the pieces over the zeros: 124.0 to 126.8
+ns against 104.4 to 107.4 in bench run 43828201014. In the forms of bench runs 43822874488 and
+43828201014, which kept that padding, the difference moved from 3 to 24 ns with the code around it,
+and each form made some of those digests slower than main on Zen 4, by up to 2.6 percent. Which part
+of the core's handling of those stores costs the time was not established; with each vector written
+once, the digests that end in a partial piece take 103.5 to 104.1 ns there and the others 101.3 to
+103.5.
+
+In bench run 43832936971, in one process where four copies of crypto-pq run in turn (the code here,
+the same code in one function with the loop, the code here with the padding of before, and main),
+the time of main over the time here, each ratio taken within one process and the median over the
+processes of a class, was on Zen 4 (80 processes) 1.189 to 1.221 for a digest of at most a block
+that ends in a partial piece (125.8 against 103.9 ns for 31 bytes), 1.021 to 1.042 for one of whole
+pieces and 1.041 to 1.052 for a MAC of 1 to 128 bytes. On Zen 3 (72 processes) it was 1.085 to
+1.111 for a digest of at most a block, 1.071 for a MAC of no data and 1.026 to 1.032 for a MAC of 1
+to 128 bytes; on Granite Rapids (64) 1.017 to 1.044 for a single block and 1.021 to 1.028 for a MAC
+of 1 to 128 bytes, and on Ice Lake (8) 1.020 to 1.059 and 1.038 to 1.043. For digests of 255 bytes
+it was 1.011 to 1.034, for digests and MACs of 1 KiB and 16 KiB 0.996 to 1.017, and on Zen 5 (8),
+which runs the portable code for one message, 0.998 to 1.002. The same code in one function with
+the loop took up to 1.4 percent more than here for a digest of at most a block on Zen 3, 1.8
+percent on Granite Rapids and 3.8 percent on Ice Lake, and 3 percent less for a MAC of no data on
+Zen 3; for the other rows the two were within 1 percent.
