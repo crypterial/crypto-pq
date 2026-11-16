@@ -173,6 +173,14 @@ Implements specification 2.0 (draft).
   so that each word the kernels load comes from one store. BLAKE2s digests of at most 64 bytes take
   up to 14% less time on Emerald Rapids and Granite Rapids and up to 3% less on Zen 3, and one of 63
   bytes 23% less on Ice Lake. Outputs are unchanged.
+- BLAKE2b on x86-64 with AVX2 and AVX-512VL
+  ([decision D-114](spec/decisions.md#decision-d-114)): in a digest or MAC in one call, the padding
+  of a final block or of the key writes each vector of message words once, a single block and two
+  blocks or more run in functions of their own, and a MAC pads its key block before the loop over
+  the blocks. A digest of at most 128 bytes or a MAC of no data takes 16% to 18% less time on Zen 4
+  when the input ends in a partial 16-byte piece and 2.1% to 4% less otherwise, 6.6% to 10% less on
+  Zen 3 and 1.7% to 5.6% less on Granite Rapids and Ice Lake; a MAC of 1 to 128 bytes takes 2.1% to
+  4.9% less on all four. Other targets are unchanged. Outputs are unchanged.
 - BLAKE3 on x86-64 with AVX2: each call of the eight-lane and four-lane kernels sets up its lanes'
   inputs with one bounds check and its counters with no loop state on the stack, and a whole group
   of eight writes its chaining values straight into the caller's buffer. On every architecture a
