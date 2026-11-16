@@ -41,7 +41,7 @@ macro_rules! sbox {
     };
 }
 
-// One round in one block of assembly, so that no copy moves the state between registers (D-109):
+// One round in one block of assembly, so that no copy moves the state between registers (D-113):
 // the S-box layer, then each word's x ^ ror(x, a) ^ ror(x, b) into a free register. x2's word goes
 // first, as the next round needs it first, and x1's new word goes into {t}, whose register holds x1
 // in the next round, so that every word has a free register to go to.
@@ -170,7 +170,7 @@ pub(super) fn absorb_bmi(s: &mut [u64; 5], first: u64, data: &[u8]) {
 // crate::ascon's digest with the state in registers throughout and x2 complemented from the start
 // state to the end: the whole eight-byte blocks of data, its padded last block, then out.len()
 // bytes. The first output word needs no permutation, so the loop over the others has one branch,
-// and the bytes of a partial word come from its register, not from an array of them (D-109). The
+// and the bytes of a partial word come from its register, not from an array of them (D-113). The
 // state is an array indexed with constants only, register values under D-76.
 #[target_feature(enable = "bmi1,bmi2")]
 pub(super) fn digest_bmi(start: &[u64; 5], data: &[u8], out: &mut [u8]) {

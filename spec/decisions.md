@@ -1706,3 +1706,53 @@ x86-64 and ARM64.
 Rationale: no target that CI built lacked compare-and-swap, so the form for such targets was not
 compiled after the caches became lazy, and a build for RV64IM stopped with six errors. The build for
 that target and the tests of the form on a runner keep it working.
+
+## Decision D-113
+
+On x86-64 with BMI1 and BMI2, each round of the Ascon permutation in the scalar kernel is one block
+of inline assembly: the round constant, the S-box layer with the word x2 complemented
+([D-109](#decision-d-109)) and the linear layer, on eight general registers that the compiler
+assigns. A round takes two copies between registers, 24 a permutation, the need of two-operand
+instructions that D-109 counts, where the code that LLVM made for the same rounds took 25 or 26 in
+the one-shot digest, 33 to 35 in the absorption of the customization string of Ascon-CXOF128 and 36
+in the permutation that the streaming hash and the reader of an extended output call. The linear
+layer writes x2's new word first, which the next round reads first, and x1's new word into a free
+register that the next round reads as x1, so that no copy runs between rounds. The one-shot digest
+writes the bytes of a partial output word from its register, as D-109 has the reader of an extended
+output and the digest off x86-64 do, in place of an array of its bytes copied with a length known at
+run time.
+
+This is CPU-specific code under [15.3](15-platforms.md#153-cpu-specific-code). The block reads and
+writes no memory, does not use the stack and declares the flags changed; the operands that it writes
+before it has read every input are outputs that the compiler places in registers of their own. Its
+instructions are XOR, AND, OR, ANDN, RORX and MOV on registers, with no branch, and the round
+constants are immediates, the complements of those of SP 800-232, since the word they enter is kept
+complemented. The functions that run the rounds are built with BMI1 and BMI2 and are reached only
+through the AVX2 tier, whose detection requires both. The digest's state is an array indexed with
+constants only, register values under [D-76](#decision-d-76), wiped below opt-level 3; at 3 its
+machine code keeps the state in registers, and the length of the output is the only value that it
+stores on the stack. A test runs the S-box block alone against the S-box table. The tests that
+compare the kernels with the portable code on 10,000 edge and random cases pass under qemu-x86_64 at
+opt-levels 0, 1, 2, 3, s and z as Haswell and EPYC-Milan, which run the kernels, and as Nehalem,
+which runs the portable code, and at 3 as EPYC-Genoa, SierraForest, Icelake-Server, GraniteRapids,
+Conroe and SandyBridge; the vectors pass at 3 as Haswell, EPYC-Milan, EPYC-Genoa, GraniteRapids,
+Conroe and Nehalem, and at 0 and 2 as Haswell.
+
+Rationale: LLVM's copies of the state between registers were the only work of the rounds beyond the
+36 operations of the circuit. Under QEMU, counting the instructions run in crypto-pq, with the
+Haswell model an Ascon-Hash256 of 0 bytes runs 1976 instructions here against 2007 before, an
+Ascon-CXOF128 of 0 bytes with 32 bytes of output 4009 against 4082 and an Ascon-XOF128 of 64 bytes
+with 16 KiB of output 945918 against 956184; the permutation alone runs 471 against 483. The
+portable code is unchanged.
+
+In bench runs 43794062267 and 43801344100, in one process where four copies of crypto-pq run in
+turn (two copies of this code, one of the code before and one of main before
+[D-106](#decision-d-106)), the time before over the time here, each ratio taken within one process
+and the median over the processes of a class, on Zen 5, Emerald Rapids and Granite Rapids (30, 24
+and 108 processes) was 1.054 to 1.063 for Ascon-Hash256, 1.043 to 1.064 for Ascon-XOF128, 1.044 to
+1.072 for Ascon-CXOF128 and 1.044 to 1.062 for an algorithm chosen at run time. On Zen 3 and Zen 4
+(60 and 72 processes) it was 1.029 to 1.091 and 1.018 to 1.064 for data of at most 64 bytes with 32
+bytes of output, 1.072 to 1.079 for 64 bytes with 1 KiB or 16 KiB of output, and 1.003 to 1.082 and
+1.002 to 1.014 for data of 1 KiB and 16 KiB. On Neoverse N2 (18 processes), whose code is
+unchanged, it was 0.998 to 1.001. The two copies of this code differed by up to 0.2 percent, but by
+2.4 percent on Zen 3 for an Ascon-CXOF128 of 16 KiB, and by 0.6 percent on Neoverse N2.
