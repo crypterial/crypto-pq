@@ -1806,7 +1806,7 @@ On Zen 4, a digest of a single block that ends in a partial 16-byte piece took a
 than one of whole pieces in main, which zeroed m and wrote the pieces over the zeros: 124.0 to 126.8
 ns against 104.4 to 107.4 in bench run 43828201014. In the forms of bench runs 43822874488 and
 43828201014, which kept that padding, the difference moved from 3 to 24 ns with the code around it,
-and each form made some of those digests slower than main on Zen 4, by up to 2.6 percent. Which part
+and each form made some of those digests slower than main on Zen 4, by up to 2.7 percent. Which part
 of the core's handling of those stores costs the time was not established; with each vector written
 once, the digests that end in a partial piece take 103.5 to 104.1 ns there and the others 101.3 to
 103.5.
@@ -1823,5 +1823,5 @@ of 1 to 128 bytes, and on Ice Lake (8) 1.020 to 1.059 and 1.038 to 1.043. For di
 it was 1.011 to 1.034, for digests and MACs of 1 KiB and 16 KiB 0.996 to 1.017, and on Zen 5 (8),
 which runs the portable code for one message, 0.998 to 1.002. The same code in one function with
 the loop took up to 1.4 percent more than here for a digest of at most a block on Zen 3, 1.8
-percent on Granite Rapids and 3.8 percent on Ice Lake, and 3 percent less for a MAC of no data on
-Zen 3; for the other rows the two were within 1 percent.
+percent on Granite Rapids and 3.8 percent on Ice Lake, and for a MAC of no data 2 percent more on
+Ice Lake and 3 percent less on Zen 3; for the other rows the two were within 1 percent.
