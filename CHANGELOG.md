@@ -152,6 +152,12 @@ Implements specification 2.0 (draft).
   inline; on x86-64 with AVX2 the customization string of Ascon-CXOF128 is absorbed with the state
   in registers. On Neoverse N2, Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128 take up to 3.4% less
   time, and on x86-64 Ascon-CXOF128 up to 2.3% less. Outputs are unchanged.
+- Ascon-Hash256, Ascon-XOF128 and Ascon-CXOF128 on x86-64 with BMI1 and BMI2
+  ([decision D-113](spec/decisions.md#decision-d-113)): each round of the permutation is one block
+  of inline assembly, with the 24 copies between registers a permutation that two-operand
+  instructions need, and the one-shot digest writes a partial output word from its register. On
+  Zen 5, Emerald Rapids and Granite Rapids they take 4.1% to 6.7% less time, and on Zen 3 and Zen 4
+  up to 8.3% and 7.3% less. Outputs are unchanged.
 - One-shot SHA3-224, SHA3-256, SHA3-384, SHA3-512 and Keccak-256 digests
   ([decision D-110](spec/decisions.md#decision-d-110)): on x86-64, the dispatcher of
   `HashAlgorithm::digest_into` reaches the kernel of the rate, the scalar one or the one-state
