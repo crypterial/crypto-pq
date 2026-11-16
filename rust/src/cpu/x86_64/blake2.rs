@@ -159,30 +159,54 @@ fn block64(block: &[u8; 128]) -> [__m256i; 8] {
 
 // The message of a final block made of the last `length` bytes of data, fewer than a block, and
 // zeros, into m: each 16-byte chunk loaded from data, or made from the bytes that end it, in a
-// register, so that no copy of the bytes is stored and read back.
+// register, so that no copy of the bytes is stored and read back. Each vector of m is written
+// once, the partial chunk's first: with m zeroed and the chunks written over the zeros, a digest
+// of a single block that ended in a partial chunk took about 20 ns more on Zen 4 than one of whole
+// chunks (D-114).
 #[target_feature(enable = "avx2")]
 #[inline]
 fn padded64(data: &[u8], length: usize, m: &mut [__m256i; 8]) {
     let (whole, rest) = data[data.len() - length..].as_chunks::<16>();
 
-    *m = [_mm256_setzero_si256(); 8];
-
-    for (words, chunk) in m.iter_mut().zip(whole) {
-        *words = _mm256_broadcastsi128_si256(load128(chunk));
-    }
-
-    if let Some(words) = m.get_mut(whole.len())
-        && !rest.is_empty()
-    {
+    // One 32-byte vector, from an instruction that the compiler cannot see through. As a splat,
+    // the halves were stored apart, and the 32-byte loads of the rounds waited for both stores to
+    // reach the cache: a MAC of 63 bytes took 10 ns more than one of 64 on Zen 3 (D-98).
+    let last = if rest.is_empty() {
+        _mm256_setzero_si256()
+    } else {
         let value = last_bytes(data, rest.len());
 
         let (low, high) = (value as i64, (value >> 64) as i64);
 
-        // One 32-byte store, from an instruction that the compiler cannot see through. As a splat,
-        // the halves were stored apart, and the 32-byte loads of the rounds waited for both stores
-        // to reach the cache: a MAC of 63 bytes took 10 ns more than one of 64 on Zen 3 (D-98).
-        *words = both_halves(_mm256_castsi128_si256(_mm_set_epi64x(high, low)));
+        both_halves(_mm256_castsi128_si256(_mm_set_epi64x(high, low)))
+    };
+
+    for (k, words) in m.iter_mut().enumerate() {
+        *words = match whole.get(k) {
+            Some(chunk) => _mm256_broadcastsi128_si256(load128(chunk)),
+            None if k == whole.len() => last,
+            None => _mm256_setzero_si256(),
+        };
     }
+}
+
+// The length, from an empty block of assembly that is not pure, so that the compiler does not move
+// it, or the code that depends on it, out of the branch where it is read. The minimum with bound,
+// which the length never exceeds, keeps the slice of padded64 free of a bounds check.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn opaque_length(mut length: usize, bound: usize) -> usize {
+    // SAFETY: an empty template, which reads and writes only the register of the length; it
+    // touches no memory, stack or flags.
+    unsafe {
+        core::arch::asm!(
+            "/* {0} */",
+            inout(reg) length,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    length.min(bound)
 }
 
 // Words w0 and w1 of the message in each half of a vector, from the pairs that hold them: one
@@ -302,8 +326,8 @@ macro_rules! rows64 {
         // chain64, whose loop stores the gathered message words of its rounds on the stack (80
         // stores), which a single block paid for (BLAKE2b-512 of 0 bytes, AMD Zen 4: 118 against
         // 104 ns). Its one call site inlines it, so that its spills share the frame of
-        // blake2b_digest_avx2, aligned to 32 bytes: out of line, half of its 32-byte spills
-        // crossed a cache line.
+        // one_digest64, aligned to 32 bytes: out of line, half of its 32-byte spills crossed a
+        // cache line.
         #[target_feature(enable = $feature)]
         #[inline]
         fn compress64(h: &mut [__m256i; 2], m: &[__m256i; 8], counter: u128, last: bool) {
@@ -446,11 +470,35 @@ macro_rules! rows64 {
             clear(&mut m, _mm256_setzero_si256());
         }
 
+        // The chaining value h in registers, with the key's length in its first word unless key is
+        // empty. In registers: the caller's copy of h with the length written in made these loads
+        // wait for its stores, which the processor could not forward to them.
+        #[target_feature(enable = $feature)]
+        #[inline]
+        fn state64(h: &[u64; 8], key: &[u8]) -> [__m256i; 2] {
+            let [low, high] = h.as_chunks::<4>().0 else {
+                unreachable!("eight words are two groups of four")
+            };
+
+            let mut state = [load256(low), load256(high)];
+
+            if !key.is_empty() {
+                let length = _mm256_set_epi64x(0, 0, 0, (key.len() as i64) << 8);
+
+                state[0] = _mm256_xor_si256(state[0], length);
+            }
+
+            state
+        }
+
         // The digest of data from the unkeyed chaining value h, out.len() bytes, keyed unless key
-        // is empty: the key's length goes into the first word here, and the key, zero-padded to a
-        // block, is the first block, or the final one when data is empty. The whole blocks come
-        // straight from data, a whole final block too, and a partial one and the key are padded in
-        // registers. The digest goes straight into out when it is a whole or half chaining value.
+        // is empty: the key's length goes into the first word of the state, and the key,
+        // zero-padded to a block, is the first block, or the final one when data is empty. The
+        // whole blocks come straight from data, a whole final block too, and a partial one and the
+        // key are padded in registers. The digest goes straight into out when it is a whole or
+        // half chaining value. A single block runs in one_digest64 and two blocks or more in
+        // chain_digest64, both out of line: in one function with the loop, the code of a single
+        // block ran 6 to 16 more instructions (D-114).
         $(#[doc = $safety] #[allow(unsafe_code)])?
         #[target_feature(enable = $feature)]
         pub(in crate::cpu::x86_64) $($unsafe)? fn blake2b_digest_avx2(
@@ -459,19 +507,50 @@ macro_rules! rows64 {
             data: &[u8],
             out: &mut [u8],
         ) {
-            let [low, high] = h.as_chunks::<4>().0 else {
-                unreachable!("eight words are two groups of four")
+            if data.len() > 128 || (!key.is_empty() && !data.is_empty()) {
+                chain_digest64(h, key, data, out);
+            } else {
+                one_digest64(h, key, data, out);
+            }
+        }
+
+        // One block: the key alone, or data of at most a block.
+        #[target_feature(enable = $feature)]
+        #[inline(never)]
+        fn one_digest64(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
+            let mut state = state64(h, key);
+
+            // The message words, cleared at the end.
+            let mut m = [_mm256_setzero_si256(); 8];
+
+            let counter = if key.is_empty() {
+                match <&[u8; 128]>::try_from(data) {
+                    Ok(block) => m = block64(block),
+                    Err(_) => padded64(data, data.len(), &mut m),
+                }
+
+                data.len() as u128
+            } else {
+                padded64(key, key.len(), &mut m);
+
+                128
             };
 
-            let mut state = [load256(low), load256(high)];
+            compress64(&mut state, &m, counter, true);
 
-            // In registers: the caller's copy of h with the length written in made these loads
-            // wait for its stores, which the processor could not forward to them.
-            if !key.is_empty() {
-                let length = _mm256_set_epi64x(0, 0, 0, (key.len() as i64) << 8);
+            output64(&state, out);
 
-                state[0] = _mm256_xor_si256(state[0], length);
-            }
+            // compress64 takes the state through memory.
+            clear(&mut state, _mm256_setzero_si256());
+
+            clear(&mut m, _mm256_setzero_si256());
+        }
+
+        // Two blocks or more: the key block and data, or data of more than a block.
+        #[target_feature(enable = $feature)]
+        #[inline(never)]
+        fn chain_digest64(h: &[u64; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
+            let mut state = state64(h, key);
 
             let (blocks, tail) = data.split_at(data.len().saturating_sub(1) / 128 * 128);
 
@@ -480,34 +559,14 @@ macro_rules! rows64 {
 
             let mut counter = 0;
 
-            // One block: the key alone, or data of at most a block.
-            if blocks.is_empty() && (key.is_empty() || data.is_empty()) {
-                let counter = if key.is_empty() {
-                    match <&[u8; 128]>::try_from(tail) {
-                        Ok(block) => m = block64(block),
-                        Err(_) => padded64(data, tail.len(), &mut m),
-                    }
-
-                    tail.len() as u128
-                } else {
-                    padded64(key, key.len(), &mut m);
-
-                    128
-                };
-
-                compress64(&mut state, &m, counter, true);
-
-                output64(&state, out);
-
-                // compress64 takes the state through memory.
-                clear(&mut state, _mm256_setzero_si256());
-
-                clear(&mut m, _mm256_setzero_si256());
-
-                return;
-            }
-
             let mut keyed = !key.is_empty();
+
+            // The key block goes into m before the loop, and the length of a partial final block
+            // comes through opaque_length, so that the loop keeps the values of neither padding
+            // (D-114).
+            if keyed {
+                padded64(key, key.len(), &mut m);
+            }
 
             let mut blocks = blocks.as_chunks::<128>().0.iter();
 
@@ -516,8 +575,6 @@ macro_rules! rows64 {
             chain64(&mut state, &mut m, |m| {
                 if keyed {
                     keyed = false;
-
-                    padded64(key, key.len(), m);
 
                     counter = 128;
 
@@ -540,7 +597,7 @@ macro_rules! rows64 {
 
                 match <&[u8; 128]>::try_from(tail) {
                     Ok(block) => *m = block64(block),
-                    Err(_) => padded64(data, tail.len(), m),
+                    Err(_) => padded64(data, opaque_length(tail.len(), data.len()), m),
                 }
 
                 Some((counter + tail.len() as u128, true))
