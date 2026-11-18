@@ -3122,11 +3122,22 @@ macro_rules! quarters {
 
 // The 64 rounds of N streams and the feed-forward, written out at each call site: target_feature
 // functions cannot be inline(always), and rounds256::<2> was not inlined at codegen-units 16, which
-// left both streams in memory.
+// left both streams in memory. Below opt-level 3 the feed-forward keeps the states alone: a copy
+// of the whole streams was a call to memcpy at opt-level 2, around which the registers with the
+// message words of an HMAC key block were saved on the stack, where nothing wiped them. At 3 the
+// copy is of registers, and the code is the one that was measured.
 macro_rules! rounds256 {
     ($streams:ident, $n:literal) => {{
-        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
-        let mut start = $streams;
+        #[cfg(crypto_pq_optimized)]
+        let start = $streams;
+
+        #[cfg(not(crypto_pq_optimized))]
+        let mut start = [[_mm_setzero_si128(); 2]; $n];
+
+        #[cfg(not(crypto_pq_optimized))]
+        for (start, stream) in start.iter_mut().zip(&$streams) {
+            *start = [stream.abef, stream.cdgh];
+        }
 
         let k = K256.as_chunks::<4>().0;
 
@@ -3138,10 +3149,18 @@ macro_rules! rounds256 {
             12 0 false, 13 1 false, 14 2 false, 15 3 false
         );
 
+        #[cfg(crypto_pq_optimized)]
         for (stream, start) in $streams.iter_mut().zip(&start) {
             stream.abef = _mm_add_epi32(stream.abef, start.abef);
 
             stream.cdgh = _mm_add_epi32(stream.cdgh, start.cdgh);
+        }
+
+        #[cfg(not(crypto_pq_optimized))]
+        for (stream, start) in $streams.iter_mut().zip(&start) {
+            stream.abef = _mm_add_epi32(stream.abef, start[0]);
+
+            stream.cdgh = _mm_add_epi32(stream.cdgh, start[1]);
         }
 
         wipe_unless_optimized!(memory::words_of(&mut start));
