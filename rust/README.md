@@ -229,13 +229,13 @@ fn main() -> Result<(), Error> {
 ## Design
 
 Code that handles secret data has no branch or memory access that depends on a secret, which CI
-checks under valgrind on x86-64 and ARM64. On ARM64 CPUs with FEAT_DIT, the asymmetric secret
-operations run with DIT set. Private keys and `SecretBytes`, the type of every secret output, wipe
-their memory when dropped. Randomness comes only from the operating system; on a target without a
-source, operations that need it return `Error::RngFailure`. CPU-specific code for x86-64 (AVX2,
-AVX-512VL, SSE4.1, SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2, SHA-3, SHA-512) is selected at run
-time, with portable code on every 64-bit target. WebAssembly and 32-bit targets are not
-supported.
+checks under valgrind on x86-64 and ARM64. On ARM64 CPUs with FEAT_DIT, under Linux, Android and
+macOS, the asymmetric secret operations run with DIT set. Private keys and `SecretBytes`, the type
+of every secret output, wipe their memory when dropped. Randomness comes only from the operating
+system; on a target without a source, operations that need it return `Error::RngFailure`.
+CPU-specific code for x86-64 (AVX2, AVX-512VL, SSE4.1, SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2,
+SHA-3, SHA-512) is selected at run time, with portable code on every 64-bit target. WebAssembly
+and 32-bit targets are not supported.
 
 Report vulnerabilities privately through
 [GitHub Security Advisories](https://github.com/crypterial/crypto-pq/security/advisories/new).
