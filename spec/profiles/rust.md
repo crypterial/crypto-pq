@@ -67,9 +67,10 @@
    the build script detects ([D-76](../decisions.md#decision-d-76)). Moves of secret values are
    avoided (secrets live behind a heap pointer, or a function writes them into storage that its owner
    wipes); copies that the compiler makes in registers or spill slots cannot be controlled, which the
-   documentation states. SLH-DSA key generation, signing and the import of a private key end by
-   zeroing the stack under them, where the frames of their kernels were
-   ([D-115](../decisions.md#decision-d-115)).
+   documentation states. The operations of ML-KEM, ML-DSA, FrodoKEM and SLH-DSA on secret values
+   end by zeroing the stack under them, where the frames of their kernels were
+   ([D-115](../decisions.md#decision-d-115)), and so does a MAC or a KDF in one call in a build at
+   opt-level 1, 2, s or z ([D-116](../decisions.md#decision-d-116)).
 4. DIT: a guard object sets DIT and restores it on drop ([14.2](../14-security.md#142-data-independent-timing-dit)); Rust threads are operating-system
    threads.
 5. Entropy without `std`: `getrandom(2)` (Linux, Android, FreeBSD, NetBSD, DragonFly, illumos,

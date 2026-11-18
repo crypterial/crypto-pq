@@ -136,6 +136,42 @@ fn dead_frames<const N: usize>() {
     wipe(&mut frames);
 }
 
+// A size for `below` by the opt-level of the build: the first at 3, the last at 0, and the one
+// between at the other levels and where the level is not read (build.rs). The frames of the same
+// calls differ that much: at 0 no call is inline and every value has a slot.
+#[allow(unused_macros)]
+macro_rules! frames {
+    ($name:ident, $optimized:expr, $other:expr, $unoptimized:expr) => {
+        #[cfg(crypto_pq_optimized)]
+        const $name: usize = $optimized;
+
+        #[cfg(crypto_pq_unoptimized)]
+        const $name: usize = $unoptimized;
+
+        #[cfg(not(any(crypto_pq_optimized, crypto_pq_unoptimized)))]
+        const $name: usize = $other;
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use frames;
+
+// `below` under a keyed hash or a KDF in one call, at the opt-levels 1, 2, s and z (D-116). There
+// their kernels pass arrays of key words by value and store state words that stay in registers at
+// 3, in frames that no wipe of a buffer reaches. 16 KiB: the calls took at most 4,943 bytes, and
+// those of BLAKE3 11,308 for 4 MiB of data, about 320 more for each doubling. Not at 0, where the
+// calls of BLAKE3 take 80 KB.
+#[allow(unused_macros)]
+macro_rules! below_keyed {
+    () => {
+        #[cfg(not(any(crypto_pq_optimized, crypto_pq_unoptimized)))]
+        $crate::wipe::below::<{ 16 << 10 }>();
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use below_keyed;
+
 // wipe for an array that holds secrets and that LLVM keeps in registers at opt-level 3: there the
 // wipe would give the array an address, and so the very memory copy it then clears, while at the
 // other levels the array is in memory and has to be wiped (D-76). build.rs sets
