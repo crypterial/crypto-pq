@@ -69,8 +69,11 @@
    wipes); copies that the compiler makes in registers or spill slots cannot be controlled, which the
    documentation states. The operations of ML-KEM, ML-DSA, FrodoKEM and SLH-DSA on secret values
    end by zeroing the stack under them, where the frames of their kernels were
-   ([D-115](../decisions.md#decision-d-115)), and so does a MAC or a KDF in one call in a build at
-   opt-level 1, 2, s or z ([D-116](../decisions.md#decision-d-116)).
+   ([D-115](../decisions.md#decision-d-115), [D-116](../decisions.md#decision-d-116)), and so do a
+   MAC and a KDF in one call and the key setup and the end of an incremental MAC, in a build at any
+   opt-level but 0 ([D-117](../decisions.md#decision-d-117)). An incremental MAC and a MAC key are
+   returned by value: that move, and every move by the caller, leaves a copy of the keyed state in
+   the caller's own frames, which the documentation states.
 4. DIT: a guard object sets DIT and restores it on drop ([14.2](../14-security.md#142-data-independent-timing-dit)); Rust threads are operating-system
    threads.
 5. Entropy without `std`: `getrandom(2)` (Linux, Android, FreeBSD, NetBSD, DragonFly, illumos,
