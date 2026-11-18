@@ -1212,8 +1212,8 @@ impl Context<'_> {
             }
         }
 
-        drop(lanes);
-
+        // The lanes are wiped where they are, at the end of this function: drop(lanes) would move
+        // them and wipe the copy (D-76).
         for (leaf, node) in leaves.iter_mut().enumerate() {
             let mut pk_adrs = *adrs;
 
@@ -1656,8 +1656,7 @@ impl Context<'_> {
             root.copy_from_slice(&tree.root()[..n]);
         }
 
-        drop(lanes);
-
+        // As in wots_leaves_lanes, the lanes are wiped in place when this function ends.
         self.fors_public_key(adrs, &roots[..self.p.k * n])
     }
 

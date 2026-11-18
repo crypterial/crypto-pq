@@ -157,6 +157,10 @@ name = "sp800_185"
 required-features = ["sha3", "hazmat"]
 
 [[test]]
+name = "stack"
+required-features = ["slh-dsa", "sha2", "sha3", "hazmat"]
+
+[[test]]
 name = "stateful"
 required-features = ["lms", "xmss", "hmac", "hazmat"]
 
