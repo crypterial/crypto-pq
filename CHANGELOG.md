@@ -380,6 +380,26 @@ Implements specification 2.0 (draft).
 
 ### Fixed
 
+- SLH-DSA key generation, signing and the import of a private key: the lanes of the F chains were
+  moved before their wipe, so that the wipe cleared the copy and the original stayed on the stack
+  ([decision D-76](spec/decisions.md#decision-d-76)). After a signature it held the secret values
+  of the last sixteen leaves of the last FORS tree, with every parameter set on x86-64 and with
+  the SHA-2 sets on ARM64, and with SLH-DSA-SHAKE-128f and SLH-DSA-SHAKE-192f on ARM64 and in
+  builds without the CPU kernels it held SK.seed, after key generation too. The lanes are now
+  wiped where they are, and a signature takes about 6 to 10 KiB less stack. A test clears the
+  stack, runs key generation and signing for the twelve parameter sets and searches the stack for
+  SK.seed, SK.prf and those FORS values. rust-v1.0.0 and rust-v1.0.1 do not have the flaw. Outputs
+  are unchanged.
+- HMAC-SHA-256 and HKDF-SHA-256 on x86-64 with the SHA extensions, in builds at opt-level 2: the
+  copy of both streams that the feed-forward of a block kept was a call to memcpy, around which
+  the registers with the words of the two key blocks were saved on the stack, where nothing wiped
+  them. Below opt-level 3 the feed-forward keeps the two state vectors of each stream alone. At
+  opt-level 3 the machine code is unchanged. Outputs are unchanged.
+- BLAKE3 in builds below opt-level 3: the portable compression wipes its state, which derives
+  from the key in the keyed modes, and the message words with their permutations, which hold the
+  key material of `derive_key`. A keyed hash of at most 64 bytes on an ARM64 core that takes the
+  portable code left the state after the rounds on the stack at opt-levels s and z. At opt-level 3
+  the machine code is unchanged. Outputs are unchanged.
 - Constant time on RISC-V and s390x: the compiler turned the masked reductions of ML-DSA and ML-KEM
   into a choice between two values, which these targets computed with a branch on secret
   coefficients. On RISC-V without the Zicond extension, ML-DSA signing, ML-DSA key generation from a
