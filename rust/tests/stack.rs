@@ -1,5 +1,5 @@
 // No secret of an operation on a private key is left on the dead stack (SPEC 14.5 item 1, D-76,
-// D-115, D-116). The stack below the caller is painted, one operation runs, and the same region is
+// D-115, D-116, D-117). The stack below the caller is painted, one operation runs, and the same region is
 // searched for the seeds and the shared secrets that the operation handled, and for SLH-DSA for
 // secret values of FORS, which the test derives itself (FIPS 205, Algorithms 14 and 19). The
 // lanes of SLH-DSA's F chains were once moved before their wipe: the copy was wiped, and the
@@ -125,6 +125,28 @@ fn read(copy: &mut [u8; SPAN]) {
     }
 }
 
+// The stack pointer of its caller, to within the sixteen bytes of this call.
+#[inline(never)]
+fn stack_pointer() -> usize {
+    let pointer: usize;
+
+    // SAFETY: the instruction reads the stack pointer into a register.
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("mov {}, rsp", out(reg) pointer, options(nomem, nostack, preserves_flags));
+
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mov {}, sp", out(reg) pointer, options(nomem, nostack, preserves_flags));
+    }
+
+    pointer
+}
+
+thread_local! {
+    // The stack pointer of dead_stack_after in this thread: the end of the copy that it returns.
+    static TOP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // What `operation` returns, and the dead stack that it left. Out of line, so that the three calls
 // start from one stack pointer.
 #[inline(never)]
@@ -133,6 +155,8 @@ fn dead_stack_after<R>(operation: impl FnOnce() -> R) -> (R, Box<[u8; SPAN]>) {
         .into_boxed_slice()
         .try_into()
         .expect("SPAN bytes");
+
+    TOP.with(|top| top.set(stack_pointer()));
 
     paint();
 
@@ -586,7 +610,7 @@ fn slh_dsa_shake_leaves_no_secret_on_the_stack() {
     feature = "frodokem",
     feature = "ml-dsa",
     all(
-        not(any(crypto_pq_optimized, crypto_pq_unoptimized)),
+        not(crypto_pq_unoptimized),
         feature = "hmac",
         feature = "hkdf",
         feature = "blake2",
@@ -931,6 +955,288 @@ fn keyed_hashes_leave_no_key_on_the_stack() {
                 &stack[..],
                 &[("the input keying material", &ikm), ("the output", &okm)],
                 LEAST,
+            );
+        }
+    }
+
+    assert!(
+        found.is_empty(),
+        "left on the stack on {}:\n{}",
+        processor(),
+        found.join("\n")
+    );
+}
+
+// An incremental MAC, created, fed, ended and dropped here: its tag is written into `tag`, or
+// with `verify` checked against it. Returns this function's stack pointer: its own frame holds the
+// MAC, and what the compiler made of the move of the MAC out of create, which no drop wipes
+// (D-76); the frames of the library lie under it.
+#[cfg(all(
+    crypto_pq_optimized,
+    feature = "hmac",
+    feature = "hkdf",
+    feature = "blake2",
+    feature = "blake3"
+))]
+#[inline(never)]
+fn incremental(
+    algorithm: &crypto_pq::MacAlgorithm,
+    key: &[u8],
+    data: &[u8],
+    tag: &mut [u8],
+    verify: bool,
+) -> usize {
+    let frame = stack_pointer();
+
+    let mut created = algorithm.create(key);
+
+    let mac = created.as_mut().expect("a MAC");
+
+    mac.update(data);
+
+    if verify {
+        assert!(mac.verify(tag), "the tag that digest_into wrote");
+    } else {
+        mac.digest_into(tag).expect("a tag");
+    }
+
+    frame
+}
+
+// The key setup of an incremental MAC alone: the MAC is created and dropped here. Returns this
+// function's stack pointer, as `incremental` does.
+#[cfg(all(
+    crypto_pq_optimized,
+    feature = "hmac",
+    feature = "hkdf",
+    feature = "blake2",
+    feature = "blake3"
+))]
+#[inline(never)]
+fn setup(algorithm: &crypto_pq::MacAlgorithm, key: &[u8]) -> usize {
+    let frame = stack_pointer();
+
+    let created = algorithm.create(key);
+
+    assert!(created.is_ok(), "a MAC");
+
+    frame
+}
+
+// At opt-level 3 the kernels keep most of a keyed hash in registers, and values of the key were
+// found in their frames all the same, so every keyed hash and KDF in one call ends with zeros
+// there too, and so do the key setup and the end of an incremental MAC (D-117). The fewest zeros
+// asked for are those of each call on its architecture, less what later calls write at their top.
+#[cfg(all(
+    crypto_pq_optimized,
+    feature = "hmac",
+    feature = "hkdf",
+    feature = "blake2",
+    feature = "blake3"
+))]
+#[test]
+fn keyed_hashes_leave_no_key_on_the_stack_at_opt_level_3() {
+    use crypto_pq::{
+        BLAKE2B_MAC, BLAKE2S_MAC, BLAKE3_KDF, BLAKE3_MAC, HKDF_SHA_256, HKDF_SHA_512, HMAC_SHA_256,
+        HMAC_SHA_512, KMAC256, KdfOptions,
+    };
+
+    // A size for x86-64 and one for ARM64.
+    const fn least(x86_64: usize, aarch64: usize) -> usize {
+        if cfg!(target_arch = "x86_64") {
+            x86_64
+        } else {
+            aarch64
+        }
+    }
+
+    let mut found = Vec::new();
+
+    let mut rng = Rng(0x0D95_748F_728E_B658);
+
+    let data = rng.bytes(100);
+
+    let long = rng.bytes(16 << 10);
+
+    // The algorithm, the size of its key, whether the key block of HMAC is searched for, the
+    // fewest zeros after a MAC of data in one call, of an empty message, and of 16 KiB, and the
+    // fewest after the key setup of an incremental MAC and after its end. After the setup the
+    // drop of the MAC writes at the top of the zeros, up to 262 bytes for BLAKE3 on ARM64, whose
+    // hasher it frees.
+    let macs = [
+        (
+            HMAC_SHA_256,
+            32,
+            true,
+            [least(1792, 704); 3],
+            [least(4160, 3648), least(1600, 832)],
+        ),
+        (
+            HMAC_SHA_512,
+            64,
+            true,
+            [least(2944, 1024); 3],
+            [least(4800, 3648), least(2752, 1216)],
+        ),
+        (
+            KMAC256,
+            32,
+            false,
+            [least(896, 832); 3],
+            [least(3136, 3328), least(896, 832)],
+        ),
+        (
+            BLAKE2B_MAC,
+            64,
+            false,
+            [least(1344, 256); 3],
+            [least(2688, 2752), least(1984, 576)],
+        ),
+        (
+            BLAKE2S_MAC,
+            32,
+            false,
+            [least(704, 192); 3],
+            [least(2688, 2752), least(1088, 704)],
+        ),
+        (
+            BLAKE3_MAC,
+            32,
+            false,
+            [least(640, 1024), least(192, 512), least(8448, 6912)],
+            [least(2816, 3136), least(832, 1152)],
+        ),
+    ];
+
+    for (algorithm, key_size, hmac, zeros, [setup_zeros, end_zeros]) in macs {
+        let name = algorithm.name();
+
+        let key = rng.bytes(key_size);
+
+        // What HMAC makes of the key before it hashes: the key under the inner and the outer pad.
+        let inner: Vec<u8> = key.iter().map(|byte| byte ^ 0x36).collect();
+
+        let outer: Vec<u8> = key.iter().map(|byte| byte ^ 0x5C).collect();
+
+        let secrets: Vec<(&str, &[u8])> = if hmac {
+            vec![
+                ("the key", &key),
+                ("the key under the inner pad", &inner),
+                ("the key under the outer pad", &outer),
+            ]
+        } else {
+            vec![("the key", &key)]
+        };
+
+        let mut tag = vec![0; algorithm.digest_size()];
+
+        for (message, operation, least) in [
+            (&data[..], "the MAC", zeros[0]),
+            (&[][..], "the MAC of an empty message", zeros[1]),
+            (&long[..], "the MAC of 16 KiB", zeros[2]),
+        ] {
+            let ((), stack) = dead_stack_after(|| {
+                algorithm
+                    .digest_into(black_box(&key), black_box(message), &mut tag)
+                    .expect("a tag");
+            });
+
+            inspect(&mut found, name, operation, &stack[..], &secrets, least);
+        }
+
+        // The key setup alone: the search under the frame of `setup`, in the frames of the
+        // library, and the zeros over the whole of the dead stack.
+        let (frame, stack) = dead_stack_after(|| setup(&algorithm, black_box(&key)));
+
+        let under = SPAN - (TOP.with(std::cell::Cell::get) - frame);
+
+        let operation = "the key setup of an incremental MAC";
+
+        inspect(&mut found, name, operation, &stack[..under], &secrets, 0);
+
+        inspect(&mut found, name, operation, &stack[..], &[], setup_zeros);
+
+        // The two functions that end a MAC, each alone, on a MAC that was made and fed before:
+        // only frames of the library lie under them.
+        let mut mac = algorithm.create(&key).expect("a MAC");
+
+        mac.update(&data);
+
+        let (result, stack) = dead_stack_after(|| mac.digest_into(&mut tag));
+
+        result.expect("a tag");
+
+        let operation = "the end of an incremental MAC";
+
+        inspect(&mut found, name, operation, &stack[..], &secrets, end_zeros);
+
+        let (equal, stack) = dead_stack_after(|| mac.verify(black_box(&tag)));
+
+        assert!(equal, "the tag that digest_into wrote");
+
+        let operation = "the verification of an incremental MAC";
+
+        inspect(&mut found, name, operation, &stack[..], &secrets, end_zeros);
+
+        drop(mac);
+
+        // The whole of it from one function: what an update left under that function lies
+        // where the zeros of the end reach.
+        for (verify, operation) in [
+            (false, "the incremental MAC"),
+            (true, "the incremental MAC and its verification"),
+        ] {
+            let (frame, stack) = dead_stack_after(|| {
+                incremental(
+                    &algorithm,
+                    black_box(&key),
+                    black_box(&data),
+                    &mut tag,
+                    verify,
+                )
+            });
+
+            let under = SPAN - (TOP.with(std::cell::Cell::get) - frame);
+
+            inspect(&mut found, name, operation, &stack[..under], &secrets, 0);
+        }
+    }
+
+    // The fewest zeros after a derivation of 32 bytes and of 200: BLAKE3-KDF computes more than a
+    // block of output in the kernels of its extended output, which go deeper.
+    for (algorithm, name, zeros) in [
+        (HKDF_SHA_256, "HKDF-SHA-256", [least(3584, 1792); 2]),
+        (HKDF_SHA_512, "HKDF-SHA-512", [least(5376, 2304); 2]),
+        (
+            BLAKE3_KDF,
+            "BLAKE3-KDF",
+            [least(1664, 896), least(3840, 1920)],
+        ),
+    ] {
+        let ikm = rng.bytes(32);
+
+        let salt = rng.bytes(16);
+
+        let options = if algorithm == BLAKE3_KDF {
+            KdfOptions::default().with_info(b"crypto-pq 2026-11-18 dead stack check")
+        } else {
+            KdfOptions::default().with_salt(&salt).with_info(b"stack")
+        };
+
+        for (length, fewest) in [32, 200].into_iter().zip(zeros) {
+            let (okm, stack) = dead_stack_after(|| {
+                algorithm
+                    .derive(black_box(&ikm), length, &options)
+                    .expect("a key")
+            });
+
+            inspect(
+                &mut found,
+                name,
+                "the derivation",
+                &stack[..],
+                &[("the input keying material", &ikm), ("the output", &okm)],
+                fewest,
             );
         }
     }
