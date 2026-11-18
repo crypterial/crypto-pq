@@ -1,11 +1,12 @@
-// No secret of SLH-DSA is left on the dead stack (SPEC 14.5 item 1, D-76, D-115). The stack below
-// the caller is painted, one operation runs, and the same region is searched for the seeds of the
-// key and for secret values of FORS, which the test derives itself (FIPS 205, Algorithms 14 and
-// 19). The lanes of the F chains were once moved before their wipe: the copy was wiped, and the
+// No secret of an operation on a private key is left on the dead stack (SPEC 14.5 item 1, D-76,
+// D-115, D-116). The stack below the caller is painted, one operation runs, and the same region is
+// searched for the seeds and the shared secrets that the operation handled, and for SLH-DSA for
+// secret values of FORS, which the test derives itself (FIPS 205, Algorithms 14 and 19). The
+// lanes of SLH-DSA's F chains were once moved before their wipe: the copy was wiped, and the
 // original kept SK.seed or the sixteen FORS values that it hashed last, on every target. A kernel
-// can also leave a value that it held in a register in its frame, so key generation and signing
-// end by writing zeros over the stack under them, and the test checks that these zeros lie where
-// the operation went deepest: a call that went deeper would have its frame under them.
+// can also leave a value that it held in a register in its frame, so the operations end by
+// writing zeros over the stack under them, and the test checks that these zeros lie where the
+// operation went deepest: a call that went deeper would have its frame under them.
 //
 // On Linux and macOS, where a thread's stack is mapped as a whole, and on the two architectures
 // whose stack pointer the test reads.
@@ -39,8 +40,9 @@ const PAINT: u8 = 0xA5;
 const ZEROS: usize = 15 << 10;
 
 // How far above the deepest byte that an operation wrote its zeros may begin: the frames of the
-// calls that write them.
-const SLACK: usize = 1 << 10;
+// calls that write them, at most 106 bytes in the builds measured (opt-level 0; 6 at 3 on x86-64,
+// the return address of memset, and none on ARM64).
+const SLACK: usize = 256;
 
 // PAINT over the SPAN bytes below the stack pointer.
 #[cfg(target_arch = "x86_64")]
@@ -573,4 +575,360 @@ fn slh_dsa_shake_leaves_no_secret_on_the_stack() {
         SLH_DSA_SHAKE_192S,
         SLH_DSA_SHAKE_256S,
     ]);
+}
+
+// The other schemes end their operations on a private key the same way (D-116), each with the
+// sizes of its own calls. What an operation left: the secrets given, and whether the zeros lie
+// where it went deepest, with `least` the smallest of its zeros less what later calls write at
+// their top.
+#[cfg(any(
+    feature = "ml-kem",
+    feature = "frodokem",
+    feature = "ml-dsa",
+    all(
+        not(any(crypto_pq_optimized, crypto_pq_unoptimized)),
+        feature = "hmac",
+        feature = "hkdf",
+        feature = "blake2",
+        feature = "blake3"
+    )
+))]
+fn inspect(
+    found: &mut Vec<String>,
+    name: &str,
+    operation: &str,
+    stack: &[u8],
+    secrets: &[(&str, &[u8])],
+    least: usize,
+) {
+    for (what, bytes) in secrets {
+        if holds(stack, bytes) {
+            found.push(format!("{name}: {what} after {operation}"));
+        }
+    }
+
+    if zeros_under(stack) < least {
+        found.push(format!(
+            "{name}: a call of {operation} went deeper than its zeros, {} bytes of {}",
+            zeros_under(stack),
+            depth(stack)
+        ));
+    }
+}
+
+#[cfg(feature = "ml-kem")]
+#[test]
+fn ml_kem_leaves_no_secret_on_the_stack() {
+    use crypto_pq::{ML_KEM_512, ML_KEM_768, ML_KEM_1024};
+
+    // Under K-PKE's key generation and encryption at opt-level 3.
+    const LEAST: usize = 5 << 10;
+
+    let mut found = Vec::new();
+
+    for algorithm in [ML_KEM_512, ML_KEM_768, ML_KEM_1024] {
+        let name = algorithm.name();
+
+        let mut rng = Rng(0x1319_8A2E_0370_7344 ^ name.bytes().map(u64::from).sum::<u64>());
+
+        let seed = rng.bytes(64);
+
+        let randomness = rng.bytes(32);
+
+        let (pair, stack) = dead_stack_after(|| {
+            hazmat::generate_kem_key_pair(algorithm, black_box(&seed)).expect("a key pair")
+        });
+
+        inspect(
+            &mut found,
+            name,
+            "key generation",
+            &stack[..],
+            &[("d", &seed[..32]), ("z", &seed[32..])],
+            LEAST,
+        );
+
+        let (encapsulation, stack) = dead_stack_after(|| {
+            hazmat::encapsulate(&pair.public_key, black_box(&randomness)).expect("a ciphertext")
+        });
+
+        inspect(
+            &mut found,
+            name,
+            "encapsulation",
+            &stack[..],
+            &[
+                ("m", &randomness),
+                ("the shared secret", &encapsulation.shared_secret),
+            ],
+            LEAST,
+        );
+
+        let (shared, stack) = dead_stack_after(|| {
+            pair.private_key
+                .decapsulate(black_box(&encapsulation.ciphertext))
+                .expect("a shared secret")
+        });
+
+        inspect(
+            &mut found,
+            name,
+            "decapsulation",
+            &stack[..],
+            &[("m", &randomness), ("the shared secret", &shared)],
+            LEAST,
+        );
+    }
+
+    assert!(
+        found.is_empty(),
+        "left on the stack on {}:\n{}",
+        processor(),
+        found.join("\n")
+    );
+}
+
+#[cfg(feature = "ml-dsa")]
+#[test]
+fn ml_dsa_leaves_no_secret_on_the_stack() {
+    use crypto_pq::{ML_DSA_44, ML_DSA_65, ML_DSA_87};
+
+    const LEAST: usize = 9 << 10;
+
+    let mut found = Vec::new();
+
+    for (algorithm, k, l) in [(ML_DSA_44, 4, 4), (ML_DSA_65, 6, 5), (ML_DSA_87, 8, 7)] {
+        let name = algorithm.name();
+
+        let mut rng = Rng(0xA409_3822_299F_31D0 ^ name.bytes().map(u64::from).sum::<u64>());
+
+        let seed = rng.bytes(32);
+
+        let randomness = rng.bytes(32);
+
+        // FIPS 204, Algorithm 6: rho, rho' and K from H(xi || k || l).
+        let expanded = shake256(&[&seed, &[k, l]], 128);
+
+        let secrets = [
+            ("xi", &seed[..]),
+            ("rho'", &expanded[32..96]),
+            ("K", &expanded[96..]),
+        ];
+
+        let (pair, stack) = dead_stack_after(|| {
+            hazmat::generate_signature_key_pair(algorithm, black_box(&seed)).expect("a key pair")
+        });
+
+        inspect(
+            &mut found,
+            name,
+            "key generation",
+            &stack[..],
+            &secrets,
+            LEAST,
+        );
+
+        let options = SignOptions::default();
+
+        let (_, stack) = dead_stack_after(|| {
+            hazmat::sign(
+                &pair.private_key,
+                black_box(MESSAGE),
+                black_box(&randomness),
+                &options,
+            )
+            .expect("a signature")
+        });
+
+        inspect(&mut found, name, "signing", &stack[..], &secrets, LEAST);
+    }
+
+    assert!(
+        found.is_empty(),
+        "left on the stack on {}:\n{}",
+        processor(),
+        found.join("\n")
+    );
+}
+
+#[cfg(feature = "frodokem")]
+#[test]
+fn frodokem_leaves_no_secret_on_the_stack() {
+    use crypto_pq::{
+        EFRODOKEM_976_AES, EFRODOKEM_976_SHAKE, EFRODOKEM_1344_AES, EFRODOKEM_1344_SHAKE,
+        FRODOKEM_976_AES, FRODOKEM_976_SHAKE, FRODOKEM_1344_AES, FRODOKEM_1344_SHAKE,
+    };
+
+    const LEAST: usize = 13 << 10;
+
+    let mut found = Vec::new();
+
+    for algorithm in [
+        FRODOKEM_976_AES,
+        FRODOKEM_976_SHAKE,
+        FRODOKEM_1344_AES,
+        FRODOKEM_1344_SHAKE,
+        EFRODOKEM_976_AES,
+        EFRODOKEM_976_SHAKE,
+        EFRODOKEM_1344_AES,
+        EFRODOKEM_1344_SHAKE,
+    ] {
+        let name = algorithm.name();
+
+        // The seed is s || seedSE || z and the draw of encapsulation u || salt; the ephemeral
+        // sets have a seedSE of half the size and no salt.
+        let secret = if name.contains("976") { 24 } else { 32 };
+
+        let (seed_se, salt) = if name.starts_with('e') {
+            (secret, 0)
+        } else {
+            (2 * secret, 2 * secret)
+        };
+
+        let mut rng = Rng(0x082E_FA98_EC4E_6C89 ^ name.bytes().map(u64::from).sum::<u64>());
+
+        let seed = rng.bytes(secret + seed_se + 16);
+
+        let randomness = rng.bytes(secret + salt);
+
+        let (pair, stack) = dead_stack_after(|| {
+            hazmat::generate_kem_key_pair(algorithm, black_box(&seed)).expect("a key pair")
+        });
+
+        inspect(
+            &mut found,
+            name,
+            "key generation",
+            &stack[..],
+            &[
+                ("s", &seed[..secret]),
+                ("seedSE", &seed[secret..secret + seed_se]),
+            ],
+            LEAST,
+        );
+
+        let (encapsulation, stack) = dead_stack_after(|| {
+            hazmat::encapsulate(&pair.public_key, black_box(&randomness)).expect("a ciphertext")
+        });
+
+        inspect(
+            &mut found,
+            name,
+            "encapsulation",
+            &stack[..],
+            &[
+                ("u", &randomness[..secret]),
+                ("the shared secret", &encapsulation.shared_secret),
+            ],
+            LEAST,
+        );
+
+        let (shared, stack) = dead_stack_after(|| {
+            pair.private_key
+                .decapsulate(black_box(&encapsulation.ciphertext))
+                .expect("a shared secret")
+        });
+
+        inspect(
+            &mut found,
+            name,
+            "decapsulation",
+            &stack[..],
+            &[
+                ("u", &randomness[..secret]),
+                ("the shared secret", &shared),
+                ("s", &seed[..secret]),
+            ],
+            LEAST,
+        );
+    }
+
+    assert!(
+        found.is_empty(),
+        "left on the stack on {}:\n{}",
+        processor(),
+        found.join("\n")
+    );
+}
+
+// At the opt-levels between 0 and 3 a keyed hash and a KDF in one call end with zeros too: there
+// their kernels pass arrays of key words through memory (D-116). build.rs gives this crate the
+// level as it gives it to the library.
+#[cfg(all(
+    not(any(crypto_pq_optimized, crypto_pq_unoptimized)),
+    feature = "hmac",
+    feature = "hkdf",
+    feature = "blake2",
+    feature = "blake3"
+))]
+#[test]
+fn keyed_hashes_leave_no_key_on_the_stack() {
+    use crypto_pq::{
+        BLAKE2B_MAC, BLAKE3_MAC, HKDF_SHA_256, HKDF_SHA_512, HMAC_SHA_256, HMAC_SHA_512, KMAC256,
+        KdfOptions,
+    };
+
+    const LEAST: usize = 15 << 10;
+
+    let mut found = Vec::new();
+
+    let mut rng = Rng(0x4528_21E6_38D0_1377);
+
+    let data = rng.bytes(100);
+
+    for algorithm in [HMAC_SHA_256, HMAC_SHA_512, KMAC256, BLAKE2B_MAC, BLAKE3_MAC] {
+        let key = rng.bytes(32);
+
+        let mut tag = vec![0; algorithm.digest_size()];
+
+        let ((), stack) = dead_stack_after(|| {
+            algorithm
+                .digest_into(black_box(&key), black_box(&data), &mut tag)
+                .expect("a tag");
+        });
+
+        inspect(
+            &mut found,
+            algorithm.name(),
+            "the MAC",
+            &stack[..],
+            &[("the key", &key)],
+            LEAST,
+        );
+    }
+
+    for (algorithm, name) in [
+        (HKDF_SHA_256, "HKDF-SHA-256"),
+        (HKDF_SHA_512, "HKDF-SHA-512"),
+    ] {
+        let ikm = rng.bytes(32);
+
+        let salt = rng.bytes(16);
+
+        let options = KdfOptions::default().with_salt(&salt).with_info(b"stack");
+
+        for length in [32, 200] {
+            let (okm, stack) = dead_stack_after(|| {
+                algorithm
+                    .derive(black_box(&ikm), length, &options)
+                    .expect("a key")
+            });
+
+            inspect(
+                &mut found,
+                name,
+                "the derivation",
+                &stack[..],
+                &[("the input keying material", &ikm), ("the output", &okm)],
+                LEAST,
+            );
+        }
+    }
+
+    assert!(
+        found.is_empty(),
+        "left on the stack on {}:\n{}",
+        processor(),
+        found.join("\n")
+    );
 }
