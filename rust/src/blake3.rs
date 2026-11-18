@@ -1202,6 +1202,14 @@ impl Hasher {
         self.flags = KEYED_HASH;
     }
 
+    // The chunks that are complete: none until the data exceeds a chunk, and from then on the
+    // updates may have hashed several chunks side by side, in frames far deeper than those of a
+    // single chunk.
+    #[allow(dead_code)]
+    pub(crate) const fn chunks(&self) -> u64 {
+        self.chunk
+    }
+
     pub(crate) fn update(&mut self, mut data: &[u8]) {
         assert!(self.root.is_none(), "UNSUPPORTED: cannot update after read");
 

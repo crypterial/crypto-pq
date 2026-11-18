@@ -36,6 +36,67 @@ use crate::sha2::{self, Sha256Stream, Sha512, finish256, finish512};
 use crate::sp800_185;
 use crate::wipe::{below_keyed, wipe};
 
+// The stack that the calls of a MAC take under them at opt-level 3, in bytes, by its hash: the
+// deepest that a MAC in one call and the end of an incremental one went in the builds measured,
+// with an eighth more (D-117). At the other levels the size is that of D-116.
+#[cfg(crypto_pq_optimized)]
+pub(crate) mod taken {
+    use crate::wipe::taken;
+
+    // HMAC in one call. Under a key longer than a block, which is hashed first, the calls take
+    // 1,743 and 2,774 bytes on x86-64 for the two block sizes, 160 to 190 more than under a
+    // shorter key.
+    taken!(HMAC_256, 2048, 960, 3072);
+
+    taken!(HMAC_512, 3200, 1344, 4800);
+
+    taken!(KMAC, 1152, 1088, 1728);
+
+    // The end of an incremental HMAC, which on ARM64 goes deeper than an HMAC in one call: 908
+    // and 1,211 bytes for 564 and 1,100.
+    taken!(END_HMAC_256, 1856, 1088, 2784);
+
+    taken!(END_HMAC_512, 3008, 1472, 4512);
+
+    // The end of an incremental MAC; a MAC in one call ends with zeros of its own, nearer its
+    // kernels (blake2::mac).
+    taken!(BLAKE2B, 2240, 832, 3360);
+
+    taken!(BLAKE2S, 1344, 960, 2016);
+
+    // BLAKE3 by the data: at most a block, a chunk, 64 KiB, and more: 9,775 bytes for 4 MiB and
+    // about 320 more for each doubling. The code of a chunk takes 855 bytes on x86-64 with debug
+    // assertions, as in the test profile, and without them 787 in the portable code, which some
+    // processors run for a single message, and 471 in the kernels.
+    taken!(BLAKE3_BLOCK, 320, 768, 1152);
+
+    taken!(
+        BLAKE3_CHUNK,
+        if cfg!(debug_assertions) { 1088 } else { 960 },
+        1408,
+        2112
+    );
+
+    taken!(BLAKE3_SMALL_TREE, 8832, 7296, 13248);
+
+    pub(crate) const BLAKE3_TREE: usize = 12 << 10;
+
+    // The end of an incremental BLAKE3 over at most a chunk.
+    taken!(BLAKE3, 1088, 1408, 2112);
+
+    // The key setup of an incremental MAC, one of whose frames holds the MAC before it is
+    // returned, by the kind.
+    taken!(CREATED_HMAC_256, 4672, 4160, 7008);
+
+    taken!(CREATED_HMAC_512, 5312, 4160, 7968);
+
+    taken!(CREATED_KMAC, 3648, 3840, 5760);
+
+    taken!(CREATED_BLAKE2, 3200, 3264, 4896);
+
+    taken!(CREATED_BLAKE3, 3328, 3648, 5472);
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MacKind {
     // The tag is the leftmost `size` bytes of the hash output (FIPS 198-1, 5).
@@ -348,6 +409,84 @@ impl MacAlgorithm {
         }
     }
 
+    // The zeros under a MAC in one call: 16 KiB at the opt-levels 1, 2, s and z (D-116), and at 3
+    // what the calls of its hash take (D-117). There the kernels keep their state in registers,
+    // and the compiler saves some of it in their frames all the same: the chaining value that a
+    // compression adds in at its end, the message words of a key block.
+    #[inline(always)]
+    fn below(&self, data: &[u8]) {
+        below_keyed!();
+
+        #[cfg(crypto_pq_optimized)]
+        match &self.kind {
+            #[cfg(any(
+                feature = "hmac",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
+            MacKind::Hmac(hash) => match hash.kind {
+                Kind::Sha256(_) => crate::wipe::below::<{ taken::HMAC_256 }>(),
+                _ => crate::wipe::below::<{ taken::HMAC_512 }>(),
+            },
+            #[cfg(feature = "sha3")]
+            MacKind::Kmac { .. } => crate::wipe::below::<{ taken::KMAC }>(),
+            // A BLAKE2 MAC ends with zeros of its own, nearer its kernels (blake2::mac).
+            #[cfg(feature = "blake2")]
+            MacKind::Blake2b(_) | MacKind::Blake2s(_) => {}
+            // The kernels of BLAKE3 take what they make of the key through their frames for a
+            // tree hashed four chunks at a time and, with debug assertions, for a single chunk
+            // too; in the other builds measured they kept it in registers, which a compiler is
+            // free to change. The zeros are written in every case, as many as the code of that
+            // much data takes.
+            #[cfg(feature = "blake3")]
+            MacKind::Blake3 if data.len() > 64 << 10 => {
+                crate::wipe::below::<{ taken::BLAKE3_TREE }>();
+            }
+            #[cfg(feature = "blake3")]
+            MacKind::Blake3 if data.len() > 1024 => {
+                crate::wipe::below::<{ taken::BLAKE3_SMALL_TREE }>();
+            }
+            #[cfg(feature = "blake3")]
+            MacKind::Blake3 if data.len() > 64 => {
+                crate::wipe::below::<{ taken::BLAKE3_CHUNK }>();
+            }
+            #[cfg(feature = "blake3")]
+            MacKind::Blake3 => crate::wipe::below::<{ taken::BLAKE3_BLOCK }>(),
+        }
+
+        let _ = data;
+    }
+
+    // The zeros under the key setup of an incremental MAC or of a MAC key, at the levels of a MAC
+    // in one call, and at 3 as many as the setup of its kind takes.
+    #[inline(always)]
+    fn created(&self) {
+        below_keyed!();
+
+        #[cfg(crypto_pq_optimized)]
+        match &self.kind {
+            #[cfg(any(
+                feature = "hmac",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
+            MacKind::Hmac(hash) => match hash.kind {
+                Kind::Sha256(_) => crate::wipe::below::<{ taken::CREATED_HMAC_256 }>(),
+                _ => crate::wipe::below::<{ taken::CREATED_HMAC_512 }>(),
+            },
+            #[cfg(feature = "sha3")]
+            MacKind::Kmac { .. } => crate::wipe::below::<{ taken::CREATED_KMAC }>(),
+            #[cfg(feature = "blake2")]
+            MacKind::Blake2b(_) | MacKind::Blake2s(_) => {
+                crate::wipe::below::<{ taken::CREATED_BLAKE2 }>();
+            }
+            #[cfg(feature = "blake3")]
+            MacKind::Blake3 => crate::wipe::below::<{ taken::CREATED_BLAKE3 }>(),
+        }
+    }
+
     /// The tag of `data` under `key`. HMAC and KMAC take keys of any length, BLAKE2b 1 to 64 bytes,
     /// BLAKE2s 1 to 32 and BLAKE3 exactly 32.
     pub fn digest(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
@@ -359,7 +498,7 @@ impl MacAlgorithm {
 
         self.mac(key, data, &mut out);
 
-        below_keyed!();
+        self.below(data);
 
         Ok(out)
     }
@@ -382,7 +521,7 @@ impl MacAlgorithm {
         #[cfg(not(target_arch = "aarch64"))]
         self.mac(key, data, out);
 
-        below_keyed!();
+        self.below(data);
 
         Ok(())
     }
@@ -398,7 +537,20 @@ impl MacAlgorithm {
     }
 
     /// An incremental MAC under `key`.
+    // In line, so that the MAC is returned into the caller's storage and the zeros lie under the
+    // caller's frame, over the frames of the key setup: one of them holds the MAC before it is
+    // returned, a copy that no drop wipes (D-117).
+    #[inline(always)]
     pub fn create(&self, key: &[u8]) -> Result<Mac, Error> {
+        let mac = self.create_checked(key);
+
+        self.created();
+
+        mac
+    }
+
+    #[inline(never)]
+    fn create_checked(&self, key: &[u8]) -> Result<Mac, Error> {
         self.check_key(key)?;
 
         let _dit = Dit::keyed();
@@ -409,7 +561,18 @@ impl MacAlgorithm {
     /// A key object under `key`, for many messages: [`MacKey::create`] gives each message a MAC in
     /// its state right after [`create`](Self::create), without the key setup again. Fails as
     /// `create` does.
+    // In line as create, for the same zeros.
+    #[inline(always)]
     pub fn key(&self, key: &[u8]) -> Result<MacKey, Error> {
+        let keyed = self.key_checked(key);
+
+        self.created();
+
+        keyed
+    }
+
+    #[inline(never)]
+    fn key_checked(&self, key: &[u8]) -> Result<MacKey, Error> {
         self.check_key(key)?;
 
         let _dit = Dit::keyed();
@@ -523,7 +686,7 @@ impl MacAlgorithm {
 
             let equal = squeeze_equal(&mut engine, tag);
 
-            below_keyed!();
+            self.below(data);
 
             return equal;
         }
@@ -536,7 +699,7 @@ impl MacAlgorithm {
 
         wipe(&mut expected);
 
-        below_keyed!();
+        self.below(data);
 
         ct::declassify_value(equal)
     }
@@ -791,6 +954,11 @@ enum MacEngine {
 
 /// An incremental MAC computation, made by [`MacAlgorithm::create`]. Its keyed state is wiped
 /// when it is dropped.
+///
+/// The value holds that state itself, so a move of it leaves a copy where it was, which nothing
+/// wipes: returning it from `create` is such a move, and so is taking it out of the `Result`. The
+/// functions of [`MacAlgorithm`] that compute a MAC in one call (`digest`, `digest_into` and
+/// `verify`) leave no such copy.
 pub struct Mac {
     engine: MacEngine,
     size: usize,
@@ -828,6 +996,8 @@ impl Mac {
 
         self.finish(&mut out);
 
+        self.below();
+
         out
     }
 
@@ -840,11 +1010,26 @@ impl Mac {
 
         self.finish(out);
 
+        self.below();
+
         Ok(())
     }
 
     /// Whether `tag` is the tag of everything absorbed so far, compared in constant time.
     pub fn verify(&self, tag: &[u8]) -> bool {
+        let equal = self.equals(tag);
+
+        self.below();
+
+        equal
+    }
+
+    // verify without its zeros. Out of line, so that the frame of verify stays small: what an
+    // update left under the caller lies where the frame of the function that ends the MAC is, and
+    // the zeros start under that frame. With the engine of KMAC and the expected tag in it, the
+    // frame covered the words of a BLAKE2b key that an update had left on ARM64.
+    #[inline(never)]
+    fn equals(&self, tag: &[u8]) -> bool {
         if tag.len() != self.size {
             return false;
         }
@@ -853,11 +1038,7 @@ impl Mac {
 
         #[cfg(feature = "sha3")]
         if let MacEngine::Kmac { engine, xof } = &self.engine {
-            let mut engine = engine.clone();
-
-            engine.update(sp800_185::output_length(*xof, self.size).as_slice());
-
-            return squeeze_equal(&mut engine, tag);
+            return kmac_equals(engine, *xof, self.size, tag);
         }
 
         let mut expected = [0; 64];
@@ -871,9 +1052,54 @@ impl Mac {
         ct::declassify_value(equal)
     }
 
+    // The zeros under the end of an incremental MAC, of the sizes of a MAC in one call. An update
+    // ends with none: what its kernels saved lies under the caller's frame as far as the update
+    // went, where these zeros reach it when the MAC is ended from the same function.
+    #[inline(always)]
+    fn below(&self) {
+        below_keyed!();
+
+        #[cfg(crypto_pq_optimized)]
+        match &self.engine {
+            #[cfg(any(
+                feature = "hmac",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
+            MacEngine::Hmac {
+                inner: Engine::Sha256(_),
+                ..
+            } => crate::wipe::below::<{ taken::END_HMAC_256 }>(),
+            #[cfg(any(
+                feature = "hmac",
+                feature = "slh-dsa",
+                feature = "lms",
+                feature = "xmss"
+            ))]
+            MacEngine::Hmac { .. } => crate::wipe::below::<{ taken::END_HMAC_512 }>(),
+            #[cfg(feature = "sha3")]
+            MacEngine::Kmac { .. } => crate::wipe::below::<{ taken::KMAC }>(),
+            #[cfg(feature = "blake2")]
+            MacEngine::Blake2b(_) => crate::wipe::below::<{ taken::BLAKE2B }>(),
+            #[cfg(feature = "blake2")]
+            MacEngine::Blake2s(_) => crate::wipe::below::<{ taken::BLAKE2S }>(),
+            // Over more than a chunk the updates may have hashed chunks side by side, as deep as
+            // a MAC of that much data in one call.
+            #[cfg(feature = "blake3")]
+            MacEngine::Blake3(hasher) => match hasher.chunks() {
+                0 => crate::wipe::below::<{ taken::BLAKE3 }>(),
+                1..=64 => crate::wipe::below::<{ taken::BLAKE3_SMALL_TREE }>(),
+                _ => crate::wipe::below::<{ taken::BLAKE3_TREE }>(),
+            },
+        }
+    }
+
     // HMAC's inner digest is wiped: with the outer key it gives the output, which may be a key
     // itself. The engines that finish here are copies, which their drops wipe. A kernel that ends
-    // both hashes in one call (hmac_into) keeps the inner digest in its registers instead.
+    // both hashes in one call (hmac_into) keeps the inner digest in its registers instead. Out of
+    // line, so that its frame lies under those of its callers, where their zeros reach it.
+    #[inline(never)]
     fn finish(&self, out: &mut [u8]) {
         match &self.engine {
             #[cfg(any(
@@ -943,10 +1169,24 @@ impl Mac {
     }
 }
 
+// The comparison of an incremental KMAC with a tag, on a copy of the engine, which its drop wipes.
+// Out of line, so that the copy lies in a frame of its own: in the frame of its caller it made
+// that frame, under which the zeros start, about 400 bytes larger for every kind of MAC.
+#[cfg(feature = "sha3")]
+#[inline(never)]
+fn kmac_equals(engine: &Keccak, xof: bool, size: usize, tag: &[u8]) -> bool {
+    let mut engine = engine.clone();
+
+    engine.update(sp800_185::output_length(xof, size).as_slice());
+
+    squeeze_equal(&mut engine, tag)
+}
+
 /// A MAC key, made by [`MacAlgorithm::key`]: the keyed state that [`MacAlgorithm::create`] sets
 /// up, from which [`create`](Self::create) starts each MAC, so that HMAC and KMAC process no key
 /// block again. Several threads may use one key at once. The keyed state is wiped when the key is
-/// dropped.
+/// dropped. A move of the key object leaves a copy of that state where it was, as a move of a
+/// [`Mac`] does.
 pub struct MacKey {
     name: &'static str,
     keyed: Keyed,
