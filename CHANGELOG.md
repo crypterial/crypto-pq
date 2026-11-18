@@ -411,9 +411,11 @@ Implements specification 2.0 (draft).
   seed and the coins with fat LTO on ARM64; ML-DSA left rho' and K after key generation in builds
   without the CPU kernels. Below opt-level 3, HMAC, HKDF and BLAKE2b left their key, the states
   after its blocks or the derived key in the frames of their kernels. The test of the dead stack
-  covers these operations, in the release build, in the test profile and at opt-level z in CI. On
-  an Apple M3 under Linux an operation of ML-KEM takes 11 to 185 ns more, 0.1 to 5 percent, and
-  ML-DSA the same time as before. At opt-level 3 on x86-64 an operation takes about 2 KB more
+  covers these operations, in the release build, in the test profile and at opt-level z in CI. An
+  operation of ML-KEM takes 19 to 72 ns more on a Neoverse N2, at most 1 percent, and 42 to 119 ns
+  more on the x86-64 server processors measured (EPYC 7763, Xeon Platinum 8573C, Xeon 6975P-C),
+  0.3 to 4.4 percent; key generation of ML-DSA takes 0.1 to 0.3 us more, up to 2.1 percent. At
+  opt-level 3 on x86-64 an operation takes about 2 KB more
   stack with ML-KEM, 4.5 KB more with ML-DSA and 4.4 to 8 KB more with FrodoKEM. A MAC or a KDF at
   opt-level 3 and the incremental forms of a MAC are as before. Outputs are unchanged.
 - HMAC-SHA-256 and HKDF-SHA-256 on x86-64 with the SHA extensions, in builds at opt-level 2: the
