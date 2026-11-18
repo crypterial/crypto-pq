@@ -34,7 +34,7 @@ use crate::keccak::Keccak;
 use crate::sha2::{self, Sha256Stream, Sha512, finish256, finish512};
 #[cfg(feature = "sha3")]
 use crate::sp800_185;
-use crate::wipe::wipe;
+use crate::wipe::{below_keyed, wipe};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MacKind {
@@ -359,6 +359,8 @@ impl MacAlgorithm {
 
         self.mac(key, data, &mut out);
 
+        below_keyed!();
+
         Ok(out)
     }
 
@@ -379,6 +381,8 @@ impl MacAlgorithm {
 
         #[cfg(not(target_arch = "aarch64"))]
         self.mac(key, data, out);
+
+        below_keyed!();
 
         Ok(())
     }
@@ -517,7 +521,11 @@ impl MacAlgorithm {
 
             engine.update(sp800_185::output_length(*xof, self.size).as_slice());
 
-            return squeeze_equal(&mut engine, tag);
+            let equal = squeeze_equal(&mut engine, tag);
+
+            below_keyed!();
+
+            return equal;
         }
 
         let mut expected = [0; 64];
@@ -527,6 +535,8 @@ impl MacAlgorithm {
         let equal = ct::equal(&expected[..self.size], tag);
 
         wipe(&mut expected);
+
+        below_keyed!();
 
         ct::declassify_value(equal)
     }
