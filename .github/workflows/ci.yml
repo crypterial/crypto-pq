@@ -418,6 +418,10 @@ jobs:
           CARGO_PROFILE_RELEASE_OPT_LEVEL: 2
         run: cargo test --locked --release --all-features --lib -- --nocapture kernel
       - run: cargo test --locked --release --all-features
+      # The search of the dead stack in the test profile as well, opt-level 3 with debug
+      # assertions, whose kernels keep other values in their frames: an AVX-512VL kernel once left
+      # a secret there that the release build did not (D-115).
+      - run: cargo test --locked --all-features --test stack
       - run: |
           mkdir -p "$RUNNER_TEMP/avx512"
           four=no one=no sha256=no sha512=no vl=no zmm=no
