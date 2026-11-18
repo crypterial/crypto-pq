@@ -1980,3 +1980,139 @@ would be a large part of it: there a MAC and a KDF end as before, the limitation
 [14.5](14-security.md#145-wiping) item 3 stands for them, and whether they take zeros of their own
 is left to a later decision with its own measurement. The incremental forms of a MAC are not changed
 either: their object holds the keyed state, and [D-76](#decision-d-76) describes its copies.
+
+## Decision D-117
+
+The zeros of [D-115](#decision-d-115) end a MAC and a KDF in one call at opt-level 3 too, where
+[D-116](#decision-d-116) wrote them at the opt-levels 1, 2, s and z only, and at every opt-level but
+0 they end the key setup of an incremental MAC or of a MAC key and the end of an incremental MAC.
+
+At opt-level 3 the sizes follow what the calls of each hash take: one for x86-64, one for ARM64, and
+one for every other target, where nothing was measured and the size is half as much again as the
+larger of the two. The depths were read under Linux; Windows and UEFI, whose calling convention has
+a function save the vector registers that it uses, take the third size on both architectures.
+`digest`, `digest_into` and `verify` of a MAC algorithm zero 2,048, 960 and 3,072 bytes for HMAC
+with SHA-224 or SHA-256, 3,200, 1,344 and 4,800 for HMAC with SHA-384 or SHA-512, and 1,152, 1,088
+and 1,728 for KMAC. For BLAKE3 they zero by the length of the data: 320, 768 and 1,152 bytes for at
+most a block, 960, 1,408 and 2,112 for at most a chunk (1,088 on x86-64 in a build with debug
+assertions), 8,832, 7,296 and 13,248 for at most 64 KiB, and 12 KiB for more. For BLAKE2 the zeros
+are written by the function that calls the kernels, next to their frames: 1,664 bytes on x86-64
+(1,920 with debug assertions), 448 on ARM64 and 2,880 elsewhere for BLAKE2b, and 960, 320 and 1,536
+for BLAKE2s. Under the whole call BLAKE2b would take 2,688 bytes on x86-64, more than the 2 KiB from
+which the C library's memset changes its method. `derive`, `extract` and `expand` of a KDF, with
+their `_into` forms, zero 3,968, 2,112 and 5,952 bytes for HKDF with SHA-256 and 5,824, 2,688 and
+8,736 with SHA-384 or SHA-512. BLAKE3-KDF zeros 1,984, 1,152 and 2,976 bytes for an input of at most
+a chunk and an output of at most 64 bytes, 4,224, 2,304 and 6,336 for a longer output, whose blocks
+come from the kernels of the extended output, and the sizes of a BLAKE3 tree for a longer input.
+
+`create` and `key` of a MAC algorithm zero, after the key setup, 4,672, 4,160 and 7,008 bytes for
+HMAC with SHA-224 or SHA-256, 5,312, 4,160 and 7,968 with SHA-384 or SHA-512, 3,648, 3,840 and 5,760
+for KMAC, 3,200, 3,264 and 4,896 for BLAKE2 and 3,328, 3,648 and 5,472 for BLAKE3. `digest`,
+`digest_into` and `verify` of a `Mac` zero 1,856, 1,088 and 2,784 bytes for HMAC with SHA-224 or
+SHA-256, 3,008, 1,472 and 4,512 with SHA-384 or SHA-512, the 1,152, 1,088 and 1,728 of a KMAC in one
+call, 2,240, 832 and 3,360 bytes for BLAKE2b, 1,344, 960 and 2,016 for BLAKE2s, and for BLAKE3
+1,088, 1,408 and 2,112 while its data fit in a chunk and the sizes of a tree after that, as an
+update may have hashed several chunks side by side. At the opt-levels 1, 2, s and z each of these
+functions zeros the 16 KiB of D-116, and none of them zeros at 0. `create` and `key` are inlined
+into their callers, so that the zeros lie under the caller's frame, over every frame of the key
+setup: the function that builds the MAC holds it in its own frame, 2,720 bytes on x86-64, before it
+is returned. `update` writes no zeros. The calls under it took at most 1,615 bytes on x86-64 and 588
+on ARM64 while the data of BLAKE3 fit in a chunk, less than the zeros at the end of the MAC, which
+reach them when the MAC is updated and ended from one function. They lie under the caller's frame,
+where the frame of the function that ends the MAC then lies, and the zeros start under that frame:
+the three functions that end a MAC keep small frames, and `verify` computes and compares in a
+function of its own, as with the engine of KMAC and the expected tag in its frame it covered the
+words of a BLAKE2b key that an update had left on ARM64.
+
+The sizes come from the build that reads how far under each of these places the stack was written,
+in fourteen builds at opt-level 3: the eleven of D-116 (ARM64 natively and as Cortex-A72 and
+Neoverse N1, x86-64 as EPYC-Milan, Haswell and Nehalem, a build for x86-64-v3, and fat LTO and the
+portable build on both) and three with debug assertions, as the test profile has them (ARM64, and
+x86-64 as EPYC-Milan and Haswell). The calls took at most, on x86-64 and on ARM64: under a MAC in
+one call 1,583 and 564 bytes for HMAC-SHA-256 and 2,583 and 1,100 for HMAC-SHA-512, and 1,743 and
+2,774 on x86-64 under a key longer than a block, which is hashed first, 911 and 908 for KMAC256,
+with a tag of 1,000 bytes too, and for BLAKE3 215 and 596 for at most a block, 855 and 1,148 for a
+chunk (787 in the portable code without debug assertions, which some processors run for one
+message), 7,759 and 6,428 for 16 KiB and for 64 KiB, and 9,775 and 8,444 for 4 MiB; under the
+function that calls the kernels of BLAKE2, 1,495 and 324 for BLAKE2b (1,727 on x86-64 with debug
+assertions) and 767 and 212 for BLAKE2s; under a KDF 3,471 and 1,796 for HKDF-SHA-256, 5,087 and
+2,300 for HKDF-SHA-512, 1,679 and 924 for BLAKE3-KDF, and 3,687 and 1,972 for 1,000 bytes or 16 KiB
+of its output; under the key setup of an incremental MAC 4,047 and 3,636 for HMAC-SHA-256, 4,599 and
+3,548 for HMAC-SHA-512, 3,167 and 3,356 for KMAC256, 2,743 and 2,844 for BLAKE2 and 2,895 and 3,140
+for BLAKE3; and under its end, the deeper of `digest_into` and `verify`, 1,583 and 908, 2,551 and
+1,211, 775 and 828, 1,887 and 676 for BLAKE2b, 1,007 and 468 for BLAKE2s and 811 and 852 for BLAKE3.
+A size is the larger depth with an eighth more, and with a tenth for BLAKE2 in one call, where the
+frames of the kernels do not depend on the message. No emulated processor ran the kernels of
+AVX-512, and none chose its kernels as an AMD processor of family 1Ah or an Intel processor with
+fast gathers does: there the test of the dead stack, which CI runs in the release build and in the
+test profile, checks that the zeros lie where each call went deepest.
+
+Without these zeros a search of the dead stack found, at opt-level 3, in those fourteen builds:
+after a BLAKE2b MAC the chaining value after the key block, with which the MAC of any message can be
+computed, in every build but the two for x86-64 with debug assertions, and after the BLAKE2b MAC of
+an empty message the key itself in every build; after the BLAKE2s MAC of an empty message 8 to 20 of
+the 32 bytes of the key in every build but fat LTO on ARM64; after HMAC-SHA-512 the state after the
+outer key block in twelve builds, every one for x86-64, ARM64 as Cortex-A72 and as Neoverse N1, its
+portable build, and fat LTO, where the state after the inner key block stayed too; after
+HKDF-SHA-512 the whole output of 64 bytes and the input keying material with fat LTO on ARM64; after
+KMAC256 up to 120 of the 136 bytes of the final state that are not output in every build for x86-64,
+and up to 96 of the 200 bytes of the state after the key; after BLAKE3-KDF 12 of the 32 bytes of the
+input keying material in five builds for ARM64; after a keyed BLAKE3 of 16 KiB 12 to 20 bytes of the
+key in four builds for ARM64 and the whole key on x86-64 with debug assertions, and states of the
+compressions of its parent nodes in ten builds; and after a keyed BLAKE3 of at most a chunk a whole
+state of its last compression on x86-64 with debug assertions, from which the rounds run backwards
+to the key, and five to seven words of one in the portable build for x86-64. At the opt-levels 2, s,
+z and 1 the search found nothing after a MAC or a KDF in one call, as D-116 left them. After an
+incremental MAC it found the keyed state in frames of the library at every opt-level: the states of
+HMAC-SHA-256 after its two key blocks and the state of KMAC256 after the key in every one of the 24
+builds below, and the key of BLAKE2, which the MAC holds as its first block, in 23 of them.
+
+With the zeros the search finds none of these values after a MAC or a KDF in one call, and none
+under the frame of the function that created, updated and ended an incremental MAC, in 24 builds:
+the fourteen at opt-level 3, the levels 2, s, z and 1 on ARM64 and on x86-64 as EPYC-Milan, and the
+portable build of both at 2. It looks for the values of D-116 and for the key of BLAKE2s and of
+BLAKE3, the chaining values after the key blocks of BLAKE2, and every word of the state of every
+compression of BLAKE2b, BLAKE2s and BLAKE3 that the key reaches, after each half of the column step
+and of the diagonal step of each round: the 64-bit words one by one, the 32-bit words one by one and
+as the pairs of neighbours in a row, in every rotation of the row, and for a tree of sixteen chunks
+and for the extended output as the pairs of one word of two compressions that a kernel runs side by
+side. A function that leaves four such values in its frame is found in every build.
+
+What stays is in the caller's own frames. A `Mac` and a `MacKey` are returned by value
+([D-76](#decision-d-76)), and the compiler keeps the result of the call in a place of the caller's
+frame and copies it to where the caller holds it: the first place keeps the keyed state, in every
+build, and nothing wipes it. Each move by the caller leaves another. The library cannot reach these
+copies. Keeping the keyed state on the heap would remove them, as the incremental BLAKE3 shows,
+whose hasher is on the heap and leaves none, for an allocation in every `create`. The documentation
+states it, and a MAC in one call leaves no such copy.
+
+Three other ways were measured and not taken. Reading the chaining value of BLAKE2b back from a
+named place, which the kernel then wipes, instead of keeping it in registers through the rounds: the
+loop of the AVX2 kernel grew by 8 to 15 instructions in two forms of it. Writing the zeros only
+where the search had found a value, and none under a BLAKE2s MAC of a message, a keyed BLAKE3 of at
+most a chunk and a BLAKE3 tree hashed eight chunks at a time: with debug assertions the same kernels
+left the key of the tree, the state of a compression and a part of a chaining value, so the absence
+held for one kind of build and not for the code. A query of the CPU's features from the function
+that writes the zeros: that function is inlined into other crates, the features are a static of this
+crate, and every read of them in the crate then went through the global offset table, one more
+instruction in each dispatch.
+
+The zeros cost, on twelve hosted runners that ran the benchmarks of this tree and of the tree before
+it in turn, six rounds each, in a default build and with every function at a 64-byte boundary (an
+EPYC 7763, an EPYC 9V74, a Xeon Platinum 8573C, a Xeon 6973P-C and a Xeon 6975P-C, a Neoverse N2): a
+MAC in one call 22 to 23 ns more with HMAC-SHA-256 on the two EPYC processors, 12 to 14.5 on the two
+Xeon 6900, 9 on the Neoverse N2 and 4 to 5 on the Xeon Platinum, which is 13 to 15 percent of a MAC
+of 64 bytes on the EPYC processors and 3 percent of one of 1 KiB; 6 to 17.5 ns with KMAC256 of 64
+bytes; with BLAKE2b 15.5 to 19 ns on the EPYC processors, 4.5 to 17.5 on the Xeon Platinum, 9 to 10
+on the Xeon 6900 and 3 to 4 on the Neoverse N2, 5 to 8 percent of a MAC of 64 bytes on x86-64; with
+BLAKE2s 9 to 11.5 ns on the EPYC processors, 17 to 21 on the Xeon 6900 and 4 to 6 on the others;
+with BLAKE3 1 to 3 ns on x86-64 and 7 to 8 on the Neoverse N2 for at most a block, 2 to 8 percent
+and 10 to 11 percent of it, 3.5 to 17 ns for a chunk, and 38 to 96 ns for 16 KiB, 0.3 to 3.3
+percent. A derivation of 32 bytes takes 20 to 53.5 ns more with HKDF-SHA-256, 9 to 20 percent, and
+19.5 to 86 ns more with HKDF-SHA-512, 2 to 5 percent. A MAC of 1 KiB made from a `MacKey` takes 8.5
+to 35 ns more with HMAC-SHA-256 and with BLAKE2b, 2 to 6 percent of the first, and a MAC of 64 bytes
+made with `create` 44 to 92 ns more, 16 to 43 percent, most of it the zeros of the key setup.
+ML-KEM-768, whose code did not change, moved by 1.2 percent at most on the runners whose rounds
+agree within 5 percent. On an EPYC 9V45, in an earlier run with 192 bytes fewer under HMAC on x86-64
+and rounds that spread by 5 to 18 percent, the zeros cost 1 to 2.5 ns with HMAC-SHA-256, 7.5 to 8.5
+with BLAKE2b, 2.5 to 3.5 with BLAKE2s and 2 to 3 with BLAKE3 of at most a block.
