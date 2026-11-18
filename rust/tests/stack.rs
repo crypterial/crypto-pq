@@ -616,6 +616,16 @@ fn inspect(
     }
 }
 
+// The fewest zeros to ask for after key generation. With the key caches in their eager form
+// (--cfg crypto_pq_eager) a key fills them when it is made: after the zeros of key generation and
+// of the decoding of the private key, the public values of the caches are expanded, in frames that
+// can lie deeper. The search for the secrets stands there, and the other operations show where the
+// zeros lie.
+#[cfg(any(feature = "ml-kem", feature = "ml-dsa"))]
+const fn after_key_generation(least: usize) -> usize {
+    if cfg!(crypto_pq_eager) { 0 } else { least }
+}
+
 #[cfg(feature = "ml-kem")]
 #[test]
 fn ml_kem_leaves_no_secret_on_the_stack() {
@@ -645,7 +655,7 @@ fn ml_kem_leaves_no_secret_on_the_stack() {
             "key generation",
             &stack[..],
             &[("d", &seed[..32]), ("z", &seed[32..])],
-            LEAST,
+            after_key_generation(LEAST),
         );
 
         let (encapsulation, stack) = dead_stack_after(|| {
@@ -725,7 +735,7 @@ fn ml_dsa_leaves_no_secret_on_the_stack() {
             "key generation",
             &stack[..],
             &secrets,
-            LEAST,
+            after_key_generation(LEAST),
         );
 
         let options = SignOptions::default();
