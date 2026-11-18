@@ -332,10 +332,11 @@ fn last_fors_secrets(
         .collect()
 }
 
-// Whether the stack copy holds an n-byte value as the lanes of the F chains hold it: as bytes,
-// as the big-endian words of a row of sixteen lanes each (the digests), or as those words two
-// bytes further, where the block of the next step has them after the compressed address.
-fn holds_node(stack: &[u8], value: &[u8]) -> bool {
+// Where the stack copy holds an n-byte value as the lanes of the F chains hold it, by depth under
+// the caller: as bytes, as the big-endian words of a row of sixteen lanes each (the digests), or
+// as those words two bytes further, where the block of the next step has them after the
+// compressed address.
+fn node_places(stack: &[u8], value: &[u8]) -> Vec<String> {
     let n = value.len();
 
     let words = n / 4;
@@ -360,16 +361,65 @@ fn holds_node(stack: &[u8], value: &[u8]) -> bool {
 
     let rows = 64 * words;
 
-    stack.windows(n).any(|window| window == value)
-        || (0..stack.len() - rows).any(|o| (0..words).all(|t| stack[o + 64 * t..][..4] == word(t)))
-        || (64..stack.len() - rows).any(|o| {
-            (1..words).all(|t| stack[o + 64 * (t - 1)..][..4] == straddle(t))
-                && stack[o - 64..][..2] == [value[1], value[0]]
-                && stack[o + 64 * (words - 1) + 2..][..2] == [value[n - 1], value[n - 2]]
-        })
+    let mut places = Vec::new();
+
+    for (o, window) in stack.windows(n).enumerate() {
+        if window == value {
+            places.push(format!("bytes at depth {}", stack.len() - o));
+        }
+    }
+
+    for o in 0..stack.len() - rows {
+        if (0..words).all(|t| stack[o + 64 * t..][..4] == word(t)) {
+            places.push(format!("digest rows at depth {}", stack.len() - o));
+        }
+    }
+
+    for o in 64..stack.len() - rows {
+        if (1..words).all(|t| stack[o + 64 * (t - 1)..][..4] == straddle(t))
+            && stack[o - 64..][..2] == [value[1], value[0]]
+            && stack[o + 64 * (words - 1) + 2..][..2] == [value[n - 1], value[n - 2]]
+        {
+            places.push(format!("block rows at depth {}", stack.len() - o));
+        }
+    }
+
+    places
 }
 
-fn check(algorithm: SignatureAlgorithm) {
+// How deep the operation went: the bytes from the lowest one that it wrote to the caller.
+fn depth(stack: &[u8]) -> usize {
+    stack.len()
+        - stack
+            .iter()
+            .position(|&byte| byte != 0)
+            .unwrap_or(stack.len())
+}
+
+// The processor, for the message of a failure: what a kernel leaves depends on the kernel, and so
+// on the processor that selects it.
+fn processor() -> String {
+    let info = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+
+    let field = |name: &str| {
+        info.lines()
+            .find(|line| line.starts_with(name))
+            .and_then(|line| line.split(':').nth(1))
+            .map_or("", str::trim)
+    };
+
+    let flags = [field("flags"), field("Features")].concat();
+
+    let kernels: Vec<&str> = ["avx2", "avx512vl", "sha_ni", "vaes", "sha3", "sha512"]
+        .into_iter()
+        .filter(|flag| flags.split(' ').any(|have| have == *flag))
+        .collect();
+
+    format!("{} {kernels:?}", field("model name"))
+}
+
+// What one parameter set left on the stack, each find as a line.
+fn check(algorithm: SignatureAlgorithm) -> Vec<String> {
     let name = algorithm.name();
 
     let n = algorithm.public_key_size() / 2;
@@ -380,19 +430,17 @@ fn check(algorithm: SignatureAlgorithm) {
 
     let randomness = rng.bytes(n);
 
+    let mut found = Vec::new();
+
     let (pair, stack) = dead_stack_after(|| {
         hazmat::generate_signature_key_pair(algorithm, black_box(&seed)).expect("a key pair")
     });
 
-    assert!(
-        !holds(&stack[..], &seed[..n]),
-        "{name}: SK.seed after key generation"
-    );
-
-    assert!(
-        !holds(&stack[..], &seed[n..2 * n]),
-        "{name}: SK.prf after key generation"
-    );
+    for (secret, bytes) in [("SK.seed", &seed[..n]), ("SK.prf", &seed[n..2 * n])] {
+        if holds(&stack[..], bytes) {
+            found.push(format!("{name}: {secret} after key generation"));
+        }
+    }
 
     let options = SignOptions::default();
 
@@ -406,53 +454,63 @@ fn check(algorithm: SignatureAlgorithm) {
         .expect("a signature")
     });
 
-    assert!(
-        !holds(&stack[..], &seed[..n]),
-        "{name}: SK.seed after signing"
-    );
-
-    assert!(
-        !holds(&stack[..], &seed[n..2 * n]),
-        "{name}: SK.prf after signing"
-    );
+    for (secret, bytes) in [("SK.seed", &seed[..n]), ("SK.prf", &seed[n..2 * n])] {
+        if holds(&stack[..], bytes) {
+            found.push(format!("{name}: {secret} after signing"));
+        }
+    }
 
     let public = pair
         .public_key
         .export_key(KeyFormat::Raw)
         .expect("a raw key");
 
-    let left = last_fors_secrets(&algorithm, &seed, &public, &signature)
+    for (i, secret) in last_fors_secrets(&algorithm, &seed, &public, &signature)
         .iter()
-        .filter(|secret| holds_node(&stack[..], secret))
-        .count();
+        .enumerate()
+    {
+        for place in node_places(&stack[..], secret) {
+            found.push(format!(
+                "{name}: FORS secret value {i} after signing, as {place} of {}",
+                depth(&stack[..])
+            ));
+        }
+    }
 
-    assert_eq!(left, 0, "{name}: secret values of FORS after signing");
+    found
+}
+
+fn check_all(algorithms: [SignatureAlgorithm; 6]) {
+    let found: Vec<String> = algorithms.into_iter().flat_map(check).collect();
+
+    assert!(
+        found.is_empty(),
+        "left on the stack on {}:\n{}",
+        processor(),
+        found.join("\n")
+    );
 }
 
 #[test]
 fn slh_dsa_sha2_leaves_no_secret_on_the_stack() {
-    for algorithm in [
+    check_all([
         SLH_DSA_SHA2_128F,
         SLH_DSA_SHA2_192F,
         SLH_DSA_SHA2_256F,
         SLH_DSA_SHA2_128S,
         SLH_DSA_SHA2_192S,
         SLH_DSA_SHA2_256S,
-    ] {
-        check(algorithm);
-    }
+    ]);
 }
 
 #[test]
 fn slh_dsa_shake_leaves_no_secret_on_the_stack() {
-    for algorithm in [
+    check_all([
         SLH_DSA_SHAKE_128F,
         SLH_DSA_SHAKE_192F,
         SLH_DSA_SHAKE_256F,
         SLH_DSA_SHAKE_128S,
         SLH_DSA_SHAKE_192S,
         SLH_DSA_SHAKE_256S,
-    ] {
-        check(algorithm);
-    }
+    ]);
 }
