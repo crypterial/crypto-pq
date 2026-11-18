@@ -401,6 +401,21 @@ Implements specification 2.0 (draft).
   3 a signature takes about 30 KB of stack on x86-64 and 32 KB on ARM64, where it took 30 to 34
   before the lanes were wiped in place, and key generation 18 KB, 4 to 7 KB more than before.
   Outputs are unchanged.
+- ML-KEM, ML-DSA and FrodoKEM: key generation, encapsulation, decapsulation, signing and the
+  import of a private key end by writing zeros over the stack under them, as SLH-DSA does, and so
+  does a MAC or a KDF in one call in a build at opt-level 1, 2, s or z
+  ([decision D-116](spec/decisions.md#decision-d-116)). At opt-level 3, FrodoKEM left its shared
+  secret on the stack after encapsulation and after decapsulation on x86-64 and in builds without
+  the CPU kernels, and with FrodoKEM-1344 on ARM64 cores without the SHA-3 instructions; ML-KEM
+  left its shared secret and the coins of the encryption when built for x86-64-v3, and the noise
+  seed and the coins with fat LTO on ARM64; ML-DSA left rho' and K after key generation in builds
+  without the CPU kernels. Below opt-level 3, HMAC, HKDF and BLAKE2b left their key, the states
+  after its blocks or the derived key in the frames of their kernels. The test of the dead stack
+  covers these operations, in the release build, in the test profile and at opt-level z in CI. On
+  an Apple M3 under Linux an operation of ML-KEM takes 11 to 185 ns more, 0.1 to 5 percent, and
+  ML-DSA the same time as before. At opt-level 3 on x86-64 an operation takes about 2 KB more
+  stack with ML-KEM, 4.5 KB more with ML-DSA and 4.4 to 8 KB more with FrodoKEM. A MAC or a KDF at
+  opt-level 3 and the incremental forms of a MAC are as before. Outputs are unchanged.
 - HMAC-SHA-256 and HKDF-SHA-256 on x86-64 with the SHA extensions, in builds at opt-level 2: the
   copy of both streams that the feed-forward of a block kept was a call to memcpy, around which
   the registers with the words of the two key blocks were saved on the stack, where nothing wiped
