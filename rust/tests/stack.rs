@@ -1,8 +1,11 @@
-// No secret of SLH-DSA is left on the dead stack (SPEC 14.5 item 1, D-76). The stack below the
-// caller is zeroed, one operation runs, and the same region is searched for the seeds of the key
-// and for secret values of FORS, which the test derives itself (FIPS 205, Algorithms 14 and 19).
-// The lanes of the F chains were once moved before their wipe: the copy was wiped, and the
-// original kept SK.seed or the sixteen FORS values that it hashed last, on every target.
+// No secret of SLH-DSA is left on the dead stack (SPEC 14.5 item 1, D-76, D-115). The stack below
+// the caller is painted, one operation runs, and the same region is searched for the seeds of the
+// key and for secret values of FORS, which the test derives itself (FIPS 205, Algorithms 14 and
+// 19). The lanes of the F chains were once moved before their wipe: the copy was wiped, and the
+// original kept SK.seed or the sixteen FORS values that it hashed last, on every target. A kernel
+// can also leave a value that it held in a register in its frame, so key generation and signing
+// end by writing zeros over the stack under them, and the test checks that these zeros lie where
+// the operation went deepest: a call that went deeper would have its frame under them.
 //
 // On Linux and macOS, where a thread's stack is mapped as a whole, and on the two architectures
 // whose stack pointer the test reads.
@@ -21,16 +24,28 @@ use crypto_pq::{
     SLH_DSA_SHAKE_256S, SignOptions, SignatureAlgorithm, hazmat,
 };
 
-// The dead stack that is cleared and read: more than any operation here uses, and well inside a
+// The dead stack that is painted and read: more than any operation here uses, and well inside a
 // test thread's stack.
 const SPAN: usize = 1 << 17;
 
 const MESSAGE: &[u8] = b"crypto-pq dead stack check";
 
-// Zeros over the SPAN bytes below the stack pointer.
+// What the dead stack holds before an operation. Not zero, so that the zeros that the library
+// writes are told from the bytes that nothing wrote.
+const PAINT: u8 = 0xA5;
+
+// The fewest zeros in a row that key generation and signing leave under them: the smallest size
+// of D-115, less what the calls after the zeros write at their top.
+const ZEROS: usize = 15 << 10;
+
+// How far above the deepest byte that an operation wrote its zeros may begin: the frames of the
+// calls that write them.
+const SLACK: usize = 1 << 10;
+
+// PAINT over the SPAN bytes below the stack pointer.
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
-fn clear() {
+fn paint() {
     // SAFETY: the bytes below the stack pointer are frames of calls that have returned, on a
     // stack mapped beyond SPAN; the block is not nostack, so the compiler keeps nothing of this
     // function there, and it restores the direction flag's cleared state by not changing it.
@@ -38,12 +53,11 @@ fn clear() {
         core::arch::asm!(
             "lea rdi, [rsp - {span}]",
             "mov rcx, {span}",
-            "xor eax, eax",
             "rep stosb",
             span = const SPAN,
             out("rdi") _,
             out("rcx") _,
-            out("rax") _,
+            in("al") PAINT,
         );
     }
 }
@@ -52,7 +66,7 @@ fn clear() {
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 fn read(copy: &mut [u8; SPAN]) {
-    // SAFETY: as in clear, for reads; copy is writable for SPAN bytes.
+    // SAFETY: as in paint, for reads; copy is writable for SPAN bytes.
     unsafe {
         core::arch::asm!(
             "lea rsi, [rsp - {span}]",
@@ -68,19 +82,20 @@ fn read(copy: &mut [u8; SPAN]) {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn clear() {
+fn paint() {
     // SAFETY: as on x86-64; SPAN is a multiple of sixteen.
     unsafe {
         core::arch::asm!(
             "sub {p}, sp, #{span}",
             "mov {n}, #{span}",
             "2:",
-            "stp xzr, xzr, [{p}], #16",
+            "stp {v}, {v}, [{p}], #16",
             "subs {n}, {n}, #16",
             "b.ne 2b",
             span = const SPAN,
             p = out(reg) _,
             n = out(reg) _,
+            v = in(reg) u64::from_ne_bytes([PAINT; 8]),
         );
     }
 }
@@ -117,7 +132,7 @@ fn dead_stack_after<R>(operation: impl FnOnce() -> R) -> (R, Box<[u8; SPAN]>) {
         .try_into()
         .expect("SPAN bytes");
 
-    clear();
+    paint();
 
     let result = black_box(operation());
 
@@ -175,6 +190,11 @@ fn the_search_finds_a_value_left_in_a_frame() {
     assert!(
         holds(&stack[..], &secret),
         "a value left in a frame is found"
+    );
+
+    assert!(
+        zeros_under(&stack[..]) < ZEROS,
+        "and its frame is not taken for the zeros of the library"
     );
 
     let (_, stack) = dead_stack_after(|| black_box(secret[0]));
@@ -387,13 +407,37 @@ fn node_places(stack: &[u8], value: &[u8]) -> Vec<String> {
     places
 }
 
+// The lowest byte that the operation wrote, as an index into the stack copy.
+fn lowest(stack: &[u8]) -> usize {
+    stack
+        .iter()
+        .position(|&byte| byte != PAINT)
+        .unwrap_or(stack.len())
+}
+
 // How deep the operation went: the bytes from the lowest one that it wrote to the caller.
 fn depth(stack: &[u8]) -> usize {
-    stack.len()
-        - stack
-            .iter()
-            .position(|&byte| byte != 0)
-            .unwrap_or(stack.len())
+    stack.len() - lowest(stack)
+}
+
+// The longest run of zeros that begins within SLACK bytes above the lowest byte that the
+// operation wrote: the zeros that it ended with, if no call went deeper than they reach.
+fn zeros_under(stack: &[u8]) -> usize {
+    let mut longest = 0;
+
+    let mut start = lowest(stack);
+
+    let end = (start + SLACK).min(stack.len());
+
+    while start < end {
+        let run = stack[start..].iter().take_while(|&&byte| byte == 0).count();
+
+        longest = longest.max(run);
+
+        start += run + 1;
+    }
+
+    longest
 }
 
 // The processor, for the message of a failure: what a kernel leaves depends on the kernel, and so
@@ -442,6 +486,14 @@ fn check(algorithm: SignatureAlgorithm) -> Vec<String> {
         }
     }
 
+    if zeros_under(&stack[..]) < ZEROS {
+        found.push(format!(
+            "{name}: a call of key generation went deeper than its zeros, {} bytes of {}",
+            zeros_under(&stack[..]),
+            depth(&stack[..])
+        ));
+    }
+
     let options = SignOptions::default();
 
     let (signature, stack) = dead_stack_after(|| {
@@ -458,6 +510,14 @@ fn check(algorithm: SignatureAlgorithm) -> Vec<String> {
         if holds(&stack[..], bytes) {
             found.push(format!("{name}: {secret} after signing"));
         }
+    }
+
+    if zeros_under(&stack[..]) < ZEROS {
+        found.push(format!(
+            "{name}: a call of signing went deeper than its zeros, {} bytes of {}",
+            zeros_under(&stack[..]),
+            depth(&stack[..])
+        ));
     }
 
     let public = pair
