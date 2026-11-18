@@ -259,8 +259,10 @@ specification state them in full.
 - **Constant-time code.** Code that handles secret data has no branch or memory access that depends
   on a secret. CI checks this with valgrind memcheck, every secret marked as undefined, on x86-64
   and ARM64, in the default and the portable build.
-- **Data-independent timing.** On ARM64 CPUs with FEAT_DIT, the asymmetric secret operations run
-  with DIT set; `enable_data_independent_timing()` extends it to MACs and KDFs.
+- **Data-independent timing.** On ARM64 CPUs with FEAT_DIT, under Linux, Android and macOS, the
+  asymmetric secret operations run with DIT set; `enable_data_independent_timing()` extends it to
+  MACs and KDFs and returns whether DIT is used. Other ARM64 systems (iOS, Windows, the BSDs) run
+  without it.
 - **Wiping.** Private keys and `SecretBytes`, the type of every secret output, wipe their memory
   when dropped, with writes that the compiler cannot remove. Neither implements `Clone`. Secret
   buffers on the stack are wiped before each function returns; copies that the compiler makes in

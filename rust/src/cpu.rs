@@ -1056,8 +1056,9 @@ impl Dit {
 /// Makes every MAC and KDF call, on every thread, run with the CPU's data-independent timing
 /// mode, as the asymmetric operations always do. There is no way back.
 ///
-/// The mode exists on ARM64 CPUs with FEAT_DIT. Returns whether the CPU has it: `false` on every
-/// other CPU, in the portable build, and wherever the call has no effect.
+/// The mode is used on ARM64 CPUs with FEAT_DIT under Linux, Android and macOS. Returns whether it
+/// is used: `false` on every other CPU, on the other ARM64 systems (iOS, Windows and the BSDs among
+/// them), and in the portable build.
 pub fn enable_data_independent_timing() -> bool {
     false
 }
