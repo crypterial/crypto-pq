@@ -113,6 +113,29 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
     compiler_fence(Ordering::SeqCst);
 }
 
+// Zeros over the `N` bytes of stack under the caller's frame: the frames of the calls that it made
+// and that have returned (D-115). A wipe reaches the buffers that the code names. It does not
+// reach a register that the compiler saved in the frame of a kernel, or a vector that a kernel
+// passed through memory: such a copy stays until a later call writes over it. A function that made
+// such calls on secrets ends with this one, whose frame lies over those dead frames. `N` is what
+// the caller's calls took at most, as measured; a frame beyond it stays as it was.
+#[inline(always)]
+pub(crate) fn below<const N: usize>() {
+    dead_frames::<N>();
+
+    // Not the caller's last call: as a tail call it would start where the caller's frame did and
+    // reach that much less.
+    compiler_fence(Ordering::SeqCst);
+}
+
+// Never inlined, so that the array lies under the caller's frame and not in it.
+#[inline(never)]
+fn dead_frames<const N: usize>() {
+    let mut frames = [0u8; N];
+
+    wipe(&mut frames);
+}
+
 // wipe for an array that holds secrets and that LLVM keeps in registers at opt-level 3: there the
 // wipe would give the array an address, and so the very memory copy it then clears, while at the
 // other levels the array is in memory and has to be wiped (D-76). build.rs sets

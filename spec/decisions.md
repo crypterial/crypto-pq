@@ -1825,3 +1825,59 @@ which runs the portable code for one message, 0.998 to 1.002. The same code in o
 the loop took up to 1.4 percent more than here for a digest of at most a block on Zen 3, 1.8
 percent on Granite Rapids and 3.8 percent on Ice Lake, and for a MAC of no data 2 percent more on
 Ice Lake and 3 percent less on Zen 3; for the other rows the two were within 1 percent.
+
+## Decision D-115
+
+A function that ran kernels on secret values may end by writing zeros over the stack under its
+frame, where the frames of its calls were. A kernel holds secret values in registers, and where it
+has more values than registers, or passes a vector through memory, the compiler stores some of them
+in the kernel's frame. These are the copies of [14.5](14-security.md#145-wiping) item 3: no wipe of
+a buffer reaches them, and they stay in the dead frame until a later call writes over them. The
+zeros are a wipe in the sense of item 1 of that section, over an array of a fixed size in the frame
+of a function which is never inlined and which the first function calls after its last call on
+secrets. A compiler fence follows that call, so that it is not a tail call, whose frame would start
+where the caller's frame did. The size is the most that the calls of the first function took in
+the builds measured, and a margin. The zeros do not reach the frame of the first function, the
+frames of its callers, a frame deeper than the size, or the registers, so the limitation of item 3
+stands, and the documentation states it as before.
+
+SLH-DSA does this in the function that computes the root of the top tree, which key generation and
+the import of a private key call, and at the end of signing, with 16 KiB at opt-level 3, 48 KiB at
+opt-level 0 and 24 KiB at the other levels. The build script tells the three apart as it reads the
+level for [D-76](#decision-d-76), and a build whose level it cannot read takes 24 KiB.
+
+Over the twelve parameter sets, the calls under the two functions took at most 12,152 bytes at
+opt-level 3: on x86-64 under qemu-x86_64, 12,152 as EPYC-Milan and as Haswell, 11,056 as Nehalem,
+11,864 built for x86-64-v3, 11,912 with fat LTO and 9,824 in the portable build; on ARM64, 9,312
+natively, 9,512 as Cortex-A72 and in the portable build and 9,384 with fat LTO. At opt-levels 1,
+2, s and z they took at most 12,432, 12,888, 13,424 and 20,528 bytes on x86-64 and 10,584, 10,416,
+10,189 and 11,920 on ARM64, and at opt-level 0, where no call is inline, about 36,000 on both. An
+operation at opt-level 3 now reaches 16 KiB under the two functions, 4 KiB deeper than its calls
+went on x86-64 and 7 KiB on ARM64.
+
+With the zeros, a search of the dead stack for SK.seed, SK.prf, the states of HMAC under SK.prf
+after its key blocks (PRF_msg) and the secret values of the last sixteen leaves of the last FORS
+tree finds none after key generation and after signing, for the twelve sets in each of these
+builds: 468 runs, with the six fast sets alone at opt-level 0 on x86-64. Without them it found
+the outer state of that HMAC after a signature with SLH-DSA-SHA2-128s and SLH-DSA-SHA2-128f at
+opt-levels 1, s and z on x86-64, and with the four SHA-2 sets of 192 and 256 bits in the build
+with fat LTO on ARM64. PRF_msg holds a keyed MAC by value, whose copies are those of
+[D-76](#decision-d-76), and they lie in the frames under signing.
+
+tests/stack.rs paints the dead stack, runs key generation and signing for the twelve sets, searches
+the stack for SK.seed, SK.prf and those values of FORS, and checks that the zeros lie where the
+operation went deepest, which fails as soon as a call goes deeper than they reach. CI runs it in
+the release build, in the test profile and at opt-level z, on the processors of its runners.
+
+Rationale: in the first CI run of that test, the test profile (opt-level 3 with debug assertions)
+on a Xeon Platinum 8573C, which runs the kernels of AVX-512VL, left the last secret value of FORS
+as bytes, 24,160 bytes under the caller of a signature 28,792 bytes deep, with SLH-DSA-SHAKE-256f
+and SLH-DSA-SHAKE-256s. The release build left none on the eight runners with AVX-512VL of that
+run, a Xeon of the same model among them, and no build measured under emulation left any. What a
+kernel leaves in its frame follows from register allocation, which changes with the compiler, its
+flags and the kernel that the processor selects, so a list of builds found clean says nothing
+about the next one, and the zeros do not depend on it. They cost one write of the array per
+operation: 86 ns for 16 KiB on an Apple M3, where the shortest operation, key generation with
+SLH-DSA-SHA2-128f, takes 95,000 ns with and without them. A wipe in each kernel is not possible, as
+the source has no name for a spill slot. One size for every level would be that of opt-level 0,
+which is 32 KiB more stack than a build at opt-level 3 needs.
