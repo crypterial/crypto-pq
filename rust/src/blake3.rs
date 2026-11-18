@@ -135,11 +135,14 @@ fn round_pair(v: &mut [u32; 16], w: &mut [u32; 16], m: &[u32; 16], n: &[u32; 16]
 // registers.
 #[inline(always)]
 fn permute(m: &[u32; 16]) -> [u32; 16] {
-    core::array::from_fn(|i| m[PERMUTATION[i]])
+    registers!(|i| m[PERMUTATION[i]]; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)
 }
 
 // The state after the seven rounds over the chaining value cv and the message words m, with the
-// 64-bit counter, the block's length and the domain flags.
+// 64-bit counter, the block's length and the domain flags. The state derives from the key in the
+// keyed modes, and the message words are secret where the input is (the key material of
+// derive_key): below opt-level 3, where they are in memory, the callers wipe the state and the
+// words they pass, and the permuted words are wiped here (D-76).
 #[inline(always)]
 fn rounds(cv: &[u32; 8], m: &[u32; 16], counter: u64, length: u32, flags: u32) -> [u32; 16] {
     let mut v = [
@@ -164,29 +167,47 @@ fn rounds(cv: &[u32; 8], m: &[u32; 16], counter: u64, length: u32, flags: u32) -
     // Written out: as a loop, the permutation became moves between registers and the stack.
     round(&mut v, m);
 
-    let m = permute(m);
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut second = permute(m);
 
-    round(&mut v, &m);
+    round(&mut v, &second);
 
-    let m = permute(&m);
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut third = permute(&second);
 
-    round(&mut v, &m);
+    round(&mut v, &third);
 
-    let m = permute(&m);
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut fourth = permute(&third);
 
-    round(&mut v, &m);
+    round(&mut v, &fourth);
 
-    let m = permute(&m);
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut fifth = permute(&fourth);
 
-    round(&mut v, &m);
+    round(&mut v, &fifth);
 
-    let m = permute(&m);
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut sixth = permute(&fifth);
 
-    round(&mut v, &m);
+    round(&mut v, &sixth);
 
-    let m = permute(&m);
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut seventh = permute(&sixth);
 
-    round(&mut v, &m);
+    round(&mut v, &seventh);
+
+    wipe_unless_optimized!(&mut second);
+
+    wipe_unless_optimized!(&mut third);
+
+    wipe_unless_optimized!(&mut fourth);
+
+    wipe_unless_optimized!(&mut fifth);
+
+    wipe_unless_optimized!(&mut sixth);
+
+    wipe_unless_optimized!(&mut seventh);
 
     v
 }
@@ -223,7 +244,11 @@ fn compress_portable(
     flags: u32,
     out: &mut [u32; 16],
 ) {
-    let v = rounds(cv, &words(block), counter, length, flags);
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut m = words(block);
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut v = rounds(cv, &m, counter, length, flags);
 
     for (i, word) in out.iter_mut().enumerate() {
         *word = if i < 8 {
@@ -232,6 +257,10 @@ fn compress_portable(
             v[i] ^ cv[i - 8]
         };
     }
+
+    wipe_unless_optimized!(&mut v);
+
+    wipe_unless_optimized!(&mut m);
 }
 
 // The chaining value, the first eight output words alone, into out.
@@ -268,11 +297,19 @@ fn chain_portable(
     flags: u32,
     out: &mut [u32; 8],
 ) {
-    let v = rounds(cv, &words(block), counter, length, flags);
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut m = words(block);
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut v = rounds(cv, &m, counter, length, flags);
 
     for (i, word) in out.iter_mut().enumerate() {
         *word = v[i] ^ v[i + 8];
     }
+
+    wipe_unless_optimized!(&mut v);
+
+    wipe_unless_optimized!(&mut m);
 }
 
 // The final block of a chain, with its length and flags.
@@ -328,15 +365,31 @@ fn chain_blocks_portable(
             f |= end;
         }
 
-        let v = rounds(&h, &words(block), counter, BLOCK as u32, f);
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut m = words(block);
 
-        h = core::array::from_fn(|i| v[i] ^ v[i + 8]);
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut v = rounds(&h, &m, counter, BLOCK as u32, f);
+
+        h = registers!(|i| v[i] ^ v[i + 8]; 0 1 2 3 4 5 6 7);
+
+        wipe_unless_optimized!(&mut v);
+
+        wipe_unless_optimized!(&mut m);
     }
 
     if let Some((block, length, f)) = last {
-        let v = rounds(&h, &words(block), counter, length, f);
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut m = words(block);
 
-        h = core::array::from_fn(|i| v[i] ^ v[i + 8]);
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut v = rounds(&h, &m, counter, length, f);
+
+        h = registers!(|i| v[i] ^ v[i + 8]; 0 1 2 3 4 5 6 7);
+
+        wipe_unless_optimized!(&mut v);
+
+        wipe_unless_optimized!(&mut m);
     }
 
     *out = h;
@@ -391,38 +444,55 @@ fn chain_blocks_pair(
 
         let (mut v, mut w) = (start(&h[0], counters[0]), start(&h[1], counters[1]));
 
-        let (m, n) = (words(first), words(second));
+        // Each round's words of both inputs under a name of their own: below opt-level 3 they
+        // are in memory and wiped, as in rounds.
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let (mut m, mut n) = (words(first), words(second));
 
         round_pair(&mut v, &mut w, &m, &n);
 
-        let (m, n) = (permute(&m), permute(&n));
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let (mut m2, mut n2) = (permute(&m), permute(&n));
 
-        round_pair(&mut v, &mut w, &m, &n);
+        round_pair(&mut v, &mut w, &m2, &n2);
 
-        let (m, n) = (permute(&m), permute(&n));
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let (mut m3, mut n3) = (permute(&m2), permute(&n2));
 
-        round_pair(&mut v, &mut w, &m, &n);
+        round_pair(&mut v, &mut w, &m3, &n3);
 
-        let (m, n) = (permute(&m), permute(&n));
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let (mut m4, mut n4) = (permute(&m3), permute(&n3));
 
-        round_pair(&mut v, &mut w, &m, &n);
+        round_pair(&mut v, &mut w, &m4, &n4);
 
-        let (m, n) = (permute(&m), permute(&n));
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let (mut m5, mut n5) = (permute(&m4), permute(&n4));
 
-        round_pair(&mut v, &mut w, &m, &n);
+        round_pair(&mut v, &mut w, &m5, &n5);
 
-        let (m, n) = (permute(&m), permute(&n));
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let (mut m6, mut n6) = (permute(&m5), permute(&n5));
 
-        round_pair(&mut v, &mut w, &m, &n);
+        round_pair(&mut v, &mut w, &m6, &n6);
 
-        let (m, n) = (permute(&m), permute(&n));
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let (mut m7, mut n7) = (permute(&m6), permute(&n6));
 
-        round_pair(&mut v, &mut w, &m, &n);
+        round_pair(&mut v, &mut w, &m7, &n7);
 
         h = [
-            core::array::from_fn(|i| v[i] ^ v[i + 8]),
-            core::array::from_fn(|i| w[i] ^ w[i + 8]),
+            registers!(|i| v[i] ^ v[i + 8]; 0 1 2 3 4 5 6 7),
+            registers!(|i| w[i] ^ w[i + 8]; 0 1 2 3 4 5 6 7),
         ];
+
+        #[cfg(not(crypto_pq_optimized))]
+        for array in [
+            &mut v, &mut w, &mut m, &mut n, &mut m2, &mut n2, &mut m3, &mut n3, &mut m4, &mut n4,
+            &mut m5, &mut n5, &mut m6, &mut n6, &mut m7, &mut n7,
+        ] {
+            wipe(array);
+        }
     }
 
     *out = h;
@@ -1422,7 +1492,11 @@ fn digest1<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
         }
     };
 
-    let v = rounds(&cv, &words(block), 0, data.len() as u32, flags);
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut m = words(block);
+
+    #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+    let mut v = rounds(&cv, &m, 0, data.len() as u32, flags);
 
     wipe_unless_optimized!(&mut cv);
 
@@ -1442,6 +1516,11 @@ fn digest1<K: KeyWords>(key: &K, flags: u32, data: &[u8], out: &mut [u8]) {
 
         wipe(&mut bytes);
     }
+
+    // The state after the rounds gives the key back, with the message.
+    wipe_unless_optimized!(&mut v);
+
+    wipe_unless_optimized!(&mut m);
 
     wipe(&mut copy);
 }
@@ -1908,7 +1987,11 @@ mod gathered {
         flags: u32,
         out: &mut [u32; 16],
     ) {
-        let v = rounds(cv, &words(block), counter, length, flags);
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut m = words(block);
+
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut v = rounds(cv, &m, counter, length, flags);
 
         for (i, word) in out.iter_mut().enumerate() {
             *word = if i < 8 {
@@ -1917,6 +2000,10 @@ mod gathered {
                 v[i] ^ cv[i - 8]
             };
         }
+
+        wipe_unless_optimized!(&mut v);
+
+        wipe_unless_optimized!(&mut m);
     }
 
     // The chaining value after whole blocks of one chunk, from cv, into out: the first block with
@@ -1967,15 +2054,31 @@ mod gathered {
                 f |= end;
             }
 
-            let v = rounds(&h, &words(block), counter, BLOCK as u32, f);
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut m = words(block);
 
-            h = core::array::from_fn(|i| v[i] ^ v[i + 8]);
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut v = rounds(&h, &m, counter, BLOCK as u32, f);
+
+            h = registers!(|i| v[i] ^ v[i + 8]; 0 1 2 3 4 5 6 7);
+
+            wipe_unless_optimized!(&mut v);
+
+            wipe_unless_optimized!(&mut m);
         }
 
         if let Some((block, length, f)) = last {
-            let v = rounds(&h, &words(block), counter, length, f);
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut m = words(block);
 
-            h = core::array::from_fn(|i| v[i] ^ v[i + 8]);
+            #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+            let mut v = rounds(&h, &m, counter, length, f);
+
+            h = registers!(|i| v[i] ^ v[i + 8]; 0 1 2 3 4 5 6 7);
+
+            wipe_unless_optimized!(&mut v);
+
+            wipe_unless_optimized!(&mut m);
         }
 
         *out = h;
@@ -2074,7 +2177,11 @@ mod gathered {
             }
         };
 
-        let v = rounds(key, &words(block), 0, data.len() as u32, flags);
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut m = words(block);
+
+        #[cfg_attr(crypto_pq_optimized, allow(unused_mut))]
+        let mut v = rounds(key, &m, 0, data.len() as u32, flags);
 
         let mut bytes = [0; 32];
 
@@ -2092,6 +2199,10 @@ mod gathered {
 
             wipe(&mut bytes);
         }
+
+        wipe_unless_optimized!(&mut v);
+
+        wipe_unless_optimized!(&mut m);
 
         wipe(&mut copy);
     }
