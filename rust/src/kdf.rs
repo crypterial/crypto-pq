@@ -12,7 +12,7 @@ use crate::hash::{HashAlgorithm, Kind, SHA_256, SHA_384, SHA_512};
 use crate::mac::{block_key, hmac};
 #[cfg(feature = "hkdf")]
 use crate::sha2::{self, Sha256, Sha512, finish256, finish512};
-use crate::wipe::{SecretBytes, wipe};
+use crate::wipe::{SecretBytes, below_keyed, wipe};
 
 // A build without HKDF has no hash for it: hkdf() always fails, which the empty type lets the
 // compiler see, so that BLAKE3-KDF keeps the whole interface.
@@ -144,6 +144,8 @@ impl KdfAlgorithm {
 
         self.derive_unchecked(ikm, &mut out, options);
 
+        below_keyed!();
+
         Ok(out)
     }
 
@@ -159,6 +161,8 @@ impl KdfAlgorithm {
         self.check_output(out.len())?;
 
         self.derive_unchecked(ikm, out, options);
+
+        below_keyed!();
 
         Ok(())
     }
@@ -216,6 +220,8 @@ impl KdfAlgorithm {
 
         hmac(&hash, options.salt, ikm, out);
 
+        below_keyed!();
+
         Ok(())
     }
 
@@ -235,6 +241,8 @@ impl KdfAlgorithm {
 
         expand_unchecked(&hash, prk, options.info, &mut out);
 
+        below_keyed!();
+
         Ok(out)
     }
 
@@ -250,6 +258,8 @@ impl KdfAlgorithm {
         let _dit = Dit::keyed();
 
         expand_unchecked(&hash, prk, options.info, out);
+
+        below_keyed!();
 
         Ok(())
     }
