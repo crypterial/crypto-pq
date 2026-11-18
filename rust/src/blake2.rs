@@ -87,7 +87,25 @@ pub(crate) trait Word:
     // The CPU kernel of mac, from the unkeyed chaining value: the kernel puts the key's length in,
     // in registers.
     fn mac_kernel(h: &[Self; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel;
+
+    // The zeros under a MAC in one call at opt-level 3 (D-117).
+    fn below();
 }
+
+// What the calls of a MAC in one call take under mac at opt-level 3, with a tenth more: the frames
+// of the kernels, whose sizes do not depend on the message. On x86-64 the code of BLAKE2b takes
+// 1,727 bytes with debug assertions, as in the test profile, and 1,495 without, and both sizes
+// stay under the 2 KiB from which the C library's memset changes its method.
+#[cfg(crypto_pq_optimized)]
+crate::wipe::taken!(
+    TAKEN_64,
+    if cfg!(debug_assertions) { 1920 } else { 1664 },
+    448,
+    2880
+);
+
+#[cfg(crypto_pq_optimized)]
+crate::wipe::taken!(TAKEN_32, 960, 320, 1536);
 
 impl Word for u64 {
     const BYTES: usize = 8;
@@ -167,6 +185,16 @@ impl Word for u64 {
     fn mac_kernel(h: &[Self; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
         cpu::blake2b_mac(h, key, data, out)
     }
+
+    // The kernels of BLAKE2b store the gathered message words of each block in their frames, and
+    // the chaining value that a block starts from: after a MAC, that of its last block, and after
+    // the MAC of an empty message the words of the key. The zeros lie here, nearer the kernels
+    // than those of the other MACs: under the whole call they would be half as many again.
+    #[inline(always)]
+    fn below() {
+        #[cfg(crypto_pq_optimized)]
+        crate::wipe::below::<TAKEN_64>();
+    }
 }
 
 impl Word for u32 {
@@ -245,6 +273,17 @@ impl Word for u32 {
     #[inline(always)]
     fn mac_kernel(h: &[Self; 8], key: &[u8], data: &[u8], out: &mut [u8]) -> Kernel {
         cpu::blake2s_mac(h, key, data, out)
+    }
+
+    // The kernels of BLAKE2s leave some of the message words of the last block in their frames,
+    // which after an empty message are words of the key, and with debug assertions a part of the
+    // chaining value after the key block. Otherwise they kept what they make of the key in
+    // registers in the builds measured, which a compiler is free to change: the zeros are written
+    // in every case.
+    #[inline(always)]
+    fn below() {
+        #[cfg(crypto_pq_optimized)]
+        crate::wipe::below::<TAKEN_32>();
     }
 }
 
@@ -834,7 +873,11 @@ pub(crate) fn digest<W: Word>(h: &[W; 8], data: &[u8], out: &mut [u8]) {
 // h of the configured digest length.
 pub(crate) fn mac<W: Word>(h: &[W; 8], key: &[u8], data: &[u8], out: &mut [u8]) {
     let kernel = match W::mac_kernel(h, key, data, out) {
-        Kernel::Done => return,
+        Kernel::Done => {
+            W::below();
+
+            return;
+        }
         Kernel::Blocks => true,
         Kernel::Portable => false,
     };
@@ -875,6 +918,8 @@ pub(crate) fn mac<W: Word>(h: &[W; 8], key: &[u8], data: &[u8], out: &mut [u8]) 
     wipe(&mut key_block);
 
     wipe(&mut last);
+
+    W::below();
 }
 
 // An incremental hash. The buffer keeps the last block seen until more data arrives, since only

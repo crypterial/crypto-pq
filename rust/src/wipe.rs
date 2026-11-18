@@ -156,6 +156,30 @@ macro_rules! frames {
 #[allow(unused_imports)]
 pub(crate) use frames;
 
+// A size for `below` at opt-level 3 by the target: x86-64, ARM64, and every other one, where no
+// depth was measured and the size is the larger of the two with half as much again. The depths
+// were read under Linux. Windows and UEFI have a calling convention of their own, in which a
+// function saves the vector registers that it uses in its frame: they take the third size.
+#[allow(unused_macros)]
+macro_rules! taken {
+    ($name:ident, $x86_64:expr, $aarch64:expr, $other:expr) => {
+        #[cfg(all(target_arch = "x86_64", not(any(windows, target_os = "uefi"))))]
+        pub(crate) const $name: usize = $x86_64;
+
+        #[cfg(all(target_arch = "aarch64", not(any(windows, target_os = "uefi"))))]
+        pub(crate) const $name: usize = $aarch64;
+
+        #[cfg(not(all(
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(any(windows, target_os = "uefi"))
+        )))]
+        pub(crate) const $name: usize = $other;
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use taken;
+
 // `below` under a keyed hash or a KDF in one call, at the opt-levels 1, 2, s and z (D-116). There
 // their kernels pass arrays of key words by value and store state words that stay in registers at
 // 3, in frames that no wipe of a buffer reaches. 16 KiB: the calls took at most 4,943 bytes, and
