@@ -1911,12 +1911,16 @@ three operations. Under a MAC in one call they took at most 4,943 bytes at 1, 2,
 (HMAC-SHA-512 on x86-64 at z) for 100 bytes and for 64 KiB of data, but for BLAKE3, whose calls
 took 9,372 bytes for 64 KiB and 11,308 for 4 MiB, about 320 more for each doubling; under HKDF
 4,255. At opt-level 0 the calls of a MAC take up to 80 KB (BLAKE3), and a MAC and a KDF end with no
-zeros there. No emulated processor ran the kernels of AVX-512. The frames that the unwind tables of
-the x86-64 build at opt-level 3 give for the kernels of every tier add up to at most 4,374 bytes
-under K-PKE's key generation and encryption, 2,656 under the decryption, 296 for G and J, 5,991
-under ML-DSA's key generation and signing and 10,029 under FrodoKEM's operations, and with its
-calls each kernel of AVX-512 takes less stack than the kernel in its place on a processor without
-it.
+zeros there. In the test profile, opt-level 3 with debug assertions, which is not among the twenty
+builds, the calls took at most 5,495 bytes under K-PKE's key generation and encryption, 3,740
+under the check of a decapsulation key, 2,215 under the decryption, 372 under the decoding and 343
+for G and J, 7,895 under ML-DSA's functions and 13,223 under FrodoKEM's, on ARM64 and on x86-64 as
+EPYC-Milan, Haswell and Nehalem. No emulated processor ran the kernels of AVX-512. The frames that
+the unwind tables of the x86-64 build at opt-level 3 give for the kernels of every tier add up to
+at most 4,374 bytes under K-PKE's key generation and encryption, 2,656 under the decryption, 296
+for G and J, 5,991 under ML-DSA's key generation and signing and 10,029 under FrodoKEM's
+operations, and with its calls each kernel of AVX-512 takes less stack than the kernel in its
+place on a processor without it, in that build and in the test profile.
 
 With the zeros, a search of the dead stack after each operation finds none of the values of ML-KEM,
 ML-DSA, FrodoKEM, SLH-DSA, LMS and XMSS in 23 builds, and none of those of a MAC or a KDF in one
@@ -1961,9 +1965,10 @@ writes one array in key generation, two in encapsulation and three in decapsulat
 ns more per operation, 0.1 to 5.0 percent (ML-KEM-768: 124, 77 and 150 ns more on 5.6, 2.8 and 4.9
 us); ML-DSA took the same time within the noise of the measurement, in which its verification,
 which writes no array, moved by as much; FrodoKEM's operations take milliseconds. On that machine
-an array of 1 to 6 KiB takes about 55 ns to write, one of 512 bytes 5 ns. A MAC of 64 bytes takes
-214 ns (BLAKE2b) to 493 ns (KMAC256) on the EPYC 9V74 of CI's benchmark job, so at opt-level 3 the
-zeros would be a large part of it: there a MAC and a KDF end as before, the limitation of
+an array of 3 to 6 KiB takes about 55 ns to write, one of 1 KiB 30 to 60 ns and one of 512 bytes,
+which the compiler writes with stores of its own, 5 ns. A MAC of 64 bytes takes 214 ns (BLAKE2b)
+to 493 ns (KMAC256) on the EPYC 9V74 of CI's benchmark job, so at opt-level 3 the zeros would be
+a large part of it: there a MAC and a KDF end as before, the limitation of
 [14.5](14-security.md#145-wiping) item 3 stands for them, and whether they take zeros of their own
 is left to a later decision with its own measurement. The incremental forms of a MAC are not
 changed either: their object holds the keyed state, and [D-76](#decision-d-76) describes its
