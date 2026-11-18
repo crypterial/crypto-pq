@@ -416,8 +416,31 @@ Implements specification 2.0 (draft).
   more on the x86-64 server processors measured (EPYC 7763, Xeon Platinum 8573C, Xeon 6975P-C),
   0.3 to 4.4 percent; key generation of ML-DSA takes 0.1 to 0.3 us more, up to 2.1 percent. At
   opt-level 3 on x86-64 an operation takes about 2 KB more
-  stack with ML-KEM, 4.5 KB more with ML-DSA and 4.4 to 8 KB more with FrodoKEM. A MAC or a KDF at
-  opt-level 3 and the incremental forms of a MAC are as before. Outputs are unchanged.
+  stack with ML-KEM, 4.5 KB more with ML-DSA and 4.4 to 8 KB more with FrodoKEM. Outputs are
+  unchanged.
+- A MAC and a KDF in one call end by writing zeros over the stack under them at opt-level 3 too, and
+  the key setup of an incremental MAC or of a MAC key and the end of an incremental MAC end with
+  them at every opt-level but 0 ([decision D-117](spec/decisions.md#decision-d-117)). At opt-level 3
+  a BLAKE2b MAC left the chaining value after its key block, and after an empty message its key; a
+  BLAKE2s MAC of an empty message 8 to 20 bytes of its key; HMAC-SHA-512 the state after its outer
+  key block on x86-64 and on ARM64 cores without the SHA-512 instructions; HKDF-SHA-512 its output
+  with fat LTO on ARM64; BLAKE3-KDF 12 bytes of its input keying material on ARM64; KMAC up to 120
+  bytes of its final state and 96 of its state after the key; a keyed BLAKE3 of more than a chunk 12
+  to 20 bytes of its key on ARM64; and with debug assertions a keyed BLAKE3 the state of a
+  compression, or its whole key. An incremental MAC left its keyed state in frames of the library at
+  every opt-level. The zeros are 320 bytes to 12 KiB at opt-level 3, by the hash and for BLAKE3 by
+  the length of the data, and those of BLAKE2 are written next to its kernels. The test of the dead
+  stack covers, at opt-level 3, a MAC in one call with data, with an empty message and with 16 KiB,
+  an incremental MAC and the three KDFs, in the release build and in the test profile. A MAC in one
+  call takes 1 to 23 ns more on the server processors measured (EPYC 7763, 9V45 and 9V74, Xeon
+  Platinum 8573C, Xeon 6975P-C, Neoverse N2): up to 15 percent for HMAC-SHA-256 of 64 bytes, 8 for
+  BLAKE2b, 13 for BLAKE2s, and 2 to 11 percent for a keyed BLAKE3 of at most 64 bytes. A keyed
+  BLAKE3 of 16 KiB takes 38 to 96 ns more, a derivation of 32 bytes 20 to 54 ns more with
+  HKDF-SHA-256 and 19 to 86 with HKDF-SHA-512, and a MAC made with `create` 44 to 92 ns more. At
+  opt-level 3 under Linux and macOS these calls take at most 1.1 KB more stack, and 2.5 KB more for
+  a BLAKE3 of more than 64 KiB; under Windows the zeros are half as many again. A `Mac` and a
+  `MacKey` are returned by value: the compiler leaves a copy of their keyed state in the caller's
+  own frame, which the library cannot wipe and the documentation now states. Outputs are unchanged.
 - HMAC-SHA-256 and HKDF-SHA-256 on x86-64 with the SHA extensions, in builds at opt-level 2: the
   copy of both streams that the feed-forward of a block kept was a call to memcpy, around which
   the registers with the words of the two key blocks were saved on the stack, where nothing wiped
