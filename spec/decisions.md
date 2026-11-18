@@ -1966,10 +1966,17 @@ ns more per operation, 0.1 to 5.0 percent (ML-KEM-768: 124, 77 and 150 ns more o
 us); ML-DSA took the same time within the noise of the measurement, in which its verification,
 which writes no array, moved by as much; FrodoKEM's operations take milliseconds. On that machine
 an array of 3 to 6 KiB takes about 55 ns to write, one of 1 KiB 30 to 60 ns and one of 512 bytes,
-which the compiler writes with stores of its own, 5 ns. A MAC of 64 bytes takes 214 ns (BLAKE2b)
-to 493 ns (KMAC256) on the EPYC 9V74 of CI's benchmark job, so at opt-level 3 the zeros would be
-a large part of it: there a MAC and a KDF end as before, the limitation of
+which the compiler writes with stores of its own, 5 ns. On server processors, with the benchmarks of
+the two trees run in turn on one machine, six rounds on each of ten hosted runners, an operation of
+ML-KEM took 19 to 72 ns more on a Neoverse N2, at most 1.0 percent, and 42 to 119 ns more on an EPYC
+7763, a Xeon Platinum 8573C and a Xeon 6975P-C, 0.3 to 4.4 percent, encapsulation the most
+(ML-KEM-768 on the EPYC 7763: 67, 95 and 115 ns more on 9.8, 3.3 and 6.8 us); key generation of
+ML-DSA took 0.1 to 0.3 us more, up to 2.1 percent, and signing up to 0.9 percent more, where
+verification, which writes no array, moved by up to 0.8 percent either way; on the EPYC 7763 key
+generation moved with the placement of the code instead, by up to 2.9 percent one way in the default
+build and up to 1.9 the other with every function at a 64-byte boundary. A MAC of 64 bytes takes 214
+ns (BLAKE2b) to 493 ns (KMAC256) on the EPYC 9V74 of CI's benchmark job, so at opt-level 3 the zeros
+would be a large part of it: there a MAC and a KDF end as before, the limitation of
 [14.5](14-security.md#145-wiping) item 3 stands for them, and whether they take zeros of their own
-is left to a later decision with its own measurement. The incremental forms of a MAC are not
-changed either: their object holds the keyed state, and [D-76](#decision-d-76) describes its
-copies.
+is left to a later decision with its own measurement. The incremental forms of a MAC are not changed
+either: their object holds the keyed state, and [D-76](#decision-d-76) describes its copies.
