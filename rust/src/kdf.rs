@@ -14,6 +14,28 @@ use crate::mac::{block_key, hmac};
 use crate::sha2::{self, Sha256, Sha512, finish256, finish512};
 use crate::wipe::{SecretBytes, below_keyed, wipe};
 
+// The stack that the calls of a derivation take under them at opt-level 3, in bytes, as those of a
+// MAC (D-117).
+#[cfg(crypto_pq_optimized)]
+mod taken {
+    #[cfg(feature = "blake3")]
+    pub(super) use crate::mac::taken::{BLAKE3_SMALL_TREE, BLAKE3_TREE};
+    use crate::wipe::taken;
+
+    // BLAKE3-KDF of at most a chunk of input: the hash of the context string and then that of
+    // the input, for an output of at most a block, and for a longer one, whose blocks the kernels
+    // of the extended output compute side by side.
+    #[cfg(feature = "blake3")]
+    taken!(BLAKE3_KDF, 1984, 1152, 2976);
+
+    #[cfg(feature = "blake3")]
+    taken!(BLAKE3_KDF_LONG, 4224, 2304, 6336);
+
+    taken!(HKDF_256, 3968, 2112, 5952);
+
+    taken!(HKDF_512, 5824, 2688, 8736);
+}
+
 // A build without HKDF has no hash for it: hkdf() always fails, which the empty type lets the
 // compiler see, so that BLAKE3-KDF keeps the whole interface.
 #[cfg(not(feature = "hkdf"))]
@@ -127,6 +149,41 @@ impl KdfAlgorithm {
         }
     }
 
+    // The zeros under a derivation in one call: 16 KiB at the opt-levels 1, 2, s and z (D-116), and
+    // at 3 what the calls of its hash take (D-117). The input of BLAKE3-KDF is the message of the
+    // hash, which its kernels take through their frames, and its output is as long as the caller
+    // asks: `output` bytes, of which every block after the first comes from the kernels of the
+    // extended output, deeper than the hash of a chunk.
+    #[inline(always)]
+    fn below(&self, input: &[u8], output: usize) {
+        below_keyed!();
+
+        #[cfg(crypto_pq_optimized)]
+        match &self.kind {
+            #[cfg(feature = "hkdf")]
+            KdfKind::Hkdf(hash) => match hash.kind {
+                Kind::Sha256(_) => crate::wipe::below::<{ taken::HKDF_256 }>(),
+                _ => crate::wipe::below::<{ taken::HKDF_512 }>(),
+            },
+            #[cfg(feature = "blake3")]
+            KdfKind::Blake3 if input.len() > 64 << 10 => {
+                crate::wipe::below::<{ taken::BLAKE3_TREE }>();
+            }
+            #[cfg(feature = "blake3")]
+            KdfKind::Blake3 if input.len() > 1024 => {
+                crate::wipe::below::<{ taken::BLAKE3_SMALL_TREE }>();
+            }
+            #[cfg(feature = "blake3")]
+            KdfKind::Blake3 if output > 64 => {
+                crate::wipe::below::<{ taken::BLAKE3_KDF_LONG }>();
+            }
+            #[cfg(feature = "blake3")]
+            KdfKind::Blake3 => crate::wipe::below::<{ taken::BLAKE3_KDF }>(),
+        }
+
+        let _ = (input, output);
+    }
+
     /// Derives `length` bytes from the input keying material `ikm`: HKDF Extract and then Expand,
     /// or BLAKE3-KDF. `length` is at most 255 HashLen for HKDF and below 2^32 for BLAKE3-KDF, and
     /// never 0.
@@ -144,7 +201,7 @@ impl KdfAlgorithm {
 
         self.derive_unchecked(ikm, &mut out, options);
 
-        below_keyed!();
+        self.below(ikm, length);
 
         Ok(out)
     }
@@ -162,7 +219,7 @@ impl KdfAlgorithm {
 
         self.derive_unchecked(ikm, out, options);
 
-        below_keyed!();
+        self.below(ikm, out.len());
 
         Ok(())
     }
@@ -220,7 +277,7 @@ impl KdfAlgorithm {
 
         hmac(&hash, options.salt, ikm, out);
 
-        below_keyed!();
+        self.below(ikm, 0);
 
         Ok(())
     }
@@ -241,7 +298,7 @@ impl KdfAlgorithm {
 
         expand_unchecked(&hash, prk, options.info, &mut out);
 
-        below_keyed!();
+        self.below(prk, length);
 
         Ok(out)
     }
@@ -259,7 +316,7 @@ impl KdfAlgorithm {
 
         expand_unchecked(&hash, prk, options.info, out);
 
-        below_keyed!();
+        self.below(prk, out.len());
 
         Ok(())
     }
