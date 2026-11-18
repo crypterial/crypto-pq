@@ -1,7 +1,9 @@
 // Sets crypto_pq_optimized when the crate is compiled at opt-level 3, where LLVM keeps the arrays
 // that wipe::wipe_unless_optimized takes in registers (D-76). At 2 some of them stay in memory
 // (keccak::permute e, for one), so 2 sets nothing, as does every other level and a level that
-// cannot be read: those arrays are then wiped. It never panics.
+// cannot be read: those arrays are then wiped. At opt-level 0 it sets crypto_pq_unoptimized: the
+// frames of the calls are larger there, and so are the zeros of wipe::below (D-115). It never
+// panics.
 use std::env;
 use std::io::Write;
 
@@ -42,7 +44,13 @@ fn main() {
 
     let _ = writeln!(out, "cargo::rerun-if-changed=build.rs");
 
-    if opt_level().as_deref() == Some("3") {
-        let _ = writeln!(out, "cargo::rustc-cfg=crypto_pq_optimized");
+    match opt_level().as_deref() {
+        Some("3") => {
+            let _ = writeln!(out, "cargo::rustc-cfg=crypto_pq_optimized");
+        }
+        Some("0") => {
+            let _ = writeln!(out, "cargo::rustc-cfg=crypto_pq_unoptimized");
+        }
+        _ => {}
     }
 }

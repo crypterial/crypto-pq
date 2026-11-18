@@ -6,7 +6,7 @@ use crate::keccak::{self, MAX_SPONGES, Sponges};
 use crate::mac::{HMAC_SHA_256, HMAC_SHA_512};
 use crate::primitives::{sha256, sha512, shake256, shake256_into};
 use crate::sha2::{IV_256, IV_512, Sha256, Sha512};
-use crate::wipe::{SecretBytes, wipe, wipe_unless_optimized};
+use crate::wipe::{SecretBytes, below, wipe, wipe_unless_optimized};
 
 const WOTS_HASH: u32 = 0;
 
@@ -37,6 +37,19 @@ const LANES: usize = 16;
 
 // The FORS tree leaves that fors_sign builds at a time, a power of two and a multiple of LANES.
 const FORS_BLOCK: usize = 128;
+
+// The stack that the calls of root and of sign_internal take at most, with a margin, at
+// opt-level 3, at 0 and at the other levels (D-115). Each zeroes it when its tree or signature is
+// done: the kernels of the hashes leave secret values of WOTS and FORS in their frames, which no
+// wipe of a buffer reaches.
+#[cfg(crypto_pq_optimized)]
+const FRAMES: usize = 16 << 10;
+
+#[cfg(crypto_pq_unoptimized)]
+const FRAMES: usize = 48 << 10;
+
+#[cfg(not(any(crypto_pq_optimized, crypto_pq_unoptimized)))]
+const FRAMES: usize = 24 << 10;
 
 type Adrs = [u8; 32];
 
@@ -1856,7 +1869,11 @@ pub(crate) fn root(p: &Parameters, sk_seed: &[u8], pk_seed: &[u8]) -> Node {
 
     set_layer(&mut adrs, p.d - 1);
 
-    context.xmss_tree(&adrs, None)
+    let root = context.xmss_tree(&adrs, None);
+
+    below::<FRAMES>();
+
+    root
 }
 
 pub(crate) fn keygen_internal(
@@ -1934,6 +1951,8 @@ pub(crate) fn sign_internal(
     declassify(&pk_fors[..n]);
 
     context.ht_sign(&pk_fors[..n], tree, leaf, ht);
+
+    below::<FRAMES>();
 
     declassify(&signature);
 

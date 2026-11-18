@@ -188,4 +188,4 @@ opt-level = 3
 # RUSTFLAGS="--cfg crypto_pq_eager" fills the key caches when a key is made, as on a target
 # without compare-and-swap.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(crypto_pq_ct)', 'cfg(crypto_pq_portable)', 'cfg(crypto_pq_sse41)', 'cfg(crypto_pq_optimized)', 'cfg(crypto_pq_eager)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(crypto_pq_ct)', 'cfg(crypto_pq_portable)', 'cfg(crypto_pq_sse41)', 'cfg(crypto_pq_optimized)', 'cfg(crypto_pq_unoptimized)', 'cfg(crypto_pq_eager)'] }
