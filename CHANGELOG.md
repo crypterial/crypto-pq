@@ -386,10 +386,21 @@ Implements specification 2.0 (draft).
   of the last sixteen leaves of the last FORS tree, with every parameter set on x86-64 and with
   the SHA-2 sets on ARM64, and with SLH-DSA-SHAKE-128f and SLH-DSA-SHAKE-192f on ARM64 and in
   builds without the CPU kernels it held SK.seed, after key generation too. The lanes are now
-  wiped where they are, and a signature takes about 6 to 10 KiB less stack. A test clears the
-  stack, runs key generation and signing for the twelve parameter sets and searches the stack for
-  SK.seed, SK.prf and those FORS values. rust-v1.0.0 and rust-v1.0.1 do not have the flaw. Outputs
-  are unchanged.
+  wiped where they are. rust-v1.0.0 and rust-v1.0.1 do not have the flaw. Outputs are unchanged.
+- SLH-DSA key generation, signing and the import of a private key end by writing zeros over the
+  stack under them, 16 KiB at opt-level 3, 48 KiB at opt-level 0 and 24 KiB at the other levels
+  ([decision D-115](spec/decisions.md#decision-d-115)): a kernel of the hashes can leave a secret
+  value that it held in a register in its frame, where no wipe of a buffer reaches. In the test
+  profile on a processor with AVX-512VL, a signature with SLH-DSA-SHAKE-256f or
+  SLH-DSA-SHAKE-256s left the last secret value of FORS that way, and at opt-levels 1, s and z on
+  x86-64 a signature with SLH-DSA-SHA2-128f or SLH-DSA-SHA2-128s left the outer HMAC state of
+  PRF_msg under SK.prf. A test paints the stack, runs key generation and signing for the twelve
+  parameter sets, searches the stack for SK.seed, SK.prf and the secret values of the last
+  sixteen leaves of the last FORS tree, and checks that the zeros lie where the operation went
+  deepest; CI runs it in the release build, in the test profile and at opt-level z. At opt-level
+  3 a signature takes about 30 KB of stack on x86-64 and 32 KB on ARM64, where it took 30 to 34
+  before the lanes were wiped in place, and key generation 18 KB, 4 to 7 KB more than before.
+  Outputs are unchanged.
 - HMAC-SHA-256 and HKDF-SHA-256 on x86-64 with the SHA extensions, in builds at opt-level 2: the
   copy of both streams that the feed-forward of a block kept was a call to memcpy, around which
   the registers with the words of the two key blocks were saved on the stack, where nothing wiped
