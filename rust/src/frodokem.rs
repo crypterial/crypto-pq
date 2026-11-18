@@ -16,7 +16,7 @@ use crate::cpu;
 use crate::ct::{self, declassify};
 use crate::keccak::{Keccak, MAX_SPONGES, Sponges};
 use crate::primitives::shake256_into;
-use crate::wipe::{SecretBytes, wipe, wipe_unless_optimized};
+use crate::wipe::{SecretBytes, below, frames, wipe, wipe_unless_optimized};
 
 const BAR: usize = 8;
 
@@ -31,6 +31,12 @@ const SHAKE128_RATE: usize = 168;
 const SHAKE256_RATE: usize = 136;
 
 const SHAKE_SUFFIX: u8 = 0x1f;
+
+// The stack that the calls of key generation, encapsulation and decapsulation take at most, with
+// a margin (D-116). Each zeroes it when it ends: the rounds of the sponges that hash the seeds and
+// the shared secret, the noise stream and the kernels of the products hold these and the secret
+// matrices in registers, and the compiler saves some of them in their frames.
+frames!(FRAMES, 14 << 10, 14 << 10, 20 << 10);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Parameters {
@@ -596,6 +602,8 @@ pub(crate) fn keygen(p: &Parameters, seed: &[u8]) -> SecretBytes {
 
     pkh.copy_from_slice(&public_key_hash(p, pk)[..secret]);
 
+    below::<FRAMES>();
+
     sk
 }
 
@@ -689,6 +697,8 @@ pub(crate) fn encapsulate(
 
     wipe(&mut g);
 
+    below::<FRAMES>();
+
     ciphertext
 }
 
@@ -773,6 +783,8 @@ pub(crate) fn decapsulate(p: &Parameters, sk: &[u8], ciphertext: &[u8], shared_s
     wipe(&mut c2_prime);
 
     wipe(&mut k_hat);
+
+    below::<FRAMES>();
 }
 
 // The import checks of a raw private key before its pairwise test (SPEC 8.2.4 item 3): pkh must be

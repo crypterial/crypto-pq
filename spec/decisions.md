@@ -1881,3 +1881,90 @@ operation: 86 ns for 16 KiB on an Apple M3, where the shortest operation, key ge
 SLH-DSA-SHA2-128f, takes 95,000 ns with and without them. A wipe in each kernel is not possible, as
 the source has no name for a spill slot. One size for every level would be that of opt-level 0,
 which is 32 KiB more stack than a build at opt-level 3 needs.
+
+## Decision D-116
+
+The zeros of [D-115](#decision-d-115) also end the operations of ML-KEM, ML-DSA and FrodoKEM on
+secret values, at every opt-level, and a MAC or a KDF in one call at the opt-levels 1, 2, s and z.
+
+For ML-KEM, K-PKE's key generation and encryption and the check of an imported decapsulation key
+zero 6 KiB at opt-level 3, 8 KiB at 1, 2, s and z and 28 KiB at 0; K-PKE's decryption and the
+decoding of a decapsulation key into its cached form 3, 6 and 20 KiB; encapsulation and
+decapsulation, for the frames of the hashes G and J, 1, 2 and 4 KiB. The frames of K-PKE's
+functions themselves lie between those and are the frames that D-115 does not reach. For ML-DSA,
+key generation, signing, the decoding of a private key into its cached form and the check of an
+imported one zero 10, 12 and 40 KiB. For FrodoKEM, key generation, encapsulation and decapsulation
+zero 14, 14 and 20 KiB. `digest`, `digest_into` and `verify` of a MAC algorithm and `derive`,
+`extract` and `expand` of a KDF, with their `_into` forms, zero 16 KiB at the opt-levels 1, 2, s
+and z: there the kernels of the keyed hashes pass arrays of key words through memory and store
+state words that stay in registers at 3.
+
+The sizes come from a build that reads, at the end of each of these functions, how far under it
+the stack was written, in the twenty builds of D-115, for the three parameter sets of ML-KEM and
+of ML-DSA and six of FrodoKEM. The calls took at most, at opt-level 3, at 1, 2, s and z, and at 0:
+4,439, 6,119 and 14,082 bytes under K-PKE's key generation and encryption, 3,508, 5,335 and 20,151
+under the check of a decapsulation key, 2,279, 4,279 and 14,082 under the decryption, 372, 1,364
+and 3,703 under the decoding, and 631, 1,428 and 3,295 for G and J; 5,911, 5,911 and 29,879 under
+ML-DSA's key generation, 5,751, 5,751 and 23,959 under signing, 719, 4,759 and 24,215 under the
+decoding and 6,934, 9,495 and 25,655 under the check; 9,983, 10,231 and 14,487 under FrodoKEM's
+three operations. Under a MAC in one call they took at most 4,943 bytes at 1, 2, s and z
+(HMAC-SHA-512 on x86-64 at z) for 100 bytes and for 64 KiB of data, but for BLAKE3, whose calls
+took 9,372 bytes for 64 KiB and 11,308 for 4 MiB, about 320 more for each doubling; under HKDF
+4,255. At opt-level 0 the calls of a MAC take up to 80 KB (BLAKE3), and a MAC and a KDF end with no
+zeros there. No emulated processor ran the kernels of AVX-512. The frames that the unwind tables of
+the x86-64 build at opt-level 3 give for the kernels of every tier add up to at most 4,374 bytes
+under K-PKE's key generation and encryption, 2,656 under the decryption, 296 for G and J, 5,991
+under ML-DSA's key generation and signing and 10,029 under FrodoKEM's operations, and with its
+calls each kernel of AVX-512 takes less stack than the kernel in its place on a processor without
+it.
+
+With the zeros, a search of the dead stack after each operation finds none of the values of ML-KEM,
+ML-DSA, FrodoKEM, SLH-DSA, LMS and XMSS in 23 builds, and none of those of a MAC or a KDF in one
+call in the builds at the opt-levels 1, 2, s and z: the opt-levels 3, 2, s, z, 1 and 0 on ARM64 and
+on x86-64 as EPYC-Milan; at opt-level 3, x86-64 as Haswell and as Nehalem, ARM64 as Cortex-A72 and
+as Neoverse N1, a build for x86-64-v3 and fat LTO on both; and the portable build of both at 3 and
+at 2. It looks for d, z, sigma, the coins, the message and the shared secret of ML-KEM; for xi,
+rho', rho'', K and the Keccak states of H(xi) of ML-DSA; for the seeds, S^T and the shared secret
+of FrodoKEM; for the values of D-115 after SLH-DSA and the seeds of LMS and XMSS after a signature;
+and after a MAC or a KDF for the key, the key XORed with HMAC's pads, the states after the key
+blocks, the inner digest, and the input, the pseudorandom key and the output of HKDF. The samples
+of FrodoKEM's S' are words of a few bits, of which runs of 8 to 11 bytes match the stack by chance,
+with the zeros and without.
+
+Without the zeros the same search found, at opt-level 3: the whole shared secret of FrodoKEM after
+encapsulation and after decapsulation, in every build for x86-64 and in the portable build for
+ARM64, and with FrodoKEM-1344 as Cortex-A72 and as Neoverse N1; the shared secret and the coins of
+ML-KEM after encapsulation in the build for x86-64-v3, and sigma and the coins with fat LTO on
+ARM64; rho', K and the states of H(xi) after ML-DSA's key generation in the portable builds. At the
+opt-levels 1, 2, s and z it found the key of HMAC XORed with its pads, its states after the key
+blocks and its inner digest, the pseudorandom key of HKDF, its states and its output, and the key
+of BLAKE2b and its chaining value after the key block.
+
+tests/stack.rs does for these operations what it does for SLH-DSA: key generation, encapsulation
+and decapsulation with the three parameter sets of ML-KEM and with eight of FrodoKEM, key generation
+and signing with the three of ML-DSA, and, in a build at the opt-levels 1, 2, s or z, a MAC of
+HMAC-SHA-256, HMAC-SHA-512, KMAC256, BLAKE2b and BLAKE3 and a derivation with HKDF of both hashes.
+It searches the stack for the seeds, the message and the shared secrets, for xi, rho' and K, and
+for the keys, the input keying material and the outputs, and checks that the zeros lie where the
+operation went deepest. They may begin 256 bytes above the deepest byte that the operation wrote,
+where the test of D-115 allowed 1,024: the call that writes them took at most 106 bytes under them
+in the builds measured.
+
+Rationale: the values found without the zeros were in builds that differ from a clean one by a
+target option, a link option or the kernels compiled in, and FrodoKEM's shared secret in the
+default build for x86-64: what a kernel leaves in its frame follows from register allocation
+(D-115), and the zeros do not depend on it. A size for each function keeps the arrays small:
+K-PKE's own frames, 10 KB and more at opt-level 3, lie between an operation and its kernels, and
+one array from the operation down would be 16 KiB. The cost is one write of each array. Against the
+tree before, in seven alternating runs of the benchmark on an Apple M3 under Linux, ML-KEM, which
+writes one array in key generation, two in encapsulation and three in decapsulation, took 11 to 185
+ns more per operation, 0.1 to 5.0 percent (ML-KEM-768: 124, 77 and 150 ns more on 5.6, 2.8 and 4.9
+us); ML-DSA took the same time within the noise of the measurement, in which its verification,
+which writes no array, moved by as much; FrodoKEM's operations take milliseconds. On that machine
+an array of 1 to 6 KiB takes about 55 ns to write, one of 512 bytes 5 ns. A MAC of 64 bytes takes
+214 ns (BLAKE2b) to 493 ns (KMAC256) on the EPYC 9V74 of CI's benchmark job, so at opt-level 3 the
+zeros would be a large part of it: there a MAC and a KDF end as before, the limitation of
+[14.5](14-security.md#145-wiping) item 3 stands for them, and whether they take zeros of their own
+is left to a later decision with its own measurement. The incremental forms of a MAC are not
+changed either: their object holds the keyed state, and [D-76](#decision-d-76) describes its
+copies.

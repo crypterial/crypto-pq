@@ -6,13 +6,25 @@ use crate::cpu::{self, Field, Field16, Prepare};
 use crate::ct::{self, declassify};
 use crate::keccak::{self, Keccak, MAX_SPONGES, Sponges};
 use crate::primitives::{sha3_256, sha3_512, shake256_into};
-use crate::wipe::{SecretBytes, registers, wipe, wipe_unless_optimized};
+use crate::wipe::{SecretBytes, below, frames, registers, wipe, wipe_unless_optimized};
 
 pub(crate) const Q: u32 = 3329;
 
 const SHA3: u8 = 0x06;
 
 const SHAKE: u8 = 0x1F;
+
+// The stack that the calls of K-PKE's key generation and encryption and of the check of a
+// decapsulation key take at most, of K-PKE's decryption and of the decoding of a key, and of the
+// hashes G and J, each with a margin (D-116). Each function zeroes it when it ends: the kernels of
+// the PRF, of the sampling and of the transforms hold the noise seeds, the noise and the secret
+// vectors in registers, and the rounds of G and J the shared secret and the coins, and the
+// compiler saves some of these in the kernels' frames.
+frames!(PKE_FRAMES, 6 << 10, 8 << 10, 28 << 10);
+
+frames!(DECRYPT_FRAMES, 3 << 10, 6 << 10, 20 << 10);
+
+frames!(HASH_FRAMES, 1 << 10, 2 << 10, 4 << 10);
 
 type Poly = [u16; 256];
 
@@ -1230,6 +1242,8 @@ impl DecapsulationKey {
 
         let caches = multiply_caches(&s);
 
+        below::<DECRYPT_FRAMES>();
+
         Self { s, caches }
     }
 }
@@ -1418,6 +1432,8 @@ fn pke_keygen(d: &[u8], p: &Parameters, ek: &mut [u8], dk: &mut [u8]) -> [u8; 32
 
     wipe(&mut g);
 
+    below::<PKE_FRAMES>();
+
     h
 }
 
@@ -1480,6 +1496,8 @@ fn pke_encrypt(key: &EncapsulationKey, m: &[u8], r: &[u8], p: &Parameters, c: &m
     wipe(&mut v);
 
     wipe(noise[..k + 1].as_flattened_mut());
+
+    below::<PKE_FRAMES>();
 }
 
 // The message goes to m.
@@ -1505,6 +1523,8 @@ fn pke_decrypt(secret: &DecapsulationKey, c: &[u8], p: &Parameters, m: &mut [u8;
     message_of(&decompress_from(c2, p.dv), &mut w, m);
 
     wipe(&mut w);
+
+    below::<DECRYPT_FRAMES>();
 }
 
 pub(crate) fn keygen_internal(d: &[u8], z: &[u8], p: &Parameters) -> (Vec<u8>, SecretBytes) {
@@ -1545,6 +1565,8 @@ pub(crate) fn encaps_internal(
     shared_secret.copy_from_slice(&g[..32]);
 
     wipe(&mut g);
+
+    below::<HASH_FRAMES>();
 
     c
 }
@@ -1591,6 +1613,8 @@ pub(crate) fn decaps_internal(
     wipe(&mut g);
 
     wipe(&mut rejected);
+
+    below::<HASH_FRAMES>();
 }
 
 // FIPS 203, 7.2: every coefficient of the encoded vector must already be reduced modulo q.
@@ -1641,10 +1665,14 @@ pub(crate) fn check_decapsulation_key(dk: &[u8], p: &Parameters) -> bool {
 
     let ek = public_key_of(dk, p);
 
-    ct::equal(&sha3_256(&[ek]), &dk[768 * k + 32..768 * k + 64])
+    let valid = ct::equal(&sha3_256(&[ek]), &dk[768 * k + 32..768 * k + 64])
         && check_encapsulation_key(ek, p)
         && canonical_secret(&dk[..384 * k])
-        && short_secret(&dk[..384 * k], p.eta1 as u32)
+        && short_secret(&dk[..384 * k], p.eta1 as u32);
+
+    below::<PKE_FRAMES>();
+
+    valid
 }
 
 // Whether every 12-bit coefficient of the encoded secret vector is below q: q - 1 - d wraps to a

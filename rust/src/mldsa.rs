@@ -7,11 +7,17 @@ use crate::cpu::{self, Field, Pack, Prepare};
 use crate::ct::{self, declassify, declassify_value};
 use crate::keccak::{self, Keccak, MAX_SPONGES, Sponges};
 use crate::primitives::{shake256, shake256_into};
-use crate::wipe::{SecretBytes, registers, wipe, wipe_unless_optimized};
+use crate::wipe::{SecretBytes, below, frames, registers, wipe, wipe_unless_optimized};
 
 pub(crate) const Q: i32 = 8380417;
 
 const SHAKE: u8 = 0x1F;
+
+// The stack that the calls of key generation, of signing, of the decoding of a private key and of
+// its check take at most, with a margin (D-116). Each zeroes it when it ends: the kernels of the
+// sponges, of the sampling and of the transforms hold the seeds, the mask and the secret vectors
+// in registers, and the compiler saves some of these in the kernels' frames.
+frames!(FRAMES, 10 << 10, 12 << 10, 40 << 10);
 
 const D: u32 = 13;
 
@@ -1809,11 +1815,15 @@ impl SigningKey {
             ntt_signed(hat);
         }
 
-        Self {
+        let key = Self {
             s1: ntt_all(s1),
             s2: ntt_all(s2),
             t0,
-        }
+        };
+
+        below::<FRAMES>();
+
+        key
     }
 }
 
@@ -1839,6 +1849,8 @@ pub(crate) fn keygen_internal(xi: &[u8], p: &Parameters) -> (Vec<u8>, SecretByte
 
     wipe(&mut seeds);
 
+    below::<FRAMES>();
+
     (pk, sk)
 }
 
@@ -1855,6 +1867,8 @@ pub(crate) fn check_private_key(sk: &[u8], p: &Parameters) -> Option<Vec<u8>> {
 
     // Whether the key is valid is public: importing it fails otherwise.
     if declassify_value(reaches(s.iter().flatten().copied(), p.eta + 1) != 0) {
+        below::<FRAMES>();
+
         return None;
     }
 
@@ -1868,7 +1882,11 @@ pub(crate) fn check_private_key(sk: &[u8], p: &Parameters) -> Option<Vec<u8>> {
 
     let rebuilt = encode_private_key([rho, key, &hash_public_key(&pk)], &s, &t, p);
 
-    declassify_value(ct::equal(&rebuilt, sk)).then_some(pk)
+    let equal = declassify_value(ct::equal(&rebuilt, sk));
+
+    below::<FRAMES>();
+
+    equal.then_some(pk)
 }
 
 fn hint_bit_pack(h: &Polys, p: &Parameters, out: &mut [u8]) {
@@ -2116,6 +2134,8 @@ pub(crate) fn sign_internal(
     hint_bit_pack(&h, p, hints);
 
     wipe(&mut rho_prime);
+
+    below::<FRAMES>();
 
     declassify(&signature);
 
