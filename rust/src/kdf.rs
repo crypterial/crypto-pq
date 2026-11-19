@@ -24,16 +24,22 @@ mod taken {
 
     // BLAKE3-KDF of at most a chunk of input: the hash of the context string and then that of
     // the input, for an output of at most a block, and for a longer one, whose blocks the kernels
-    // of the extended output compute side by side.
+    // of the extended output compute side by side. On x86-64 they take at most 3,439 and 5,415
+    // bytes, both in a build for x86-64-v3 with fat LTO, and 2,095 and 4,271 with fat LTO alone
+    // (D-118).
     #[cfg(feature = "blake3")]
-    taken!(BLAKE3_KDF, 1984, 1152, 2976);
+    taken!(BLAKE3_KDF, 3840, 1152, 5760);
 
     #[cfg(feature = "blake3")]
-    taken!(BLAKE3_KDF_LONG, 4224, 2304, 6336);
+    taken!(BLAKE3_KDF_LONG, 6016, 2560, 9024);
 
-    taken!(HKDF_256, 3968, 2112, 5952);
+    // HKDF with SHA-256 takes at most 6,455 bytes on x86-64: Expand alone under a PRK longer than
+    // a block, in a build for x86-64-v3 with fat LTO on a core without the SHA extensions (3,991
+    // without the LTO). With SHA-384 or SHA-512 it takes 6,735 bytes there, and 2,572 on ARM64
+    // in a build in one codegen unit (D-118).
+    taken!(HKDF_256, 7104, 2112, 10656);
 
-    taken!(HKDF_512, 5824, 2688, 8736);
+    taken!(HKDF_512, 7424, 2880, 11136);
 }
 
 // A build without HKDF has no hash for it: hkdf() always fails, which the empty type lets the
@@ -162,23 +168,23 @@ impl KdfAlgorithm {
         match &self.kind {
             #[cfg(feature = "hkdf")]
             KdfKind::Hkdf(hash) => match hash.kind {
-                Kind::Sha256(_) => crate::wipe::below::<{ taken::HKDF_256 }>(),
-                _ => crate::wipe::below::<{ taken::HKDF_512 }>(),
+                Kind::Sha256(_) => crate::wipe::keyed::<{ taken::HKDF_256 }>(),
+                _ => crate::wipe::keyed::<{ taken::HKDF_512 }>(),
             },
             #[cfg(feature = "blake3")]
             KdfKind::Blake3 if input.len() > 64 << 10 => {
-                crate::wipe::below::<{ taken::BLAKE3_TREE }>();
+                crate::wipe::keyed::<{ taken::BLAKE3_TREE }>();
             }
             #[cfg(feature = "blake3")]
             KdfKind::Blake3 if input.len() > 1024 => {
-                crate::wipe::below::<{ taken::BLAKE3_SMALL_TREE }>();
+                crate::wipe::keyed::<{ taken::BLAKE3_SMALL_TREE }>();
             }
             #[cfg(feature = "blake3")]
             KdfKind::Blake3 if output > 64 => {
-                crate::wipe::below::<{ taken::BLAKE3_KDF_LONG }>();
+                crate::wipe::keyed::<{ taken::BLAKE3_KDF_LONG }>();
             }
             #[cfg(feature = "blake3")]
-            KdfKind::Blake3 => crate::wipe::below::<{ taken::BLAKE3_KDF }>(),
+            KdfKind::Blake3 => crate::wipe::keyed::<{ taken::BLAKE3_KDF }>(),
         }
 
         let _ = (input, output);

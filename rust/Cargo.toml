@@ -44,6 +44,9 @@ ascon = []
 hmac = ["sha2"]
 hkdf = ["hmac"]
 hazmat = []
+# A MAC and a KDF end by writing zeros over the stack under them (decision D-118). Not a default
+# feature.
+stack-zeros = []
 
 # docs.rs documents every feature, hazmat included, and shows the features that each item needs.
 [package.metadata.docs.rs]

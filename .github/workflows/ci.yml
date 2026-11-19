@@ -264,7 +264,8 @@ jobs:
       - run: |
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             for features in "" ml-kem frodokem ml-dsa slh-dsa lms xmss sha2 sha3 blake2 blake3 ascon hmac hkdf hazmat \
-              "ml-kem hazmat" "frodokem hazmat" "ml-dsa hazmat" "slh-dsa hazmat" "lms hazmat" "xmss hazmat" "sha3 hazmat"; do
+              "ml-kem hazmat" "frodokem hazmat" "ml-dsa hazmat" "slh-dsa hazmat" "lms hazmat" "xmss hazmat" "sha3 hazmat" \
+              stack-zeros "hmac hkdf sha3 blake2 blake3 stack-zeros"; do
               echo "::group::$target [$features]"
               cargo clippy --locked --target "$target" --no-default-features --features "$features" -- -D warnings
               echo "::endgroup::"
@@ -331,7 +332,7 @@ jobs:
           }
           lint
           lint --all-features
-          for features in "" ml-kem frodokem ml-dsa slh-dsa lms xmss sha2 sha3 blake2 blake3 ascon hmac hkdf hazmat; do
+          for features in "" ml-kem frodokem ml-dsa slh-dsa lms xmss sha2 sha3 blake2 blake3 ascon hmac hkdf hazmat stack-zeros; do
             lint --no-default-features --features "$features"
           done
       - run: |

@@ -43,20 +43,47 @@ use crate::wipe::{below_keyed, wipe};
 pub(crate) mod taken {
     use crate::wipe::taken;
 
-    // HMAC in one call. Under a key longer than a block, which is hashed first, the calls take
-    // 1,743 and 2,774 bytes on x86-64 for the two block sizes, 160 to 190 more than under a
-    // shorter key.
-    taken!(HMAC_256, 2048, 960, 3072);
+    // HMAC in one call, by its path: a key longer than a block is hashed first, and a tag shorter
+    // than the digest is cut from a digest on the stack, each through a function more. The two
+    // lengths are public. With a tenth more (D-118), the deepest of each path in the builds
+    // measured, which on x86-64 is a build for x86-64-v3 in one codegen unit or with fat LTO:
+    // 2,167, 2,519, 4,119 and 4,471 bytes with SHA-224 or SHA-256, for a key of at most a block
+    // and the whole tag, a short tag, a long key, and both; 2,599, 2,847, 4,431 and 4,783 with
+    // SHA-384 or SHA-512, and 1,388, 1,772, 1,516 and 1,860 on ARM64, on a core without the
+    // SHA-512 instructions in a build in one codegen unit. With SHA-256 on ARM64 every path
+    // takes at most 780 bytes and keeps one size.
+    // Under the Windows convention HMAC with SHA-256 took 2,864 bytes at most, on its deepest
+    // path, and KMAC 1,648: the third sizes have a tenth more than these too.
+    taken!(HMAC_256, 2432, 960, 3648);
 
-    taken!(HMAC_512, 3200, 1344, 4800);
+    taken!(HMAC_256_TRUNCATED, 2816, 960, 4224);
 
-    taken!(KMAC, 1152, 1088, 1728);
+    taken!(HMAC_256_LONG, 4544, 960, 6816);
+
+    taken!(HMAC_256_LONG_TRUNCATED, 4928, 960, 7392);
+
+    taken!(HMAC_512, 2880, 1536, 4320);
+
+    taken!(HMAC_512_TRUNCATED, 3136, 1984, 4704);
+
+    taken!(HMAC_512_LONG, 4928, 1728, 7392);
+
+    taken!(HMAC_512_LONG_TRUNCATED, 5312, 2112, 7968);
+
+    // KMAC in one call: 1,055 bytes on x86-64, with debug assertions, and 964 on ARM64, where the
+    // end of an incremental KMAC takes this size too.
+    taken!(KMAC, 1216, 1088, 1856);
 
     // The end of an incremental HMAC, which on ARM64 goes deeper than an HMAC in one call: 908
-    // and 1,211 bytes for 564 and 1,100.
-    taken!(END_HMAC_256, 1856, 1088, 2784);
+    // and 1,364 bytes. On x86-64 it takes 1,583 and 2,567 bytes, and with SHA-256 in the builds
+    // for x86-64-v3 in one codegen unit or with fat LTO the end read 4,575.
+    taken!(END_HMAC_256, 5056, 1088, 7584);
 
-    taken!(END_HMAC_512, 3008, 1472, 4512);
+    // The end of an incremental KMAC, which in the builds for x86-64-v3 in one codegen unit or
+    // with fat LTO sees the frames of a MAC made from a key object: 4,007 bytes.
+    taken!(END_KMAC, 4416, 1088, 6624);
+
+    taken!(END_HMAC_512, 3008, 1536, 4512);
 
     // The end of an incremental MAC; a MAC in one call ends with zeros of its own, nearer its
     // kernels (blake2::mac).
@@ -67,7 +94,9 @@ pub(crate) mod taken {
     // BLAKE3 by the data: at most a block, a chunk, 64 KiB, and more: 9,775 bytes for 4 MiB and
     // about 320 more for each doubling. The code of a chunk takes 855 bytes on x86-64 with debug
     // assertions, as in the test profile, and without them 787 in the portable code, which some
-    // processors run for a single message, and 471 in the kernels.
+    // processors run for a single message, and 471 in the kernels. Where x86-64 has its kernels,
+    // the zeros of at most a chunk are written under blake3::keyed_hash, by the path that ran,
+    // and these two sizes serve the portable build.
     taken!(BLAKE3_BLOCK, 320, 768, 1152);
 
     taken!(
@@ -77,24 +106,36 @@ pub(crate) mod taken {
         2112
     );
 
-    taken!(BLAKE3_SMALL_TREE, 8832, 7296, 13248);
+    taken!(BLAKE3_SMALL_TREE, 9216, 7296, 13824);
 
-    pub(crate) const BLAKE3_TREE: usize = 12 << 10;
+    // Under the Windows convention a tree of more than 64 KiB took 11,664 bytes, with fat LTO
+    // (D-118).
+    pub(crate) const BLAKE3_TREE: usize = if cfg!(any(windows, target_os = "uefi")) {
+        12864
+    } else {
+        12 << 10
+    };
 
     // The end of an incremental BLAKE3 over at most a chunk.
     taken!(BLAKE3, 1088, 1408, 2112);
 
     // The key setup of an incremental MAC, one of whose frames holds the MAC before it is
     // returned, by the kind.
-    taken!(CREATED_HMAC_256, 4672, 4160, 7008);
+    taken!(CREATED_HMAC_256, 5120, 4160, 7680);
 
     taken!(CREATED_HMAC_512, 5312, 4160, 7968);
 
-    taken!(CREATED_KMAC, 3648, 3840, 5760);
+    // Under a key longer than a block, which the setup hashes first: 5,743 bytes on x86-64 and
+    // 4,052 on ARM64. With SHA-256 the setup takes the same under both keys.
+    taken!(CREATED_HMAC_512_LONG, 6336, 4480, 9504);
 
-    taken!(CREATED_BLAKE2, 3200, 3264, 4896);
+    // 4,023 bytes on x86-64, in a build for x86-64-v3 in one codegen unit, and 3,700 on ARM64.
+    taken!(CREATED_KMAC, 4480, 4096, 6720);
 
-    taken!(CREATED_BLAKE3, 3328, 3648, 5472);
+    // 3,559 bytes on x86-64, in a build for x86-64-v3 in one codegen unit, and 3,100 on ARM64.
+    taken!(CREATED_BLAKE2, 3968, 3456, 5952);
+
+    taken!(CREATED_BLAKE3, 4032, 3648, 6048);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -412,9 +453,10 @@ impl MacAlgorithm {
     // The zeros under a MAC in one call: 16 KiB at the opt-levels 1, 2, s and z (D-116), and at 3
     // what the calls of its hash take (D-117). There the kernels keep their state in registers,
     // and the compiler saves some of it in their frames all the same: the chaining value that a
-    // compression adds in at its end, the message words of a key block.
+    // compression adds in at its end, the message words of a key block. HMAC takes them by its
+    // path, which the lengths of the key and of the tag choose (D-118).
     #[inline(always)]
-    fn below(&self, data: &[u8]) {
+    fn below(&self, key: &[u8], data: &[u8]) {
         below_keyed!();
 
         #[cfg(crypto_pq_optimized)]
@@ -425,12 +467,39 @@ impl MacAlgorithm {
                 feature = "lms",
                 feature = "xmss"
             ))]
-            MacKind::Hmac(hash) => match hash.kind {
-                Kind::Sha256(_) => crate::wipe::below::<{ taken::HMAC_256 }>(),
-                _ => crate::wipe::below::<{ taken::HMAC_512 }>(),
-            },
+            MacKind::Hmac(hash) => {
+                // The block of the hash, written out: a call of block_size from code inlined
+                // into another crate would export it.
+                let (small, block) = match hash.kind {
+                    Kind::Sha256(_) => (true, 64),
+                    _ => (false, 128),
+                };
+
+                let long = key.len() > block;
+
+                let truncated = self.size != hash.digest_size;
+
+                match (small, long, truncated) {
+                    (true, false, false) => crate::wipe::keyed::<{ taken::HMAC_256 }>(),
+                    (true, false, true) => {
+                        crate::wipe::keyed::<{ taken::HMAC_256_TRUNCATED }>();
+                    }
+                    (true, true, false) => crate::wipe::keyed::<{ taken::HMAC_256_LONG }>(),
+                    (true, true, true) => {
+                        crate::wipe::keyed::<{ taken::HMAC_256_LONG_TRUNCATED }>();
+                    }
+                    (false, false, false) => crate::wipe::keyed::<{ taken::HMAC_512 }>(),
+                    (false, false, true) => {
+                        crate::wipe::keyed::<{ taken::HMAC_512_TRUNCATED }>();
+                    }
+                    (false, true, false) => crate::wipe::keyed::<{ taken::HMAC_512_LONG }>(),
+                    (false, true, true) => {
+                        crate::wipe::keyed::<{ taken::HMAC_512_LONG_TRUNCATED }>();
+                    }
+                }
+            }
             #[cfg(feature = "sha3")]
-            MacKind::Kmac { .. } => crate::wipe::below::<{ taken::KMAC }>(),
+            MacKind::Kmac { .. } => crate::wipe::keyed::<{ taken::KMAC }>(),
             // A BLAKE2 MAC ends with zeros of its own, nearer its kernels (blake2::mac).
             #[cfg(feature = "blake2")]
             MacKind::Blake2b(_) | MacKind::Blake2s(_) => {}
@@ -441,27 +510,32 @@ impl MacAlgorithm {
             // much data takes.
             #[cfg(feature = "blake3")]
             MacKind::Blake3 if data.len() > 64 << 10 => {
-                crate::wipe::below::<{ taken::BLAKE3_TREE }>();
+                crate::wipe::keyed::<{ taken::BLAKE3_TREE }>();
             }
             #[cfg(feature = "blake3")]
             MacKind::Blake3 if data.len() > 1024 => {
-                crate::wipe::below::<{ taken::BLAKE3_SMALL_TREE }>();
+                crate::wipe::keyed::<{ taken::BLAKE3_SMALL_TREE }>();
             }
+            // Written under keyed_hash, which knows the path that ran: no size here fits the
+            // kernel of one block, the first call of a process and the code before rows_avx2.
+            #[cfg(feature = "blake3")]
+            MacKind::Blake3 if blake3::KEYED_ZEROS => {}
             #[cfg(feature = "blake3")]
             MacKind::Blake3 if data.len() > 64 => {
-                crate::wipe::below::<{ taken::BLAKE3_CHUNK }>();
+                crate::wipe::keyed::<{ taken::BLAKE3_CHUNK }>();
             }
             #[cfg(feature = "blake3")]
-            MacKind::Blake3 => crate::wipe::below::<{ taken::BLAKE3_BLOCK }>(),
+            MacKind::Blake3 => crate::wipe::keyed::<{ taken::BLAKE3_BLOCK }>(),
         }
 
-        let _ = data;
+        let _ = (key, data);
     }
 
     // The zeros under the key setup of an incremental MAC or of a MAC key, at the levels of a MAC
-    // in one call, and at 3 as many as the setup of its kind takes.
+    // in one call, and at 3 as many as the setup of its kind takes, and for HMAC with SHA-384 or
+    // SHA-512 as many as the setup takes under a key of that length (D-118).
     #[inline(always)]
-    fn created(&self) {
+    fn created(&self, key: &[u8]) {
         below_keyed!();
 
         #[cfg(crypto_pq_optimized)]
@@ -473,18 +547,23 @@ impl MacAlgorithm {
                 feature = "xmss"
             ))]
             MacKind::Hmac(hash) => match hash.kind {
-                Kind::Sha256(_) => crate::wipe::below::<{ taken::CREATED_HMAC_256 }>(),
-                _ => crate::wipe::below::<{ taken::CREATED_HMAC_512 }>(),
+                Kind::Sha256(_) => crate::wipe::keyed::<{ taken::CREATED_HMAC_256 }>(),
+                _ if key.len() > 128 => {
+                    crate::wipe::keyed::<{ taken::CREATED_HMAC_512_LONG }>();
+                }
+                _ => crate::wipe::keyed::<{ taken::CREATED_HMAC_512 }>(),
             },
             #[cfg(feature = "sha3")]
-            MacKind::Kmac { .. } => crate::wipe::below::<{ taken::CREATED_KMAC }>(),
+            MacKind::Kmac { .. } => crate::wipe::keyed::<{ taken::CREATED_KMAC }>(),
             #[cfg(feature = "blake2")]
             MacKind::Blake2b(_) | MacKind::Blake2s(_) => {
-                crate::wipe::below::<{ taken::CREATED_BLAKE2 }>();
+                crate::wipe::keyed::<{ taken::CREATED_BLAKE2 }>();
             }
             #[cfg(feature = "blake3")]
-            MacKind::Blake3 => crate::wipe::below::<{ taken::CREATED_BLAKE3 }>(),
+            MacKind::Blake3 => crate::wipe::keyed::<{ taken::CREATED_BLAKE3 }>(),
         }
+
+        let _ = key;
     }
 
     /// The tag of `data` under `key`. HMAC and KMAC take keys of any length, BLAKE2b 1 to 64 bytes,
@@ -498,7 +577,7 @@ impl MacAlgorithm {
 
         self.mac(key, data, &mut out);
 
-        self.below(data);
+        self.below(key, data);
 
         Ok(out)
     }
@@ -521,7 +600,7 @@ impl MacAlgorithm {
         #[cfg(not(target_arch = "aarch64"))]
         self.mac(key, data, out);
 
-        self.below(data);
+        self.below(key, data);
 
         Ok(())
     }
@@ -544,7 +623,7 @@ impl MacAlgorithm {
     pub fn create(&self, key: &[u8]) -> Result<Mac, Error> {
         let mac = self.create_checked(key);
 
-        self.created();
+        self.created(key);
 
         mac
     }
@@ -566,7 +645,7 @@ impl MacAlgorithm {
     pub fn key(&self, key: &[u8]) -> Result<MacKey, Error> {
         let keyed = self.key_checked(key);
 
-        self.created();
+        self.created(key);
 
         keyed
     }
@@ -686,7 +765,7 @@ impl MacAlgorithm {
 
             let equal = squeeze_equal(&mut engine, tag);
 
-            self.below(data);
+            self.below(key, data);
 
             return equal;
         }
@@ -699,7 +778,7 @@ impl MacAlgorithm {
 
         wipe(&mut expected);
 
-        self.below(data);
+        self.below(key, data);
 
         ct::declassify_value(equal)
     }
@@ -1070,27 +1149,27 @@ impl Mac {
             MacEngine::Hmac {
                 inner: Engine::Sha256(_),
                 ..
-            } => crate::wipe::below::<{ taken::END_HMAC_256 }>(),
+            } => crate::wipe::keyed::<{ taken::END_HMAC_256 }>(),
             #[cfg(any(
                 feature = "hmac",
                 feature = "slh-dsa",
                 feature = "lms",
                 feature = "xmss"
             ))]
-            MacEngine::Hmac { .. } => crate::wipe::below::<{ taken::END_HMAC_512 }>(),
+            MacEngine::Hmac { .. } => crate::wipe::keyed::<{ taken::END_HMAC_512 }>(),
             #[cfg(feature = "sha3")]
-            MacEngine::Kmac { .. } => crate::wipe::below::<{ taken::KMAC }>(),
+            MacEngine::Kmac { .. } => crate::wipe::keyed::<{ taken::END_KMAC }>(),
             #[cfg(feature = "blake2")]
-            MacEngine::Blake2b(_) => crate::wipe::below::<{ taken::BLAKE2B }>(),
+            MacEngine::Blake2b(_) => crate::wipe::keyed::<{ taken::BLAKE2B }>(),
             #[cfg(feature = "blake2")]
-            MacEngine::Blake2s(_) => crate::wipe::below::<{ taken::BLAKE2S }>(),
+            MacEngine::Blake2s(_) => crate::wipe::keyed::<{ taken::BLAKE2S }>(),
             // Over more than a chunk the updates may have hashed chunks side by side, as deep as
             // a MAC of that much data in one call.
             #[cfg(feature = "blake3")]
             MacEngine::Blake3(hasher) => match hasher.chunks() {
-                0 => crate::wipe::below::<{ taken::BLAKE3 }>(),
-                1..=64 => crate::wipe::below::<{ taken::BLAKE3_SMALL_TREE }>(),
-                _ => crate::wipe::below::<{ taken::BLAKE3_TREE }>(),
+                0 => crate::wipe::keyed::<{ taken::BLAKE3 }>(),
+                1..=64 => crate::wipe::keyed::<{ taken::BLAKE3_SMALL_TREE }>(),
+                _ => crate::wipe::keyed::<{ taken::BLAKE3_TREE }>(),
             },
         }
     }

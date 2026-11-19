@@ -119,6 +119,7 @@ pub(crate) fn wipe<T: Copy + Default>(values: &mut [T]) {
 // passed through memory: such a copy stays until a later call writes over it. A function that made
 // such calls on secrets ends with this one, whose frame lies over those dead frames. `N` is what
 // the caller's calls took at most, as measured; a frame beyond it stays as it was.
+#[cfg_attr(not(feature = "stack-zeros"), allow(dead_code))]
 #[inline(always)]
 pub(crate) fn below<const N: usize>() {
     dead_frames::<N>();
@@ -129,6 +130,7 @@ pub(crate) fn below<const N: usize>() {
 }
 
 // Never inlined, so that the array lies under the caller's frame and not in it.
+#[cfg_attr(not(feature = "stack-zeros"), allow(dead_code))]
 #[inline(never)]
 fn dead_frames<const N: usize>() {
     let mut frames = [0u8; N];
@@ -189,8 +191,18 @@ pub(crate) use taken;
 macro_rules! below_keyed {
     () => {
         #[cfg(not(any(crypto_pq_optimized, crypto_pq_unoptimized)))]
-        $crate::wipe::below::<{ 16 << 10 }>();
+        $crate::wipe::keyed::<{ 16 << 10 }>();
     };
+}
+
+// `below` for a keyed hash or a KDF: with the feature `stack-zeros` alone (D-118). Without it a
+// MAC and a KDF wipe the buffers that they name and write no zeros over their dead frames. One
+// gate for every such place, so that their sizes are compiled, and checked, in both settings.
+#[allow(dead_code)]
+#[inline(always)]
+pub(crate) fn keyed<const N: usize>() {
+    #[cfg(feature = "stack-zeros")]
+    below::<N>();
 }
 
 #[allow(unused_imports)]
