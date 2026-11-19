@@ -19,8 +19,18 @@ const SHAKE: u8 = 0x1F;
 // hashes G and J, each with a margin (D-116). Each function zeroes it when it ends: the kernels of
 // the PRF, of the sampling and of the transforms hold the noise seeds, the noise and the secret
 // vectors in registers, and the rounds of G and J the shared secret and the coins, and the
-// compiler saves some of these in the kernels' frames.
-frames!(PKE_FRAMES, 6 << 10, 8 << 10, 28 << 10);
+// compiler saves some of these in the kernels' frames. Under the Windows convention the calls of
+// K-PKE took 5,800 bytes at opt-level 3, with debug assertions: 6,400 there (D-118).
+frames!(
+    PKE_FRAMES,
+    if cfg!(any(windows, target_os = "uefi")) {
+        6400
+    } else {
+        6 << 10
+    },
+    8 << 10,
+    28 << 10
+);
 
 frames!(DECRYPT_FRAMES, 3 << 10, 6 << 10, 20 << 10);
 

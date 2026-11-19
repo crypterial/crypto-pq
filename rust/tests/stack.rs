@@ -614,7 +614,8 @@ fn slh_dsa_shake_leaves_no_secret_on_the_stack() {
         feature = "hmac",
         feature = "hkdf",
         feature = "blake2",
-        feature = "blake3"
+        feature = "blake3",
+        feature = "stack-zeros"
     )
 ))]
 fn inspect(
@@ -885,15 +886,19 @@ fn frodokem_leaves_no_secret_on_the_stack() {
     );
 }
 
-// At the opt-levels between 0 and 3 a keyed hash and a KDF in one call end with zeros too: there
-// their kernels pass arrays of key words through memory (D-116). build.rs gives this crate the
-// level as it gives it to the library.
+// With the feature `stack-zeros` (D-118): at the opt-levels between 0 and 3 a keyed hash and a KDF
+// in one call end with zeros too: there their kernels pass arrays of key words through memory
+// (D-116). build.rs gives this crate the level as it gives it to the library. Without the feature
+// these tests are not compiled: a MAC and a KDF then wipe the buffers that they name, and what the
+// compiler saved of a key in a dead frame stays, so a search of the dead stack has nothing to
+// assert there.
 #[cfg(all(
     not(any(crypto_pq_optimized, crypto_pq_unoptimized)),
     feature = "hmac",
     feature = "hkdf",
     feature = "blake2",
-    feature = "blake3"
+    feature = "blake3",
+    feature = "stack-zeros"
 ))]
 #[test]
 fn keyed_hashes_leave_no_key_on_the_stack() {
@@ -976,7 +981,8 @@ fn keyed_hashes_leave_no_key_on_the_stack() {
     feature = "hmac",
     feature = "hkdf",
     feature = "blake2",
-    feature = "blake3"
+    feature = "blake3",
+    feature = "stack-zeros"
 ))]
 #[inline(never)]
 fn incremental(
@@ -1010,7 +1016,8 @@ fn incremental(
     feature = "hmac",
     feature = "hkdf",
     feature = "blake2",
-    feature = "blake3"
+    feature = "blake3",
+    feature = "stack-zeros"
 ))]
 #[inline(never)]
 fn setup(algorithm: &crypto_pq::MacAlgorithm, key: &[u8]) -> usize {
@@ -1032,7 +1039,8 @@ fn setup(algorithm: &crypto_pq::MacAlgorithm, key: &[u8]) -> usize {
     feature = "hmac",
     feature = "hkdf",
     feature = "blake2",
-    feature = "blake3"
+    feature = "blake3",
+    feature = "stack-zeros"
 ))]
 #[test]
 fn keyed_hashes_leave_no_key_on_the_stack_at_opt_level_3() {
@@ -1062,49 +1070,50 @@ fn keyed_hashes_leave_no_key_on_the_stack_at_opt_level_3() {
     // fewest zeros after a MAC of data in one call, of an empty message, and of 16 KiB, and the
     // fewest after the key setup of an incremental MAC and after its end. After the setup the
     // drop of the MAC writes at the top of the zeros, up to 262 bytes for BLAKE3 on ARM64, whose
-    // hasher it frees.
+    // hasher it frees. On x86-64 the kernel of one block of BLAKE3 takes 16 bytes and ends with
+    // 64 bytes of zeros, which later calls write over: no fewest zeros are asked for there.
     let macs = [
         (
             HMAC_SHA_256,
             32,
             true,
-            [least(1792, 704); 3],
-            [least(4160, 3648), least(1600, 832)],
+            [least(2176, 704); 3],
+            [least(4608, 3648), least(4800, 832)],
         ),
         (
             HMAC_SHA_512,
             64,
             true,
-            [least(2944, 1024); 3],
-            [least(4800, 3648), least(2752, 1216)],
+            [least(2624, 1216); 3],
+            [least(4800, 3648), least(2752, 1280)],
         ),
         (
             KMAC256,
             32,
             false,
-            [least(896, 832); 3],
-            [least(3136, 3328), least(896, 832)],
+            [least(960, 832); 3],
+            [least(3968, 3584), least(4160, 832)],
         ),
         (
             BLAKE2B_MAC,
             64,
             false,
             [least(1344, 256); 3],
-            [least(2688, 2752), least(1984, 576)],
+            [least(3456, 2944), least(1984, 576)],
         ),
         (
             BLAKE2S_MAC,
             32,
             false,
             [least(704, 192); 3],
-            [least(2688, 2752), least(1088, 704)],
+            [least(3456, 2944), least(1088, 704)],
         ),
         (
             BLAKE3_MAC,
             32,
             false,
-            [least(640, 1024), least(192, 512), least(8448, 6912)],
-            [least(2816, 3136), least(832, 1152)],
+            [least(384, 1024), least(0, 512), least(8832, 6912)],
+            [least(3520, 3136), least(832, 1152)],
         ),
     ];
 
@@ -1205,12 +1214,12 @@ fn keyed_hashes_leave_no_key_on_the_stack_at_opt_level_3() {
     // The fewest zeros after a derivation of 32 bytes and of 200: BLAKE3-KDF computes more than a
     // block of output in the kernels of its extended output, which go deeper.
     for (algorithm, name, zeros) in [
-        (HKDF_SHA_256, "HKDF-SHA-256", [least(3584, 1792); 2]),
-        (HKDF_SHA_512, "HKDF-SHA-512", [least(5376, 2304); 2]),
+        (HKDF_SHA_256, "HKDF-SHA-256", [least(6720, 1792); 2]),
+        (HKDF_SHA_512, "HKDF-SHA-512", [least(6976, 2496); 2]),
         (
             BLAKE3_KDF,
             "BLAKE3-KDF",
-            [least(1664, 896), least(3840, 1920)],
+            [least(3520, 896), least(5632, 2176)],
         ),
     ] {
         let ikm = rng.bytes(32);
@@ -1239,6 +1248,57 @@ fn keyed_hashes_leave_no_key_on_the_stack_at_opt_level_3() {
                 fewest,
             );
         }
+    }
+
+    // HMAC in one call under a key longer than a block, which is hashed first, with a tag
+    // shorter than the digest: the path that goes deepest, through two functions more (D-118).
+    // The key blocks are made of the hash of the key.
+    #[cfg(feature = "sha2")]
+    for (algorithm, hash, key_size, fewest) in [
+        (HMAC_SHA_256, crypto_pq::SHA_256, 65, least(4672, 704)),
+        (HMAC_SHA_512, crypto_pq::SHA_512, 129, least(5056, 1792)),
+    ] {
+        let name = algorithm.name();
+
+        let truncated = algorithm
+            .configure(&crypto_pq::MacOptions::default().with_length(16))
+            .expect("a tag of 16 bytes");
+
+        let key = rng.bytes(key_size);
+
+        let hashed = hash.digest(&key);
+
+        let inner: Vec<u8> = hashed.iter().map(|byte| byte ^ 0x36).collect();
+
+        let outer: Vec<u8> = hashed.iter().map(|byte| byte ^ 0x5C).collect();
+
+        let secrets: [(&str, &[u8]); 4] = [
+            ("the key", &key),
+            ("the hash of the key", &hashed),
+            ("the hash of the key under the inner pad", &inner),
+            ("the hash of the key under the outer pad", &outer),
+        ];
+
+        let mut tag = [0; 16];
+
+        let ((), stack) = dead_stack_after(|| {
+            truncated
+                .digest_into(black_box(&key), black_box(&data), &mut tag)
+                .expect("a tag");
+        });
+
+        let operation = "the truncated MAC under a long key";
+
+        inspect(&mut found, name, operation, &stack[..], &secrets, fewest);
+
+        let (equal, stack) =
+            dead_stack_after(|| truncated.verify(black_box(&key), black_box(&data), &tag));
+
+        assert!(equal, "the tag that digest_into wrote");
+
+        let operation = "the verification of a truncated MAC under a long key";
+
+        inspect(&mut found, name, operation, &stack[..], &secrets, fewest);
     }
 
     assert!(

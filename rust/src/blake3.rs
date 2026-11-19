@@ -1799,7 +1799,13 @@ pub(crate) fn keyed_hash(key: &[u8], data: &[u8], out: &mut [u8]) {
             return gathered::keyed_hash(key, data, out);
         }
 
-        keyed::<KEYED_HASH>(|| word, key.try_into().expect("a 32-byte key"), data, out);
+        let ran = keyed::<KEYED_HASH>(|| word, key.try_into().expect("a 32-byte key"), data, out);
+
+        #[cfg(crypto_pq_optimized)]
+        below(ran, data.len());
+
+        #[cfg(not(crypto_pq_optimized))]
+        let _ = ran;
     }
 
     #[cfg(not(all(
@@ -1849,7 +1855,7 @@ fn keyed<const FLAGS: u32>(
     key: &[u8; KEY],
     data: &[u8],
     out: &mut [u8],
-) {
+) -> Ran {
     #[cfg(not(all(
         target_arch = "x86_64",
         not(target_env = "sgx"),
@@ -1869,22 +1875,112 @@ fn keyed<const FLAGS: u32>(
             let word = word();
 
             if cpu::blake3_digest1_now(word, key, root, data, out) {
-                return;
+                return Ran::Kernel;
             }
 
             if cpu::blake3_portable_now(word) || cpu::blake3_baseline_now(word) {
                 digest1_bytes::<FLAGS>(data, out, key);
 
-                return;
+                return Ran::Scalar;
             }
         }
 
         keyed_short(key, root, data, out);
 
-        return;
+        return Ran::Probed;
     }
 
     keyed_long(key, FLAGS, data, out);
+
+    Ran::Long
+}
+
+// The path that keyed took, for the zeros under keyed_hash (D-117): the vector kernel of one
+// block, chosen by the word of features as read; digest1_bytes; keyed_short, which a process takes
+// for its first keyed hash, with the detection of the features, and a core with SSE4.1 alone for
+// each; or keyed_long.
+#[cfg_attr(
+    not(all(
+        crypto_pq_optimized,
+        target_arch = "x86_64",
+        not(target_env = "sgx"),
+        not(crypto_pq_portable)
+    )),
+    allow(dead_code)
+)]
+enum Ran {
+    Kernel,
+    Scalar,
+    Probed,
+    Long,
+}
+
+// Whether keyed_hash ends with the zeros of at most a chunk of data itself: where x86-64 has its
+// kernels. Elsewhere the MAC writes them (mac.rs).
+#[cfg(crypto_pq_optimized)]
+pub(crate) const KEYED_ZEROS: bool = cfg!(all(
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+));
+
+// What the calls of a keyed hash of at most a chunk take under keyed_hash on x86-64 at opt-level
+// 3, with a tenth more, by the path. The vector kernel of one block takes 16 bytes, its return
+// address and one saved register, and with debug assertions, as in the test profile, 224. The
+// portable code of one block takes 143, most of it under its stack pointer. The first keyed hash
+// of a process takes 215. More than a block takes 631, and 879 with debug assertions. The code
+// before rows_avx2 takes 407 for at most a block and 1,183 for more: with the zeros of the other
+// cores alone, a state word of a keyed compression stayed under them in a build with debug
+// assertions. No size for all of these would do: the larger ones are a call of memset, where 64
+// bytes are four stores, and the path is known here, not where the MAC writes its zeros, in code
+// inlined into other crates. Under the calling convention of Windows and UEFI, where a function
+// saves the vector registers that it uses and nothing was measured, the sizes are those of the
+// MAC for the targets not measured.
+#[cfg(all(
+    crypto_pq_optimized,
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+mod taken {
+    const fn size(measured: usize, other: usize) -> usize {
+        if cfg!(any(windows, target_os = "uefi")) {
+            other
+        } else {
+            measured
+        }
+    }
+
+    pub(super) const KERNEL: usize = size(if cfg!(debug_assertions) { 256 } else { 64 }, 1152);
+
+    pub(super) const SCALAR: usize = size(192, 1152);
+
+    pub(super) const PROBED: usize = size(256, 1152);
+
+    pub(super) const CHUNK: usize = size(if cfg!(debug_assertions) { 1024 } else { 704 }, 2112);
+
+    pub(super) const GATHERED_BLOCK: usize = size(448, 1152);
+
+    pub(super) const GATHERED_CHUNK: usize = size(1344, 2112);
+}
+
+// The zeros under a keyed hash in one call of at most a chunk at opt-level 3, by the path that
+// ran. More data: the MAC writes them, by the length.
+#[cfg(all(
+    crypto_pq_optimized,
+    target_arch = "x86_64",
+    not(target_env = "sgx"),
+    not(crypto_pq_portable)
+))]
+#[inline(always)]
+fn below(ran: Ran, length: usize) {
+    match ran {
+        Ran::Kernel => crate::wipe::keyed::<{ taken::KERNEL }>(),
+        Ran::Scalar => crate::wipe::keyed::<{ taken::SCALAR }>(),
+        Ran::Probed => crate::wipe::keyed::<{ taken::PROBED }>(),
+        Ran::Long if length <= CHUNK => crate::wipe::keyed::<{ taken::CHUNK }>(),
+        Ran::Long => {}
+    }
 }
 
 // digest1 for a key in bytes, out of line as digest1_words, for keyed on x86-64: one copy for
@@ -2253,7 +2349,9 @@ mod gathered {
         }
     }
 
-    // Out of line, as one_shot, so that keyed_hash's frameless path on the other cores stays so.
+    // Out of line, as one_shot, so that keyed_hash's path on the other cores keeps its registers.
+    // The zeros of at most a chunk of data are written here, as under keyed_hash on the other
+    // cores (D-117): the kernels of this code take more stack than theirs.
     #[inline(never)]
     pub(super) fn keyed_hash(key: &[u8], data: &[u8], out: &mut [u8]) {
         let key = key.try_into().expect("a 32-byte key");
@@ -2264,6 +2362,9 @@ mod gathered {
             && out.len() <= 32
             && cpu::blake3_gathered_digest1_bytes(key, root, data, out)
         {
+            #[cfg(crypto_pq_optimized)]
+            crate::wipe::keyed::<{ taken::GATHERED_BLOCK }>();
+
             return;
         }
 
@@ -2274,6 +2375,11 @@ mod gathered {
         one_shot(&k, KEYED_HASH, data, out);
 
         wipe(&mut k);
+
+        #[cfg(crypto_pq_optimized)]
+        if data.len() <= CHUNK {
+            crate::wipe::keyed::<{ taken::GATHERED_CHUNK }>();
+        }
     }
 
     // derive_key(context, key material) into out.

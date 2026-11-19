@@ -1981,6 +1981,10 @@ would be a large part of it: there a MAC and a KDF end as before, the limitation
 is left to a later decision with its own measurement. The incremental forms of a MAC are not changed
 either: their object holds the keyed state, and [D-76](#decision-d-76) describes its copies.
 
+The zeros that this decision gave a MAC and a KDF in one call at the opt-levels 1, 2, s and z are
+written only with the feature `stack-zeros` since [D-118](#decision-d-118). Those of ML-KEM, ML-DSA
+and FrodoKEM stand.
+
 ## Decision D-117
 
 The zeros of [D-115](#decision-d-115) end a MAC and a KDF in one call at opt-level 3 too, where
@@ -2116,3 +2120,163 @@ ML-KEM-768, whose code did not change, moved by 1.2 percent at most on the runne
 agree within 5 percent. On an EPYC 9V45, in an earlier run with 192 bytes fewer under HMAC on x86-64
 and rounds that spread by 5 to 18 percent, the zeros cost 1 to 2.5 ns with HMAC-SHA-256, 7.5 to 8.5
 with BLAKE2b, 2.5 to 3.5 with BLAKE2s and 2 to 3 with BLAKE3 of at most a block.
+
+Since [D-118](#decision-d-118) the zeros of this decision are written only with the feature
+`stack-zeros`. The sizes that this decision gave HMAC, KMAC, HKDF, BLAKE3-KDF, the key setups and a
+keyed BLAKE3 of at most a chunk on x86-64, its margin of an eighth, and its sentence on the
+processors that no emulation chose are withdrawn by D-118, which measures those paths and gives the
+sizes anew.
+
+## Decision D-118
+
+The zeros that [D-116](#decision-d-116) and [D-117](#decision-d-117) write over the stack after a
+keyed hash or a KDF are an option, the Cargo feature `stack-zeros`, which is not a default feature.
+Without it a MAC and a KDF (HMAC, KMAC, HKDF, the MACs of BLAKE2 and BLAKE3, BLAKE3-KDF) do what
+they did before those two decisions: they wipe the buffers that they name ([D-76](#decision-d-76))
+and write no zeros over their dead frames, at any opt-level. What the compiler saved of a key or of
+a keyed state in a stack frame of such a call is then not cleared, and stays until later calls write
+over it, as the limitation of D-76 says. The zeros of ML-KEM, ML-DSA, FrodoKEM and SLH-DSA
+([D-115](#decision-d-115), D-116) are not part of the option: they are always written, and those
+that end a signature of SLH-DSA cover the HMAC inside it.
+
+Rationale: the standards of these functions ask for the destruction of keys and of intermediate
+values, which the wipes of the buffers do. The zeros go beyond that. They cost every call, and a
+size is the deepest that the calls went in the builds, on the processors, for the lengths and in the
+calls that were run, with a tenth more: it holds for that list and for nothing else. On 2026-11-19
+four cases outside the list of D-117 went deeper than its zeros, two of them by the build setting
+alone, 8 and 11 percent over, and in three the search of the dead stack found a keyed value. A build
+setting outside the list below can take more than these sizes too.
+
+The feature adds no item and changes no output. One function, `wipe::keyed`, stands at every place
+where a keyed hash or a KDF writes these zeros and is empty without the feature; the sizes are
+compiled in both settings. Without the feature the machine code of a MAC and of a KDF in one call is
+that of the tree before D-116: compared at opt-level 3 in one codegen unit on x86-64 and on ARM64,
+no function of such a call differs. What differs is what D-116 and D-117 added besides the zeros and
+what stays: `create` and `key` of a MAC algorithm are inlined into their callers over functions of
+their own, `verify` of a `Mac` compares in a function of its own, and the functions of ML-KEM,
+ML-DSA and FrodoKEM end with their zeros. No timing was run for the default build.
+
+The four cases, all on the tree of D-117. A keyed BLAKE3 in one call on Intel's cores from Golden
+Cove on without AVX-512, which run the one-shot code before the row kernels (`blake3::gathered`): a
+call that is not the first of its process wrote 407 bytes deep for at most a block, against 320
+bytes of zeros, and 1,231 to 1,247 for at most a chunk, against 960, or 1,088 with debug assertions,
+and with debug assertions the search found a pair of words of the state of a keyed compression 1,168
+bytes deep. D-117 had read the first keyed hash of a process, which detects the features of the
+processor on another path, under models that never take that code. BLAKE3-KDF with fat LTO: on the
+same cores a later derivation of at most 64 bytes wrote 2,095 bytes deep against 1,984, and the
+search found 8 bytes of the input keying material; an output of two blocks wrote 4,239 to 4,271
+bytes deep against 4,224 under six of seven models, where D-117 had measured outputs of 1,000 bytes
+and of 16 KiB. HMAC in one call under a key longer than a block or with a tag shorter than the
+digest, each a function more that D-117 did not run, with fat LTO or in one codegen unit: with
+SHA-384 or SHA-512 up to 3,455 bytes deep against 3,200 on x86-64 and 1,860 against 1,344 on ARM64,
+and the search found the whole state after the outer key block, 64 bytes, in the build in one
+codegen unit on x86-64 and with fat LTO and in one unit on ARM64 cores without the SHA-512
+instructions, and 16 to 32 of its bytes with fat LTO on x86-64; with SHA-224 or SHA-256 up to 2,691
+bytes against 2,048, and Expand of HKDF with SHA-256 under a PRK longer than a block 3,991 against
+3,968 in a build for x86-64-v3, with nothing found. The key setup of an incremental MAC in a build
+for x86-64-v3 in one codegen unit, neither setting alone: with KMAC256 3,959 bytes deep against
+3,648, and the search found the state after the key, 200 bytes, 160 of them when the MAC came from a
+key object; with BLAKE2 3,527 to 3,559 against 3,200 and with BLAKE3 3,639 against 3,328, with
+nothing found.
+
+With the feature, the sizes at opt-level 3 are the deepest of each place over the builds below with
+a tenth more, rounded up to a multiple of 64 bytes, on x86-64 and on ARM64; the other targets take
+half as much again as the larger of the two, and at least the depth read under the Windows
+convention with a tenth more. HMAC in one call takes its size by its path, which the lengths of the
+key and of the tag choose and which are public: with SHA-224 or SHA-256 on x86-64 2,432 bytes for a
+key of at most a block and the whole tag, 2,816 for a shorter tag, 4,544 for a longer key and 4,928
+for both, from depths of 2,167, 2,519, 4,119 and 4,471, and 960 for each on ARM64; with SHA-384 or
+SHA-512 2,880, 3,136, 4,928 and 5,312 on x86-64, from 2,599, 2,847, 4,431 and 4,783, and 1,536,
+1,984, 1,728 and 2,112 on ARM64. KMAC zeros 1,216 and 1,088 bytes in one call. The end of an
+incremental MAC zeros 5,056 and 1,088 bytes for HMAC with SHA-224 or SHA-256, 3,008 and 1,536 with
+SHA-384 or SHA-512, and 4,416 and 1,088 for KMAC; its key setup 5,120 and 4,160 for HMAC with
+SHA-224 or SHA-256, 5,312 and 4,160 with SHA-384 or SHA-512 and 6,336 and 4,480 under a key longer
+than a block, 4,480 and 4,096 for KMAC, 3,968 and 3,456 for BLAKE2 and 4,032 and 3,648 for BLAKE3.
+HKDF zeros 7,104 and 2,112 bytes with SHA-256 and 7,424 and 2,880 with SHA-384 or SHA-512, from
+6,455 and 6,735 bytes on x86-64; BLAKE3-KDF 3,840 and 1,152 for an output of at most 64 bytes and
+6,016 and 2,560 for a longer one, from 3,439 and 5,415. On x86-64 with its kernels the zeros of a
+keyed BLAKE3 of at most a chunk are written under `keyed_hash`, which reads the word of features and
+so knows the path that ran, where the code of the MAC is inlined into other crates and cannot: 64
+bytes after the vector kernel of one block, which takes 16, and 256 with debug assertions, where it
+takes 224; 192 after the portable code of one block, from 143; 256 after the first keyed hash of a
+process and on a core with SSE4.1 alone, from 215; 704 for more than a block, and 1,024 with debug
+assertions, from 631 and 879; 448 and 1,344 in the code before the row kernels, from 407 and 1,183.
+Up to 256 bytes the compiler writes these zeros with stores and calls no memset. A tree of at most
+64 KiB zeros 9,216 and 7,296 bytes, from 8,367 on x86-64, and a longer one 12 KiB, and 12,864 bytes
+under the Windows convention. The other sizes of D-117 stand. At the opt-levels 1, 2, s and z the
+zeros are the 16 KiB of D-116.
+
+The builds, all at opt-level 3: on x86-64 the release build, debug assertions, fat LTO, one codegen
+unit, the portable build, the build for x86-64-v3, and x86-64-v3 with one codegen unit and with fat
+LTO; on ARM64 the first five. Each x86-64 build ran under seven emulated processors, named by what
+they make the library choose: EPYC-Milan and Haswell (the AVX2 kernels), Nehalem (the SSE4.1
+kernels), the first EPYC (three or four inputs of BLAKE3 in 128-bit registers), EPYC-Milan with its
+family set to 1Ah (the portable code for one message), Haswell with its model set to 8Fh (the code
+of BLAKE3 before the row kernels) and qemu64 (neither AVX2 nor SSE4.1), the builds for x86-64-v3
+under the five with AVX2; each ARM64 build natively and as Cortex-A72 and Neoverse N1, which have
+neither the SHA-3 nor the SHA-512 instructions. Every operation ran as the first of its process and
+again after itself. A probe at every place that writes these zeros read, in two modes, the lowest
+byte that was not zero and, with the dead stack painted, the lowest byte written; the search of
+D-117 ran in the same builds. HMAC, KMAC and HKDF ran over grids of the lengths of the key, the
+data, the tag, the salt and the output, 265,540 runs on the tree of D-117 and the same grids on this
+one; BLAKE3-KDF over 1 byte to a chunk of input keying material and 32 bytes to 16 KiB of output; a
+keyed BLAKE3 over 0 bytes to 1 MiB.
+
+With these sizes no place lacks its tenth in those grids, and the search finds no value under the
+caller's frame: in the two builds for x86-64-v3 with one codegen unit and with fat LTO, where the
+sizes before them had left the outer key state of HMAC, that of the PRK of HKDF and 8 bytes of the
+input keying material of BLAKE3-KDF, 10,760 runs of the grids of HMAC, KMAC and HKDF and 2,720 rows
+of the other keyed operations and of BLAKE3-KDF; in the eleven other builds the grids ran with sizes
+that are nowhere larger than these and found nothing; in the 24 builds of D-117, 1,440 rows, of
+which 817 find nothing and 575 find a value in the caller's own frame alone. The same probe and
+search over ML-KEM, ML-DSA, FrodoKEM and SLH-DSA, 4,854 rows in eleven builds, found no secret under
+the caller's frame. With fat LTO and in one codegen unit, rows of a FrodoKEM encapsulation matched 8
+or 9 bytes of the secret matrix S', whose entries are small, against small integers that lie in the
+first 56 bytes under the caller and are the same for every key. HSS/LMS and XMSS write no such
+zeros.
+
+Where a place reads more than its zeros it reads what earlier calls of the same operation wrote
+under it. The end of an incremental MAC reads the frames of its key setup and of its updates. The
+signing of SLH-DSA with SHA-2 reads the key setup of the HMAC of its randomizer, which the 16 KiB of
+zeros that end the signing cover. With fat LTO the 3,072 bytes of zeros of K-PKE's decryption read
+one store of zero 4,111 to 4,127 bytes deep, the stack probe of the function that decodes the
+encapsulation key, whose frame is over a page in that build. The 1,024 bytes that end an
+encapsulation and a decapsulation of ML-KEM lie over the dead frame of K-PKE's encryption, whose
+secret buffers are wiped by name and whose own zeros lie under it (D-116): what stays in that frame
+was read in the release build, for x86-64-v3 and with fat LTO, for two parameter sets, two keys and
+messages and a first and a later call, 72 dumps, and was 3 addresses of code, 10 or 11 addresses of
+memory, 10 to 13 integers under 65,536 and at most 2 single bytes, none of which changed with the
+key or the message. The words were read by their values, not by the definition of each register.
+
+Under the Windows convention the depths were read natively on one processor, an AMD Zen 3, for
+x86_64-pc-windows-gnu, in the release build, with debug assertions and with fat LTO, in 1,025,622
+rows: every frame of the library lay within the zeros of that target, and three sizes that had less
+than the tenth there have it now, 12,864 bytes for a tree of BLAKE3 of more than 64 KiB, 6,400 at
+opt-level 3 for K-PKE of ML-KEM and the sizes of HMAC with SHA-256. The frames of the allocator,
+which an operation that returns a vector or builds a boxed hasher calls before it reads its key and
+which can lie deeper, are not counted, and the test of the dead stack does not run under Windows.
+
+The tree of a keyed BLAKE3 on the 512-bit kernels was not executed. Read from the frames of its
+functions it takes at most 7,864 bytes under the MAC for at most 64 KiB and 9,848 for more.
+
+Cost. With the feature a MAC and a KDF take what D-117 gives, and more where a size grew. In Actions
+run 44510450265 of a temporary workflow, the zeros of a keyed BLAKE3 by the path that ran, against
+those of D-117, took 1 to 3 ns less for at most 64 bytes and 1 to 6 ns less for 128 bytes to 1 KiB
+on an EPYC 9V74, a Xeon 6975P-C and a Xeon Platinum 8370C, and the same time on a Neoverse N2 and
+for 16 KiB. The sizes that grew after that run were not timed.
+
+Not covered: the kernels of AVX-512 of every family, which no emulated processor runs; build
+settings outside the list above; the opt-levels 1, 2, s and z, swept only in part; BLAKE3-KDF with
+more than a chunk of input keying material; the parameter sets of FrodoKEM and SLH-DSA that were not
+run, of which the s sets of SLH-DSA and the stateful schemes have no complete run; a second key
+generation of HSS/LMS and XMSS in one process; processors other than the one under Windows. The
+search looks for the keys, the seeds, the randomness, the outputs, the keyed states and, for the
+BLAKE hashes, every state word of the keyed compressions, and for one parameter set of ML-KEM,
+ML-DSA and FrodoKEM for the noise seeds and the first polynomial of the secret vectors; it does not
+look for the round variables of SHA-2 and of Keccak or for the other polynomials. In an earlier run
+of the two builds for x86-64-v3 with one codegen unit and with fat LTO, with smaller zeros under the
+key setups, the probe read 73 depths beyond its window of 128 KiB and others of 31,000 to 41,000
+bytes at the key setup of HMAC with SHA-256; with the sizes above the same builds give no such read.
+The sizes at the end of an incremental HMAC with SHA-224 or SHA-256 and of an incremental KMAC on
+x86-64 come from that run too, from reads of 4,575 and 4,007 bytes; with the sizes above, the grids
+read 1,367 and 743 bytes there in the same two builds, and the larger sizes are kept.

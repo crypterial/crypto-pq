@@ -35,6 +35,7 @@
 //! | `hmac` | HMAC with SHA-2, such as `HMAC_SHA_256` (FIPS 198-1); enables `sha2` |
 //! | `hkdf` | HKDF with SHA-2, such as `HKDF_SHA_256` (RFC 5869); enables `hmac` |
 //! | `hazmat` | `hazmat`: deterministic operations for test vectors; not a default feature |
+//! | `stack-zeros` | a MAC and a KDF end by writing zeros over the stack under them; not a default feature |
 //!
 //! A feature also enables the types that its constants use, such as `KemAlgorithm` for
 //! `ml-kem`. The signature features make the SHA-2 and SHA-3 values that FIPS 204 and FIPS 205

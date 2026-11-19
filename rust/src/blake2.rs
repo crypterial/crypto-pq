@@ -193,7 +193,7 @@ impl Word for u64 {
     #[inline(always)]
     fn below() {
         #[cfg(crypto_pq_optimized)]
-        crate::wipe::below::<TAKEN_64>();
+        crate::wipe::keyed::<TAKEN_64>();
     }
 }
 
@@ -283,7 +283,7 @@ impl Word for u32 {
     #[inline(always)]
     fn below() {
         #[cfg(crypto_pq_optimized)]
-        crate::wipe::below::<TAKEN_32>();
+        crate::wipe::keyed::<TAKEN_32>();
     }
 }
 
