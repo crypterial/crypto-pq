@@ -19,10 +19,15 @@ release is supported. Within 2.x, an upgrade never removes or changes a specifie
 The crate's MAJOR.MINOR is the version of the crypto-pq specification that it implements: every
 2.0.x release implements specification 2.0. Releases are published from signed tags `rust-vX.Y.Z`.
 
-The 1.0.x releases receive no patch. Values that they leave on the stack after operations on
-secret values, which 2.0.0 fixes, are listed in
-[security/audit-2026-11.md](security/audit-2026-11.md#released-versions). Version 2.0 removes the
-WebAssembly and 32-bit targets, so their users stay on 1.0.x, which keeps these residues.
+The 1.0.x releases receive no patch. The values that they leave on the stack after operations on
+secret values are listed in
+[security/audit-2026-11.md](security/audit-2026-11.md#released-versions). In 2.0.0 the operations
+of ML-KEM, ML-DSA, FrodoKEM and SLH-DSA on secret values end with zeros over the stack in every
+build; a MAC and a KDF do so at the opt-levels 1, 2, s and z in every build, and at opt-level 3
+only with the Cargo feature `stack-zeros`, which is not a default feature
+([After a keyed hash](security/audit-2026-11.md#after-a-keyed-hash) states what stays without it).
+Version 2.0 removes the WebAssembly and 32-bit targets, so their users stay on 1.0.x, which keeps
+these residues.
 
 ## Scope
 
