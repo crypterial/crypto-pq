@@ -73,13 +73,14 @@ Implements specification 2.0 (draft).
   eight lanes in 256-bit registers with AVX-512VL, in place of the AVX2 kernels, the sixteen-lane
   kernel loads each block in 256-bit halves, and an extended output computes all of its groups of
   sixteen blocks in one loop. With the AVX-512VL kernels for one message, the blocks of one chunk,
-  such as those of a 1 KiB hash, and single blocks run the row form of the blake3 crate's assembly
-  for one input. Outputs are unchanged.
+  such as those of a 1 KiB hash, and single blocks run the row form for one input, in which each
+  rotation is one VPRORD. Outputs are unchanged.
 - BLAKE3 on x86-64: two to four inputs, parents or blocks of an extended output run in the row form,
   each 128-bit lane holding one row of one input ([decision D-84](spec/decisions.md#decision-d-84)):
   with AVX-512 on the processors above, on 512-bit registers for three or four and 256-bit registers
-  for two, and with AVX2 on 256-bit registers, `hash_many` in the register plan of the blake3 crate's
-  assembly, unless the core runs a 256-bit instruction as two operations. The chaining values of a
+  for two, and with AVX2 on 256-bit registers, `hash_many` with two inputs to each of two sets of
+  state registers and the message vectors of the round in registers, unless the core runs a 256-bit
+  instruction as two operations. The chaining values of a
   tree of up to the width of the kernels go straight into the block of the top parent, with no copy
   between levels, and five to eight blocks of an extended output run on eight lanes. An extended
   output from an input of at most one block skips the chunk buffer. Outputs are unchanged.
@@ -219,7 +220,7 @@ Implements specification 2.0 (draft).
   unchanged.
 - BLAKE3 on x86-64 with AVX2 or SSE4.1: the kernels for one message keep the message in four
   registers and build each round's words from the previous round's with shuffles, unpacks and
-  blends, as the reference SSE4.1 code does, instead of loading each word again from the block.
+  blends, instead of loading each word again from the block.
   A digest of less than a block loads its words from the input, with no zeroed copy. Outputs are
   unchanged.
 - BLAKE2b's MAC on x86-64 with AVX2 runs in one call of the digest kernel, which pads the key
@@ -510,6 +511,32 @@ Implements specification 2.0 (draft).
   builds now, `--cfg crypto_pq_eager` takes it on any target, and CI builds the library for RV64IM
   and runs the tests in that form. The machine code of other targets is unchanged. rust-v1.0.0 and
   rust-v1.0.1 have the same flaw.
+
+### Security
+
+- The source audit of November 2026, its findings and its fixes are recorded in
+  [security/audit-2026-11.md](security/audit-2026-11.md); the entries under Changed and Fixed above
+  give each change in full.
+- Finding F1, the FORS secret values and SK.seed that SLH-DSA left on the stack, came in after
+  rust-v1.0.1 and was never released.
+- Values that rust-v1.0.1 leaves on the stack, measured on that tag with the audit's harness
+  ([Released versions](security/audit-2026-11.md#released-versions)): at opt-level 3, FrodoKEM
+  its whole shared secret after encapsulation and decapsulation (F9), ML-KEM its shared secret and
+  the coins of the encryption (F4), and KMAC256 its state after the key; at opt-levels s and z,
+  HMAC and HKDF their key XORed with the pads, their key states, the PRK and the output (F3); and
+  at opt-level 3, the keyed hashes in one call parts of their key or keyed state, and an
+  incremental MAC its keyed state. 1.0.0 was not measured: between the two tags the code of ML-KEM
+  changed in visibility only and that of HMAC, HKDF, KMAC and BLAKE2 did not change, while that of
+  FrodoKEM, BLAKE3 and the CPU dispatch did.
+- This release ends the operations on secret values with zeros over the stack under them: SLH-DSA
+  ([decision D-115](spec/decisions.md#decision-d-115)); ML-KEM, ML-DSA and FrodoKEM at every
+  opt-level ([decision D-116](spec/decisions.md#decision-d-116)); a MAC and a KDF at the
+  opt-levels 1, 2, s and z in every build ([decision D-119](spec/decisions.md#decision-d-119)),
+  and at opt-level 3 with the feature `stack-zeros`
+  ([decision D-117](spec/decisions.md#decision-d-117),
+  [decision D-118](spec/decisions.md#decision-d-118)).
+- The 1.0.x line receives no patch. This release removes the WebAssembly and 32-bit targets, so
+  their users stay on 1.0.x, which keeps these residues.
 
 ## [1.0.1] - 2026-10-26
 

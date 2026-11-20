@@ -470,7 +470,7 @@ impl MacAlgorithm {
             ))]
             MacKind::Hmac(hash) => {
                 // The block of the hash, written out: a call of block_size from code inlined
-                // into another crate would export it.
+                // into a dependent crate would export it.
                 let (small, block) = match hash.kind {
                     Kind::Sha256(_) => (true, 64),
                     _ => (false, 128),
@@ -607,7 +607,7 @@ impl MacAlgorithm {
     }
 
     // mac under the keyed DIT guard. Out of line, as the guard reads a flag of this crate: from code
-    // inlined in another crate each read of it, here too, would go through the GOT.
+    // inlined in a dependent crate each read of it, here too, would go through the GOT.
     #[cfg(target_arch = "aarch64")]
     #[inline(never)]
     fn mac_keyed(&self, key: &[u8], data: &[u8], out: &mut [u8]) {
@@ -853,7 +853,7 @@ impl MacAlgorithm {
         }
     }
 
-    // HMAC and KMAC. Out of line on x86-64 and RISC-V: called from code inlined in another crate,
+    // HMAC and KMAC. Out of line on x86-64 and RISC-V: called from code inlined in a client crate,
     // hmac would be exported, and its callers in this crate would call it through the GOT.
     #[cfg(not(target_arch = "aarch64"))]
     #[inline(never)]

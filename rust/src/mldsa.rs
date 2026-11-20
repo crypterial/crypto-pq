@@ -921,7 +921,7 @@ fn sample_bounded(block: &[u64; 17], eta: i32, a: &mut Poly, count: &mut usize) 
 }
 
 // The accepted values never steer a branch: each candidate is written and only an accepted one
-// advances the count. Which candidates are rejected is public, as BoringSSL also has it: the bytes
+// advances the count. Which candidates are rejected is public: the bytes
 // of the SHAKE256 stream are independent of each other, so the rejected ones say nothing about the
 // accepted coefficients. Those are computed without a division (205 * x >> 10 = x / 5 for x < 15).
 // The nibbles go low before high in each byte of each little-endian lane, in plain loops over the

@@ -45,6 +45,7 @@ crypto-pq = { version = "1", default-features = false, features = ["ml-kem", "ml
 | `hmac` | HMAC-SHA-224, HMAC-SHA-256, HMAC-SHA-384, HMAC-SHA-512; enables `sha2` |
 | `hkdf` | HKDF-SHA-256, HKDF-SHA-384, HKDF-SHA-512; enables `hmac` |
 | `hazmat` | deterministic operations for test vectors; not a default feature |
+| `stack-zeros` | stack zeros after a MAC and a KDF at opt-level 3; not a default feature |
 
 ## Examples
 
@@ -233,10 +234,14 @@ checks under valgrind on x86-64 and ARM64. On ARM64 CPUs with FEAT_DIT, under Li
 macOS, the asymmetric secret operations run with DIT set. Private keys and `SecretBytes`, the type
 of every secret output, wipe their memory when dropped. An incremental MAC and a MAC key hold their
 keyed state in the value itself, so returning or moving one leaves a copy that is not wiped; a MAC
-in one call leaves none. Randomness comes only from the operating system; on a target without a
-source, operations that need it return `Error::RngFailure`. CPU-specific code for x86-64 (AVX2,
-AVX-512VL, SSE4.1, SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2, SHA-3, SHA-512) is selected at run
-time, with portable code on every 64-bit target. WebAssembly and 32-bit targets are not supported.
+in one call leaves none. What a MAC or a KDF leaves on the stack, with the feature `stack-zeros`
+and without it, is stated under "After a keyed hash" in
+[the audit record](https://github.com/crypterial/crypto-pq/blob/main/security/audit-2026-11.md).
+Randomness comes only from the operating system; on a target without a source, operations that
+need it return `Error::RngFailure`. CPU-specific code for x86-64 (AVX2
+with BMI1 and BMI2, AVX-512F and AVX-512VL, SSE4.1, SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2,
+SHA-3, SHA-512) is selected at run time, with portable code on every 64-bit target. WebAssembly and
+32-bit targets are not supported.
 
 Report vulnerabilities privately through
 [GitHub Security Advisories](https://github.com/crypterial/crypto-pq/security/advisories/new).

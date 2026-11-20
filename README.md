@@ -58,6 +58,10 @@ crypto-pq = "1"
 
 - The `hazmat` feature is opt-in. It adds the `hazmat` module, with deterministic operations that
   take seeds and randomness from the caller, for known-answer and interoperability tests.
+- The `stack-zeros` feature is opt-in. With it a MAC and a KDF at opt-level 3 end by writing zeros
+  over the stack under them, as they do at the opt-levels 1, 2, s and z in every build
+  ([D-118](spec/decisions.md#decision-d-118), [D-119](spec/decisions.md#decision-d-119));
+  [Design](#design) states what stays without it.
 
 ## Examples
 
@@ -279,7 +283,7 @@ specification state them in full.
   NetBSD, DragonFly, illumos and Solaris, `getentropy` on Apple platforms and OpenBSD, and
   `ProcessPrng` on Windows. On a target without one, operations that need randomness return
   `Error::RngFailure`.
-- **CPU paths.** Kernels for x86-64 (AVX2, AVX-512VL on 256-bit registers for Keccak, SSE4.1,
+- **CPU paths.** Kernels for x86-64 (AVX2 with BMI1 and BMI2, AVX-512F and AVX-512VL, SSE4.1,
   SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2, SHA-3, SHA-512) are selected at run time, with
   portable code on every 64-bit target and no target CPU flag needed. WebAssembly and 32-bit targets
   are not supported: a build for one stops with a compile error.

@@ -1,6 +1,6 @@
 // BLAKE3 with AVX2 or SSE4.1, in two forms.
 //
-// Many inputs at once, as the reference implementation's hash_many: each vector holds one state
+// Many inputs at once (hash_many): each vector holds one state
 // word of eight inputs (AVX2) or four (SSE4.1), so a G function of the specification runs on all
 // of them with each instruction. The message words are transposed into that form as each block
 // is loaded: with AVX2, the 128-bit loads of inputs i and i + 4 share a register (an insert from
@@ -12,7 +12,7 @@
 // BLAKE2s kernels, so the four G functions of a step run in the lanes; between the column and the
 // diagonal steps the rows a, c and d rotate, so that b, whose chain links the steps, never waits
 // for a shuffle. The message stays in four registers: each round builds its half steps' vectors
-// from the previous round's with shuffles, unpacks and blends, as the reference SSE4.1 code does
+// from the previous round's with shuffles, unpacks and blends
 // (with AVX-512VL, two two-table permutations). The state stays in registers from one block to
 // the next.
 //
@@ -318,7 +318,7 @@ macro_rules! rows {
         }
 
         // Round R's four half-step vectors, in lane order, from the previous round's (the block's
-        // words in order for round 0), as the reference SSE4.1 code builds them: the first round
+        // words in order for round 0): the first round
         // takes the even and the odd words of each half, every later round the permutation of
         // the message words, in registers.
         #[target_feature(enable = $feature)]
@@ -1560,16 +1560,14 @@ mod rows_pair {
     }
 }
 
-// The row form with AVX-512VL on xmm registers, in the form of the blake3 crate's AVX-512 assembly
-// for one input (its hash_many), instruction for instruction: each rotation is one VPRORD, which
+// The row form with AVX-512VL on xmm registers for one input: each rotation is one VPRORD, which
 // takes the chain of a half step from eight cycles to six where the AVX2 form rotates by 12 and 7
 // with two shifts and an OR; the state's rows are in xmm0 to xmm3 and the message's in xmm4 to
 // xmm7, permuted with thirteen shuffles and blends between the rounds of a loop of seven. The
-// intrinsics form, its message in two ymm registers and two VPERMT2D a round, took 50.7 ns a block
-// of a 1 KiB hash on Granite Rapids and 61.2 on Emerald Rapids, against 46.2 and 55.7 for rscrypto,
-// which runs this assembly there, and 63.4 against 62.2 on AMD Zen 4. The EVEX instructions are
-// inline assembly in AVX2 code. The chain takes SPLIT, the rotations of split_half, which the
-// dispatch chooses on AMD's cores (D-108).
+// intrinsics form before it, its message in two ymm registers and two VPERMT2D a round, took 50.7
+// ns a block of a 1 KiB hash on Granite Rapids, 61.2 on Emerald Rapids and 63.4 on AMD Zen 4. The
+// EVEX instructions are inline assembly in AVX2 code. The chain takes SPLIT, the rotations of
+// split_half, which the dispatch chooses on AMD's cores (D-108).
 mod rows_vl {
     use super::*;
 
@@ -2384,12 +2382,11 @@ macro_rules! pairs_load {
     };
 }
 
-// Row form on four inputs with four vectors of message for each of two states, in the plan of the
-// blake3 crate's AVX2 assembly for four inputs, instruction for instruction but its prefetches:
-// the states in ymm0 to ymm3 and ymm8 to ymm11 and the message vectors of the round in ymm4 to ymm7
-// and ymm12 to ymm15, each pair of the first two half steps saved to the table's slots as ymm4 and
-// ymm5 or their temporaries take over. Measured on Zen 3 for four chunks, with the message vectors
-// as memory operands of the states' additions, 1651 ns against 1499 for that assembly.
+// Row form on four inputs with four vectors of message for each of two states: the states in ymm0
+// to ymm3 and ymm8 to ymm11 and the message vectors of the round in ymm4 to ymm7 and ymm12 to
+// ymm15, each pair of the first two half steps saved to the table's slots as ymm4 and ymm5 or their
+// temporaries take over. With the message vectors as memory operands of the states' additions
+// instead, four chunks took 1651 ns on Zen 3.
 
 // Message vectors mx and my into rows a.
 #[rustfmt::skip]

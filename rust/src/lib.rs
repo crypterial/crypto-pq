@@ -8,7 +8,7 @@
 //! or memory access that depends on a secret, which CI checks under valgrind; on ARM64 CPUs with
 //! FEAT_DIT, under Linux, Android and macOS, the asymmetric operations also run in the
 //! data-independent timing mode (see [`enable_data_independent_timing`]). CPU-specific code for
-//! x86-64 and ARM64 is chosen at run time, with a portable fallback on every target.
+//! x86-64 and ARM64 is chosen at run time, with a portable fallback on every 64-bit target.
 //!
 //! The crate builds for 64-bit targets only. WebAssembly and 32-bit targets are not supported, and
 //! a build for one of them stops with a compile error.

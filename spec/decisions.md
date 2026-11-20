@@ -300,9 +300,8 @@ tier for one message: the rotations of their AVX2 row forms that take two shifts
 one VPRORD or VPRORQ (BLAKE2b by 63, BLAKE2s by 12 and 7, BLAKE3 every rotation), on 128-bit and
 256-bit registers, written as inline assembly in the AVX2 code, so that the compiler places no value
 in a 512-bit register. BLAKE3 keeps the message in registers and moves its words to the next round's
-order with shuffles, unpacks and blends, in the form of the blake3 crate's assembly for one input: as
-two VPERMT2D a round on two registers, a block of a 1 KiB hash took 50.7 ns on Granite Rapids, 61.2 on
-Emerald Rapids and 63.4 on Zen 4, against 46.2, 55.7 and 62.2 for that assembly in rscrypto. On
+order with shuffles, unpacks and blends: as two VPERMT2D a round on two registers, a block of a 1
+KiB hash took 50.7 ns on Granite Rapids, 61.2 on Emerald Rapids and 63.4 on Zen 4. On
 the processors of a table of families, AMD family 1Ah, these kernels for one message give way to the
 portable code in general registers, which takes less time there; their kernels for several messages
 stay. BLAKE2b and BLAKE2s keep their AVX2 forms on the other AMD processors with AVX-512, where
@@ -319,20 +318,16 @@ other processors with AVX-512 run the eight-lane AVX2 kernel there. The minimum 
 1.89, the first in which these target features and intrinsics are stable
 ([15.2](15-platforms.md#152-supported-platforms)). Rationale: sixteen more registers, three-input
 logic and 64-bit rotations take fewer instructions per Keccak round than AVX2 does, and 256-bit
-registers keep the clock at which the core runs AVX2 code. On the processors of the third table, the
-512-bit BLAKE3 kernels of the blake3 crate and rscrypto hashed 16 KiB in 0.43 (Zen 5), 0.68 (Zen 4),
-0.56 (Emerald Rapids) and 0.55 (Granite Rapids) of the time of the eight-lane AVX2 kernel, close to
-what their instruction counts predict for each core, so no clock cost showed; Sapphire Rapids, whose
-core Emerald Rapids revises, was not measured. On Ice Lake Xeon they took 0.70, a fifth more than
-the count predicts, and the processor stayed out of the table until this crate's own sixteen-lane
-kernel took 0.56 to 0.58 of the time of its eight-lane kernel for 16 KiB and 64 KiB, in three runs,
+registers keep the clock at which the core runs AVX2 code. On Ice Lake Xeon the sixteen-lane BLAKE3
+kernel took 0.56 to 0.58 of the time of the eight-lane kernel for 16 KiB and 64 KiB, in three runs,
 and a copy of the kernel in the same process 0.63 to 0.73, in two; what separates the two copies
-there was not established. For SHA-256 on eight lanes, the block of one lane takes 18 to 22 ns on the
-Zen 4, Zen 5, Ice Lake, Emerald Rapids and Granite Rapids processors measured, against 20 to 59 ns with
-the SHA extensions on two lanes and 31 to 44 ns with AVX2. AMD processors with the SHA extensions
-run SHA-256 lanes with them instead: with the SHA-NI rounds of specification 1.1, LMS, XMSS and
-SLH-DSA-SHA2 took 0.5 to 6 percent less time on Zen 4 and Zen 5 than with the eight-lane kernel, and
-7 to 14 percent more on Emerald Rapids.
+there was not established. Sapphire Rapids, whose core Emerald Rapids revises, was not measured.
+For SHA-256 on eight lanes, the block of one lane takes 18 to 22 ns on the Zen 4, Zen 5, Ice Lake,
+Emerald Rapids and Granite Rapids processors measured, against 20 to 59 ns with the SHA extensions
+on two lanes and 31 to 44 ns with AVX2. AMD processors with the SHA extensions run SHA-256 lanes
+with them instead: with the SHA-NI rounds of specification 1.1, LMS, XMSS and SLH-DSA-SHA2 took
+0.5 to 6 percent less time on Zen 4 and Zen 5 than with the eight-lane kernel, and 7 to 14 percent
+more on Emerald Rapids.
 
 ## Decision D-45
 
@@ -625,12 +620,10 @@ chaining value and the key block, and for BLAKE3 the key. A `MacKey` is safe for
 it is destroyed ([6.7](06-api.md#67-lifetime-equality-and-printing) item 1,
 [14.5](14-security.md#145-wiping)); `create` copies that state into the new `Mac` in place at
 opt-levels 2 and 3; at the others the compiler may stage it on the stack [[D-76](#decision-d-76)].
-`Mac` itself is unchanged. Rationale: a protocol that tags many messages under one key, and the
-reused-key rows of the rival comparison, paid the key setup for every message: two compressions
-for HMAC and a permutation for KMAC (keyed BLAKE2
-compresses its key block as the first block of each message, with a key object too). The other
-Rust MAC crates key once and reuse the keyed state, and ring and aws-lc-rs do it with a key object,
-as WebCrypto does with CryptoKey. A `Mac.reset` that put back a state saved
+`Mac` itself is unchanged. Rationale: a protocol that tags many messages under one key paid the key
+setup for every message: two compressions for HMAC and a permutation for KMAC (keyed BLAKE2
+compresses its key block as the first block of each message, with a key object too). A key object
+sets it up once, as WebCrypto does with CryptoKey. A `Mac.reset` that put back a state saved
 inside the `Mac` was measured first and rejected: the saved state grew every `Mac` from 336 to 448
 bytes on 64-bit targets, and a build of main with only that growth made one-shot BLAKE2 MACs take
 2 to 5 percent more time on Haswell, and KMAC up to 1.5 percent. A key object leaves `Mac`, and so
@@ -649,7 +642,7 @@ registers ([15.3](15-platforms.md#153-cpu-specific-code) item 2). The table read
 string and the family and model of leaf 1, with the extended fields, once at detection; which form
 runs depends otherwise only on the public lengths, never on the data or the key. The constant-time
 and SSE4.1 builds leave the table out, so that their checks run the same kernels on every runner.
-Both forms are tested against the reference code on every processor with AVX2. Rationale: with
+Both forms are tested against the portable code on every processor with AVX2. Rationale: with
 AVX-512 hidden, as on the client processors of these cores, the earlier form took 1.2 and 2.3
 percent less time for 64 bytes on Emerald Rapids and Granite Rapids and 0.6 percent less for 1 KiB
 on both, while on Haswell its kernels took 5 percent more for 1 KiB and on AMD Zen 3 1.1 percent
@@ -741,8 +734,8 @@ form, in which each 128-bit lane of a register holds one row of one input's stat
 word of every input in each register. On the processors of the third table of
 [D-44](#decision-d-44), three or four take 512-bit registers and two take 256-bit registers, in the
 kernels that D-44 describes, while five to eight stay on eight lanes. With AVX2 alone, three or four
-take 256-bit registers, two to each set of state registers, `hash_many` in the register plan of the
-blake3 crate's assembly for four inputs, except on the cores of another table, which keep four lanes
+take 256-bit registers, two to each set of state registers, `hash_many` with the message vectors of
+the round in registers, except on the cores of another table, which keep four lanes
 on 128-bit registers: AMD family 17h below model 30h (Zen 1 and Zen+), where a 256-bit instruction
 runs as two operations of 128 bits, Intel's cores of the Atom line alone (family 6, models AFh, B6h,
 BEh and DDh), and processors of other vendors. Both tables read the CPUID vendor string and the
@@ -759,10 +752,10 @@ models 169 cycles a block on Sapphire Rapids and Ice Lake Xeon, on two inputs or
 and 283 on eight lanes, and on Zen 4 225 on two and 233 on four against 296. In one process on one
 runner, the kernels before this decision took 1.69 (Emerald Rapids), 2.07 (Ice Lake Xeon), 1.12 (Zen
 4) and 1.15 (Zen 5) times the time here for 4 KiB, and 1.26, 1.25, 1.06 and 1.43 for 2 KiB. With AVX2
-they took 1.31 for 4 KiB on Zen 3, and 1.27 on Zen 4 with AVX-512 hidden. The blake3 crate's register
-plan took 1478 ns for 4 KiB on Zen 3 against 1651 for the row form that first replaced the 128-bit
-kernel, which reads the message from memory, though llvm-mca 19 models them at 267 and 255 cycles a
-block: the measurement decided, and what the model misses was not established. On Zen 1 and Zen+,
+they took 1.31 for 4 KiB on Zen 3, and 1.27 on Zen 4 with AVX-512 hidden. The row form that first
+replaced the 128-bit kernel, which reads the message from memory, took 1651 ns for 4 KiB on Zen 3
+and was replaced by the register plan, though llvm-mca 19 models them at 255 and 267 cycles a
+block: a measurement decided, and what the model misses was not established. On Zen 1 and Zen+,
 where no runner exists, llvm-mca 19 models that plan at 466 cycles a block against 377 for four lanes
 on 128-bit registers. The cores of the Atom line were neither modelled nor measured.
 
@@ -786,13 +779,12 @@ runs on the code and the kernels of SHA-3. It has no NIST identifier, so it is r
 and no MAC or KDF takes it.
 
 Rationale: FIPS 202 did not take this padding, but Keccak-256 is the hash of Ethereum, for its
-addresses, its transactions and its state, so software for that chain needs it, and AWS-LC ships it
-as `EVP_keccak256`. Its security rests on the permutation, the rate and the sponge of SHA3-256.
+addresses, its transactions and its state, so software for that chain needs it. Its security
+rests on the permutation, the rate and the sponge of SHA3-256.
 
 No standard publishes vectors for it. `tools/keccak_vectors.py` derives `derived/keccak256.txt` with
 its own Keccak-f[1600], written from FIPS 202 §3, which must agree with hashlib's SHA3-256 under the
-padding of SHA-3 and with three published digests under the padding of Keccak. RustCrypto's sha3 0.10.9
-and tiny-keccak 2.0.2 give the same values for each of the 284 messages.
+padding of SHA-3 and with three published digests under the padding of Keccak.
 
 ## Decision D-88
 
@@ -808,9 +800,9 @@ crypto-pq no longer supports.
 
 `MacAlgorithm::digest_into` is inlined into its callers, as a hint, and it reaches BLAKE2 and BLAKE3
 by calls of their own functions. HMAC and KMAC stay behind one function out of line on x86-64 and
-riscv64, and all of the MAC on ARM64: called from code inlined in another crate, the functions of
-this crate that they call would be exported, and the other callers in this crate would reach them
-through the GOT.
+riscv64, and all of the MAC on ARM64: called from code inlined in a crate that uses this one, the
+functions of this crate that they call would be exported, and the other callers in this crate
+would reach them through the GOT.
 
 This is a form of the portable code that the target chooses at compile time, not CPU-specific code
 under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on public lengths.
@@ -857,11 +849,9 @@ on Zen 4. On Zen 3, which has no AVX-512 and runs the AVX2 form, it was 1.005 an
 of the code before took 0.972 to 1.021 of the time of the other, by row. SLH-DSA over SHA2 at the
 192-bit and 256-bit levels took 0.2 to 2.7 percent less time in the five classes with AVX-512.
 
-Rows that rivals led over those 40 rows in these five classes went from 4 of 200 to 0 in one copy
-and 2 in the other. On Ice Lake, SHA-384 and SHA-512 of nothing were at 1.055 and 1.054 against
-aws-lc-rs in the first copy and at 0.946 and 0.940 in the second, with the same machine code,
-against 0.951 and 0.953 before. The place of the code decides the hashes of nothing. Intel's cores with AVX-512 other than Ice Lake, Emerald Rapids and Granite Rapids
-were not measured.
+On Ice Lake, SHA-384 and SHA-512 of nothing took 11 and 12 percent more time in one copy than in
+the other, with the same machine code: the place of the code decides the hashes of nothing. Intel's
+cores with AVX-512 other than Ice Lake, Emerald Rapids and Granite Rapids were not measured.
 
 The test of the tier and both forms are in one function out of line, which grows from 415 to 759
 lines of assembly. It is the machine code measured, and every other function of x86-64 is the
@@ -905,8 +895,8 @@ Rationale: the rounds read each vector of the message with one 32-byte load, and
 that two stores wrote cannot take its value from them: it waits until both reach the cache. In a
 MAC, the final block is stored after the rounds of the key block, so its stores reach the cache
 only after those rounds retire, and the rounds of the final block wait for them. In bench run
-42388218855, a BLAKE2b MAC of 63 bytes took 280.6 ns against 270.1 for 64 bytes on Zen 3, where
-blake2-rfc took 277.1 and 274.3. Lengths whose pieces are all whole, as 16, 64 and 128 bytes, did
+42388218855, a BLAKE2b MAC of 63 bytes took 280.6 ns against 270.1 for 64 bytes on Zen 3. Lengths
+whose pieces are all whole, as 16, 64 and 128 bytes, did
 not pay this. Intel's cores run the AVX-512VL kernel, Zen 3 and Zen 4 the AVX2 one, and Zen 5 the
 portable code. Under QEMU, the AVX2 kernel runs 1 or 2 instructions fewer for a digest of at most a
 block, 1 to 3 more for one of 255 or 256 bytes, 2 to 6 more for a MAC of 1 to 256 bytes and 2 fewer
@@ -922,9 +912,7 @@ the 55 rows of BLAKE2s and BLAKE3, whose code is the same, 0.996 to 1.000. A dig
 takes as long as one of 64 on Zen 3, 136.2 ns against 135.8, and 2.4 to 3.7 ns more on Intel's
 cores, where it took 13 to 19 ns more. On Zen 4 a MAC of 63 bytes takes as long as one of 64, 225.1
 ns against 226.7, but a digest of 63 bytes still takes 19.2 ns more than one of 64, against 23.5
-before: a wait that this change does not remove. The BLAKE2b MAC of 63 bytes on Zen 3, which
-blake2-rfc led by 1.3 percent, now leads it by 2.4 percent, and rivals lead none of the rows of
-BLAKE2b in these six classes.
+before: a wait that this change does not remove.
 
 Against both copies of the code before, beyond the spread of the rows of BLAKE2s and BLAKE3 of the
 same class, seven rows take more time here, all in the AVX2 kernel, which has one form for Zen 3
@@ -934,17 +922,14 @@ registers, takes 1.3 percent more, 136.8 and 136.9 ns against 135.0 and 135.1. O
 0.9 percent more, and a BLAKE2b-256 digest of 64 bytes and digests of 1 KiB and 16 KiB 0.6 to 0.8
 percent more. The rounds of these rows run the instructions before, with other registers and stack
 offsets, and on Zen 3 the last five take as long as before, 0.999 to 1.003. On the other rows with
-a partial piece, the ratio above is 1.006 to 1.044 on Zen 4 and 1.014 to 1.048 on Zen 3. Rivals
-lead none of the seven rows: the rival that leads the others on each still takes 1.6 to 20.7
-percent more time than the code here.
+a partial piece, the ratio above is 1.006 to 1.044 on Zen 4 and 1.014 to 1.048 on Zen 3.
 
 The vector holds bytes of the key or the data, and it is cleared with the rest of the message at
 the end, as before. The instruction takes registers only and touches no memory, stack or flags; it
 is emitted by the macro of the other instructions of the module. The reference answers of BLAKE2
 for inputs of 0 to 255 bytes, keyed and unkeyed, and the self-test of RFC 7693 pass on x86-64 under
 QEMU with AVX2, and the unit tests compare the one-call digest and MAC with the compression of
-padded blocks. In the bench runs, before any timing, the output of every row agrees with those of
-the rivals, on Intel's cores through the AVX-512VL kernel. The machine code of ARM64, armv7, i686,
+padded blocks. The machine code of ARM64, armv7, i686,
 riscv64 and WebAssembly is the same as before, function by function, and on x86-64 only the
 one-call digests of BLAKE2b of both kernels change. With this crate at opt-level 3 and the
 application at 1, on all six, what the application's crate compiles of this one is drop glue,
@@ -1005,8 +990,7 @@ MAC of 1 KiB and 1.027 for one of 16 KiB, and 1.001 for the MAC of 0 bytes. For 
 of one block it was 0.997 to 0.999, and 0.996 to 1.000 by job, while the two copies of the code
 before, the same machine code at other places, differed by up to 0.5 percent in a job; with every
 call on the assembly it was 0.990 to 0.997. BLAKE2s and BLAKE3, whose machine code is unchanged,
-gave 0.999 as geometric means over their rows. dryoc, which led the digest of 16 KiB by 1.1 percent,
-takes 1.5 percent more time than this code.
+gave 0.999 as geometric means over their rows.
 
 In bench run 42553148391, with every call on the assembly and an earlier form of the function that
 fills the runs, the time before over the time here on Neoverse N2 was 1.007 for a digest of 255
@@ -1056,9 +1040,7 @@ jobs, was 1.039, 1.089, 1.090, 1.084, 1.040, 1.088 and 1.013 for hashes of 0, 1,
 bytes, 1.096, 1.135, 1.135, 1.127, 1.087, 1.143 and 1.065 for keyed hashes of these lengths, and
 1.021 for `derive_key` of 32 bytes and 1.016 with two contexts in turn. Inputs of 1 KiB and more and
 extended output gave 0.998 to 1.005, with the same machine code. The two copies of the code before
-differed by up to 0.34 percent in a job. On the hashes and keyed hashes of at most 64 bytes,
-ab-blake3, the nearest rival there, with its hash of one block or of one chunk, took 1.147 to 1.190
-times the time here, against 1.016 to 1.148 times the time before. The code with the array took
+differed by up to 0.34 percent in a job. The code with the array took
 keyed hashes 0.3 to 1.0 percent more time than here, through the register allocation of the kernel,
 and hashes, whose machine code is the same, the same time.
 
@@ -1126,9 +1108,7 @@ digest, 1.015 to 1.030 of 64, 1.011 to 1.033 of 65 and 1.011 to 1.019 of 129; 1.
 HMAC-SHA-256 of 64 bytes under a key set up once, 0.999 to 1.004 of 1 KiB and 1.000 of 16 KiB. The
 one-shot digests, with the same machine code, gave 0.996 to 1.018. The two copies of the code before
 differed by up to 2.8 percent on a one-shot digest, 1.7 percent on an update of 16 bytes and 0.9
-percent on the other rows. RustCrypto's sha2, whose update the caller's crate compiles in line, took
-0.652 to 0.996 times the time here on updates of 1 byte and 0.955 on Zen 3 on updates of 8 bytes; on
-the other rows, the rival that leads each took more time than this code. In bench run 42572122614,
+percent on the other rows. In bench run 42572122614,
 where every update of less than a block went through memcpy, the SHA-256 of 1 KiB in updates of 1
 byte gave 1.141 on Zen 3 and 1.371 on Zen 4.
 
@@ -1374,7 +1354,7 @@ first detection. On x86-64, the loop over the whole blocks of the kept state rea
 first SHA256RNDS2 of a block from the copy that a MOVDQA writes after the PADDD, which put the
 MOVDQA on the chain from one block to the next. llvm-mca puts that loop at 162 cycles a block on
 Ice Lake and at 195 on Sapphire Rapids, Emerald Rapids and Granite Rapids, and the loop here at 161
-and 194, as the loop of CRYPTOGAMS in aws-lc-rs and ring; Zen 3, Zen 4 and Zen 5 take 129 in both.
+and 194; Zen 3, Zen 4 and Zen 5 take 129 in both.
 The bound of the 32 dependent SHA256RNDS2 of a block and the PADDD is 129 cycles on Zen, 161 on Ice
 Lake and 193 on Sapphire Rapids. Under QEMU, counting the instructions run in crypto-pq, with the
 Neoverse N2 model a SHA-512 of 16 KiB in updates of 64 bytes runs 81282 instructions here against
@@ -1503,9 +1483,8 @@ without AVX2 and SSE4.1, the keyed path went through the dispatch of the kernels
 feature word again, and ran 18 to 81 more instructions than before; through Zen 5's path it runs 968
 against 987 for 0 bytes, 974 against 990 for 1, 995 against 987 for 32, 1035 against 995 for 63 and
 973 against 965 for 64. With the Neoverse N2 model, where the call is direct, a hash of 64 bytes
-runs 938 against 967 and an extended output of 20 bytes from 3, 966 against 1000. The blake3 crate,
-ab-blake3 and rscrypto run 647, 556 and 636 instructions for a hash of 0 bytes on the AVX2 path,
-where this code runs 448.
+runs 938 against 967 and an extended output of 20 bytes from 3, 966 against 1000. On the AVX2 path
+a hash of 0 bytes runs 448 instructions.
 
 In bench run 43715242317, measured as in [D-106](#decision-d-106), on Zen 3, Zen 4, Emerald Rapids
 and Granite Rapids (50, 40, 5 and 45 processes) the time before over the time here was 0.993 to
@@ -1606,8 +1585,8 @@ before, 55 of them before the kernel, a SHA3-384 4632 against 4698, a Keccak-256
 and a SHA3-512 of 1 KiB 66792 against 66838, and the Haswell model runs the same; with the Neoverse
 N2 model, where the call is direct, a SHA3-512 of 64 bytes runs 3679 against 3693, a SHA3-384 3694
 against 3708, a Keccak-256 3656 against 3670 and a SHA3-512 of 1 KiB 52352 against 52366. The
-permutation, which runs 4422 of the instructions of a SHA3-512 of 64 bytes on the Zen 3 path against
-4737 in that of keccak-asm, is unchanged, so that the code around it runs 215 instructions against
+permutation, which runs 4422 of the instructions of a SHA3-512 of 64 bytes on the Zen 3 path, is
+unchanged, so that the code around it runs 215 instructions against
 261. The stack bytes of the path, frames and saved registers, go from 936 to 760. The one-state
 AVX-512VL kernels, which QEMU does not run, are reached from the one-shot digest in 23 instructions,
 the last a jump; through the kernel's dispatch, as at first, the path took 85, with twelve registers
@@ -2097,9 +2076,9 @@ where the search had found a value, and none under a BLAKE2s MAC of a message, a
 most a chunk and a BLAKE3 tree hashed eight chunks at a time: with debug assertions the same kernels
 left the key of the tree, the state of a compression and a part of a chaining value, so the absence
 held for one kind of build and not for the code. A query of the CPU's features from the function
-that writes the zeros: that function is inlined into other crates, the features are a static of this
-crate, and every read of them in the crate then went through the global offset table, one more
-instruction in each dispatch.
+that writes the zeros: that function is inlined into a crate that uses this one, the features are a
+static of this crate, and every read of them in the crate then went through the global offset
+table, one more instruction in each dispatch.
 
 The zeros cost, on twelve hosted runners that ran the benchmarks of this tree and of the tree before
 it in turn, six rounds each, in a default build and with every function at a 64-byte boundary (an
@@ -2198,15 +2177,15 @@ HKDF zeros 7,104 and 2,112 bytes with SHA-256 and 7,424 and 2,880 with SHA-384 o
 6,455 and 6,735 bytes on x86-64; BLAKE3-KDF 3,840 and 1,152 for an output of at most 64 bytes and
 6,016 and 2,560 for a longer one, from 3,439 and 5,415. On x86-64 with its kernels the zeros of a
 keyed BLAKE3 of at most a chunk are written under `keyed_hash`, which reads the word of features and
-so knows the path that ran, where the code of the MAC is inlined into other crates and cannot: 64
-bytes after the vector kernel of one block, which takes 16, and 256 with debug assertions, where it
-takes 224; 192 after the portable code of one block, from 143; 256 after the first keyed hash of a
-process and on a core with SSE4.1 alone, from 215; 704 for more than a block, and 1,024 with debug
-assertions, from 631 and 879; 448 and 1,344 in the code before the row kernels, from 407 and 1,183.
-Up to 256 bytes the compiler writes these zeros with stores and calls no memset. A tree of at most
-64 KiB zeros 9,216 and 7,296 bytes, from 8,367 on x86-64, and a longer one 12 KiB, and 12,864 bytes
-under the Windows convention. The other sizes of D-117 stand. At the opt-levels 1, 2, s and z the
-zeros are the 16 KiB of D-116.
+so knows the path that ran, where the code of the MAC is inlined into a crate that uses this one
+and cannot: 64 bytes after the vector kernel of one block, which takes 16, and 256 with debug
+assertions, where it takes 224; 192 after the portable code of one block, from 143; 256 after the
+first keyed hash of a process and on a core with SSE4.1 alone, from 215; 704 for more than a
+block, and 1,024 with debug assertions, from 631 and 879; 448 and 1,344 in the code before the row
+kernels, from 407 and 1,183. Up to 256 bytes the compiler writes these zeros with stores and calls
+no memset. A tree of at most 64 KiB zeros 9,216 and 7,296 bytes, from 8,367 on x86-64, and a
+longer one 12 KiB, and 12,864 bytes under the Windows convention. The other sizes of D-117 stand.
+At the opt-levels 1, 2, s and z the zeros are the 16 KiB of D-116.
 
 The builds, all at opt-level 3: on x86-64 the release build, debug assertions, fat LTO, one codegen
 unit, the portable build, the build for x86-64-v3, and x86-64-v3 with one codegen unit and with fat

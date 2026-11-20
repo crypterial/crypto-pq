@@ -523,7 +523,7 @@ fn cv_bytes(cv: &[u32; 8], out: &mut [u8; 32]) {
     }
 }
 
-// What hash_many's inputs share (the reference implementation's hash_many): each has `blocks`
+// What hash_many's inputs share: each has `blocks`
 // whole blocks and is hashed from the key, input i with the counter plus i if `increment` (chunks)
 // or the counter itself (parents), its first block with `start` added to the flags and its last
 // with `end`.
@@ -1933,9 +1933,9 @@ pub(crate) const KEYED_ZEROS: bool = cfg!(all(
 // cores alone, a state word of a keyed compression stayed under them in a build with debug
 // assertions. No size for all of these would do: the larger ones are a call of memset, where 64
 // bytes are four stores, and the path is known here, not where the MAC writes its zeros, in code
-// inlined into other crates. Under the calling convention of Windows and UEFI, where a function
-// saves the vector registers that it uses and nothing was measured, the sizes are those of the
-// MAC for the targets not measured.
+// inlined into a crate that uses this one. Under the calling convention of Windows and UEFI,
+// where a function saves the vector registers that it uses and nothing was measured, the sizes
+// are those of the MAC for the targets not measured.
 #[cfg(all(
     crypto_pq_optimized,
     target_arch = "x86_64",
