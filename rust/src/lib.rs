@@ -17,7 +17,7 @@
 //!
 //! Each algorithm family is a Cargo feature, and the default features enable all of them. A build
 //! that needs only some takes `default-features = false` and names them, for example
-//! `crypto-pq = { version = "1", default-features = false, features = ["ml-kem", "ml-dsa"] }`.
+//! `crypto-pq = { version = "2", default-features = false, features = ["ml-kem", "ml-dsa"] }`.
 //!
 //! | feature | enables |
 //! |---|---|

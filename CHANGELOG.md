@@ -7,9 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 the [crypto-pq specification](spec/00-contents.md) that it implements
 ([Section 20.1](spec/20-versioning.md)).
 
-## [Unreleased]
+## [2.0.0] - 2026-11-20
 
-Implements specification 2.0 (draft).
+Implements specification 2.0. It is not compatible with 1.x: it removes the WebAssembly and 32-bit
+targets ([decision D-105](spec/decisions.md#decision-d-105)) and needs Rust 1.89 or later.
 
 ### Added
 
@@ -617,5 +618,6 @@ These rules are part of the API contract:
 - **One key, one mode** ([9.1.2](spec/09-signatures.md)). Each ML-DSA or SLH-DSA key is used with
   only one of the hedged and deterministic variants, and only one of the pure and pre-hash modes.
 
+[2.0.0]: https://github.com/crypterial/crypto-pq/tree/rust-v2.0.0
 [1.0.1]: https://github.com/crypterial/crypto-pq/tree/rust-v1.0.1
 [1.0.0]: https://github.com/crypterial/crypto-pq/tree/rust-v1.0.0
