@@ -155,11 +155,12 @@ impl KdfAlgorithm {
         }
     }
 
-    // The zeros under a derivation in one call: 16 KiB at the opt-levels 1, 2, s and z (D-116), and
-    // at 3 what the calls of its hash take (D-117). The input of BLAKE3-KDF is the message of the
-    // hash, which its kernels take through their frames, and its output is as long as the caller
-    // asks: `output` bytes, of which every block after the first comes from the kernels of the
-    // extended output, deeper than the hash of a chunk.
+    // The zeros under a derivation in one call: 16 KiB at the opt-levels 1, 2, s and z in every
+    // build (D-116, D-119), and at 3, with the feature `stack-zeros`, what the calls of its hash
+    // take (D-117). The input of BLAKE3-KDF is the message of the hash, which its kernels take
+    // through their frames, and its output is as long as the caller asks: `output` bytes, of which
+    // every block after the first comes from the kernels of the extended output, deeper than the
+    // hash of a chunk.
     #[inline(always)]
     fn below(&self, input: &[u8], output: usize) {
         below_keyed!();

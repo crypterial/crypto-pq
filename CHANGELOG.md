@@ -23,35 +23,35 @@ Implements specification 2.0 (draft).
   as Ethereum uses it, on the code and the kernels of SHA-3. Its padding differs from that of
   `SHA3_256`, so the two give different digests. It is refused as a pre-hash.
 - The Cargo feature `stack-zeros`, not a default feature ([decision
-  D-118](spec/decisions.md#decision-d-118)): with it a MAC and a KDF in one call, the key setup of
-  an incremental MAC or of a MAC key and the end of an incremental MAC end by writing zeros over the
-  stack under them, in a build at any opt-level but 0, as the operations on private keys always do.
-  Without it they wipe the buffers that they name, as the standards ask, and what the compiler saved
-  of a key or of a keyed state in a stack frame of a MAC or a KDF stays until later calls write over
-  it: at opt-level 3 a BLAKE2b MAC leaves the chaining value after its key block, and after an empty
-  message its key; a BLAKE2s MAC of an empty message 8 to 20 bytes of its key; HMAC-SHA-512 the
-  state after its outer key block on x86-64 and on ARM64 cores without the SHA-512 instructions;
-  HKDF-SHA-512 its output with fat LTO on ARM64; KMAC up to 120 bytes of its final state and 96 of
-  its state after the key; BLAKE3-KDF 12 bytes of its input keying material on ARM64; a keyed
-  BLAKE3 of more than a chunk 12 to 20 bytes of its key on ARM64, and with debug assertions the
-  state of a compression or its whole key. Below opt-level 3, HMAC, HKDF and BLAKE2b leave their
-  key, the states after its blocks or the derived key in the frames of their kernels, and an
-  incremental MAC leaves its keyed state in frames of the library at every opt-level. The zeros
-  are 64 bytes to 12 KiB at
-  opt-level 3, by the hash, by the lengths of the key and of the tag for HMAC, and for BLAKE3 by the
-  length of the data and by the code that ran, and 16 KiB at the opt-levels 1, 2, s and z. Their
-  sizes are the depths measured in a list of builds with a tenth more: eight builds at opt-level 3
-  on x86-64 under seven processor models, five on ARM64 under three, first and later calls, over
-  grids of lengths; a build setting outside that list can take more, as fat LTO, one codegen unit
-  and x86-64-v3 did, alone and together, before they were in it. The test of the dead stack covers
-  these calls with the feature, in the release build and in the test profile. With the feature a MAC
-  in one call takes 1 to 23 ns more on the server processors measured (EPYC 7763, 9V45 and 9V74,
-  Xeon Platinum 8573C, Xeon 6975P-C, Neoverse N2), up to 15 percent for HMAC-SHA-256 of 64 bytes, a
-  keyed BLAKE3 of 16 KiB 38 to 96 ns more, a derivation of 32 bytes 20 to 86 ns more with HKDF and a
-  MAC made with `create` 44 to 92 ns more, measured with the sizes of decision D-117; the sizes that
-  have grown since were not timed. Without it the machine code of a MAC and of a KDF in one call is
-  what it was before these zeros. A `Mac` and a `MacKey` are returned by value: the compiler leaves
-  a copy of their keyed state in the caller's own frame, which the library cannot wipe and the
+  D-118](spec/decisions.md#decision-d-118), [decision D-119](spec/decisions.md#decision-d-119)):
+  with it a MAC and a KDF in one call, the key setup of an incremental MAC or of a MAC key and the
+  end of an incremental MAC end by writing zeros over the stack under them at opt-level 3 too, as
+  the operations on private keys always do. At the opt-levels 1, 2, s and z they end with 16 KiB of
+  zeros in every build, with the feature and without it, and at opt-level 0 with none. Without the
+  feature, at opt-level 3, they wipe the buffers that they name, as the standards ask, and what the
+  compiler saved of a key or of a keyed state in a stack frame of a MAC or a KDF stays until later
+  calls write over it: a BLAKE2b MAC leaves the chaining value after its key block, and after an
+  empty message its key; a BLAKE2s MAC of an empty message 8 to 20 bytes of its key; HMAC-SHA-512
+  the state after its outer key block on x86-64 and on ARM64 cores without the SHA-512
+  instructions; HKDF-SHA-512 its output with fat LTO on ARM64; KMAC up to 120 bytes of its final
+  state and 96 of its state after the key; BLAKE3-KDF 12 bytes of its input keying material on
+  ARM64; a keyed BLAKE3 of more than a chunk 12 to 20 bytes of its key on ARM64, and with debug
+  assertions the state of a compression or its whole key; and an incremental MAC its keyed state in
+  frames of the library. With the feature the zeros at opt-level 3 are 64 bytes to 12 KiB, by the
+  hash, by the lengths of the key and of the tag for HMAC, and for BLAKE3 by the length of the data
+  and by the code that ran. Their sizes are the depths measured in a list of builds with a tenth
+  more: eight builds at opt-level 3 on x86-64 under seven processor models, five on ARM64 under
+  three, first and later calls, over grids of lengths; a build setting outside that list can take
+  more, as fat LTO, one codegen unit and x86-64-v3 did, alone and together, before they were in
+  it. The test of the dead stack covers these calls at opt-level 3 with the feature, in the release
+  build and in the test profile. With the feature a MAC in one call takes 1 to 23 ns more on the
+  server processors measured (EPYC 7763, 9V45 and 9V74, Xeon Platinum 8573C, Xeon 6975P-C,
+  Neoverse N2), up to 15 percent for HMAC-SHA-256 of 64 bytes, a keyed BLAKE3 of 16 KiB 38 to 96 ns
+  more, a derivation of 32 bytes 20 to 86 ns more with HKDF and a MAC made with `create` 44 to 92
+  ns more, measured with the sizes of decision D-117; the sizes that have grown since were not
+  timed. Without it the machine code of a MAC and of a KDF in one call at opt-level 3 is what it
+  was before these zeros. A `Mac` and a `MacKey` are returned by value: the compiler leaves a copy
+  of their keyed state in the caller's own frame, which the library cannot wipe and the
   documentation states. Outputs are unchanged.
 
 ### Changed
@@ -433,20 +433,24 @@ Implements specification 2.0 (draft).
   before the lanes were wiped in place, and key generation 18 KB, 4 to 7 KB more than before.
   Outputs are unchanged.
 - ML-KEM, ML-DSA and FrodoKEM: key generation, encapsulation, decapsulation, signing and the
-  import of a private key end by writing zeros over the stack under them, as SLH-DSA does
-  ([decision D-116](spec/decisions.md#decision-d-116)). At opt-level 3, FrodoKEM left its shared
-  secret on the stack after encapsulation and after decapsulation on x86-64 and in builds without
-  the CPU kernels, and with FrodoKEM-1344 on ARM64 cores without the SHA-3 instructions; ML-KEM
-  left its shared secret and the coins of the encryption when built for x86-64-v3, and the noise
-  seed and the coins with fat LTO on ARM64; ML-DSA left rho' and K after key generation in builds
-  without the CPU kernels. The test of the dead stack covers these operations, in the release
-  build, in the test profile and at opt-level z in CI. An
-  operation of ML-KEM takes 19 to 72 ns more on a Neoverse N2, at most 1 percent, and 42 to 119 ns
-  more on the x86-64 server processors measured (EPYC 7763, Xeon Platinum 8573C, Xeon 6975P-C),
-  0.3 to 4.4 percent; key generation of ML-DSA takes 0.1 to 0.3 us more, up to 2.1 percent. At
-  opt-level 3 on x86-64 an operation takes about 2 KB more
-  stack with ML-KEM, 4.5 KB more with ML-DSA and 4.4 to 8 KB more with FrodoKEM. Outputs are
-  unchanged.
+  import of a private key end by writing zeros over the stack under them, as SLH-DSA does, and so
+  do a MAC or a KDF in one call, the key setup of an incremental MAC or of a MAC key and the end of
+  an incremental MAC in every build at opt-level 1, 2, s or z ([decision
+  D-116](spec/decisions.md#decision-d-116), [decision D-119](spec/decisions.md#decision-d-119)). At
+  opt-level 3, FrodoKEM left its shared secret on the stack after encapsulation and after
+  decapsulation on x86-64 and in builds without the CPU kernels, and with FrodoKEM-1344 on ARM64
+  cores without the SHA-3 instructions; ML-KEM left its shared secret and the coins of the
+  encryption when built for x86-64-v3, and the noise seed and the coins with fat LTO on ARM64;
+  ML-DSA left rho' and K after key generation in builds without the CPU kernels. Below opt-level 3,
+  HMAC, HKDF and BLAKE2b left their key, the states after its blocks or the derived key in the
+  frames of their kernels, and an incremental MAC its keyed state in frames of the library. The
+  test of the dead stack covers these operations, in the release build, in the test profile and at
+  opt-level z in CI, where it covers a MAC and a KDF in one call with the default and with every
+  feature. An operation of ML-KEM takes 19 to 72 ns more on a Neoverse N2, at most 1 percent, and
+  42 to 119 ns more on the x86-64 server processors measured (EPYC 7763, Xeon Platinum 8573C, Xeon
+  6975P-C), 0.3 to 4.4 percent; key generation of ML-DSA takes 0.1 to 0.3 us more, up to 2.1
+  percent. At opt-level 3 on x86-64 an operation takes about 2 KB more stack with ML-KEM, 4.5 KB
+  more with ML-DSA and 4.4 to 8 KB more with FrodoKEM. Outputs are unchanged.
 - HMAC-SHA-256 and HKDF-SHA-256 on x86-64 with the SHA extensions, in builds at opt-level 2: the
   copy of both streams that the feed-forward of a block kept was a call to memcpy, around which
   the registers with the words of the two key blocks were saved on the stack, where nothing wiped

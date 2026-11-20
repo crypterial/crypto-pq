@@ -450,11 +450,12 @@ impl MacAlgorithm {
         }
     }
 
-    // The zeros under a MAC in one call: 16 KiB at the opt-levels 1, 2, s and z (D-116), and at 3
-    // what the calls of its hash take (D-117). There the kernels keep their state in registers,
-    // and the compiler saves some of it in their frames all the same: the chaining value that a
-    // compression adds in at its end, the message words of a key block. HMAC takes them by its
-    // path, which the lengths of the key and of the tag choose (D-118).
+    // The zeros under a MAC in one call: 16 KiB at the opt-levels 1, 2, s and z in every build
+    // (D-116, D-119), and at 3, with the feature `stack-zeros`, what the calls of its hash take
+    // (D-117). There the kernels keep their state in registers, and the compiler saves some of it
+    // in their frames all the same: the chaining value that a compression adds in at its end, the
+    // message words of a key block. HMAC takes them by its path, which the lengths of the key and
+    // of the tag choose (D-118).
     #[inline(always)]
     fn below(&self, key: &[u8], data: &[u8]) {
         below_keyed!();

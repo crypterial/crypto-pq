@@ -611,11 +611,11 @@ fn slh_dsa_shake_leaves_no_secret_on_the_stack() {
     feature = "ml-dsa",
     all(
         not(crypto_pq_unoptimized),
+        any(not(crypto_pq_optimized), feature = "stack-zeros"),
         feature = "hmac",
         feature = "hkdf",
         feature = "blake2",
-        feature = "blake3",
-        feature = "stack-zeros"
+        feature = "blake3"
     )
 ))]
 fn inspect(
@@ -886,19 +886,15 @@ fn frodokem_leaves_no_secret_on_the_stack() {
     );
 }
 
-// With the feature `stack-zeros` (D-118): at the opt-levels between 0 and 3 a keyed hash and a KDF
-// in one call end with zeros too: there their kernels pass arrays of key words through memory
-// (D-116). build.rs gives this crate the level as it gives it to the library. Without the feature
-// these tests are not compiled: a MAC and a KDF then wipe the buffers that they name, and what the
-// compiler saved of a key in a dead frame stays, so a search of the dead stack has nothing to
-// assert there.
+// At the opt-levels between 0 and 3 a keyed hash and a KDF in one call end with zeros too, with
+// the feature `stack-zeros` and without it: there their kernels pass arrays of key words through
+// memory (D-116, D-119). build.rs gives this crate the level as it gives it to the library.
 #[cfg(all(
     not(any(crypto_pq_optimized, crypto_pq_unoptimized)),
     feature = "hmac",
     feature = "hkdf",
     feature = "blake2",
-    feature = "blake3",
-    feature = "stack-zeros"
+    feature = "blake3"
 ))]
 #[test]
 fn keyed_hashes_leave_no_key_on_the_stack() {

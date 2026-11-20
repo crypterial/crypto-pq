@@ -44,8 +44,8 @@ ascon = []
 hmac = ["sha2"]
 hkdf = ["hmac"]
 hazmat = []
-# A MAC and a KDF end by writing zeros over the stack under them (decision D-118). Not a default
-# feature.
+# At opt-level 3 a MAC and a KDF end by writing zeros over the stack under them (decisions D-118
+# and D-119); at the opt-levels 1, 2, s and z they always do. Not a default feature.
 stack-zeros = []
 
 # docs.rs documents every feature, hazmat included, and shows the features that each item needs.
