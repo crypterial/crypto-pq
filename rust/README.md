@@ -18,7 +18,7 @@ is `no_std` with `alloc` and needs Rust 1.89 or later.
 
 ```toml
 [dependencies]
-crypto-pq = "1"
+crypto-pq = "2"
 ```
 
 The default features enable every algorithm family. To build only some, turn the defaults off and
@@ -26,7 +26,7 @@ name the families:
 
 ```toml
 [dependencies]
-crypto-pq = { version = "1", default-features = false, features = ["ml-kem", "ml-dsa"] }
+crypto-pq = { version = "2", default-features = false, features = ["ml-kem", "ml-dsa"] }
 ```
 
 | feature | algorithms |
@@ -237,8 +237,9 @@ keyed state in the value itself, so returning or moving one leaves a copy that i
 in one call leaves none. What a MAC or a KDF leaves on the stack, with the feature `stack-zeros`
 and without it, is stated under "After a keyed hash" in
 [the audit record](https://github.com/crypterial/crypto-pq/blob/main/security/audit-2026-11.md).
-Randomness comes only from the operating system; on a target without a source, operations that
-need it return `Error::RngFailure`. CPU-specific code for x86-64 (AVX2
+That audit, of November 2026, was AI-assisted and run by the maintainer; there has been no
+third-party audit. Randomness comes only from the operating system; on a target without a source,
+operations that need it return `Error::RngFailure`. CPU-specific code for x86-64 (AVX2
 with BMI1 and BMI2, AVX-512F and AVX-512VL, SSE4.1, SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2,
 SHA-3, SHA-512) is selected at run time, with portable code on every 64-bit target. WebAssembly and
 32-bit targets are not supported.

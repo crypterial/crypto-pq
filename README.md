@@ -43,7 +43,7 @@ of the specification lists every size.
 
 ```toml
 [dependencies]
-crypto-pq = "1"
+crypto-pq = "2"
 ```
 
 - Rust 1.89 or later, edition 2024.
@@ -53,7 +53,7 @@ crypto-pq = "1"
 
   ```toml
   [dependencies]
-  crypto-pq = { version = "1", default-features = false, features = ["ml-kem", "ml-dsa"] }
+  crypto-pq = { version = "2", default-features = false, features = ["ml-kem", "ml-dsa"] }
   ```
 
 - The `hazmat` feature is opt-in. It adds the `hazmat` module, with deterministic operations that
@@ -290,6 +290,9 @@ specification state them in full.
   `RUSTFLAGS="--cfg crypto_pq_portable"` builds the portable code only.
 - **Allocation.** Every operation is synchronous. Fixed-size operations allocate only their returned
   value, and the `_into` forms allocate nothing.
+- **Review.** The source was audited in November 2026: an AI-assisted audit run by the maintainer,
+  recorded with its findings, fixes and limits in
+  [security/audit-2026-11.md](security/audit-2026-11.md). There has been no third-party audit.
 
 CI builds and tests the crate with stable Rust on Linux x86-64 and ARM64, macOS ARM64, Windows
 x86-64 and ARM64 and Linux musl, and under emulation on RISC-V 64 and big-endian s390x. On Linux
@@ -307,11 +310,12 @@ for Android, iOS and bare-metal ARM64 and RISC-V.
   from the RFC 8391 reference implementation, and the files of `vectors/cross/`, which cover every
   error case, option and format. CI runs the suite on every push and checks every file against
   [`vectors/SHA256SUMS`](vectors/SHA256SUMS); the full ACVP sets and the large-data tests run weekly.
-- The crate's MAJOR.MINOR is the version of the specification that it implements: every 1.0.x
-  release implements specification 1.0 ([20.1](spec/20-versioning.md),
-  [VERSIONS.md](spec/VERSIONS.md)). Within 1.x, no public item is removed or renamed and no specified
-  behaviour changes; a minor release can add algorithms, options, operations and error codes, which
-  is why `Error` is non-exhaustive ([20.3](spec/20-versioning.md)).
+- The crate's MAJOR.MINOR is the version of the specification that it implements: every 2.0.x
+  release implements specification 2.0, and every 1.0.x release specification 1.0
+  ([20.1](spec/20-versioning.md), [VERSIONS.md](spec/VERSIONS.md)). Within 2.x, no public item is
+  removed or renamed and no specified behaviour changes; a minor release can add algorithms,
+  options, operations and error codes, which is why `Error` is non-exhaustive
+  ([20.3](spec/20-versioning.md)).
 - Releases are published from signed tags `rust-vX.Y.Z` on `main`. The crate is built on x86-64 and
   ARM64 hosts and the two builds are compared byte for byte; it carries a build provenance
   attestation and is published through crates.io trusted publishing.
