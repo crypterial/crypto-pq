@@ -1982,8 +1982,8 @@ is left to a later decision with its own measurement. The incremental forms of a
 either: their object holds the keyed state, and [D-76](#decision-d-76) describes its copies.
 
 The zeros that this decision gave a MAC and a KDF in one call at the opt-levels 1, 2, s and z are
-written only with the feature `stack-zeros` since [D-118](#decision-d-118). Those of ML-KEM, ML-DSA
-and FrodoKEM stand.
+written in every build: the feature `stack-zeros` of [D-118](#decision-d-118) does not govern them
+([D-119](#decision-d-119)). Those of ML-KEM, ML-DSA and FrodoKEM stand.
 
 ## Decision D-117
 
@@ -2121,11 +2121,12 @@ agree within 5 percent. On an EPYC 9V45, in an earlier run with 192 bytes fewer 
 and rounds that spread by 5 to 18 percent, the zeros cost 1 to 2.5 ns with HMAC-SHA-256, 7.5 to 8.5
 with BLAKE2b, 2.5 to 3.5 with BLAKE2s and 2 to 3 with BLAKE3 of at most a block.
 
-Since [D-118](#decision-d-118) the zeros of this decision are written only with the feature
-`stack-zeros`. The sizes that this decision gave HMAC, KMAC, HKDF, BLAKE3-KDF, the key setups and a
-keyed BLAKE3 of at most a chunk on x86-64, its margin of an eighth, and its sentence on the
-processors that no emulation chose are withdrawn by D-118, which measures those paths and gives the
-sizes anew.
+Since [D-118](#decision-d-118) the zeros of this decision at opt-level 3 are written only with the
+feature `stack-zeros`; at the opt-levels 1, 2, s and z the key setup and the end of an incremental
+MAC end with the 16 KiB of D-116 in every build ([D-119](#decision-d-119)). The sizes that this
+decision gave HMAC, KMAC, HKDF, BLAKE3-KDF, the key setups and a keyed BLAKE3 of at most a chunk
+on x86-64, its margin of an eighth, and its sentence on the processors that no emulation chose are
+withdrawn by D-118, which measures those paths and gives the sizes anew.
 
 ## Decision D-118
 
@@ -2144,8 +2145,9 @@ values, which the wipes of the buffers do. The zeros go beyond that. They cost e
 size is the deepest that the calls went in the builds, on the processors, for the lengths and in the
 calls that were run, with a tenth more: it holds for that list and for nothing else. On 2026-11-19
 four cases outside the list of D-117 went deeper than its zeros, two of them by the build setting
-alone, 8 and 11 percent over, and in three the search of the dead stack found a keyed value. A build
-setting outside the list below can take more than these sizes too.
+alone, 8 and 11 percent over, and in each of the four the search of the dead stack found a keyed
+value, in the first only in a build with debug assertions. A build setting outside the list below
+can take more than these sizes too.
 
 The feature adds no item and changes no output. One function, `wipe::keyed`, stands at every place
 where a keyed hash or a KDF writes these zeros and is empty without the feature; the sizes are
@@ -2280,3 +2282,41 @@ bytes at the key setup of HMAC with SHA-256; with the sizes above the same build
 The sizes at the end of an incremental HMAC with SHA-224 or SHA-256 and of an incremental KMAC on
 x86-64 come from that run too, from reads of 4,575 and 4,007 bytes; with the sizes above, the grids
 read 1,367 and 743 bytes there in the same two builds, and the larger sizes are kept.
+
+Since [D-119](#decision-d-119) the feature governs these zeros at opt-level 3 alone: at the
+opt-levels 1, 2, s and z a MAC and a KDF in one call, the key setup of an incremental MAC or of a
+MAC key and the end of an incremental MAC end with the 16 KiB of D-116 in every build, and what this
+decision says of a build without the feature holds at opt-level 3 only.
+
+## Decision D-119
+
+At the opt-levels 1, 2, s and z a MAC and a KDF in one call, the key setup of an incremental MAC or
+of a MAC key and the end of an incremental MAC end with the 16 KiB of zeros of
+[D-116](#decision-d-116) in every build, with the feature `stack-zeros` and without it. The feature
+governs opt-level 3 alone, with the sizes of [D-117](#decision-d-117) as [D-118](#decision-d-118)
+gives them anew. At opt-level 0 these calls write no such zeros, as before.
+
+Rationale: [D-76](#decision-d-76) wipes, at the opt-levels other than 3, the arrays that the
+compiler keeps in registers at 3, as they are in memory there. Below opt-level 3 the kernels of the
+keyed hashes pass arrays of key words through memory and store state words in frames that no wipe
+of a buffer reaches (D-116), so a build at those levels keeps the promise of D-76 only with these
+zeros. On the tree of D-118, on ARM64 natively at opt-level z with the default features and
+`hazmat`, the test of the dead stack for these levels, compiled without the feature, found the
+output of HKDF-SHA-256 and of HKDF-SHA-512 after a derivation of 32 bytes and after one of 200
+bytes, as D-116 had found it without its zeros. The mechanism of D-116 is one size for every such
+call: 16 KiB, over calls that took at most 4,943 bytes, and 11,308 for a BLAKE3 MAC of 4 MiB, where
+a size at opt-level 3 is the depth of one path with a tenth more. CI has run its test at opt-level
+z since D-116.
+
+The feature `stack-zeros` decides whether these calls write zeros at opt-level 3, where the kernels
+keep most of a key in registers and the sizes are the depths of the builds that D-118 lists.
+`wipe::keyed` stays the gate there; the 16 KiB of the other levels are written by `wipe::below`
+itself. The cost falls on builds below opt-level 3 alone, one array of 16 KiB after each of these
+calls, and was not timed. The machine code at opt-level 3 does not change.
+
+Checked: with this decision the test of the dead stack passes at opt-level z on ARM64 natively with
+the default features and `hazmat` and with every feature, at the opt-levels 2, s and 1 there with
+the default features and `hazmat`, and at opt-level z with those features on x86-64 as EPYC-Milan,
+Haswell and Nehalem. Compared at opt-level 3 in one codegen unit, with the default features and
+`hazmat`, no function of the library differs from the tree of D-118, on x86-64 and on ARM64. CI runs
+the test at opt-level z with the default features and `hazmat` as well as with every feature.

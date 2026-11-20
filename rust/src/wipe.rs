@@ -182,22 +182,24 @@ macro_rules! taken {
 #[allow(unused_imports)]
 pub(crate) use taken;
 
-// `below` under a keyed hash or a KDF in one call, at the opt-levels 1, 2, s and z (D-116). There
-// their kernels pass arrays of key words by value and store state words that stay in registers at
-// 3, in frames that no wipe of a buffer reaches. 16 KiB: the calls took at most 4,943 bytes, and
-// those of BLAKE3 11,308 for 4 MiB of data, about 320 more for each doubling. Not at 0, where the
-// calls of BLAKE3 take 80 KB.
+// `below` under a keyed hash or a KDF in one call, at the opt-levels 1, 2, s and z (D-116), in
+// every build: the feature `stack-zeros` does not govern it (D-119). There their kernels pass
+// arrays of key words by value and store state words that stay in registers at 3, in frames that
+// no wipe of a buffer reaches. 16 KiB: the calls took at most 4,943 bytes, and those of BLAKE3
+// 11,308 for 4 MiB of data, about 320 more for each doubling. Not at 0, where the calls of BLAKE3
+// take 80 KB.
 #[allow(unused_macros)]
 macro_rules! below_keyed {
     () => {
         #[cfg(not(any(crypto_pq_optimized, crypto_pq_unoptimized)))]
-        $crate::wipe::keyed::<{ 16 << 10 }>();
+        $crate::wipe::below::<{ 16 << 10 }>();
     };
 }
 
-// `below` for a keyed hash or a KDF: with the feature `stack-zeros` alone (D-118). Without it a
-// MAC and a KDF wipe the buffers that they name and write no zeros over their dead frames. One
-// gate for every such place, so that their sizes are compiled, and checked, in both settings.
+// `below` for a keyed hash or a KDF at opt-level 3: with the feature `stack-zeros` alone (D-118,
+// D-119). Without it a MAC and a KDF there wipe the buffers that they name and write no zeros over
+// their dead frames. One gate for every such place, so that their sizes are compiled, and
+// checked, in both settings.
 #[allow(dead_code)]
 #[inline(always)]
 pub(crate) fn keyed<const N: usize>() {

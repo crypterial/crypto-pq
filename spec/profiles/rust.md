@@ -69,11 +69,12 @@
    wipes); copies that the compiler makes in registers or spill slots cannot be controlled, which the
    documentation states. The operations of ML-KEM, ML-DSA, FrodoKEM and SLH-DSA on secret values
    end by zeroing the stack under them, where the frames of their kernels were
-   ([D-115](../decisions.md#decision-d-115), [D-116](../decisions.md#decision-d-116)). With the
-   feature `stack-zeros`, which is not a default feature, so do a MAC and a KDF in one call and the
-   key setup and the end of an incremental MAC, in a build at any opt-level but 0
-   ([D-118](../decisions.md#decision-d-118)); without it, what the compiler saved of a key in a
-   stack frame of a MAC or a KDF is not cleared. An incremental MAC and a MAC key are
+   ([D-115](../decisions.md#decision-d-115), [D-116](../decisions.md#decision-d-116)). So do a MAC
+   and a KDF in one call and the key setup and the end of an incremental MAC, in every build at the
+   opt-levels 1, 2, s and z, and at opt-level 3 with the feature `stack-zeros`, which is not a
+   default feature ([D-118](../decisions.md#decision-d-118),
+   [D-119](../decisions.md#decision-d-119)); without it, what the compiler saved of a key in a stack
+   frame of a MAC or a KDF at opt-level 3 is not cleared. An incremental MAC and a MAC key are
    returned by value: that move, and every move by the caller, leaves a copy of the keyed state in
    the caller's own frames, which the documentation states.
 4. DIT: a guard object sets DIT and restores it on drop ([14.2](../14-security.md#142-data-independent-timing-dit)); Rust threads are operating-system
@@ -128,7 +129,7 @@
    | `hmac` | `HMAC_SHA_*`; the MAC types | `sha2` |
    | `hkdf` | `HKDF_SHA_*`; the KDF types | `hmac` |
    | `hazmat` | the `hazmat` module ([13](../13-hazmat.md#13-the-hazmat-namespace)), with the operations of the enabled families | |
-   | `stack-zeros` | none: a MAC and a KDF end by writing zeros over the stack under them ([D-118](../decisions.md#decision-d-118)) | |
+   | `stack-zeros` | none: zeros over the stack under a MAC and a KDF at opt-level 3 ([D-119](../decisions.md#decision-d-119)) | |
 
    Rules:
 
@@ -136,8 +137,9 @@
       explicitly. Rationale: hazmat operations take seeds and randomness from the caller, and a reused
       value breaks the scheme ([13](../13-hazmat.md#13-the-hazmat-namespace) item 1); an application that never names the feature cannot
       reach them, so no default build exposes them. `stack-zeros` is not a default feature either: it
-      adds no item and changes no output, and a MAC or a KDF costs more with it
-      ([D-118](../decisions.md#decision-d-118)).
+      adds no item and changes no output, and a MAC or a KDF at opt-level 3 costs more with it
+      ([D-118](../decisions.md#decision-d-118)). At the opt-levels 1, 2, s and z these calls end
+      with zeros with the feature and without it ([D-119](../decisions.md#decision-d-119)).
    2. `Error`, `enable_data_independent_timing` and the key formats and options of the enabled
       families are always available with them; `SecretBytes` is available with every family that
       returns it.
