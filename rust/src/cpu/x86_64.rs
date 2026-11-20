@@ -644,12 +644,10 @@ fn one_state(vendor: Vendor, eax: u32) -> bool {
 // output, in 512-bit registers (D-44), and on two to four in the row form of the same kernels
 // (D-84), from the family and model in CPUID leaf 1 EAX: AMD Zen 4 (family 19h) and Zen 5 (1Ah),
 // Intel Ice Lake Xeon (family 6, models 6Ah and 6Ch), Sapphire Rapids (8Fh), Emerald Rapids (CFh)
-// and Granite Rapids (ADh). There the blake3 crate's and rscrypto's 512-bit kernels hashed 16 KiB
-// in 0.43 (Zen 5), 0.68 (Zen 4), 0.56 (Emerald Rapids) and 0.55 (Granite Rapids) of the time of
-// the eight-lane AVX2 kernel (Sapphire Rapids, the core of Emerald Rapids, not measured). On Ice
-// Lake Xeon this crate's own took 0.56 to 0.58 of the time of its eight-lane kernel for 16 KiB and
-// 64 KiB, and a copy of it in the same process 0.63 to 0.73. Cores not in the table and cores of
-// other vendors keep 256-bit registers.
+// and Granite Rapids (ADh). On Ice Lake Xeon the sixteen-lane kernel took 0.56 to 0.58 of the time
+// of the eight-lane kernel for 16 KiB and 64 KiB, and a copy of it in the same process 0.63 to
+// 0.73 (Sapphire Rapids, the core of Emerald Rapids, not measured). Cores not in the table and
+// cores of other vendors keep 256-bit registers.
 fn zmm_lanes(vendor: Vendor, eax: u32) -> bool {
     let (family, model) = family_model(eax);
 
@@ -2386,7 +2384,7 @@ fn blake2_avx2(word: u32) -> bool {
 }
 
 // The BLAKE2 functions below read FEATURES out of line: a read inlined into the generic engine
-// made FEATURES visible to other crates, and so every read of it in this crate took the GOT.
+// made FEATURES visible to a crate that uses this one, and so every read of it here took the GOT.
 #[allow(unsafe_code)]
 #[cfg(feature = "blake2")]
 pub(crate) fn blake2b(

@@ -206,8 +206,8 @@ jobs:
       # optimization level has no instruction on a 512-bit register outside them. The kernels'
       # three-input logic, and the 512-bit registers in those four, show that the disassembly read
       # their code. The feature word (cpu/x86_64.rs, FEATURES) is read relative to the instruction
-      # pointer, not through the GOT, which every read takes once a function that other crates
-      # inline exports it.
+      # pointer, not through the GOT, which every read takes once a function that a crate using this
+      # one inlines exports it.
       - if: matrix.cfg == ''
         run: |
           for level in 0 1 2 3 s z; do

@@ -1,4 +1,4 @@
-// BLAKE3 with NEON on several inputs at once, as the reference implementation's hash_many: each
+// BLAKE3 with NEON on several inputs at once (hash_many): each
 // vector holds one state word of four inputs, so a G function of the specification runs on four
 // inputs with each instruction. The message words are transposed into the same form as each
 // block is loaded. Rotations by 16 and 8 are a REV32 and a TBL, by 12 and 7 a USHR and an SLI.

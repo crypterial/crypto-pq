@@ -2035,7 +2035,7 @@ impl Sha512 {
     }
 }
 
-// Inline on x86-64, so that the drop of a hasher in another crate wipes the state without a call;
+// Inline on x86-64, so that the drop of a hasher in a dependent crate wipes the state with no call;
 // elsewhere as the methods of Hasher (hash.rs).
 impl Drop for Sha256 {
     #[cfg_attr(target_arch = "x86_64", inline)]
