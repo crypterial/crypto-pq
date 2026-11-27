@@ -322,8 +322,9 @@ Android, iOS and bare-metal ARM64 and RISC-V.
   from the RFC 8391 reference implementation, and the files of `vectors/cross/`, which cover every
   error case, option and format. CI runs the suite on every push and checks every file against
   [`vectors/SHA256SUMS`](vectors/SHA256SUMS); the full ACVP sets and the large-data tests run weekly.
-- The crate's MAJOR.MINOR is the version of the specification that it implements: every 2.0.x
-  release implements specification 2.0, and every 1.0.x release specification 1.0
+- The crate's MAJOR.MINOR is the version of the specification that it implements: every 2.1.x
+  release implements specification 2.1, every 2.0.x release specification 2.0, and every 1.0.x
+  release specification 1.0
   ([20.1](spec/20-versioning.md), [VERSIONS.md](spec/VERSIONS.md)). Within 2.x, no public item is
   removed or renamed and no specified behaviour changes; a minor release can add algorithms,
   options, operations and error codes, which is why `Error` is non-exhaustive

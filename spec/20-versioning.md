@@ -3,15 +3,15 @@
 ## 20.1 Versions
 
 1. The package follows Semantic Versioning 2.0.0 [[D-66](decisions.md#decision-d-66-revised-by-d-71)]. Its MAJOR.MINOR equals the version of this
-   specification it implements (1.0.x implements SPEC 1.0, 2.0.x SPEC 2.0); PATCH is independent
-   of the specification. The first release that implements this specification is 2.0.0
-   [[D-105](decisions.md#decision-d-105-revised-by-d-120)].
+   specification it implements (1.0.x implements SPEC 1.0, 2.0.x SPEC 2.0, 2.1.x SPEC 2.1); PATCH
+   is independent of the specification. The first release that implements this specification is
+   2.1.0 [[D-120](decisions.md#decision-d-120)].
 2. The package manifests (`Cargo.toml` and `Cargo.lock`) carry the release version; CI checks that
    they agree.
 
 ## 20.2 Format and interface versions
 
-| item | version in 2.0 |
+| item | version in 2.1 |
 |---|---|
 | state record | writes and reads 2; refuses 1 ([11.7](11-stateful-signatures.md#117-state-record-version-2), [11.8](11-stateful-signatures.md#118-state-record-version-1)) |
 | tree cache | 1 ([11.10](11-stateful-signatures.md#1110-tree-cache)) |
