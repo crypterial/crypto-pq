@@ -1,8 +1,11 @@
 # Benchmarks
 
-This folder describes how crypto-pq is timed and holds its times for each release. The times of
-2.0.0 are in [`results-2.0.0.md`](results-2.0.0.md). Performance never justifies weakening a rule
-of the specification (principle P11).
+This folder describes how crypto-pq is timed and holds the times of the releases that were timed.
+The times of 2.0.0 are in [`results-2.0.0.md`](results-2.0.0.md). 2.1.0 was not timed: built with
+Rust 1.99.0 at opt-level 3 in one codegen unit, as the binaries below are, its machine code on
+x86-64 and ARM64 is that of 2.0.0, function by function
+([D-120](../spec/decisions.md#decision-d-120)). Performance never justifies weakening a rule of
+the specification (principle P11).
 
 ## What is timed
 
