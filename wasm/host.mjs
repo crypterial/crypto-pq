@@ -1,6 +1,8 @@
 // A host for a wasm32-wasip1 module that uses crypto-pq, in browsers and Node.js. crypto-pq
-// imports random_get alone, filled here from crypto.getRandomValues; the other four are imports
-// of Rust's std. A pointer or a length arrives as a signed 32-bit number, hence the `>>> 0`.
+// imports random_get alone, filled here from crypto.getRandomValues. Rust's std imports others,
+// which change between Rust versions: the environment is empty here, proc_exit throws, and every
+// other function returns ENOSYS (52). A pointer or a length arrives as a signed 32-bit number,
+// hence the `>>> 0`.
 export async function instantiate(bytes) {
   let memory;
 
@@ -28,13 +30,20 @@ export async function instantiate(bytes) {
 
       return 0;
     },
-    fd_write: () => 52,
     proc_exit(code) {
       throw new Error(`proc_exit(${code})`);
     },
   };
 
-  const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi });
+  const module = await WebAssembly.compile(bytes);
+
+  for (const { module: from, name, kind } of WebAssembly.Module.imports(module)) {
+    if (from === "wasi_snapshot_preview1" && kind === "function" && !Object.hasOwn(wasi, name)) {
+      wasi[name] = () => 52;
+    }
+  }
+
+  const instance = await WebAssembly.instantiate(module, { wasi_snapshot_preview1: wasi });
 
   memory = instance.exports.memory;
 
