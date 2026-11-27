@@ -5,7 +5,7 @@ use crate::blake3;
 use crate::cpu::Dit;
 use crate::error::Error;
 #[cfg(feature = "blake3")]
-use crate::hash::fits_u32;
+use crate::hash::fits_output;
 #[cfg(feature = "hkdf")]
 use crate::hash::{HashAlgorithm, Kind, SHA_256, SHA_384, SHA_512};
 #[cfg(feature = "hkdf")]
@@ -138,14 +138,14 @@ impl KdfAlgorithm {
         }
     }
 
-    // RFC 5869, 2.3: L is at most 255 HashLen, and BLAKE3-KDF's at most 2^32 - 1 (SPEC 12.8).
-    // Every KDF refuses an empty output.
+    // RFC 5869, 2.3: L is at most 255 HashLen, and BLAKE3-KDF's at most 2^32 - 1 (2^31 - 1 on
+    // wasm32, SPEC 12.8). Every KDF refuses an empty output.
     const fn check_output(&self, length: usize) -> Result<(), Error> {
         let fits = match self.kind {
             #[cfg(feature = "hkdf")]
             KdfKind::Hkdf(hash) => length <= 255 * hash.digest_size(),
             #[cfg(feature = "blake3")]
-            KdfKind::Blake3 => fits_u32(length),
+            KdfKind::Blake3 => fits_output(length),
         };
 
         if length == 0 || !fits {
@@ -192,8 +192,8 @@ impl KdfAlgorithm {
     }
 
     /// Derives `length` bytes from the input keying material `ikm`: HKDF Extract and then Expand,
-    /// or BLAKE3-KDF. `length` is at most 255 HashLen for HKDF and below 2^32 for BLAKE3-KDF, and
-    /// never 0.
+    /// or BLAKE3-KDF. `length` is at most 255 HashLen for HKDF and below 2^32 for BLAKE3-KDF (2^31
+    /// on wasm32), and never 0.
     pub fn derive(
         &self,
         ikm: &[u8],

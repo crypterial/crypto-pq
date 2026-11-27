@@ -64,7 +64,7 @@ SP 800-232 §5.3); a longer value fails `configure` with INVALID_OPTION.
    documentation SHOULD advise keys with at least the desired security strength and tags of at least
    64 bits unless a risk analysis supports a shorter one.
 2. KMAC128 and KMAC256 follow SP 800-185 §4. The key K and `customization` S can have any length.
-   `length` is the tag length in bytes, 4 to 2^32 − 1 [[D-02](decisions.md#decision-d-02)]; L = 8 · `length`. The lower bound is the
+   `length` is the tag length in bytes, 4 to 2^32 − 1 (2^31 − 1 on wasm32, [12.8](#128-limits)) [[D-02](decisions.md#decision-d-02)]; L = 8 · `length`. The lower bound is the
    32-bit minimum of SP 800-185 §8.4.2; the documentation SHOULD repeat its advice that tags shorter
    than 64 bits need a careful risk analysis. `xof = true` selects KMACXOF (SP 800-185 §4.3.1, with
    right_encode(0)); the tag still has `length` bytes. `digestSize` is `length`.
@@ -105,7 +105,7 @@ SP 800-232 §5.3); a longer value fails `configure` with INVALID_OPTION.
 1. `derive(ikm, L, {info})` is BLAKE3 derive_key with context string = `info` (any bytes, possibly
    empty) and key material = `ikm`. The documentation SHOULD repeat the advice of [BLAKE3] that the
    context string be hard-coded, globally unique and application-specific.
-2. A non-empty `salt` fails with INVALID_OPTION. L MUST be 1 to 2^32 − 1 (INVALID_LENGTH) [[D-35](decisions.md#decision-d-35)].
+2. A non-empty `salt` fails with INVALID_OPTION. L MUST be 1 to 2^32 − 1 (2^31 − 1 on wasm32, [12.8](#128-limits)) (INVALID_LENGTH) [[D-35](decisions.md#decision-d-35)].
 3. `extract`, `extractInto`, `expand` and `expandInto` fail with UNSUPPORTED before any other check:
    BLAKE3 has no extract-then-expand split. `prkSize` is 32.
 
@@ -127,5 +127,8 @@ SP 800-232 §5.3); a longer value fails `configure` with INVALID_OPTION.
 | signature context | 0..255 | INVALID_CONTEXT (`verify`: `false`) |
 | message, data, ikm, info, salt, customization (where unbounded) | platform maximum | |
 
-The 2^32 − 1 bound applies on every platform, so that results do not depend on the platform; on
-platforms whose buffers cannot reach it, the platform's allocation limit applies first ([6.2](06-api.md#62-inputs-and-outputs) item 6).
+The 2^32 − 1 bound applies on every 64-bit platform, so that results do not depend on the platform
+there. On wasm32, where one buffer holds at most 2^31 − 1 bytes, the bound of these rows is
+2^31 − 1, and a longer output fails with the error of its row
+[[D-120](decisions.md#decision-d-120)]. A failure to allocate an output within the bound is an
+allocation failure ([6.2](06-api.md#62-inputs-and-outputs) item 6).

@@ -170,6 +170,7 @@ jobs:
       - run: rustup override set ${{ matrix.rust }}
       - run: rustup target add aarch64-unknown-linux-gnu aarch64-apple-darwin aarch64-pc-windows-msvc x86_64-pc-windows-msvc
       - run: rustup target add aarch64-linux-android aarch64-apple-ios aarch64-unknown-none riscv64gc-unknown-none-elf
+      - run: rustup target add wasm32-wasip1 wasm32-wasip2 wasm32-unknown-unknown wasm32v1-none
       - if: matrix.rust == 'stable' && matrix.cfg == ''
         run: cargo fmt --check
       # The API documentation builds without a warning, broken links included, for the default
@@ -242,6 +243,16 @@ jobs:
         run: |
           for target in aarch64-linux-android aarch64-apple-ios aarch64-unknown-none riscv64gc-unknown-none-elf; do
             for features in "" --all-features; do
+              cargo clippy --lib --locked $features --target "$target" -- -D warnings
+            done
+          done
+      # wasm32 runs the portable code (D-120). wasm32-wasip1 with its tests, which rust-wasm runs;
+      # the other wasm32 targets the library alone.
+      - if: matrix.cfg != '--cfg crypto_pq_ct'
+        run: |
+          for features in "" --all-features; do
+            cargo clippy --all-targets --locked $features --target wasm32-wasip1 -- -D warnings
+            for target in wasm32-wasip2 wasm32-unknown-unknown wasm32v1-none; do
               cargo clippy --lib --locked $features --target "$target" -- -D warnings
             done
           done
@@ -392,6 +403,54 @@ jobs:
       - run: rustup target add x86_64-unknown-linux-musl
       - run: cargo test --locked --release --all-features --target x86_64-unknown-linux-musl -- --nocapture kernel
       - run: cargo test --locked --release --all-features --target x86_64-unknown-linux-musl
+
+  # wasm32 under wasmtime (D-120): the suite in the test profile, whose overflow checks catch a
+  # 32-bit usize, without the tests that need threads, unwinding or the native stack; the library
+  # built for the wasm32 targets that CI does not run; then the host for JavaScript of wasm/ under
+  # Node.js, which must equal the block in the crate README.
+  rust-wasm:
+    name: rust wasm32-wasip1
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    env:
+      WASMTIME: "50.0.3"
+      WASMTIME_SHA256: c59133a9334e96eaca5e26f0d4c35199bfe43ab34049aa254ef4b47af1361476
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - run: rustup default stable
+      - run: rustup target add wasm32-wasip1 wasm32-wasip2 wasm32-unknown-unknown wasm32v1-none
+      - run: |
+          archive="wasmtime-v$WASMTIME-x86_64-linux"
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$RUNNER_TEMP/$archive.tar.xz" \
+            "https://github.com/bytecodealliance/wasmtime/releases/download/v$WASMTIME/$archive.tar.xz"
+          echo "$WASMTIME_SHA256  $RUNNER_TEMP/$archive.tar.xz" | sha256sum -c
+          tar -xJf "$RUNNER_TEMP/$archive.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$archive" >> "$GITHUB_PATH"
+      - run: wasmtime --version && node --version
+      - env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime run --dir ${{ github.workspace }}::${{ github.workspace }} --
+        run: |
+          for features in "" --all-features; do
+            cargo test --locked $features --target wasm32-wasip1 -- --test-threads=1
+          done
+          cargo test --locked --release --all-features --target wasm32-wasip1 -- --test-threads=1
+      - run: |
+          for target in wasm32-wasip2 wasm32-unknown-unknown wasm32v1-none; do
+            for features in "" --all-features; do
+              cargo build --lib --release --locked $features --target "$target"
+            done
+          done
+      - working-directory: wasm
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --release --target wasm32-wasip1 -- -D warnings
+          cargo build --locked --release --target wasm32-wasip1
+          node test.mjs
+      - run: diff <(awk '/^```js$/ { f = 1; next } /^```$/ { f = 0 } f' README.md) ../wasm/host.mjs
 
   # The AVX-512VL kernels on real hardware: QEMU's user mode does not emulate AVX-512, and the
   # x86-64 runners are a mix of CPUs with and without it, so twelve copies of the suite run, each

@@ -13,8 +13,9 @@ its result is kept in an atomic.
 | operating systems | Linux (glibc and musl), macOS, Windows; other systems with an entropy source of [14.3](14-security.md#143-entropy) |
 | processors with CPU-specific code | x86-64, ARM64 (little-endian); RISC-V 64 runs portable code |
 | portable only | every other 64-bit architecture, including big-endian; MUST stay correct |
+| WebAssembly | wasm32: portable code, MUST stay correct; CI tests `wasm32-wasip1` and builds `wasm32-wasip2`, `wasm32-unknown-unknown` and `wasm32v1-none` ([18.3](18-testing.md#183-platforms)), of which `wasm32-wasip1` alone has an entropy source ([14.3](14-security.md#143-entropy)); the limits of [14.8](14-security.md#148-security-considerations) item 12 [[D-120](decisions.md#decision-d-120)] |
 | without compare-and-swap | portable code, the key caches filled when a key is made; for example RV64IM (`riscv64im-unknown-none-elf`), the instruction set of zkVMs, built with `build-std` on nightly [[D-112](decisions.md#decision-d-112)] |
-| not supported | WebAssembly and 32-bit targets: a build stops with a compile error [[D-105](decisions.md#decision-d-105)] |
+| not supported | wasm64 and the 32-bit targets other than wasm32: a build stops with a compile error [[D-105](decisions.md#decision-d-105-revised-by-d-120), [D-120](decisions.md#decision-d-120)] |
 | Rust | 1.89 or later, edition 2024, `no_std` with `alloc` |
 
 ## 15.3 CPU-specific code
@@ -42,7 +43,8 @@ its result is kept in an atomic.
    implementer and part numbers of MIDR_EL1 choose among the kernels of a tier, or the portable code,
    for some functions, as for BLAKE2b on Neoverse N2 [[D-101](decisions.md#decision-d-101)]; like the
    x86-64 tables, they depend on the processor only, never on the data.
-4. RISC-V runs the portable code: crypto-pq 2.0 contains no RISC-V kernel.
+4. RISC-V and wasm32 run the portable code: crypto-pq 2.0 contains no RISC-V kernel and no
+   WebAssembly kernel, SIMD128 included [[D-120](decisions.md#decision-d-120)].
 5. Every kernel MUST have a test that compares it with its portable twin on random inputs, and the
    official vectors MUST pass on every tier ([18.2](18-testing.md#182-cpu-tiers)).
 6. The implementation MUST offer a way to force the portable code, used by CI (Part II).

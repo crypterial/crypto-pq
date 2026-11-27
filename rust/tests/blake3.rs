@@ -258,6 +258,15 @@ fn kdf() {
         Some(Error::InvalidLength)
     );
 
+    // SPEC 12.8 [D-120]: on wasm32 at most 2^31 - 1 bytes, refused before anything is allocated.
+    #[cfg(target_pointer_width = "32")]
+    for beyond in [isize::MAX as usize + 1, u32::MAX as usize] {
+        assert_eq!(
+            BLAKE3_KDF.derive(b"ikm", beyond, &context).err(),
+            Some(Error::InvalidLength)
+        );
+    }
+
     let salted = KdfOptions::default().with_salt(b"s").with_info(b"context");
 
     assert_eq!(

@@ -8,10 +8,11 @@
 //! or memory access that depends on a secret, which CI checks under valgrind; on ARM64 CPUs with
 //! FEAT_DIT, under Linux, Android and macOS, the asymmetric operations also run in the
 //! data-independent timing mode (see [`enable_data_independent_timing`]). CPU-specific code for
-//! x86-64 and ARM64 is chosen at run time, with a portable fallback on every 64-bit target.
+//! x86-64 and ARM64 is chosen at run time, with a portable fallback on every other target.
 //!
-//! The crate builds for 64-bit targets only. WebAssembly and 32-bit targets are not supported, and
-//! a build for one of them stops with a compile error.
+//! The crate builds for 64-bit targets and for wasm32 (see [WebAssembly](#webassembly)). wasm64
+//! and the other 32-bit targets are not supported, and a build for one of them stops with a
+//! compile error.
 //!
 //! # Features
 //!
@@ -48,10 +49,20 @@
 //! # Randomness
 //!
 //! Randomness comes from the operating system: `getrandom` on Linux, Android, FreeBSD, NetBSD,
-//! DragonFly, illumos and Solaris, `getentropy` on Apple platforms and OpenBSD, and `ProcessPrng`
-//! on Windows. On every other target, such as bare metal, every operation that draws randomness
+//! DragonFly, illumos and Solaris, `getentropy` on Apple platforms and OpenBSD, `ProcessPrng` on
+//! Windows and `random_get` on WASI preview 1. On every other target, such as
+//! `wasm32-unknown-unknown`, `wasm32-wasip2` or bare metal, every operation that draws randomness
 //! fails with [`Error::RngFailure`]; hashes, XOFs, MACs, KDFs, verification, decapsulation and
 //! deterministic signing need no randomness.
+//!
+//! # WebAssembly
+//!
+//! On wasm32 the crate runs its portable code. A module built for `wasm32-wasip1` takes its
+//! randomness from the host's `random_get`: a WASI runtime supplies it, and so does a short host in
+//! JavaScript for browsers and Node.js, which takes the bytes from `crypto.getRandomValues`; the
+//! crate's README shows one. The runtime compiles the module for the processor that runs it, so the
+//! constant-time check of CI does not cover the code that runs, DIT is not used, and the zeros
+//! written over the stack reach only the stack in linear memory.
 //!
 //! # Examples
 //!
@@ -242,11 +253,12 @@
     )
 )]
 
-// The portable code and its tests are written and checked for 64-bit native targets (D-105).
-#[cfg(any(target_family = "wasm", not(target_pointer_width = "64")))]
-compile_error!(
-    "crypto-pq builds for 64-bit targets only; WebAssembly and 32-bit targets are not supported"
-);
+// The portable code is written and checked for 64-bit native targets and for wasm32 (D-105, D-120).
+#[cfg(not(any(
+    target_arch = "wasm32",
+    all(not(target_family = "wasm"), target_pointer_width = "64")
+)))]
+compile_error!("crypto-pq supports 64-bit targets and wasm32, not wasm64 or other 32-bit targets");
 
 extern crate alloc;
 

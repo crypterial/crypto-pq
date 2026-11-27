@@ -15,7 +15,7 @@ use crate::hash::check_length;
 #[cfg(feature = "blake2")]
 use crate::hash::field;
 #[cfg(feature = "sha3")]
-use crate::hash::fits_u32;
+use crate::hash::fits_output;
 #[cfg(any(
     feature = "hmac",
     feature = "slh-dsa",
@@ -377,7 +377,8 @@ impl MacAlgorithm {
                 // SP 800-185, 8.4.2: a tag shall not be shorter than 32 bits.
                 let size = length.unwrap_or(if rate == 168 { 32 } else { 64 });
 
-                if size < 4 || !fits_u32(size) || !salt.is_empty() || !personalization.is_empty() {
+                if size < 4 || !fits_output(size) || !salt.is_empty() || !personalization.is_empty()
+                {
                     return Err(Error::InvalidOption);
                 }
 

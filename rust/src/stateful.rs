@@ -2290,6 +2290,10 @@ mod tests {
     // counted by its key, whether it was released, stored, refused or lost in the crash, and no
     // index is released twice.
     #[test]
+    #[cfg_attr(
+        any(target_family = "wasm", not(panic = "unwind")),
+        ignore = "spawns threads and catches panics"
+    )]
     fn no_one_time_key_signs_twice() {
         let two = [
             ("LMS_SHA256_M24_H5", "LMOTS_SHA256_N24_W4"),

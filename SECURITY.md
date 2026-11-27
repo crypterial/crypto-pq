@@ -21,13 +21,14 @@ The crate's MAJOR.MINOR is the version of the crypto-pq specification that it im
 
 The 1.0.x releases receive no patch. The values that they leave on the stack after operations on
 secret values are listed in
-[security/audit-2026-11.md](security/audit-2026-11.md#released-versions). In 2.0.0 the operations
+[security/audit-2026-11.md](security/audit-2026-11.md#released-versions). Since 2.0.0 the operations
 of ML-KEM, ML-DSA, FrodoKEM and SLH-DSA on secret values end with zeros over the stack in every
 build; a MAC and a KDF do so at the opt-levels 1, 2, s and z in every build, and at opt-level 3
 only with the Cargo feature `stack-zeros`, which is not a default feature
 ([After a keyed hash](security/audit-2026-11.md#after-a-keyed-hash) states what stays without it).
-Version 2.0 removes the WebAssembly and 32-bit targets, so their users stay on 1.0.x, which keeps
-these residues.
+Version 2.0 removed the WebAssembly and 32-bit targets, and 2.1 brings wasm32 back
+([decision D-120](spec/decisions.md#decision-d-120)); users of the other 32-bit targets stay on
+1.0.x, which keeps these residues.
 
 ## Scope
 

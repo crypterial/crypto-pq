@@ -94,6 +94,22 @@ fn fill(out: &mut [u8]) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(all(target_os = "wasi", target_env = "p1"))]
+#[allow(unsafe_code)]
+fn fill(out: &mut [u8]) -> Result<(), Error> {
+    #[link(wasm_import_module = "wasi_snapshot_preview1")]
+    unsafe extern "C" {
+        fn random_get(buffer: *mut u8, length: usize) -> i32;
+    }
+
+    // SAFETY: the pointer and length describe the writable slice `out`.
+    if unsafe { random_get(out.as_mut_ptr(), out.len()) } != 0 {
+        return Err(Error::RngFailure);
+    }
+
+    Ok(())
+}
+
 #[cfg(not(any(
     target_os = "linux",
     target_os = "android",
@@ -105,6 +121,7 @@ fn fill(out: &mut [u8]) -> Result<(), Error> {
     target_vendor = "apple",
     target_os = "openbsd",
     windows,
+    all(target_os = "wasi", target_env = "p1"),
 )))]
 fn fill(_: &mut [u8]) -> Result<(), Error> {
     Err(Error::RngFailure)

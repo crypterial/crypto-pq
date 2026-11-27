@@ -213,9 +213,16 @@ pub(crate) const fn check_length(actual: usize, expected: usize) -> Result<(), E
     }
 }
 
-// The largest output of one XOF call, and of a KMAC tag, on every platform (SPEC 12.8).
-pub(crate) const fn fits_u32(length: usize) -> bool {
-    length <= u32::MAX as usize
+// The largest output of one XOF call, of a KMAC tag and of BLAKE3-KDF (SPEC 12.8): 2^32 - 1 bytes,
+// or 2^31 - 1 on wasm32, where no buffer is larger and the allocation would panic (D-120).
+pub(crate) const fn fits_output(length: usize) -> bool {
+    const LIMIT: usize = if usize::BITS > 32 {
+        u32::MAX as usize
+    } else {
+        isize::MAX as usize
+    };
+
+    length <= LIMIT
 }
 
 // A BLAKE2 salt or personalization of at most `size` bytes, which the parameter block zero-pads.
@@ -833,15 +840,15 @@ impl XofAlgorithm {
         #[cfg(not(feature = "ascon"))]
         let ascon = false;
 
-        if !fits_u32(length) || (ascon && length == 0) {
+        if !fits_output(length) || (ascon && length == 0) {
             Err(Error::InvalidLength)
         } else {
             Ok(())
         }
     }
 
-    /// `length` bytes of output for `data`. A call gives at most 2^32 - 1 bytes; the Ascon XOFs
-    /// give at least one.
+    /// `length` bytes of output for `data`. A call gives at most 2^32 - 1 bytes (2^31 - 1 on
+    /// wasm32); the Ascon XOFs give at least one.
     pub fn digest(&self, data: &[u8], length: usize) -> Result<Vec<u8>, Error> {
         self.check_output(length)?;
 
@@ -853,8 +860,8 @@ impl XofAlgorithm {
     }
 
     /// `out.len()` bytes of output for `data`, without allocating. Fails with
-    /// [`Error::InvalidLength`] if `out` is longer than 2^32 - 1 bytes or, for the Ascon XOFs,
-    /// empty.
+    /// [`Error::InvalidLength`] if `out` is longer than 2^32 - 1 bytes (2^31 - 1 on wasm32) or, for
+    /// the Ascon XOFs, empty.
     // As HashAlgorithm::digest_into: off x86-64, BLAKE3 and Ascon call their own code here, always
     // inline (D-108, D-109); on x86-64 the dispatcher takes every kind.
     #[cfg_attr(not(target_arch = "x86_64"), inline(always))]
@@ -994,8 +1001,8 @@ impl Xof {
         Ok(())
     }
 
-    /// The next `length` bytes of output, at most 2^32 - 1 a call. BLAKE3 ends after 2^64 - 1
-    /// bytes.
+    /// The next `length` bytes of output, at most 2^32 - 1 a call (2^31 - 1 on wasm32). BLAKE3 ends
+    /// after 2^64 - 1 bytes.
     pub fn read(&mut self, length: usize) -> Result<Vec<u8>, Error> {
         self.check_read(length)?;
 
@@ -1015,7 +1022,8 @@ impl Xof {
         Ok(())
     }
 
-    // At most 2^32 - 1 bytes a call, and BLAKE3 ends after 2^64 - 1 bytes in all.
+    // At most 2^32 - 1 bytes a call (2^31 - 1 on wasm32), and BLAKE3 ends after 2^64 - 1 bytes in
+    // all.
     fn check_read(&self, length: usize) -> Result<(), Error> {
         let fits = match &self.engine {
             #[cfg(feature = "blake3")]
@@ -1023,7 +1031,7 @@ impl Xof {
             _ => true,
         };
 
-        if fits_u32(length) && fits {
+        if fits_output(length) && fits {
             Ok(())
         } else {
             Err(Error::InvalidLength)

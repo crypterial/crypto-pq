@@ -238,14 +238,80 @@ in one call leaves none. What a MAC or a KDF leaves on the stack, with the featu
 and without it, is stated under "After a keyed hash" in
 [the audit record](https://github.com/crypterial/crypto-pq/blob/main/security/audit-2026-11.md).
 That audit, of November 2026, was AI-assisted and run by the maintainer; there has been no
-third-party audit. Randomness comes only from the operating system; on a target without a source,
-operations that need it return `Error::RngFailure`. CPU-specific code for x86-64 (AVX2
-with BMI1 and BMI2, AVX-512F and AVX-512VL, SSE4.1, SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2,
-SHA-3, SHA-512) is selected at run time, with portable code on every 64-bit target. WebAssembly and
-32-bit targets are not supported.
+third-party audit. Randomness comes only from the operating system, or on WASI preview 1 from the
+host's `random_get`; on a target without a source, operations that need it return
+`Error::RngFailure`. CPU-specific code for x86-64 (AVX2 with BMI1 and BMI2, AVX-512F and
+AVX-512VL, SSE4.1, SHA-NI, AES-NI) and ARM64 (NEON, AES, SHA-2, SHA-3, SHA-512) is selected at run
+time, with portable code on every other target. The crate also builds for wasm32, where it runs the
+portable code; wasm64 and the other 32-bit targets are not supported.
 
 Report vulnerabilities privately through
 [GitHub Security Advisories](https://github.com/crypterial/crypto-pq/security/advisories/new).
+
+## WebAssembly
+
+On wasm32 the crate runs its portable code. Built for `wasm32-wasip1`, it takes its randomness
+from the host's `random_get` (WASI preview 1). A WASI runtime supplies it; in a browser or in
+Node.js, a host in JavaScript does, with `crypto.getRandomValues`:
+
+```js
+// A host for a wasm32-wasip1 module that uses crypto-pq, in browsers and Node.js. crypto-pq
+// imports random_get alone, filled here from crypto.getRandomValues; the other four are imports
+// of Rust's std. A pointer or a length arrives as a signed 32-bit number, hence the `>>> 0`.
+export async function instantiate(bytes) {
+  let memory;
+
+  const wasi = {
+    random_get(pointer, length) {
+      try {
+        const end = (pointer >>> 0) + (length >>> 0);
+
+        for (let at = pointer >>> 0; at < end; at += 65536) {
+          crypto.getRandomValues(new Uint8Array(memory.buffer, at, Math.min(65536, end - at)));
+        }
+
+        return 0;
+      } catch {
+        return 29;
+      }
+    },
+    environ_get: () => 0,
+    environ_sizes_get(count, size) {
+      const view = new DataView(memory.buffer);
+
+      view.setUint32(count >>> 0, 0, true);
+
+      view.setUint32(size >>> 0, 0, true);
+
+      return 0;
+    },
+    fd_write: () => 52,
+    proc_exit(code) {
+      throw new Error(`proc_exit(${code})`);
+    },
+  };
+
+  const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi });
+
+  memory = instance.exports.memory;
+
+  instance.exports._initialize?.();
+
+  return instance.exports;
+}
+```
+
+The repository holds this host as
+[wasm/host.mjs](https://github.com/crypterial/crypto-pq/blob/main/wasm/host.mjs), next to a module
+that uses it and the test that CI runs. It fills the module's memory in place, which a browser
+refuses for shared memory: there every draw fails, and the operation returns `Error::RngFailure`.
+
+`wasm32-wasip2`, `wasm32-unknown-unknown` and `wasm32v1-none` have no source of randomness: there,
+every operation that draws randomness returns `Error::RngFailure`, among them key generation,
+encapsulation and hedged signing, while the hashes, XOFs, MACs, KDFs, verification, decapsulation
+and deterministic signing need none. On wasm32 the runtime compiles the module for its processor,
+so the constant-time check of CI does not cover the code that runs, and the zeros written over the
+stack reach only the stack in linear memory.
 
 ## License
 

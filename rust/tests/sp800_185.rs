@@ -325,18 +325,34 @@ fn kmac_options() {
             assert_eq!(algorithm.configure(&options), Err(Error::InvalidOption));
         }
 
-        // SPEC 12.6 item 2 [D-02]: at most 2^32 - 1 bytes, on every platform.
-        let longest = MacOptions::default().with_length(u32::MAX as usize);
+        // SPEC 12.6 item 2 [D-02, D-120]: at most 2^32 - 1 bytes on every 64-bit platform, and
+        // 2^31 - 1 on wasm32.
+        #[cfg(target_pointer_width = "64")]
+        let longest = u32::MAX as usize;
+
+        #[cfg(target_pointer_width = "32")]
+        let longest = isize::MAX as usize;
 
         assert_eq!(
-            algorithm.configure(&longest).map(|kmac| kmac.digest_size()),
-            Ok(u32::MAX as usize)
+            algorithm
+                .configure(&MacOptions::default().with_length(longest))
+                .map(|kmac| kmac.digest_size()),
+            Ok(longest)
         );
 
+        #[cfg(target_pointer_width = "64")]
         assert_eq!(
             algorithm.configure(&MacOptions::default().with_length(u32::MAX as usize + 1)),
             Err(Error::InvalidOption)
         );
+
+        #[cfg(target_pointer_width = "32")]
+        for beyond in [isize::MAX as usize + 1, u32::MAX as usize] {
+            assert_eq!(
+                algorithm.configure(&MacOptions::default().with_length(beyond)),
+                Err(Error::InvalidOption)
+            );
+        }
 
         let short = algorithm
             .configure(&MacOptions::default().with_length(4))

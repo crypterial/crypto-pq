@@ -87,7 +87,7 @@ and the rows are grouped by processor model. The runs of November 2026 drew thes
 A job can also be limited to some processor models: it prints its processor and ends without
 timing on any other. A result table covers only the processors that its runs measured, and gives
 the number of runners of each. RISC-V runs the portable code and is checked for correctness only
-([D-105](../spec/decisions.md#decision-d-105)); it is not timed.
+([D-105](../spec/decisions.md#decision-d-105-revised-by-d-120)); it is not timed.
 
 ## How
 
