@@ -2,7 +2,7 @@
 
 ## 4.1 Included
 
-crypto-pq 2.0 provides the algorithms of Section [5](05-algorithms.md) in seven categories: key encapsulation mechanisms
+crypto-pq 2.1 provides the algorithms of Section [5](05-algorithms.md) in seven categories: key encapsulation mechanisms
 (KEM), signatures, stateful hash-based signatures, hash functions, extendable-output functions (XOF),
 message authentication codes (MAC) and key derivation functions (KDF). It also provides public and
 private key encoding (raw, DER, PEM) for the algorithms that have a standard encoding.

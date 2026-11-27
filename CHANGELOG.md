@@ -7,6 +7,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 the [crypto-pq specification](spec/00-contents.md) that it implements
 ([Section 20.1](spec/20-versioning.md)).
 
+## [2.1.0] - 2026-11-28
+
+Implements specification 2.1, which adds wasm32 to the supported targets. On x86-64, ARM64 and
+riscv64, built with one codegen unit, the library's machine code is that of 2.0.0, function by
+function.
+
+### Added
+
+- wasm32 ([decision D-120](spec/decisions.md#decision-d-120)): the crate builds for
+  `wasm32-wasip1`, `wasm32-wasip2`, `wasm32-unknown-unknown` and `wasm32v1-none` and runs its
+  portable code there, and CI runs the test suite on `wasm32-wasip1` under wasmtime. On
+  `wasm32-wasip1` randomness comes from the host's `random_get` (WASI preview 1); the other three
+  have no source, and the operations that need randomness return `Error::RngFailure`.
+  `wasm/host.mjs`, a host for browsers and Node.js, supplies `random_get` from
+  `crypto.getRandomValues`, and CI runs it. On wasm32 one output of an XOF, a KMAC tag and a
+  BLAKE3-KDF output are at most 2^31 - 1 bytes long, the constant-time check of CI does not cover
+  the code that the runtime compiles, DIT is not used, and the zeros over the stack reach only
+  the stack in linear memory. wasm64 and the other 32-bit targets still stop with a compile
+  error.
+
 ## [2.0.0] - 2026-11-20
 
 Implements specification 2.0. It is not compatible with 1.x: it removes the WebAssembly and 32-bit
@@ -620,6 +640,7 @@ These rules are part of the API contract:
 - **One key, one mode** ([9.1.2](spec/09-signatures.md)). Each ML-DSA or SLH-DSA key is used with
   only one of the hedged and deterministic variants, and only one of the pure and pre-hash modes.
 
+[2.1.0]: https://github.com/crypterial/crypto-pq/tree/rust-v2.1.0
 [2.0.0]: https://github.com/crypterial/crypto-pq/tree/rust-v2.0.0
 [1.0.1]: https://github.com/crypterial/crypto-pq/tree/rust-v1.0.1
 [1.0.0]: https://github.com/crypterial/crypto-pq/tree/rust-v1.0.0

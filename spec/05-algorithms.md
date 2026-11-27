@@ -1,6 +1,6 @@
 # 5. Algorithm catalogue
 
-Each table lists the algorithm values of crypto-pq 2.0, their `name` strings, the authoritative
+Each table lists the algorithm values of crypto-pq 2.1, their `name` strings, the authoritative
 standard and the sizes. All sizes are in bytes and are normative: an implementation MUST report and
 enforce exactly these sizes.
 

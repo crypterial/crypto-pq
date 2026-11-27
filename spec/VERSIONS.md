@@ -4,10 +4,14 @@
 |---|---|---|
 | SPEC 1.0 | published | 2026-10-23 |
 | SPEC 2.0 | published | 2026-11-20 |
+| SPEC 2.1 | published | 2026-11-28 |
 
 SPEC 2.0 was begun as SPEC 1.1. It became 2.0 on 2026-11-14, when WebAssembly and 32-bit targets
 left the supported platforms ([D-105](decisions.md#decision-d-105-revised-by-d-120)), a change that
 SPEC 1.0 allows only in 2.0.0 (its Section 20.3 item 1).
+
+SPEC 2.1 adds wasm32 to the supported platforms ([D-120](decisions.md#decision-d-120)). No
+behaviour on the other platforms changes, as Section 20.3 item 1 of SPEC 2.0 requires.
 
 ## Specification versions and package versions
 
@@ -16,10 +20,10 @@ Decisions [D-66](decisions.md#decision-d-66-revised-by-d-71) and [D-71](decision
 
 1. The crypto-pq package, the Rust crate `crypto-pq`, follows Semantic Versioning 2.0.0.
 2. Its MAJOR.MINOR equals the version of this specification that it implements: every 1.0.x release
-   implements SPEC 1.0, and every 2.0.x release SPEC 2.0. PATCH is independent of the
-   specification.
-3. The first release that implements SPEC 1.0 is 1.0.0, and the first that implements SPEC 2.0 is
-   2.0.0.
+   implements SPEC 1.0, every 2.0.x release SPEC 2.0, and every 2.1.x release SPEC 2.1. PATCH is
+   independent of the specification.
+3. The first release that implements SPEC 1.0 is 1.0.0, the first that implements SPEC 2.0 is
+   2.0.0, and the first that implements SPEC 2.1 is 2.1.0.
 4. A release starts from a signed, annotated tag `rust-vX.Y.Z` (for example `rust-v1.0.0`) on the
    default branch of the repository `crypterial/crypto-pq`
    ([Section 20.4](20-versioning.md#204-release-process)).

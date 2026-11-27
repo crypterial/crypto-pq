@@ -8,7 +8,7 @@ its result is kept in an atomic.
 
 ## 15.2 Supported platforms
 
-| dimension | supported in 2.0 |
+| dimension | supported in 2.1 |
 |---|---|
 | operating systems | Linux (glibc and musl), macOS, Windows; other systems with an entropy source of [14.3](14-security.md#143-entropy) |
 | processors with CPU-specific code | x86-64, ARM64 (little-endian); RISC-V 64 runs portable code |
@@ -43,7 +43,7 @@ its result is kept in an atomic.
    implementer and part numbers of MIDR_EL1 choose among the kernels of a tier, or the portable code,
    for some functions, as for BLAKE2b on Neoverse N2 [[D-101](decisions.md#decision-d-101)]; like the
    x86-64 tables, they depend on the processor only, never on the data.
-4. RISC-V and wasm32 run the portable code: crypto-pq 2.0 contains no RISC-V kernel and no
+4. RISC-V and wasm32 run the portable code: crypto-pq 2.1 contains no RISC-V kernel and no
    WebAssembly kernel, SIMD128 included [[D-120](decisions.md#decision-d-120)].
 5. Every kernel MUST have a test that compares it with its portable twin on random inputs, and the
    official vectors MUST pass on every tier ([18.2](18-testing.md#182-cpu-tiers)).
