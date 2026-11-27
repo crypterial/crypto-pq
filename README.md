@@ -269,14 +269,17 @@ specification state them in full.
   without it.
 - **Wiping.** Private keys and `SecretBytes`, the type of every secret output, wipe their memory
   when dropped, with writes that the compiler cannot remove. Neither implements `Clone`. Secret
-  buffers on the stack are wiped before each function returns. The operations on private keys
-  end by writing zeros over the stack that their calls used, where the compiler may have saved
-  values from registers. The MACs and the KDFs do so in every build at the opt-levels 1, 2, s and
-  z, and at opt-level 3 with the feature `stack-zeros`, which is not a default feature; without
-  it, what the compiler saved of a key in a stack frame of a MAC or a KDF at opt-level 3 stays
-  there until later calls write over it. Copies in registers, and the copy that a move of a value
-  leaves, cannot be wiped: an incremental MAC and a MAC key hold their keyed state in the value
-  itself, so returning or moving one leaves such a copy, which a MAC in one call does not.
+  buffers on the stack are wiped before each function returns. The operations of ML-KEM, ML-DSA,
+  FrodoKEM and SLH-DSA on secret values end by writing zeros over the stack that their calls used,
+  where the compiler may have saved values from registers. The MACs and the KDFs do so in every
+  build at the opt-levels 1, 2, s and z, and at opt-level 3 with the feature `stack-zeros`, which
+  is not a default feature; without it, what the compiler saved of a key in a stack frame of a MAC
+  or a KDF at opt-level 3 stays there until later calls write over it. HSS/LMS and XMSS write no
+  such zeros; in the builds that [the audit](security/audit-2026-11.md) searched, none of their
+  secrets was left on the stack after their operations. Copies in registers, and the copy that a
+  move of a value leaves, cannot be wiped: an incremental MAC and a MAC key hold their keyed state
+  in the value itself, so returning or moving one leaves such a copy, which a MAC in one call does
+  not.
 - **Self-tests.** Key generation runs a pairwise consistency test by default, private-key import
   validates the key, and every stateful signature is verified before it is released.
 - **Randomness** comes only from the operating system: `getrandom` on Linux, Android, FreeBSD,

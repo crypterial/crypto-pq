@@ -1,12 +1,11 @@
 // AES-128 and AES-256 encryption (FIPS 197). With the AES instructions (AES-NI on x86-64, the
 // ARMv8 AES instructions on arm64) the round keys are expanded and the blocks encrypted by them.
 // Everywhere else the portable code is constant time all the same: a group of four blocks in
-// bitsliced form, as BearSSL's aes_ct64 packs them, eight u64 planes of which plane b holds bit b
-// of every byte. The S-box is the circuit of Boyar and Peralta (eprint 2009/191). The rounds are
-// fixsliced (Adomnicai and Peyrin, eprint 2020/1123): they leave out ShiftRows, so that after
-// round r the state is ShiftRows applied r times fewer than FIPS 197 has it, and MixColumns and
-// the round key of round r are moved to match. No table is indexed by data and no branch depends
-// on it.
+// bitsliced form, eight u64 planes of which plane b holds bit b of every byte. The S-box is the
+// circuit of Boyar and Peralta (eprint 2009/191). The rounds are fixsliced (Adomnicai and
+// Peyrin, eprint 2020/1123): they leave out ShiftRows, so that after round r the state is
+// ShiftRows applied r times fewer than FIPS 197 has it, and MixColumns and the round key of round
+// r are moved to match. No table is indexed by data and no branch depends on it.
 
 use alloc::boxed::Box;
 use core::ops::{BitAnd, BitOr, BitXor, BitXorAssign, Not, Shl, Shr};
@@ -48,7 +47,7 @@ trait Plane:
     fn gather(q: &[Self; 8], blocks: &mut [[u8; 16]]);
 }
 
-// As BearSSL's aes_ct64: words 0 and 1 of block i through q[i], words 2 and 3 through q[i + 4].
+// Words 0 and 1 of block i go through q[i], words 2 and 3 through q[i + 4].
 impl Plane for u64 {
     const BLOCKS: usize = 4;
 
