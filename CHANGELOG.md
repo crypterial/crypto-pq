@@ -368,9 +368,9 @@ targets ([decision D-105](spec/decisions.md#decision-d-105)) and needs Rust 1.89
   are unchanged.
 - AES in the portable code, which the AES sets of FrodoKEM use for the matrix A on CPUs without AES
   instructions: the rounds are fixsliced (Adomnicai and Peyrin, ePrint 2020/1123), with four blocks
-  in 64-bit planes, in the layout of BearSSL's aes_ct64. The round keys are converted to match at
-  key setup, and the S-box runs without its NOTs. The paths that use the AES instructions are
-  unchanged. Outputs are unchanged.
+  in eight 64-bit planes, plane b holding bit b of every byte. The round keys are converted to
+  match at key setup, and the S-box runs without its NOTs. The paths that use the AES instructions
+  are unchanged. Outputs are unchanged.
 - ML-KEM and ML-DSA where the NTT has no AVX2 or NEON kernel (RISC-V, s390x and the portable
   builds): the NTT and its inverse take three passes on eight coefficients held in registers, with
   the twiddle factors and their products by QINV from static tables, in place of one pass through
