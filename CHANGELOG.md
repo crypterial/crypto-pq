@@ -10,7 +10,8 @@ the [crypto-pq specification](spec/00-contents.md) that it implements
 ## [2.0.0] - 2026-11-20
 
 Implements specification 2.0. It is not compatible with 1.x: it removes the WebAssembly and 32-bit
-targets ([decision D-105](spec/decisions.md#decision-d-105)) and needs Rust 1.89 or later.
+targets ([decision D-105](spec/decisions.md#decision-d-105-revised-by-d-120)) and needs Rust 1.89
+or later.
 
 ### Added
 
@@ -405,11 +406,12 @@ targets ([decision D-105](spec/decisions.md#decision-d-105)) and needs Rust 1.89
 
 ### Removed
 
-- Support for WebAssembly and 32-bit targets ([decision D-105](spec/decisions.md#decision-d-105)):
-  the crate builds for 64-bit targets only, and a build for WebAssembly or a 32-bit target stops
-  with a compile error. CI no longer builds or tests them. Every other 64-bit target keeps the
-  portable code, big-endian s390x among them. This is not compatible with 1.x, so this release
-  implements specification 2.0; 1.0.x stays the release for those targets.
+- Support for WebAssembly and 32-bit targets
+  ([decision D-105](spec/decisions.md#decision-d-105-revised-by-d-120)): the crate builds for
+  64-bit targets only, and a build for WebAssembly or a 32-bit target stops with a compile error.
+  CI no longer builds or tests them. Every other 64-bit target keeps the portable code, big-endian
+  s390x among them. This is not compatible with 1.x, so this release implements specification 2.0;
+  1.0.x stays the release for those targets.
 
 ### Fixed
 

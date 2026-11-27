@@ -224,6 +224,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(panic = "unwind"), ignore = "catches a panic")]
     fn a_panicking_first_use_leaves_it_empty() {
         let cell = lazy::OnceBox::new(|| 1u32);
 
@@ -264,6 +265,7 @@ mod tests {
     // The threads ask for the value at the same moment. They must all get the same one, and
     // every value computed by a losing thread must be dropped exactly once.
     #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
     fn concurrent_first_use_agrees_and_frees_the_losers() {
         let threads = 8;
 

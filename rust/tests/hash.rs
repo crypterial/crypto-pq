@@ -426,6 +426,7 @@ fn xof_update_after_read() {
 }
 
 // SPEC 12.8: at most 2^32 - 1 bytes per call, refused before anything is allocated.
+#[cfg(target_pointer_width = "64")]
 #[test]
 fn xof_output_limit() {
     let beyond = u32::MAX as usize + 1;
@@ -438,6 +439,24 @@ fn xof_output_limit() {
         assert_eq!(xof.read(beyond), Err(Error::InvalidLength));
 
         assert_eq!(xof.update(b"abc"), Ok(()));
+    }
+}
+
+// SPEC 12.8 [D-120]: on wasm32 at most 2^31 - 1 bytes per call, refused before anything is
+// allocated.
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn xof_output_limit() {
+    for beyond in [isize::MAX as usize + 1, u32::MAX as usize] {
+        for (_, algorithm) in XOFS {
+            assert_eq!(algorithm.digest(b"", beyond), Err(Error::InvalidLength));
+
+            let mut xof = algorithm.create();
+
+            assert_eq!(xof.read(beyond), Err(Error::InvalidLength));
+
+            assert_eq!(xof.update(b"abc"), Ok(()));
+        }
     }
 }
 

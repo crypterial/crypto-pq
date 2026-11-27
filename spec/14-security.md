@@ -59,13 +59,14 @@ piece, which is the case for lattice and hash-based private keys and not for key
 
 ## 14.3 Entropy
 
-1. Every random value comes from the operating system's cryptographic random source, requested for
-   the operation that uses it. There is no user-space generator, no seeding by the
-   caller (except hazmat), and no fallback.
+1. Every random value comes from the operating system's or the runtime's cryptographic random
+   source, requested for the operation that uses it. There is no user-space generator, no seeding
+   by the caller (except hazmat), and no fallback.
 2. Failure, a short read, or the absence of a source on the platform fails with RNG_FAILURE.
 3. Sources (Part II gives the details): `getrandom(2)` on Linux and Android and the BSD and illumos
    systems that provide it; `getentropy` (in chunks of at most 256 bytes) on Apple systems and
-   OpenBSD; `ProcessPrng` on Windows. They are used for operating-system access only (P1).
+   OpenBSD; `ProcessPrng` on Windows; `random_get` on WASI preview 1. They are used for
+   operating-system access only (P1).
 4. A source can block until the operating system has initialized its pool at boot; this is an
    operating-system property, not a crypto-pq wait (P7).
 
@@ -146,3 +147,12 @@ leaves to callers and deployments. The sections cited define the rules.
 11. **Faults.** The countermeasures of [14.7](#147-fault-countermeasures) cover key generation, key import and stateful signing.
     They do not detect every fault; for example, verifying an SLH-DSA signature before release is not
     effective (RFC 9909 §9).
+12. **WebAssembly.** On wasm32 the runtime compiles the module for the processor that runs it, so
+    the constant-time check of [14.1](#141-constant-time) item 7, which runs native machine code,
+    does not cover the code that runs, and DIT is not used
+    ([14.2](#142-data-independent-timing-dit) item 3). The zeros over the stack of
+    [14.5](#145-wiping) reach the stack in linear memory only; what the runtime's code holds in
+    registers and in frames of its own stack is out of the module's reach. On `wasm32-wasip1` the
+    randomness is the host's `random_get` ([14.3](#143-entropy) item 3), so its quality is the
+    host's: a host for JavaScript takes it from `crypto.getRandomValues`
+    [[D-120](decisions.md#decision-d-120)].

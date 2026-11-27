@@ -2814,6 +2814,7 @@ fn signature_index(signature: &[u8]) -> u32 {
 
 // One key shared by many threads through a mutex: every index is used once.
 #[test]
+#[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
 fn concurrent_shared_key() {
     let store = MemoryStore::default();
 
@@ -2871,6 +2872,7 @@ fn concurrent_shared_key() {
 // Keys loaded from one store in different threads: the compare-and-swap lets one of them use
 // each index; the others get StateConflict and reload.
 #[test]
+#[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
 fn concurrent_keys_sharing_a_store() {
     let store = MemoryStore::default();
 

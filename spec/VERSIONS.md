@@ -6,8 +6,8 @@
 | SPEC 2.0 | published | 2026-11-20 |
 
 SPEC 2.0 was begun as SPEC 1.1. It became 2.0 on 2026-11-14, when WebAssembly and 32-bit targets
-left the supported platforms ([D-105](decisions.md#decision-d-105)), a change that SPEC 1.0 allows
-only in 2.0.0 (its Section 20.3 item 1).
+left the supported platforms ([D-105](decisions.md#decision-d-105-revised-by-d-120)), a change that
+SPEC 1.0 allows only in 2.0.0 (its Section 20.3 item 1).
 
 ## Specification versions and package versions
 

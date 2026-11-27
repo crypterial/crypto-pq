@@ -709,22 +709,22 @@ stores the value. No timing was taken on these targets.
 
 ## Decision D-80
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-81
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-82
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-83
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-84
@@ -761,12 +761,12 @@ on 128-bit registers. The cores of the Atom line were neither modelled nor measu
 
 ## Decision D-85
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-86
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-87
@@ -788,12 +788,12 @@ padding of SHA-3 and with three published digests under the padding of Keccak.
 
 ## Decision D-88
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-89
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-90
@@ -808,7 +808,7 @@ This is a form of the portable code that the target chooses at compile time, not
 under [15.3](15-platforms.md#153-cpu-specific-code). Which path runs depends only on public lengths.
 With this crate at opt-level 3 and the application at 1, on x86-64, ARM64 and riscv64, what the
 application's crate compiles of this one is drop glue and `Debug`. The forms that this decision gave
-WebAssembly are withdrawn by [D-105](#decision-d-105).
+WebAssembly are withdrawn by [D-105](#decision-d-105-revised-by-d-120).
 
 Rationale: a test of the kind and of a key of a constant length took 3 to 6 percent of a MAC of a
 block. In bench run 42350709458, on x86-64, the time before over the time here for keyed BLAKE3 of at
@@ -818,12 +818,12 @@ in the MAC entries.
 
 ## Decision D-91
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-92
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-93
@@ -861,22 +861,22 @@ random pairs of blocks and on lone blocks, and CI fails unless a runner with AVX
 
 ## Decision D-94
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-95
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-96
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-97
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-98
@@ -937,12 +937,12 @@ application at 1, on all six, what the application's crate compiles of this one 
 
 ## Decision D-99
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-100
 
-Withdrawn on 2026-11-14 by [D-105](#decision-d-105): it concerned WebAssembly or 32-bit targets, which
+Withdrawn on 2026-11-14 by [D-105](#decision-d-105-revised-by-d-120): it concerned WebAssembly or 32-bit targets, which
 crypto-pq no longer supports.
 
 ## Decision D-101
@@ -1276,26 +1276,28 @@ SHA-256 of 1 KiB in updates of 1 byte runs 165236 against 189317, of 32 bytes 68
 and of 100 bytes 66123 against 66114; on 32-bit Arm 96151 against 109447, 40855 against 41255 and
 39673 against 39856.
 
-## Decision D-105
+## Decision D-105 (revised by D-120)
 
-crypto-pq builds for 64-bit targets only. A build for WebAssembly, or for a target whose pointers
-are not 64 bits wide, stops with a compile error ([15.2](15-platforms.md#152-supported-platforms)),
-and CI builds and tests no such target ([18.3](18-testing.md#183-platforms)). Every other 64-bit
-target keeps the portable code, big-endian s390x among them, and the CPU-specific code is that of
-x86-64 and ARM64, as before. The forms of the portable code that only the removed targets took are
-gone, with the configuration `crypto_pq_pairs` of the build script, and so are the decisions that
-chose them: D-80 to D-83, D-85, D-86, D-88, D-89, D-91, D-92, D-94 to D-97, D-99 and D-100 are
-withdrawn, and D-79, D-84, D-90, D-102 and D-104 lose their text on those targets. Of D-88, the wipe
-of the other targets without stable inline assembly and of Miri stays: each value of four bytes or
-more takes a volatile store of its own.
+crypto-pq 2.0 builds for 64-bit targets only: a build for WebAssembly, or for a target whose
+pointers are not 64 bits wide, stops with a compile error, and CI builds and tests no such target.
+[D-120](#decision-d-120) brings wasm32 back in 2.1, on the portable code that this decision keeps;
+for wasm64 and the other 32-bit targets nothing changes
+([15.2](15-platforms.md#152-supported-platforms), [18.3](18-testing.md#183-platforms)). Every other
+64-bit target keeps the portable code, big-endian s390x among them, and the CPU-specific code is
+that of x86-64 and ARM64, as before. The forms of the portable code that only the removed targets
+took are gone, with the configuration `crypto_pq_pairs` of the build script, and so are the
+decisions that chose them: D-80 to D-83, D-85, D-86, D-88, D-89, D-91, D-92, D-94 to D-97, D-99
+and D-100 are withdrawn, and D-79, D-84, D-90, D-102 and D-104 lose their text on those targets. Of
+D-88, the wipe of the other targets without stable inline assembly and of Miri stays: each value
+of four bytes or more takes a volatile store of its own.
 
 P9 and 15.2 of SPEC 1.0 keep every platform that works working, 32-bit ones included, so the change
 cannot come in a 1.x release (Section 20.3 item 1 of SPEC 1.0). The draft begun as SPEC 1.1 is
 therefore SPEC 2.0, and the first release that implements it is 2.0.0
 ([20.1](20-versioning.md#201-versions)); the decisions before this one that name specification 1.1
 mean this draft. Every format that 1.0.x writes, 2.0 reads
-([20.3](20-versioning.md#203-compatibility-within-2x) item 4). WebAssembly and 32-bit targets stay
-on 1.0.x.
+([20.3](20-versioning.md#203-compatibility-within-2x) item 4). The removed targets stay on 1.0.x,
+wasm32 until 2.1.0 ([D-120](#decision-d-120)).
 
 Rationale: the work on performance is for x86-64 and ARM64 processors and is judged on them, and
 RISC-V runs the portable code, checked for correctness only. A WebAssembly runtime compiles the
@@ -2299,3 +2301,56 @@ the default features and `hazmat`, and at opt-level z with those features on x86
 Haswell and Nehalem. Compared at opt-level 3 in one codegen unit, with the default features and
 `hazmat`, no function of the library differs from the tree of D-118, on x86-64 and on ARM64. CI runs
 the test at opt-level z with the default features and `hazmat` as well as with every feature.
+
+## Decision D-120
+
+wasm32 is a supported target again, for correctness, as RISC-V is: it runs the portable code, which
+[D-105](#decision-d-105-revised-by-d-120) kept as the code of every 64-bit target, and has no
+kernel of its own. A build for wasm64, or for a target other than wasm32 whose pointers are not 64
+bits wide, still stops with a compile error
+([15.2](15-platforms.md#152-supported-platforms)). On WASI preview 1 (`wasm32-wasip1`) the
+randomness comes from `random_get`, as in SPEC 1.0 ([14.3](14-security.md#143-entropy) item 3);
+`wasm32-wasip2`, `wasm32-unknown-unknown` and `wasm32v1-none` have no source, and the operations
+that need randomness fail there with RNG_FAILURE (item 2), while those that take none work. A host
+supplies `random_get` to a module built for `wasm32-wasip1`; the repository holds a host for
+JavaScript, `wasm/host.mjs`, whose `random_get` takes its bytes from `crypto.getRandomValues`, and
+CI runs it under Node.js ([18.3](18-testing.md#183-platforms)).
+
+On wasm32 `usize` is 32 bits wide, and one buffer holds at most 2^31 − 1 bytes. The bound of
+2^32 − 1 bytes on one output of an XOF, a KMAC tag and a BLAKE3-KDF output
+([12.8](12-symmetric-primitives.md#128-limits)) is therefore 2^31 − 1 there, and a longer request
+fails with the error of 12.8 instead of reaching an allocation that cannot succeed; on 64-bit
+targets the bound and the code are as before. The running totals that the standards define past
+2^32 (the message lengths of SHA-2, the counters of BLAKE2 and BLAKE3, the indices of the stateful
+schemes) are kept in u64 or u128 already, and every state kept in `usize` across calls is bounded
+by one block. The lengths of N and S in the prefix of cSHAKE, which together can pass 2^32 there,
+are added in u64.
+
+The limits on wasm32 are those of [14.8](14-security.md#148-security-considerations) item 12: the
+constant-time check reads native machine code, which the runtime makes from the module itself; DIT
+is not used; the zeros over the stack reach only the stack in linear memory; and the test of the
+dead stack, which reads the native stack, does not run there, nor do the tests that need threads
+or unwinding.
+
+Rationale: the portable code is written in 64-bit words, and wasm32 has 64-bit integer
+instructions, so it runs that code without forms of its own; only `usize` is narrower. The forms
+that D-105 removed were those of the 32-bit processors, whose registers do not hold a 64-bit word,
+and they stay removed with those targets. wasm64 stays out: Rust ships it at tier 3 only, and CI
+does not build or test it. No WebAssembly form or SIMD128 code is added: the runtime's compiler,
+not a processor, would decide its effect ([D-105](#decision-d-105-revised-by-d-120)).
+
+Checked: on `wasm32-wasip1` under wasmtime 50.0.3, with one test thread, the suite passes in the
+test profile with the default features (143 tests) and with every feature (278 tests), and in the
+release profile with every feature (278 tests). Eight tests are left out on wasm32 alone: six
+that start threads, of which one also catches a panic, one more that catches a panic, and one
+that expects a panic, which the test harness leaves out where a panic aborts. Clippy passes with
+`-D warnings` for `wasm32-wasip1`, `wasm32-wasip2`, `wasm32-unknown-unknown` and `wasm32v1-none`,
+with the default features and with every feature, in the default build and with
+`crypto_pq_portable`, on Rust 1.89 and 1.97.1, and the library builds in the release profile for
+the last three. Under Node.js 24.19.0, with the host for JavaScript, a module built for
+`wasm32-wasip1` generates an ML-KEM-768 key, encapsulates and decapsulates, generates an
+ML-DSA-65 key, signs hedged and verifies, and both fail with RNG_FAILURE when `random_get` fails.
+A build for `i686-unknown-linux-gnu` and one for `armv7-unknown-linux-gnueabihf` stop with the
+compile error. Compared with 2.0.0 at opt-level 3 in one codegen unit, with every feature, on
+x86-64, ARM64 and riscv64, in the default build and with `crypto_pq_portable`, no function of the
+library differs.

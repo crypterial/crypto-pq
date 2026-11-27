@@ -65,11 +65,12 @@ pub(crate) fn prefix(rate: usize, name: &[u8], customization: &[u8]) -> Option<[
         left_encode(8 * customization.len() as u128),
     ];
 
-    let length = encodings.iter().map(|e| e.as_slice().len()).sum::<usize>()
-        + name.len()
-        + customization.len();
+    // In u64: on wasm32 the lengths of N and S together can pass 2^32 (D-120).
+    let length = encodings.iter().map(|e| e.as_slice().len()).sum::<usize>() as u64
+        + name.len() as u64
+        + customization.len() as u64;
 
-    if length <= rate {
+    if length <= rate as u64 {
         let mut block = [0; 200];
 
         let mut position = 0;

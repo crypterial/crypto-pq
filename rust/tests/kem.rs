@@ -772,6 +772,7 @@ fn shareable<T: Send + Sync>() {}
 // Keys computed by no one yet are used by many threads at once: whichever thread fills a cache,
 // every result must match, and the keys stay usable from any thread.
 #[test]
+#[cfg_attr(target_family = "wasm", ignore = "spawns threads")]
 fn concurrent_first_use() {
     shareable::<crypto_pq::KemPublicKey>();
 

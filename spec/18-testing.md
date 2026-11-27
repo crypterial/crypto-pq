@@ -28,10 +28,13 @@ contains no instruction on a 512-bit register outside those two kernels
 ## 18.3 Platforms
 
 CI MUST build and test: Linux x86-64 and ARM64, macOS ARM64, Windows x86-64 and ARM64; RISC-V 64
-and big-endian s390x under emulation; Linux musl; the minimum and the current toolchain of
-[15.2](15-platforms.md#152-supported-platforms). CI MUST build RV64IM, a target without
-compare-and-swap, and test the form of the key caches that it takes
-[[D-112](decisions.md#decision-d-112)].
+and big-endian s390x under emulation; Linux musl; `wasm32-wasip1` under a WebAssembly runtime; the
+minimum and the current toolchain of [15.2](15-platforms.md#152-supported-platforms). CI MUST build
+RV64IM, a target without compare-and-swap, and test the form of the key caches that it takes
+[[D-112](decisions.md#decision-d-112)]. CI MUST build `wasm32-wasip2`, `wasm32-unknown-unknown` and
+`wasm32v1-none`, and run the host for JavaScript of [D-120](decisions.md#decision-d-120) under
+Node.js. On wasm32 the tests that need threads or unwinding, and the test of the dead stack,
+which reads the native stack, do not run.
 
 ## 18.4 Vectors and robustness
 

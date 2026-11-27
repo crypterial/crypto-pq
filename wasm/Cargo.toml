@@ -1,0 +1,16 @@
+[package]
+name = "crypto-pq-wasm-example"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+crypto-pq = { path = "../rust", default-features = false, features = ["ml-kem", "ml-dsa", "hmac"] }
+
+[profile.release]
+panic = "abort"
+
+[workspace]

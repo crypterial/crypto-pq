@@ -81,8 +81,8 @@
    threads.
 5. Entropy without `std`: `getrandom(2)` (Linux, Android, FreeBSD, NetBSD, DragonFly, illumos,
    Solaris), `getentropy` in chunks of 256 bytes (Apple, OpenBSD), `ProcessPrng` from
-   `bcryptprimitives.dll` (Windows, linked with `raw-dylib`). Every other target returns
-   RNG_FAILURE.
+   `bcryptprimitives.dll` (Windows, linked with `raw-dylib`), `random_get` (WASI preview 1). Every
+   other target, including WASI preview 2, returns RNG_FAILURE.
 6. Constant-time verification: `RUSTFLAGS="--cfg crypto_pq_ct"` and the `ct` test under valgrind
    memcheck, in the default and `crypto_pq_portable` builds, on x86-64 with the minimum and the stable
    toolchain and on ARM64 with the stable toolchain, and on x86-64 in the `crypto_pq_sse41` build with
